@@ -1,0 +1,12 @@
+[package]
+name = "phpun-core"
+description = "PHP language semantics implemented in Rust: lexer, parser, interpreter, runtime."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+regex = "1.11"
+md5 = "0.7"
+sha1 = "0.10"

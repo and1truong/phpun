@@ -1,0 +1,699 @@
+use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::fmt;
+use std::rc::Rc;
+
+/// PHP arrays are insertion-ordered maps. Keys normalize per PHP rules:
+/// `"8"` → 8, `"08"` stays string, `8.5` → 8, `true` → 1, `null` → "".
+///
+/// Stored as a Vec of entries (PHP tests exercise small arrays); existing
+/// keys update in place so iteration order is insertion order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ArrKey {
+    Int(i64),
+    Str(Rc<str>),
+}
+
+pub type Cell = Rc<RefCell<Value>>;
+
+#[derive(Debug)]
+pub struct PhpArray {
+    /// Elements are cells so `$a[0] =& $x` and `foreach (&$v)` can alias them.
+    pub entries: Vec<(ArrKey, Cell)>,
+    /// Next free integer key for `$arr[] = ...` (max int key seen + 1).
+    pub next: i64,
+}
+
+impl Default for PhpArray {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PhpArray {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            next: 0,
+        }
+    }
+
+    pub fn get(&self, k: &ArrKey) -> Option<Value> {
+        self.entries
+            .iter()
+            .find(|(ek, _)| ek == k)
+            .map(|(_, v)| v.borrow().clone())
+    }
+
+    /// The cell holding an element (for by-ref binding).
+    pub fn get_cell(&self, k: &ArrKey) -> Option<Cell> {
+        self.entries
+            .iter()
+            .find(|(ek, _)| ek == k)
+            .map(|(_, v)| v.clone())
+    }
+
+    pub fn push(&mut self, v: Value) {
+        self.entries
+            .push((ArrKey::Int(self.next), Rc::new(RefCell::new(v))));
+        self.next += 1;
+    }
+
+    pub fn set(&mut self, k: ArrKey, v: Value) {
+        self.set_cell(k, Rc::new(RefCell::new(v)));
+    }
+
+    /// Insert or update. An existing key's cell is replaced with the new
+    /// value (so aliases bound to the cell see it); a missing key appends.
+    pub fn set_cell(&mut self, k: ArrKey, c: Cell) {
+        if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
+            *slot.1.borrow_mut() = c.borrow().clone();
+            return;
+        }
+        if let ArrKey::Int(i) = k {
+            if i >= self.next {
+                self.next = i + 1;
+            }
+            self.entries.push((ArrKey::Int(i), c));
+        } else {
+            self.entries.push((k, c));
+        }
+    }
+
+    /// Bind an element slot to a specific cell (`$a[k] =& $x`).
+    pub fn bind_cell(&mut self, k: ArrKey, c: Cell) {
+        if let ArrKey::Int(i) = k {
+            if i >= self.next {
+                self.next = i + 1;
+            }
+        }
+        if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
+            slot.1 = c;
+        } else {
+            self.entries.push((k, c));
+        }
+    }
+
+    /// Remove a key (unset). Returns whether it existed.
+    pub fn unset(&mut self, k: &ArrKey) -> bool {
+        let n = self.entries.len();
+        self.entries.retain(|(ek, _)| ek != k);
+        self.entries.len() != n
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &(ArrKey, Cell)> {
+        self.entries.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+impl Clone for PhpArray {
+    fn clone(&self) -> Self {
+        // Deep-clone cell contents (PHP copy-on-write: the copy is independent).
+        Self {
+            entries: self
+                .entries
+                .iter()
+                .map(|(k, c)| (k.clone(), Rc::new(RefCell::new(c.borrow().clone()))))
+                .collect(),
+            next: self.next,
+        }
+    }
+}
+
+/// PHP array keys as produced by `$arr[k]` indexing and array literals.
+pub fn to_key(v: &Value) -> ArrKey {
+    match v {
+        Value::Int(i) => ArrKey::Int(*i),
+        Value::Float(f) => ArrKey::Int(*f as i64),
+        Value::Bool(b) => ArrKey::Int(*b as i64),
+        Value::Null => ArrKey::Str("".into()),
+        Value::Str(s) => {
+            // Canonical integer strings become int keys ("8"→8, " 8"/"08"/"+8" don't).
+            if let Some(i) = canonical_int(s) {
+                ArrKey::Int(i)
+            } else {
+                ArrKey::Str(s.clone())
+            }
+        }
+        Value::Array(_) | Value::Object(_) | Value::Callable(_) | Value::Resource(_) => {
+            ArrKey::Str("".into()) // illegal key — caller warns
+        }
+    }
+}
+
+/// Integer strings that PHP treats as int array keys: optional `-`, digits,
+/// no leading `+`, no whitespace, no leading zeros (except "0").
+pub fn canonical_int(s: &str) -> Option<i64> {
+    if s.is_empty() {
+        return None;
+    }
+    if s == "0"
+        || (s.starts_with('-') && s[1..].chars().all(|c| c.is_ascii_digit()) && !s[1..].is_empty())
+    {
+        return s.parse().ok();
+    }
+    if s.chars().all(|c| c.is_ascii_digit()) && !s.starts_with('0') {
+        return s.parse().ok();
+    }
+    if s.starts_with('-') && s.len() > 1 {
+        return s.parse().ok();
+    }
+    None
+}
+
+#[derive(Debug, Clone)]
+pub enum Value {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(Rc<str>),
+    /// Copy-on-write via Rc: clones share until mutated (see interp::set_index).
+    Array(Rc<RefCell<PhpArray>>),
+    /// Instances of user-defined and builtin classes.
+    Object(Rc<RefCell<PhpObject>>),
+    /// Closures (`function(){}`, `fn()=>`, first-class `f(...)`).
+    Callable(Rc<PhpCallable>),
+    /// `resource` — opaque handle for fopen() and friends.
+    Resource(Rc<RefCell<PhpResource>>),
+}
+
+impl Value {
+    pub fn str(s: impl Into<String>) -> Self {
+        Value::Str(s.into().into())
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Null => "NULL",
+            Value::Bool(_) => "bool",
+            Value::Int(_) => "int",
+            Value::Float(_) => "float",
+            Value::Str(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+            Value::Callable(_) => "object",
+            Value::Resource(_) => "resource",
+        }
+    }
+
+    /// PHP gettype() names.
+    pub fn gettype(&self) -> &'static str {
+        match self {
+            Value::Null => "NULL",
+            Value::Bool(_) => "boolean",
+            Value::Int(_) => "integer",
+            Value::Float(_) => "double",
+            Value::Str(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) | Value::Callable(_) => "object",
+            Value::Resource(_) => "resource",
+        }
+    }
+
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            Value::Null => false,
+            Value::Bool(b) => *b,
+            Value::Int(i) => *i != 0,
+            Value::Float(f) => *f != 0.0,
+            Value::Str(s) => !s.is_empty() && s.as_ref() != "0",
+            Value::Array(a) => !a.borrow().is_empty(),
+            Value::Object(_) | Value::Callable(_) => true,
+            Value::Resource(_) => true,
+        }
+    }
+
+    /// String cast *without* invoking __toString (interp handles that).
+    pub fn to_php_string(&self) -> String {
+        match self {
+            Value::Null => String::new(),
+            Value::Bool(b) => if *b { "1" } else { "" }.to_string(),
+            Value::Int(i) => i.to_string(),
+            Value::Float(f) => format_float(*f),
+            Value::Str(s) => s.to_string(),
+            // PHP raises "Array to string conversion" warning — caller emits it.
+            Value::Array(_) => "Array".to_string(),
+            Value::Object(o) => format!("Object id #{}", o.borrow().id),
+            Value::Callable(_) => "Closure".to_string(),
+            Value::Resource(r) => format!("Resource id #{}", r.borrow().id()),
+        }
+    }
+
+    pub fn to_int(&self) -> i64 {
+        match self {
+            Value::Null => 0,
+            Value::Bool(b) => *b as i64,
+            Value::Int(i) => *i,
+            Value::Float(f) => *f as i64,
+            Value::Str(s) => match numeric(s) {
+                Numeric::Int(i) => i,
+                Numeric::Float(f) => f as i64,
+                Numeric::Leading(f, _) => f as i64,
+                Numeric::NonNumeric => 0,
+            },
+            Value::Array(a) => {
+                if a.borrow().is_empty() {
+                    0
+                } else {
+                    1
+                }
+            }
+            Value::Object(_) | Value::Callable(_) => 1,
+            Value::Resource(r) => r.borrow().id() as i64,
+        }
+    }
+
+    pub fn to_float(&self) -> f64 {
+        match self {
+            Value::Null => 0.0,
+            Value::Bool(b) => *b as i64 as f64,
+            Value::Int(i) => *i as f64,
+            Value::Float(f) => *f,
+            Value::Str(s) => match numeric(s) {
+                Numeric::Int(i) => i as f64,
+                Numeric::Float(f) => f,
+                Numeric::Leading(f, _) => f,
+                Numeric::NonNumeric => 0.0,
+            },
+            Value::Array(a) => {
+                if a.borrow().is_empty() {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
+            Value::Object(_) | Value::Callable(_) => 1.0,
+            Value::Resource(r) => r.borrow().id() as f64,
+        }
+    }
+}
+
+/// Result of PHP's is_numeric-style string analysis.
+pub enum Numeric {
+    /// Fully numeric integer string (leading whitespace allowed).
+    Int(i64),
+    Float(f64),
+    /// Leading numeric portion of a non-well-formed string
+    /// (float value, true when the parsed part is an integer literal).
+    Leading(f64, bool),
+    NonNumeric,
+}
+
+impl Numeric {
+    /// The parsed numeric portion as a float (0 for non-numeric).
+    pub fn to_float(&self) -> f64 {
+        match self {
+            Numeric::Int(i) => *i as f64,
+            Numeric::Float(f) | Numeric::Leading(f, _) => *f,
+            Numeric::NonNumeric => 0.0,
+        }
+    }
+}
+
+/// Parse a string the way PHP coerces it to a number.
+/// Accepts leading whitespace; trailing whitespace for fully-numeric forms.
+pub fn numeric(s: &str) -> Numeric {
+    let t = s.trim_start();
+    if t.is_empty() {
+        return Numeric::NonNumeric;
+    }
+    let bytes = t.as_bytes();
+    let mut i = 0;
+    if bytes[i] == b'+' || bytes[i] == b'-' {
+        i += 1;
+    }
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    let mut seen_exp = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0'..=b'9' => {
+                seen_digit = true;
+                i += 1;
+            }
+            b'.' if !seen_dot && !seen_exp => {
+                seen_dot = true;
+                i += 1;
+            }
+            b'e' | b'E' if seen_digit && !seen_exp => {
+                seen_exp = true;
+                i += 1;
+                if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+                    i += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    if !seen_digit {
+        return Numeric::NonNumeric;
+    }
+    let text = &t[..i];
+    let rest = &t[i..];
+    if rest.trim().is_empty() {
+        if !seen_dot && !seen_exp {
+            if let Ok(v) = text.parse::<i64>() {
+                return Numeric::Int(v);
+            }
+        }
+        if let Ok(v) = text.parse::<f64>() {
+            return Numeric::Float(v);
+        }
+        Numeric::NonNumeric
+    } else {
+        let is_int = !seen_dot && !seen_exp && text.parse::<i64>().is_ok();
+        text.parse::<f64>()
+            .map(|f| Numeric::Leading(f, is_int))
+            .unwrap_or(Numeric::NonNumeric)
+    }
+}
+
+/// Format an f64 the way PHP's echo/string conversion does (precision=14).
+/// Float → string for echo/print/casts (PHP `precision=14` rules).
+pub fn format_float(f: f64) -> String {
+    php_gcvt(f, 14)
+}
+
+/// Float → string for var_dump/print_r (PHP `serialize_precision=-1`:
+/// shortest round-trip repr, G-style scientific cutoff at 17 digits).
+pub fn format_float_repr(f: f64) -> String {
+    php_gcvt(f, 17)
+}
+
+/// PHP zend_gcvt-style float formatting: significant digits come from the
+/// shortest round-trip representation (rounded to `precision` digits only
+/// when the shortest form is longer); scientific notation when the decimal
+/// exponent is < -4 or >= precision.
+fn php_gcvt(f: f64, precision: usize) -> String {
+    if f.is_nan() {
+        return "NAN".to_string();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "INF".into() } else { "-INF".into() };
+    }
+    if f == 0.0 {
+        return if f.is_sign_negative() {
+            "-0".into()
+        } else {
+            "0".into()
+        };
+    }
+    let neg = f < 0.0;
+    let (digits, exp) = gcvt_digits(f.abs(), precision);
+    let nd = digits.len() as i64;
+    let sign = if neg { "-" } else { "" };
+    if exp < -4 || exp >= precision as i64 {
+        // Scientific: X.YE±E — mantissa always carries a decimal point.
+        let mant = if nd > 1 {
+            format!("{}.{}", &digits[..1], &digits[1..])
+        } else {
+            format!("{}.0", &digits[..1])
+        };
+        format!(
+            "{}{}E{}{}",
+            sign,
+            mant,
+            if exp < 0 { "-" } else { "+" },
+            exp.abs()
+        )
+    } else if exp >= 0 {
+        let e = exp as usize;
+        let s = if digits.len() <= e + 1 {
+            format!("{}{}", digits, "0".repeat(e + 1 - digits.len()))
+        } else {
+            format!("{}.{}", &digits[..e + 1], &digits[e + 1..])
+        };
+        format!("{}{}", sign, s)
+    } else {
+        format!("{}0.{}{}", sign, "0".repeat((-exp - 1) as usize), digits)
+    }
+}
+
+/// Significant digits (no decimal point) + decimal exponent of |v|.
+/// Uses the shortest round-trip repr; if that exceeds `precision` digits
+/// the value is re-rounded to `precision` digits.
+fn gcvt_digits(v: f64, precision: usize) -> (String, i64) {
+    let split = |s: String| -> (String, i64) {
+        let (mant, e) = s.split_once('e').unwrap();
+        let exp: i64 = e.parse().unwrap_or(0);
+        let digits: String = mant.chars().filter(|c| c.is_ascii_digit()).collect();
+        let digits = digits.trim_end_matches('0').to_string();
+        let digits = if digits.is_empty() {
+            "0".to_string()
+        } else {
+            digits
+        };
+        (digits, exp)
+    };
+    let (d, e) = split(format!("{:e}", v));
+    if d.len() > precision {
+        split(format!("{:.*e}", precision - 1, v))
+    } else {
+        (d, e)
+    }
+}
+
+/// C `%.*G` formatting for sprintf's %g/%h (fixed `precision` digits).
+pub fn gcvt(value: f64, precision: usize) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    let exp = value.abs().log10().floor() as i64;
+    if exp < -4 || exp >= precision as i64 {
+        let s = format!("{:.*e}", precision.saturating_sub(1), value);
+        let (mant, exp_s) = s.split_once('e').unwrap();
+        let mant = mant.trim_end_matches('0').trim_end_matches('.');
+        let exp_v: i64 = exp_s.parse().unwrap_or(0);
+        format!(
+            "{}E{}{:02}",
+            mant,
+            if exp_v < 0 { "-" } else { "+" },
+            exp_v.abs()
+        )
+    } else {
+        let decimals = (precision as i64 - 1 - exp).max(0) as usize;
+        let mut s = format!("{:.*}", decimals, value);
+        if s.contains('.') {
+            s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+        }
+        s
+    }
+}
+
+/// PHP loose comparison (`<=>` semantics) implementing the PHP 8 rules.
+pub fn compare(a: &Value, b: &Value) -> Ordering {
+    use Value::*;
+    match (a, b) {
+        (Bool(_), _) | (_, Bool(_)) | (Null, _) | (_, Null) => a.is_truthy().cmp(&b.is_truthy()),
+        (Int(_) | Float(_), Str(s)) => {
+            match numeric(s) {
+                Numeric::Int(_) | Numeric::Float(_) => num_cmp(a.to_float(), b.to_float()),
+                // PHP 8: non-numeric (incl. leading-numeric) string →
+                // the number is cast to string and compared as strings.
+                Numeric::Leading(_, _) | Numeric::NonNumeric => {
+                    a.to_php_string().as_str().cmp(s.as_ref())
+                }
+            }
+        }
+        (Str(_), Int(_) | Float(_)) => compare(b, a).reverse(),
+        (Int(_) | Float(_), Int(_) | Float(_)) => num_cmp(a.to_float(), b.to_float()),
+        (Str(x), Str(y)) => {
+            // Both numeric strings → numeric compare, else string compare.
+            match (numeric(x), numeric(y)) {
+                (Numeric::Int(_) | Numeric::Float(_), Numeric::Int(_) | Numeric::Float(_)) => {
+                    num_cmp(numeric(x).to_float(), numeric(y).to_float())
+                }
+                _ => x.as_ref().cmp(y.as_ref()),
+            }
+        }
+        (Array(x), Array(y)) => {
+            // Loose array comparison: equal if same key/values loosely.
+            let x = x.borrow();
+            let y = y.borrow();
+            if x.len() != y.len() {
+                return x.len().cmp(&y.len());
+            }
+            for (k, c) in &x.entries {
+                match y.get(k) {
+                    Some(yv) if compare(&c.borrow(), &yv) == Ordering::Equal => {}
+                    _ => return Ordering::Less, // PHP's real rule is more subtle; approximate.
+                }
+            }
+            Ordering::Equal
+        }
+        (Array(_), _) => Ordering::Greater,
+        (_, Array(_)) => Ordering::Less,
+        (Object(x), Object(y)) => {
+            // Loose object ==: same class and loosely-equal props.
+            let x = x.borrow();
+            let y = y.borrow();
+            if x.class.name() != y.class.name() {
+                return Ordering::Less;
+            }
+            if x.props.len() != y.props.len() {
+                return x.props.len().cmp(&y.props.len());
+            }
+            for (k, c) in x.props.iter() {
+                match y.props.get(k) {
+                    Some(yc) if compare(&c.borrow(), &yc.borrow()) == Ordering::Equal => {}
+                    _ => return Ordering::Less,
+                }
+            }
+            Ordering::Equal
+        }
+        (Object(_), _) | (Callable(_), _) => Ordering::Greater,
+        (_, Object(_)) | (_, Callable(_)) => Ordering::Less,
+        (Resource(x), Resource(y)) => x.borrow().id().cmp(&y.borrow().id()),
+        (Resource(_), _) => Ordering::Greater,
+        (_, Resource(_)) => Ordering::Less,
+    }
+}
+
+fn num_cmp(a: f64, b: f64) -> Ordering {
+    // NaN is never equal, not even to NaN (nan-comparison-false.phpt).
+    a.partial_cmp(&b).unwrap_or(Ordering::Less)
+}
+
+/// Strict comparison `===`.
+pub fn identical(a: &Value, b: &Value) -> bool {
+    use Value::*;
+    match (a, b) {
+        (Null, Null) => true,
+        (Bool(x), Bool(y)) => x == y,
+        (Int(x), Int(y)) => x == y,
+        (Float(x), Float(y)) => x == y,
+        (Str(x), Str(y)) => x == y,
+        (Array(x), Array(y)) => {
+            let x = x.borrow();
+            let y = y.borrow();
+            x.len() == y.len()
+                && x.iter().enumerate().all(|(i, (k, c))| {
+                    // === also requires same order.
+                    match y.entries.get(i) {
+                        Some((yk, yc)) => k == yk && identical(&c.borrow(), &yc.borrow()),
+                        None => false,
+                    }
+                })
+        }
+        (Object(x), Object(y)) => Rc::ptr_eq(x, y),
+        (Callable(x), Callable(y)) => Rc::ptr_eq(x, y),
+        (Resource(x), Resource(y)) => Rc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_php_string())
+    }
+}
+
+// ----- objects, closures, resources -----
+
+/// A resolved class: declaration plus runtime state (static props).
+#[derive(Debug)]
+pub struct PhpClass {
+    pub decl: Rc<crate::ast::ClassDecl>,
+    /// `self::$prop` storage, initialized lazily from declared defaults.
+    pub statics: RefCell<HashMap<String, Cell>>,
+    pub statics_init: RefCell<bool>,
+}
+
+impl PhpClass {
+    pub fn name(&self) -> &str {
+        &self.decl.name
+    }
+
+    /// Method lookup walking the parent chain.
+    pub fn find_method(&self, name: &str) -> Option<Rc<crate::ast::MethodDecl>> {
+        let lname = name.to_lowercase();
+        self.decl.find_method(&lname)
+    }
+}
+
+#[derive(Debug)]
+pub struct PhpObject {
+    pub class: Rc<PhpClass>,
+    /// Instance properties (declared + dynamic).
+    pub props: HashMap<String, Cell>,
+    /// Declared-property order for var_dump/foreach output.
+    pub prop_order: Vec<String>,
+    /// PHP's per-process object handle counter.
+    pub id: u64,
+    /// Internal payload for builtin classes (e.g. Exception fields).
+    pub internal: Option<ObjectInternal>,
+}
+
+#[derive(Debug)]
+pub enum ObjectInternal {
+    /// Throwable fields (message/code/file/line/trace string).
+    Exception {
+        file: String,
+        line: u32,
+        trace: String,
+    },
+    /// DateTime, closures-as-objects, etc. — opaque marker.
+    None,
+}
+
+#[derive(Debug)]
+pub struct PhpCallable {
+    /// None for plain closures built from a decl.
+    pub kind: CallableKind,
+    /// Captured `use`/`fn` scope: name → cell.
+    pub captures: Vec<(String, Cell)>,
+    /// `$this` binding for methods-as-closures.
+    pub this_obj: Option<Rc<RefCell<PhpObject>>>,
+    /// Declared class context for `self::`/`static::` inside the body.
+    pub scope_class: Option<Rc<PhpClass>>,
+}
+
+#[derive(Debug)]
+pub enum CallableKind {
+    /// Closure / arrow fn built from a decl.
+    Closure(Rc<crate::ast::FunctionDecl>),
+    /// `create_function`-style or first-class callable of a named function.
+    Named(String),
+    /// `[$objOrClass, 'method']` callable.
+    Method {
+        obj: Option<Rc<RefCell<PhpObject>>>,
+        class: Option<Rc<PhpClass>>,
+        name: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum PhpResource {
+    /// fopen(): a file handle with PHP mode flags.
+    File {
+        id: u64,
+        file: std::fs::File,
+        read: bool,
+        write: bool,
+        /// Byte position used for reads (we do our own buffering for fgets).
+        pos: u64,
+        eof: bool,
+    },
+    /// curl/db handles etc. — opaque placeholder.
+    Other { id: u64, kind: &'static str },
+}
+
+impl PhpResource {
+    pub fn id(&self) -> u64 {
+        match self {
+            PhpResource::File { id, .. } => *id,
+            PhpResource::Other { id, .. } => *id,
+        }
+    }
+}
+
+use std::collections::HashMap;

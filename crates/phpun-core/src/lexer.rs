@@ -1,0 +1,664 @@
+use crate::error::PhpError;
+
+/// A single token. Literal payloads keep their cooked values where cheap
+/// (numbers) and raw otherwise (strings are decoded by the parser).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Token {
+    /// Inline HTML outside `<?php ... ?>`; echoed verbatim on output.
+    Inline(String),
+    /// `$name` — name without the sigil.
+    Variable(String),
+    /// Bare identifier / keyword text.
+    Ident(String),
+    Int(i64),
+    Float(f64),
+    /// Single-quoted string: only \\ and \' escapes.
+    SimpleString(String),
+    /// Double-quoted / heredoc content as parts for interpolation.
+    InterpString(Vec<StringPart>),
+    /// `<?=` echo tag — emitted as Token::Echo by the lexer.
+    Echo,
+    Op(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StringPart {
+    Lit(String),
+    /// `$name`
+    Var(String),
+    /// `{$expr_source}` — re-lexed lazily by the parser.
+    Expr(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct Lexed {
+    pub token: Token,
+    pub line: usize,
+}
+
+const KEYWORDS: &[&str] = &[
+    "echo",
+    "if",
+    "else",
+    "elseif",
+    "while",
+    "for",
+    "foreach",
+    "as",
+    "function",
+    "return",
+    "true",
+    "false",
+    "null",
+    "and",
+    "or",
+    "xor",
+    "break",
+    "continue",
+    "do",
+    "switch",
+    "case",
+    "default",
+    "global",
+    "static",
+    "const",
+    "new",
+    "class",
+    "extends",
+    "implements",
+    "interface",
+    "trait",
+    "use",
+    "namespace",
+    "try",
+    "catch",
+    "finally",
+    "throw",
+    "instanceof",
+    "print",
+    "isset",
+    "unset",
+    "empty",
+    "list",
+    "array",
+    "declare",
+    "include",
+    "include_once",
+    "require",
+    "require_once",
+    "fn",
+    "match",
+    "enum",
+    "readonly",
+    "yield",
+    "from",
+    "clone",
+    "public",
+    "private",
+    "protected",
+    "abstract",
+    "final",
+    "var",
+    "goto",
+    "die",
+    "exit",
+    "eval",
+    "insteadof",
+];
+
+/// Two-mode PHP lexer: outside `<?php`/`<?=`/`<?` everything is inline HTML.
+pub fn lex(src: &str) -> Result<Vec<Lexed>, PhpError> {
+    let mut out = Vec::new();
+    let bytes = src.as_bytes();
+    let mut pos = 0usize;
+    let mut line = 1usize;
+
+    while pos < bytes.len() {
+        // Inline HTML until an open tag.
+        let rest = &src[pos..];
+        match rest.find("<?") {
+            None => {
+                push(&mut out, Token::Inline(rest.to_string()), line);
+                pos = bytes.len();
+            }
+            Some(off) => {
+                if off > 0 {
+                    let html = &rest[..off];
+                    line += html.matches('\n').count();
+                    push(&mut out, Token::Inline(html.to_string()), line);
+                }
+                let tag_at = pos + off;
+                let after = &src[tag_at..];
+                if after.starts_with("<?php") && boundary(after, 5) {
+                    pos = tag_at + 5;
+                    pos += skip_ws_and_newline(&src[pos..], &mut line);
+                    pos = lex_php(src, pos, &mut line, &mut out)?;
+                } else if after.starts_with("<?=") {
+                    pos = tag_at + 3;
+                    push(&mut out, Token::Echo, line);
+                    pos = lex_php(src, pos, &mut line, &mut out)?;
+                } else if rest[off..].starts_with("<?\n")
+                    || rest[off..].starts_with("<?\r")
+                    || rest[off..].starts_with("<?\t")
+                    || rest[off..].starts_with("<? ")
+                {
+                    // Short open tag — only honored when short_open_tag is on;
+                    // our default matches run-tests (off) → treat as inline text.
+                    push(&mut out, Token::Inline("<?".to_string()), line);
+                    pos = tag_at + 2;
+                } else {
+                    push(&mut out, Token::Inline("<?".to_string()), line);
+                    pos = tag_at + 2;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn boundary(s: &str, n: usize) -> bool {
+    match s.as_bytes().get(n) {
+        None => true,
+        Some(&b) => b == b' ' || b == b'\t' || b == b'\n' || b == b'\r',
+    }
+}
+
+fn skip_ws_and_newline(s: &str, line: &mut usize) -> usize {
+    let mut n = 0;
+    for &b in s.as_bytes() {
+        match b {
+            b' ' | b'\t' | b'\r' => n += 1,
+            b'\n' => {
+                n += 1;
+                *line += 1;
+                break; // PHP skips at most the first newline after `<?php`
+            }
+            _ => break,
+        }
+    }
+    n
+}
+
+fn push(out: &mut Vec<Lexed>, token: Token, line: usize) {
+    out.push(Lexed { token, line });
+}
+
+/// Lex PHP code mode starting at `pos`; returns the offset where PHP mode
+/// ends (at the `?>` close tag, which is consumed).
+fn lex_php(
+    src: &str,
+    mut pos: usize,
+    line: &mut usize,
+    out: &mut Vec<Lexed>,
+) -> Result<usize, PhpError> {
+    let b = src.as_bytes();
+    loop {
+        let Some(&c) = b.get(pos) else { return Ok(pos) };
+        match c {
+            b' ' | b'\t' | b'\r' => pos += 1,
+            b'\n' => {
+                *line += 1;
+                pos += 1;
+            }
+            b'#' if b.get(pos + 1) == Some(&b'[') => {
+                // PHP 8 attribute `#[...]` — a real token, not a comment.
+                push(out, Token::Op("#["), *line);
+                pos += 2;
+            }
+            b'#' => {
+                while matches!(b.get(pos), Some(&x) if x != b'\n') {
+                    pos += 1;
+                }
+            }
+            b'/' if b.get(pos + 1) == Some(&b'/') => {
+                while matches!(b.get(pos), Some(&x) if x != b'\n') {
+                    pos += 1;
+                }
+            }
+            b'/' if b.get(pos + 1) == Some(&b'*') => {
+                let start_line = *line;
+                pos += 2;
+                loop {
+                    match b.get(pos) {
+                        None => {
+                            return Err(PhpError::parse(
+                                "syntax error, unexpected end of file, unterminated comment",
+                                start_line,
+                            ))
+                        }
+                        Some(&x) if x == b'*' && b.get(pos + 1) == Some(&b'/') => {
+                            pos += 2;
+                            break;
+                        }
+                        Some(&x) => {
+                            if x == b'\n' {
+                                *line += 1;
+                            }
+                            pos += 1;
+                        }
+                    }
+                }
+            }
+            b'?' if b.get(pos + 1) == Some(&b'>') => {
+                pos += 2;
+                // `?>` implies end of statement; a single following newline is
+                // swallowed by PHP (it is part of the close tag).
+                push(out, Token::Op(";"), *line);
+                if b.get(pos) == Some(&b'\n') {
+                    pos += 1;
+                    *line += 1;
+                } else if b.get(pos) == Some(&b'\r') && b.get(pos + 1) == Some(&b'\n') {
+                    pos += 2;
+                    *line += 1;
+                }
+                return Ok(pos);
+            }
+            b'$' => {
+                let (name, n) = ident(src, pos + 1);
+                if name.is_empty() {
+                    push(out, Token::Op("$"), *line);
+                    pos += 1;
+                } else {
+                    push(out, Token::Variable(name), *line);
+                    pos += 1 + n;
+                }
+            }
+            b'0'..=b'9' => {
+                let (tok, n) = number(src, pos, *line)?;
+                out.push(Lexed {
+                    token: tok,
+                    line: *line,
+                });
+                pos += n;
+            }
+            b'.' if matches!(b.get(pos + 1), Some(&x) if x.is_ascii_digit()) => {
+                let (tok, n) = number(src, pos, *line)?;
+                out.push(Lexed {
+                    token: tok,
+                    line: *line,
+                });
+                pos += n;
+            }
+            b'\'' => {
+                let (s, n) = single_string(src, pos, *line)?;
+                push(out, Token::SimpleString(s), *line);
+                *line += s_matches(&src[pos..pos + n]);
+                pos += n;
+            }
+            b'"' => {
+                let (parts, n) = double_string(src, pos, *line)?;
+                *line += s_matches(&src[pos..pos + n]);
+                push(out, Token::InterpString(parts), *line);
+                pos += n;
+            }
+            b'`' => {
+                return Err(PhpError::parse(
+                    "syntax error, unexpected '`' (backtick execution not supported)",
+                    *line,
+                ));
+            }
+            _ => {
+                if c == b'_' || c.is_ascii_alphabetic() || c >= 0x80 {
+                    let (name, n) = ident(src, pos);
+                    push(out, Token::Ident(name), *line);
+                    pos += n;
+                } else {
+                    let (op, n) = operator(src, pos).ok_or_else(|| {
+                        PhpError::parse(format!("syntax error, unexpected '{}'", c as char), *line)
+                    })?;
+                    push(out, Token::Op(op), *line);
+                    pos += n;
+                }
+            }
+        }
+    }
+}
+
+fn s_matches(s: &str) -> usize {
+    s.matches('\n').count()
+}
+
+fn ident(src: &str, pos: usize) -> (String, usize) {
+    let b = src.as_bytes();
+    let mut n = 0;
+    while let Some(&c) = b.get(pos + n) {
+        if c == b'_' || c.is_ascii_alphanumeric() || c >= 0x80 {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    (src[pos..pos + n].to_string(), n)
+}
+
+fn number(src: &str, pos: usize, line: usize) -> Result<(Token, usize), PhpError> {
+    let b = src.as_bytes();
+    let s = &src[pos..];
+    // Hex / binary / octal literals.
+    if s.starts_with("0x") || s.starts_with("0X") {
+        let mut n = 2;
+        while matches!(b.get(pos + n), Some(&c) if c.is_ascii_hexdigit()) {
+            n += 1;
+        }
+        let v = i64::from_str_radix(&s[2..n], 16)
+            .map_err(|_| PhpError::parse("syntax error, invalid hexadecimal literal", line))?;
+        return Ok((Token::Int(v), n));
+    }
+    if s.starts_with("0b") || s.starts_with("0B") {
+        let mut n = 2;
+        while matches!(b.get(pos + n), Some(&c) if c == b'0' || c == b'1') {
+            n += 1;
+        }
+        let v = i64::from_str_radix(&s[2..n], 2)
+            .map_err(|_| PhpError::parse("syntax error, invalid binary literal", line))?;
+        return Ok((Token::Int(v), n));
+    }
+    // Legacy octal `0o`/implicit `0...` — PHP 8.1+ also has explicit `0o`.
+    if (s.starts_with("0o") || s.starts_with("0O")) && s.len() > 2 {
+        let mut n = 2;
+        while matches!(b.get(pos + n), Some(&c) if (b'0'..=b'7').contains(&c)) {
+            n += 1;
+        }
+        let v = i64::from_str_radix(&s[2..n], 8)
+            .map_err(|_| PhpError::parse("syntax error, invalid octal literal", line))?;
+        return Ok((Token::Int(v), n));
+    }
+    let mut n = 0;
+    let mut is_float = false;
+    while matches!(b.get(pos + n), Some(&c) if c.is_ascii_digit() || c == b'_') {
+        n += 1;
+    }
+    if b.get(pos + n) == Some(&b'.')
+        && !matches!(b.get(pos + n + 1), Some(&c) if c.is_ascii_alphabetic() || c == b'_' || c == b'$')
+    {
+        is_float = true;
+        n += 1;
+        while matches!(b.get(pos + n), Some(&c) if c.is_ascii_digit() || c == b'_') {
+            n += 1;
+        }
+    }
+    if matches!(b.get(pos + n), Some(&c) if c == b'e' || c == b'E') {
+        let mut m = n + 1;
+        if matches!(b.get(pos + m), Some(&c) if c == b'+' || c == b'-') {
+            m += 1;
+        }
+        if matches!(b.get(pos + m), Some(&c) if c.is_ascii_digit()) {
+            is_float = true;
+            n = m;
+            while matches!(b.get(pos + n), Some(&c) if c.is_ascii_digit()) {
+                n += 1;
+            }
+        }
+    }
+    if s.starts_with('.') && !is_float {
+        is_float = true;
+    }
+    let text: String = s[..n].chars().filter(|c| *c != '_').collect();
+    if is_float {
+        let v: f64 = text
+            .parse()
+            .map_err(|_| PhpError::parse("syntax error, invalid float literal", line))?;
+        Ok((Token::Float(v), n))
+    } else if text.starts_with('0')
+        && text.len() > 1
+        && text.chars().all(|c| ('0'..='7').contains(&c))
+    {
+        let v = i64::from_str_radix(&text[1..], 8)
+            .map_err(|_| PhpError::parse("syntax error, invalid octal literal", line))?;
+        Ok((Token::Int(v), n))
+    } else {
+        match text.parse::<i64>() {
+            Ok(v) => Ok((Token::Int(v), n)),
+            Err(_) => {
+                // Integer overflow → float, matching PHP.
+                let v: f64 = text
+                    .parse()
+                    .map_err(|_| PhpError::parse("syntax error, invalid integer literal", line))?;
+                Ok((Token::Float(v), n))
+            }
+        }
+    }
+}
+
+fn single_string(src: &str, pos: usize, line: usize) -> Result<(String, usize), PhpError> {
+    let b = src.as_bytes();
+    let mut n = 1;
+    let mut s = String::new();
+    loop {
+        match b.get(pos + n) {
+            None => {
+                return Err(PhpError::parse("syntax error, unterminated string", line));
+            }
+            Some(&b'\\') => match b.get(pos + n + 1) {
+                Some(&b'\'') => {
+                    s.push('\'');
+                    n += 2;
+                }
+                Some(&b'\\') => {
+                    s.push('\\');
+                    n += 2;
+                }
+                _ => {
+                    s.push('\\');
+                    n += 1;
+                }
+            },
+            Some(&b'\'') => return Ok((s, n + 1)),
+            Some(&c) => {
+                // raw byte — keep UTF-8 correctness by working on chars
+                let ch = src[pos + n..].chars().next().unwrap();
+                s.push(ch);
+                n += ch.len_utf8();
+                let _ = c;
+            }
+        }
+    }
+}
+
+fn double_string(src: &str, pos: usize, line: usize) -> Result<(Vec<StringPart>, usize), PhpError> {
+    let b = src.as_bytes();
+    let mut n = 1;
+    let mut parts: Vec<StringPart> = Vec::new();
+    let mut lit = String::new();
+    macro_rules! flush {
+        () => {
+            if !lit.is_empty() {
+                parts.push(StringPart::Lit(std::mem::take(&mut lit)));
+            }
+        };
+    }
+    loop {
+        match b.get(pos + n) {
+            None => return Err(PhpError::parse("syntax error, unterminated string", line)),
+            Some(&b'"') => {
+                flush!();
+                return Ok((parts, n + 1));
+            }
+            Some(&b'\\') => {
+                let e = b.get(pos + n + 1).copied();
+                let (ch, adv) = match e {
+                    Some(b'n') => ('\n', 2),
+                    Some(b't') => ('\t', 2),
+                    Some(b'r') => ('\r', 2),
+                    Some(b'v') => ('\x0b', 2),
+                    Some(b'e') => ('\x1b', 2),
+                    Some(b'f') => ('\x0c', 2),
+                    Some(b'\\') => ('\\', 2),
+                    Some(b'$') => ('$', 2),
+                    Some(b'"') => ('"', 2),
+                    Some(b'0'..=b'7') => {
+                        let mut v = 0u32;
+                        let mut k = 1;
+                        while k <= 3 {
+                            match b.get(pos + n + k) {
+                                Some(&d @ b'0'..=b'7') => {
+                                    v = v * 8 + (d - b'0') as u32;
+                                    k += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        (char::from_u32(v).unwrap_or('\u{fffd}'), k)
+                    }
+                    Some(b'x') => {
+                        let mut v = 0u32;
+                        let mut k = 2;
+                        while k <= 3 {
+                            match b.get(pos + n + k) {
+                                Some(&d) if d.is_ascii_hexdigit() => {
+                                    v = v * 16 + (d as char).to_digit(16).unwrap_or(0);
+                                    k += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        if k == 2 {
+                            ('\\', 1)
+                        } else {
+                            (char::from_u32(v).unwrap_or('\u{fffd}'), k)
+                        }
+                    }
+                    Some(b'u') if b.get(pos + n + 2) == Some(&b'{') => {
+                        let mut k = 3;
+                        let mut v = 0u32;
+                        while let Some(&d) = b.get(pos + n + k) {
+                            if d == b'}' {
+                                k += 1;
+                                break;
+                            }
+                            if d.is_ascii_hexdigit() {
+                                v = v * 16 + (d as char).to_digit(16).unwrap_or(0);
+                            }
+                            k += 1;
+                        }
+                        (char::from_u32(v).unwrap_or('\u{fffd}'), k)
+                    }
+                    _ => ('\\', 1),
+                };
+                lit.push(ch);
+                n += adv;
+            }
+            Some(&b'{') if b.get(pos + n + 1) == Some(&b'$') => {
+                // Complex (curly) interpolation: {$expr}
+                let mut k = n + 2;
+                let mut depth = 1usize;
+                while let Some(&d) = b.get(pos + k) {
+                    if d == b'{' {
+                        depth += 1;
+                    } else if d == b'}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    k += 1;
+                }
+                if depth != 0 {
+                    return Err(PhpError::parse(
+                        "syntax error, unterminated '{$' in string",
+                        line,
+                    ));
+                }
+                flush!();
+                parts.push(StringPart::Expr(src[pos + n + 1..pos + k].to_string()));
+                n = k + 1;
+            }
+            Some(&b'$') => {
+                // $var or ${expr}
+                if b.get(pos + n + 1) == Some(&b'{') {
+                    let mut k = n + 2;
+                    let mut depth = 1usize;
+                    while let Some(&d) = b.get(pos + k) {
+                        if d == b'{' {
+                            depth += 1;
+                        } else if d == b'}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        k += 1;
+                    }
+                    if depth != 0 {
+                        return Err(PhpError::parse(
+                            "syntax error, unterminated '{$' in string",
+                            line,
+                        ));
+                    }
+                    flush!();
+                    parts.push(StringPart::Expr(src[pos + n + 2..pos + k].to_string()));
+                    n = k + 1;
+                } else {
+                    let (name, len) = ident(src, pos + n + 1);
+                    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+                        lit.push('$');
+                        n += 1;
+                    } else {
+                        flush!();
+                        // Simple syntax also allows one `->prop` or `[index]`
+                        // (more complex forms go through the {$...} branch).
+                        let rest = pos + n + 1 + len;
+                        if src[rest..].starts_with("->") {
+                            let (pn, plen) = ident(src, rest + 2);
+                            if !pn.is_empty() {
+                                parts.push(StringPart::Expr(format!("${}->{}", name, pn)));
+                                n = rest + 2 + plen - pos;
+                            } else {
+                                parts.push(StringPart::Var(name));
+                                n += 1 + len;
+                            }
+                        } else if src[rest..].starts_with('[') {
+                            // One-dimensional index (unquoted ident/number/quoted).
+                            let mut k = rest + 1;
+                            while let Some(&d) = b.get(k) {
+                                if d == b']' {
+                                    break;
+                                }
+                                k += 1;
+                            }
+                            if b.get(k) == Some(&b']') {
+                                parts.push(StringPart::Expr(format!(
+                                    "${}{}",
+                                    name,
+                                    &src[rest..=k]
+                                )));
+                                n = k + 1 - pos;
+                            } else {
+                                parts.push(StringPart::Var(name));
+                                n += 1 + len;
+                            }
+                        } else {
+                            parts.push(StringPart::Var(name));
+                            n += 1 + len;
+                        }
+                    }
+                }
+            }
+            Some(_) => {
+                let ch = src[pos + n..].chars().next().unwrap();
+                lit.push(ch);
+                n += ch.len_utf8();
+            }
+        }
+    }
+}
+
+/// Longest-match operator table.
+fn operator(src: &str, pos: usize) -> Option<(&'static str, usize)> {
+    const OPS: &[&str] = &[
+        "<=>", "===", "!==", "...", "**=", "<<=", ">>=", "??=", "=>", "==", "!=", "<>", "<=", ">=",
+        "&&", "||", "++", "--", "+=", "-=", "*=", "/=", ".=", "%=", "&=", "|=", "^=", "<<", ">>",
+        "**", "??", "->", "?->", "::", "\\", "(", ")", "[", "]", "{", "}", ";", ",", "?", ":", "+",
+        "-", "*", "/", "%", "=", "<", ">", "!", ".", "&", "|", "^", "~", "@",
+    ];
+    for op in OPS {
+        if src[pos..].starts_with(op) {
+            return Some((op, op.len()));
+        }
+    }
+    None
+}
+
+pub fn is_keyword(name: &str) -> bool {
+    KEYWORDS.contains(&name.to_ascii_lowercase().as_str())
+}

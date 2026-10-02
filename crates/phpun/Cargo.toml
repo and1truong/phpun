@@ -1,0 +1,15 @@
+[package]
+name = "phpun"
+description = "Bun for PHP — a modern PHP runtime and toolchain written in Rust."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "phpun"
+path = "src/main.rs"
+
+[dependencies]
+phpun-core = { path = "../phpun-core" }
+phpun-phpt = { path = "../phpun-phpt" }

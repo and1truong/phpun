@@ -1,0 +1,2233 @@
+use crate::ast::*;
+use crate::error::PhpError;
+use crate::lexer::{lex, Lexed, Token};
+use std::rc::Rc;
+
+pub struct Parser<'a> {
+    toks: &'a [Lexed],
+    pos: usize,
+}
+
+pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
+    let toks = lex(src)?;
+    let mut p = Parser {
+        toks: &toks,
+        pos: 0,
+    };
+    p.program()
+}
+
+/// Parse a standalone PHP expression source (used for string interpolation).
+pub fn parse_expr_src(src: &str) -> Result<Expr, PhpError> {
+    let wrapped = format!("<?php {};", src);
+    let toks = lex(&wrapped)?;
+    let mut p = Parser {
+        toks: &toks,
+        pos: 0,
+    };
+    let e = p.expr()?;
+    Ok(e)
+}
+
+impl<'a> Parser<'a> {
+    fn peek(&self) -> Option<&Token> {
+        self.toks.get(self.pos).map(|l| &l.token)
+    }
+
+    fn peek2(&self) -> Option<&Token> {
+        self.toks.get(self.pos + 1).map(|l| &l.token)
+    }
+
+    fn line(&self) -> usize {
+        self.toks
+            .get(self.pos)
+            .map(|l| l.line)
+            .unwrap_or_else(|| self.toks.last().map(|l| l.line).unwrap_or(1))
+    }
+
+    fn next(&mut self) -> Option<Token> {
+        let t = self.peek().cloned();
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    fn at_op(&self, op: &str) -> bool {
+        matches!(self.peek(), Some(Token::Op(o)) if *o == op)
+    }
+
+    fn eat_op(&mut self, op: &str) -> bool {
+        if self.at_op(op) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_op(&mut self, op: &str) -> Result<(), PhpError> {
+        if self.eat_op(op) {
+            Ok(())
+        } else {
+            Err(PhpError::parse(
+                format!(
+                    "syntax error, unexpected {}, expecting \"{}\"",
+                    self.describe(),
+                    op
+                ),
+                self.line(),
+            ))
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self.peek() {
+            None => "end of file".to_string(),
+            Some(Token::Ident(s)) => format!("identifier \"{}\"", s),
+            Some(Token::Variable(s)) => format!("variable \"${}\"", s),
+            Some(Token::Int(v)) => format!("integer {}", v),
+            Some(Token::Float(v)) => format!("float {}", v),
+            Some(Token::Op(o)) => format!("token \"{}\"", o),
+            Some(_) => "token".to_string(),
+        }
+    }
+
+    fn ident(&mut self) -> Option<String> {
+        if let Some(Token::Ident(s)) = self.peek() {
+            let s = s.clone();
+            self.pos += 1;
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    fn ident_is(&self, kw: &str) -> bool {
+        matches!(self.peek(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case(kw))
+    }
+
+    fn eat_ident(&mut self, kw: &str) -> bool {
+        if self.ident_is(kw) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn program(&mut self) -> Result<Vec<Stmt>, PhpError> {
+        let mut stmts = Vec::new();
+        while self.peek().is_some() {
+            stmts.push(Stmt::Line(self.line()));
+            stmts.push(self.stmt()?);
+        }
+        Ok(stmts)
+    }
+
+    /// A `{ ... }` block or a single statement body.
+    fn body(&mut self) -> Result<Vec<Stmt>, PhpError> {
+        if self.eat_op("{") {
+            let mut v = Vec::new();
+            while !self.eat_op("}") {
+                if self.peek().is_none() {
+                    return Err(PhpError::parse(
+                        "syntax error, unexpected end of file",
+                        self.line(),
+                    ));
+                }
+                v.push(Stmt::Line(self.line()));
+                v.push(self.stmt()?);
+            }
+            Ok(v)
+        } else if self.eat_op(":") {
+            // Alternative syntax: if: ... endif; etc. — not yet supported.
+            Err(PhpError::parse(
+                "syntax error, alternative syntax (endif/endwhile/...) not supported",
+                self.line(),
+            ))
+        } else {
+            let l = self.line();
+            Ok(vec![Stmt::Line(l), self.stmt()?])
+        }
+    }
+
+    fn stmt(&mut self) -> Result<Stmt, PhpError> {
+        match self.peek().cloned() {
+            Some(Token::Inline(s)) => {
+                self.pos += 1;
+                Ok(Stmt::Inline(s))
+            }
+            Some(Token::Echo) => {
+                self.pos += 1;
+                let args = self.expr_list()?;
+                self.eat_op(";");
+                Ok(Stmt::Echo(args))
+            }
+            Some(Token::Ident(_)) => {
+                if self.ident_is("echo") {
+                    self.pos += 1;
+                    let args = self.expr_list()?;
+                    self.expect_op(";")?;
+                    Ok(Stmt::Echo(args))
+                } else if self.ident_is("if") {
+                    self.if_stmt()
+                } else if self.ident_is("while") {
+                    self.pos += 1;
+                    self.expect_op("(")?;
+                    let cond = self.expr()?;
+                    self.expect_op(")")?;
+                    let body = self.body()?;
+                    Ok(Stmt::While { cond, body })
+                } else if self.ident_is("do") {
+                    self.pos += 1;
+                    let body = self.body()?;
+                    if !self.eat_ident("while") {
+                        return Err(PhpError::parse(
+                            "syntax error, unexpected end of statement, expecting \"while\"",
+                            self.line(),
+                        ));
+                    }
+                    self.expect_op("(")?;
+                    let cond = self.expr()?;
+                    self.expect_op(")")?;
+                    self.expect_op(";")?;
+                    Ok(Stmt::DoWhile { body, cond })
+                } else if self.ident_is("for") {
+                    self.for_stmt()
+                } else if self.ident_is("function") {
+                    self.function_decl()
+                } else if self.ident_is("return") {
+                    self.pos += 1;
+                    if self.at_op(";") {
+                        self.pos += 1;
+                        Ok(Stmt::Return(None))
+                    } else {
+                        let e = self.expr()?;
+                        self.expect_op(";")?;
+                        Ok(Stmt::Return(Some(e)))
+                    }
+                } else if self.ident_is("break") || self.ident_is("continue") {
+                    let is_break = self.ident_is("break");
+                    self.pos += 1;
+                    let arg = if self.at_op(";") {
+                        None
+                    } else {
+                        Some(self.expr()?)
+                    };
+                    self.expect_op(";")?;
+                    Ok(if is_break {
+                        Stmt::Break(arg)
+                    } else {
+                        Stmt::Continue(arg)
+                    })
+                } else if self.ident_is("global") {
+                    self.pos += 1;
+                    let name = match self.next() {
+                        Some(Token::Variable(n)) => n,
+                        _ => {
+                            return Err(PhpError::parse(
+                                "syntax error, unexpected token, expecting variable",
+                                self.line(),
+                            ))
+                        }
+                    };
+                    self.expect_op(";")?;
+                    Ok(Stmt::Global(name))
+                } else if self.ident_is("static")
+                    && matches!(self.peek2(), Some(Token::Variable(_)))
+                {
+                    self.static_stmt()
+                } else if self.ident_is("switch") {
+                    self.switch_stmt()
+                } else if self.ident_is("foreach") {
+                    self.foreach_stmt()
+                } else if self.ident_is("unset") {
+                    self.pos += 1;
+                    self.expect_op("(")?;
+                    let mut xs = Vec::new();
+                    while !self.at_op(")") {
+                        xs.push(self.expr()?);
+                        if !self.eat_op(",") {
+                            break;
+                        }
+                    }
+                    self.expect_op(")")?;
+                    self.expect_op(";")?;
+                    Ok(Stmt::Unset(xs))
+                } else if self.ident_is("try") {
+                    self.try_stmt()
+                } else if self.ident_is("throw") {
+                    self.pos += 1;
+                    let e = self.expr()?;
+                    self.expect_op(";")?;
+                    Ok(Stmt::Expr(Expr::Throw(Box::new(e))))
+                } else if self.ident_is("declare") {
+                    self.declare_stmt()
+                } else if self.ident_is("namespace") {
+                    self.pos += 1;
+                    let name = self.name_path().unwrap_or_default();
+                    if self.eat_op("{") {
+                        // `namespace Foo { ... }` — body parsed inline.
+                        let mut v = Vec::new();
+                        while !self.eat_op("}") {
+                            if self.peek().is_none() {
+                                return Err(PhpError::parse(
+                                    "syntax error, unexpected end of file",
+                                    self.line(),
+                                ));
+                            }
+                            v.push(self.stmt()?);
+                        }
+                        return Ok(Stmt::Block(vec![Stmt::Namespace(name), Stmt::Block(v)]));
+                    }
+                    self.expect_op(";")?;
+                    Ok(Stmt::Namespace(name))
+                } else if self.ident_is("class")
+                    || self.ident_is("interface")
+                    || self.ident_is("trait")
+                    || self.ident_is("enum")
+                    || ((self.ident_is("abstract")
+                        || self.ident_is("final")
+                        || self.ident_is("readonly"))
+                        && matches!(self.peek2(), Some(Token::Ident(k)) if k.eq_ignore_ascii_case("class")))
+                {
+                    self.class_decl()
+                } else if self.ident_is("use")
+                    && matches!(self.peek2(), Some(Token::Ident(_)) | Some(Token::Op("\\")))
+                {
+                    self.use_stmt()
+                } else {
+                    self.expr_stmt()
+                }
+            }
+            Some(Token::Op("{")) => {
+                self.pos += 1;
+                let mut v = Vec::new();
+                while !self.eat_op("}") {
+                    if self.peek().is_none() {
+                        return Err(PhpError::parse(
+                            "syntax error, unexpected end of file",
+                            self.line(),
+                        ));
+                    }
+                    v.push(self.stmt()?);
+                }
+                Ok(Stmt::Block(v))
+            }
+            Some(Token::Op(";")) => {
+                self.pos += 1;
+                Ok(Stmt::Expr(Expr::Null))
+            }
+            Some(_) => self.expr_stmt(),
+            None => Err(PhpError::parse(
+                "syntax error, unexpected end of file",
+                self.line(),
+            )),
+        }
+    }
+
+    fn expr_stmt(&mut self) -> Result<Stmt, PhpError> {
+        let e = self.expr()?;
+        self.expect_op(";")?;
+        Ok(Stmt::Expr(e))
+    }
+
+    /// `static $a = 1, $b;` — persistent function-local vars.
+    fn static_stmt(&mut self) -> Result<Stmt, PhpError> {
+        self.pos += 1; // static
+        let mut vars = Vec::new();
+        loop {
+            let name = match self.next() {
+                Some(Token::Variable(n)) => n,
+                t => {
+                    return Err(PhpError::parse(
+                        format!(
+                            "syntax error, unexpected {}, expecting variable",
+                            desc_t(t.as_ref())
+                        ),
+                        self.line(),
+                    ))
+                }
+            };
+            let default = if self.eat_op("=") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            vars.push((name, default));
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op(";")?;
+        Ok(Stmt::Static(vars))
+    }
+
+    fn switch_stmt(&mut self) -> Result<Stmt, PhpError> {
+        self.pos += 1; // switch
+        self.expect_op("(")?;
+        let cond = self.expr()?;
+        self.expect_op(")")?;
+        self.expect_op("{")?;
+        let mut cases: Vec<(Option<Expr>, Vec<Stmt>)> = Vec::new();
+        let mut cur: Option<Vec<Stmt>> = None;
+        loop {
+            if self.eat_op("}") {
+                break;
+            }
+            if self.peek().is_none() {
+                return Err(PhpError::parse(
+                    "syntax error, unexpected end of file",
+                    self.line(),
+                ));
+            }
+            if self.ident_is("case") {
+                if let Some(b) = cur.take() {
+                    cases.last_mut().unwrap().1 = b;
+                }
+                self.pos += 1;
+                let e = self.expr()?;
+                if !self.eat_op(":") {
+                    self.expect_op(";")?;
+                }
+                cases.push((Some(e), Vec::new()));
+                cur = Some(Vec::new());
+            } else if self.ident_is("default") {
+                if let Some(b) = cur.take() {
+                    cases.last_mut().unwrap().1 = b;
+                }
+                self.pos += 1;
+                if !self.eat_op(":") {
+                    self.expect_op(";")?;
+                }
+                cases.push((None, Vec::new()));
+                cur = Some(Vec::new());
+            } else {
+                cur.get_or_insert_with(Vec::new)
+                    .push(Stmt::Line(self.line()));
+                let s = self.stmt()?;
+                cur.get_or_insert_with(Vec::new).push(s);
+            }
+        }
+        if let Some(b) = cur.take() {
+            cases.last_mut().unwrap().1 = b;
+        }
+        Ok(Stmt::Switch { cond, cases })
+    }
+
+    fn foreach_stmt(&mut self) -> Result<Stmt, PhpError> {
+        self.pos += 1; // foreach
+        self.expect_op("(")?;
+        let arr = self.expr()?;
+        if !self.eat_ident("as") {
+            return Err(PhpError::parse(
+                "syntax error, unexpected token, expecting \"as\"",
+                self.line(),
+            ));
+        }
+        let first = self.foreach_target()?;
+        let (key, val) = if self.eat_op("=>") {
+            let v = self.foreach_target()?;
+            (Some(first), v)
+        } else {
+            (None, first)
+        };
+        self.expect_op(")")?;
+        let body = self.body()?;
+        let key = key.map(|t| match t {
+            ForeachTarget::Var(n) => ForeachKey::Var(n),
+            _ => ForeachKey::Var(String::new()), // list keys unsupported
+        });
+        Ok(Stmt::Foreach {
+            arr,
+            key,
+            val,
+            body,
+        })
+    }
+
+    fn foreach_target(&mut self) -> Result<ForeachTarget, PhpError> {
+        if self.eat_op("&") {
+            return match self.next() {
+                Some(Token::Variable(n)) => Ok(ForeachTarget::ByRef(n)),
+                t => Err(PhpError::parse(
+                    format!(
+                        "syntax error, unexpected {}, expecting variable",
+                        desc_t(t.as_ref())
+                    ),
+                    self.line(),
+                )),
+            };
+        }
+        if self.at_op("[") {
+            self.pos += 1;
+            let mut items = Vec::new();
+            while !self.at_op("]") {
+                if self.eat_op(",") {
+                    items.push(None);
+                    continue;
+                }
+                items.push(Some(self.foreach_target()?));
+                if !self.eat_op(",") {
+                    break;
+                }
+            }
+            self.expect_op("]")?;
+            return Ok(ForeachTarget::List(items));
+        }
+        if self.ident_is("list") && matches!(self.peek2(), Some(Token::Op("("))) {
+            self.pos += 1;
+            self.expect_op("(")?;
+            let mut items = Vec::new();
+            while !self.at_op(")") {
+                if self.at_op(",") {
+                    items.push(None);
+                    self.pos += 1;
+                    continue;
+                }
+                items.push(Some(self.foreach_target()?));
+                if !self.eat_op(",") {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            return Ok(ForeachTarget::List(items));
+        }
+        match self.next() {
+            Some(Token::Variable(n)) => Ok(ForeachTarget::Var(n)),
+            t => Err(PhpError::parse(
+                format!(
+                    "syntax error, unexpected {}, expecting variable",
+                    desc_t(t.as_ref())
+                ),
+                self.line(),
+            )),
+        }
+    }
+
+    fn try_stmt(&mut self) -> Result<Stmt, PhpError> {
+        self.pos += 1; // try
+        let body = self.body()?;
+        let mut catches = Vec::new();
+        while self.ident_is("catch") {
+            self.pos += 1;
+            self.expect_op("(")?;
+            let mut types = Vec::new();
+            loop {
+                if let Some(n) = self.name_path() {
+                    types.push(n);
+                }
+                if !self.eat_op("|") {
+                    break;
+                }
+            }
+            let var = match self.next() {
+                Some(Token::Variable(n)) => Some(n),
+                Some(t) => {
+                    self.pos -= 1;
+                    let _ = t;
+                    None
+                }
+                None => None,
+            };
+            self.expect_op(")")?;
+            let cbody = self.body()?;
+            catches.push(Catch {
+                types,
+                var,
+                body: cbody,
+            });
+        }
+        let finally = if self.ident_is("finally") {
+            self.pos += 1;
+            Some(self.body()?)
+        } else {
+            None
+        };
+        Ok(Stmt::Try {
+            body,
+            catches,
+            finally,
+        })
+    }
+
+    fn declare_stmt(&mut self) -> Result<Stmt, PhpError> {
+        self.pos += 1; // declare
+        self.expect_op("(")?;
+        let name = self.ident().unwrap_or_default();
+        self.expect_op("=")?;
+        let value = self.expr()?;
+        self.expect_op(")")?;
+        let decl = Stmt::Declare { name, value };
+        if self.eat_op(";") {
+            Ok(decl)
+        } else {
+            // `declare(...) { }` / `declare(...):` block forms.
+            let body = self.body()?;
+            Ok(Stmt::Block(vec![decl, Stmt::Block(body)]))
+        }
+    }
+
+    /// Top-level `use A\B, C as D;` (namespace import). Names collected but
+    /// aliasing is not applied yet (no namespace support).
+    fn use_stmt(&mut self) -> Result<Stmt, PhpError> {
+        self.pos += 1; // use
+        if self.ident_is("function") || self.ident_is("const") {
+            self.pos += 1;
+        }
+        let mut names = Vec::new();
+        loop {
+            if let Some(n) = self.name_path() {
+                names.push(n);
+            }
+            if self.ident_is("as") {
+                self.pos += 1;
+                self.ident();
+            }
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op(";")?;
+        Ok(Stmt::Use(names))
+    }
+
+    /// `Foo\Bar\Baz` — backslash-joined qualified name.
+    fn name_path(&mut self) -> Option<String> {
+        let mut parts = Vec::new();
+        // leading \ for FQ names
+        let lead = self.eat_op("\\");
+        while matches!(self.peek(), Some(Token::Ident(_))) {
+            parts.push(self.ident().unwrap());
+            if !self.eat_op("\\") {
+                break;
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        let mut s = parts.join("\\");
+        if lead {
+            s = format!("\\{}", s);
+        }
+        Some(s)
+    }
+
+    /// Skip `#[Attr(...)]` groups (attributes are parsed but discarded).
+    fn skip_attrs(&mut self) {
+        while self.eat_op("#[") {
+            let mut depth = 1i32;
+            while depth > 0 {
+                match self.next() {
+                    Some(Token::Op("[")) | Some(Token::Op("#[")) => depth += 1,
+                    Some(Token::Op("]")) => depth -= 1,
+                    Some(_) => {}
+                    None => return,
+                }
+            }
+        }
+    }
+
+    fn class_decl(&mut self) -> Result<Stmt, PhpError> {
+        let mut is_abstract = false;
+        let mut is_final = false;
+        loop {
+            if self.ident_is("abstract") {
+                is_abstract = true;
+                self.pos += 1;
+            } else if self.ident_is("final") {
+                is_final = true;
+                self.pos += 1;
+            } else if self.ident_is("readonly") {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let kind = if self.eat_ident("interface") {
+            ClassKind::Interface
+        } else if self.eat_ident("trait") {
+            ClassKind::Trait
+        } else if self.eat_ident("enum") {
+            ClassKind::Enum
+        } else if self.eat_ident("class") {
+            ClassKind::Class
+        } else {
+            return Err(PhpError::parse(
+                "syntax error, expecting class kind",
+                self.line(),
+            ));
+        };
+        let name = self
+            .ident()
+            .unwrap_or_else(|| "class@anonymous".to_string());
+        // enum backing type `enum X: int`
+        if self.eat_op(":") {
+            self.skip_type()?;
+        }
+        let mut parent = None;
+        if self.eat_ident("extends") {
+            parent = self.name_path();
+        }
+        let mut implements = Vec::new();
+        if self.eat_ident("implements") {
+            while let Some(n) = self.name_path() {
+                implements.push(n);
+                if !self.eat_op(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_op("{")?;
+        let mut methods = Vec::new();
+        let mut props = Vec::new();
+        let mut consts = Vec::new();
+        let mut traits = Vec::new();
+        while !self.at_op("}") {
+            if self.peek().is_none() {
+                return Err(PhpError::parse(
+                    "syntax error, unexpected end of file",
+                    self.line(),
+                ));
+            }
+            self.skip_attrs();
+            let mut vis = Visibility::Public;
+            let mut is_static = false;
+            let mut m_abstract = false;
+            let mut m_final = false;
+            let mut m_readonly = false;
+            loop {
+                if self.ident_is("public") {
+                    vis = Visibility::Public;
+                    self.pos += 1;
+                } else if self.ident_is("protected") {
+                    vis = Visibility::Protected;
+                    self.pos += 1;
+                } else if self.ident_is("private") {
+                    vis = Visibility::Private;
+                    self.pos += 1;
+                } else if self.ident_is("static") {
+                    is_static = true;
+                    self.pos += 1;
+                } else if self.ident_is("abstract") {
+                    m_abstract = true;
+                    self.pos += 1;
+                } else if self.ident_is("final") {
+                    m_final = true;
+                    self.pos += 1;
+                } else if self.ident_is("readonly") {
+                    m_readonly = true;
+                    self.pos += 1;
+                } else if self.ident_is("var") {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            if self.ident_is("function") {
+                let m = self.method_decl(is_static, m_abstract, m_final, vis)?;
+                methods.push(Rc::new(m));
+                continue;
+            }
+            if self.ident_is("const") {
+                self.pos += 1;
+                loop {
+                    let cname = self.ident().unwrap_or_default();
+                    self.expect_op("=")?;
+                    let cv = self.expr()?;
+                    consts.push((cname, cv));
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+                self.expect_op(";")?;
+                continue;
+            }
+            if self.ident_is("use") {
+                self.pos += 1;
+                while let Some(n) = self.name_path() {
+                    traits.push(n);
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+                if self.eat_op("{") {
+                    // Trait adaptations (`insteadof`/`as`) — skip the block.
+                    let mut depth = 1i32;
+                    while depth > 0 {
+                        match self.next() {
+                            Some(Token::Op("{")) => depth += 1,
+                            Some(Token::Op("}")) => depth -= 1,
+                            Some(_) => {}
+                            None => break,
+                        }
+                    }
+                } else {
+                    self.expect_op(";")?;
+                }
+                continue;
+            }
+            if self.ident_is("case") {
+                // enum cases
+                self.pos += 1;
+                let cname = self.ident().unwrap_or_default();
+                let cv = if self.eat_op("=") {
+                    self.expr()?
+                } else {
+                    Expr::Null
+                };
+                consts.push((cname, cv));
+                self.expect_op(";")?;
+                continue;
+            }
+            // Typed or untyped property: [type] $name [= default], ...;
+            if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
+                && !matches!(self.peek2(), Some(Token::Op("(")))
+            {
+                self.skip_type()?;
+            }
+            loop {
+                let pname = match self.next() {
+                    Some(Token::Variable(n)) => n,
+                    t => {
+                        return Err(PhpError::parse(
+                            format!(
+                                "syntax error, unexpected {}, expecting variable",
+                                desc_t(t.as_ref())
+                            ),
+                            self.line(),
+                        ))
+                    }
+                };
+                let default = if self.eat_op("=") {
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
+                props.push(PropDecl {
+                    name: pname,
+                    default,
+                    is_static,
+                    visibility: vis,
+                    readonly: m_readonly,
+                });
+                if !self.eat_op(",") {
+                    break;
+                }
+            }
+            self.expect_op(";")?;
+        }
+        self.expect_op("}")?;
+        Ok(Stmt::Class(Rc::new(ClassDecl {
+            name,
+            kind,
+            is_abstract,
+            is_final,
+            parent,
+            implements,
+            traits,
+            methods,
+            props,
+            consts,
+        })))
+    }
+
+    fn method_decl(
+        &mut self,
+        is_static: bool,
+        is_abstract: bool,
+        is_final: bool,
+        vis: Visibility,
+    ) -> Result<MethodDecl, PhpError> {
+        self.pos += 1; // function
+        let by_ref = self.eat_op("&");
+        let name = self.ident().unwrap_or_default();
+        let params = self.params()?;
+        if self.eat_op(":") {
+            self.skip_type()?;
+        }
+        let body = if self.eat_op(";") {
+            Vec::new()
+        } else {
+            self.body()?
+        };
+        Ok(MethodDecl {
+            decl: FunctionDecl {
+                name,
+                params,
+                body,
+                by_ref,
+            },
+            is_static,
+            is_abstract,
+            is_final,
+            visibility: vis,
+        })
+    }
+
+    fn params(&mut self) -> Result<Vec<Param>, PhpError> {
+        self.expect_op("(")?;
+        let mut params = Vec::new();
+        while !self.at_op(")") {
+            self.skip_attrs();
+            // skip type declaration before the variable
+            if matches!(
+                self.peek(),
+                Some(Token::Ident(_)) | Some(Token::Op("?")) | Some(Token::Op("\\"))
+            ) && !matches!(self.peek2(), Some(Token::Op(",")) | Some(Token::Op(")")))
+            {
+                self.skip_type()?;
+            }
+            let by_ref = self.eat_op("&");
+            let variadic = self.eat_op("...");
+            // promoted constructor params may carry visibility
+            for _ in 0..3 {
+                if self.ident_is("public")
+                    || self.ident_is("private")
+                    || self.ident_is("protected")
+                    || self.ident_is("readonly")
+                {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            if matches!(self.peek(), Some(Token::Ident(_)))
+                && !matches!(self.peek2(), Some(Token::Variable(_)))
+            {
+                // trailing type after visibility (e.g. `private int $x`)
+                self.skip_type()?;
+            }
+            let pname = match self.next() {
+                Some(Token::Variable(n)) => n,
+                t => {
+                    return Err(PhpError::parse(
+                        format!(
+                            "syntax error, unexpected {}, expecting variable",
+                            desc_t(t.as_ref())
+                        ),
+                        self.line(),
+                    ))
+                }
+            };
+            let default = if self.eat_op("=") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            params.push(Param {
+                name: pname,
+                default,
+                by_ref,
+                variadic,
+            });
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(params)
+    }
+
+    fn if_stmt(&mut self) -> Result<Stmt, PhpError> {
+        self.pos += 1; // if
+        self.expect_op("(")?;
+        let cond = self.expr()?;
+        self.expect_op(")")?;
+        let then = self.body()?;
+        let mut else_ = Vec::new();
+        {
+            if self.ident_is("elseif") {
+                self.pos += 1;
+                self.expect_op("(")?;
+                let c = self.expr()?;
+                self.expect_op(")")?;
+                let b = self.body()?;
+                else_ = vec![Stmt::If {
+                    cond: c,
+                    then: b,
+                    else_: Vec::new(),
+                }];
+                // chain deeper elseif/else inside this nested If
+                let mut tail = match else_.last_mut() {
+                    Some(Stmt::If { else_, .. }) => else_,
+                    _ => unreachable!(),
+                };
+                while self.ident_is("elseif") {
+                    self.pos += 1;
+                    self.expect_op("(")?;
+                    let c = self.expr()?;
+                    self.expect_op(")")?;
+                    let b = self.body()?;
+                    *tail = vec![Stmt::If {
+                        cond: c,
+                        then: b,
+                        else_: Vec::new(),
+                    }];
+                    tail = match tail.last_mut() {
+                        Some(Stmt::If { else_, .. }) => else_,
+                        _ => unreachable!(),
+                    };
+                }
+                if self.ident_is("else") {
+                    self.pos += 1;
+                    *tail = self.body()?;
+                }
+            } else if self.ident_is("else") {
+                self.pos += 1;
+                else_ = self.body()?;
+            }
+        }
+        Ok(Stmt::If { cond, then, else_ })
+    }
+
+    fn for_stmt(&mut self) -> Result<Stmt, PhpError> {
+        self.pos += 1; // for
+        self.expect_op("(")?;
+        let mut init = Vec::new();
+        if !self.at_op(";") {
+            init = self.expr_list()?;
+        }
+        self.expect_op(";")?;
+        let mut cond = Vec::new();
+        if !self.at_op(";") {
+            cond = self.expr_list()?;
+        }
+        self.expect_op(";")?;
+        let mut inc = Vec::new();
+        if !self.at_op(")") {
+            inc = self.expr_list()?;
+        }
+        self.expect_op(")")?;
+        // foreach is a different keyword; plain for body here.
+        let body = self.body()?;
+        Ok(Stmt::For {
+            init,
+            cond,
+            inc,
+            body,
+        })
+    }
+
+    fn function_decl(&mut self) -> Result<Stmt, PhpError> {
+        self.pos += 1; // function
+        let by_ref = self.eat_op("&");
+        let name = self.ident().ok_or_else(|| {
+            PhpError::parse(
+                "syntax error, unexpected token, expecting function name",
+                self.line(),
+            )
+        })?;
+        let params = self.params()?;
+        // Return type declarations (: int) — parse & ignore for now.
+        if self.eat_op(":") {
+            self.skip_type()?;
+        }
+        let body = self.body()?;
+        Ok(Stmt::Function(FunctionDecl {
+            name,
+            params,
+            body,
+            by_ref,
+        }))
+    }
+
+    /// `function (&$a) use ($x, &$y) { }`, `static function () {}`,
+    /// `fn($x) => $x + 1`.
+    fn closure_expr(&mut self) -> Result<Expr, PhpError> {
+        let mut arrow = false;
+        let mut uses = Vec::new();
+        if self.ident_is("static") {
+            self.pos += 1;
+        }
+        if self.eat_ident("fn") {
+            arrow = true;
+        } else {
+            self.expect_ident("function")?;
+        }
+        let by_ref = self.eat_op("&");
+        let params = self.params()?;
+        if !arrow && self.ident_is("use") {
+            self.pos += 1;
+            self.expect_op("(")?;
+            while !self.at_op(")") {
+                let by_ref = self.eat_op("&");
+                match self.next() {
+                    Some(Token::Variable(n)) => uses.push((n, by_ref)),
+                    t => {
+                        return Err(PhpError::parse(
+                            format!(
+                                "syntax error, unexpected {}, expecting variable",
+                                desc_t(t.as_ref())
+                            ),
+                            self.line(),
+                        ))
+                    }
+                }
+                if !self.eat_op(",") {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+        }
+        let body = if arrow {
+            self.expect_op("=>")?;
+            let e = self.expr()?;
+            vec![Stmt::Return(Some(e))]
+        } else {
+            if self.eat_op(":") {
+                self.skip_type()?;
+            }
+            self.body()?
+        };
+        Ok(Expr::Closure(ClosureExpr {
+            decl: FunctionDecl {
+                name: String::new(),
+                params,
+                body,
+                by_ref,
+            },
+            uses,
+            arrow,
+        }))
+    }
+
+    /// The class operand of `new`: name path, `self`/`static`/`parent`,
+    /// `$var`, `{expr}`, or anonymous `class { ... }`. Returns (class expr,
+    /// ctor args) — anonymous classes take their ctor args before the body.
+    fn new_class_expr(&mut self) -> Result<(Expr, Vec<Expr>), PhpError> {
+        if self.ident_is("class") {
+            // Anonymous class — parse body as a class decl with a synthetic name.
+            self.pos += 1;
+            // optional constructor args before body
+            let ctor_args = if self.at_op("(") {
+                self.pos += 1;
+                self.args()?
+            } else {
+                Vec::new()
+            };
+            // delegate: parse `extends`/`implements`/body by simulating
+            self.skip_attrs();
+            let mut parent = None;
+            if self.eat_ident("extends") {
+                parent = self.name_path();
+            }
+            let mut implements = Vec::new();
+            if self.eat_ident("implements") {
+                while let Some(n) = self.name_path() {
+                    implements.push(n);
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+            }
+            self.expect_op("{")?;
+            let mut methods = Vec::new();
+            let mut props = Vec::new();
+            let mut consts = Vec::new();
+            let mut traits = Vec::new();
+            // reuse class body by inlining a tiny loop (mirrors class_decl)
+            while !self.at_op("}") {
+                if self.peek().is_none() {
+                    return Err(PhpError::parse(
+                        "syntax error, unexpected end of file",
+                        self.line(),
+                    ));
+                }
+                self.skip_attrs();
+                let mut vis = Visibility::Public;
+                let mut is_static = false;
+                let mut m_abstract = false;
+                let mut m_final = false;
+                let mut m_readonly = false;
+                loop {
+                    if self.ident_is("public") {
+                        vis = Visibility::Public;
+                        self.pos += 1;
+                    } else if self.ident_is("protected") {
+                        vis = Visibility::Protected;
+                        self.pos += 1;
+                    } else if self.ident_is("private") {
+                        vis = Visibility::Private;
+                        self.pos += 1;
+                    } else if self.ident_is("static") {
+                        is_static = true;
+                        self.pos += 1;
+                    } else if self.ident_is("abstract") {
+                        m_abstract = true;
+                        self.pos += 1;
+                    } else if self.ident_is("final") {
+                        m_final = true;
+                        self.pos += 1;
+                    } else if self.ident_is("readonly") {
+                        m_readonly = true;
+                        self.pos += 1;
+                    } else if self.ident_is("var") {
+                        self.pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if self.ident_is("function") {
+                    methods.push(Rc::new(
+                        self.method_decl(is_static, m_abstract, m_final, vis)?,
+                    ));
+                    continue;
+                }
+                if self.ident_is("const") {
+                    self.pos += 1;
+                    loop {
+                        let cname = self.ident().unwrap_or_default();
+                        self.expect_op("=")?;
+                        consts.push((cname, self.expr()?));
+                        if !self.eat_op(",") {
+                            break;
+                        }
+                    }
+                    self.expect_op(";")?;
+                    continue;
+                }
+                if self.ident_is("use") {
+                    self.pos += 1;
+                    while let Some(n) = self.name_path() {
+                        traits.push(n);
+                        if !self.eat_op(",") {
+                            break;
+                        }
+                    }
+                    if self.eat_op("{") {
+                        let mut depth = 1i32;
+                        while depth > 0 {
+                            match self.next() {
+                                Some(Token::Op("{")) => depth += 1,
+                                Some(Token::Op("}")) => depth -= 1,
+                                Some(_) => {}
+                                None => break,
+                            }
+                        }
+                    } else {
+                        self.expect_op(";")?;
+                    }
+                    continue;
+                }
+                if self.ident_is("case") {
+                    self.pos += 1;
+                    let cname = self.ident().unwrap_or_default();
+                    let cv = if self.eat_op("=") {
+                        self.expr()?
+                    } else {
+                        Expr::Null
+                    };
+                    consts.push((cname, cv));
+                    self.expect_op(";")?;
+                    continue;
+                }
+                if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
+                    && !matches!(self.peek2(), Some(Token::Op("(")))
+                {
+                    self.skip_type()?;
+                }
+                loop {
+                    let pname = match self.next() {
+                        Some(Token::Variable(n)) => n,
+                        t => {
+                            return Err(PhpError::parse(
+                                format!(
+                                    "syntax error, unexpected {}, expecting variable",
+                                    desc_t(t.as_ref())
+                                ),
+                                self.line(),
+                            ))
+                        }
+                    };
+                    let default = if self.eat_op("=") {
+                        Some(self.expr()?)
+                    } else {
+                        None
+                    };
+                    props.push(PropDecl {
+                        name: pname,
+                        default,
+                        is_static,
+                        visibility: vis,
+                        readonly: m_readonly,
+                    });
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+                self.expect_op(";")?;
+            }
+            self.expect_op("}")?;
+            return Ok((
+                Expr::AnonClass(Rc::new(ClassDecl {
+                    name: format!("class@anonymous${}", self.line()),
+                    kind: ClassKind::Class,
+                    is_abstract: false,
+                    is_final: false,
+                    parent,
+                    implements,
+                    traits,
+                    methods,
+                    props,
+                    consts,
+                })),
+                ctor_args,
+            ));
+        }
+        // `new self` / `new static` / `new parent`
+        if self.ident_is("self") || self.ident_is("static") || self.ident_is("parent") {
+            return Ok((Expr::Const(self.ident().unwrap()), Vec::new()));
+        }
+        match self.peek().cloned() {
+            Some(Token::Ident(_)) | Some(Token::Op("\\")) => {
+                let n = self.name_path().unwrap_or_default();
+                Ok((Expr::Const(n), Vec::new()))
+            }
+            Some(Token::Variable(n)) => {
+                self.pos += 1;
+                Ok((Expr::Var(n), Vec::new()))
+            }
+            Some(Token::Op("{")) => {
+                self.pos += 1;
+                let e = self.expr()?;
+                self.expect_op("}")?;
+                Ok((e, Vec::new()))
+            }
+            Some(Token::Op("(")) => {
+                self.pos += 1;
+                let e = self.expr()?;
+                self.expect_op(")")?;
+                Ok((e, Vec::new()))
+            }
+            t => Err(PhpError::parse(
+                format!(
+                    "syntax error, unexpected {}, expecting class name",
+                    desc_t(t.as_ref())
+                ),
+                self.line(),
+            )),
+        }
+    }
+
+    fn match_expr(&mut self) -> Result<Expr, PhpError> {
+        self.pos += 1; // match
+        self.expect_op("(")?;
+        let subject = self.expr()?;
+        self.expect_op(")")?;
+        self.expect_op("{")?;
+        let mut arms = Vec::new();
+        while !self.at_op("}") {
+            if self.eat_ident("default") {
+                self.expect_op("=>")?;
+                let r = self.expr()?;
+                arms.push(MatchArm {
+                    conds: Vec::new(),
+                    result: r,
+                });
+            } else {
+                let mut conds = vec![self.expr()?];
+                while self.eat_op(",") {
+                    if self.at_op("=>") {
+                        break;
+                    }
+                    conds.push(self.expr()?);
+                }
+                self.expect_op("=>")?;
+                let r = self.expr()?;
+                arms.push(MatchArm { conds, result: r });
+            }
+            self.eat_op(",");
+        }
+        self.expect_op("}")?;
+        Ok(Expr::Match {
+            subject: Box::new(subject),
+            arms,
+        })
+    }
+
+    fn expect_ident(&mut self, kw: &str) -> Result<(), PhpError> {
+        if self.eat_ident(kw) {
+            Ok(())
+        } else {
+            Err(PhpError::parse(
+                format!(
+                    "syntax error, unexpected {}, expecting \"{}\"",
+                    self.describe(),
+                    kw
+                ),
+                self.line(),
+            ))
+        }
+    }
+
+    /// Skip a type declaration (names, |, &, ?, parenthesized DNF).
+    fn skip_type(&mut self) -> Result<(), PhpError> {
+        let mut depth = 0i32;
+        loop {
+            match self.peek() {
+                Some(Token::Ident(_)) | Some(Token::Op("\\")) => {
+                    self.pos += 1;
+                }
+                Some(Token::Op("?")) if depth == 0 => self.pos += 1,
+                Some(Token::Op("|")) | Some(Token::Op("&")) => self.pos += 1,
+                Some(Token::Op("(")) => {
+                    depth += 1;
+                    self.pos += 1;
+                }
+                Some(Token::Op(")")) if depth > 0 => {
+                    depth -= 1;
+                    self.pos += 1;
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    fn expr_list(&mut self) -> Result<Vec<Expr>, PhpError> {
+        let mut v = vec![self.expr()?];
+        while self.eat_op(",") {
+            v.push(self.expr()?);
+        }
+        Ok(v)
+    }
+
+    pub fn expr(&mut self) -> Result<Expr, PhpError> {
+        if self.ident_is("throw") {
+            self.pos += 1;
+            let e = self.assign()?;
+            return Ok(Expr::Throw(Box::new(e)));
+        }
+        self.assign()
+    }
+
+    fn assign(&mut self) -> Result<Expr, PhpError> {
+        let e = self.ternary()?;
+        const ASSIGN_OPS: &[&str] = &[
+            "=", "+=", "-=", "*=", "/=", ".=", "%=", "&=", "|=", "^=", "<<=", ">>=", "**=", "??=",
+        ];
+        if let Some(Token::Op(op)) = self.peek() {
+            if ASSIGN_OPS.contains(op) {
+                let mut op: &'static str = op;
+                self.pos += 1;
+                if op == "=" && self.eat_op("&") {
+                    op = "=&"; // by-reference assignment
+                }
+                let rhs = self.assign()?;
+                let target = self.list_target(e)?;
+                return Ok(Expr::Assign {
+                    target: Box::new(target),
+                    op,
+                    value: Box::new(rhs),
+                });
+            }
+        }
+        Ok(e)
+    }
+
+    /// `[a, b]` / `list(a, b)` on the left of `=` is destructuring.
+    fn list_target(&mut self, e: Expr) -> Result<Expr, PhpError> {
+        match e {
+            Expr::ArrayLit(items) => Ok(Expr::List(
+                items.into_iter().map(|(_, v)| Some(v)).collect(),
+            )),
+            Expr::Call { name, args } => match *name {
+                Expr::Str(n) if n.eq_ignore_ascii_case("list") => {
+                    Ok(Expr::List(args.into_iter().map(Some).collect()))
+                }
+                other => Ok(Expr::Call {
+                    name: Box::new(other),
+                    args,
+                }),
+            },
+            other => Ok(other),
+        }
+    }
+
+    fn ternary(&mut self) -> Result<Expr, PhpError> {
+        let c = self.logical_or()?;
+        if self.eat_op("?") {
+            if self.at_op(":") {
+                self.pos += 1;
+                let f = self.assign()?;
+                return Ok(Expr::Ternary {
+                    c: Box::new(c),
+                    t: None,
+                    f: Box::new(f),
+                });
+            }
+            let t = self.ternary()?;
+            self.expect_op(":")?;
+            let f = self.ternary()?;
+            return Ok(Expr::Ternary {
+                c: Box::new(c),
+                t: Some(Box::new(t)),
+                f: Box::new(f),
+            });
+        }
+        if self.eat_op("??") {
+            let r = self.assign()?;
+            return Ok(Expr::Binary {
+                op: "??",
+                l: Box::new(c),
+                r: Box::new(r),
+            });
+        }
+        Ok(c)
+    }
+
+    fn logical_or(&mut self) -> Result<Expr, PhpError> {
+        let mut e = self.logical_and()?;
+        loop {
+            if self.eat_op("||") {
+                let r = self.logical_and()?;
+                e = Expr::Binary {
+                    op: "||",
+                    l: Box::new(e),
+                    r: Box::new(r),
+                };
+            } else if self.ident_is("or") {
+                self.pos += 1;
+                let r = self.logical_and()?;
+                e = Expr::Binary {
+                    op: "||",
+                    l: Box::new(e),
+                    r: Box::new(r),
+                };
+            } else if self.ident_is("xor") {
+                self.pos += 1;
+                let r = self.logical_and()?;
+                e = Expr::Binary {
+                    op: "xor",
+                    l: Box::new(e),
+                    r: Box::new(r),
+                };
+            } else {
+                return Ok(e);
+            }
+        }
+    }
+
+    fn logical_and(&mut self) -> Result<Expr, PhpError> {
+        let mut e = self.equality()?;
+        loop {
+            if self.eat_op("&&") {
+                let r = self.equality()?;
+                e = Expr::Binary {
+                    op: "&&",
+                    l: Box::new(e),
+                    r: Box::new(r),
+                };
+            } else if self.ident_is("and") {
+                self.pos += 1;
+                let r = self.equality()?;
+                e = Expr::Binary {
+                    op: "&&",
+                    l: Box::new(e),
+                    r: Box::new(r),
+                };
+            } else {
+                return Ok(e);
+            }
+        }
+    }
+
+    fn equality(&mut self) -> Result<Expr, PhpError> {
+        let mut e = self.comparison()?;
+        loop {
+            let op = match self.peek() {
+                Some(Token::Op("==")) => "==",
+                Some(Token::Op("!=")) => "!=",
+                Some(Token::Op("<>")) => "!=",
+                Some(Token::Op("===")) => "===",
+                Some(Token::Op("!==")) => "!==",
+                Some(Token::Op("<=>")) => "<=>",
+                _ => return Ok(e),
+            };
+            self.pos += 1;
+            let r = self.comparison()?;
+            e = Expr::Binary {
+                op,
+                l: Box::new(e),
+                r: Box::new(r),
+            };
+        }
+    }
+
+    fn comparison(&mut self) -> Result<Expr, PhpError> {
+        let mut e = self.concat()?;
+        loop {
+            let op = match self.peek() {
+                Some(Token::Op("<")) => "<",
+                Some(Token::Op("<=")) => "<=",
+                Some(Token::Op(">")) => ">",
+                Some(Token::Op(">=")) => ">=",
+                _ => return Ok(e),
+            };
+            self.pos += 1;
+            let r = self.concat()?;
+            e = Expr::Binary {
+                op,
+                l: Box::new(e),
+                r: Box::new(r),
+            };
+        }
+    }
+
+    /// `.` binds tighter than `+`/`-` since PHP 8.0.
+    fn concat(&mut self) -> Result<Expr, PhpError> {
+        let mut e = self.bit_or()?;
+        while self.eat_op(".") {
+            let r = self.bit_or()?;
+            e = Expr::Binary {
+                op: ".",
+                l: Box::new(e),
+                r: Box::new(r),
+            };
+        }
+        Ok(e)
+    }
+
+    fn bit_or(&mut self) -> Result<Expr, PhpError> {
+        let mut e = self.bit_xor()?;
+        while self.eat_op("|") {
+            let r = self.bit_xor()?;
+            e = Expr::Binary {
+                op: "|",
+                l: Box::new(e),
+                r: Box::new(r),
+            };
+        }
+        Ok(e)
+    }
+
+    fn bit_xor(&mut self) -> Result<Expr, PhpError> {
+        let mut e = self.bit_and()?;
+        while self.eat_op("^") {
+            let r = self.bit_and()?;
+            e = Expr::Binary {
+                op: "^",
+                l: Box::new(e),
+                r: Box::new(r),
+            };
+        }
+        Ok(e)
+    }
+
+    fn bit_and(&mut self) -> Result<Expr, PhpError> {
+        let mut e = self.shift()?;
+        while self.eat_op("&") {
+            let r = self.shift()?;
+            e = Expr::Binary {
+                op: "&",
+                l: Box::new(e),
+                r: Box::new(r),
+            };
+        }
+        Ok(e)
+    }
+
+    fn shift(&mut self) -> Result<Expr, PhpError> {
+        let mut e = self.additive()?;
+        loop {
+            let op = if self.eat_op("<<") {
+                "<<"
+            } else if self.eat_op(">>") {
+                ">>"
+            } else {
+                return Ok(e);
+            };
+            let r = self.additive()?;
+            e = Expr::Binary {
+                op,
+                l: Box::new(e),
+                r: Box::new(r),
+            };
+        }
+    }
+
+    fn additive(&mut self) -> Result<Expr, PhpError> {
+        let mut e = self.term()?;
+        loop {
+            let op = match self.peek() {
+                Some(Token::Op("+")) => "+",
+                Some(Token::Op("-")) => "-",
+                _ => return Ok(e),
+            };
+            self.pos += 1;
+            let r = self.term()?;
+            e = Expr::Binary {
+                op,
+                l: Box::new(e),
+                r: Box::new(r),
+            };
+        }
+    }
+
+    fn term(&mut self) -> Result<Expr, PhpError> {
+        let mut e = self.power()?;
+        loop {
+            let op = match self.peek() {
+                Some(Token::Op("*")) => "*",
+                Some(Token::Op("/")) => "/",
+                Some(Token::Op("%")) => "%",
+                _ => return Ok(e),
+            };
+            self.pos += 1;
+            let r = self.power()?;
+            e = Expr::Binary {
+                op,
+                l: Box::new(e),
+                r: Box::new(r),
+            };
+        }
+    }
+
+    /// `**` is right-associative and binds tighter than unary minus.
+    fn power(&mut self) -> Result<Expr, PhpError> {
+        let e = self.unary()?;
+        if self.eat_op("**") {
+            let r = self.power()?;
+            return Ok(Expr::Binary {
+                op: "**",
+                l: Box::new(e),
+                r: Box::new(r),
+            });
+        }
+        Ok(e)
+    }
+
+    fn unary(&mut self) -> Result<Expr, PhpError> {
+        if self.eat_op("!") {
+            let e = self.unary()?;
+            return Ok(Expr::Unary {
+                op: "!",
+                e: Box::new(e),
+            });
+        }
+        if self.eat_op("-") {
+            let e = self.unary()?;
+            return Ok(Expr::Unary {
+                op: "-",
+                e: Box::new(e),
+            });
+        }
+        if self.eat_op("+") {
+            let e = self.unary()?;
+            return Ok(Expr::Unary {
+                op: "+",
+                e: Box::new(e),
+            });
+        }
+        if self.eat_op("~") {
+            let e = self.unary()?;
+            return Ok(Expr::Unary {
+                op: "~",
+                e: Box::new(e),
+            });
+        }
+        if self.eat_op("++") {
+            let e = self.unary()?;
+            return Ok(Expr::PreInc(Box::new(e)));
+        }
+        if self.eat_op("--") {
+            let e = self.unary()?;
+            return Ok(Expr::PreDec(Box::new(e)));
+        }
+        if self.eat_op("@") {
+            // Error suppression — parsed; runtime treats as no-op for now.
+            let e = self.unary()?;
+            return Ok(Expr::Unary {
+                op: "@",
+                e: Box::new(e),
+            });
+        }
+        if self.ident_is("clone") {
+            self.pos += 1;
+            let e = self.unary()?;
+            return Ok(Expr::Clone(Box::new(e)));
+        }
+        // `(type)` cast: (int) (integer) (float) (real) (double) (string)
+        // (binary) (bool) (boolean) (array) (object) (unset)
+        if self.at_op("(") {
+            if let Some(Token::Ident(t)) = self.peek2() {
+                let kind = match t.to_lowercase().as_str() {
+                    "int" | "integer" => Some(CastKind::Int),
+                    "float" | "real" | "double" => Some(CastKind::Float),
+                    "string" | "binary" => Some(CastKind::String),
+                    "bool" | "boolean" => Some(CastKind::Bool),
+                    "array" => Some(CastKind::Array),
+                    "object" => Some(CastKind::Object),
+                    "unset" => Some(CastKind::Unset),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    if matches!(
+                        self.toks.get(self.pos + 2).map(|l| &l.token),
+                        Some(Token::Op(")"))
+                    ) {
+                        self.pos += 3; // ( type )
+                        let e = self.unary()?;
+                        return Ok(Expr::Cast {
+                            kind,
+                            e: Box::new(e),
+                        });
+                    }
+                }
+            }
+        }
+        let mut e = self.postfix()?;
+        // `instanceof` binds between unary and relational ops.
+        while self.ident_is("instanceof") {
+            self.pos += 1;
+            let c = self.unary()?;
+            e = Expr::Instanceof {
+                obj: Box::new(e),
+                class: Box::new(c),
+            };
+        }
+        Ok(e)
+    }
+
+    fn postfix(&mut self) -> Result<Expr, PhpError> {
+        let mut e = self.primary()?;
+        loop {
+            if self.eat_op("++") {
+                e = Expr::PostInc(Box::new(e));
+            } else if self.eat_op("--") {
+                e = Expr::PostDec(Box::new(e));
+            } else if self.eat_op("[") {
+                let i = if self.at_op("]") {
+                    None
+                } else {
+                    Some(Box::new(self.expr()?))
+                };
+                self.expect_op("]")?;
+                e = Expr::Index { e: Box::new(e), i };
+            } else if self.eat_op("(") {
+                let args = self.args()?;
+                e = Expr::Call {
+                    name: Box::new(e),
+                    args,
+                };
+            } else if self.at_op("->") || self.at_op("?->") {
+                let nullsafe = self.at_op("?->");
+                self.pos += 1;
+                let name = self.prop_name()?;
+                if self.at_op("(") {
+                    self.pos += 1;
+                    let args = self.args()?;
+                    e = Expr::MethodCall {
+                        obj: Box::new(e),
+                        name,
+                        args,
+                        nullsafe,
+                    };
+                } else {
+                    e = Expr::Prop {
+                        obj: Box::new(e),
+                        name,
+                        nullsafe,
+                    };
+                }
+            } else if self.eat_op("::") {
+                if self.at_op("(") {
+                    // `expr::(...)` first-class-callable-ish — unsupported
+                    return Err(PhpError::parse("syntax error, unexpected (", self.line()));
+                }
+                match self.next() {
+                    Some(Token::Ident(n)) => {
+                        if n == "class" {
+                            e = Expr::ClassConst {
+                                class: Box::new(e),
+                                name: "class".into(),
+                            };
+                        } else if self.at_op("(") {
+                            self.pos += 1;
+                            let args = self.args()?;
+                            e = Expr::StaticCall {
+                                class: Box::new(e),
+                                name: n,
+                                args,
+                            };
+                        } else {
+                            e = Expr::ClassConst {
+                                class: Box::new(e),
+                                name: n,
+                            };
+                        }
+                    }
+                    Some(Token::Variable(n)) => {
+                        e = Expr::StaticProp {
+                            class: Box::new(e),
+                            name: n,
+                        };
+                    }
+                    Some(Token::Op("{")) => {
+                        let inner = self.expr()?;
+                        self.expect_op("}")?;
+                        if self.at_op("(") {
+                            self.pos += 1;
+                            let args = self.args()?;
+                            e = Expr::MethodCall {
+                                obj: Box::new(e),
+                                name: PropName::Expr(Box::new(inner)),
+                                args,
+                                nullsafe: false,
+                            };
+                        } else {
+                            return Err(PhpError::parse(
+                                "syntax error, unsupported ::{...} property",
+                                self.line(),
+                            ));
+                        }
+                    }
+                    t => {
+                        return Err(PhpError::parse(
+                            format!("syntax error, unexpected {}", desc_t(t.as_ref())),
+                            self.line(),
+                        ))
+                    }
+                }
+            } else {
+                return Ok(e);
+            }
+        }
+    }
+
+    fn args(&mut self) -> Result<Vec<Expr>, PhpError> {
+        let mut args = Vec::new();
+        while !self.at_op(")") {
+            // named arguments `name:` — name recorded via Str marker
+            if matches!(self.peek(), Some(Token::Ident(_)))
+                && matches!(self.peek2(), Some(Token::Op(":")))
+            {
+                let n = self.ident().unwrap();
+                self.pos += 1; // :
+                let v = self.expr()?;
+                args.push(Expr::Binary {
+                    op: "named",
+                    l: Box::new(Expr::Str(n)),
+                    r: Box::new(v),
+                });
+            } else {
+                args.push(self.expr()?);
+            }
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(args)
+    }
+
+    fn prop_name(&mut self) -> Result<PropName, PhpError> {
+        match self.next() {
+            Some(Token::Ident(n)) => Ok(PropName::Name(n)),
+            Some(Token::Variable(n)) => Ok(PropName::Var(n)),
+            Some(Token::Op("{")) => {
+                let e = self.expr()?;
+                self.expect_op("}")?;
+                Ok(PropName::Expr(Box::new(e)))
+            }
+            t => Err(PhpError::parse(
+                format!(
+                    "syntax error, unexpected {}, expecting identifier",
+                    desc_t(t.as_ref())
+                ),
+                self.line(),
+            )),
+        }
+    }
+
+    fn primary(&mut self) -> Result<Expr, PhpError> {
+        match self.peek().cloned() {
+            Some(Token::Int(v)) => {
+                self.pos += 1;
+                Ok(Expr::Int(v))
+            }
+            Some(Token::Float(v)) => {
+                self.pos += 1;
+                Ok(Expr::Float(v))
+            }
+            Some(Token::SimpleString(s)) => {
+                self.pos += 1;
+                Ok(Expr::Str(s))
+            }
+            Some(Token::InterpString(parts)) => {
+                self.pos += 1;
+                Ok(Expr::Interp(parts))
+            }
+            Some(Token::Variable(name)) => {
+                self.pos += 1;
+                Ok(Expr::Var(name))
+            }
+            Some(Token::Op("(")) => {
+                self.pos += 1;
+                let e = self.expr()?;
+                self.expect_op(")")?;
+                Ok(e)
+            }
+            Some(Token::Op("[")) => {
+                // Short array literal.
+                self.pos += 1;
+                let items = self.array_items("]")?;
+                Ok(Expr::ArrayLit(items))
+            }
+            Some(Token::Op("$")) => {
+                // Variable variable: `$$name` or `${expr}`.
+                self.pos += 1;
+                match self.peek().cloned() {
+                    Some(Token::Variable(n)) => {
+                        self.pos += 1;
+                        Ok(Expr::VarVar(Box::new(Expr::Var(n))))
+                    }
+                    Some(Token::Op("{")) => {
+                        self.pos += 1;
+                        let e = self.expr()?;
+                        self.expect_op("}")?;
+                        Ok(Expr::VarVar(Box::new(e)))
+                    }
+                    t => Err(PhpError::parse(
+                        format!("syntax error, unexpected {}", desc_t(t.as_ref())),
+                        self.line(),
+                    )),
+                }
+            }
+            Some(Token::Ident(_)) => {
+                if self.ident_is("true") {
+                    self.pos += 1;
+                    Ok(Expr::Bool(true))
+                } else if self.ident_is("false") {
+                    self.pos += 1;
+                    Ok(Expr::Bool(false))
+                } else if self.ident_is("null") {
+                    self.pos += 1;
+                    Ok(Expr::Null)
+                } else if self.ident_is("isset") {
+                    self.pos += 1;
+                    self.expect_op("(")?;
+                    let args = self.expr_list()?;
+                    self.expect_op(")")?;
+                    Ok(Expr::Isset(args))
+                } else if self.ident_is("empty") {
+                    self.pos += 1;
+                    self.expect_op("(")?;
+                    let e = self.expr()?;
+                    self.expect_op(")")?;
+                    Ok(Expr::Empty(Box::new(e)))
+                } else if self.ident_is("print") {
+                    self.pos += 1;
+                    let e = self.expr()?;
+                    Ok(Expr::Print(Box::new(e)))
+                } else if self.ident_is("exit") || self.ident_is("die") {
+                    self.pos += 1;
+                    let arg = if self.eat_op("(") {
+                        let a = if self.at_op(")") {
+                            None
+                        } else {
+                            Some(Box::new(self.expr()?))
+                        };
+                        self.expect_op(")")?;
+                        a
+                    } else if matches!(
+                        self.peek(),
+                        Some(Token::Op(";")) | Some(Token::Op(")")) | None
+                    ) {
+                        None
+                    } else {
+                        Some(Box::new(self.expr()?))
+                    };
+                    Ok(Expr::Exit(arg))
+                } else if self.ident_is("array") && matches!(self.peek2(), Some(Token::Op("("))) {
+                    self.pos += 1;
+                    self.expect_op("(")?;
+                    let items = self.array_items(")")?;
+                    Ok(Expr::ArrayLit(items))
+                } else if self.ident_is("function")
+                    || (self.ident_is("static")
+                        && matches!(self.peek2(), Some(Token::Ident(f)) if f.eq_ignore_ascii_case("function")
+                            || f.eq_ignore_ascii_case("fn")))
+                    || self.ident_is("fn")
+                {
+                    self.closure_expr()
+                } else if self.ident_is("new") {
+                    self.pos += 1;
+                    let (class, mut ctor_args) = self.new_class_expr()?;
+                    if self.at_op("(") {
+                        self.pos += 1;
+                        ctor_args = self.args()?;
+                    }
+                    Ok(Expr::New {
+                        class: Box::new(class),
+                        args: ctor_args,
+                    })
+                } else if self.ident_is("match") && matches!(self.peek2(), Some(Token::Op("("))) {
+                    self.match_expr()
+                } else if self.ident_is("list") && matches!(self.peek2(), Some(Token::Op("("))) {
+                    self.pos += 1;
+                    self.expect_op("(")?;
+                    let mut items = Vec::new();
+                    while !self.at_op(")") {
+                        if self.at_op(",") {
+                            items.push(None);
+                            self.pos += 1;
+                            continue;
+                        }
+                        items.push(Some(self.expr()?));
+                        if !self.eat_op(",") {
+                            break;
+                        }
+                    }
+                    self.expect_op(")")?;
+                    Ok(Expr::List(items))
+                } else if self.ident_is("include")
+                    || self.ident_is("include_once")
+                    || self.ident_is("require")
+                    || self.ident_is("require_once")
+                    || self.ident_is("eval")
+                {
+                    let kind = match self.ident().unwrap().to_ascii_lowercase().as_str() {
+                        "include" => IncludeKind::Include,
+                        "include_once" => IncludeKind::IncludeOnce,
+                        "require" => IncludeKind::Require,
+                        "require_once" => IncludeKind::RequireOnce,
+                        _ => IncludeKind::Eval,
+                    };
+                    let e = if self.eat_op("(") {
+                        let e = self.expr()?;
+                        self.expect_op(")")?;
+                        e
+                    } else {
+                        self.expr()?
+                    };
+                    Ok(Expr::Include {
+                        kind,
+                        e: Box::new(e),
+                    })
+                } else if self.ident_is("__line__") {
+                    let line = self.line();
+                    self.pos += 1;
+                    Ok(Expr::Int(line as i64))
+                } else if self.ident_is("__file__") {
+                    self.pos += 1;
+                    Ok(Expr::MagicConst(MagicConst::File))
+                } else if self.ident_is("__dir__") {
+                    self.pos += 1;
+                    Ok(Expr::MagicConst(MagicConst::Dir))
+                } else if self.ident_is("__function__") {
+                    self.pos += 1;
+                    Ok(Expr::MagicConst(MagicConst::Function))
+                } else if self.ident_is("__method__") {
+                    self.pos += 1;
+                    Ok(Expr::MagicConst(MagicConst::Method))
+                } else if self.ident_is("__class__") {
+                    self.pos += 1;
+                    Ok(Expr::MagicConst(MagicConst::Class))
+                } else if self.ident_is("__namespace__") {
+                    self.pos += 1;
+                    Ok(Expr::MagicConst(MagicConst::Namespace))
+                } else if self.ident_is("static") {
+                    // `static::` — static class ref
+                    self.pos += 1;
+                    Ok(Expr::Const("static".into()))
+                } else if self.ident_is("self") {
+                    self.pos += 1;
+                    Ok(Expr::Const("self".into()))
+                } else if self.ident_is("parent") {
+                    self.pos += 1;
+                    Ok(Expr::Const("parent".into()))
+                } else {
+                    // Bare identifier: constant or function name target. Qualified
+                    // names (\A\B) and function call args go through here.
+                    let start = self.pos;
+                    let name = if self.at_op("\\") {
+                        self.name_path().unwrap_or_default()
+                    } else {
+                        self.ident().unwrap()
+                    };
+                    let name = name.trim_start_matches('\\').to_string();
+                    if self.at_op("(") {
+                        self.pos += 1;
+                        let args = self.args()?;
+                        Ok(Expr::Call {
+                            name: Box::new(Expr::Str(name)),
+                            args,
+                        })
+                    } else if self.at_op("::") {
+                        // reset: `X::` handled by postfix on Const
+                        self.pos = start;
+                        let name = self.ident().unwrap();
+                        Ok(Expr::Const(name))
+                    } else {
+                        // Unqualified constant (e.g. PHP_EOL) or undefined constant.
+                        Ok(Expr::Const(name))
+                    }
+                }
+            }
+            Some(Token::Op("\\")) => {
+                // Fully-qualified name: \PHP_EOL, \Foo\Bar::baz, \func().
+                let name = self
+                    .name_path()
+                    .unwrap_or_default()
+                    .trim_start_matches('\\')
+                    .to_string();
+                if name.is_empty() {
+                    return Err(PhpError::parse(
+                        "syntax error, unexpected token \"\\\"",
+                        self.line(),
+                    ));
+                }
+                if self.at_op("(") {
+                    self.pos += 1;
+                    let args = self.args()?;
+                    Ok(Expr::Call {
+                        name: Box::new(Expr::Str(name)),
+                        args,
+                    })
+                } else {
+                    Ok(Expr::Const(name))
+                }
+            }
+            Some(t) => Err(PhpError::parse(
+                format!("syntax error, unexpected {}", desc_t(Some(&t))),
+                self.line(),
+            )),
+            None => Err(PhpError::parse(
+                "syntax error, unexpected end of file",
+                self.line(),
+            )),
+        }
+    }
+
+    fn array_items(&mut self, close: &str) -> Result<Vec<(Option<Expr>, Expr)>, PhpError> {
+        let mut items = Vec::new();
+        while !self.at_op(close) {
+            let first = self.expr()?;
+            if self.eat_op("=>") {
+                let v = self.expr()?;
+                items.push((Some(first), v));
+            } else {
+                items.push((None, first));
+            }
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op(close)?;
+        Ok(items)
+    }
+}
+
+fn desc_t(t: Option<&Token>) -> String {
+    match t {
+        None => "end of file".to_string(),
+        Some(Token::Ident(s)) => format!("identifier \"{}\"", s),
+        Some(Token::Variable(s)) => format!("variable \"${}\"", s),
+        Some(Token::Op(o)) => format!("token \"{}\"", o),
+        Some(Token::Int(v)) => format!("integer {}", v),
+        Some(Token::Float(v)) => format!("float {}", v),
+        _ => "token".to_string(),
+    }
+}
