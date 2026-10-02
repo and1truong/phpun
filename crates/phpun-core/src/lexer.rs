@@ -335,33 +335,45 @@ fn number(src: &str, pos: usize, line: usize) -> Result<(Token, usize), PhpError
     let b = src.as_bytes();
     let s = &src[pos..];
     // Hex / binary / octal literals.
+    // Base-prefixed literals allow `_` separators and overflow to float
+    // (tests/lang/integer_literals/*_64bit.phpt).
+    fn radix_lit(digits: &str, radix: u32, line: usize) -> Result<Token, PhpError> {
+        let clean: String = digits.chars().filter(|c| *c != '_').collect();
+        match i64::from_str_radix(&clean, radix) {
+            Ok(v) => Ok(Token::Int(v)),
+            Err(_) if !clean.is_empty() && clean.chars().all(|c| c.is_digit(radix)) => {
+                let v = clean.chars().fold(0.0f64, |a, c| {
+                    a * radix as f64 + c.to_digit(radix).unwrap_or(0) as f64
+                });
+                Ok(Token::Float(v))
+            }
+            Err(_) => Err(PhpError::parse(
+                "syntax error, invalid numeric literal",
+                line,
+            )),
+        }
+    }
     if s.starts_with("0x") || s.starts_with("0X") {
         let mut n = 2;
-        while matches!(b.get(pos + n), Some(&c) if c.is_ascii_hexdigit()) {
+        while matches!(b.get(pos + n), Some(&c) if c.is_ascii_hexdigit() || c == b'_') {
             n += 1;
         }
-        let v = i64::from_str_radix(&s[2..n], 16)
-            .map_err(|_| PhpError::parse("syntax error, invalid hexadecimal literal", line))?;
-        return Ok((Token::Int(v), n));
+        return radix_lit(&s[2..n], 16, line).map(|t| (t, n));
     }
     if s.starts_with("0b") || s.starts_with("0B") {
         let mut n = 2;
-        while matches!(b.get(pos + n), Some(&c) if c == b'0' || c == b'1') {
+        while matches!(b.get(pos + n), Some(&c) if c == b'0' || c == b'1' || c == b'_') {
             n += 1;
         }
-        let v = i64::from_str_radix(&s[2..n], 2)
-            .map_err(|_| PhpError::parse("syntax error, invalid binary literal", line))?;
-        return Ok((Token::Int(v), n));
+        return radix_lit(&s[2..n], 2, line).map(|t| (t, n));
     }
     // Legacy octal `0o`/implicit `0...` — PHP 8.1+ also has explicit `0o`.
     if (s.starts_with("0o") || s.starts_with("0O")) && s.len() > 2 {
         let mut n = 2;
-        while matches!(b.get(pos + n), Some(&c) if (b'0'..=b'7').contains(&c)) {
+        while matches!(b.get(pos + n), Some(&c) if (b'0'..=b'7').contains(&c) || c == b'_') {
             n += 1;
         }
-        let v = i64::from_str_radix(&s[2..n], 8)
-            .map_err(|_| PhpError::parse("syntax error, invalid octal literal", line))?;
-        return Ok((Token::Int(v), n));
+        return radix_lit(&s[2..n], 8, line).map(|t| (t, n));
     }
     let mut n = 0;
     let mut is_float = false;
@@ -399,13 +411,21 @@ fn number(src: &str, pos: usize, line: usize) -> Result<(Token, usize), PhpError
             .parse()
             .map_err(|_| PhpError::parse("syntax error, invalid float literal", line))?;
         Ok((Token::Float(v), n))
-    } else if text.starts_with('0')
-        && text.len() > 1
-        && text.chars().all(|c| ('0'..='7').contains(&c))
-    {
-        let v = i64::from_str_radix(&text[1..], 8)
-            .map_err(|_| PhpError::parse("syntax error, invalid octal literal", line))?;
-        Ok((Token::Int(v), n))
+    } else if text.starts_with('0') && text.len() > 1 && !is_float {
+        // Leading-0 decimal literal is an implicit octal — a non-octal
+        // digit is PHP's "Invalid numeric literal" (invalid_octal.phpt).
+        if !text.chars().all(|c| ('0'..='7').contains(&c)) {
+            return Err(PhpError::parse("Invalid numeric literal", line));
+        }
+        match i64::from_str_radix(&text[1..], 8) {
+            Ok(v) => Ok((Token::Int(v), n)),
+            Err(_) => {
+                let v = text[1..]
+                    .chars()
+                    .fold(0.0f64, |a, c| a * 8.0 + c.to_digit(8).unwrap_or(0) as f64);
+                Ok((Token::Float(v), n))
+            }
+        }
     } else {
         match text.parse::<i64>() {
             Ok(v) => Ok((Token::Int(v), n)),
@@ -519,18 +539,49 @@ fn double_string(src: &str, pos: usize, line: usize) -> Result<(Vec<StringPart>,
                         }
                     }
                     Some(b'u') if b.get(pos + n + 2) == Some(&b'{') => {
+                        // \u{HEX}: only 1+ hex digits then '}', else PHP's
+                        // "Invalid UTF-8 codepoint escape sequence" parse
+                        // error (tests/lang/string/unicode_escape_*.phpt).
                         let mut k = 3;
                         let mut v = 0u32;
+                        let mut digits = 0usize;
+                        let mut closed = false;
                         while let Some(&d) = b.get(pos + n + k) {
-                            if d == b'}' {
-                                k += 1;
-                                break;
+                            match d {
+                                b'}' if digits > 0 => {
+                                    closed = true;
+                                    k += 1;
+                                    break;
+                                }
+                                _ if d.is_ascii_hexdigit() => {
+                                    v = v
+                                        .saturating_mul(16)
+                                        .saturating_add((d as char).to_digit(16).unwrap_or(0));
+                                    digits += 1;
+                                    k += 1;
+                                }
+                                _ => {
+                                    return Err(PhpError::parse(
+                                        "Invalid UTF-8 codepoint escape sequence",
+                                        line,
+                                    ))
+                                }
                             }
-                            if d.is_ascii_hexdigit() {
-                                v = v * 16 + (d as char).to_digit(16).unwrap_or(0);
-                            }
-                            k += 1;
                         }
+                        if !closed {
+                            return Err(PhpError::parse(
+                                "Invalid UTF-8 codepoint escape sequence",
+                                line,
+                            ));
+                        }
+                        if v > 0x10ffff {
+                            return Err(PhpError::parse(
+                                "Invalid UTF-8 codepoint escape sequence: Codepoint too large",
+                                line,
+                            ));
+                        }
+                        // PHP emits raw UTF-8 even for surrogate halves
+                        // (CESU-8); our UTF-8 String can't hold them.
                         (char::from_u32(v).unwrap_or('\u{fffd}'), k)
                     }
                     _ => ('\\', 1),

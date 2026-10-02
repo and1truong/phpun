@@ -32,7 +32,7 @@ pub enum Stmt {
     Return(Option<Expr>),
     Break(Option<Expr>),
     Continue(Option<Expr>),
-    Global(String),
+    Global(Vec<String>),
     /// `static $a = 1, $b;` — function-local persistent vars.
     Static(Vec<(String, Option<Expr>)>),
     Switch {
@@ -146,12 +146,16 @@ pub struct Catch {
 #[derive(Debug, Clone)]
 pub enum ForeachKey {
     Var(String),
+    /// `foreach ($a as &$k => $v)` is a fatal error in PHP.
+    ByRef,
 }
 
 #[derive(Debug, Clone)]
 pub enum ForeachTarget {
     Var(String),
     ByRef(String),
+    /// Any other assignable lvalue (`$b[0]`, `$o->p`, ...).
+    Lvalue(Box<Expr>),
     List(Vec<Option<ForeachTarget>>),
 }
 
@@ -162,6 +166,9 @@ pub struct FunctionDecl {
     pub body: Vec<Stmt>,
     /// `&name(` — returns by reference.
     pub by_ref: bool,
+    /// Source line of the `function` keyword (for TypeError "defined in"
+    /// and compile-time deprecation diagnostics).
+    pub line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +177,9 @@ pub struct Param {
     pub default: Option<Expr>,
     pub by_ref: bool,
     pub variadic: bool,
+    /// Declared type members in source order; "null" included when the
+    /// type is explicitly nullable (`?T` or `T|null`).
+    pub ty: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +194,8 @@ pub enum Expr {
     /// Unqualified constant read (true/false/null are separate variants).
     Const(String),
     ArrayLit(Vec<(Option<Expr>, Expr)>),
+    /// `&expr` inside an array literal — element is bound by reference.
+    ByRef(Box<Expr>),
     Assign {
         target: Box<Expr>,
         op: &'static str,
@@ -255,7 +267,7 @@ pub enum Expr {
     /// `ClassName::CONST` / `::method()` / `::$prop` / `className::class`.
     StaticProp {
         class: Box<Expr>,
-        name: String,
+        name: PropName,
     },
     StaticCall {
         class: Box<Expr>,

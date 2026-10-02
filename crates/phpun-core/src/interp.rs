@@ -10,8 +10,8 @@ use crate::error::{ErrorKind, PhpError};
 use crate::lexer::StringPart;
 use crate::parser;
 use crate::value::{
-    compare, format_float_repr, identical, numeric, to_key, ArrKey, CallableKind, Cell, Numeric,
-    ObjectInternal, PhpArray, PhpCallable, PhpClass, PhpObject, PhpResource, Value,
+    compare, format_float_repr, identical, numeric, to_key, trace_arg, ArrKey, CallableKind, Cell,
+    Numeric, ObjectInternal, PhpArray, PhpCallable, PhpClass, PhpObject, PhpResource, Value,
 };
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -39,6 +39,9 @@ pub struct Frame {
     this_obj: Option<Rc<RefCell<PhpObject>>>,
     /// Class context for self::/static::/parent::.
     scope_class: Option<Rc<PhpClass>>,
+    /// Class the running method was declared in — PHP's private
+    /// property slot is keyed by the declaring class (`\0Cls\0prop`).
+    decl_class: Option<Rc<PhpClass>>,
 }
 
 impl Frame {
@@ -49,6 +52,7 @@ impl Frame {
             fn_name,
             this_obj: None,
             scope_class: None,
+            decl_class: None,
         }
     }
 }
@@ -80,7 +84,6 @@ pub struct Interp<'a> {
     /// Pending exception carried across an Err(Throw) return.
     pending_exception: Option<Value>,
     /// Pending fatal error message for exceptions raised as PhpError.
-    obj_counter: u64,
     res_counter: u64,
     shutdown_fns: Vec<(Value, Vec<Cell>)>,
     error_handler: Option<Value>,
@@ -92,6 +95,12 @@ pub struct Interp<'a> {
     in_handler: bool,
     /// Current line estimate for error messages (best-effort).
     pub cur_line: usize,
+    /// Declaring class of the method about to be invoked (set by
+    /// invoke_method, consumed by invoke_fn to fill Frame::decl_class).
+    pending_decl_class: Option<Rc<PhpClass>>,
+    /// Live object handles for PHP's var_dump `#N` id: the lowest freed
+    /// slot is reused, matching Zend's object store recycling.
+    obj_handles: Vec<std::rc::Weak<RefCell<PhpObject>>>,
 }
 
 /// Result of a top-level program run.
@@ -154,7 +163,6 @@ impl<'a> Interp<'a> {
             global_statics: HashMap::new(),
             included: HashSet::new(),
             pending_exception: None,
-            obj_counter: 0,
             res_counter: 0,
             shutdown_fns: Vec::new(),
             error_handler: None,
@@ -163,6 +171,8 @@ impl<'a> Interp<'a> {
             exception_handler: None,
             in_handler: false,
             cur_line: 1,
+            pending_decl_class: None,
+            obj_handles: Vec::new(),
         };
         it.register_builtin_classes();
         it
@@ -210,6 +220,7 @@ impl<'a> Interp<'a> {
                     params: vec![],
                     body: vec![],
                     by_ref: false,
+                    line: 0,
                 },
                 is_static: false,
                 is_abstract: false,
@@ -248,6 +259,7 @@ impl<'a> Interp<'a> {
                             params: vec![],
                             body: vec![],
                             by_ref: false,
+                            line: 0,
                         },
                         is_static: false,
                         is_abstract: true,
@@ -548,11 +560,24 @@ impl<'a> Interp<'a> {
     fn print_fatal(&mut self, e: &PhpError) {
         match e.kind {
             ErrorKind::Uncaught { ref class } => {
+                let frames = e.trace.clone().unwrap_or_default();
+                let mut t = String::new();
+                for (i, fr) in frames.iter().enumerate() {
+                    t.push_str(&format!("#{} {}\n", i, fr));
+                }
+                t.push_str(&format!("#{} {{main}}\n", frames.len()));
                 self.emit(&format!(
-                    "\nFatal error: Uncaught {}: {} in {}:{}\nStack trace:\n#0 {{main}}\n  thrown in {} on line {}\n",
-                    class, e.message, self.file, e.line, self.file, e.line
+                    "\nFatal error: Uncaught {}: {} in {}:{}\nStack trace:\n{}  thrown in {} on line {}\n",
+                    class,
+                    e.message,
+                    self.file,
+                    e.line,
+                    t,
+                    self.file,
+                    e.thrown_line.unwrap_or(e.line)
                 ));
             }
+            // Plain fatals (compile errors, E_ERROR) print no trace.
             _ => {
                 self.emit(&format!(
                     "\nFatal error: {} in {} on line {}\n",
@@ -572,13 +597,32 @@ impl<'a> Interp<'a> {
                 .get("message")
                 .map(|c| c.borrow().to_php_string())
                 .unwrap_or_default();
-            let (file, line) = match &o.internal {
-                Some(ObjectInternal::Exception { file, line, .. }) => (file.clone(), *line),
-                _ => (self.file.to_string(), self.cur_line as u32),
+            let (file, line, thrown, tr) = match &o.internal {
+                Some(ObjectInternal::Exception {
+                    file,
+                    line,
+                    trace,
+                    thrown,
+                }) => (
+                    file.clone(),
+                    *line,
+                    *thrown,
+                    if trace.is_empty() {
+                        "#0 {main}".to_string()
+                    } else {
+                        trace.clone()
+                    },
+                ),
+                _ => (
+                    self.file.to_string(),
+                    self.cur_line as u32,
+                    self.cur_line as u32,
+                    "#0 {main}".to_string(),
+                ),
             };
             self.emit(&format!(
-                "\nFatal error: Uncaught {}: {} in {}:{}\nStack trace:\n#0 {{main}}\n  thrown in {} on line {}\n",
-                class, msg, file, line, file, line
+                "\nFatal error: Uncaught {}: {} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
+                class, msg, file, line, tr, file, thrown
             ));
         } else {
             self.print_fatal(&PhpError::fatal("Can only throw objects", self.cur_line));
@@ -612,6 +656,7 @@ impl<'a> Interp<'a> {
                 file: self.file.to_string(),
                 line: self.cur_line as u32,
                 trace: String::new(),
+                thrown: self.cur_line as u32,
             });
             if !o.prop_order.contains(&"message".into()) {
                 o.prop_order.push("message".into());
@@ -625,6 +670,8 @@ impl<'a> Interp<'a> {
     fn throw(&mut self, v: Value) -> PhpError {
         self.pending_exception = Some(v);
         PhpError {
+            trace: None,
+            thrown_line: None,
             kind: ErrorKind::Throw,
             message: "throw".into(),
             line: self.cur_line,
@@ -644,8 +691,32 @@ impl<'a> Interp<'a> {
             // Internal errors raised as exceptions become real throwables so
             // userland `catch` blocks can intercept them.
             let v = self.exception(class, &e.message);
+            if let Value::Object(o) = &v {
+                if let Some(ObjectInternal::Exception {
+                    trace,
+                    thrown,
+                    line,
+                    ..
+                }) = &mut o.borrow_mut().internal
+                {
+                    if let Some(frames) = &e.trace {
+                        let mut t = String::new();
+                        for (i, f) in frames.iter().enumerate() {
+                            t.push_str(&format!("#{} {}\n", i, f));
+                        }
+                        t.push_str(&format!("#{} {{main}}", frames.len()));
+                        *trace = t;
+                    }
+                    if let Some(l) = e.thrown_line {
+                        *thrown = l as u32;
+                        *line = l as u32;
+                    }
+                }
+            }
             self.pending_exception = Some(v);
             return Err(PhpError {
+                trace: None,
+                thrown_line: None,
                 kind: ErrorKind::Throw,
                 message: e.message,
                 line: e.line,
@@ -784,11 +855,20 @@ impl<'a> Interp<'a> {
                 Flow::Normal
             }
             Stmt::Function(d) => {
+                if let Err(e) = self.decl_type_checks(&d.name, d) {
+                    return self.err_flow(e);
+                }
                 self.functions
                     .insert(d.name.to_lowercase(), Rc::new(d.clone()));
                 Flow::Normal
             }
             Stmt::Class(d) => {
+                for m in &d.methods {
+                    let fname = format!("{}::{}", d.name, m.decl.name);
+                    if let Err(e) = self.decl_type_checks(&fname, &m.decl) {
+                        return self.err_flow(e);
+                    }
+                }
                 self.register_class(d.clone());
                 Flow::Normal
             }
@@ -850,15 +930,17 @@ impl<'a> Interp<'a> {
                 };
                 Flow::Continue(n)
             }
-            Stmt::Global(name) => {
-                // Bind the local name to the global cell.
-                let gcell = self
-                    .globals
-                    .vars
-                    .entry(name.clone())
-                    .or_insert_with(|| cell(Value::Null))
-                    .clone();
-                self.cur().vars.insert(name.clone(), gcell);
+            Stmt::Global(names) => {
+                // Bind each local name to its global cell.
+                for name in names {
+                    let gcell = self
+                        .globals
+                        .vars
+                        .entry(name.clone())
+                        .or_insert_with(|| cell(Value::Null))
+                        .clone();
+                    self.cur().vars.insert(name.clone(), gcell);
+                }
                 Flow::Normal
             }
             Stmt::Unset(xs) => {
@@ -867,11 +949,25 @@ impl<'a> Interp<'a> {
                         Expr::Var(n) => {
                             self.cur().vars.remove(n);
                         }
+                        Expr::VarVar(inner) => {
+                            if let Ok(n) = self.eval(inner) {
+                                if let Ok(name) = self.conv_str(&n) {
+                                    self.cur().vars.remove(&name);
+                                }
+                            }
+                        }
                         Expr::Index { e, i } => {
                             let _ = self.unset_index(e, i.as_deref());
                         }
                         Expr::Prop { .. } => {
                             let _ = self.unset_prop(x);
+                        }
+                        Expr::StaticProp { class, name } => {
+                            if let Ok(pn) = self.prop_name(name) {
+                                if let Ok(cls) = self.class_of(class) {
+                                    cls.statics.borrow_mut().remove(&pn);
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -999,6 +1095,12 @@ impl<'a> Interp<'a> {
         val: &ForeachTarget,
         body: &[Stmt],
     ) -> Flow {
+        if matches!(key, Some(ForeachKey::ByRef)) {
+            return self.err_flow(PhpError::fatal(
+                "Key element cannot be a reference",
+                self.cur_line,
+            ));
+        }
         let src = match self.eval(arr) {
             Ok(v) => v,
             Err(e) => return self.err_flow(e),
@@ -1006,10 +1108,92 @@ impl<'a> Interp<'a> {
         match src {
             Value::Array(rc) => {
                 let by_ref = matches!(val, ForeachTarget::ByRef(_));
+                // `&$v` foreach iterates the live array — appends and
+                // removals during the loop are observed (foreachLoop.009).
+                let live = by_ref;
+                if live {
+                    // PHP separates a shared (non-reference) array when the
+                    // loop takes references to its elements, so &-writes
+                    // don't leak into other copies (foreachLoop.016). An
+                    // is_ref array is iterated live as-is.
+                    let rc = if Rc::strong_count(&rc) > 1 && !rc.borrow().is_ref {
+                        let sep: Vec<(ArrKey, Cell)> = rc
+                            .borrow()
+                            .entries
+                            .iter()
+                            .map(|(k, c)| (k.clone(), cell(c.borrow().clone())))
+                            .collect();
+                        let nr = Rc::new(RefCell::new(PhpArray {
+                            entries: sep,
+                            next: rc.borrow().next,
+                            is_ref: false,
+                        }));
+                        if let Ok(c) = self.eval_cell(arr) {
+                            *c.borrow_mut() = Value::Array(nr.clone());
+                        }
+                        nr
+                    } else {
+                        rc
+                    };
+                    rc.borrow_mut().is_ref = true;
+                    // PHP's live iterator tracks "the element after the
+                    // current one in logical order" — prepends (unshift) and
+                    // renumbering (shift) don't move it, tombstoned current
+                    // elements still anchor it (foreachLoop.013/.015).
+                    let mut last: Option<Cell> = None;
+                    loop {
+                        let next = {
+                            let a = rc.borrow();
+                            let live_at = |from: usize| -> Option<(ArrKey, Cell)> {
+                                a.entries[from..]
+                                    .iter()
+                                    .find(|(k, _)| !matches!(k, ArrKey::Tomb))
+                                    .cloned()
+                            };
+                            match &last {
+                                None => live_at(0),
+                                Some(lc) => {
+                                    match a.entries.iter().position(|(_, c)| Rc::ptr_eq(c, lc)) {
+                                        Some(i) => live_at(i + 1),
+                                        // Current element gone entirely —
+                                        // restart at the first live element.
+                                        None => live_at(0),
+                                    }
+                                }
+                            }
+                        };
+                        let Some((k, c)) = next else { break };
+                        last = Some(c.clone());
+                        if let Some(ForeachKey::Var(kn)) = key {
+                            self.var_set(kn, key_value(&k));
+                        }
+                        match val {
+                            ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                            ForeachTarget::ByRef(n) => {
+                                self.cur().vars.insert(n.clone(), c);
+                            }
+                            ForeachTarget::Lvalue(e) => {
+                                let _ = self.store(e, c.borrow().clone());
+                            }
+                            ForeachTarget::List(items) => {
+                                if self.foreach_list(items, &c.borrow().clone()).is_err() {}
+                            }
+                        }
+                        match self.exec_block(body) {
+                            Flow::Break(0) | Flow::Break(1) => break,
+                            Flow::Break(n) => return Flow::Break(n - 1),
+                            Flow::Continue(0) | Flow::Continue(1) => continue,
+                            Flow::Continue(n) => return Flow::Continue(n - 1),
+                            Flow::Normal => {}
+                            f => return f,
+                        }
+                    }
+                    return Flow::Normal;
+                }
                 // Snapshot (key, cell) pairs — PHP iterates a copy for
                 // value-iteration but shares cells for &-iteration.
                 let snapshot: Vec<(ArrKey, Cell)> = if by_ref {
-                    rc.borrow().entries.clone()
+                    rc.borrow().iter().cloned().collect()
                 } else {
                     rc.borrow()
                         .entries
@@ -1027,6 +1211,9 @@ impl<'a> Interp<'a> {
                         ForeachTarget::ByRef(n) => {
                             self.cur().vars.insert(n.clone(), c);
                         }
+                        ForeachTarget::Lvalue(e) => {
+                            let _ = self.store(e, c.borrow().clone());
+                        }
                         ForeachTarget::List(items) => {
                             if self.foreach_list(items, &c.borrow().clone()).is_err() {}
                         }
@@ -1043,35 +1230,95 @@ impl<'a> Interp<'a> {
                 Flow::Normal
             }
             Value::Object(o) => {
-                // IteratorAggregate → getIterator() then iterate that.
+                // IteratorAggregate → getIterator() then iterate that
+                // (its result may itself be an IteratorAggregate — loop).
                 if self.obj_is_a(&o, "IteratorAggregate") {
-                    let it_obj = self
-                        .method_invoke(o.clone(), "getIterator", vec![])
-                        .unwrap_or(Value::Null);
-                    match it_obj {
-                        Value::Object(io) => return self.exec_foreach_iter(io, key, val, body),
-                        _ => return Flow::Normal,
+                    let mut cur = o.clone();
+                    loop {
+                        let it_obj = match self.method_invoke(cur.clone(), "getIterator", vec![]) {
+                            Ok(v) => v,
+                            Err(e) => return self.err_flow(e),
+                        };
+                        match it_obj {
+                            Value::Object(io) if self.obj_is_a(&io, "IteratorAggregate") => {
+                                cur = io;
+                            }
+                            // getIterator() must return a Traversable.
+                            Value::Object(io) if self.obj_is_a(&io, "Iterator") => {
+                                return self.exec_foreach_iter(io, key, val, body);
+                            }
+                            _ => {
+                                let cls_name = cur.borrow().class.name().to_string();
+                                let v = self.exception(
+                                    "Exception",
+                                    &format!(
+                                        "Objects returned by {}::getIterator() must be traversable or implement interface Iterator",
+                                        cls_name
+                                    ),
+                                );
+                                return Flow::Throw(v);
+                            }
+                        }
                     }
                 }
                 if self.obj_is_a(&o, "Iterator") {
+                    if matches!(val, ForeachTarget::ByRef(_)) {
+                        return self.err_flow(PhpError::uncaught(
+                            "Error",
+                            "An iterator cannot be used with foreach by reference",
+                            self.cur_line,
+                        ));
+                    }
                     return self.exec_foreach_iter(o.clone(), key, val, body);
                 }
-                // Plain object: iterate its props.
-                let snapshot: Vec<(String, Cell)> = {
-                    let ob = o.borrow();
-                    ob.prop_order
-                        .iter()
-                        .filter_map(|n| ob.props.get(n).map(|c| (n.clone(), c.clone())))
-                        .collect()
-                };
-                for (k, c) in snapshot {
+                // Plain object: iterate the live property table by
+                // position — unset() during the loop tombstones a slot
+                // (foreachLoopObjects.004/.005).
+                let cls = o.borrow().class.clone();
+                let mut pos = 0usize;
+                loop {
+                    let next = {
+                        let ob = o.borrow();
+                        if pos >= ob.prop_order.len() {
+                            None
+                        } else {
+                            let n = ob.prop_order[pos].clone();
+                            ob.props.get(&n).map(|c| (n, c.clone()))
+                        }
+                    };
+                    if next.is_none() {
+                        // Tombstoned or past the end: keep scanning while
+                        // positions remain, else done.
+                        let more = {
+                            let ob = o.borrow();
+                            pos + 1 < ob.prop_order.len()
+                        };
+                        if !more {
+                            break;
+                        }
+                        pos += 1;
+                        continue;
+                    }
+                    let (n, c) = next.unwrap();
+                    pos += 1;
+                    if !self.prop_visible(&cls, &n) {
+                        continue;
+                    }
+                    let plain = n
+                        .strip_prefix('\0')
+                        .and_then(|r| r.split('\0').nth(1))
+                        .map(|s| s.to_string())
+                        .unwrap_or(n);
                     if let Some(ForeachKey::Var(kn)) = key {
-                        self.var_set(kn, Value::str(k.clone()));
+                        self.var_set(kn, Value::str(plain));
                     }
                     match val {
                         ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
                         ForeachTarget::ByRef(n) => {
                             self.cur().vars.insert(n.clone(), c);
+                        }
+                        ForeachTarget::Lvalue(e) => {
+                            let _ = self.store(e, c.borrow().clone());
                         }
                         ForeachTarget::List(items) => {
                             let _ = self.foreach_list(items, &c.borrow().clone());
@@ -1091,7 +1338,7 @@ impl<'a> Interp<'a> {
             _ => {
                 self.warn(&format!(
                     "foreach() argument must be of type array|object, {} given",
-                    src.gettype()
+                    src.debug_type()
                 ));
                 Flow::Normal
             }
@@ -1115,20 +1362,24 @@ impl<'a> Interp<'a> {
             if !ok {
                 break;
             }
+            // PHP calls current() before key() on each iteration.
+            let v = self
+                .method_invoke(it.clone(), "current", vec![])
+                .unwrap_or(Value::Null);
             if let Some(ForeachKey::Var(kn)) = key {
                 let k = self
                     .method_invoke(it.clone(), "key", vec![])
                     .unwrap_or(Value::Null);
                 self.var_set(kn, k);
             }
-            let v = self
-                .method_invoke(it.clone(), "current", vec![])
-                .unwrap_or(Value::Null);
             match val {
                 ForeachTarget::Var(n) => self.var_set(n, v),
                 ForeachTarget::ByRef(n) => {
                     let c = cell(v);
                     self.cur().vars.insert(n.clone(), c);
+                }
+                ForeachTarget::Lvalue(e) => {
+                    let _ = self.store(e, v);
                 }
                 ForeachTarget::List(items) => {
                     let _ = self.foreach_list(items, &v);
@@ -1155,6 +1406,9 @@ impl<'a> Interp<'a> {
                     let iv = a.get(&ArrKey::Int(i as i64)).unwrap_or(Value::Null);
                     match t {
                         ForeachTarget::Var(n) => self.var_set(n, iv),
+                        ForeachTarget::Lvalue(e) => {
+                            let _ = self.store(e, iv);
+                        }
                         ForeachTarget::ByRef(n) => self.var_set(n, iv),
                         ForeachTarget::List(sub) => {
                             self.foreach_list(sub, &iv)?;
@@ -1206,6 +1460,22 @@ impl<'a> Interp<'a> {
             Expr::ArrayLit(items) => {
                 let mut arr = PhpArray::new();
                 for (k, v) in items {
+                    // `&$x` elements bind the source cell, not a copy.
+                    if let Expr::ByRef(e) = v {
+                        let c = self.eval_cell(e)?;
+                        arr.is_ref = true;
+                        match k {
+                            Some(ke) => {
+                                let kv = self.eval(ke)?;
+                                arr.bind_cell(to_key(&kv), c);
+                            }
+                            None => {
+                                let key = ArrKey::Int(arr.next);
+                                arr.bind_cell(key, c);
+                            }
+                        }
+                        continue;
+                    }
                     let val = self.eval(v)?;
                     match k {
                         Some(ke) => {
@@ -1216,6 +1486,12 @@ impl<'a> Interp<'a> {
                     }
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(arr))))
+            }
+            Expr::ByRef(e) => {
+                // `&expr` outside array literals binds the target cell.
+                let c = self.eval_cell(e)?;
+                let v = c.borrow().clone();
+                Ok(v)
             }
             Expr::List(_) => self.fail(PhpError::fatal("Cannot use list() as value", 0)),
             Expr::Assign { target, op, value } => self.assign(target, op, value),
@@ -1295,6 +1571,8 @@ impl<'a> Interp<'a> {
                     0
                 };
                 Err(PhpError {
+                    trace: None,
+                    thrown_line: None,
                     kind: ErrorKind::Fatal,
                     message: format!("\u{1}exit:{}", code),
                     line: 0,
@@ -1310,6 +1588,8 @@ impl<'a> Interp<'a> {
                         let v = self.exception("Error", "Can only throw objects");
                         self.pending_exception = Some(v);
                         Err(PhpError {
+                            trace: None,
+                            thrown_line: None,
                             kind: ErrorKind::Throw,
                             message: "throw".into(),
                             line: 0,
@@ -1341,6 +1621,8 @@ impl<'a> Interp<'a> {
                     );
                     self.pending_exception = Some(e);
                     Err(PhpError {
+                        trace: None,
+                        thrown_line: None,
                         kind: ErrorKind::Throw,
                         message: "match".into(),
                         line: 0,
@@ -1411,20 +1693,24 @@ impl<'a> Interp<'a> {
                             class: ob.class.clone(),
                             props,
                             prop_order: ob.prop_order.clone(),
-                            id: self.next_obj_id(),
+                            id: 0,
                             internal: match &ob.internal {
-                                Some(ObjectInternal::Exception { file, line, trace }) => {
-                                    Some(ObjectInternal::Exception {
-                                        file: file.clone(),
-                                        line: *line,
-                                        trace: trace.clone(),
-                                    })
-                                }
+                                Some(ObjectInternal::Exception {
+                                    file,
+                                    line,
+                                    trace,
+                                    thrown,
+                                }) => Some(ObjectInternal::Exception {
+                                    file: file.clone(),
+                                    line: *line,
+                                    trace: trace.clone(),
+                                    thrown: *thrown,
+                                }),
                                 _ => None,
                             },
                         };
                         drop(ob);
-                        let nv = Value::Object(Rc::new(RefCell::new(new_obj)));
+                        let nv = Value::Object(self.alloc_obj(new_obj));
                         // __clone magic
                         if let Value::Object(no) = &nv {
                             if no.borrow().class.find_method("__clone").is_some() {
@@ -1437,6 +1723,8 @@ impl<'a> Interp<'a> {
                         let e = self.exception("Error", "Cannot clone non-object");
                         self.pending_exception = Some(e);
                         Err(PhpError {
+                            trace: None,
+                            thrown_line: None,
                             kind: ErrorKind::Throw,
                             message: "clone".into(),
                             line: 0,
@@ -1575,6 +1863,8 @@ impl<'a> Interp<'a> {
                     );
                     self.pending_exception = Some(e);
                     Err(PhpError {
+                        trace: None,
+                        thrown_line: None,
                         kind: ErrorKind::Throw,
                         message: "cast".into(),
                         line: 0,
@@ -1588,6 +1878,8 @@ impl<'a> Interp<'a> {
                 );
                 self.pending_exception = Some(e);
                 Err(PhpError {
+                    trace: None,
+                    thrown_line: None,
                     kind: ErrorKind::Throw,
                     message: "cast".into(),
                     line: 0,
@@ -1621,6 +1913,8 @@ impl<'a> Interp<'a> {
         );
         self.pending_exception = Some(v);
         Err(PhpError {
+            trace: None,
+            thrown_line: None,
             kind: ErrorKind::Throw,
             message: "const".into(),
             line: 0,
@@ -1635,12 +1929,130 @@ impl<'a> Interp<'a> {
             return Ok(src.borrow().clone());
         }
         let needs_read = op != "=";
+        // PHP evaluates the LHS lvalue chain (index exprs' side effects)
+        // BEFORE the RHS: `$a[f()][g()] = rhs` calls f,g first
+        // (engine_assignExecutionOrder_003). Dynamic names inside an object
+        // property access ($o->{e}, $o->p[e]) are evaluated early for side
+        // effects but Zend's temp register is then overwritten by the
+        // assignment value — so the ACTUAL name/key becomes the RHS value
+        // (engine_assignExecutionOrder_001).
+        enum Late {
+            Prop { ov: Value, name: Option<PropName> },
+            Index { base: Cell, key: Option<Value> },
+            Static { class: Box<Expr>, pn: String },
+            Keyed { e: Expr, keys: Vec<Option<Value>> },
+            None,
+        }
+        fn has_prop(e: &Expr) -> bool {
+            match e {
+                Expr::Prop { .. } => true,
+                Expr::Index { e, .. } => has_prop(e),
+                _ => false,
+            }
+        }
+        let mut late = Late::None;
+        let target_cell = match target {
+            Expr::Prop { obj, name, .. } => {
+                match self.eval(obj) {
+                    Ok(ov) => {
+                        // A {dynamic} name expr runs now (side effects); its
+                        // effective name is overwritten by the RHS at write
+                        // time. A plain $var name keeps its value.
+                        let dyn_name = matches!(name, PropName::Expr(_));
+                        if dyn_name {
+                            let _ = self.prop_name(name);
+                        }
+                        late = Late::Prop {
+                            ov,
+                            name: if dyn_name { None } else { Some(name.clone()) },
+                        };
+                        None
+                    }
+                    Err(_) => None,
+                }
+            }
+            Expr::Index { e, i } if has_prop(e) => {
+                // Prop-chain index: container resolved early; a dynamic index
+                // expr runs for side effects and its effective key is replaced
+                // by the RHS (register quirk), a literal keeps its value.
+                match self.eval_cell(e) {
+                    Ok(c) => {
+                        // The register quirk only hits call-result dims
+                        // (engine_assignExecutionOrder_001): literals, plain
+                        // vars and binary-op dims keep their evaluated value.
+                        let clobber = matches!(
+                            i.as_deref(),
+                            Some(Expr::Call { .. })
+                                | Some(Expr::MethodCall { .. })
+                                | Some(Expr::StaticCall { .. })
+                                | Some(Expr::New { .. })
+                        );
+                        let key = match i.as_deref() {
+                            Some(ie) => self.eval(ie).ok().filter(|_| !clobber),
+                            None => None,
+                        };
+                        late = Late::Index { base: c, key };
+                        None
+                    }
+                    Err(_) => None,
+                }
+            }
+            Expr::Index { .. } => {
+                // Zend evaluates dim exprs BEFORE the RHS (innermost first)
+                // but traverses the container only at write time — so the
+                // write lands on the variable's CURRENT value
+                // (engine_assignExecutionOrder_003 mod() case).
+                let mut dims = Vec::new();
+                let mut base = target;
+                while let Expr::Index { e, i } = base {
+                    dims.push(i.as_deref());
+                    base = e;
+                }
+                dims.reverse();
+                let mut keys = Vec::with_capacity(dims.len());
+                for d in dims {
+                    match d {
+                        Some(ie) => match self.eval(ie) {
+                            Ok(k) => keys.push(Some(k)),
+                            Err(_) => keys.push(None),
+                        },
+                        None => keys.push(None),
+                    }
+                }
+                late = Late::Keyed {
+                    e: base.clone(),
+                    keys,
+                };
+                None
+            }
+            Expr::StaticProp { class, name } => {
+                // Static prop names evaluate BEFORE the RHS with their own
+                // result (no register quirk: engine_assignExecutionOrder_001).
+                match self.prop_name(name) {
+                    Ok(pn) => {
+                        late = Late::Static {
+                            class: class.clone(),
+                            pn,
+                        };
+                        None
+                    }
+                    Err(_) => None,
+                }
+            }
+            Expr::List(_) => None,
+            _ => self.eval_cell(target).ok(),
+        };
         let rhs = self.eval(value)?;
         let cur = if needs_read {
-            self.silence += 1;
-            let c = self.eval(target);
-            self.silence -= 1;
-            c.unwrap_or(Value::Null)
+            match &target_cell {
+                Some(c) => c.borrow().clone(),
+                None => {
+                    self.silence += 1;
+                    let c = self.eval(target);
+                    self.silence -= 1;
+                    c.unwrap_or(Value::Null)
+                }
+            }
         } else {
             Value::Null
         };
@@ -1673,7 +2085,41 @@ impl<'a> Interp<'a> {
                 ))
             }
         };
-        self.store(target, newv.clone())?;
+        match late {
+            Late::Prop { ov, name } => {
+                // Dynamic name: the RHS value lands in the name register.
+                let pn = match name {
+                    Some(n) => self.prop_name(&n)?,
+                    None => self.conv_str(&newv)?,
+                };
+                self.store_prop(ov, &pn, newv.clone())?;
+            }
+            Late::Index { base, key } => {
+                // A clobbered (call-result) dim falls back to the RHS value.
+                let key = key.map(|k| to_key(&k)).unwrap_or(to_key(&newv));
+                let mut b = base.borrow_mut();
+                if matches!(*b, Value::Null) {
+                    *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+                }
+                if let Value::Array(rc) = &mut *b {
+                    rc.borrow_mut().set(key, newv.clone());
+                }
+                drop(b);
+            }
+            Late::Static { class, pn } => {
+                let c = self.static_prop_named(&class, &pn)?;
+                *c.borrow_mut() = newv.clone();
+            }
+            Late::Keyed { e, keys } => {
+                self.assign_index_path(&e, &keys, newv.clone())?;
+            }
+            Late::None => match target_cell {
+                Some(c) => {
+                    *c.borrow_mut() = newv.clone();
+                }
+                None => self.store(target, newv.clone())?,
+            },
+        }
         Ok(newv)
     }
 
@@ -1693,6 +2139,7 @@ impl<'a> Interp<'a> {
                 let name = self.conv_str(&n)?;
                 Ok(self.var_cell(&name))
             }
+            Expr::StaticProp { class, name } => self.static_prop_cell(class, name),
             _ => {
                 // Function calls returning by-ref, etc.: evaluate to temp cell.
                 let v = self.eval(e)?;
@@ -1705,6 +2152,11 @@ impl<'a> Interp<'a> {
     fn bind_cell(&mut self, target: &Expr, src: Cell) -> Result<(), PhpError> {
         match target {
             Expr::Var(n) => {
+                // Binding an array by `=&` marks it referenced: later writes
+                // through copies go through, not CoW-split (Zend is_ref).
+                if let Value::Array(rc) = &*src.borrow() {
+                    rc.borrow_mut().is_ref = true;
+                }
                 self.cur().vars.insert(n.clone(), src);
                 Ok(())
             }
@@ -1771,16 +2223,35 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
             Expr::Index { e, i } => self.set_index(e, i.as_deref(), v),
+            Expr::StaticProp { class, name } => {
+                let c = self.static_prop_cell(class, name)?;
+                *c.borrow_mut() = v;
+                Ok(())
+            }
             Expr::List(items) => {
-                let vals = match v {
-                    Value::Array(a) => {
-                        let a = a.borrow();
-                        (0..items.len())
-                            .map(|i| a.get(&ArrKey::Int(i as i64)).unwrap_or(Value::Null))
-                            .collect::<Vec<_>>()
-                    }
-                    _ => vec![Value::Null; items.len()],
-                };
+                // PHP reads each [i] positionally — a missing key warns
+                // "Undefined array key i" (engine_assignExecutionOrder_002).
+                let vals: Vec<Value> = (0..items.len())
+                    .map(|i| match &v {
+                        Value::Array(a) => match a.borrow().get(&ArrKey::Int(i as i64)) {
+                            Some(v) => v,
+                            None => {
+                                if items[i].is_some() {
+                                    self.warn(&format!("Undefined array key {}", i));
+                                }
+                                Value::Null
+                            }
+                        },
+                        other => {
+                            if items[i].is_some() {
+                                // list() on a non-array warns "Cannot use T
+                                // as array" (engine_assignExecutionOrder_002).
+                                self.warn(&format!("Cannot use {} as array", other.debug_type()));
+                            }
+                            Value::Null
+                        }
+                    })
+                    .collect();
                 for (i, t) in items.iter().enumerate() {
                     if let Some(t) = t {
                         self.store(t, vals[i].clone())?;
@@ -1795,47 +2266,46 @@ impl<'a> Interp<'a> {
             } => {
                 let pn = self.prop_name(name)?;
                 let ov = self.eval(obj)?;
-                match ov {
-                    Value::Object(o) => {
-                        let cls = o.borrow().class.clone();
-                        if o.borrow().props.contains_key(&pn) || self.declared_prop(&cls, &pn) {
-                            o.borrow_mut().props.insert(pn, cell(v));
-                            Ok(())
-                        } else if cls.find_method("__set").is_some() {
-                            self.method_invoke(
-                                o.clone(),
-                                "__set",
-                                vec![cell(Value::str(pn)), cell(v)],
-                            )?;
-                            Ok(())
-                        } else {
-                            let mut ob = o.borrow_mut();
-                            if !ob.prop_order.contains(&pn) {
-                                ob.prop_order.push(pn.clone());
-                            }
-                            ob.props.insert(pn, cell(v));
-                            Ok(())
-                        }
-                    }
-                    _ => {
-                        self.warn(&format!(
-                            "Attempt to assign property \"{}\" on {}",
-                            pn,
-                            ov.gettype()
-                        ));
-                        Ok(())
-                    }
-                }
+                self.store_prop(ov, &pn, v)
             }
             _ => self.fail(PhpError::fatal("Cannot assign to this expression", 0)),
         }
     }
 
-    fn declared_prop(&self, cls: &Rc<PhpClass>, name: &str) -> bool {
-        cls.decl
-            .props
-            .iter()
-            .any(|p| p.name == name && !p.is_static)
+    /// Write `$ov->$pn = v` — private-slot, `__set` or dynamic-prop rules.
+    fn store_prop(&mut self, ov: Value, pn: &str, v: Value) -> Result<(), PhpError> {
+        match ov {
+            Value::Object(o) => {
+                let cls = o.borrow().class.clone();
+                if let Some(k) = self.obj_prop_key(&o, pn) {
+                    o.borrow_mut().props.insert(k, cell(v));
+                    Ok(())
+                } else if cls.find_method("__set").is_some() {
+                    self.method_invoke(
+                        o.clone(),
+                        "__set",
+                        vec![cell(Value::str(pn.to_string())), cell(v)],
+                    )?;
+                    Ok(())
+                } else {
+                    let mut ob = o.borrow_mut();
+                    let pn = pn.to_string();
+                    if !ob.prop_order.contains(&pn) {
+                        ob.prop_order.push(pn.clone());
+                    }
+                    ob.props.insert(pn, cell(v));
+                    Ok(())
+                }
+            }
+            _ => {
+                self.warn(&format!(
+                    "Attempt to assign property \"{}\" on {}",
+                    pn,
+                    ov.gettype()
+                ));
+                Ok(())
+            }
+        }
     }
 
     /// `$arr[$k] = v` / `$arr[] = v`.
@@ -1844,6 +2314,68 @@ impl<'a> Interp<'a> {
             Some(ie) => Some(self.eval(ie)?),
             None => None,
         };
+        self.set_index_val(e, key, v)
+    }
+
+    /// `$e[k1][k2]... = v` with already-evaluated keys, traversed at write
+    /// time (Zend ASSIGN_DIM semantics): intermediate scalar levels produce
+    /// "Cannot use T as array" warnings; a scalar base for a single-level
+    /// write throws "Cannot use a scalar value as an array".
+    fn assign_index_path(
+        &mut self,
+        e: &Expr,
+        keys: &[Option<Value>],
+        v: Value,
+    ) -> Result<(), PhpError> {
+        let mut c = self.eval_cell(e)?;
+        let last = keys.len() - 1;
+        for (n, k) in keys.iter().enumerate() {
+            match self.index_into_key(c.clone(), k.clone()) {
+                Ok(nc) => {
+                    if n == last {
+                        *nc.borrow_mut() = v;
+                        return Ok(());
+                    }
+                    c = nc;
+                }
+                Err(_) => {
+                    let is_str = matches!(*c.borrow(), Value::Str(_));
+                    if is_str {
+                        // String offset write (final level only).
+                        let mut b = c.borrow_mut();
+                        if let Value::Str(s) = &mut *b {
+                            let vs = self.conv_str(&v).unwrap_or_default();
+                            let mut bytes = s.as_bytes().to_vec();
+                            let idx = k
+                                .as_ref()
+                                .map(|k| k.to_int() as usize)
+                                .unwrap_or(bytes.len());
+                            if idx >= bytes.len() {
+                                bytes.resize(idx + 1, b' ');
+                            }
+                            bytes[idx] = vs.as_bytes().first().copied().unwrap_or(b' ');
+                            *s = String::from_utf8_lossy(&bytes).into_owned().into();
+                        }
+                        return Ok(());
+                    }
+                    let t = c.borrow().debug_type();
+                    if keys.len() == 1 {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            "Cannot use a scalar value as an array",
+                            self.cur_line,
+                        ));
+                    }
+                    self.warn(&format!("Cannot use {} as array", t));
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `set_index` with an already-evaluated key.
+    fn set_index_val(&mut self, e: &Expr, key: Option<Value>, v: Value) -> Result<(), PhpError> {
         match e {
             Expr::Var(name) => {
                 let arr_cell = self.var_cell(name);
@@ -1862,8 +2394,10 @@ impl<'a> Interp<'a> {
                         // through the cell, so mutate in place via borrow_mut —
                         // PHP semantics: write through to all aliases... PHP
                         // separates unreferenced copies; our Rc aliases share.
-                        // For `$a = $b; $a[0]=1` PHP copies. Handle via split:
-                        if Rc::strong_count(rc) > 1 {
+                        // For `$a = $b; $a[0]=1` PHP copies. Handle via split.
+                        // A referenced array (is_ref — elements aliased) is
+                        // written through, never split.
+                        if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
                             let fresh = rc.borrow().clone();
                             *b = Value::Array(Rc::new(RefCell::new(fresh)));
                             if let Value::Array(rc) = &mut *b {
@@ -1899,130 +2433,150 @@ impl<'a> Interp<'a> {
                     }
                     _ => {
                         drop(b);
-                        return self
-                            .fail(PhpError::fatal("Cannot use scalar value as an array", 0));
+                        // Catchable Error: `$int[0] = x` (engine_..._002).
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            "Cannot use a scalar value as an array",
+                            self.cur_line,
+                        ));
                     }
                 }
                 Ok(())
             }
-            Expr::Index { e: inner, i: ii } => {
-                // Nested: $a[0][1] = v — ensure inner is array then recurse.
-                let inner_cell = self.index_cell(inner, ii.as_deref())?;
-                let mut b = inner_cell.borrow_mut();
-                if matches!(*b, Value::Null) {
-                    *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
-                }
-                if let Value::Array(rc) = &mut *b {
-                    let mut arr = rc.borrow_mut();
-                    match key {
-                        Some(k) => arr.set(to_key(&k), v),
-                        None => arr.push(v),
+            // Nested lvalue bases ($a[0][1], $a->b[0], C::$a[0], $$v[0]):
+            // resolve the element cell generically and write into it.
+            Expr::Index { .. } | Expr::Prop { .. } | Expr::StaticProp { .. } | Expr::VarVar(..) => {
+                match self.index_cell_key(e, key.clone()) {
+                    Ok(c) => {
+                        *c.borrow_mut() = v;
+                        Ok(())
                     }
-                    Ok(())
-                } else {
-                    drop(b);
-                    self.fail(PhpError::fatal("Cannot use scalar value as an array", 0))
+                    // String offsets can't be cells — splice the byte in place.
+                    Err(e2) => match self.eval_cell(e) {
+                        Ok(bc) if matches!(*bc.borrow(), Value::Str(_)) => {
+                            let mut b = bc.borrow_mut();
+                            if let Value::Str(s) = &mut *b {
+                                let vs = self.conv_str(&v).unwrap_or_default();
+                                let mut bytes = s.as_bytes().to_vec();
+                                let idx = key
+                                    .as_ref()
+                                    .map(|k| k.to_int() as usize)
+                                    .unwrap_or(bytes.len());
+                                if idx >= bytes.len() {
+                                    bytes.resize(idx + 1, b' ');
+                                }
+                                bytes[idx] = vs.as_bytes().first().copied().unwrap_or(b' ');
+                                *s = String::from_utf8_lossy(&bytes).into_owned().into();
+                            }
+                            Ok(())
+                        }
+                        // Nested dim on a scalar is a Warning, not an Error
+                        // (engine_assignExecutionOrder_002) — write is skipped.
+                        Ok(bc) => {
+                            let t = bc.borrow().debug_type();
+                            drop(bc);
+                            self.warn(&format!("Cannot use {} as array", t));
+                            Ok(())
+                        }
+                        _ => Err(e2),
+                    },
                 }
             }
             _ => self.fail(PhpError::fatal("Cannot use expression as array", 0)),
         }
     }
 
-    /// Cell for `$e[$i]` — creates the array/key when assigning.
+    /// Index into `c`'s array value, taking a cell for `key`/`[]`.
+    fn index_into_key(&mut self, c: Cell, key: Option<Value>) -> Result<Cell, PhpError> {
+        let mut b = c.borrow_mut();
+        if matches!(*b, Value::Null) {
+            *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+        }
+        if let Value::Array(rc) = &mut *b {
+            if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
+                let fresh = rc.borrow().clone();
+                *b = Value::Array(Rc::new(RefCell::new(fresh)));
+            }
+            let rc = match &*b {
+                Value::Array(rc) => rc.clone(),
+                _ => unreachable!(),
+            };
+            drop(b);
+            let key = match key {
+                Some(k) => to_key(&k),
+                None => {
+                    let mut arr = rc.borrow_mut();
+                    let k = ArrKey::Int(arr.next);
+                    let c = cell(Value::Null);
+                    arr.bind_cell(k.clone(), c.clone());
+                    return Ok(c);
+                }
+            };
+            let mut arr = rc.borrow_mut();
+            match arr.get_cell(&key) {
+                Some(c) => Ok(c),
+                None => {
+                    let c = cell(Value::Null);
+                    arr.bind_cell(key, c.clone());
+                    Ok(c)
+                }
+            }
+        } else {
+            drop(b);
+            self.fail(PhpError::fatal("Cannot use scalar value as an array", 0))
+        }
+    }
+
     fn index_cell(&mut self, e: &Expr, i: Option<&Expr>) -> Result<Cell, PhpError> {
+        let key = match i {
+            Some(ie) => Some(self.eval(ie)?),
+            None => None,
+        };
+        self.index_cell_key(e, key)
+    }
+
+    /// `index_cell` with an already-evaluated key.
+    fn index_cell_key(&mut self, e: &Expr, key: Option<Value>) -> Result<Cell, PhpError> {
         match e {
             Expr::Var(name) => {
-                let arr_cell = self.var_cell(name);
-                let mut b = arr_cell.borrow_mut();
-                if matches!(*b, Value::Null) {
-                    *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
-                }
-                match &mut *b {
-                    Value::Array(rc) => {
-                        if Rc::strong_count(rc) > 1 {
-                            let fresh = rc.borrow().clone();
-                            *b = Value::Array(Rc::new(RefCell::new(fresh)));
-                        }
-                        let rc = match &*b {
-                            Value::Array(rc) => rc.clone(),
-                            _ => unreachable!(),
-                        };
-                        drop(b);
-                        let key = match i {
-                            Some(ie) => to_key(&self.eval(ie)?),
-                            None => {
-                                let mut arr = rc.borrow_mut();
-                                let k = ArrKey::Int(arr.next);
-                                let c = cell(Value::Null);
-                                arr.bind_cell(k.clone(), c.clone());
-                                return Ok(c);
-                            }
-                        };
-                        let mut arr = rc.borrow_mut();
-                        match arr.get_cell(&key) {
-                            Some(c) => Ok(c),
-                            None => {
-                                let c = cell(Value::Null);
-                                arr.bind_cell(key, c.clone());
-                                Ok(c)
-                            }
-                        }
-                    }
-                    _ => {
-                        drop(b);
-                        self.fail(PhpError::fatal("Cannot use scalar value as an array", 0))
-                    }
-                }
+                let c = self.var_cell(name);
+                self.index_into_key(c, key)
             }
             Expr::Index { e: inner, i: ii } => {
                 let c = self.index_cell(inner, ii.as_deref())?;
-                let mut b = c.borrow_mut();
-                if matches!(*b, Value::Null) {
-                    *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
-                }
-                if let Value::Array(rc) = &mut *b {
-                    if Rc::strong_count(rc) > 1 {
-                        let fresh = rc.borrow().clone();
-                        *b = Value::Array(Rc::new(RefCell::new(fresh)));
-                    }
-                    let rc = match &*b {
-                        Value::Array(rc) => rc.clone(),
-                        _ => unreachable!(),
-                    };
-                    drop(b);
-                    let key = match i {
-                        Some(ie) => to_key(&self.eval(ie)?),
-                        None => {
-                            let mut arr = rc.borrow_mut();
-                            let k = ArrKey::Int(arr.next);
-                            let c = cell(Value::Null);
-                            arr.bind_cell(k.clone(), c.clone());
-                            return Ok(c);
-                        }
-                    };
-                    let mut arr = rc.borrow_mut();
-                    match arr.get_cell(&key) {
-                        Some(c) => Ok(c),
-                        None => {
-                            let c = cell(Value::Null);
-                            arr.bind_cell(key, c.clone());
-                            Ok(c)
-                        }
-                    }
-                } else {
-                    drop(b);
-                    self.fail(PhpError::fatal("Cannot use scalar value as an array", 0))
-                }
+                self.index_into_key(c, key)
+            }
+            Expr::Prop {
+                obj,
+                name,
+                nullsafe,
+            } => {
+                let c = self.prop_cell(obj, name, *nullsafe)?;
+                self.index_into_key(c, key)
+            }
+            Expr::StaticProp { class, name } => {
+                let c = self.static_prop_cell(class, name)?;
+                self.index_into_key(c, key)
+            }
+            Expr::VarVar(inner) => {
+                let n = self.eval(inner)?;
+                let name = self.conv_str(&n)?;
+                let c = self.var_cell(&name);
+                self.index_into_key(c, key)
             }
             _ => {
                 // e.g. function call result index — read-only path.
-                let v = self.index_read(e, i)?;
+                let v = match key {
+                    Some(k) => self.index_read_val(e, Some(k))?,
+                    None => self.index_read(e, None)?,
+                };
                 Ok(cell(v))
             }
         }
     }
 
     fn index_read(&mut self, e: &Expr, i: Option<&Expr>) -> Result<Value, PhpError> {
+        // Base evaluates before the index expr (left-to-right).
         let base = self.eval(e)?;
         let key = match i {
             Some(ie) => self.eval(ie)?,
@@ -2030,6 +2584,19 @@ impl<'a> Interp<'a> {
                 return self.fail(PhpError::fatal("[] used in read context", 0));
             }
         };
+        self.index_read_base(base, key)
+    }
+
+    /// `index_read` for a caller that already evaluated `e` and the key.
+    fn index_read_val(&mut self, e: &Expr, key: Option<Value>) -> Result<Value, PhpError> {
+        let base = self.eval(e)?;
+        match key {
+            Some(k) => self.index_read_base(base, k),
+            None => self.fail(PhpError::fatal("[] used in read context", 0)),
+        }
+    }
+
+    fn index_read_base(&mut self, base: Value, key: Value) -> Result<Value, PhpError> {
         match base {
             Value::Array(rc) => {
                 let k = to_key(&key);
@@ -2146,6 +2713,20 @@ impl<'a> Interp<'a> {
                 self.silence -= 1;
                 v
             }
+            Expr::VarVar(inner) => {
+                let n = self.eval(inner)?;
+                let name = self.conv_str(&n)?;
+                self.silence += 1;
+                let v = self.var_get(&name).unwrap_or(Value::Null);
+                self.silence -= 1;
+                v
+            }
+            Expr::StaticProp { class, name } => {
+                self.silence += 1;
+                let v = self.static_prop_read(class, name).unwrap_or(Value::Null);
+                self.silence -= 1;
+                v
+            }
             _ => {
                 return self.fail(PhpError::fatal(
                     "Cannot increment/decrement non-variable",
@@ -2193,7 +2774,7 @@ impl<'a> Interp<'a> {
                         Value::str(perl_inc(s))
                     } else {
                         self.deprecated(
-                            "Decrement on non-numeric string is deprecated, use str_decrement() instead",
+                            "Decrement on non-numeric string has no effect and is deprecated",
                         );
                         v.clone()
                     }
@@ -2581,10 +3162,11 @@ impl<'a> Interp<'a> {
                     let mut order = Vec::new();
                     match &v {
                         Value::Array(a) => {
-                            for (k, c) in a.borrow().entries.iter() {
+                            for (k, c) in a.borrow().iter() {
                                 let name = match k {
                                     ArrKey::Int(i) => i.to_string(),
                                     ArrKey::Str(s) => s.to_string(),
+                                    ArrKey::Tomb => continue,
                                 };
                                 props.insert(name.clone(), cell(c.borrow().clone()));
                                 order.push(name);
@@ -2601,13 +3183,13 @@ impl<'a> Interp<'a> {
                         .get("stdclass")
                         .cloned()
                         .expect("stdClass registered");
-                    Value::Object(Rc::new(RefCell::new(PhpObject {
+                    Value::Object(self.alloc_obj(PhpObject {
                         class: cls,
                         props,
                         prop_order: order,
-                        id: self.next_obj_id(),
+                        id: 0,
                         internal: None,
-                    })))
+                    }))
                 }
             },
         })
@@ -2831,6 +3413,120 @@ impl<'a> Interp<'a> {
         &mut self,
         decl: &FunctionDecl,
         args: Vec<Cell>,
+        unused: Vec<Cell>,
+    ) -> Result<Value, PhpError> {
+        // Callee `Stmt::Line` markers must not leak into the caller:
+        // diagnostics after the call report the call-site line.
+        let saved_line = self.cur_line;
+        let r = self.bind_and_run_inner(decl, args, unused);
+        self.cur_line = saved_line;
+        r
+    }
+
+    /// PHP's compile-time checks on typed params (tests/lang/type_hints_*):
+    /// `= null` on a non-nullable type is the implicit-nullable deprecation;
+    /// a scalar literal default on a class type is a fatal.
+    fn decl_type_checks(&mut self, fname: &str, decl: &FunctionDecl) -> Result<(), PhpError> {
+        let builtins = [
+            "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed",
+            "void", "never", "false", "true", "self", "parent", "static", "null",
+        ];
+        let saved = self.cur_line;
+        for p in &decl.params {
+            let Some(ty) = &p.ty else { continue };
+            self.cur_line = decl.line;
+            let nullable = ty.iter().any(|m| m.eq_ignore_ascii_case("null"));
+            let null_default = match &p.default {
+                Some(Expr::Null) => true,
+                Some(Expr::Const(c)) => c.eq_ignore_ascii_case("null"),
+                _ => false,
+            };
+            match &p.default {
+                _ if null_default => {
+                    if !nullable {
+                        self.deprecated(&format!(
+                            "{}(): Implicitly marking parameter ${} as nullable is deprecated, the explicit nullable type must be used instead",
+                            fname, p.name
+                        ));
+                    }
+                }
+                Some(Expr::Int(_)) | Some(Expr::Float(_)) | Some(Expr::Str(_))
+                | Some(Expr::Bool(_)) => {
+                    let kind = match p.default {
+                        Some(Expr::Int(_)) => "int",
+                        Some(Expr::Float(_)) => "float",
+                        Some(Expr::Str(_)) => "string",
+                        _ => "bool",
+                    };
+                    let mut disp = ty.clone();
+                    disp.retain(|m| !m.eq_ignore_ascii_case("null"));
+                    let tn = disp.join("|");
+                    if disp
+                        .iter()
+                        .any(|m| !builtins.contains(&m.to_lowercase().as_str()))
+                    {
+                        self.cur_line = saved;
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Cannot use {} as default value for parameter ${} of type {}",
+                                kind, p.name, tn
+                            ),
+                            decl.line,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.cur_line = saved;
+        Ok(())
+    }
+
+    /// Scalar literal default check context ends; whether `v` satisfies a
+    /// type member — scalar builtins pass (weak-mode coercion territory).
+    fn param_type_match(&mut self, m: &str, v: &Value) -> bool {
+        let l = m.to_lowercase();
+        match l.as_str() {
+            "null" => matches!(v, Value::Null),
+            "int" | "float" | "string" | "bool" | "mixed" | "void" | "never" | "false" | "true"
+            | "self" | "parent" | "static" => true,
+            "array" => matches!(v, Value::Array(_)),
+            "iterable" => {
+                matches!(v, Value::Array(_))
+                    || matches!(v, Value::Object(o) if self.obj_is_a(o, "Traversable"))
+            }
+            "callable" => matches!(
+                v,
+                Value::Callable(_) | Value::Str(_) | Value::Object(_) | Value::Array(_)
+            ),
+            "object" => matches!(v, Value::Object(_)),
+            // Named class/interface — instanceof check.
+            _ => match v {
+                Value::Object(o) => self.obj_is_a(o, m),
+                _ => false,
+            },
+        }
+    }
+
+    /// PHP's "given" type word in TypeError messages.
+    fn zval_type_name(&self, v: &Value) -> String {
+        match v {
+            Value::Null => "null".into(),
+            Value::Bool(_) => "bool".into(),
+            Value::Int(_) => "int".into(),
+            Value::Float(_) => "float".into(),
+            Value::Str(_) => "string".into(),
+            Value::Array(_) => "array".into(),
+            Value::Object(o) => o.borrow().class.name().to_string(),
+            Value::Callable(_) => "Closure".into(),
+            Value::Resource(_) => "resource".into(),
+        }
+    }
+
+    fn bind_and_run_inner(
+        &mut self,
+        decl: &FunctionDecl,
+        args: Vec<Cell>,
         _unused: Vec<Cell>,
     ) -> Result<Value, PhpError> {
         let required = decl
@@ -2845,6 +3541,66 @@ impl<'a> Interp<'a> {
                 format!("Too few arguments to function, {} passed", args.len()),
                 0,
             ));
+        }
+        // Enforce declared param types (tests/lang/type_hints_*.phpt).
+        for (i, p) in decl.params.iter().enumerate() {
+            let (Some(ty), Some(a)) = (&p.ty, args.get(i)) else {
+                continue;
+            };
+            let v = a.borrow().clone();
+            let implicit_null = !ty.iter().any(|m| m.eq_ignore_ascii_case("null"))
+                && match &p.default {
+                    Some(Expr::Null) => true,
+                    Some(Expr::Const(c)) => c.eq_ignore_ascii_case("null"),
+                    _ => false,
+                };
+            let ok = (implicit_null && matches!(v, Value::Null))
+                || ty.iter().any(|m| self.param_type_match(m, &v));
+            if !ok {
+                let fname = self
+                    .stack
+                    .last()
+                    .and_then(|f| f.decl_class.as_ref().map(|c| c.name().to_string()))
+                    .map(|c| format!("{}::{}", c, decl.name))
+                    .unwrap_or_else(|| decl.name.clone());
+                let mut disp: Vec<String> = ty
+                    .iter()
+                    .filter(|m| !m.eq_ignore_ascii_case("null"))
+                    .cloned()
+                    .collect();
+                if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) || implicit_null {
+                    if disp.len() == 1 {
+                        disp[0] = format!("?{}", disp[0]);
+                    } else {
+                        disp.push("null".into());
+                    }
+                }
+                let given = self.zval_type_name(&v);
+                let msg = format!(
+                    "{}(): Argument #{} (${}) must be of type {}, {} given, called in {} on line {} and defined in {}:{}",
+                    fname,
+                    i + 1,
+                    p.name,
+                    disp.join("|"),
+                    given,
+                    self.file,
+                    self.cur_line,
+                    self.file,
+                    decl.line
+                );
+                let argdesc = args
+                    .iter()
+                    .map(|a| trace_arg(&a.borrow()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let frame = format!("{}({}): {}({})", self.file, self.cur_line, fname, argdesc);
+                let call_line = self.cur_line;
+                self.stack.pop();
+                let mut e = PhpError::uncaught("TypeError", msg, call_line);
+                e.trace = Some(vec![frame]);
+                e.thrown_line = Some(decl.line);
+                return self.fail(e);
+            }
         }
         {
             // Compute param bindings first (defaults may eval exprs that
@@ -2874,10 +3630,22 @@ impl<'a> Interp<'a> {
                 }
             }
             let frame = self.stack.last_mut().unwrap();
+            // func_get_arg(i) sees the param's CURRENT value, so frame args
+            // are the bound param cells plus any extra call args.
+            let mut fa: Vec<Cell> = Vec::new();
+            for (i, p) in decl.params.iter().enumerate() {
+                if p.variadic {
+                    break;
+                }
+                fa.push(binds[i].1.clone());
+            }
+            for a in &args[fa.len().min(args.len())..] {
+                fa.push(a.clone());
+            }
             for (n, c) in binds {
                 frame.vars.insert(n, c);
             }
-            frame.args = args;
+            frame.args = fa;
         }
         let flow = self.exec_block(&decl.body);
         self.stack.pop();
@@ -2886,12 +3654,16 @@ impl<'a> Interp<'a> {
             Flow::Throw(v) => {
                 self.pending_exception = Some(v);
                 Err(PhpError {
+                    trace: None,
+                    thrown_line: None,
                     kind: ErrorKind::Throw,
                     message: "throw".into(),
                     line: 0,
                 })
             }
             Flow::Exit(c) => Err(PhpError {
+                trace: None,
+                thrown_line: None,
                 kind: ErrorKind::Fatal,
                 message: format!("\u{1}exit:{}", c),
                 line: 0,
@@ -2937,6 +3709,7 @@ impl<'a> Interp<'a> {
                 .vars
                 .insert("this".to_string(), cell(Value::Object(obj.clone())));
         }
+        frame.decl_class = self.pending_decl_class.take();
         frame.this_obj = this_obj;
         frame.scope_class = scope_class;
         self.stack.push(frame);
@@ -3037,9 +3810,26 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn next_obj_id(&mut self) -> u64 {
-        self.obj_counter += 1;
-        self.obj_counter
+    /// Allocate a PHP object handle id: reuse the lowest dead slot,
+    /// like Zend's object store recycling freed handles.
+    fn next_obj_id(&mut self, rc: &Rc<RefCell<PhpObject>>) -> u64 {
+        let w = Rc::downgrade(rc);
+        for (i, h) in self.obj_handles.iter_mut().enumerate() {
+            if h.upgrade().is_none() {
+                *h = w.clone();
+                return (i + 1) as u64;
+            }
+        }
+        self.obj_handles.push(w);
+        self.obj_handles.len() as u64
+    }
+
+    /// Wrap a PhpObject in Rc and assign its handle id.
+    pub fn alloc_obj(&mut self, o: PhpObject) -> Rc<RefCell<PhpObject>> {
+        let rc = Rc::new(RefCell::new(o));
+        let id = self.next_obj_id(&rc);
+        rc.borrow_mut().id = id;
+        rc
     }
 
     /// `new X(args)` — instantiate + call __construct.
@@ -3104,7 +3894,7 @@ impl<'a> Interp<'a> {
                     }),
                     props: HashMap::new(),
                     prop_order: vec![],
-                    id: self.next_obj_id(),
+                    id: 0,
                     internal: None,
                 })))
             }
@@ -3132,10 +3922,17 @@ impl<'a> Interp<'a> {
                     Some(d) => self.eval(d).unwrap_or(Value::Null),
                     None => Value::Null,
                 };
-                if !prop_order.contains(&p.name) {
-                    prop_order.push(p.name.clone());
+                // Private props live in a per-declaring-class slot
+                // ("\0Cls\0name"), so C::$e and E::$e are distinct.
+                let key = if p.visibility == crate::ast::Visibility::Private {
+                    format!("\0{}\0{}", c.decl.name, p.name)
+                } else {
+                    p.name.clone()
+                };
+                if !prop_order.contains(&key) {
+                    prop_order.push(key.clone());
                 }
-                props.insert(p.name.clone(), cell(default));
+                props.insert(key, cell(default));
             }
         }
         let internal = if self.is_throwable_name(&cls.decl.name) {
@@ -3143,17 +3940,18 @@ impl<'a> Interp<'a> {
                 file: self.file.to_string(),
                 line: self.cur_line as u32,
                 trace: String::new(),
+                thrown: self.cur_line as u32,
             })
         } else {
             None
         };
-        Value::Object(Rc::new(RefCell::new(PhpObject {
+        Value::Object(self.alloc_obj(PhpObject {
             class: cls,
             props,
             prop_order,
-            id: self.next_obj_id(),
+            id: 0,
             internal,
-        })))
+        }))
     }
 
     fn is_throwable_name(&mut self, name: &str) -> bool {
@@ -3205,8 +4003,8 @@ impl<'a> Interp<'a> {
             Value::Null if nullsafe => Ok(Value::Null),
             Value::Object(o) => {
                 let cls = o.borrow().class.clone();
-                if let Some(c) = o.borrow().props.get(&pn) {
-                    return Ok(c.borrow().clone());
+                if let Some(k) = self.obj_prop_key(&o, &pn) {
+                    return Ok(o.borrow().props.get(&k).unwrap().borrow().clone());
                 }
                 // __get magic
                 if cls.find_method("__get").is_some() {
@@ -3245,14 +4043,15 @@ impl<'a> Interp<'a> {
         let ov = self.eval(obj)?;
         match ov {
             Value::Object(o) => {
+                let key = self.obj_prop_key(&o, &pn).unwrap_or_else(|| pn.clone());
                 let mut ob = o.borrow_mut();
-                if !ob.props.contains_key(&pn) {
-                    if !ob.prop_order.contains(&pn) {
-                        ob.prop_order.push(pn.clone());
+                if !ob.props.contains_key(&key) {
+                    if !ob.prop_order.contains(&key) {
+                        ob.prop_order.push(key.clone());
                     }
-                    ob.props.insert(pn.clone(), cell(Value::Null));
+                    ob.props.insert(key.clone(), cell(Value::Null));
                 }
-                Ok(ob.props.get(&pn).unwrap().clone())
+                Ok(ob.props.get(&key).unwrap().clone())
             }
             _ => self.fail(PhpError::fatal(
                 format!("Attempt to assign property \"{}\" on non-object", pn),
@@ -3261,14 +4060,37 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Resolve a property access to its storage key on `o`.
+    /// Private slots are `\0DeclaringClass\0name`; a method sees the
+    /// private slot of its own declaring class, then public/protected
+    /// and dynamic props under the plain name.
+    fn obj_prop_key(&mut self, o: &Rc<RefCell<PhpObject>>, pn: &str) -> Option<String> {
+        let dc = self.stack.last().and_then(|f| {
+            f.decl_class
+                .as_ref()
+                .or(f.scope_class.as_ref())
+                .map(|c| c.name().to_string())
+        });
+        if let Some(dc) = dc {
+            let k = format!("\0{}\0{}", dc, pn);
+            if o.borrow().props.contains_key(&k) {
+                return Some(k);
+            }
+        }
+        if o.borrow().props.contains_key(pn) {
+            return Some(pn.to_string());
+        }
+        None
+    }
+
     fn unset_prop(&mut self, e: &Expr) -> Result<(), PhpError> {
         if let Expr::Prop { obj, name, .. } = e {
             let pn = self.prop_name(name)?;
             let ov = self.eval(obj)?;
             if let Value::Object(o) = ov {
                 let cls = o.borrow().class.clone();
-                if o.borrow().props.contains_key(&pn) {
-                    o.borrow_mut().props.remove(&pn);
+                if let Some(k) = self.obj_prop_key(&o, &pn) {
+                    o.borrow_mut().props.remove(&k);
                 } else if cls.find_method("__unset").is_some() {
                     self.method_invoke(o.clone(), "__unset", vec![cell(Value::str(pn))])?;
                 }
@@ -3312,18 +4134,23 @@ impl<'a> Interp<'a> {
     }
 
     /// `$obj->method()` dispatch to a resolved decl.
+    /// `dc` is the declaring class — used as the private-prop scope.
     fn invoke_method(
         &mut self,
         obj: Rc<RefCell<PhpObject>>,
         m: &Rc<MethodDecl>,
         args: Vec<Cell>,
-        _cls: Rc<PhpClass>,
+        dc: Rc<PhpClass>,
     ) -> Result<Value, PhpError> {
         let scope = obj.borrow().class.clone();
-        if m.is_static {
-            return self.invoke_fn(&Rc::new(m.decl.clone()), args, None, Some(scope));
-        }
-        self.invoke_fn(&Rc::new(m.decl.clone()), args, Some(obj), Some(scope))
+        self.pending_decl_class = Some(dc);
+        let r = if m.is_static {
+            self.invoke_fn(&Rc::new(m.decl.clone()), args, None, Some(scope))
+        } else {
+            self.invoke_fn(&Rc::new(m.decl.clone()), args, Some(obj), Some(scope))
+        };
+        self.pending_decl_class = None;
+        r
     }
 
     /// Calls a method by name through an object cell (magic methods, __call).
@@ -3354,10 +4181,10 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        match cls.find_method(name) {
-            Some(m) => self.invoke_method(obj, &m, args, cls),
+        match self.find_method_in(&cls, name) {
+            Some((m, dc)) => self.invoke_method(obj, &m, args, dc),
             None => {
-                if let Some(m) = cls.find_method("__call") {
+                if let Some((m, dc)) = self.find_method_in(&cls, "__call") {
                     let mut arr = PhpArray::new();
                     for a in &args {
                         arr.push(a.borrow().clone());
@@ -3369,7 +4196,7 @@ impl<'a> Interp<'a> {
                             cell(Value::str(name)),
                             cell(Value::Array(Rc::new(RefCell::new(arr)))),
                         ],
-                        cls,
+                        dc,
                     );
                 }
                 self.fail(PhpError::uncaught(
@@ -3412,7 +4239,12 @@ impl<'a> Interp<'a> {
                 _ => Some(Value::Int(self.cur_line as i64)),
             },
             "gettrace" => Some(Value::Array(Rc::new(RefCell::new(PhpArray::new())))),
-            "gettraceasstring" => Some(Value::str("#0 {main}")),
+            "gettraceasstring" => match &ob.internal {
+                Some(ObjectInternal::Exception { trace, .. }) if !trace.is_empty() => {
+                    Some(Value::str(trace.clone()))
+                }
+                _ => Some(Value::str("#0 {main}")),
+            },
             "getprevious" => Some(Value::Null),
             "__tostring" => {
                 let msg = ob
@@ -3456,12 +4288,32 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn static_prop_read(&mut self, class: &Expr, name: &str) -> Result<Value, PhpError> {
+    fn static_prop_read(&mut self, class: &Expr, name: &PropName) -> Result<Value, PhpError> {
+        let name = self.prop_name(name)?;
         let cls = self.class_of(class)?;
         self.statics_init(&cls);
-        let v = cls.statics.borrow().get(name).map(|c| c.borrow().clone());
+        let v = cls.statics.borrow().get(&name).map(|c| c.borrow().clone());
         match v {
             Some(v) => Ok(v),
+            None => self.fail(PhpError::uncaught(
+                "Error",
+                format!("Undefined static property {}::${}", cls.name(), name),
+                0,
+            )),
+        }
+    }
+
+    fn static_prop_cell(&mut self, class: &Expr, name: &PropName) -> Result<Cell, PhpError> {
+        let name = self.prop_name(name)?;
+        self.static_prop_named(class, &name)
+    }
+
+    fn static_prop_named(&mut self, class: &Expr, name: &str) -> Result<Cell, PhpError> {
+        let cls = self.class_of(class)?;
+        self.statics_init(&cls);
+        let found = cls.statics.borrow().get(name).cloned();
+        match found {
+            Some(c) => Ok(c),
             None => self.fail(PhpError::uncaught(
                 "Error",
                 format!("Undefined static property {}::${}", cls.name(), name),
@@ -3504,14 +4356,20 @@ impl<'a> Interp<'a> {
     ) -> Result<Value, PhpError> {
         // Throwable methods are instance-only; look up incl. parents.
         match self.find_method_in(&cls, name) {
-            Some(m) => self.invoke_fn(&Rc::new(m.decl.clone()), args, None, Some(cls.clone())),
+            Some((m, dc)) => {
+                self.pending_decl_class = Some(dc);
+                let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, None, Some(cls.clone()));
+                self.pending_decl_class = None;
+                r
+            }
             None => {
-                if let Some(m) = self.find_method_in(&cls, "__callstatic") {
+                if let Some((m, dc)) = self.find_method_in(&cls, "__callstatic") {
                     let mut arr = PhpArray::new();
                     for a in &args {
                         arr.push(a.borrow().clone());
                     }
-                    return self.invoke_fn(
+                    self.pending_decl_class = Some(dc);
+                    let r = self.invoke_fn(
                         &Rc::new(m.decl.clone()),
                         vec![
                             cell(Value::str(name)),
@@ -3520,6 +4378,8 @@ impl<'a> Interp<'a> {
                         None,
                         Some(cls.clone()),
                     );
+                    self.pending_decl_class = None;
+                    return r;
                 }
                 self.fail(PhpError::uncaught(
                     "Error",
@@ -3531,12 +4391,74 @@ impl<'a> Interp<'a> {
     }
 
     /// Method lookup walking parent chain (uses registered classes).
-    fn find_method_in(&mut self, cls: &Rc<PhpClass>, name: &str) -> Option<Rc<MethodDecl>> {
+    /// Visibility + declaring class for a property name (var_dump marks
+    /// `["n":protected]` and `["n":"Cls":private]`).
+    pub fn prop_visibility(
+        &mut self,
+        cls: &Rc<PhpClass>,
+        name: &str,
+    ) -> (crate::ast::Visibility, String) {
+        // Private slots are stored mangled ("\0Cls\0name"); the declaring
+        // class is encoded directly in the key.
+        if let Some(rest) = name.strip_prefix('\0') {
+            if let Some((dcls, _)) = rest.split_once('\0') {
+                return (crate::ast::Visibility::Private, dcls.to_string());
+            }
+        }
+        let mut cur = Some(cls.clone());
+        while let Some(c) = cur {
+            for p in &c.decl.props {
+                if p.name == name && !p.is_static {
+                    return (p.visibility, c.name().to_string());
+                }
+            }
+            cur = c
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        (crate::ast::Visibility::Public, String::new())
+    }
+
+    /// Whether prop `name` on `cls` is readable from the current scope
+    /// (foreach over objects iterates only visible props).
+    pub fn prop_visible(&mut self, cls: &Rc<PhpClass>, name: &str) -> bool {
+        let (vis, dcls) = self.prop_visibility(cls, name);
+        let scope = self.stack.last().and_then(|f| {
+            f.decl_class
+                .as_ref()
+                .or(f.scope_class.as_ref())
+                .map(|s| s.decl.name.clone())
+        });
+        match (vis, scope) {
+            (crate::ast::Visibility::Public, _) => true,
+            (crate::ast::Visibility::Private, Some(s)) => s == dcls,
+            (crate::ast::Visibility::Protected, Some(s)) => {
+                self.is_a_str(&s, &dcls) || self.is_a_str(&dcls, &s)
+            }
+            _ => false,
+        }
+    }
+
+    /// is-a check between two class-name strings.
+    fn is_a_str(&mut self, a: &str, b: &str) -> bool {
+        match self.classes.get(&a.to_lowercase()).cloned() {
+            Some(c) => self.is_a(&c, b),
+            None => a.eq_ignore_ascii_case(b),
+        }
+    }
+
+    fn find_method_in(
+        &mut self,
+        cls: &Rc<PhpClass>,
+        name: &str,
+    ) -> Option<(Rc<MethodDecl>, Rc<PhpClass>)> {
         let lname = name.to_lowercase();
         let mut cur = Some(cls.clone());
         while let Some(c) = cur {
             if let Some(m) = c.decl.find_method(&lname) {
-                return Some(m);
+                return Some((m, c));
             }
             cur = c
                 .decl
@@ -3675,6 +4597,8 @@ impl<'a> Interp<'a> {
             Flow::Return(v) => Ok(v),
             Flow::Normal => Ok(Value::Int(1)),
             Flow::Exit(c) => Err(PhpError {
+                trace: None,
+                thrown_line: None,
                 kind: ErrorKind::Fatal,
                 message: format!("\u{1}exit:{}", c),
                 line: 0,
@@ -3682,6 +4606,8 @@ impl<'a> Interp<'a> {
             Flow::Throw(v) => {
                 self.pending_exception = Some(v);
                 Err(PhpError {
+                    trace: None,
+                    thrown_line: None,
                     kind: ErrorKind::Throw,
                     message: "throw".into(),
                     line: 0,
@@ -3711,6 +4637,8 @@ impl<'a> Interp<'a> {
                     Flow::Return(v) => Ok(v),
                     Flow::Normal => Ok(Value::Null),
                     Flow::Exit(c) => Err(PhpError {
+                        trace: None,
+                        thrown_line: None,
                         kind: ErrorKind::Fatal,
                         message: format!("\u{1}exit:{}", c),
                         line: 0,
@@ -3718,6 +4646,8 @@ impl<'a> Interp<'a> {
                     Flow::Throw(v) => {
                         self.pending_exception = Some(v);
                         Err(PhpError {
+                            trace: None,
+                            thrown_line: None,
                             kind: ErrorKind::Throw,
                             message: "throw".into(),
                             line: 0,
@@ -3730,6 +4660,8 @@ impl<'a> Interp<'a> {
                 let v = self.exception("ParseError", &e.message);
                 self.pending_exception = Some(v);
                 Err(PhpError {
+                    trace: None,
+                    thrown_line: None,
                     kind: ErrorKind::Throw,
                     message: "eval".into(),
                     line: 0,
@@ -3797,6 +4729,11 @@ impl<'a> Interp<'a> {
         self.stack.last()
     }
     /// Args of the currently-executing function.
+    /// True while executing inside a function/method call frame.
+    pub fn in_call(&self) -> bool {
+        !self.stack.is_empty()
+    }
+
     pub fn frame_args(&self) -> &[Cell] {
         self.stack.last().map(|f| f.args.as_slice()).unwrap_or(&[])
     }
@@ -3822,9 +4759,6 @@ impl<'a> Interp<'a> {
         self.classes
             .get(&name.trim_start_matches('\\').to_lowercase())
             .cloned()
-    }
-    pub fn obj_new_id(&mut self) -> u64 {
-        self.next_obj_id()
     }
     pub fn instantiate_class(&mut self, name: &str, args: Vec<Cell>) -> Result<Value, PhpError> {
         self.new_instance(name, args)
@@ -3861,6 +4795,7 @@ fn key_value(k: &ArrKey) -> Value {
     match k {
         ArrKey::Int(i) => Value::Int(*i),
         ArrKey::Str(s) => Value::str(s.to_string()),
+        ArrKey::Tomb => Value::Null,
     }
 }
 

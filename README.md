@@ -10,7 +10,7 @@ tracked continuously as `PHPT passed / applicable PHPT tests`.
 
 ## Current compatibility
 
-`tests/lang` (core language): **140 / 280 applicable tests — 50.0%**
+`tests/lang` (core language): **206 / 280 applicable tests — 73.6%**
 (reference PHP 8.5.11). Regenerate with the harness command below;
 see `docs/compatibility.md` for what works, what fails, and the next
 highest-leverage semantic cluster.

@@ -153,6 +153,10 @@ impl<'a> Parser<'a> {
     }
 
     fn stmt(&mut self) -> Result<Stmt, PhpError> {
+        // `#[Attr]` may precede any declaration statement.
+        if self.at_op("#[") {
+            self.skip_attrs();
+        }
         match self.peek().cloned() {
             Some(Token::Inline(s)) => {
                 self.pos += 1;
@@ -223,17 +227,23 @@ impl<'a> Parser<'a> {
                     })
                 } else if self.ident_is("global") {
                     self.pos += 1;
-                    let name = match self.next() {
-                        Some(Token::Variable(n)) => n,
-                        _ => {
-                            return Err(PhpError::parse(
-                                "syntax error, unexpected token, expecting variable",
-                                self.line(),
-                            ))
+                    let mut names = Vec::new();
+                    loop {
+                        match self.next() {
+                            Some(Token::Variable(n)) => names.push(n),
+                            _ => {
+                                return Err(PhpError::parse(
+                                    "syntax error, unexpected token, expecting variable",
+                                    self.line(),
+                                ))
+                            }
                         }
-                    };
+                        if !self.eat_op(",") {
+                            break;
+                        }
+                    }
                     self.expect_op(";")?;
-                    Ok(Stmt::Global(name))
+                    Ok(Stmt::Global(names))
                 } else if self.ident_is("static")
                     && matches!(self.peek2(), Some(Token::Variable(_)))
                 {
@@ -437,6 +447,7 @@ impl<'a> Parser<'a> {
         let body = self.body()?;
         let key = key.map(|t| match t {
             ForeachTarget::Var(n) => ForeachKey::Var(n),
+            ForeachTarget::ByRef(_) => ForeachKey::ByRef,
             _ => ForeachKey::Var(String::new()), // list keys unsupported
         });
         Ok(Stmt::Foreach {
@@ -495,7 +506,28 @@ impl<'a> Parser<'a> {
             return Ok(ForeachTarget::List(items));
         }
         match self.next() {
-            Some(Token::Variable(n)) => Ok(ForeachTarget::Var(n)),
+            Some(Token::Variable(n)) => {
+                // Lvalue targets: `$b[0]`, `$o->p`, ...
+                let mut e = Expr::Var(n);
+                while self.at_op("[") {
+                    self.pos += 1;
+                    let i = if self.at_op("]") {
+                        None
+                    } else {
+                        Some(Box::new(self.expr()?))
+                    };
+                    self.expect_op("]")?;
+                    e = Expr::Index { e: Box::new(e), i };
+                }
+                if let Expr::Var(_) = e {
+                    Ok(ForeachTarget::Var(match e {
+                        Expr::Var(n) => n,
+                        _ => unreachable!(),
+                    }))
+                } else {
+                    Ok(ForeachTarget::Lvalue(Box::new(e)))
+                }
+            }
             t => Err(PhpError::parse(
                 format!(
                     "syntax error, unexpected {}, expecting variable",
@@ -630,6 +662,8 @@ impl<'a> Parser<'a> {
     }
 
     fn class_decl(&mut self) -> Result<Stmt, PhpError> {
+        // `#[Attr]` groups may precede the class modifiers.
+        self.skip_attrs();
         let mut is_abstract = false;
         let mut is_final = false;
         loop {
@@ -840,6 +874,7 @@ impl<'a> Parser<'a> {
         is_final: bool,
         vis: Visibility,
     ) -> Result<MethodDecl, PhpError> {
+        let line = self.line();
         self.pos += 1; // function
         let by_ref = self.eat_op("&");
         let name = self.ident().unwrap_or_default();
@@ -858,6 +893,7 @@ impl<'a> Parser<'a> {
                 params,
                 body,
                 by_ref,
+                line,
             },
             is_static,
             is_abstract,
@@ -872,13 +908,15 @@ impl<'a> Parser<'a> {
         while !self.at_op(")") {
             self.skip_attrs();
             // skip type declaration before the variable
-            if matches!(
+            let ty = if matches!(
                 self.peek(),
                 Some(Token::Ident(_)) | Some(Token::Op("?")) | Some(Token::Op("\\"))
             ) && !matches!(self.peek2(), Some(Token::Op(",")) | Some(Token::Op(")")))
             {
-                self.skip_type()?;
-            }
+                self.take_type()
+            } else {
+                None
+            };
             let by_ref = self.eat_op("&");
             let variadic = self.eat_op("...");
             // promoted constructor params may carry visibility
@@ -921,6 +959,7 @@ impl<'a> Parser<'a> {
                 default,
                 by_ref,
                 variadic,
+                ty,
             });
             if !self.eat_op(",") {
                 break;
@@ -1011,6 +1050,7 @@ impl<'a> Parser<'a> {
     }
 
     fn function_decl(&mut self) -> Result<Stmt, PhpError> {
+        let line = self.line();
         self.pos += 1; // function
         let by_ref = self.eat_op("&");
         let name = self.ident().ok_or_else(|| {
@@ -1030,12 +1070,14 @@ impl<'a> Parser<'a> {
             params,
             body,
             by_ref,
+            line,
         }))
     }
 
     /// `function (&$a) use ($x, &$y) { }`, `static function () {}`,
     /// `fn($x) => $x + 1`.
     fn closure_expr(&mut self) -> Result<Expr, PhpError> {
+        let line = self.line();
         let mut arrow = false;
         let mut uses = Vec::new();
         if self.ident_is("static") {
@@ -1087,6 +1129,7 @@ impl<'a> Parser<'a> {
                 params,
                 body,
                 by_ref,
+                line,
             },
             uses,
             arrow,
@@ -1287,7 +1330,19 @@ impl<'a> Parser<'a> {
             }
             Some(Token::Variable(n)) => {
                 self.pos += 1;
-                Ok((Expr::Var(n), Vec::new()))
+                // `new $a[i][j]` — dims belong to the class-name expr
+                // (engine_assignExecutionOrder_007), not the new object.
+                let mut e = Expr::Var(n);
+                while self.eat_op("[") {
+                    let i = if self.at_op("]") {
+                        None
+                    } else {
+                        Some(Box::new(self.expr()?))
+                    };
+                    self.expect_op("]")?;
+                    e = Expr::Index { e: Box::new(e), i };
+                }
+                Ok((e, Vec::new()))
             }
             Some(Token::Op("{")) => {
                 self.pos += 1;
@@ -1364,14 +1419,40 @@ impl<'a> Parser<'a> {
 
     /// Skip a type declaration (names, |, &, ?, parenthesized DNF).
     fn skip_type(&mut self) -> Result<(), PhpError> {
+        let _ = self.take_type();
+        Ok(())
+    }
+
+    /// Consume a type expression, returning its member names in source
+    /// order. `?T`/`T|null` append a "null" member; parentheses flatten.
+    fn take_type(&mut self) -> Option<Vec<String>> {
+        let mut members: Vec<String> = Vec::new();
+        let mut nullable = false;
         let mut depth = 0i32;
+        let mut name = String::new();
         loop {
             match self.peek() {
-                Some(Token::Ident(_)) | Some(Token::Op("\\")) => {
+                Some(Token::Ident(n)) => {
+                    if !name.is_empty() {
+                        name.push('\\');
+                    }
+                    name.push_str(n);
                     self.pos += 1;
                 }
-                Some(Token::Op("?")) if depth == 0 => self.pos += 1,
-                Some(Token::Op("|")) | Some(Token::Op("&")) => self.pos += 1,
+                Some(Token::Op("\\")) => {
+                    name.push('\\');
+                    self.pos += 1;
+                }
+                Some(Token::Op("?")) if depth == 0 => {
+                    nullable = true;
+                    self.pos += 1;
+                }
+                Some(Token::Op("|")) | Some(Token::Op("&")) => {
+                    if !name.is_empty() {
+                        members.push(std::mem::take(&mut name));
+                    }
+                    self.pos += 1;
+                }
                 Some(Token::Op("(")) => {
                     depth += 1;
                     self.pos += 1;
@@ -1380,8 +1461,19 @@ impl<'a> Parser<'a> {
                     depth -= 1;
                     self.pos += 1;
                 }
-                _ => return Ok(()),
+                _ => break,
             }
+        }
+        if !name.is_empty() {
+            members.push(name);
+        }
+        if nullable && !members.iter().any(|m| m.eq_ignore_ascii_case("null")) {
+            members.push("null".into());
+        }
+        if members.is_empty() {
+            None
+        } else {
+            Some(members)
         }
     }
 
@@ -1859,11 +1951,14 @@ impl<'a> Parser<'a> {
                         }
                     }
                     Some(Token::Variable(n)) => {
+                        // `C::$name` — a literal static prop name (unlike
+                        // `$o->$name`, which reads the variable).
                         e = Expr::StaticProp {
                             class: Box::new(e),
-                            name: n,
+                            name: PropName::Name(n),
                         };
                     }
+                    // `Cls::{expr}` / `Cls::${expr}` — dynamic name or call.
                     Some(Token::Op("{")) => {
                         let inner = self.expr()?;
                         self.expect_op("}")?;
@@ -1877,10 +1972,45 @@ impl<'a> Parser<'a> {
                                 nullsafe: false,
                             };
                         } else {
-                            return Err(PhpError::parse(
-                                "syntax error, unsupported ::{...} property",
-                                self.line(),
-                            ));
+                            e = Expr::StaticProp {
+                                class: Box::new(e),
+                                name: PropName::Expr(Box::new(inner)),
+                            };
+                        }
+                    }
+                    Some(Token::Op("$")) => {
+                        // `C::$${x}` / `C::${expr}` — name by expression.
+                        let inner = if self.at_op("{") {
+                            self.pos += 1;
+                            let inner = self.expr()?;
+                            self.expect_op("}")?;
+                            inner
+                        } else {
+                            // `C::$$x` — name read from variable $x.
+                            match self.next() {
+                                Some(Token::Variable(n)) => Expr::Var(n),
+                                t => {
+                                    return Err(PhpError::parse(
+                                        format!("syntax error, unexpected {}", desc_t(t.as_ref())),
+                                        self.line(),
+                                    ))
+                                }
+                            }
+                        };
+                        if self.at_op("(") {
+                            self.pos += 1;
+                            let args = self.args()?;
+                            e = Expr::MethodCall {
+                                obj: Box::new(e),
+                                name: PropName::Expr(Box::new(inner)),
+                                args,
+                                nullsafe: false,
+                            };
+                        } else {
+                            e = Expr::StaticProp {
+                                class: Box::new(e),
+                                name: PropName::Expr(Box::new(inner)),
+                            };
                         }
                     }
                     t => {
@@ -1927,6 +2057,13 @@ impl<'a> Parser<'a> {
             Some(Token::Ident(n)) => Ok(PropName::Name(n)),
             Some(Token::Variable(n)) => Ok(PropName::Var(n)),
             Some(Token::Op("{")) => {
+                let e = self.expr()?;
+                self.expect_op("}")?;
+                Ok(PropName::Expr(Box::new(e)))
+            }
+            // `$obj->${expr}`
+            Some(Token::Op("$")) => {
+                self.expect_op("{")?;
                 let e = self.expr()?;
                 self.expect_op("}")?;
                 Ok(PropName::Expr(Box::new(e)))
@@ -2204,9 +2341,9 @@ impl<'a> Parser<'a> {
     fn array_items(&mut self, close: &str) -> Result<Vec<(Option<Expr>, Expr)>, PhpError> {
         let mut items = Vec::new();
         while !self.at_op(close) {
-            let first = self.expr()?;
+            let first = self.array_elem()?;
             if self.eat_op("=>") {
-                let v = self.expr()?;
+                let v = self.array_elem()?;
                 items.push((Some(first), v));
             } else {
                 items.push((None, first));
@@ -2217,6 +2354,15 @@ impl<'a> Parser<'a> {
         }
         self.expect_op(close)?;
         Ok(items)
+    }
+
+    /// One array-literal element — may be `&expr` (bound by reference).
+    fn array_elem(&mut self) -> Result<Expr, PhpError> {
+        if self.eat_op("&") {
+            Ok(Expr::ByRef(Box::new(self.expr()?)))
+        } else {
+            self.expr()
+        }
     }
 }
 

@@ -12,6 +12,10 @@ use std::rc::Rc;
 pub enum ArrKey {
     Int(i64),
     Str(Rc<str>),
+    /// Zend-style tombstone: `unset`/`array_shift` mark a bucket dead but
+    /// keep its position so a live `foreach (&$v)` iteration over bucket
+    /// positions still sees later elements (foreachLoop.013/.015).
+    Tomb,
 }
 
 pub type Cell = Rc<RefCell<Value>>;
@@ -22,6 +26,9 @@ pub struct PhpArray {
     pub entries: Vec<(ArrKey, Cell)>,
     /// Next free integer key for `$arr[] = ...` (max int key seen + 1).
     pub next: i64,
+    /// Zend's is_ref: once elements are aliased (`foreach &$v`, `=&`),
+    /// writes through a shared (copied) zval must NOT copy-on-write split.
+    pub is_ref: bool,
 }
 
 impl Default for PhpArray {
@@ -35,6 +42,7 @@ impl PhpArray {
         Self {
             entries: Vec::new(),
             next: 0,
+            is_ref: false,
         }
     }
 
@@ -94,23 +102,31 @@ impl PhpArray {
         }
     }
 
-    /// Remove a key (unset). Returns whether it existed.
+    /// Remove a key (unset). The bucket is tombstoned — position kept,
+    /// value gone (see ArrKey::Tomb). Returns whether it existed.
     pub fn unset(&mut self, k: &ArrKey) -> bool {
-        let n = self.entries.len();
-        self.entries.retain(|(ek, _)| ek != k);
-        self.entries.len() != n
+        if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| ek == k) {
+            slot.0 = ArrKey::Tomb;
+            true
+        } else {
+            false
+        }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &(ArrKey, Cell)> {
-        self.entries.iter()
+    /// Live entries only (tombstones skipped).
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &(ArrKey, Cell)> {
+        self.entries
+            .iter()
+            .filter(|(k, _)| !matches!(k, ArrKey::Tomb))
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
+    /// Number of live elements.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.iter().count()
     }
 }
 
@@ -124,6 +140,7 @@ impl Clone for PhpArray {
                 .map(|(k, c)| (k.clone(), Rc::new(RefCell::new(c.borrow().clone()))))
                 .collect(),
             next: self.next,
+            is_ref: false,
         }
     }
 }
@@ -146,6 +163,26 @@ pub fn to_key(v: &Value) -> ArrKey {
         Value::Array(_) | Value::Object(_) | Value::Callable(_) | Value::Resource(_) => {
             ArrKey::Str("".into()) // illegal key — caller warns
         }
+    }
+}
+
+/// PHP's stack-trace argument printer: `'str'`, `Object(C)`, `Array`,
+/// scalars as their plain value (tests/lang/type_hints_001.phpt).
+pub fn trace_arg(v: &Value) -> String {
+    match v {
+        Value::Object(o) => format!("Object({})", o.borrow().class.name()),
+        Value::Str(s) => {
+            if s.chars().count() > 15 {
+                format!("'{}...'", s.chars().take(15).collect::<String>())
+            } else {
+                format!("'{}'", s)
+            }
+        }
+        Value::Array(_) => "Array".into(),
+        Value::Null => "NULL".into(),
+        Value::Callable(_) => "Object(Closure)".into(),
+        Value::Resource(_) => "Resource id #1".into(),
+        other => other.to_php_string(),
     }
 }
 
@@ -216,6 +253,22 @@ impl Value {
             Value::Array(_) => "array",
             Value::Object(_) | Value::Callable(_) => "object",
             Value::Resource(_) => "resource",
+        }
+    }
+
+    /// PHP 8's `get_debug_type` — used in engine diagnostics ("int given",
+    /// "true given", class name for objects).
+    pub fn debug_type(&self) -> String {
+        match self {
+            Value::Null => "null".to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Int(_) => "int".to_string(),
+            Value::Float(_) => "float".to_string(),
+            Value::Str(_) => "string".to_string(),
+            Value::Array(_) => "array".to_string(),
+            Value::Object(o) => o.borrow().class.name().to_string(),
+            Value::Callable(_) => "Closure".to_string(),
+            Value::Resource(_) => "resource".to_string(),
         }
     }
 
@@ -496,7 +549,13 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
         (Bool(_), _) | (_, Bool(_)) | (Null, _) | (_, Null) => a.is_truthy().cmp(&b.is_truthy()),
         (Int(_) | Float(_), Str(s)) => {
             match numeric(s) {
-                Numeric::Int(_) | Numeric::Float(_) => num_cmp(a.to_float(), b.to_float()),
+                // Int strings compare exactly — f64 would lose low bits on
+                // 64-bit ints (operators/operator_equals_variation_64bit).
+                Numeric::Int(si) => match a {
+                    Int(ai) => ai.cmp(&si),
+                    _ => num_cmp(a.to_float(), si as f64),
+                },
+                Numeric::Float(_) => num_cmp(a.to_float(), b.to_float()),
                 // PHP 8: non-numeric (incl. leading-numeric) string →
                 // the number is cast to string and compared as strings.
                 Numeric::Leading(_, _) | Numeric::NonNumeric => {
@@ -505,10 +564,12 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
             }
         }
         (Str(_), Int(_) | Float(_)) => compare(b, a).reverse(),
+        (Int(x), Int(y)) => x.cmp(y),
         (Int(_) | Float(_), Int(_) | Float(_)) => num_cmp(a.to_float(), b.to_float()),
         (Str(x), Str(y)) => {
             // Both numeric strings → numeric compare, else string compare.
             match (numeric(x), numeric(y)) {
+                (Numeric::Int(xi), Numeric::Int(yi)) => xi.cmp(&yi),
                 (Numeric::Int(_) | Numeric::Float(_), Numeric::Int(_) | Numeric::Float(_)) => {
                     num_cmp(numeric(x).to_float(), numeric(y).to_float())
                 }
@@ -639,7 +700,12 @@ pub enum ObjectInternal {
     Exception {
         file: String,
         line: u32,
+        /// Fully formatted trace body (`#0 f(1): g()\n#1 {main}`); empty →
+        /// callers fall back to `#0 {main}`.
         trace: String,
+        /// `thrown in` footer line — usually `line`; param TypeErrors
+        /// attribute to the callee's declaration line.
+        thrown: u32,
     },
     /// DateTime, closures-as-objects, etc. — opaque marker.
     None,
