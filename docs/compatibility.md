@@ -1,4 +1,4 @@
-# Compatibility notes — tests/lang @ 257/280 (91.8%)
+# Compatibility notes — tests/lang @ 272/280 (97.1%)
 
 Reference: PHP 8.5.11 (cli). Harness: `phpun phpt … -j 8`.
 
@@ -72,9 +72,9 @@ Reference: PHP 8.5.11 (cli). Harness: `phpun phpt … -j 8`.
 
 | Cluster                            | ~tests | Missing semantic                                   |
 |------------------------------------|--------|----------------------------------------------------|
-| passByReference / returnByReference| ~17    | `&$var` references through args/returns (PR #1)    |
-| bug20175/bug21600/bug22510/bug24658| 4      | reference edge cases (same PR #1 cluster)          |
-| 030                                | 1      | `$GLOBALS['x'] = &$this` reference (PR #1 cluster) |
+| 030 (`$GLOBALS['x'] =& $this`)     | 1      | `$this` inside a by-ref global slot                |
+| bug20175/22510/24658 + returnByRef | 4      | residual reference edge cases                      |
+| bug55754                           | 1      | `ZEND_SEND_PREFER_REF` (prefer-ref builtin args)   |
 | unicode_escape_surrogates          | 1      | needs byte-string values (UTF-8 `Value::Str` limit)|
 | bitwiseNot_variationStr            | 1      | same byte-string gap (`~"0"` → 0xCF)               |
 
