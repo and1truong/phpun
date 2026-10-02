@@ -769,7 +769,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 } else {
                     n - off
                 };
-                let tail: Vec<(ArrKey, Cell)> = arr.entries.drain(..).collect();
+                let tail: Vec<(ArrKey, Cell)> = std::mem::take(&mut arr.entries);
                 let (head, rest) = tail.split_at(off as usize);
                 let (cut, tail2) = rest.split_at((len as usize).min(rest.len()));
                 for (k, c) in cut {
