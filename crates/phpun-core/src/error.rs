@@ -15,6 +15,10 @@ pub struct PhpError {
     /// Line the `thrown in` footer attributes to (defaults to `line`).
     /// Param-type TypeErrors attribute to the declaration line.
     pub thrown_line: Option<usize>,
+    /// Uncaught-display variant of `message` (param TypeErrors display the
+    /// longer "... and defined in FILE:M" form while getMessage() stays
+    /// short).
+    pub display_msg: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +48,7 @@ impl PhpError {
             line,
             trace: None,
             thrown_line: None,
+            display_msg: None,
         }
     }
 
@@ -54,6 +59,7 @@ impl PhpError {
             line,
             trace: None,
             thrown_line: None,
+            display_msg: None,
         }
     }
 
@@ -64,6 +70,7 @@ impl PhpError {
             line,
             trace: None,
             thrown_line: None,
+            display_msg: None,
         }
     }
 
@@ -74,6 +81,7 @@ impl PhpError {
             line,
             trace: None,
             thrown_line: None,
+            display_msg: None,
         }
     }
 }

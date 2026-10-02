@@ -442,11 +442,33 @@ pub fn format_float_repr(f: f64) -> String {
     php_gcvt(f, 17)
 }
 
+/// Float → string honoring an explicit INI precision (`precision=N` for
+/// echo/casts, `serialize_precision=N` for var_dump/var_export/print_r):
+/// forced %G formatting — always `n` significant digits (bug24640). A
+/// negative `prec` selects the shortest round-trip form (`-1`).
+pub fn format_float_prec(f: f64, prec: i64) -> String {
+    if prec < 0 {
+        format_float_repr(f)
+    } else {
+        php_gcvt_fixed(f, prec as usize)
+    }
+}
+
+/// PHP zend_gcvt-style float formatting with a forced significant-digit
+/// count (%.Ng): digits come from `{:.*e}` rounding, trailing zeros trimmed.
+fn php_gcvt_fixed(f: f64, precision: usize) -> String {
+    php_gcvt_impl(f, precision, true)
+}
+
 /// PHP zend_gcvt-style float formatting: significant digits come from the
 /// shortest round-trip representation (rounded to `precision` digits only
 /// when the shortest form is longer); scientific notation when the decimal
 /// exponent is < -4 or >= precision.
 fn php_gcvt(f: f64, precision: usize) -> String {
+    php_gcvt_impl(f, precision, false)
+}
+
+fn php_gcvt_impl(f: f64, precision: usize, force: bool) -> String {
     if f.is_nan() {
         return "NAN".to_string();
     }
@@ -461,7 +483,7 @@ fn php_gcvt(f: f64, precision: usize) -> String {
         };
     }
     let neg = f < 0.0;
-    let (digits, exp) = gcvt_digits(f.abs(), precision);
+    let (digits, exp) = gcvt_digits(f.abs(), precision, force);
     let nd = digits.len() as i64;
     let sign = if neg { "-" } else { "" };
     if exp < -4 || exp >= precision as i64 {
@@ -494,7 +516,7 @@ fn php_gcvt(f: f64, precision: usize) -> String {
 /// Significant digits (no decimal point) + decimal exponent of |v|.
 /// Uses the shortest round-trip repr; if that exceeds `precision` digits
 /// the value is re-rounded to `precision` digits.
-fn gcvt_digits(v: f64, precision: usize) -> (String, i64) {
+fn gcvt_digits(v: f64, precision: usize, force: bool) -> (String, i64) {
     let split = |s: String| -> (String, i64) {
         let (mant, e) = s.split_once('e').unwrap();
         let exp: i64 = e.parse().unwrap_or(0);
@@ -507,6 +529,9 @@ fn gcvt_digits(v: f64, precision: usize) -> (String, i64) {
         };
         (digits, exp)
     };
+    if force {
+        return split(format!("{:.*e}", precision - 1, v));
+    }
     let (d, e) = split(format!("{:e}", v));
     if d.len() > precision {
         split(format!("{:.*e}", precision - 1, v))
@@ -694,6 +719,20 @@ pub struct PhpObject {
     pub internal: Option<ObjectInternal>,
 }
 
+/// One recorded call for exception backtraces (getTrace()).
+#[derive(Debug, Clone)]
+pub struct TraceFrame {
+    /// Callee name (`fopen`, `Error2Exception`, `Cls::m`/`{closure}`-ish).
+    pub function: String,
+    /// Class name for method calls (None for plain/builtin functions).
+    pub class: Option<String>,
+    /// `->` for object methods, `::` for static — empty for functions.
+    pub ty: String,
+    /// Call-site file and line.
+    pub file: String,
+    pub line: u32,
+}
+
 #[derive(Debug)]
 pub enum ObjectInternal {
     /// Throwable fields (message/code/file/line/trace string).
@@ -706,6 +745,15 @@ pub enum ObjectInternal {
         /// `thrown in` footer line — usually `line`; param TypeErrors
         /// attribute to the callee's declaration line.
         thrown: u32,
+        /// Uncaught-display message when it differs from `message`
+        /// (param TypeErrors show "... and defined in FILE:M").
+        full_msg: String,
+        /// ParseError raised inside eval()'d code: the inner source line.
+        /// Uncaught display uses the plain `Parse error:` form
+        /// (`in FILE(N) : eval()'d code on line M` — tests/lang/019).
+        eval_ctx: u32,
+        /// Call stack snapshot at construction → getTrace() (tests/lang/038).
+        frames: Rc<Vec<TraceFrame>>,
     },
     /// DateTime, closures-as-objects, etc. — opaque marker.
     None,

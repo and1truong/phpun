@@ -1,20 +1,33 @@
 use crate::ast::*;
 use crate::error::PhpError;
-use crate::lexer::{lex, Lexed, Token};
+use crate::lexer::{lex, lex_with, Lexed, Token};
 use std::rc::Rc;
 
 pub struct Parser<'a> {
     toks: &'a [Lexed],
     pos: usize,
+    /// Compile-time deprecation diagnostics (msg, line) — PHP emits them
+    /// before execution; `parse_with` prepends them as `Stmt::Deprecated`.
+    deprecations: Vec<(String, usize)>,
 }
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
-    let toks = lex(src)?;
+    parse_with(src, false)
+}
+
+/// `parse` honoring `short_open_tag` (INI `short_open_tag=On`).
+pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
+    let toks = lex_with(src, short_open)?;
     let mut p = Parser {
         toks: &toks,
         pos: 0,
+        deprecations: Vec::new(),
     };
-    p.program()
+    let mut stmts = p.program()?;
+    for (i, (msg, line)) in std::mem::take(&mut p.deprecations).into_iter().enumerate() {
+        stmts.insert(i, Stmt::Deprecated { msg, line });
+    }
+    Ok(stmts)
 }
 
 /// Parse a standalone PHP expression source (used for string interpolation).
@@ -24,6 +37,7 @@ pub fn parse_expr_src(src: &str) -> Result<Expr, PhpError> {
     let mut p = Parser {
         toks: &toks,
         pos: 0,
+        deprecations: Vec::new(),
     };
     let e = p.expr()?;
     Ok(e)
@@ -140,16 +154,42 @@ impl<'a> Parser<'a> {
                 v.push(self.stmt()?);
             }
             Ok(v)
-        } else if self.eat_op(":") {
-            // Alternative syntax: if: ... endif; etc. — not yet supported.
-            Err(PhpError::parse(
-                "syntax error, alternative syntax (endif/endwhile/...) not supported",
-                self.line(),
-            ))
         } else {
             let l = self.line();
             Ok(vec![Stmt::Line(l), self.stmt()?])
         }
+    }
+
+    /// Like `body()` but also accepts PHP's `:` alternative syntax:
+    /// `: stmts end<kw>;` (tests/lang/008, 028, 033).
+    fn body_any(&mut self, end: &str) -> Result<Vec<Stmt>, PhpError> {
+        if self.eat_op(":") {
+            let v = self.body_until(&[end])?;
+            self.pos += 1; // end<kw>
+            self.eat_op(";");
+            return Ok(v);
+        }
+        self.body()
+    }
+
+    /// Statements up to (not consuming) any terminator keyword — the
+    /// body of a `:` alternative-syntax block.
+    fn body_until(&mut self, stops: &[&str]) -> Result<Vec<Stmt>, PhpError> {
+        let mut v = Vec::new();
+        loop {
+            if stops.iter().any(|s| self.ident_is(s)) {
+                break;
+            }
+            if self.peek().is_none() {
+                return Err(PhpError::parse(
+                    "syntax error, unexpected end of file",
+                    self.line(),
+                ));
+            }
+            v.push(Stmt::Line(self.line()));
+            v.push(self.stmt()?);
+        }
+        Ok(v)
     }
 
     fn stmt(&mut self) -> Result<Stmt, PhpError> {
@@ -181,7 +221,7 @@ impl<'a> Parser<'a> {
                     self.expect_op("(")?;
                     let cond = self.expr()?;
                     self.expect_op(")")?;
-                    let body = self.body()?;
+                    let body = self.body_any("endwhile")?;
                     Ok(Stmt::While { cond, body })
                 } else if self.ident_is("do") {
                     self.pos += 1;
@@ -229,8 +269,10 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     let mut names = Vec::new();
                     loop {
-                        match self.next() {
-                            Some(Token::Variable(n)) => names.push(n),
+                        match self.peek().cloned() {
+                            Some(Token::Variable(_)) | Some(Token::Op("$")) => {
+                                names.push(self.expr()?);
+                            }
                             _ => {
                                 return Err(PhpError::parse(
                                     "syntax error, unexpected token, expecting variable",
@@ -345,6 +387,7 @@ impl<'a> Parser<'a> {
 
     /// `static $a = 1, $b;` — persistent function-local vars.
     fn static_stmt(&mut self) -> Result<Stmt, PhpError> {
+        let line = self.line();
         self.pos += 1; // static
         let mut vars = Vec::new();
         loop {
@@ -371,7 +414,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op(";")?;
-        Ok(Stmt::Static(vars))
+        Ok(Stmt::Static { vars, line })
     }
 
     fn switch_stmt(&mut self) -> Result<Stmt, PhpError> {
@@ -379,11 +422,19 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let cond = self.expr()?;
         self.expect_op(")")?;
-        self.expect_op("{")?;
+        let alt = self.eat_op(":");
+        if !alt {
+            self.expect_op("{")?;
+        }
         let mut cases: Vec<(Option<Expr>, Vec<Stmt>)> = Vec::new();
         let mut cur: Option<Vec<Stmt>> = None;
         loop {
-            if self.eat_op("}") {
+            if alt && self.ident_is("endswitch") {
+                self.pos += 1;
+                self.eat_op(";");
+                break;
+            }
+            if !alt && self.eat_op("}") {
                 break;
             }
             if self.peek().is_none() {
@@ -396,10 +447,15 @@ impl<'a> Parser<'a> {
                 if let Some(b) = cur.take() {
                     cases.last_mut().unwrap().1 = b;
                 }
+                let cl = self.line();
                 self.pos += 1;
                 let e = self.expr()?;
                 if !self.eat_op(":") {
                     self.expect_op(";")?;
+                    self.deprecations.push((
+                        "Case statements followed by a semicolon (;) are deprecated, use a colon (:) instead".into(),
+                        cl,
+                    ));
                 }
                 cases.push((Some(e), Vec::new()));
                 cur = Some(Vec::new());
@@ -407,9 +463,14 @@ impl<'a> Parser<'a> {
                 if let Some(b) = cur.take() {
                     cases.last_mut().unwrap().1 = b;
                 }
+                let cl = self.line();
                 self.pos += 1;
                 if !self.eat_op(":") {
                     self.expect_op(";")?;
+                    self.deprecations.push((
+                        "Case statements followed by a semicolon (;) are deprecated, use a colon (:) instead".into(),
+                        cl,
+                    ));
                 }
                 cases.push((None, Vec::new()));
                 cur = Some(Vec::new());
@@ -444,7 +505,7 @@ impl<'a> Parser<'a> {
             (None, first)
         };
         self.expect_op(")")?;
-        let body = self.body()?;
+        let body = self.body_any("endforeach")?;
         let key = key.map(|t| match t {
             ForeachTarget::Var(n) => ForeachKey::Var(n),
             ForeachTarget::ByRef(_) => ForeachKey::ByRef,
@@ -596,7 +657,7 @@ impl<'a> Parser<'a> {
             Ok(decl)
         } else {
             // `declare(...) { }` / `declare(...):` block forms.
-            let body = self.body()?;
+            let body = self.body_any("enddeclare")?;
             Ok(Stmt::Block(vec![decl, Stmt::Block(body)]))
         }
     }
@@ -907,6 +968,21 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         while !self.at_op(")") {
             self.skip_attrs();
+            // promoted ctor params: visibility/readonly precede the type
+            // (`public int $x`, `public $errno` — error_2_exception_001).
+            let mut promoted = false;
+            for _ in 0..3 {
+                if self.ident_is("public")
+                    || self.ident_is("private")
+                    || self.ident_is("protected")
+                    || self.ident_is("readonly")
+                {
+                    self.pos += 1;
+                    promoted = true;
+                } else {
+                    break;
+                }
+            }
             // skip type declaration before the variable
             let ty = if matches!(
                 self.peek(),
@@ -919,24 +995,6 @@ impl<'a> Parser<'a> {
             };
             let by_ref = self.eat_op("&");
             let variadic = self.eat_op("...");
-            // promoted constructor params may carry visibility
-            for _ in 0..3 {
-                if self.ident_is("public")
-                    || self.ident_is("private")
-                    || self.ident_is("protected")
-                    || self.ident_is("readonly")
-                {
-                    self.pos += 1;
-                } else {
-                    break;
-                }
-            }
-            if matches!(self.peek(), Some(Token::Ident(_)))
-                && !matches!(self.peek2(), Some(Token::Variable(_)))
-            {
-                // trailing type after visibility (e.g. `private int $x`)
-                self.skip_type()?;
-            }
             let pname = match self.next() {
                 Some(Token::Variable(n)) => n,
                 t => {
@@ -960,6 +1018,7 @@ impl<'a> Parser<'a> {
                 by_ref,
                 variadic,
                 ty,
+                promoted,
             });
             if !self.eat_op(",") {
                 break;
@@ -974,49 +1033,55 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let cond = self.expr()?;
         self.expect_op(")")?;
-        let then = self.body()?;
+        let alt = self.at_op(":");
+        let arm_body = |p: &mut Self, stops: &[&str]| -> Result<Vec<Stmt>, PhpError> {
+            if alt {
+                p.expect_op(":")?;
+                p.body_until(stops)
+            } else {
+                p.body()
+            }
+        };
+        let then = if alt {
+            self.pos += 1;
+            self.body_until(&["elseif", "else", "endif"])?
+        } else {
+            self.body()?
+        };
+        let mut arms: Vec<(Expr, Vec<Stmt>)> = vec![(cond, then)];
         let mut else_ = Vec::new();
-        {
+        loop {
             if self.ident_is("elseif") {
                 self.pos += 1;
                 self.expect_op("(")?;
                 let c = self.expr()?;
                 self.expect_op(")")?;
-                let b = self.body()?;
-                else_ = vec![Stmt::If {
-                    cond: c,
-                    then: b,
-                    else_: Vec::new(),
-                }];
-                // chain deeper elseif/else inside this nested If
-                let mut tail = match else_.last_mut() {
-                    Some(Stmt::If { else_, .. }) => else_,
-                    _ => unreachable!(),
-                };
-                while self.ident_is("elseif") {
-                    self.pos += 1;
-                    self.expect_op("(")?;
-                    let c = self.expr()?;
-                    self.expect_op(")")?;
-                    let b = self.body()?;
-                    *tail = vec![Stmt::If {
-                        cond: c,
-                        then: b,
-                        else_: Vec::new(),
-                    }];
-                    tail = match tail.last_mut() {
-                        Some(Stmt::If { else_, .. }) => else_,
-                        _ => unreachable!(),
-                    };
-                }
-                if self.ident_is("else") {
-                    self.pos += 1;
-                    *tail = self.body()?;
-                }
-            } else if self.ident_is("else") {
-                self.pos += 1;
-                else_ = self.body()?;
+                let b = arm_body(self, &["elseif", "else", "endif"])?;
+                arms.push((c, b));
+                continue;
             }
+            if self.ident_is("else") {
+                self.pos += 1;
+                else_ = arm_body(self, &["endif"])?;
+            }
+            break;
+        }
+        if alt {
+            if !self.eat_ident("endif") {
+                return Err(PhpError::parse(
+                    "syntax error, unexpected end of file, expecting \"endif\"",
+                    self.line(),
+                ));
+            }
+            self.eat_op(";");
+        }
+        let (cond, then) = arms.remove(0);
+        for (c, b) in arms.into_iter().rev() {
+            else_ = vec![Stmt::If {
+                cond: c,
+                then: b,
+                else_,
+            }];
         }
         Ok(Stmt::If { cond, then, else_ })
     }
@@ -1040,7 +1105,7 @@ impl<'a> Parser<'a> {
         }
         self.expect_op(")")?;
         // foreach is a different keyword; plain for body here.
-        let body = self.body()?;
+        let body = self.body_any("endfor")?;
         Ok(Stmt::For {
             init,
             cond,
@@ -1333,14 +1398,35 @@ impl<'a> Parser<'a> {
                 // `new $a[i][j]` — dims belong to the class-name expr
                 // (engine_assignExecutionOrder_007), not the new object.
                 let mut e = Expr::Var(n);
-                while self.eat_op("[") {
-                    let i = if self.at_op("]") {
-                        None
+                loop {
+                    if self.eat_op("[") {
+                        let i = if self.at_op("]") {
+                            None
+                        } else {
+                            Some(Box::new(self.expr()?))
+                        };
+                        self.expect_op("]")?;
+                        e = Expr::Index { e: Box::new(e), i };
+                    } else if self.eat_op("->") {
+                        // `new $this->prop` (bug21669); `->m()` stays ctor args.
+                        match self.next() {
+                            Some(Token::Ident(pn)) => {
+                                e = Expr::Prop {
+                                    obj: Box::new(e),
+                                    name: PropName::Name(pn),
+                                    nullsafe: false,
+                                };
+                            }
+                            _ => {
+                                return Err(PhpError::parse(
+                                    "syntax error, unexpected token, expecting property name",
+                                    self.line(),
+                                ))
+                            }
+                        }
                     } else {
-                        Some(Box::new(self.expr()?))
-                    };
-                    self.expect_op("]")?;
-                    e = Expr::Index { e: Box::new(e), i };
+                        break;
+                    }
                 }
                 Ok((e, Vec::new()))
             }

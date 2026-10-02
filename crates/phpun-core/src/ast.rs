@@ -5,6 +5,12 @@ use std::rc::Rc;
 pub enum Stmt {
     /// Parser-injected line marker — updates Interp::cur_line.
     Line(usize),
+    /// Parser-injected compile-time deprecation (e.g. `case e;` —
+    /// tests/lang/033). PHP prints these before execution begins.
+    Deprecated {
+        msg: String,
+        line: usize,
+    },
     Inline(String),
     Echo(Vec<Expr>),
     Expr(Expr),
@@ -32,9 +38,15 @@ pub enum Stmt {
     Return(Option<Expr>),
     Break(Option<Expr>),
     Continue(Option<Expr>),
-    Global(Vec<String>),
-    /// `static $a = 1, $b;` — function-local persistent vars.
-    Static(Vec<(String, Option<Expr>)>),
+    /// `global $a, $$b;` — each item is normally `Expr::Var`; `Expr::VarVar`
+    /// resolves the global name dynamically (tests/lang/bug24396).
+    Global(Vec<Expr>),
+    /// `static $a = 1, $b;` — function-local persistent vars. `line` is the
+    /// `static` keyword line (redeclaration detection).
+    Static {
+        vars: Vec<(String, Option<Expr>)>,
+        line: usize,
+    },
     Switch {
         cond: Expr,
         cases: Vec<(Option<Expr>, Vec<Stmt>)>,
@@ -180,6 +192,10 @@ pub struct Param {
     /// Declared type members in source order; "null" included when the
     /// type is explicitly nullable (`?T` or `T|null`).
     pub ty: Option<Vec<String>>,
+    /// Constructor property promotion (`public $errno` in `__construct`):
+    /// declare the prop and auto-assign at call time
+    /// (error_2_exception_001).
+    pub promoted: bool,
 }
 
 #[derive(Debug, Clone)]

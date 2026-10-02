@@ -58,7 +58,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "var_export" => {
             let v = arg(args, 0);
             let ret = arg(args, 1).is_truthy();
-            let s = var_export(&v);
+            let s = var_export(it, &v);
             if ret {
                 Value::str(s)
             } else {
@@ -771,7 +771,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 } else {
                     n - off
                 };
-                let tail: Vec<(ArrKey, Cell)> = arr.entries.drain(..).collect();
+                let tail: Vec<(ArrKey, Cell)> = std::mem::take(&mut arr.entries);
                 let (head, rest) = tail.split_at(off as usize);
                 let (cut, tail2) = rest.split_at((len as usize).min(rest.len()));
                 for (k, c) in cut {
@@ -1583,6 +1583,12 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         // ----- constants / functions -----
         "define" => {
             let n = arg_str(it, args, 0);
+            if n.contains("::") {
+                return err(
+                    "ValueError",
+                    "define(): Argument #1 ($constant_name) cannot be a class constant",
+                );
+            }
             let v = arg(args, 1);
             it.define_const(&n, v);
             Value::Bool(true)
@@ -1593,6 +1599,10 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "constant" => {
             let n = arg_str(it, args, 0);
+            if n.contains("::") {
+                let cls = n.split_once("::").map(|(c, _)| c).unwrap_or_default();
+                return err("Error", format!("Class \"{}\" not found", cls));
+            }
             match it.const_get(&n) {
                 Some(v) => v,
                 None => return err("Error", format!("Undefined constant {}", n)),
@@ -1798,7 +1808,11 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "restore_error_handler" | "restore_exception_handler" => Value::Bool(true),
         "trigger_error" | "user_error" => {
             let msg = arg_str(it, args, 0);
-            it.warn_pub(&msg);
+            // E_USER_WARNING=512 / E_USER_NOTICE=1024 / E_USER_DEPRECATED=
+            // 16384 select the diagnostic label + errno seen by the handler
+            // (error_2_exception_001, bug21094). Default is E_USER_NOTICE.
+            let level = args.get(1).map(|c| c.borrow().to_int()).unwrap_or(1024);
+            it.emit_diag_pub(level, &msg)?;
             Value::Bool(true)
         }
         "error_reporting" => {
@@ -1994,7 +2008,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     it.warn_pub(&format!(
                         "file_get_contents({}): Failed to open stream: {}",
                         path, e
-                    ));
+                    ))?;
                     Value::Bool(false)
                 }
             }
@@ -2019,7 +2033,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     it.warn_pub(&format!(
                         "file_put_contents({}): Failed to open stream: {}",
                         path, e
-                    ));
+                    ))?;
                     Value::Bool(false)
                 }
             }
@@ -2187,7 +2201,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     })))
                 }
                 Err(e) => {
-                    it.warn_pub(&format!("fopen({}): Failed to open stream: {}", path, e));
+                    it.warn_pub(&format!("fopen({}): Failed to open stream: {}", path, e))?;
                     Value::Bool(false)
                 }
             }
@@ -2297,7 +2311,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     Value::Array(Rc::new(RefCell::new(a)))
                 }
                 Err(_) => {
-                    it.warn_pub(&format!("file({}): Failed to open stream", path));
+                    it.warn_pub(&format!("file({}): Failed to open stream", path))?;
                     Value::Bool(false)
                 }
             }
@@ -2311,7 +2325,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     Value::Int(b.len() as i64)
                 }
                 Err(_) => {
-                    it.warn_pub(&format!("readfile({}): Failed to open stream", path));
+                    it.warn_pub(&format!("readfile({}): Failed to open stream", path))?;
                     Value::Bool(false)
                 }
             }
@@ -2410,7 +2424,24 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "get_extension_funcs" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
         "dl" => Value::Bool(false),
-        "assert" | "assert_options" => Value::Bool(true),
+        "assert" => {
+            let v = arg(args, 0);
+            if v.is_truthy() {
+                Value::Bool(true)
+            } else {
+                return err("AssertionError", "assert(false)");
+            }
+        }
+        "assert_options" => Value::Bool(true),
+        "setlocale" => {
+            // No real locale switching — echo the first locale string.
+            let loc = arg_str(it, args, 1);
+            if loc.is_empty() {
+                Value::str("C")
+            } else {
+                Value::str(loc)
+            }
+        }
         "cli_set_process_title" | "cli_get_process_title" => Value::Bool(true),
         "sleep" => {
             let n = arg(args, 0).to_int().clamp(0, 60);
@@ -2807,12 +2838,12 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
         Value::Bool(b) => it.emit(&format!("{}{}bool({})\n", pad, r, b)),
         Value::Int(i) => it.emit(&format!("{}{}int({})\n", pad, r, i)),
         Value::Float(f) => {
-            // var_dump uses serialize_precision=-1 → shortest repr.
+            let prec = it.ini_int("serialize_precision", -1);
             it.emit(&format!(
                 "{}{}float({})\n",
                 pad,
                 r,
-                crate::value::format_float_repr(*f)
+                crate::value::format_float_prec(*f, prec)
             ))
         }
         Value::Str(s) => it.emit(&format!("{}{}string({}) \"{}\"\n", pad, r, s.len(), s)),
@@ -2917,16 +2948,29 @@ fn print_r(_it: &mut Interp, v: &Value, indent: usize) -> String {
             s.push(')');
             s
         }
+        Value::Float(f) => {
+            let prec = _it.ini_int("precision", 14);
+            crate::value::format_float_prec(*f, prec)
+        }
         other => other.to_php_string(),
     }
 }
 
-fn var_export(v: &Value) -> String {
+fn var_export(it: &mut Interp, v: &Value) -> String {
     match v {
         Value::Null => "NULL".into(),
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
-        Value::Float(f) => crate::value::format_float_repr(*f),
+        Value::Float(f) => {
+            let prec = it.ini_int("serialize_precision", -1);
+            let s = crate::value::format_float_prec(*f, prec);
+            // var_export always renders a decimal point: 0.0, 100.0.
+            if s.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+                format!("{}.0", s)
+            } else {
+                s
+            }
+        }
         Value::Str(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")),
         Value::Array(a) => {
             let a = a.borrow();
@@ -2941,7 +2985,7 @@ fn var_export(v: &Value) -> String {
                     ArrKey::Tomb => continue,
                 });
                 s.push_str(" => ");
-                s.push_str(&var_export(&c.borrow()));
+                s.push_str(&var_export(it, &c.borrow()));
                 s.push_str(",\n");
             }
             s.push(')');
@@ -2953,7 +2997,7 @@ fn var_export(v: &Value) -> String {
             for n in &ob.prop_order {
                 if let Some(c) = ob.props.get(n) {
                     s.push_str(&format!("   '{}' => ", n));
-                    s.push_str(&var_export(&c.borrow()));
+                    s.push_str(&var_export(it, &c.borrow()));
                     s.push_str(",\n");
                 }
             }
@@ -4087,7 +4131,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
             let re = match php_regex(&pat) {
                 Some(r) => r,
                 None => {
-                    it.warn_pub(&format!("preg_match(): Invalid regex '{}'", pat));
+                    it.warn_pub(&format!("preg_match(): Invalid regex '{}'", pat))?;
                     return Ok(Value::Bool(false));
                 }
             };

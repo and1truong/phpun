@@ -108,10 +108,24 @@ const KEYWORDS: &[&str] = &[
 
 /// Two-mode PHP lexer: outside `<?php`/`<?=`/`<?` everything is inline HTML.
 pub fn lex(src: &str) -> Result<Vec<Lexed>, PhpError> {
+    lex_with(src, false)
+}
+
+/// `lex` with `short_open_tag` — when on, `<?` opens PHP like `<?php`.
+pub fn lex_with(src: &str, short_open: bool) -> Result<Vec<Lexed>, PhpError> {
+    // CLI PHP skips a leading `#!...` shebang line (tests/lang/bug23584).
+    let (src, shebang) = match src.strip_prefix("#!") {
+        Some(rest) => match rest.find('\n') {
+            Some(nl) => (&rest[nl + 1..], true),
+            None => ("", true),
+        },
+        None => (src, false),
+    };
     let mut out = Vec::new();
     let bytes = src.as_bytes();
     let mut pos = 0usize;
-    let mut line = 1usize;
+    // The shebang occupies line 1; real numbering starts at line 2.
+    let mut line = if shebang { 2 } else { 1 };
 
     while pos < bytes.len() {
         // Inline HTML until an open tag.
@@ -137,15 +151,16 @@ pub fn lex(src: &str) -> Result<Vec<Lexed>, PhpError> {
                     pos = tag_at + 3;
                     push(&mut out, Token::Echo, line);
                     pos = lex_php(src, pos, &mut line, &mut out)?;
-                } else if rest[off..].starts_with("<?\n")
-                    || rest[off..].starts_with("<?\r")
-                    || rest[off..].starts_with("<?\t")
-                    || rest[off..].starts_with("<? ")
+                } else if short_open
+                    && (rest[off..].starts_with("<?\n")
+                        || rest[off..].starts_with("<?\r")
+                        || rest[off..].starts_with("<?\t")
+                        || rest[off..].starts_with("<? "))
                 {
-                    // Short open tag — only honored when short_open_tag is on;
-                    // our default matches run-tests (off) → treat as inline text.
-                    push(&mut out, Token::Inline("<?".to_string()), line);
+                    // `<?` with short_open_tag=on opens PHP mode.
                     pos = tag_at + 2;
+                    pos += skip_ws_and_newline(&src[pos..], &mut line);
+                    pos = lex_php(src, pos, &mut line, &mut out)?;
                 } else {
                     push(&mut out, Token::Inline("<?".to_string()), line);
                     pos = tag_at + 2;

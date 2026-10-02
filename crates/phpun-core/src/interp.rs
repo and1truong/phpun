@@ -11,7 +11,8 @@ use crate::lexer::StringPart;
 use crate::parser;
 use crate::value::{
     compare, format_float_repr, identical, numeric, to_key, trace_arg, ArrKey, CallableKind, Cell,
-    Numeric, ObjectInternal, PhpArray, PhpCallable, PhpClass, PhpObject, PhpResource, Value,
+    Numeric, ObjectInternal, PhpArray, PhpCallable, PhpClass, PhpObject, PhpResource, TraceFrame,
+    Value,
 };
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -79,10 +80,15 @@ pub struct Interp<'a> {
     statics: HashMap<String, HashMap<String, Cell>>,
     /// Global static vars (`static` at top level).
     global_statics: HashMap<String, Cell>,
+    /// static-decl sites per function scope (fn key → var → source line) —
+    /// PHP fatals on a same-scope redeclaration at a different site.
+    static_decls: HashMap<String, HashMap<String, usize>>,
     /// include_once/require_once registry (canonical paths).
     included: HashSet<std::path::PathBuf>,
     /// Pending exception carried across an Err(Throw) return.
     pending_exception: Option<Value>,
+    /// Live call stack (user + builtin) for getTrace() snapshots.
+    call_trace: Vec<TraceFrame>,
     /// Pending fatal error message for exceptions raised as PhpError.
     res_counter: u64,
     shutdown_fns: Vec<(Value, Vec<Cell>)>,
@@ -101,6 +107,8 @@ pub struct Interp<'a> {
     /// Live object handles for PHP's var_dump `#N` id: the lowest freed
     /// slot is reused, matching Zend's object store recycling.
     obj_handles: Vec<std::rc::Weak<RefCell<PhpObject>>>,
+    /// `-d` ini settings (e.g. short_open_tag=on).
+    pub ini: HashMap<String, String>,
 }
 
 /// Result of a top-level program run.
@@ -147,6 +155,14 @@ impl<'a> Interp<'a> {
         constants.insert("E_CORE_WARNING".into(), Value::Int(32));
         constants.insert("E_COMPILE_ERROR".into(), Value::Int(64));
         constants.insert("E_COMPILE_WARNING".into(), Value::Int(128));
+        // Locale categories (glibc values).
+        constants.insert("LC_CTYPE".into(), Value::Int(0));
+        constants.insert("LC_NUMERIC".into(), Value::Int(1));
+        constants.insert("LC_TIME".into(), Value::Int(2));
+        constants.insert("LC_COLLATE".into(), Value::Int(3));
+        constants.insert("LC_MONETARY".into(), Value::Int(4));
+        constants.insert("LC_MESSAGES".into(), Value::Int(5));
+        constants.insert("LC_ALL".into(), Value::Int(6));
         let mut it = Self {
             file,
             globals: Frame::new(String::new()),
@@ -161,8 +177,10 @@ impl<'a> Interp<'a> {
             silence: 0,
             statics: HashMap::new(),
             global_statics: HashMap::new(),
+            static_decls: HashMap::new(),
             included: HashSet::new(),
             pending_exception: None,
+            call_trace: Vec::new(),
             res_counter: 0,
             shutdown_fns: Vec::new(),
             error_handler: None,
@@ -173,6 +191,7 @@ impl<'a> Interp<'a> {
             cur_line: 1,
             pending_decl_class: None,
             obj_handles: Vec::new(),
+            ini: HashMap::new(),
         };
         it.register_builtin_classes();
         it
@@ -344,6 +363,7 @@ impl<'a> Interp<'a> {
             ("DivisionByZeroError", "ArithmeticError"),
             ("CompileError", "Error"),
             ("ParseError", "CompileError"),
+            ("AssertionError", "Error"),
             ("UnhandledMatchError", "Error"),
         ] {
             reg(
@@ -398,8 +418,21 @@ impl<'a> Interp<'a> {
     }
 
     /// Convenience: parse+run a source string (used by tests and the CLI).
+    /// INI integer value with default (e.g. precision=14).
+    pub fn ini_int(&self, k: &str, dflt: i64) -> i64 {
+        self.ini.get(k).and_then(|s| s.parse().ok()).unwrap_or(dflt)
+    }
+
+    /// INI truthiness — PHP accepts 1/On/true/yes case-insensitively.
+    pub fn ini_on(&self, k: &str) -> bool {
+        match self.ini.get(k).map(|s| s.to_lowercase()) {
+            Some(v) => matches!(v.as_str(), "1" | "on" | "true" | "yes"),
+            None => false,
+        }
+    }
+
     pub fn run_source(&mut self, src: &str) -> RunResult {
-        match parser::parse(src) {
+        match parser::parse_with(src, self.ini_on("short_open_tag")) {
             Ok(stmts) => self.run(&stmts),
             Err(e) => {
                 self.print_parse(&e);
@@ -420,7 +453,7 @@ impl<'a> Interp<'a> {
             Some(c) => Ok(c.borrow().clone()),
             None => {
                 if self.silence == 0 {
-                    self.warn(&format!("Undefined variable ${}", name));
+                    self.warn(&format!("Undefined variable ${}", name))?;
                 }
                 Ok(Value::Null)
             }
@@ -469,14 +502,15 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn warn(&mut self, msg: &str) {
-        if self.silence > 0 || self.error_level & 2 == 0 {
-            return;
-        }
+    /// Shared diagnostic path: Warning/Notice/Deprecated all route through
+    /// a user error handler first (PHP semantics); the handler's error —
+    /// e.g. a thrown Error2Exception — propagates to the caller (038).
+    /// Only a literal `false` return lets the builtin handler continue.
+    fn emit_diag(&mut self, level: &str, errno: i64, msg: &str) -> Result<(), PhpError> {
         if self.error_handler.is_some() && !self.in_handler {
             let h = self.error_handler.clone().unwrap();
             let args: Vec<Cell> = vec![
-                cell(Value::Int(2)),
+                cell(Value::Int(errno)),
                 cell(Value::str(msg)),
                 cell(Value::str(self.file)),
                 cell(Value::Int(self.cur_line as i64)),
@@ -484,13 +518,21 @@ impl<'a> Interp<'a> {
             self.in_handler = true;
             let r = self.call_value(&h, args);
             self.in_handler = false;
-            if let Ok(v) = r {
-                if v.is_truthy() {
-                    return;
-                }
+            match r {
+                Err(e) => return Err(e),
+                Ok(v) if !matches!(v, Value::Bool(false)) => return Ok(()),
+                Ok(_) => {}
             }
         }
-        self.diag("Warning", msg);
+        self.diag(level, msg);
+        Ok(())
+    }
+
+    fn warn(&mut self, msg: &str) -> Result<(), PhpError> {
+        if self.silence > 0 || self.error_level & 2 == 0 {
+            return Ok(());
+        }
+        self.emit_diag("Warning", 2, msg)
     }
 
     /// Public wrapper so builtins can share PHP's float→int coercion.
@@ -527,18 +569,18 @@ impl<'a> Interp<'a> {
     }
 
     #[allow(dead_code)]
-    fn notice(&mut self, msg: &str) {
+    fn notice(&mut self, msg: &str) -> Result<(), PhpError> {
         if self.silence > 0 || self.error_level & 8 == 0 {
-            return;
+            return Ok(());
         }
-        self.diag("Notice", msg);
+        self.emit_diag("Notice", 8, msg)
     }
 
-    fn deprecated(&mut self, msg: &str) {
+    fn deprecated(&mut self, msg: &str) -> Result<(), PhpError> {
         if self.silence > 0 || self.error_level & 8192 == 0 {
-            return;
+            return Ok(());
         }
-        self.diag("Deprecated", msg);
+        self.emit_diag("Deprecated", 8192, msg)
     }
 
     /// error_reporting([$level]) — returns previous level.
@@ -597,12 +639,15 @@ impl<'a> Interp<'a> {
                 .get("message")
                 .map(|c| c.borrow().to_php_string())
                 .unwrap_or_default();
-            let (file, line, thrown, tr) = match &o.internal {
+            let (file, line, thrown, tr, msg, eval_ctx) = match &o.internal {
                 Some(ObjectInternal::Exception {
                     file,
                     line,
                     trace,
                     thrown,
+                    full_msg,
+                    eval_ctx,
+                    ..
                 }) => (
                     file.clone(),
                     *line,
@@ -612,18 +657,35 @@ impl<'a> Interp<'a> {
                     } else {
                         trace.clone()
                     },
+                    if full_msg.is_empty() {
+                        msg
+                    } else {
+                        full_msg.clone()
+                    },
+                    *eval_ctx,
                 ),
                 _ => (
                     self.file.to_string(),
                     self.cur_line as u32,
                     self.cur_line as u32,
                     "#0 {main}".to_string(),
+                    msg,
+                    0,
                 ),
             };
-            self.emit(&format!(
-                "\nFatal error: Uncaught {}: {} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
-                class, msg, file, line, tr, file, thrown
-            ));
+            if eval_ctx > 0 {
+                // ParseError inside eval'd code prints the plain
+                // `Parse error:` form (tests/lang/019).
+                self.emit(&format!(
+                    "\nParse error: {} in {}({}) : eval()'d code on line {}\n",
+                    msg, file, line, eval_ctx
+                ));
+            } else {
+                self.emit(&format!(
+                    "\nFatal error: Uncaught {}: {} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
+                    class, msg, file, line, tr, file, thrown
+                ));
+            }
         } else {
             self.print_fatal(&PhpError::fatal("Can only throw objects", self.cur_line));
         }
@@ -657,6 +719,9 @@ impl<'a> Interp<'a> {
                 line: self.cur_line as u32,
                 trace: String::new(),
                 thrown: self.cur_line as u32,
+                full_msg: String::new(),
+                eval_ctx: 0,
+                frames: Rc::new(self.call_trace.clone()),
             });
             if !o.prop_order.contains(&"message".into()) {
                 o.prop_order.push("message".into());
@@ -672,6 +737,7 @@ impl<'a> Interp<'a> {
         PhpError {
             trace: None,
             thrown_line: None,
+            display_msg: None,
             kind: ErrorKind::Throw,
             message: "throw".into(),
             line: self.cur_line,
@@ -680,7 +746,16 @@ impl<'a> Interp<'a> {
 
     /// Builtin call — errors become catchable throwables via `fail`.
     fn call_builtin(&mut self, name: &str, args: &[Cell]) -> Result<Option<Value>, PhpError> {
-        match builtins::call(self, name, args) {
+        self.call_trace.push(TraceFrame {
+            function: name.to_string(),
+            class: None,
+            ty: String::new(),
+            file: self.file.to_string(),
+            line: self.cur_line as u32,
+        });
+        let r = builtins::call(self, name, args);
+        self.call_trace.pop();
+        match r {
             Ok(r) => Ok(r),
             Err(e) => self.fail(e),
         }
@@ -696,6 +771,7 @@ impl<'a> Interp<'a> {
                     trace,
                     thrown,
                     line,
+                    full_msg,
                     ..
                 }) = &mut o.borrow_mut().internal
                 {
@@ -711,12 +787,16 @@ impl<'a> Interp<'a> {
                         *thrown = l as u32;
                         *line = l as u32;
                     }
+                    if let Some(m) = &e.display_msg {
+                        *full_msg = m.clone();
+                    }
                 }
             }
             self.pending_exception = Some(v);
             return Err(PhpError {
                 trace: None,
                 thrown_line: None,
+                display_msg: None,
                 kind: ErrorKind::Throw,
                 message: e.message,
                 line: e.line,
@@ -740,6 +820,13 @@ impl<'a> Interp<'a> {
             Stmt::Line(l) => {
                 self.cur_line = *l;
                 Flow::Normal
+            }
+            Stmt::Deprecated { msg, line } => {
+                self.cur_line = *line;
+                match self.deprecated(msg) {
+                    Ok(()) => Flow::Normal,
+                    Err(e) => self.err_flow(e),
+                }
             }
             Stmt::Inline(t) => {
                 self.emit(t);
@@ -872,9 +959,22 @@ impl<'a> Interp<'a> {
                 self.register_class(d.clone());
                 Flow::Normal
             }
-            Stmt::Static(vars) => {
+            Stmt::Static { vars, line } => {
                 let key = self.fn_statics_key();
                 for (name, default) in vars {
+                    // `static $a` redeclared at a different site in the same
+                    // scope is a compile fatal (tests/lang/static_basic_002).
+                    let prev = self
+                        .static_decls
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(name.clone(), *line);
+                    if prev.is_some_and(|l| l != *line) {
+                        return self.err_flow(PhpError::fatal(
+                            format!("Duplicate declaration of static variable ${}", name),
+                            self.cur_line,
+                        ));
+                    }
                     let exists = {
                         let table = if self.stack.is_empty() {
                             &self.global_statics
@@ -931,15 +1031,34 @@ impl<'a> Interp<'a> {
                 Flow::Continue(n)
             }
             Stmt::Global(names) => {
-                // Bind each local name to its global cell.
-                for name in names {
+                // Bind each local name to its global cell. `$$x` resolves
+                // the name dynamically (bug24396).
+                for e in names {
+                    let name = match e {
+                        Expr::Var(n) => n.clone(),
+                        // `global $$b` — the global name is $b's value.
+                        Expr::VarVar(inner) => match self.eval(inner) {
+                            Ok(v) => match self.conv_str(&v) {
+                                Ok(s) => s,
+                                Err(e) => return self.err_flow(e),
+                            },
+                            Err(e) => return self.err_flow(e),
+                        },
+                        other => match self.eval(other) {
+                            Ok(v) => match self.conv_str(&v) {
+                                Ok(s) => s,
+                                Err(e) => return self.err_flow(e),
+                            },
+                            Err(e) => return self.err_flow(e),
+                        },
+                    };
                     let gcell = self
                         .globals
                         .vars
                         .entry(name.clone())
                         .or_insert_with(|| cell(Value::Null))
                         .clone();
-                    self.cur().vars.insert(name.clone(), gcell);
+                    self.cur().vars.insert(name, gcell);
                 }
                 Flow::Normal
             }
@@ -1336,10 +1455,12 @@ impl<'a> Interp<'a> {
                 Flow::Normal
             }
             _ => {
-                self.warn(&format!(
+                if let Err(e) = self.warn(&format!(
                     "foreach() argument must be of type array|object, {} given",
                     src.debug_type()
-                ));
+                )) {
+                    return self.err_flow(e);
+                }
                 Flow::Normal
             }
         }
@@ -1573,6 +1694,7 @@ impl<'a> Interp<'a> {
                 Err(PhpError {
                     trace: None,
                     thrown_line: None,
+                    display_msg: None,
                     kind: ErrorKind::Fatal,
                     message: format!("\u{1}exit:{}", code),
                     line: 0,
@@ -1590,6 +1712,7 @@ impl<'a> Interp<'a> {
                         Err(PhpError {
                             trace: None,
                             thrown_line: None,
+                            display_msg: None,
                             kind: ErrorKind::Throw,
                             message: "throw".into(),
                             line: 0,
@@ -1623,6 +1746,7 @@ impl<'a> Interp<'a> {
                     Err(PhpError {
                         trace: None,
                         thrown_line: None,
+                        display_msg: None,
                         kind: ErrorKind::Throw,
                         message: "match".into(),
                         line: 0,
@@ -1700,11 +1824,17 @@ impl<'a> Interp<'a> {
                                     line,
                                     trace,
                                     thrown,
+                                    full_msg,
+                                    eval_ctx,
+                                    frames,
                                 }) => Some(ObjectInternal::Exception {
                                     file: file.clone(),
                                     line: *line,
                                     trace: trace.clone(),
                                     thrown: *thrown,
+                                    full_msg: full_msg.clone(),
+                                    eval_ctx: *eval_ctx,
+                                    frames: frames.clone(),
                                 }),
                                 _ => None,
                             },
@@ -1725,6 +1855,7 @@ impl<'a> Interp<'a> {
                         Err(PhpError {
                             trace: None,
                             thrown_line: None,
+                            display_msg: None,
                             kind: ErrorKind::Throw,
                             message: "clone".into(),
                             line: 0,
@@ -1847,7 +1978,7 @@ impl<'a> Interp<'a> {
     fn conv_str(&mut self, v: &Value) -> Result<String, PhpError> {
         match v {
             Value::Array(_) => {
-                self.warn("Array to string conversion");
+                self.warn("Array to string conversion")?;
                 Ok("Array".into())
             }
             Value::Object(o) => {
@@ -1865,6 +1996,7 @@ impl<'a> Interp<'a> {
                     Err(PhpError {
                         trace: None,
                         thrown_line: None,
+                        display_msg: None,
                         kind: ErrorKind::Throw,
                         message: "cast".into(),
                         line: 0,
@@ -1880,10 +2012,15 @@ impl<'a> Interp<'a> {
                 Err(PhpError {
                     trace: None,
                     thrown_line: None,
+                    display_msg: None,
                     kind: ErrorKind::Throw,
                     message: "cast".into(),
                     line: 0,
                 })
+            }
+            Value::Float(f) => {
+                let prec = self.ini_int("precision", 14);
+                Ok(crate::value::format_float_prec(*f, prec))
             }
             _ => Ok(v.to_php_string()),
         }
@@ -1915,6 +2052,7 @@ impl<'a> Interp<'a> {
         Err(PhpError {
             trace: None,
             thrown_line: None,
+            display_msg: None,
             kind: ErrorKind::Throw,
             message: "const".into(),
             line: 0,
@@ -2056,7 +2194,7 @@ impl<'a> Interp<'a> {
         } else {
             Value::Null
         };
-        let newv = match op {
+        let mut newv = match op {
             "=" => rhs,
             "+=" => self.arith("+", cur, rhs)?,
             "-=" => self.arith("-", cur, rhs)?,
@@ -2111,7 +2249,7 @@ impl<'a> Interp<'a> {
                 *c.borrow_mut() = newv.clone();
             }
             Late::Keyed { e, keys } => {
-                self.assign_index_path(&e, &keys, newv.clone())?;
+                newv = self.assign_index_path(&e, &keys, newv)?;
             }
             Late::None => match target_cell {
                 Some(c) => {
@@ -2231,13 +2369,14 @@ impl<'a> Interp<'a> {
             Expr::List(items) => {
                 // PHP reads each [i] positionally — a missing key warns
                 // "Undefined array key i" (engine_assignExecutionOrder_002).
-                let vals: Vec<Value> = (0..items.len())
-                    .map(|i| match &v {
+                let mut vals: Vec<Value> = Vec::with_capacity(items.len());
+                for (i, slot) in items.iter().enumerate() {
+                    let vi = match &v {
                         Value::Array(a) => match a.borrow().get(&ArrKey::Int(i as i64)) {
                             Some(v) => v,
                             None => {
-                                if items[i].is_some() {
-                                    self.warn(&format!("Undefined array key {}", i));
+                                if slot.is_some() {
+                                    self.warn(&format!("Undefined array key {}", i))?;
                                 }
                                 Value::Null
                             }
@@ -2246,12 +2385,13 @@ impl<'a> Interp<'a> {
                             if items[i].is_some() {
                                 // list() on a non-array warns "Cannot use T
                                 // as array" (engine_assignExecutionOrder_002).
-                                self.warn(&format!("Cannot use {} as array", other.debug_type()));
+                                self.warn(&format!("Cannot use {} as array", other.debug_type()))?;
                             }
                             Value::Null
                         }
-                    })
-                    .collect();
+                    };
+                    vals.push(vi);
+                }
                 for (i, t) in items.iter().enumerate() {
                     if let Some(t) = t {
                         self.store(t, vals[i].clone())?;
@@ -2302,7 +2442,7 @@ impl<'a> Interp<'a> {
                     "Attempt to assign property \"{}\" on {}",
                     pn,
                     ov.gettype()
-                ));
+                ))?;
                 Ok(())
             }
         }
@@ -2321,20 +2461,23 @@ impl<'a> Interp<'a> {
     /// time (Zend ASSIGN_DIM semantics): intermediate scalar levels produce
     /// "Cannot use T as array" warnings; a scalar base for a single-level
     /// write throws "Cannot use a scalar value as an array".
+    /// Returns the effective stored value: string-offset writes return the
+    /// byte actually stored, everything else echoes `v` (bug22592: chained
+    /// `$a[i] = $a[j] = $s` only warns for the first write).
     fn assign_index_path(
         &mut self,
         e: &Expr,
         keys: &[Option<Value>],
         v: Value,
-    ) -> Result<(), PhpError> {
+    ) -> Result<Value, PhpError> {
         let mut c = self.eval_cell(e)?;
         let last = keys.len() - 1;
         for (n, k) in keys.iter().enumerate() {
             match self.index_into_key(c.clone(), k.clone()) {
                 Ok(nc) => {
                     if n == last {
-                        *nc.borrow_mut() = v;
-                        return Ok(());
+                        *nc.borrow_mut() = v.clone();
+                        return Ok(v);
                     }
                     c = nc;
                 }
@@ -2343,20 +2486,46 @@ impl<'a> Interp<'a> {
                     if is_str {
                         // String offset write (final level only).
                         let mut b = c.borrow_mut();
-                        if let Value::Str(s) = &mut *b {
+                        let mut bytes = match &*b {
+                            Value::Str(s) => s.as_bytes().to_vec(),
+                            _ => Vec::new(),
+                        };
+                        if matches!(*b, Value::Str(_)) {
                             let vs = self.conv_str(&v).unwrap_or_default();
-                            let mut bytes = s.as_bytes().to_vec();
-                            let idx = k
-                                .as_ref()
-                                .map(|k| k.to_int() as usize)
-                                .unwrap_or(bytes.len());
+                            let byte = vs.as_bytes().first().copied().unwrap_or(b' ');
+                            // PHP 8: negative offsets index from the end;
+                            // beyond -len stays illegal (bug22592).
+                            let idx_i =
+                                k.as_ref().map(|k| k.to_int()).unwrap_or(bytes.len() as i64);
+                            let idx_i = if idx_i < 0 {
+                                idx_i + bytes.len() as i64
+                            } else {
+                                idx_i
+                            };
+                            if idx_i < 0 {
+                                drop(b);
+                                let orig = k.as_ref().map(|k| k.to_int()).unwrap_or_default();
+                                self.warn(&format!("Illegal string offset {}", orig))?;
+                                return Ok(v);
+                            }
+                            let idx = idx_i as usize;
                             if idx >= bytes.len() {
                                 bytes.resize(idx + 1, b' ');
                             }
-                            bytes[idx] = vs.as_bytes().first().copied().unwrap_or(b' ');
-                            *s = String::from_utf8_lossy(&bytes).into_owned().into();
+                            bytes[idx] = byte;
+                            if vs.len() > 1 {
+                                drop(b);
+                                self.warn(
+                                    "Only the first byte will be assigned to the string offset",
+                                )?;
+                                b = c.borrow_mut();
+                            }
+                            if let Value::Str(s) = &mut *b {
+                                *s = String::from_utf8_lossy(&bytes).into_owned().into();
+                            }
+                            return Ok(Value::str(String::from_utf8_lossy(&[byte]).into_owned()));
                         }
-                        return Ok(());
+                        return Ok(v);
                     }
                     let t = c.borrow().debug_type();
                     if keys.len() == 1 {
@@ -2366,12 +2535,12 @@ impl<'a> Interp<'a> {
                             self.cur_line,
                         ));
                     }
-                    self.warn(&format!("Cannot use {} as array", t));
-                    return Ok(());
+                    self.warn(&format!("Cannot use {} as array", t))?;
+                    return Ok(v);
                 }
             }
         }
-        Ok(())
+        Ok(v)
     }
 
     /// `set_index` with an already-evaluated key.
@@ -2419,13 +2588,33 @@ impl<'a> Interp<'a> {
                         let mut bytes = s.as_bytes().to_vec();
                         match key {
                             Some(k) => {
-                                let idx = k.to_int() as usize;
+                                // PHP 8: negative offsets index from the
+                                // end; beyond -len is illegal (bug22592).
+                                let orig = k.to_int();
+                                let idx = if orig < 0 {
+                                    orig + bytes.len() as i64
+                                } else {
+                                    orig
+                                };
+                                if idx < 0 {
+                                    drop(b);
+                                    self.warn(&format!("Illegal string offset {}", orig))?;
+                                    return Ok(());
+                                }
+                                let idx = idx as usize;
                                 let vs = self.conv_str(&v).unwrap_or_default();
                                 let vb = vs.as_bytes();
                                 if idx >= bytes.len() {
                                     bytes.resize(idx + 1, b' ');
                                 }
                                 bytes[idx] = vb.first().copied().unwrap_or(b' ');
+                                if vs.len() > 1 {
+                                    drop(b);
+                                    self.warn(
+                                        "Only the first byte will be assigned to the string offset",
+                                    )?;
+                                    return Ok(());
+                                }
                             }
                             None => bytes.extend_from_slice(v.to_php_string().as_bytes()),
                         }
@@ -2458,15 +2647,33 @@ impl<'a> Interp<'a> {
                             if let Value::Str(s) = &mut *b {
                                 let vs = self.conv_str(&v).unwrap_or_default();
                                 let mut bytes = s.as_bytes().to_vec();
-                                let idx = key
+                                let orig = key
                                     .as_ref()
-                                    .map(|k| k.to_int() as usize)
-                                    .unwrap_or(bytes.len());
+                                    .map(|k| k.to_int())
+                                    .unwrap_or(bytes.len() as i64);
+                                let idx = if orig < 0 {
+                                    orig + bytes.len() as i64
+                                } else {
+                                    orig
+                                };
+                                if idx < 0 {
+                                    drop(b);
+                                    self.warn(&format!("Illegal string offset {}", orig))?;
+                                    return Ok(());
+                                }
+                                let idx = idx as usize;
                                 if idx >= bytes.len() {
                                     bytes.resize(idx + 1, b' ');
                                 }
                                 bytes[idx] = vs.as_bytes().first().copied().unwrap_or(b' ');
+                                let multi = vs.len() > 1;
                                 *s = String::from_utf8_lossy(&bytes).into_owned().into();
+                                if multi {
+                                    drop(b);
+                                    self.warn(
+                                        "Only the first byte will be assigned to the string offset",
+                                    )?;
+                                }
                             }
                             Ok(())
                         }
@@ -2475,7 +2682,7 @@ impl<'a> Interp<'a> {
                         Ok(bc) => {
                             let t = bc.borrow().debug_type();
                             drop(bc);
-                            self.warn(&format!("Cannot use {} as array", t));
+                            self.warn(&format!("Cannot use {} as array", t))?;
                             Ok(())
                         }
                         _ => Err(e2),
@@ -2609,7 +2816,7 @@ impl<'a> Interp<'a> {
                             other => other.to_php_string(),
                         };
                         if self.silence == 0 {
-                            self.warn(&format!("Undefined array key {}", shown));
+                            self.warn(&format!("Undefined array key {}", shown))?;
                         }
                         Ok(Value::Null)
                     }
@@ -2625,7 +2832,7 @@ impl<'a> Interp<'a> {
                 };
                 if idx < 0 || idx as usize >= bytes.len() {
                     if self.silence == 0 {
-                        self.warn(&format!("Uninitialized string offset {}", key.to_int()));
+                        self.warn(&format!("Uninitialized string offset {}", key.to_int()))?;
                     }
                     Ok(Value::Null)
                 } else {
@@ -2637,7 +2844,9 @@ impl<'a> Interp<'a> {
             }
             Value::Null => {
                 if self.silence == 0 {
-                    self.warn("Trying to access array offset on value of type null");
+                    // PHP 8.5 dropped "value of type" from this message
+                    // (bug25922, passByReference_003).
+                    self.warn("Trying to access array offset on null")?;
                 }
                 Ok(Value::Null)
             }
@@ -2645,16 +2854,19 @@ impl<'a> Interp<'a> {
                 // ArrayAccess? basic prop fallback — try get
                 let _ = o;
                 if self.silence == 0 {
-                    self.warn(&format!("Cannot use object of type {} as array", ""));
+                    self.warn(&format!("Cannot use object of type {} as array", ""))?;
                 }
                 Ok(Value::Null)
             }
             _ => {
                 if self.silence == 0 {
-                    self.warn(&format!(
-                        "Trying to access array offset on value of type {}",
-                        base.type_name().to_lowercase()
-                    ));
+                    // PHP 8.5 names the scalar itself: int/float/null and
+                    // the literal true|false (no "value of type").
+                    let what = match &base {
+                        Value::Bool(b) => b.to_string(),
+                        _ => base.type_name().to_lowercase(),
+                    };
+                    self.warn(&format!("Trying to access array offset on {}", what))?;
                 }
                 Ok(Value::Null)
             }
@@ -2694,38 +2906,18 @@ impl<'a> Interp<'a> {
     }
 
     fn incdec(&mut self, target: &Expr, delta: i64, post: bool) -> Result<Value, PhpError> {
+        // PHP warns on undefined vars/props/keys during ++/-- (bug25547).
         let old = match target {
-            Expr::Var(name) => {
-                self.silence += 1;
-                let v = self.var_get(name).unwrap_or(Value::Null);
-                self.silence -= 1;
-                v
-            }
-            Expr::Index { e, i } => {
-                self.silence += 1;
-                let v = self.index_read(e, i.as_deref()).unwrap_or(Value::Null);
-                self.silence -= 1;
-                v
-            }
-            Expr::Prop { .. } => {
-                self.silence += 1;
-                let v = self.prop_read_loose(target).unwrap_or(Value::Null);
-                self.silence -= 1;
-                v
-            }
+            Expr::Var(name) => self.var_get(name).unwrap_or(Value::Null),
+            Expr::Index { e, i } => self.index_read(e, i.as_deref()).unwrap_or(Value::Null),
+            Expr::Prop { .. } => self.prop_read_loose(target).unwrap_or(Value::Null),
             Expr::VarVar(inner) => {
                 let n = self.eval(inner)?;
                 let name = self.conv_str(&n)?;
-                self.silence += 1;
-                let v = self.var_get(&name).unwrap_or(Value::Null);
-                self.silence -= 1;
-                v
+                self.var_get(&name).unwrap_or(Value::Null)
             }
             Expr::StaticProp { class, name } => {
-                self.silence += 1;
-                let v = self.static_prop_read(class, name).unwrap_or(Value::Null);
-                self.silence -= 1;
-                v
+                self.static_prop_read(class, name).unwrap_or(Value::Null)
             }
             _ => {
                 return self.fail(PhpError::fatal(
@@ -2734,15 +2926,15 @@ impl<'a> Interp<'a> {
                 ))
             }
         };
-        let new = self.incdec_value(&old, delta);
+        let new = self.incdec_value(&old, delta)?;
         self.store(target, new.clone())?;
         Ok(if post { old } else { new })
     }
 
     /// PHP inc/dec semantics: null++ = 1, null-- = null, strings increment
     /// alphanumerically (Perl-style), numeric strings go numeric.
-    fn incdec_value(&mut self, v: &Value, delta: i64) -> Value {
-        match v {
+    fn incdec_value(&mut self, v: &Value, delta: i64) -> Result<Value, PhpError> {
+        Ok(match v {
             Value::Null => {
                 if delta > 0 {
                     Value::Int(1)
@@ -2770,18 +2962,18 @@ impl<'a> Interp<'a> {
                     if delta > 0 {
                         self.deprecated(
                             "Increment on non-numeric string is deprecated, use str_increment() instead",
-                        );
+                        )?;
                         Value::str(perl_inc(s))
                     } else {
                         self.deprecated(
                             "Decrement on non-numeric string has no effect and is deprecated",
-                        );
+                        )?;
                         v.clone()
                     }
                 }
             },
             _ => v.clone(),
-        }
+        })
     }
 
     fn unary(&mut self, op: &'static str, e: &Expr) -> Result<Value, PhpError> {
@@ -2806,7 +2998,7 @@ impl<'a> Interp<'a> {
                         },
                         Numeric::Float(f) => Value::Float(-f),
                         Numeric::Leading(f, is_int) => {
-                            self.warn("A non-numeric value encountered");
+                            self.warn("A non-numeric value encountered")?;
                             if is_int {
                                 Value::Int(-(f as i64))
                             } else {
@@ -2833,7 +3025,7 @@ impl<'a> Interp<'a> {
                         Numeric::Int(i) => Value::Int(i),
                         Numeric::Float(f) => Value::Float(f),
                         Numeric::Leading(f, is_int) => {
-                            self.warn("A non-numeric value encountered");
+                            self.warn("A non-numeric value encountered")?;
                             if is_int {
                                 Value::Int(f as i64)
                             } else {
@@ -3006,10 +3198,10 @@ impl<'a> Interp<'a> {
         let (ln, warn_l) = self.num(&l);
         let (rn, warn_r) = self.num(&r);
         if warn_l {
-            self.warn("A non-numeric value encountered");
+            self.warn("A non-numeric value encountered")?;
         }
         if warn_r {
-            self.warn("A non-numeric value encountered");
+            self.warn("A non-numeric value encountered")?;
         }
         let (ln, rn) = match (ln, rn) {
             (Some(a), Some(b)) => (a, b),
@@ -3049,11 +3241,33 @@ impl<'a> Interp<'a> {
             "%" => {
                 let a = match ln {
                     Num::I(i) => i,
-                    Num::F(f) => coerce_float(f, |m| self.warn(m)),
+                    Num::F(f) => {
+                        let mut werr = None;
+                        let i = coerce_float(f, |m| {
+                            if let Err(e) = self.warn(m) {
+                                werr = Some(e);
+                            }
+                        });
+                        if let Some(e) = werr {
+                            return Err(e);
+                        }
+                        i
+                    }
                 };
                 let b = match rn {
                     Num::I(i) => i,
-                    Num::F(f) => coerce_float(f, |m| self.warn(m)),
+                    Num::F(f) => {
+                        let mut werr = None;
+                        let i = coerce_float(f, |m| {
+                            if let Err(e) = self.warn(m) {
+                                werr = Some(e);
+                            }
+                        });
+                        if let Some(e) = werr {
+                            return Err(e);
+                        }
+                        i
+                    }
                 };
                 if b == 0 {
                     return self.fail(PhpError::uncaught(
@@ -3101,10 +3315,30 @@ impl<'a> Interp<'a> {
         if let Value::Str(s) = v {
             match numeric(s) {
                 Numeric::Int(i) => return Ok(i),
-                Numeric::Float(f) => return Ok(coerce_float(f, |m| self.warn(m))),
+                Numeric::Float(f) => {
+                    let mut werr = None;
+                    let i = coerce_float(f, |m| {
+                        if let Err(e) = self.warn(m) {
+                            werr = Some(e);
+                        }
+                    });
+                    if let Some(e) = werr {
+                        return Err(e);
+                    }
+                    return Ok(i);
+                }
                 Numeric::Leading(f, _) => {
-                    self.warn("A non-numeric value encountered");
-                    return Ok(coerce_float(f, |m| self.warn(m)));
+                    self.warn("A non-numeric value encountered")?;
+                    let mut werr = None;
+                    let i = coerce_float(f, |m| {
+                        if let Err(e) = self.warn(m) {
+                            werr = Some(e);
+                        }
+                    });
+                    if let Some(e) = werr {
+                        return Err(e);
+                    }
+                    return Ok(i);
                 }
                 Numeric::NonNumeric => {
                     return Err(PhpError::uncaught(
@@ -3135,7 +3369,9 @@ impl<'a> Interp<'a> {
             },
             _ => return v.to_int(),
         };
-        coerce_float(f, |msg| self.warn(msg))
+        coerce_float(f, |msg| {
+            let _ = self.warn(msg);
+        })
     }
 
     /// `(type)expr` cast.
@@ -3418,7 +3654,33 @@ impl<'a> Interp<'a> {
         // Callee `Stmt::Line` markers must not leak into the caller:
         // diagnostics after the call report the call-site line.
         let saved_line = self.cur_line;
+        let fr = self
+            .stack
+            .last()
+            .map(|f| TraceFrame {
+                function: f.fn_name.clone(),
+                class: f.scope_class.as_ref().map(|c| c.name().to_string()),
+                ty: if f.this_obj.is_some() {
+                    "->"
+                } else if f.scope_class.is_some() {
+                    "::"
+                } else {
+                    ""
+                }
+                .to_string(),
+                file: self.file.to_string(),
+                line: saved_line as u32,
+            })
+            .unwrap_or_else(|| TraceFrame {
+                function: decl.name.clone(),
+                class: None,
+                ty: String::new(),
+                file: self.file.to_string(),
+                line: saved_line as u32,
+            });
+        self.call_trace.push(fr);
         let r = self.bind_and_run_inner(decl, args, unused);
+        self.call_trace.pop();
         self.cur_line = saved_line;
         r
     }
@@ -3447,7 +3709,7 @@ impl<'a> Interp<'a> {
                         self.deprecated(&format!(
                             "{}(): Implicitly marking parameter ${} as nullable is deprecated, the explicit nullable type must be used instead",
                             fname, p.name
-                        ));
+                        ))?;
                     }
                 }
                 Some(Expr::Int(_)) | Some(Expr::Float(_)) | Some(Expr::Str(_))
@@ -3576,18 +3838,19 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let given = self.zval_type_name(&v);
+                // getMessage() is the short form; the uncaught display
+                // appends ` and defined in FILE:M` (catchable_error_002).
                 let msg = format!(
-                    "{}(): Argument #{} (${}) must be of type {}, {} given, called in {} on line {} and defined in {}:{}",
+                    "{}(): Argument #{} (${}) must be of type {}, {} given, called in {} on line {}",
                     fname,
                     i + 1,
                     p.name,
                     disp.join("|"),
                     given,
                     self.file,
-                    self.cur_line,
-                    self.file,
-                    decl.line
+                    self.cur_line
                 );
+                let display = format!("{} and defined in {}:{}", msg, self.file, decl.line);
                 let argdesc = args
                     .iter()
                     .map(|a| trace_arg(&a.borrow()))
@@ -3599,6 +3862,7 @@ impl<'a> Interp<'a> {
                 let mut e = PhpError::uncaught("TypeError", msg, call_line);
                 e.trace = Some(vec![frame]);
                 e.thrown_line = Some(decl.line);
+                e.display_msg = Some(display);
                 return self.fail(e);
             }
         }
@@ -3642,6 +3906,21 @@ impl<'a> Interp<'a> {
             for a in &args[fa.len().min(args.len())..] {
                 fa.push(a.clone());
             }
+            // Promoted ctor params: declare+assign $this->{name}
+            // (error_2_exception_001).
+            let is_ctor = decl.name.eq_ignore_ascii_case("__construct");
+            for (i, p) in decl.params.iter().enumerate() {
+                if p.promoted && is_ctor {
+                    if let Some(obj) = &frame.this_obj {
+                        let v = binds[i].1.borrow().clone();
+                        let mut o = obj.borrow_mut();
+                        o.props.insert(p.name.clone(), cell(v));
+                        if !o.prop_order.contains(&p.name) {
+                            o.prop_order.push(p.name.clone());
+                        }
+                    }
+                }
+            }
             for (n, c) in binds {
                 frame.vars.insert(n, c);
             }
@@ -3656,6 +3935,7 @@ impl<'a> Interp<'a> {
                 Err(PhpError {
                     trace: None,
                     thrown_line: None,
+                    display_msg: None,
                     kind: ErrorKind::Throw,
                     message: "throw".into(),
                     line: 0,
@@ -3664,6 +3944,7 @@ impl<'a> Interp<'a> {
             Flow::Exit(c) => Err(PhpError {
                 trace: None,
                 thrown_line: None,
+                display_msg: None,
                 kind: ErrorKind::Fatal,
                 message: format!("\u{1}exit:{}", c),
                 line: 0,
@@ -3941,6 +4222,9 @@ impl<'a> Interp<'a> {
                 line: self.cur_line as u32,
                 trace: String::new(),
                 thrown: self.cur_line as u32,
+                full_msg: String::new(),
+                eval_ctx: 0,
+                frames: Rc::new(self.call_trace.clone()),
             })
         } else {
             None
@@ -4010,14 +4294,14 @@ impl<'a> Interp<'a> {
                 if cls.find_method("__get").is_some() {
                     return self.method_invoke(o.clone(), "__get", vec![cell(Value::str(pn))]);
                 }
-                self.warn(&format!("Undefined property: {}::${}", cls.name(), pn));
+                self.warn(&format!("Undefined property: {}::${}", cls.name(), pn))?;
                 Ok(Value::Null)
             }
             Value::Null => {
                 if nullsafe {
                     return Ok(Value::Null);
                 }
-                self.warn(&format!("Attempt to read property \"{}\" on null", pn));
+                self.warn(&format!("Attempt to read property \"{}\" on null", pn))?;
                 Ok(Value::Null)
             }
             other => {
@@ -4026,7 +4310,7 @@ impl<'a> Interp<'a> {
                         "Attempt to read property \"{}\" on {}",
                         pn,
                         other.gettype()
-                    ));
+                    ))?;
                 }
                 Ok(Value::Null)
             }
@@ -4169,11 +4453,15 @@ impl<'a> Interp<'a> {
         };
         let cls = obj.borrow().class.clone();
         if is_throwable {
-            // Native method only when the resolved method is a builtin stub
-            // (empty body); a userland override always runs.
-            let stub = cls
-                .find_method(name)
-                .map(|m| m.decl.body.is_empty())
+            // Native method only when the resolved method is a builtin
+            // registration (line 0 — userland always runs, even an empty
+            // body: `__construct(public $x) {}` still promotes).
+            // find_method_in walks the parent chain so inherited stubs
+            // (Exception::getTrace on a userland subclass) resolve
+            // (tests/lang/038, error_2_exception_001).
+            let stub = self
+                .find_method_in(&cls, name)
+                .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
                 .unwrap_or(false);
             if stub {
                 if let Some(v) = self.throwable_method(&obj, name, &args) {
@@ -4238,7 +4526,36 @@ impl<'a> Interp<'a> {
                 Some(ObjectInternal::Exception { line, .. }) => Some(Value::Int(*line as i64)),
                 _ => Some(Value::Int(self.cur_line as i64)),
             },
-            "gettrace" => Some(Value::Array(Rc::new(RefCell::new(PhpArray::new())))),
+            "gettrace" => {
+                let mut arr = PhpArray::new();
+                let frames: Vec<TraceFrame> = match &ob.internal {
+                    Some(ObjectInternal::Exception { frames, .. }) => (**frames).clone(),
+                    _ => Vec::new(),
+                };
+                // PHP orders innermost call first (tests/lang/038).
+                for fr in frames.iter().rev() {
+                    let mut f = PhpArray::new();
+                    f.set(
+                        ArrKey::Str(fr.file.as_str().into()),
+                        Value::str(fr.file.clone()),
+                    );
+                    f.set(ArrKey::Str("line".into()), Value::Int(fr.line as i64));
+                    f.set(
+                        ArrKey::Str("function".into()),
+                        Value::str(fr.function.clone()),
+                    );
+                    if let Some(c) = &fr.class {
+                        f.set(ArrKey::Str("class".into()), Value::str(c.clone()));
+                        f.set(ArrKey::Str("type".into()), Value::str(fr.ty.clone()));
+                    }
+                    f.set(
+                        ArrKey::Str("args".into()),
+                        Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+                    );
+                    arr.push(Value::Array(Rc::new(RefCell::new(f))));
+                }
+                Some(Value::Array(Rc::new(RefCell::new(arr))))
+            }
             "gettraceasstring" => match &ob.internal {
                 Some(ObjectInternal::Exception { trace, .. }) if !trace.is_empty() => {
                     Some(Value::str(trace.clone()))
@@ -4548,7 +4865,7 @@ impl<'a> Interp<'a> {
                     },
                     self.file,
                     path_s,
-                ));
+                ))?;
                 match kind {
                     IncludeKind::Include | IncludeKind::IncludeOnce => return Ok(Value::Bool(false)),
                     _ => {
@@ -4576,7 +4893,7 @@ impl<'a> Interp<'a> {
                 self.warn(&format!(
                     "include({}): Failed to open stream: {}",
                     path_s, e
-                ));
+                ))?;
                 return Ok(Value::Bool(false));
             }
         };
@@ -4599,6 +4916,7 @@ impl<'a> Interp<'a> {
             Flow::Exit(c) => Err(PhpError {
                 trace: None,
                 thrown_line: None,
+                display_msg: None,
                 kind: ErrorKind::Fatal,
                 message: format!("\u{1}exit:{}", c),
                 line: 0,
@@ -4608,6 +4926,7 @@ impl<'a> Interp<'a> {
                 Err(PhpError {
                     trace: None,
                     thrown_line: None,
+                    display_msg: None,
                     kind: ErrorKind::Throw,
                     message: "throw".into(),
                     line: 0,
@@ -4639,6 +4958,7 @@ impl<'a> Interp<'a> {
                     Flow::Exit(c) => Err(PhpError {
                         trace: None,
                         thrown_line: None,
+                        display_msg: None,
                         kind: ErrorKind::Fatal,
                         message: format!("\u{1}exit:{}", c),
                         line: 0,
@@ -4648,6 +4968,7 @@ impl<'a> Interp<'a> {
                         Err(PhpError {
                             trace: None,
                             thrown_line: None,
+                            display_msg: None,
                             kind: ErrorKind::Throw,
                             message: "throw".into(),
                             line: 0,
@@ -4658,10 +4979,19 @@ impl<'a> Interp<'a> {
             }
             Err(e) => {
                 let v = self.exception("ParseError", &e.message);
+                if let Value::Object(o) = &v {
+                    if let Some(ObjectInternal::Exception { eval_ctx, .. }) =
+                        &mut o.borrow_mut().internal
+                    {
+                        // `<?php\n` prepend shifts inner lines by one.
+                        *eval_ctx = e.line.saturating_sub(1) as u32;
+                    }
+                }
                 self.pending_exception = Some(v);
                 Err(PhpError {
                     trace: None,
                     thrown_line: None,
+                    display_msg: None,
                     kind: ErrorKind::Throw,
                     message: "eval".into(),
                     line: 0,
@@ -4773,8 +5103,24 @@ impl<'a> Interp<'a> {
     pub fn var_name_set(&mut self, name: &str, v: Value) {
         self.var_set(name, v);
     }
-    pub fn warn_pub(&mut self, msg: &str) {
-        self.warn(msg);
+    pub fn warn_pub(&mut self, msg: &str) -> Result<(), PhpError> {
+        self.warn(msg)
+    }
+
+    /// Diagnostic at a caller-selected E_USER_* level (trigger_error).
+    /// Respects error_reporting masking + the silence (@) counter.
+    pub fn emit_diag_pub(&mut self, level: i64, msg: &str) -> Result<(), PhpError> {
+        if self.silence > 0 || self.error_level & level == 0 {
+            return Ok(());
+        }
+        let (name, errno) = match level {
+            512 => ("Warning", 512),
+            16384 => ("Deprecated", 16384),
+            // E_USER_ERROR=256 is uncatchable in PHP 8.4+ and aborts.
+            256 => return self.fail(PhpError::fatal(msg.to_string(), self.cur_line)),
+            _ => ("Notice", level),
+        };
+        self.emit_diag(name, errno, msg)
     }
     pub fn invoke_callable_str(&mut self, name: &str, args: Vec<Cell>) -> Result<Value, PhpError> {
         self.call_value(&Value::str(name), args)
