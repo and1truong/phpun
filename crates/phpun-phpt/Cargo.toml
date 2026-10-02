@@ -1,0 +1,10 @@
+[package]
+name = "phpun-phpt"
+description = "PHPT test harness: parses php-src test files and runs them against a PHP binary."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+regex = "1.11"

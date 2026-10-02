@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/phpun",
+    "crates/phpun-core",
+    "crates/phpun-phpt",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/and1truong/phpun"
+
+[profile.release]
+lto = true
+codegen-units = 1
