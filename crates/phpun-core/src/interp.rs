@@ -118,6 +118,17 @@ pub struct Interp<'a> {
     /// File currently executing — include resolution uses its directory
     /// (PHP checks include_path, then the calling file's dir, then cwd).
     cur_file: String,
+    /// Bytes emitted so far — memory_limit bookkeeping.
+    pub mem_used: u64,
+    /// Size of the last emit — the 'tried to allocate' figure.
+    mem_last: u64,
+    /// Raised once the memory_limit fatal fired — buffers are dropped
+    /// at shutdown instead of flushed (bug45392).
+    pub mem_exceeded: bool,
+    /// Execution deadline set by set_time_limit/hard_timeout (045).
+    deadline: Option<std::time::Instant>,
+    /// Seconds figure for the 'Maximum execution time' message.
+    deadline_secs: i64,
     /// `-d` ini settings (e.g. short_open_tag=on).
     pub ini: HashMap<String, String>,
 }
@@ -225,6 +236,11 @@ impl<'a> Interp<'a> {
             destructed: HashSet::new(),
             internal_cb: 0,
             cur_file: file.to_string(),
+            mem_used: 0,
+            mem_last: 0,
+            mem_exceeded: false,
+            deadline: None,
+            deadline_secs: 0,
             ini: HashMap::new(),
         };
         // Auto-globals. PHP's $_SERVER carries env + script metadata;
@@ -425,6 +441,44 @@ impl<'a> Interp<'a> {
             },
             false,
         );
+        // DateTime — stub class whose ctor accepts an optional datetime
+        // string; exists so `new DateTime(...)` type-checks
+        // (compare_objects_basic2).
+        reg(
+            ClassDecl {
+                name: "DateTime".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                parent: None,
+                implements: vec![],
+                traits: vec![],
+                methods: vec![Rc::new(MethodDecl {
+                    decl: FunctionDecl {
+                        name: "__construct".into(),
+                        params: vec![Param {
+                            name: "datetime".into(),
+                            default: Some(Expr::Str("now".into())),
+                            by_ref: false,
+                            variadic: false,
+                            ty: Some(vec!["string".into()]),
+                            promoted: false,
+                        }],
+                        body: vec![],
+                        by_ref: false,
+                        line: 0,
+                        file: String::new(),
+                    },
+                    is_static: false,
+                    is_abstract: false,
+                    is_final: false,
+                    visibility: Visibility::Public,
+                })],
+                props: vec![],
+                consts: vec![],
+            },
+            false,
+        );
         reg(
             throwable_class("Exception", None, &["message", "code", "file", "line"]),
             false,
@@ -477,6 +531,13 @@ impl<'a> Interp<'a> {
     }
 
     pub fn run(&mut self, stmts: &[Stmt]) -> RunResult {
+        // hard_timeout ini is the absolute deadline (045).
+        let ht = self.ini_bytes("hard_timeout");
+        if ht > 0 {
+            self.deadline =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(ht as u64));
+            self.deadline_secs = ht;
+        }
         self.hoist_funcs(stmts);
         let flow = self.exec_block(stmts);
         let result = self.finish(flow);
@@ -541,7 +602,9 @@ impl<'a> Interp<'a> {
                 let _ = self.method_invoke(o.clone(), "__destruct", vec![]);
             }
         }
-        self.flush_ob_all();
+        if !self.mem_exceeded {
+            self.flush_ob_all();
+        }
     }
 
     /// Convenience: parse+run a source string (used by tests and the CLI).
@@ -664,11 +727,41 @@ impl<'a> Interp<'a> {
 
     /// Emit output through the output-buffer stack.
     pub fn emit(&mut self, s: &str) {
+        // memory_limit>0 turns into a deferred fatal once accumulated
+        // writes pass it (bug45392); checked at the next statement.
+        self.mem_used += s.len() as u64;
+        self.mem_last = s.len() as u64;
         if let Some(buf) = self.ob_stack.last_mut() {
             buf.buf.push_str(s);
         } else {
             self.out.push_str(s);
         }
+    }
+
+    /// set_time_limit(N): restart the counter for N seconds (0 =
+    /// unlimited) (045).
+    pub fn set_deadline(&mut self, secs: i64) {
+        self.deadline_secs = secs;
+        self.deadline = if secs <= 0 {
+            None
+        } else {
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(secs as u64))
+        };
+    }
+
+    /// INI byte shorthand: `2M`, `512K`, `1G`, plain ints, -1 unlimited.
+    pub fn ini_bytes(&self, k: &str) -> i64 {
+        let Some(raw) = self.ini.get(k) else {
+            return -1;
+        };
+        let s = raw.trim();
+        let (num, mul) = match s.as_bytes().last() {
+            Some(b'K') | Some(b'k') => (&s[..s.len() - 1], 1i64 << 10),
+            Some(b'M') | Some(b'm') => (&s[..s.len() - 1], 1i64 << 20),
+            Some(b'G') | Some(b'g') => (&s[..s.len() - 1], 1i64 << 30),
+            _ => (s, 1),
+        };
+        num.trim().parse::<i64>().unwrap_or(-1) * mul
     }
 
     /// Shared diagnostic path: Warning/Notice/Deprecated all route through
@@ -835,10 +928,17 @@ impl<'a> Interp<'a> {
             }
             // Plain fatals (compile errors, E_ERROR) print no trace.
             _ => {
-                self.emit(&format!(
+                let s = format!(
                     "\nFatal error: {} in {} on line {}\n",
                     e.message, self.file, e.line
-                ));
+                );
+                if self.mem_exceeded {
+                    // Memory-exhausted: buffers are dropped, so the
+                    // fatal goes straight to output (bug45392).
+                    self.out.push_str(&s);
+                } else {
+                    self.emit(&s);
+                }
             }
         }
     }
@@ -1041,6 +1141,31 @@ impl<'a> Interp<'a> {
 
     pub fn exec_block(&mut self, stmts: &[Stmt]) -> Flow {
         for s in stmts {
+            // memory_limit fires between statements (bug45392).
+            let limit = self.ini_bytes("memory_limit");
+            if limit > 0 && self.mem_used as i64 > limit {
+                self.mem_exceeded = true;
+                return self.err_flow(PhpError::fatal(
+                    format!(
+                        "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
+                        limit, self.mem_last
+                    ),
+                    self.cur_line,
+                ));
+            }
+            if let Some(d) = self.deadline {
+                if std::time::Instant::now() > d {
+                    let secs = self.deadline_secs;
+                    return self.err_flow(PhpError::fatal(
+                        format!(
+                            "Maximum execution time of {} second{} exceeded",
+                            secs,
+                            if secs == 1 { "" } else { "s" }
+                        ),
+                        self.cur_line,
+                    ));
+                }
+            }
             match self.exec(s) {
                 Flow::Normal => {}
                 f => return f,
@@ -1216,13 +1341,16 @@ impl<'a> Interp<'a> {
                             self.cur_line,
                         ));
                     }
+                    // Statics live per-function-decl: inside a function
+                    // they never fall back to the top-level table
+                    // (static_variation_001).
                     let exists = {
                         let table = if self.stack.is_empty() {
-                            &self.global_statics
+                            Some(&self.global_statics)
                         } else {
-                            self.statics.get(&key).unwrap_or(&self.global_statics)
+                            self.statics.get(&key)
                         };
-                        table.get(name).cloned()
+                        table.and_then(|t| t.get(name).cloned())
                     };
                     let cellv = match exists {
                         Some(c) => c,
@@ -2044,6 +2172,14 @@ impl<'a> Interp<'a> {
             } => self.method_call(obj, name, args, *nullsafe),
             Expr::StaticProp { class, name } => self.static_prop_read(class, name),
             Expr::StaticCall { class, name, args } => self.static_call(class, name, args),
+            Expr::StaticCallDyn { class, name, args } => {
+                // `C::$var(...)`: class resolves first, then the name.
+                let cls = self.class_of(class)?;
+                let nv = self.eval(name)?;
+                let n = self.conv_str(&nv)?;
+                let argvals = self.arg_cells(args, &[])?;
+                self.static_invoke(cls, &n, argvals)
+            }
             Expr::ClassConst { class, name } => self.class_const(class, name),
             Expr::Clone(e) => {
                 let v = self.eval(e)?;
@@ -3098,7 +3234,33 @@ impl<'a> Interp<'a> {
                 }
             }
             Value::Str(s) => {
-                let idx = key.to_int();
+                // String offset keys: a leading int is used with an
+                // 'Illegal string offset' warning when followed by
+                // non-numeric junk; a key with no leading int (or a
+                // float-shaped one) is a TypeError (bug29566).
+                let idx = match &key {
+                    Value::Str(k) => {
+                        let b = k.as_bytes();
+                        let mut i = usize::from(b.first() == Some(&b'-'));
+                        let start = i;
+                        while i < b.len() && b[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                        if i == b.len() && i > start {
+                            k.parse::<i64>().unwrap_or(0)
+                        } else if i > start && matches!(numeric(k), Numeric::Leading(_, _)) {
+                            self.warn(&format!("Illegal string offset \"{}\"", k))?;
+                            k[..i].parse::<i64>().unwrap_or(0)
+                        } else {
+                            return self.fail(PhpError::uncaught(
+                                "TypeError",
+                                "Cannot access offset of type string on string",
+                                self.cur_line,
+                            ));
+                        }
+                    }
+                    _ => key.to_int(),
+                };
                 let bytes = s.as_bytes();
                 let idx = if idx < 0 {
                     idx + bytes.len() as i64
@@ -3370,24 +3532,40 @@ impl<'a> Interp<'a> {
                 }
             }
             "." => {
-                let lv = self.eval(l)?;
-                let rv = self.eval(r)?;
+                let (lv, rv) = self.binary_operands(l, r)?;
                 let ls = self.conv_str(&lv)?;
                 let rs = self.conv_str(&rv)?;
                 Ok(Value::str(format!("{}{}", ls, rs)))
             }
             "==" | "!=" | "===" | "!==" | "<" | "<=" | ">" | ">=" | "<=>" => {
-                let lv = self.eval(l)?;
-                let rv = self.eval(r)?;
+                let (lv, rv) = self.binary_operands(l, r)?;
                 Ok(self.compare_op(op, &lv, &rv))
             }
             "named" => self.eval(r), // named-arg marker: value passthrough
             _ => {
-                let lv = self.eval(l)?;
-                let rv = self.eval(r)?;
+                let (lv, rv) = self.binary_operands(l, r)?;
                 self.arith(op, lv, rv)
             }
         }
+    }
+
+    /// Operands of a binary op: Zend binds plain CVs at op-execution —
+    /// i.e. after the right operand has run — so `$a . ($a=$b)` sees the
+    /// assigned value. Other left expressions evaluate normally first
+    /// (execution_order).
+    fn binary_operands(&mut self, l: &Expr, r: &Expr) -> Result<(Value, Value), PhpError> {
+        if let Expr::Var(n) = l {
+            let c = self.var_cell_opt(n);
+            let rv = self.eval(r)?;
+            let lv = match c {
+                Some(c) => c.borrow().clone(),
+                None => self.eval(l)?,
+            };
+            return Ok((lv, rv));
+        }
+        let lv = self.eval(l)?;
+        let rv = self.eval(r)?;
+        Ok((lv, rv))
     }
 
     fn compare_op(&self, op: &str, a: &Value, b: &Value) -> Value {
@@ -5400,7 +5578,10 @@ impl<'a> Interp<'a> {
                 }
             }
             Err(e) => {
-                let v = self.exception("ParseError", &e.message);
+                // ` on line N` inside bracket messages is padded-file
+                // relative — unshift it (syntax_errors).
+                let msg = Self::unshift_line_ref(&e.message);
+                let v = self.exception("ParseError", &msg);
                 if let Value::Object(o) = &v {
                     if let Some(ObjectInternal::Exception { eval_ctx, .. }) =
                         &mut o.borrow_mut().internal
@@ -5420,6 +5601,29 @@ impl<'a> Interp<'a> {
                 })
             }
         }
+    }
+
+    /// Rewrites ` on line N` inside an error message to N-1 — eval'd
+    /// code is parsed behind a `<?php\n` pad that shifts every line.
+    fn unshift_line_ref(msg: &str) -> String {
+        let Some(p) = msg.find(" on line ") else {
+            return msg.to_string();
+        };
+        let tail = &msg[p + 9..];
+        let digits: usize = tail
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .map(|c| c.len_utf8())
+            .sum();
+        let Ok(n) = tail[..digits].parse::<usize>() else {
+            return msg.to_string();
+        };
+        format!(
+            "{}{}{}",
+            &msg[..p + 9],
+            n.saturating_sub(1),
+            &tail[digits..]
+        )
     }
 
     /// Flush all output buffers at script end, innermost first so each

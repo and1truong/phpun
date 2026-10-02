@@ -18,6 +18,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
 /// `parse` honoring `short_open_tag` (INI `short_open_tag=On`).
 pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
     let toks = lex_with(src, short_open)?;
+    bracket_check(&toks)?;
     let mut p = Parser {
         toks: &toks,
         pos: 0,
@@ -28,6 +29,50 @@ pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
         stmts.insert(i, Stmt::Deprecated { msg, line });
     }
     Ok(stmts)
+}
+
+/// Zend-style bracket-balance pre-pass: mismatched/unclosed/mismatched
+/// closers report as `Unclosed 'X'`, `Unmatched 'Y'`,
+/// `Unclosed 'X' does not match 'Y'` (syntax_errors).
+fn bracket_check(toks: &[crate::lexer::Lexed]) -> Result<(), PhpError> {
+    let mut stack: Vec<(&'static str, usize)> = Vec::new();
+    let last_line = toks.last().map(|t| t.line).unwrap_or(1);
+    for t in toks {
+        let Token::Op(op) = &t.token else { continue };
+        match *op {
+            "(" | "[" | "{" | "#[" => stack.push((if *op == "#[" { "[" } else { op }, t.line)),
+            ")" | "]" | "}" => {
+                let open = match *op {
+                    ")" => "(",
+                    "]" => "[",
+                    _ => "{",
+                };
+                match stack.pop() {
+                    Some((o, _)) if o == open => {}
+                    Some((o, ol)) => {
+                        // Multi-line spans name the opener's line.
+                        let msg = if ol != t.line {
+                            format!("Unclosed '{}' on line {} does not match '{}'", o, ol, op)
+                        } else {
+                            format!("Unclosed '{}' does not match '{}'", o, op)
+                        };
+                        return Err(PhpError::parse(msg, t.line));
+                    }
+                    None => return Err(PhpError::parse(format!("Unmatched '{}'", op), t.line)),
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((o, ol)) = stack.pop() {
+        let msg = if ol != last_line {
+            format!("Unclosed '{}' on line {}", o, ol)
+        } else {
+            format!("Unclosed '{}'", o)
+        };
+        return Err(PhpError::parse(msg, last_line));
+    }
+    Ok(())
 }
 
 /// Parse a standalone PHP expression source (used for string interpolation).
@@ -2040,12 +2085,25 @@ impl<'a> Parser<'a> {
                         }
                     }
                     Some(Token::Variable(n)) => {
-                        // `C::$name` — a literal static prop name (unlike
-                        // `$o->$name`, which reads the variable).
-                        e = Expr::StaticProp {
-                            class: Box::new(e),
-                            name: PropName::Name(n),
-                        };
+                        if self.at_op("(") {
+                            // `C::$method()` — dynamic static call; the
+                            // name comes from the variable's value
+                            // (tests/lang/044).
+                            self.pos += 1;
+                            let args = self.args()?;
+                            e = Expr::StaticCallDyn {
+                                class: Box::new(e),
+                                name: Box::new(Expr::Var(n)),
+                                args,
+                            };
+                        } else {
+                            // `C::$name` — a literal static prop name
+                            // (unlike `$o->$name`, which reads the var).
+                            e = Expr::StaticProp {
+                                class: Box::new(e),
+                                name: PropName::Name(n),
+                            };
+                        }
                     }
                     // `Cls::{expr}` / `Cls::${expr}` — dynamic name or call.
                     Some(Token::Op("{")) => {
@@ -2202,7 +2260,8 @@ impl<'a> Parser<'a> {
                 Ok(Expr::ArrayLit(items))
             }
             Some(Token::Op("$")) => {
-                // Variable variable: `$$name` or `${expr}`.
+                // Variable variable: `$$name`, `${expr}`, or chained
+                // `$$$a` (023).
                 self.pos += 1;
                 match self.peek().cloned() {
                     Some(Token::Variable(n)) => {
@@ -2213,6 +2272,10 @@ impl<'a> Parser<'a> {
                         self.pos += 1;
                         let e = self.expr()?;
                         self.expect_op("}")?;
+                        Ok(Expr::VarVar(Box::new(e)))
+                    }
+                    Some(Token::Op("$")) => {
+                        let e = self.primary()?;
                         Ok(Expr::VarVar(Box::new(e)))
                     }
                     t => Err(PhpError::parse(

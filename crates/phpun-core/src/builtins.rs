@@ -1873,15 +1873,54 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             Value::Int(it.error_reporting(lv))
         }
         "ini_set" => {
-            // return previous value as string|false
-            Value::str(arg_str(it, args, 1))
+            // Stores into the INI table and returns the previous
+            // value (false when unset) — memory_limit, html_errors,
+            // docref_* etc. all read back through ini_get (bug45392).
+            let k = arg_str(it, args, 0);
+            let prev = it.ini.get(&k).cloned();
+            let v = arg_str(it, args, 1);
+            // Shrinking the limit under current usage refuses with a
+            // warning and leaves the old value (bug45392).
+            if k == "memory_limit" {
+                it.ini.insert(k.clone(), v);
+                let lim = it.ini_bytes(&k);
+                if lim > 0 && (it.mem_used as i64) > lim {
+                    let _ = it
+                        .ini
+                        .insert(k.clone(), prev.clone().unwrap_or_else(|| "-1".into()));
+                    it.warn_pub(&format!(
+                        "Failed to set memory limit to {} bytes (Current memory usage is {} bytes)",
+                        lim, it.mem_used
+                    ))?;
+                    return Ok(Some(match prev {
+                        Some(p) => Value::str(p),
+                        None => Value::Bool(false),
+                    }));
+                }
+            } else {
+                it.ini.insert(k, v);
+            }
+            match prev {
+                Some(p) => Value::str(p),
+                None => Value::Bool(false),
+            }
         }
-        "ini_get" => Value::Bool(false),
+        "ini_get" => {
+            let k = arg_str(it, args, 0);
+            match it.ini.get(&k) {
+                Some(v) => Value::str(v.clone()),
+                None => Value::Bool(false),
+            }
+        }
         "ini_get_all" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
         "ini_restore" => Value::Null,
         "ini_parse_quantity" => Value::Int(arg(args, 0).to_int()),
         "error_get_last" | "error_clear_last" => Value::Null,
-        "set_time_limit" => Value::Bool(true),
+        "set_time_limit" => {
+            // Restarts the seconds counter (045).
+            it.set_deadline(arg(args, 0).to_int());
+            Value::Bool(true)
+        }
         "ignore_user_abort" => Value::Int(0),
         "register_tick_function" | "unregister_tick_function" => Value::Bool(true),
 

@@ -322,7 +322,14 @@ fn lex_php(
                     pos += n;
                 } else {
                     let (op, n) = operator(src, pos).ok_or_else(|| {
-                        PhpError::parse(format!("syntax error, unexpected '{}'", c as char), *line)
+                        // Non-printable bytes report as
+                        // `unexpected character 0x7F` (bug71897).
+                        let msg = if !(0x20..0x7f).contains(&c) {
+                            format!("syntax error, unexpected character 0x{:02X}", c)
+                        } else {
+                            format!("syntax error, unexpected '{}'", c as char)
+                        };
+                        PhpError::parse(msg, *line)
                     })?;
                     push(out, Token::Op(op), *line);
                     pos += n;
@@ -677,6 +684,15 @@ fn double_string(src: &str, pos: usize, line: usize) -> Result<(Vec<StringPart>,
                                 n += 1 + len;
                             }
                         } else if src[rest..].starts_with('[') {
+                            // Quoted keys are illegal in simple
+                            // interpolation — `$arr['x']` is E_PARSE
+                            // (bug21820).
+                            if matches!(b.get(rest + 1), Some(b'\'') | Some(b'"')) {
+                                return Err(PhpError::parse(
+                                    "syntax error, unexpected string content \"\", expecting \"-\" or identifier or variable or number",
+                                    line,
+                                ));
+                            }
                             // One-dimensional index (unquoted ident/number/quoted).
                             let mut k = rest + 1;
                             while let Some(&d) = b.get(k) {

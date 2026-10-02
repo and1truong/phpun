@@ -293,6 +293,12 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// `C::$var(...)` — static call whose method name is an expression.
+    StaticCallDyn {
+        class: Box<Expr>,
+        name: Box<Expr>,
+        args: Vec<Expr>,
+    },
     ClassConst {
         class: Box<Expr>,
         name: String,
