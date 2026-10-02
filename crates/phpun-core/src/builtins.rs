@@ -1688,10 +1688,63 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             },
             _ => Value::Null,
         },
-        "get_class_vars"
-        | "get_declared_classes"
-        | "get_declared_interfaces"
-        | "get_declared_traits" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+        "get_class_vars" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+        "get_declared_classes" => {
+            let mut a = PhpArray::new();
+            for n in it.declared_names(crate::ast::ClassKind::Class) {
+                a.push(Value::str(n));
+            }
+            for n in it.declared_names(crate::ast::ClassKind::Enum) {
+                a.push(Value::str(n));
+            }
+            Value::Array(Rc::new(RefCell::new(a)))
+        }
+        "get_declared_interfaces" => {
+            let mut a = PhpArray::new();
+            for n in it.declared_names(crate::ast::ClassKind::Interface) {
+                a.push(Value::str(n));
+            }
+            Value::Array(Rc::new(RefCell::new(a)))
+        }
+        "get_declared_traits" => {
+            let mut a = PhpArray::new();
+            for n in it.declared_names(crate::ast::ClassKind::Trait) {
+                a.push(Value::str(n));
+            }
+            Value::Array(Rc::new(RefCell::new(a)))
+        }
+        "debug_print_backtrace" => {
+            it.emit(&it.format_backtrace());
+            Value::Null
+        }
+        "debug_backtrace" => {
+            let mut arr = PhpArray::new();
+            for fr in it.backtrace() {
+                let mut f = PhpArray::new();
+                if fr.file != "[internal function]" {
+                    f.set(ArrKey::Str("file".into()), Value::str(fr.file.clone()));
+                    f.set(ArrKey::Str("line".into()), Value::Int(fr.line as i64));
+                }
+                f.set(
+                    ArrKey::Str("function".into()),
+                    Value::str(fr.function.clone()),
+                );
+                if let Some(c) = &fr.class {
+                    f.set(ArrKey::Str("class".into()), Value::str(c.clone()));
+                    f.set(ArrKey::Str("type".into()), Value::str(fr.ty.clone()));
+                }
+                let mut a = PhpArray::new();
+                for av in &fr.args {
+                    a.push(av.borrow().clone());
+                }
+                f.set(
+                    ArrKey::Str("args".into()),
+                    Value::Array(Rc::new(RefCell::new(a))),
+                );
+                arr.push(Value::Array(Rc::new(RefCell::new(f))));
+            }
+            Value::Array(Rc::new(RefCell::new(arr)))
+        }
         "is_a" => match arg(args, 0) {
             Value::Object(o) => {
                 let n = arg_str(it, args, 1);

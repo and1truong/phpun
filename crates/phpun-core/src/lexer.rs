@@ -143,7 +143,10 @@ pub fn lex_with(src: &str, short_open: bool) -> Result<Vec<Lexed>, PhpError> {
                 }
                 let tag_at = pos + off;
                 let after = &src[tag_at..];
-                if after.starts_with("<?php") && boundary(after, 5) {
+                if after.len() >= 5
+                    && after[..5].eq_ignore_ascii_case("<?php")
+                    && boundary(after, 5)
+                {
                     pos = tag_at + 5;
                     pos += skip_ws_and_newline(&src[pos..], &mut line);
                     pos = lex_php(src, pos, &mut line, &mut out)?;

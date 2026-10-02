@@ -172,8 +172,17 @@ pub fn to_key(v: &Value) -> ArrKey {
 /// `#0 file(7): fn('a', 2)` / `#0 [internal function]: cb('x')`.
 /// Internal callees hide their args (PHP: no arg info for builtins).
 pub fn format_trace(frames: &[TraceFrame]) -> String {
+    let rev: Vec<TraceFrame> = frames.iter().rev().cloned().collect();
+    let mut t = format_backtrace_frames(&rev);
+    t.push_str(&format!("#{} {{main}}", frames.len()));
+    t
+}
+
+/// debug_print_backtrace() output: innermost-first frames already ordered
+/// by the caller, no `{main}` trailer.
+pub fn format_backtrace_frames(frames: &[TraceFrame]) -> String {
     let mut t = String::new();
-    for (i, fr) in frames.iter().rev().enumerate() {
+    for (i, fr) in frames.iter().enumerate() {
         let site = if fr.file == "[internal function]" {
             fr.file.clone()
         } else {
@@ -194,7 +203,6 @@ pub fn format_trace(frames: &[TraceFrame]) -> String {
         };
         t.push_str(&format!("#{} {}: {}({})\n", i, site, callee, args));
     }
-    t.push_str(&format!("#{} {{main}}", frames.len()));
     t
 }
 

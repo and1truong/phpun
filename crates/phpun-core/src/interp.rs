@@ -10,9 +10,9 @@ use crate::error::{ErrorKind, PhpError};
 use crate::lexer::StringPart;
 use crate::parser;
 use crate::value::{
-    compare, format_float_repr, format_trace, identical, numeric, to_key, trace_arg, ArrKey,
-    CallableKind, Cell, Numeric, ObjectInternal, PhpArray, PhpCallable, PhpClass, PhpObject,
-    PhpResource, TraceFrame, Value,
+    compare, format_backtrace_frames, format_float_repr, format_trace, identical, numeric, to_key,
+    trace_arg, ArrKey, CallableKind, Cell, Numeric, ObjectInternal, PhpArray, PhpCallable,
+    PhpClass, PhpObject, PhpResource, TraceFrame, Value,
 };
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -43,6 +43,8 @@ pub struct Frame {
     /// Class the running method was declared in — PHP's private
     /// property slot is keyed by the declaring class (`\0Cls\0prop`).
     decl_class: Option<Rc<PhpClass>>,
+    /// File this frame's code was declared in (include resolution base).
+    file: String,
 }
 
 impl Frame {
@@ -54,6 +56,7 @@ impl Frame {
             this_obj: None,
             scope_class: None,
             decl_class: None,
+            file: String::new(),
         }
     }
 }
@@ -109,6 +112,12 @@ pub struct Interp<'a> {
     obj_handles: Vec<std::rc::Weak<RefCell<PhpObject>>>,
     /// Object ptrs whose __destruct already ran (shutdown pass).
     destructed: HashSet<usize>,
+    /// Nonzero while a callable is invoked from inside a builtin's
+    /// internals (ob handlers) — marks its trace site internal-function.
+    internal_cb: u32,
+    /// File currently executing — include resolution uses its directory
+    /// (PHP checks include_path, then the calling file's dir, then cwd).
+    cur_file: String,
     /// `-d` ini settings (e.g. short_open_tag=on).
     pub ini: HashMap<String, String>,
 }
@@ -214,6 +223,8 @@ impl<'a> Interp<'a> {
             pending_decl_class: None,
             obj_handles: Vec::new(),
             destructed: HashSet::new(),
+            internal_cb: 0,
+            cur_file: file.to_string(),
             ini: HashMap::new(),
         };
         // Auto-globals. PHP's $_SERVER carries env + script metadata;
@@ -317,6 +328,7 @@ impl<'a> Interp<'a> {
                     body: vec![],
                     by_ref: false,
                     line: 0,
+                    file: String::new(),
                 },
                 is_static: false,
                 is_abstract: false,
@@ -356,6 +368,7 @@ impl<'a> Interp<'a> {
                             body: vec![],
                             by_ref: false,
                             line: 0,
+                            file: String::new(),
                         },
                         is_static: false,
                         is_abstract: true,
@@ -450,7 +463,21 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// PHP binds a compilation unit's unconditional top-level function
+    /// decls before executing it (bug23279's later-declared handler).
+    fn hoist_funcs(&mut self, stmts: &[Stmt]) {
+        for s in stmts {
+            if let Stmt::Function(d) = s {
+                let _ = self.decl_type_checks(&d.name, d);
+                let mut d = d.clone();
+                d.file = self.cur_file.clone();
+                self.functions.insert(d.name.to_lowercase(), Rc::new(d));
+            }
+        }
+    }
+
     pub fn run(&mut self, stmts: &[Stmt]) -> RunResult {
+        self.hoist_funcs(stmts);
         let flow = self.exec_block(stmts);
         let result = self.finish(flow);
         self.run_shutdown();
@@ -468,7 +495,13 @@ impl<'a> Interp<'a> {
                 fatal: None,
             },
             Flow::Throw(v) => {
-                self.uncaught(&v);
+                // set_exception_handler replaces the uncaught display
+                // entirely; exit is still 255 (bug23279).
+                if let Some(h) = self.exception_handler.clone() {
+                    let _ = self.call_value(&h, vec![cell(v)]);
+                } else {
+                    self.uncaught(&v);
+                }
                 RunResult {
                     exit_code: 255,
                     fatal: Some(PhpError::fatal("uncaught exception", 0)),
@@ -697,11 +730,56 @@ impl<'a> Interp<'a> {
 
     /// PHP CLI also logs a `PHP <Level>:` line to stderr, but PHPT EXPECT
     /// sections only contain the display_errors output: `\n<Level>: msg`.
+    /// html_errors=1 switches to the `<b>` docref format (bug35176).
     fn diag(&mut self, level: &str, msg: &str) {
-        self.emit(&format!(
-            "\n{}: {} in {} on line {}\n",
-            level, msg, self.file, self.cur_line
-        ));
+        if self.ini_on("html_errors") {
+            let msg = self.docref(msg);
+            self.emit(&format!(
+                "<br />\n<b>{}</b>:  {} in <b>{}</b> on line <b>{}</b><br />\n",
+                level, msg, self.file, self.cur_line
+            ));
+        } else {
+            self.emit(&format!(
+                "\n{}: {} in {} on line {}\n",
+                level, msg, self.file, self.cur_line
+            ));
+        }
+    }
+
+    /// html_errors docref: `fn(args): rest` becomes
+    /// `fn(args) [<a href='{root}function.{slug}.html'>...</a>]: rest`.
+    fn docref(&self, msg: &str) -> String {
+        let Some(p) = msg.find("): ") else {
+            return msg.to_string();
+        };
+        let Some(open) = msg.find('(') else {
+            return msg.to_string();
+        };
+        let fname = &msg[..open];
+        if fname.is_empty()
+            || !fname.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || open > p
+        {
+            return msg.to_string();
+        }
+        let args = &msg[open + 1..p];
+        let rest = &msg[p + 3..];
+        let strip_q = |s: &str| s.trim_matches('"').to_string();
+        let root = self
+            .ini
+            .get("docref_root")
+            .map(|s| strip_q(s))
+            .unwrap_or_default();
+        let ext = self
+            .ini
+            .get("docref_ext")
+            .map(|s| strip_q(s))
+            .unwrap_or_else(|| ".html".into());
+        let slug = fname.to_lowercase().replace('_', "-");
+        format!(
+            "{}({}) [<a href='{}function.{}{}'>function.{}{}</a>]: {}",
+            fname, args, root, slug, ext, slug, ext, rest
+        )
     }
 
     #[allow(dead_code)]
@@ -828,10 +906,17 @@ impl<'a> Interp<'a> {
                 self.flush_ob_all();
                 // Zend prints `Uncaught C: msg` — no colon when msg empty.
                 let colon = if msg.is_empty() { "" } else { ": " };
-                self.out.push_str(&format!(
-                    "\nFatal error: Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
-                    class, colon, msg, file, line, tr, file, thrown
-                ));
+                if self.ini_on("html_errors") {
+                    self.out.push_str(&format!(
+                        "<br />\n<b>Fatal error</b>:  Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in <b>{}</b> on line <b>{}</b><br />\n",
+                        class, colon, msg, file, line, tr, file, thrown
+                    ));
+                } else {
+                    self.out.push_str(&format!(
+                        "\nFatal error: Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
+                        class, colon, msg, file, line, tr, file, thrown
+                    ));
+                }
             }
         } else {
             self.print_fatal(&PhpError::fatal("Can only throw objects", self.cur_line));
@@ -1094,8 +1179,9 @@ impl<'a> Interp<'a> {
                 if let Err(e) = self.decl_type_checks(&d.name, d) {
                     return self.err_flow(e);
                 }
-                self.functions
-                    .insert(d.name.to_lowercase(), Rc::new(d.clone()));
+                let mut d = d.clone();
+                d.file = self.cur_file.clone();
+                self.functions.insert(d.name.to_lowercase(), Rc::new(d));
                 Flow::Normal
             }
             Stmt::Class(d) => {
@@ -1105,7 +1191,13 @@ impl<'a> Interp<'a> {
                         return self.err_flow(e);
                     }
                 }
-                self.register_class(d.clone());
+                let mut d = (**d).clone();
+                for m in &mut d.methods {
+                    let mut mm = (**m).clone();
+                    mm.decl.file = self.cur_file.clone();
+                    *m = Rc::new(mm);
+                }
+                self.register_class(Rc::new(d));
                 Flow::Normal
             }
             Stmt::Static { vars, line } => {
@@ -2231,10 +2323,23 @@ impl<'a> Interp<'a> {
         // assignment value — so the ACTUAL name/key becomes the RHS value
         // (engine_assignExecutionOrder_001).
         enum Late {
-            Prop { ov: Value, name: Option<PropName> },
-            Index { base: Cell, key: Option<Value> },
-            Static { class: Box<Expr>, pn: String },
-            Keyed { e: Expr, keys: Vec<Option<Value>> },
+            Prop {
+                ov: Value,
+                name: Option<PropName>,
+            },
+            Index {
+                base: Cell,
+                key: Option<Value>,
+                append: bool,
+            },
+            Static {
+                class: Box<Expr>,
+                pn: String,
+            },
+            Keyed {
+                e: Expr,
+                keys: Vec<Option<Value>>,
+            },
             None,
         }
         fn has_prop(e: &Expr) -> bool {
@@ -2285,7 +2390,11 @@ impl<'a> Interp<'a> {
                             Some(ie) => self.eval(ie).ok().filter(|_| !clobber),
                             None => None,
                         };
-                        late = Late::Index { base: c, key };
+                        late = Late::Index {
+                            base: c,
+                            key,
+                            append: i.is_none(),
+                        };
                         None
                     }
                     Err(_) => None,
@@ -2388,15 +2497,21 @@ impl<'a> Interp<'a> {
                 };
                 self.store_prop(ov, &pn, newv.clone())?;
             }
-            Late::Index { base, key } => {
-                // A clobbered (call-result) dim falls back to the RHS value.
-                let key = key.map(|k| to_key(&k)).unwrap_or(to_key(&newv));
+            Late::Index { base, key, append } => {
+                // A clobbered (call-result) dim falls back to the RHS
+                // value; a real `[]` always appends (bug21961).
                 let mut b = base.borrow_mut();
                 if matches!(*b, Value::Null) {
                     *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
                 }
                 if let Value::Array(rc) = &mut *b {
-                    rc.borrow_mut().set(key, newv.clone());
+                    let mut arr = rc.borrow_mut();
+                    if append {
+                        arr.push(newv.clone());
+                    } else {
+                        let key = key.map(|k| to_key(&k)).unwrap_or(to_key(&newv));
+                        arr.set(key, newv.clone());
+                    }
                 }
                 drop(b);
             }
@@ -3814,9 +3929,13 @@ impl<'a> Interp<'a> {
         // Callee `Stmt::Line` markers must not leak into the caller:
         // diagnostics after the call report the call-site line.
         let saved_line = self.cur_line;
-        // A callback invoked FROM a builtin has call site
-        // `[internal function]` (bug32828's ob handler trace).
-        let from_builtin = self.call_trace.last().map(|f| f.internal).unwrap_or(false);
+        // A callback invoked from inside a builtin's own machinery
+        // (internal_cb: ob handlers, sort callbacks) has call site
+        // `[internal function]`; engine callbacks like the error handler
+        // invoked mid-eval instead report the builtin's own call site
+        // (bug32828 vs bug28213).
+        let from_builtin =
+            self.internal_cb > 0 && self.call_trace.last().map(|f| f.internal).unwrap_or(false);
         let (site_file, site_line) = if from_builtin {
             ("[internal function]".to_string(), 0)
         } else {
@@ -4165,6 +4284,11 @@ impl<'a> Interp<'a> {
         frame.decl_class = self.pending_decl_class.take();
         frame.this_obj = this_obj;
         frame.scope_class = scope_class;
+        frame.file = if decl.file.is_empty() {
+            self.cur_file.clone()
+        } else {
+            decl.file.clone()
+        };
         self.stack.push(frame);
         self.bind_and_run(decl, args, Vec::new())
     }
@@ -4853,8 +4977,22 @@ impl<'a> Interp<'a> {
         // Throwable methods are instance-only; look up incl. parents.
         match self.find_method_in(&cls, name) {
             Some((m, dc)) => {
+                // Forwarding call: a non-static method invoked statically
+                // still receives $this when the caller's $this is an
+                // instance of the callee's class (bug21961).
+                let this_obj = if m.is_static {
+                    None
+                } else {
+                    self.stack
+                        .last()
+                        .and_then(|f| f.this_obj.clone())
+                        .filter(|o| {
+                            let cname = o.borrow().class.name().to_string();
+                            self.is_a_str(&cname, cls.name())
+                        })
+                };
                 self.pending_decl_class = Some(dc);
-                let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, None, Some(cls.clone()));
+                let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(cls.clone()));
                 self.pending_decl_class = None;
                 r
             }
@@ -4935,6 +5073,38 @@ impl<'a> Interp<'a> {
             }
             _ => false,
         }
+    }
+
+    /// Declared class/interface/trait names for get_declared_*().
+    pub fn declared_names(&self, kind: crate::ast::ClassKind) -> Vec<String> {
+        self.classes
+            .values()
+            .filter(|c| c.decl.kind == kind)
+            .map(|c| c.name().to_string())
+            .collect()
+    }
+
+    /// Zend backtrace text for debug_print_backtrace(): innermost-first
+    /// frames, no `{main}` line (bug28213).
+    pub fn format_backtrace(&self) -> String {
+        let frames: Vec<TraceFrame> = self
+            .call_trace
+            .iter()
+            .rev()
+            .skip_while(|f| f.internal)
+            .cloned()
+            .collect();
+        format_backtrace_frames(&frames)
+    }
+
+    /// debug_backtrace() array — same frames as format_backtrace().
+    pub fn backtrace(&self) -> Vec<TraceFrame> {
+        self.call_trace
+            .iter()
+            .rev()
+            .skip_while(|f| f.internal)
+            .cloned()
+            .collect()
     }
 
     /// is-a check between two class-name strings.
@@ -5021,40 +5191,108 @@ impl<'a> Interp<'a> {
         if kind == IncludeKind::Eval {
             return self.eval_code(&path_s);
         }
-        // Resolution: relative to current file's dir, then cwd.
+        // include()/require() appear in backtraces as internal-function
+        // frames — even for a failed open (bug28213).
+        self.call_trace.push(TraceFrame {
+            function: match kind {
+                IncludeKind::Include | IncludeKind::IncludeOnce => "include",
+                _ => "require",
+            }
+            .to_string(),
+            class: None,
+            ty: String::new(),
+            file: self.file.to_string(),
+            line: self.cur_line as u32,
+            args: vec![cell(pathv.clone())],
+            internal: true,
+        });
+        let inc_pop = |it: &mut Interp| {
+            it.call_trace.pop();
+        };
+        // Resolution: include_path entries (`.` = cwd), then the calling
+        // file's dir, then cwd (PHP's stream search order).
         let p = std::path::Path::new(&path_s);
         let cands: Vec<std::path::PathBuf> = if p.is_absolute() {
             vec![p.to_path_buf()]
         } else {
-            let dir = std::path::Path::new(self.file)
+            let mut v: Vec<std::path::PathBuf> = Vec::new();
+            for part in self
+                .ini
+                .get("include_path")
+                .map(|s| s.as_str())
+                .unwrap_or("")
+                .split(':')
+            {
+                if part.is_empty() {
+                    continue;
+                }
+                v.push(std::path::Path::new(part).join(&path_s));
+            }
+            // The calling file's dir = the file lexically containing the
+            // include call (the frame's decl file, not the entry script).
+            let base = self
+                .stack
+                .last()
+                .map(|f| f.file.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&self.cur_file);
+            let dir = std::path::Path::new(base)
                 .parent()
                 .map(|d| d.to_path_buf())
                 .unwrap_or_default();
-            vec![dir.join(&path_s), std::path::PathBuf::from(&path_s)]
+            v.push(dir.join(&path_s));
+            v.push(std::path::PathBuf::from(&path_s));
+            v
         };
         let found = cands.iter().find(|c| c.exists()).cloned();
         let path = match found {
             Some(p) => p,
             None => {
-                self.warn(&format!(
-                    "{}({}): Failed opening '{}' for inclusion (include_path='.:/home/linuxbrew/.linuxbrew/share/pear')",
-                    match kind {
-                        IncludeKind::Include | IncludeKind::IncludeOnce => "include",
-                        _ => "require",
-                    },
-                    self.file,
-                    path_s,
-                ))?;
+                // PHP emits a pair: the stream failure (path as written)
+                // then the generic 'Failed opening' (bug43958).
+                let fname = match kind {
+                    IncludeKind::Include => "include",
+                    IncludeKind::IncludeOnce => "include_once",
+                    IncludeKind::Require => "require",
+                    _ => "require_once",
+                };
+                let ip = ".:/home/linuxbrew/.linuxbrew/share/pear";
+                let r = self
+                    .warn(&format!(
+                        "{}({}): Failed to open stream: No such file or directory",
+                        fname, path_s,
+                    ))
+                    .and_then(|_| match kind {
+                        // PHP 8.5 emits the generic 'Failed opening'
+                        // warning only for include*; require* goes
+                        // straight to the uncaught Error (bug35176).
+                        IncludeKind::Include | IncludeKind::IncludeOnce => self.warn(&format!(
+                            "{}(): Failed opening '{}' for inclusion (include_path='{}')",
+                            fname, path_s, ip,
+                        )),
+                        _ => Ok(()),
+                    });
+                if let Err(e) = r {
+                    inc_pop(self);
+                    return Err(e);
+                }
                 match kind {
-                    IncludeKind::Include | IncludeKind::IncludeOnce => return Ok(Value::Bool(false)),
+                    IncludeKind::Include | IncludeKind::IncludeOnce => {
+                        inc_pop(self);
+                        return Ok(Value::Bool(false));
+                    }
                     _ => {
-                        return self.fail(PhpError::fatal(
+                        inc_pop(self);
+                        // require* failures raise an uncaught Error
+                        // (bug35176).
+                        return self.fail(PhpError::uncaught(
+                            "Error",
                             format!(
-                                "Failed opening required '{}' (include_path='.:/home/linuxbrew/.linuxbrew/share/pear')",
-                                path_s
+                                "Failed opening required '{}' (include_path='{}')",
+                                path_s, ip
                             ),
-                            0,
-                        ))
+                            self.cur_line,
+                        ));
                     }
                 }
             }
@@ -5062,6 +5300,7 @@ impl<'a> Interp<'a> {
         let canon = path.canonicalize().unwrap_or(path);
         if matches!(kind, IncludeKind::IncludeOnce | IncludeKind::RequireOnce) {
             if self.included.contains(&canon) {
+                inc_pop(self);
                 return Ok(Value::Bool(true));
             }
             self.included.insert(canon.clone());
@@ -5069,26 +5308,30 @@ impl<'a> Interp<'a> {
         let src = match std::fs::read_to_string(&canon) {
             Ok(s) => s,
             Err(e) => {
-                self.warn(&format!(
+                let e = e.to_string();
+                let _ = self.warn(&format!(
                     "include({}): Failed to open stream: {}",
                     path_s, e
-                ))?;
+                ));
+                inc_pop(self);
                 return Ok(Value::Bool(false));
             }
         };
-        // Include executes in the current scope (PHP semantics).
-        let saved_file = self.file.to_string();
         let fname = canon.display().to_string();
         let stmts = match parser::parse(&src) {
             Ok(s) => s,
             Err(e) => {
                 self.print_parse_at(&e, &fname);
+                inc_pop(self);
                 return Ok(Value::Bool(false));
             }
         };
-        // self.file is &'a — swap not possible; record include file for messages
-        let _ = saved_file;
+        // Include executes in the current scope (PHP semantics).
+        let saved_file = std::mem::replace(&mut self.cur_file, canon.display().to_string());
+        self.hoist_funcs(&stmts);
         let flow = self.exec_block(&stmts);
+        inc_pop(self);
+        self.cur_file = saved_file;
         match flow {
             Flow::Return(v) => Ok(v),
             Flow::Normal => Ok(Value::Int(1)),
@@ -5210,8 +5453,10 @@ impl<'a> Interp<'a> {
                 let m = mode | if already { 0 } else { 1 };
                 // A handler throwing inside ob_end_clean propagates as an
                 // uncaught exception (bug32828).
-                let out = self.call_value(&h, vec![cell(Value::str(buf)), cell(Value::Int(m))])?;
-                Ok(Some(out.to_php_string()))
+                self.internal_cb += 1;
+                let out = self.call_value(&h, vec![cell(Value::str(buf)), cell(Value::Int(m))]);
+                self.internal_cb -= 1;
+                Ok(Some(out?.to_php_string()))
             }
             None => Ok(Some(buf)),
         }

@@ -955,6 +955,7 @@ impl<'a> Parser<'a> {
                 body,
                 by_ref,
                 line,
+                file: String::new(),
             },
             is_static,
             is_abstract,
@@ -1136,6 +1137,7 @@ impl<'a> Parser<'a> {
             body,
             by_ref,
             line,
+            file: String::new(),
         }))
     }
 
@@ -1195,6 +1197,7 @@ impl<'a> Parser<'a> {
                 body,
                 by_ref,
                 line,
+                file: String::new(),
             },
             uses,
             arrow,
