@@ -30,13 +30,13 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         // ----- output/debug -----
         "var_dump" => {
             for a in args {
-                var_dump(it, &a.borrow(), 0, false);
+                var_dump(it, &a.borrow(), 0, false, false);
             }
             Value::Null
         }
         "debug_zval_dump" => {
             for a in args {
-                var_dump(it, &a.borrow(), 0, true);
+                var_dump(it, &a.borrow(), 0, true, false);
             }
             Value::Null
         }
@@ -48,6 +48,10 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 Value::str(s)
             } else {
                 it.emit(&s);
+                // print_r echoes a trailing newline only for arrays/objects.
+                if matches!(v, Value::Array(_) | Value::Object(_)) {
+                    it.emit("\n");
+                }
                 Value::Bool(true)
             }
         }
@@ -765,7 +769,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 } else {
                     n - off
                 };
-                let tail: Vec<(ArrKey, Cell)> = arr.entries.drain(..).collect();
+                let tail: Vec<(ArrKey, Cell)> = std::mem::take(&mut arr.entries);
                 let (head, rest) = tail.split_at(off as usize);
                 let (cut, tail2) = rest.split_at((len as usize).min(rest.len()));
                 for (k, c) in cut {
@@ -2739,31 +2743,34 @@ fn key_str(k: &ArrKey) -> String {
 
 // ---------- var_dump / print_r / var_export ----------
 
-fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool) {
+/// var_dump one zval; `is_ref` prints PHP's `&` prefix for reference cells.
+fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool) {
     let pad = "  ".repeat(indent);
     let _ = zval;
+    let r = if is_ref { "&" } else { "" };
     match v {
-        Value::Null => it.emit(&format!("{}NULL\n", pad)),
-        Value::Bool(b) => it.emit(&format!("{}bool({})\n", pad, b)),
-        Value::Int(i) => it.emit(&format!("{}int({})\n", pad, i)),
+        Value::Null => it.emit(&format!("{}{}NULL\n", pad, r)),
+        Value::Bool(b) => it.emit(&format!("{}{}bool({})\n", pad, r, b)),
+        Value::Int(i) => it.emit(&format!("{}{}int({})\n", pad, r, i)),
         Value::Float(f) => {
             // var_dump uses serialize_precision=-1 → shortest repr.
             it.emit(&format!(
-                "{}float({})\n",
+                "{}{}float({})\n",
                 pad,
+                r,
                 crate::value::format_float_repr(*f)
             ))
         }
-        Value::Str(s) => it.emit(&format!("{}string({}) \"{}\"\n", pad, s.len(), s)),
+        Value::Str(s) => it.emit(&format!("{}{}string({}) \"{}\"\n", pad, r, s.len(), s)),
         Value::Array(a) => {
             let a = a.borrow();
-            it.emit(&format!("{}array({}) {{\n", pad, a.len()));
+            it.emit(&format!("{}{}array({}) {{\n", pad, r, a.len()));
             for (k, c) in a.entries.iter() {
                 match k {
                     ArrKey::Int(i) => it.emit(&format!("{}  [{}]=>\n", pad, i)),
                     ArrKey::Str(s) => it.emit(&format!("{}  [\"{}\"]=>\n", pad, s)),
                 }
-                var_dump(it, &c.borrow(), indent + 1, zval);
+                var_dump(it, &c.borrow(), indent + 1, zval, Rc::strong_count(c) > 1);
             }
             it.emit(&format!("{}}}\n", pad));
         }
@@ -2779,7 +2786,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool) {
             for n in &ob.prop_order {
                 if let Some(c) = ob.props.get(n) {
                     it.emit(&format!("{}  [\"{}\"]=>\n", pad, n));
-                    var_dump(it, &c.borrow(), indent + 1, zval);
+                    var_dump(it, &c.borrow(), indent + 1, zval, Rc::strong_count(c) > 1);
                 }
             }
             it.emit(&format!("{}}}\n", pad));
