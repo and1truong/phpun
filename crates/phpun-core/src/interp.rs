@@ -45,6 +45,8 @@ pub struct Frame {
     decl_class: Option<Rc<PhpClass>>,
     /// File this frame's code was declared in (include resolution base).
     file: String,
+    /// Function declared `&name()` — returns bind cells, not values.
+    ret_by_ref: bool,
 }
 
 impl Frame {
@@ -57,6 +59,7 @@ impl Frame {
             scope_class: None,
             decl_class: None,
             file: String::new(),
+            ret_by_ref: false,
         }
     }
 }
@@ -79,6 +82,14 @@ pub struct Interp<'a> {
     /// While >0, warnings are suppressed (implements `??`, `isset`,
     /// `empty`, `@`).
     silence: u32,
+    /// Cell returned by the last `&fn()` call (returnByReference tests).
+    last_ret_cell: Option<Cell>,
+    /// The last invoked function was declared `&name()` (returns by ref).
+    last_call_by_ref: bool,
+    /// Insertion order of global vars (for $GLOBALS ordering).
+    globals_order: Vec<String>,
+    /// Shared PhpArray backing $GLOBALS — same cells as globals.vars.
+    globals_arr: Option<Rc<RefCell<PhpArray>>>,
     /// Function-scoped static storage: fn name → var → cell.
     statics: HashMap<String, HashMap<String, Cell>>,
     /// Global static vars (`static` at top level).
@@ -208,6 +219,10 @@ impl<'a> Interp<'a> {
         let mut it = Self {
             file,
             globals: Frame::new(String::new()),
+            last_ret_cell: None,
+            last_call_by_ref: false,
+            globals_order: Vec::new(),
+            globals_arr: None,
             stack: Vec::new(),
             functions: HashMap::new(),
             classes: HashMap::new(),
@@ -658,6 +673,10 @@ impl<'a> Interp<'a> {
     }
 
     fn superglobal_cell(&mut self, name: &str) -> Option<Cell> {
+        if name == "GLOBALS" {
+            // Live view — never the seeded/lazy globals.vars cell.
+            return Some(cell(self.globals_array_val()));
+        }
         if !Self::is_superglobal(name) {
             return None;
         }
@@ -689,14 +708,69 @@ impl<'a> Interp<'a> {
     /// The cell behind a variable name — creating it on demand.
     /// Superglobals resolve to the global cell (writes propagate).
     pub fn var_cell(&mut self, name: &str) -> Cell {
+        if name == "GLOBALS" {
+            // $GLOBALS is a live view over the global symbol table — array
+            // entries share the same Cells as globals.vars so writes alias.
+            return cell(self.globals_array_val());
+        }
+        let is_global = self.stack.is_empty();
+        let existed = self.cur().vars.contains_key(name);
         if let Some(c) = self.superglobal_cell(name) {
             return c;
         }
-        self.cur()
+        let c = self
+            .cur()
             .vars
             .entry(name.to_string())
             .or_insert_with(|| Rc::new(RefCell::new(Value::Null)))
-            .clone()
+            .clone();
+        if is_global && !existed {
+            self.globals_order.push(name.to_string());
+        }
+        c
+    }
+
+    /// Shared array backing $GLOBALS, synced both directions with globals.vars.
+    fn globals_array_val(&mut self) -> Value {
+        let arr = self
+            .globals_arr
+            .get_or_insert_with(|| Rc::new(RefCell::new(PhpArray::new())))
+            .clone();
+        // vars -> array (preserve global insertion order)
+        let mut names: Vec<String> = self.globals_order.clone();
+        for n in self.globals.vars.keys() {
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+        {
+            let mut a = arr.borrow_mut();
+            // Entries alias globals.vars cells — writes must never CoW-split.
+            a.is_ref = true;
+            for n in names {
+                if let Some(c) = self.globals.vars.get(&n) {
+                    a.set_cell(ArrKey::Str(n.into()), c.clone());
+                }
+            }
+        }
+        // array -> vars (writes through $GLOBALS create real globals)
+        let pairs: Vec<(String, Cell)> = {
+            let a = arr.borrow();
+            a.entries
+                .iter()
+                .filter_map(|(k, c)| match k {
+                    ArrKey::Str(s) => Some((s.to_string(), c.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (n, c) in pairs {
+            if !self.globals.vars.contains_key(&n) {
+                self.globals.vars.insert(n.clone(), c);
+                self.globals_order.push(n);
+            }
+        }
+        Value::Array(arr)
     }
 
     /// Peek without creating.
@@ -1376,6 +1450,53 @@ impl<'a> Interp<'a> {
                 Flow::Normal
             }
             Stmt::Return(e) => {
+                let ret_by_ref = self.stack.last().map(|f| f.ret_by_ref).unwrap_or(false);
+                if ret_by_ref {
+                    if let Some(e) = e {
+                        // `function &f() { return $x; }` — the returned cell is
+                        // bound, not copied (returnByReference tests).
+                        let is_lval = matches!(
+                            e,
+                            Expr::Var(_)
+                                | Expr::Index { .. }
+                                | Expr::Prop { .. }
+                                | Expr::VarVar(_)
+                                | Expr::StaticProp { .. }
+                        );
+                        if is_lval {
+                            let c = match self.eval_cell(e) {
+                                Ok(c) => c,
+                                Err(e) => return self.err_flow(e),
+                            };
+                            self.last_ret_cell = Some(c.clone());
+                            return Flow::Return(c.borrow().clone());
+                        }
+                        if matches!(
+                            e,
+                            Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. }
+                        ) {
+                            // `return &f()` chains through when callee returns
+                            // by reference (returnByReference.006/009).
+                            let (c, was_ref) = match self.eval_call_cell(e) {
+                                Ok(t) => t,
+                                Err(e) => return self.err_flow(e),
+                            };
+                            if was_ref {
+                                self.last_ret_cell = Some(c.clone());
+                            } else if let Err(e) = self
+                                .notice("Only variable references should be returned by reference")
+                            {
+                                return self.err_flow(e);
+                            }
+                            return Flow::Return(c.borrow().clone());
+                        }
+                        if let Err(e) =
+                            self.notice("Only variable references should be returned by reference")
+                        {
+                            return self.err_flow(e);
+                        }
+                    }
+                }
                 let v = match e {
                     Some(e) => match self.eval(e) {
                         Ok(v) => v,
@@ -2153,10 +2274,14 @@ impl<'a> Interp<'a> {
             }
             Expr::New { class, args } => {
                 let name = self.class_name_of(class)?;
-                let mut argvals = Vec::new();
-                for a in args {
-                    argvals.push(cell(self.eval(a)?));
-                }
+                let params = self
+                    .classes
+                    .get(&name.to_lowercase())
+                    .cloned()
+                    .and_then(|c| self.find_method_in(&c, "__construct"))
+                    .map(|m| m.0.decl.params.clone())
+                    .unwrap_or_default();
+                let argvals = self.arg_cells(args, &params, &format!("{}::__construct()", name))?;
                 self.new_instance(&name, argvals)
             }
             Expr::Prop {
@@ -2177,7 +2302,8 @@ impl<'a> Interp<'a> {
                 let cls = self.class_of(class)?;
                 let nv = self.eval(name)?;
                 let n = self.conv_str(&nv)?;
-                let argvals = self.arg_cells(args, &[])?;
+                let argvals =
+                    self.arg_cells(args, &[], &format!("{}::{{closure}}()", cls.name()))?;
                 self.static_invoke(cls, &n, argvals)
             }
             Expr::ClassConst { class, name } => self.class_const(class, name),
@@ -2446,7 +2572,16 @@ impl<'a> Interp<'a> {
         }
         if op == "=&" {
             // By-reference assignment: bind cells.
-            let src = self.eval_cell(value)?;
+            let src = match value {
+                Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. } => {
+                    let (c, was_ref) = self.eval_call_cell(value)?;
+                    if !was_ref {
+                        self.notice("Only variables should be assigned by reference")?;
+                    }
+                    c
+                }
+                _ => self.eval_cell(value)?,
+            };
             self.bind_cell(target, src.clone())?;
             return Ok(src.borrow().clone());
         }
@@ -2685,11 +2820,29 @@ impl<'a> Interp<'a> {
                 Ok(self.var_cell(&name))
             }
             Expr::StaticProp { class, name } => self.static_prop_cell(class, name),
+            Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. } => {
+                Ok(self.eval_call_cell(e)?.0)
+            }
             _ => {
                 // Function calls returning by-ref, etc.: evaluate to temp cell.
                 let v = self.eval(e)?;
                 Ok(cell(v))
             }
+        }
+    }
+
+    /// Evaluate a call expression, keeping the callee's returned cell when the
+    /// function was declared `&name()` (returns by reference).
+    fn eval_call_cell(&mut self, e: &Expr) -> Result<(Cell, bool), PhpError> {
+        self.last_ret_cell = None;
+        self.last_call_by_ref = false;
+        let v = self.eval(e)?;
+        let declared = self.last_call_by_ref;
+        match self.last_ret_cell.take() {
+            Some(c) => Ok((c, true)),
+            // A function declared `&` that returns a non-variable binds a temp
+            // cell — the caller does not warn (the callee warned at `return`).
+            None => Ok((cell(v), declared)),
         }
     }
 
@@ -3895,18 +4048,26 @@ impl<'a> Interp<'a> {
                 match v {
                     Value::Callable(_) | Value::Object(_) => {
                         // $closure() / $obj->__invoke()
-                        let vals = self.arg_cells(args, &[])?;
+                        let vals = self.arg_cells(args, &[], "")?;
                         return self.call_value(&v, vals);
                     }
                     _ => self.conv_str(&v).unwrap_or_default(),
                 }
             }
-            Expr::Prop { .. }
-            | Expr::MethodCall { .. }
-            | Expr::Index { .. }
-            | Expr::StaticProp { .. } => {
+            Expr::StaticProp { class, name } => {
+                // `C::$var()` — dynamic static method call.
+                let cls = self.class_of(class)?;
+                let mn = self.prop_name(name)?;
+                let params = self
+                    .find_method_in(&cls, &mn)
+                    .map(|m| m.0.decl.params.clone())
+                    .unwrap_or_default();
+                let vals = self.arg_cells(args, &params, &format!("{}()", mn))?;
+                return self.static_invoke(cls, &mn, vals);
+            }
+            Expr::Prop { .. } | Expr::MethodCall { .. } | Expr::Index { .. } => {
                 let v = self.eval(name)?;
-                let vals = self.arg_cells(args, &[])?;
+                let vals = self.arg_cells(args, &[], "")?;
                 return self.call_value(&v, vals);
             }
             _ => {
@@ -3919,7 +4080,12 @@ impl<'a> Interp<'a> {
 
     /// Evaluate args into cells (by-ref params alias caller storage).
     /// `named` params collected as (name, cell) too.
-    fn arg_cells(&mut self, args: &[Expr], decl: &[Param]) -> Result<Vec<Cell>, PhpError> {
+    fn arg_cells(
+        &mut self,
+        args: &[Expr],
+        decl: &[Param],
+        ctx: &str,
+    ) -> Result<Vec<Cell>, PhpError> {
         let mut out = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             // named argument wrapper
@@ -3929,11 +4095,44 @@ impl<'a> Interp<'a> {
             };
             let by_ref = decl.get(i).map(|p| p.by_ref).unwrap_or(false);
             if by_ref {
-                match self.eval_cell(a) {
-                    Ok(c) => out.push(c),
-                    Err(_) => {
-                        return self.fail(PhpError::fatal(
-                            "Only variables should be passed by reference",
+                match a {
+                    Expr::Var(_) | Expr::Index { .. } | Expr::Prop { .. } | Expr::VarVar(_) => {
+                        match self.eval_cell(a) {
+                            Ok(c) => out.push(c),
+                            Err(_) => {
+                                return self.fail(PhpError::fatal(
+                                    "Only variables should be passed by reference",
+                                    0,
+                                ))
+                            }
+                        }
+                    }
+                    Expr::Assign {
+                        op: "=&", target, ..
+                    } => {
+                        // `f($x =& v)` binds the target by reference
+                        // (passByReference_010); plain `=` throws Error below.
+                        self.eval(a)?;
+                        out.push(self.eval_cell(target)?);
+                    }
+                    Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. } => {
+                        // `f(g())`: binds only when g() returns by reference,
+                        // otherwise a notice and pass by value (passByReference_004/007).
+                        let (c, was_ref) = self.eval_call_cell(a)?;
+                        if !was_ref {
+                            self.notice("Only variables should be passed by reference")?;
+                        }
+                        out.push(c);
+                    }
+                    _ => {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "{}: Argument #{} (${}) could not be passed by reference",
+                                ctx,
+                                i + 1,
+                                decl.get(i).map(|p| p.name.as_str()).unwrap_or("")
+                            ),
                             0,
                         ))
                     }
@@ -3962,9 +4161,34 @@ impl<'a> Interp<'a> {
     fn call_named(&mut self, fname: &str, args: &[Expr]) -> Result<Value, PhpError> {
         let lname = fname.trim_start_matches('\\').to_lowercase();
         let decl = self.functions.get(&lname).cloned();
+        // Synthetic params carrying builtin by-ref flags so call results in
+        // by-ref slots emit "Only variables should be passed by reference"
+        // (passByReference_012, array_shift(array_shift($a))).
+        let builtin_params: Vec<Param> = if decl.is_none() {
+            builtin_byref(&lname)
+                .map(|flags| {
+                    flags
+                        .iter()
+                        .map(|by_ref| Param {
+                            name: String::new(),
+                            default: None,
+                            by_ref: *by_ref,
+                            variadic: false,
+                            ty: None,
+                            promoted: false,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let argvals = self.arg_cells(
             args,
-            decl.as_deref().map(|d| d.params.as_slice()).unwrap_or(&[]),
+            decl.as_deref()
+                .map(|d| d.params.as_slice())
+                .unwrap_or(&builtin_params),
+            &format!("{}()", fname),
         )?;
         if let Some(v) = self.call_builtin(&lname, &argvals)? {
             return Ok(v);
@@ -3991,6 +4215,7 @@ impl<'a> Interp<'a> {
                     CallableKind::Closure(decl) => {
                         let mut frame_args = Vec::new();
                         let mut frame = Frame::new("{closure}".into());
+                        frame.ret_by_ref = decl.by_ref;
                         for (n, cap) in &c.captures {
                             frame.vars.insert(n.clone(), cap.clone());
                         }
@@ -4148,7 +4373,11 @@ impl<'a> Interp<'a> {
                 internal: false,
             });
         self.call_trace.push(fr);
+        self.last_call_by_ref = decl.by_ref;
         let r = self.bind_and_run_inner(decl, args, unused);
+        // Overwrite (don't restore): the flag must describe THIS callee even
+        // though nested calls overwrote it during the body.
+        self.last_call_by_ref = decl.by_ref;
         self.call_trace.pop();
         self.cur_line = saved_line;
         r
@@ -4454,6 +4683,7 @@ impl<'a> Interp<'a> {
             ));
         }
         let mut frame = Frame::new(decl.name.clone());
+        frame.ret_by_ref = decl.by_ref;
         if let Some(obj) = &this_obj {
             frame
                 .vars
@@ -4869,7 +5099,11 @@ impl<'a> Interp<'a> {
         match ov {
             Value::Null if nullsafe => Ok(Value::Null),
             Value::Object(o) => {
-                let argvals = self.arg_cells(args, &[])?;
+                let params = self
+                    .find_method_in(&o.borrow().class.clone(), &mn)
+                    .map(|m| m.0.decl.params.clone())
+                    .unwrap_or_default();
+                let argvals = self.arg_cells(args, &params, &format!("{}()", mn))?;
                 // method_invoke handles builtin (Throwable), __call, undefined.
                 self.method_invoke(o.clone(), &mn, argvals)
             }
@@ -5142,7 +5376,11 @@ impl<'a> Interp<'a> {
 
     fn static_call(&mut self, class: &Expr, name: &str, args: &[Expr]) -> Result<Value, PhpError> {
         let cls = self.class_of(class)?;
-        let argvals = self.arg_cells(args, &[])?;
+        let params = self
+            .find_method_in(&cls, name)
+            .map(|m| m.0.decl.params.clone())
+            .unwrap_or_default();
+        let argvals = self.arg_cells(args, &params, &format!("{}()", name))?;
         self.static_invoke(cls, name, argvals)
     }
 
@@ -5969,4 +6207,28 @@ fn bitwise_str(op: &str, a: &str, b: &str) -> String {
         });
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// By-ref flags for builtin parameters (only slots that accept references are
+/// `true`). Used to warn on non-variable args in by-ref positions and to alias
+/// real cells for mutating builtins like array_pop/sort/preg_match.
+fn builtin_byref(name: &str) -> Option<&'static [bool]> {
+    Some(match name {
+        "array_pop" | "array_shift" | "array_walk" | "sort" | "rsort" | "asort" | "arsort"
+        | "ksort" | "krsort" | "usort" | "uasort" | "uksort" | "natsort" | "natcasesort"
+        | "shuffle" | "reset" | "end" | "next" | "prev" | "current" | "pos" | "each"
+        | "array_push" | "array_unshift" | "array_splice" | "array_multisort" => &[true],
+        "preg_match" | "preg_match_all" => &[false, false, true, true],
+        "preg_replace"
+        | "preg_replace_callback"
+        | "preg_replace_callback_array"
+        | "str_replace"
+        | "str_ireplace" => &[false, false, false, true],
+        "parse_str" => &[false, true],
+        "sscanf" | "fscanf" => &[false, false],
+        "exec" => &[false, true, true],
+        "passthru" | "system" => &[false, true],
+        "preg_filter" | "preg_grep" => &[false],
+        _ => return None,
+    })
 }

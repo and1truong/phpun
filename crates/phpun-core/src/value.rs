@@ -75,6 +75,11 @@ impl PhpArray {
     /// value (so aliases bound to the cell see it); a missing key appends.
     pub fn set_cell(&mut self, k: ArrKey, c: Cell) {
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
+            // Same cell on both sides (a $GLOBALS sync can alias the slot to
+            // its own global) — writing it would borrow_mut+borrow itself.
+            if Rc::ptr_eq(&slot.1, &c) {
+                return;
+            }
             *slot.1.borrow_mut() = c.borrow().clone();
             return;
         }
