@@ -118,6 +118,45 @@ pub struct PropDecl {
     pub is_static: bool,
     pub visibility: Visibility,
     pub readonly: bool,
+    /// Declared type members in source order (`?T`/`T|null` include
+    /// "null"); None for an untyped property. Only used for hook
+    /// set-parameter compat checks — the runtime doesn't enforce it.
+    pub ty: Option<Vec<String>>,
+    /// `abstract` modifier (only meaningful with bodiless hooks).
+    pub is_abstract: bool,
+    /// `final` modifier — the prop (and its hooks) cannot be overridden.
+    pub is_final: bool,
+    /// Asymmetric write visibility (`public private(set) $p`); None
+    /// means writes use `visibility`.
+    pub set_vis: Option<Visibility>,
+    /// Trait the prop was merged from (`use T`), for `__METHOD__`
+    /// inside hooks (`T::$prop::get`).
+    pub decl_in: Option<String>,
+    /// PHP 8.4 property hooks (`public $p { get => ..; set => .. }`);
+    /// None for a plain property.
+    pub hooks: Option<Vec<PropHook>>,
+}
+
+/// One `get`/`set` hook on a hooked property (Zend/tests/property_hooks).
+#[derive(Debug, Clone)]
+pub struct PropHook {
+    /// Raw hook identifier (`get`/`set`; anything else is a decl error).
+    pub name: String,
+    /// `get` vs `set`.
+    pub is_get: bool,
+    /// `set`'s declared params (`set(T $v)`); empty = implicit `$value`.
+    pub params: Vec<Param>,
+    /// A `(...)` parameter list was written at all (`get()` is a decl
+    /// error even when empty).
+    pub has_plist: bool,
+    /// `None` = abstract declaration (interfaces/abstract classes only).
+    pub body: Option<Vec<Stmt>>,
+    /// `&get` returns by reference.
+    pub by_ref: bool,
+    /// `final` hook.
+    pub is_final: bool,
+    /// Hook's own visibility when written explicitly (`private get`).
+    pub visibility: Option<Visibility>,
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +238,14 @@ pub struct Param {
     /// declare the prop and auto-assign at call time
     /// (error_2_exception_001).
     pub promoted: bool,
+    /// Promotion modifiers retained for synthesized props.
+    pub vis: Option<Visibility>,
+    pub readonly: bool,
+    pub is_final: bool,
+    /// Asymmetric write visibility (`private(set)`).
+    pub set_vis: Option<Visibility>,
+    /// Hooks on a promoted property (`public $p { get {} }`).
+    pub hooks: Option<Vec<PropHook>>,
 }
 
 #[derive(Debug, Clone)]
@@ -288,6 +335,9 @@ pub enum Expr {
         class: Box<Expr>,
         name: PropName,
     },
+    /// `(expr)` — keeps `(parent::$p)::get()` distinct from the
+    /// property-hook call syntax `parent::$p::get()`.
+    Paren(Box<Expr>),
     StaticCall {
         class: Box<Expr>,
         name: String,
@@ -366,4 +416,6 @@ pub enum MagicConst {
     Method,
     Class,
     Namespace,
+    /// `__PROPERTY__` — the hooked prop's name inside a hook, "" outside.
+    Property,
 }

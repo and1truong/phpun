@@ -9,6 +9,11 @@ pub struct Parser<'a> {
     /// Compile-time deprecation diagnostics (msg, line) — PHP emits them
     /// before execution; `parse_with` prepends them as `Stmt::Deprecated`.
     deprecations: Vec<(String, usize)>,
+    /// Enclosing class name while parsing members (hook error text).
+    cur_class: String,
+    /// (prop name, is_get) while inside a hook body — gates
+    /// `parent::$p::get()/set()` syntax.
+    hook_ctx: Option<(String, bool)>,
 }
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
@@ -23,6 +28,8 @@ pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
         toks: &toks,
         pos: 0,
         deprecations: Vec::new(),
+        cur_class: String::new(),
+        hook_ctx: None,
     };
     let mut stmts = p.program()?;
     for (i, (msg, line)) in std::mem::take(&mut p.deprecations).into_iter().enumerate() {
@@ -83,6 +90,8 @@ pub fn parse_expr_src(src: &str) -> Result<Expr, PhpError> {
         toks: &toks,
         pos: 0,
         deprecations: Vec::new(),
+        cur_class: String::new(),
+        hook_ctx: None,
     };
     let e = p.expr()?;
     Ok(e)
@@ -802,6 +811,7 @@ impl<'a> Parser<'a> {
         let name = self
             .ident()
             .unwrap_or_else(|| "class@anonymous".to_string());
+        self.cur_class = name.clone();
         // enum backing type `enum X: int`
         if self.eat_op(":") {
             self.skip_type()?;
@@ -837,16 +847,25 @@ impl<'a> Parser<'a> {
             let mut m_abstract = false;
             let mut m_final = false;
             let mut m_readonly = false;
+            let mut m_set_vis = None;
             loop {
                 if self.ident_is("public") {
                     vis = Visibility::Public;
                     self.pos += 1;
                 } else if self.ident_is("protected") {
-                    vis = Visibility::Protected;
-                    self.pos += 1;
+                    if self.at_asym_set() {
+                        m_set_vis = Some(Visibility::Protected);
+                    } else {
+                        vis = Visibility::Protected;
+                        self.pos += 1;
+                    }
                 } else if self.ident_is("private") {
-                    vis = Visibility::Private;
-                    self.pos += 1;
+                    if self.at_asym_set() {
+                        m_set_vis = Some(Visibility::Private);
+                    } else {
+                        vis = Visibility::Private;
+                        self.pos += 1;
+                    }
                 } else if self.ident_is("static") {
                     is_static = true;
                     self.pos += 1;
@@ -922,11 +941,13 @@ impl<'a> Parser<'a> {
                 continue;
             }
             // Typed or untyped property: [type] $name [= default], ...;
-            if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
+            let pty = if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
                 && !matches!(self.peek2(), Some(Token::Op("(")))
             {
-                self.skip_type()?;
-            }
+                self.take_type()
+            } else {
+                None
+            };
             loop {
                 let pname = match self.next() {
                     Some(Token::Variable(n)) => n,
@@ -951,12 +972,28 @@ impl<'a> Parser<'a> {
                     is_static,
                     visibility: vis,
                     readonly: m_readonly,
+                    ty: pty.clone(),
+                    is_abstract: m_abstract,
+                    is_final: m_final,
+                    set_vis: m_set_vis,
+                    decl_in: None,
+                    hooks: None,
                 });
                 if !self.eat_op(",") {
                     break;
                 }
             }
-            self.expect_op(";")?;
+            // PHP 8.4 property hooks attach to the LAST declarator
+            // (`public $p { get => ..; }`) — no trailing `;` after `}`.
+            if self.at_op("{") {
+                let hn = props.last().map(|p| p.name.clone()).unwrap_or_default();
+                let hs = self.prop_hooks(&hn)?;
+                if let Some(p) = props.last_mut() {
+                    p.hooks = hs;
+                }
+            } else {
+                self.expect_op(";")?;
+            }
         }
         self.expect_op("}")?;
         Ok(Stmt::Class(Rc::new(ClassDecl {
@@ -984,6 +1021,7 @@ impl<'a> Parser<'a> {
         self.pos += 1; // function
         let by_ref = self.eat_op("&");
         let name = self.ident().unwrap_or_default();
+        let prev_hook = self.hook_ctx.take();
         let params = self.params()?;
         if self.eat_op(":") {
             self.skip_type()?;
@@ -993,6 +1031,7 @@ impl<'a> Parser<'a> {
         } else {
             self.body()?
         };
+        self.hook_ctx = prev_hook;
         Ok(MethodDecl {
             decl: FunctionDecl {
                 name,
@@ -1009,6 +1048,157 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `{ get => e; set { .. }; set(T $v) { .. }; get; }` — PHP 8.4
+    /// property hooks (Zend/tests/property_hooks). Called with the `{`
+    /// already detected; consumes through the closing `}`.
+    fn prop_hooks(&mut self, pname: &str) -> Result<Option<Vec<PropHook>>, PhpError> {
+        self.expect_op("{")?;
+        if self.at_op("}") {
+            return Err(PhpError::fatal(
+                "Property hook list must not be empty",
+                self.line(),
+            ));
+        }
+        let mut hs: Vec<PropHook> = Vec::new();
+        while !self.at_op("}") {
+            if self.peek().is_none() {
+                return Err(PhpError::parse(
+                    "syntax error, unexpected end of file",
+                    self.line(),
+                ));
+            }
+            self.skip_attrs();
+            let mut hvis = None;
+            let mut hfinal = false;
+            loop {
+                if self.ident_is("public") {
+                    hvis = Some(Visibility::Public);
+                    self.pos += 1;
+                } else if self.ident_is("protected") {
+                    hvis = Some(Visibility::Protected);
+                    self.pos += 1;
+                } else if self.ident_is("private") {
+                    hvis = Some(Visibility::Private);
+                    self.pos += 1;
+                } else if self.ident_is("final") {
+                    hfinal = true;
+                    self.pos += 1;
+                } else if self.ident_is("static") {
+                    return Err(PhpError::fatal(
+                        "Cannot use the static modifier on a property hook",
+                        self.line(),
+                    ));
+                } else {
+                    break;
+                }
+            }
+            let by_ref = self.eat_op("&");
+            // Any identifier is consumed here — an unknown one is a
+            // compile-fatal naming the class+prop (unknown_hook).
+            let hname = match self.next() {
+                Some(Token::Ident(n)) => n,
+                t => {
+                    return Err(PhpError::parse(
+                        format!(
+                            "syntax error, unexpected {}, expecting \"get\" or \"set\"",
+                            desc_t(t.as_ref())
+                        ),
+                        self.line(),
+                    ))
+                }
+            };
+            if hname != "get" && hname != "set" {
+                return Err(PhpError::fatal(
+                    format!(
+                        "Unknown hook \"{}\" for property {}::${}, expected \"get\" or \"set\"",
+                        hname, self.cur_class, pname
+                    ),
+                    self.line(),
+                ));
+            }
+            let is_get = hname == "get";
+            if hs.iter().any(|h| h.is_get == is_get) {
+                return Err(PhpError::fatal(
+                    format!("Cannot redeclare property hook \"{}\"", hname),
+                    self.line(),
+                ));
+            }
+            let has_plist = self.at_op("(");
+            let params = if has_plist {
+                self.params()?
+            } else {
+                Vec::new()
+            };
+            let line = self.line();
+            let prev_hook = self.hook_ctx.replace((pname.to_string(), is_get));
+            let body = if self.eat_op("=>") {
+                let e = self.expr()?;
+                self.expect_op(";")?;
+                if is_get {
+                    Some(vec![Stmt::Line(line), Stmt::Return(Some(e))])
+                } else {
+                    // `set => e` ≡ `set { $this->prop = e; }` (hooks short form).
+                    Some(vec![
+                        Stmt::Line(line),
+                        Stmt::Expr(Expr::Assign {
+                            target: Box::new(Expr::Prop {
+                                obj: Box::new(Expr::Var("this".into())),
+                                name: PropName::Name(pname.to_string()),
+                                nullsafe: false,
+                            }),
+                            op: "=",
+                            value: Box::new(e),
+                        }),
+                    ])
+                }
+            } else if self.at_op("{") {
+                Some(self.body()?)
+            } else if self.eat_op(";") {
+                None
+            } else {
+                return Err(PhpError::parse(
+                    format!(
+                        "syntax error, unexpected {}, expecting \"=>\" or \"{{\" or \";\"",
+                        desc_t(self.peek())
+                    ),
+                    self.line(),
+                ));
+            };
+            self.hook_ctx = prev_hook;
+            hs.push(PropHook {
+                name: hname,
+                is_get,
+                params,
+                has_plist,
+                body,
+                by_ref,
+                is_final: hfinal,
+                visibility: hvis,
+            });
+        }
+        self.expect_op("}")?;
+        // `}` ends the prop; a `;` is tolerated but not required.
+        self.eat_op(";");
+        Ok(Some(hs))
+    }
+
+    /// `private(set)` / `protected(set)` asymmetric write visibility —
+    /// at `ident (`, consume `( set )` when that's what follows.
+    fn at_asym_set(&mut self) -> bool {
+        if matches!(self.peek2(), Some(Token::Op("(")))
+            && matches!(self.toks.get(self.pos + 2).map(|l| &l.token), Some(Token::Ident(n)) if n == "set")
+            && matches!(
+                self.toks.get(self.pos + 3).map(|l| &l.token),
+                Some(Token::Op(")"))
+            )
+        {
+            self.pos += 4; // `private` `(` `set` `)`
+            true
+        } else {
+            false
+        }
+    }
+
     fn params(&mut self) -> Result<Vec<Param>, PhpError> {
         self.expect_op("(")?;
         let mut params = Vec::new();
@@ -1017,12 +1207,37 @@ impl<'a> Parser<'a> {
             // promoted ctor params: visibility/readonly precede the type
             // (`public int $x`, `public $errno` — error_2_exception_001).
             let mut promoted = false;
-            for _ in 0..3 {
-                if self.ident_is("public")
-                    || self.ident_is("private")
-                    || self.ident_is("protected")
-                    || self.ident_is("readonly")
-                {
+            let mut pvis = None;
+            let mut preadonly = false;
+            let mut pfinal = false;
+            let mut psetv = None;
+            for _ in 0..4 {
+                if self.ident_is("public") {
+                    pvis = Some(Visibility::Public);
+                    self.pos += 1;
+                    promoted = true;
+                } else if self.ident_is("private") {
+                    if self.at_asym_set() {
+                        psetv = Some(Visibility::Private);
+                    } else {
+                        pvis = Some(Visibility::Private);
+                        self.pos += 1;
+                    }
+                    promoted = true;
+                } else if self.ident_is("protected") {
+                    if self.at_asym_set() {
+                        psetv = Some(Visibility::Protected);
+                    } else {
+                        pvis = Some(Visibility::Protected);
+                        self.pos += 1;
+                    }
+                    promoted = true;
+                } else if self.ident_is("readonly") {
+                    preadonly = true;
+                    self.pos += 1;
+                    promoted = true;
+                } else if self.ident_is("final") {
+                    pfinal = true;
                     self.pos += 1;
                     promoted = true;
                 } else {
@@ -1058,6 +1273,15 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            // Promoted hooked props: `public $p { get {} }` (8.4). Hooks
+            // imply promotion even without a visibility modifier
+            // (gh15438_1: `__construct($p { set => ... })`).
+            let phooks = if self.at_op("{") {
+                promoted = true;
+                self.prop_hooks(&pname)?
+            } else {
+                None
+            };
             params.push(Param {
                 name: pname,
                 default,
@@ -1065,6 +1289,11 @@ impl<'a> Parser<'a> {
                 variadic,
                 ty,
                 promoted,
+                vis: pvis,
+                readonly: preadonly,
+                is_final: pfinal,
+                set_vis: psetv,
+                hooks: phooks,
             });
             if !self.eat_op(",") {
                 break;
@@ -1170,12 +1399,14 @@ impl<'a> Parser<'a> {
                 self.line(),
             )
         })?;
+        let prev_hook = self.hook_ctx.take();
         let params = self.params()?;
         // Return type declarations (: int) — parse & ignore for now.
         if self.eat_op(":") {
             self.skip_type()?;
         }
         let body = self.body()?;
+        self.hook_ctx = prev_hook;
         Ok(Stmt::Function(FunctionDecl {
             name,
             params,
@@ -1201,6 +1432,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("function")?;
         }
         let by_ref = self.eat_op("&");
+        let prev_hook = self.hook_ctx.take();
         let params = self.params()?;
         if !arrow && self.ident_is("use") {
             self.pos += 1;
@@ -1235,6 +1467,7 @@ impl<'a> Parser<'a> {
             }
             self.body()?
         };
+        self.hook_ctx = prev_hook;
         Ok(Expr::Closure(ClosureExpr {
             decl: FunctionDecl {
                 name: String::new(),
@@ -1264,6 +1497,7 @@ impl<'a> Parser<'a> {
                 Vec::new()
             };
             // delegate: parse `extends`/`implements`/body by simulating
+            self.cur_class = "class@anonymous".into();
             self.skip_attrs();
             let mut parent = None;
             if self.eat_ident("extends") {
@@ -1297,16 +1531,25 @@ impl<'a> Parser<'a> {
                 let mut m_abstract = false;
                 let mut m_final = false;
                 let mut m_readonly = false;
+                let mut m_set_vis = None;
                 loop {
                     if self.ident_is("public") {
                         vis = Visibility::Public;
                         self.pos += 1;
                     } else if self.ident_is("protected") {
-                        vis = Visibility::Protected;
-                        self.pos += 1;
+                        if self.at_asym_set() {
+                            m_set_vis = Some(Visibility::Protected);
+                        } else {
+                            vis = Visibility::Protected;
+                            self.pos += 1;
+                        }
                     } else if self.ident_is("private") {
-                        vis = Visibility::Private;
-                        self.pos += 1;
+                        if self.at_asym_set() {
+                            m_set_vis = Some(Visibility::Private);
+                        } else {
+                            vis = Visibility::Private;
+                            self.pos += 1;
+                        }
                     } else if self.ident_is("static") {
                         is_static = true;
                         self.pos += 1;
@@ -1379,11 +1622,13 @@ impl<'a> Parser<'a> {
                     self.expect_op(";")?;
                     continue;
                 }
-                if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
+                let pty = if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
                     && !matches!(self.peek2(), Some(Token::Op("(")))
                 {
-                    self.skip_type()?;
-                }
+                    self.take_type()
+                } else {
+                    None
+                };
                 loop {
                     let pname = match self.next() {
                         Some(Token::Variable(n)) => n,
@@ -1408,12 +1653,26 @@ impl<'a> Parser<'a> {
                         is_static,
                         visibility: vis,
                         readonly: m_readonly,
+                        ty: pty.clone(),
+                        is_abstract: m_abstract,
+                        is_final: m_final,
+                        set_vis: m_set_vis,
+                        decl_in: None,
+                        hooks: None,
                     });
                     if !self.eat_op(",") {
                         break;
                     }
                 }
-                self.expect_op(";")?;
+                if self.at_op("{") {
+                    let hn = props.last().map(|p| p.name.clone()).unwrap_or_default();
+                    let hs = self.prop_hooks(&hn)?;
+                    if let Some(p) = props.last_mut() {
+                        p.hooks = hs;
+                    }
+                } else {
+                    self.expect_op(";")?;
+                }
             }
             self.expect_op("}")?;
             return Ok((
@@ -1955,10 +2214,34 @@ impl<'a> Parser<'a> {
         }
         if self.eat_op("++") {
             let e = self.unary()?;
+            if matches!(
+                e,
+                Expr::Call { .. }
+                    | Expr::MethodCall { .. }
+                    | Expr::StaticCall { .. }
+                    | Expr::StaticCallDyn { .. }
+            ) {
+                return Err(PhpError::fatal(
+                    "Can't use method return value in write context",
+                    self.line(),
+                ));
+            }
             return Ok(Expr::PreInc(Box::new(e)));
         }
         if self.eat_op("--") {
             let e = self.unary()?;
+            if matches!(
+                e,
+                Expr::Call { .. }
+                    | Expr::MethodCall { .. }
+                    | Expr::StaticCall { .. }
+                    | Expr::StaticCallDyn { .. }
+            ) {
+                return Err(PhpError::fatal(
+                    "Can't use method return value in write context",
+                    self.line(),
+                ));
+            }
             return Ok(Expr::PreDec(Box::new(e)));
         }
         if self.eat_op("@") {
@@ -2020,8 +2303,32 @@ impl<'a> Parser<'a> {
         let mut e = self.primary()?;
         loop {
             if self.eat_op("++") {
+                if matches!(
+                    e,
+                    Expr::Call { .. }
+                        | Expr::MethodCall { .. }
+                        | Expr::StaticCall { .. }
+                        | Expr::StaticCallDyn { .. }
+                ) {
+                    return Err(PhpError::fatal(
+                        "Can't use method return value in write context",
+                        self.line(),
+                    ));
+                }
                 e = Expr::PostInc(Box::new(e));
             } else if self.eat_op("--") {
+                if matches!(
+                    e,
+                    Expr::Call { .. }
+                        | Expr::MethodCall { .. }
+                        | Expr::StaticCall { .. }
+                        | Expr::StaticCallDyn { .. }
+                ) {
+                    return Err(PhpError::fatal(
+                        "Can't use method return value in write context",
+                        self.line(),
+                    ));
+                }
                 e = Expr::PostDec(Box::new(e));
             } else if self.eat_op("[") {
                 let i = if self.at_op("]") {
@@ -2071,6 +2378,60 @@ impl<'a> Parser<'a> {
                             };
                         } else if self.at_op("(") {
                             self.pos += 1;
+                            // `parent::$p::get()/set()` — PHP checks the
+                            // hook context at compile time.
+                            if let Expr::StaticProp {
+                                class: pc,
+                                name: PropName::Name(pn),
+                            } = &e
+                            {
+                                if let Expr::Const(cn) = pc.as_ref() {
+                                    if cn.eq_ignore_ascii_case("parent")
+                                        && (n.eq_ignore_ascii_case("get")
+                                            || n.eq_ignore_ascii_case("set"))
+                                    {
+                                        if self.cur_class.is_empty() {
+                                            return Err(PhpError::fatal(
+                                                "Cannot use \"parent\" when no class scope is active",
+                                                self.line(),
+                                            ));
+                                        }
+                                        match &self.hook_ctx {
+                                            None => {
+                                                return Err(PhpError::fatal(
+                                                    format!(
+                                                        "Must not use parent::${}::{}() outside a property hook",
+                                                        pn, n
+                                                    ),
+                                                    self.line(),
+                                                ))
+                                            }
+                                            Some((hp, hg)) => {
+                                                if hp != pn {
+                                                    return Err(PhpError::fatal(
+                                                        format!(
+                                                            "Must not use parent::${}::{}() in a different property (${})",
+                                                            pn, n, hp
+                                                        ),
+                                                        self.line(),
+                                                    ));
+                                                }
+                                                if *hg != n.eq_ignore_ascii_case("get") {
+                                                    return Err(PhpError::fatal(
+                                                        format!(
+                                                            "Must not use parent::${}::{}() in a different property hook ({})",
+                                                            pn,
+                                                            n,
+                                                            if *hg { "get" } else { "set" }
+                                                        ),
+                                                        self.line(),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             let args = self.args()?;
                             e = Expr::StaticCall {
                                 class: Box::new(e),
@@ -2208,12 +2569,29 @@ impl<'a> Parser<'a> {
                 self.expect_op("}")?;
                 Ok(PropName::Expr(Box::new(e)))
             }
-            // `$obj->${expr}`
+            // `$obj->${expr}` / `$obj->$$var` — variable-variable: the prop
+            // name is the VALUE of the variable named by the expr
+            // (engine_assignExecutionOrder_001).
             Some(Token::Op("$")) => {
-                self.expect_op("{")?;
-                let e = self.expr()?;
-                self.expect_op("}")?;
-                Ok(PropName::Expr(Box::new(e)))
+                if self.at_op("{") {
+                    self.pos += 1;
+                    let e = self.expr()?;
+                    self.expect_op("}")?;
+                    Ok(PropName::Expr(Box::new(Expr::VarVar(Box::new(e)))))
+                } else {
+                    match self.next() {
+                        Some(Token::Variable(n)) => Ok(PropName::Expr(Box::new(Expr::VarVar(
+                            Box::new(Expr::Var(n)),
+                        )))),
+                        t => Err(PhpError::parse(
+                            format!(
+                                "syntax error, unexpected {}, expecting identifier",
+                                desc_t(t.as_ref())
+                            ),
+                            self.line(),
+                        )),
+                    }
+                }
             }
             t => Err(PhpError::parse(
                 format!(
@@ -2251,7 +2629,13 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 let e = self.expr()?;
                 self.expect_op(")")?;
-                Ok(e)
+                // Mark parenthesized class-prop refs so `(X::$p)::m()`
+                // is not confused with the `X::$p::m()` hook syntax.
+                Ok(if matches!(e, Expr::StaticProp { .. }) {
+                    Expr::Paren(Box::new(e))
+                } else {
+                    e
+                })
             }
             Some(Token::Op("[")) => {
                 // Short array literal.
@@ -2417,6 +2801,9 @@ impl<'a> Parser<'a> {
                 } else if self.ident_is("__namespace__") {
                     self.pos += 1;
                     Ok(Expr::MagicConst(MagicConst::Namespace))
+                } else if self.ident_is("__property__") {
+                    self.pos += 1;
+                    Ok(Expr::MagicConst(MagicConst::Property))
                 } else if self.ident_is("static") {
                     // `static::` — static class ref
                     self.pos += 1;

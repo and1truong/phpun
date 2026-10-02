@@ -47,6 +47,11 @@ pub struct Frame {
     file: String,
     /// Function declared `&name()` — returns bind cells, not values.
     ret_by_ref: bool,
+    /// While running a property hook: (object id, prop name, is_get,
+    /// owner class name) — `$this->prop` inside its own hook hits the
+    /// backing slot directly; the owner names `__METHOD__`'s class part
+    /// (trait origin too) (Zend/tests/property_hooks).
+    hook_prop: Option<(u64, String, bool, String)>,
 }
 
 impl Frame {
@@ -60,6 +65,7 @@ impl Frame {
             decl_class: None,
             file: String::new(),
             ret_by_ref: false,
+            hook_prop: None,
         }
     }
 }
@@ -118,6 +124,9 @@ pub struct Interp<'a> {
     /// Declaring class of the method about to be invoked (set by
     /// invoke_method, consumed by invoke_fn to fill Frame::decl_class).
     pending_decl_class: Option<Rc<PhpClass>>,
+    /// (object id, prop, is_get, owner) whose hook is about to run —
+    /// consumed by invoke_fn to fill Frame::hook_prop.
+    pending_hook_prop: Option<(u64, String, bool, String)>,
     /// Live object handles for PHP's var_dump `#N` id: the lowest freed
     /// slot is reused, matching Zend's object store recycling.
     obj_handles: Vec<std::rc::Weak<RefCell<PhpObject>>>,
@@ -247,6 +256,7 @@ impl<'a> Interp<'a> {
             in_handler: false,
             cur_line: 1,
             pending_decl_class: None,
+            pending_hook_prop: None,
             obj_handles: Vec::new(),
             destructed: HashSet::new(),
             internal_cb: 0,
@@ -346,6 +356,12 @@ impl<'a> Interp<'a> {
                         is_static: false,
                         visibility: Visibility::Protected,
                         readonly: false,
+                        ty: None,
+                        is_abstract: false,
+                        is_final: false,
+                        set_vis: None,
+                        decl_in: None,
+                        hooks: None,
                     })
                     .collect(),
                 consts: vec![],
@@ -478,6 +494,11 @@ impl<'a> Interp<'a> {
                             variadic: false,
                             ty: Some(vec!["string".into()]),
                             promoted: false,
+                            vis: None,
+                            readonly: false,
+                            is_final: false,
+                            set_vis: None,
+                            hooks: None,
                         }],
                         body: vec![],
                         by_ref: false,
@@ -489,6 +510,94 @@ impl<'a> Interp<'a> {
                     is_final: false,
                     visibility: Visibility::Public,
                 })],
+                props: vec![],
+                consts: vec![],
+            },
+            false,
+        );
+        // Reflection stubs — enough surface for the hooked-prop tests:
+        // ReflectionClass::newInstanceWithoutConstructor builds the shell
+        // without running __construct; ReflectionProperty::isInitialized
+        // checks slot presence (typed props with no default start uninit).
+        let mk_method = |name: &str, params: Vec<Param>| {
+            Rc::new(MethodDecl {
+                decl: FunctionDecl {
+                    name: name.into(),
+                    params,
+                    body: vec![],
+                    by_ref: false,
+                    line: 0,
+                    file: String::new(),
+                },
+                is_static: false,
+                is_abstract: false,
+                is_final: false,
+                visibility: Visibility::Public,
+            })
+        };
+        let str_param = |n: &str| Param {
+            name: n.into(),
+            default: None,
+            by_ref: false,
+            variadic: false,
+            ty: Some(vec!["string".into()]),
+            promoted: false,
+            vis: None,
+            readonly: false,
+            is_final: false,
+            set_vis: None,
+            hooks: None,
+        };
+        reg(
+            ClassDecl {
+                name: "ReflectionClass".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                parent: None,
+                implements: vec![],
+                traits: vec![],
+                methods: vec![
+                    mk_method("__construct", vec![str_param("class")]),
+                    mk_method("newInstanceWithoutConstructor", vec![]),
+                    mk_method("getName", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+            },
+            false,
+        );
+        reg(
+            ClassDecl {
+                name: "ReflectionProperty".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                parent: None,
+                implements: vec![],
+                traits: vec![],
+                methods: vec![
+                    mk_method(
+                        "__construct",
+                        vec![str_param("class"), str_param("property")],
+                    ),
+                    mk_method(
+                        "isInitialized",
+                        vec![Param {
+                            name: "object".into(),
+                            default: Some(Expr::Null),
+                            by_ref: false,
+                            variadic: false,
+                            ty: None,
+                            promoted: false,
+                            vis: None,
+                            readonly: false,
+                            is_final: false,
+                            set_vis: None,
+                            hooks: None,
+                        }],
+                    ),
+                ],
                 props: vec![],
                 consts: vec![],
             },
@@ -640,7 +749,12 @@ impl<'a> Interp<'a> {
         match parser::parse_with(src, self.ini_on("short_open_tag")) {
             Ok(stmts) => self.run(&stmts),
             Err(e) => {
-                self.print_parse(&e);
+                // Compile-time semantic errors (hook decl checks, `parent::`
+                // misuse) are E_ERROR fatals, not syntax errors.
+                match e.kind {
+                    ErrorKind::Parse => self.print_parse(&e),
+                    _ => self.print_fatal(&e),
+                }
                 RunResult {
                     exit_code: 255,
                     fatal: Some(e),
@@ -1396,7 +1510,9 @@ impl<'a> Interp<'a> {
                     mm.decl.file = self.cur_file.clone();
                     *m = Rc::new(mm);
                 }
-                self.register_class(Rc::new(d));
+                if let Err(e) = self.register_class(Rc::new(d)) {
+                    return self.err_flow(e);
+                }
                 Flow::Normal
             }
             Stmt::Static { vars, line } => {
@@ -1569,7 +1685,9 @@ impl<'a> Interp<'a> {
                             let _ = self.unset_index(e, i.as_deref());
                         }
                         Expr::Prop { .. } => {
-                            let _ = self.unset_prop(x);
+                            if let Err(e) = self.unset_prop(x) {
+                                return self.err_flow(e);
+                            }
                         }
                         Expr::StaticProp { class, name } => {
                             if let Ok(pn) = self.prop_name(name) {
@@ -2295,8 +2413,30 @@ impl<'a> Interp<'a> {
                 args,
                 nullsafe,
             } => self.method_call(obj, name, args, *nullsafe),
+            Expr::Paren(e) => self.eval(e),
             Expr::StaticProp { class, name } => self.static_prop_read(class, name),
-            Expr::StaticCall { class, name, args } => self.static_call(class, name, args),
+            Expr::StaticCall { class, name, args } => {
+                // `parent::$prop::get()` — parent property hook call.
+                if let Expr::StaticProp {
+                    class: pc,
+                    name: PropName::Name(pn),
+                } = class.as_ref()
+                {
+                    if let Expr::Const(n) = pc.as_ref() {
+                        if n.eq_ignore_ascii_case("parent")
+                            && (name.eq_ignore_ascii_case("get")
+                                || name.eq_ignore_ascii_case("set"))
+                        {
+                            return self.hook_parent_call(
+                                pn,
+                                name.eq_ignore_ascii_case("get"),
+                                args,
+                            );
+                        }
+                    }
+                }
+                self.static_call(class, name, args)
+            }
             Expr::StaticCallDyn { class, name, args } => {
                 // `C::$var(...)`: class resolves first, then the name.
                 let cls = self.class_of(class)?;
@@ -2382,7 +2522,7 @@ impl<'a> Interp<'a> {
                 }
             }
             Expr::AnonClass(decl) => {
-                self.register_class(decl.clone());
+                self.register_class(decl.clone())?;
                 Ok(Value::str(decl.name.clone()))
             }
         }
@@ -2406,12 +2546,22 @@ impl<'a> Interp<'a> {
             ),
             MagicConst::Method => {
                 let f = self.stack.last();
-                match f.and_then(|f| {
-                    f.scope_class
+                match f {
+                    // Hook frame: owner is the declaring class/trait —
+                    // `T::$prop::get` for trait-origin hooks (not the
+                    // consuming class).
+                    Some(f) if f.hook_prop.is_some() => {
+                        let (_, _, _, owner) = f.hook_prop.as_ref().unwrap();
+                        Value::str(format!("{}::{}", owner, f.fn_name))
+                    }
+                    Some(f) => match f
+                        .scope_class
                         .as_ref()
                         .map(|c| format!("{}::{}", c.name(), f.fn_name))
-                }) {
-                    Some(s) => Value::str(s),
+                    {
+                        Some(s) => Value::str(s),
+                        None => Value::str(""),
+                    },
                     None => Value::str(""),
                 }
             }
@@ -2422,6 +2572,14 @@ impl<'a> Interp<'a> {
                     .unwrap_or_default(),
             ),
             MagicConst::Namespace => Value::str(""),
+            // `__PROPERTY__` inside a hook names its prop; anywhere else
+            // (methods, closures nested in a hook, top level) it is "".
+            MagicConst::Property => Value::str(
+                self.stack
+                    .last()
+                    .and_then(|f| f.hook_prop.as_ref().map(|(_, pn, _, _)| pn.clone()))
+                    .unwrap_or_default(),
+            ),
         }
     }
 
@@ -2454,10 +2612,24 @@ impl<'a> Interp<'a> {
                 self.silence += 1;
                 let v = self.prop_read_loose(e);
                 self.silence -= 1;
-                Ok(match v {
-                    Ok(v) => !matches!(v, Value::Null),
-                    Err(_) => false,
-                })
+                match v {
+                    Ok(v) => Ok(!matches!(v, Value::Null)),
+                    // A hooked get runs inside isset — its exceptions
+                    // escape (write-only prop throws through the
+                    // try/catch, not `false`).
+                    Err(e) if matches!(e.kind, ErrorKind::Throw) => {
+                        // Uninitialized typed prop reads still mean
+                        // "not set" for isset — hook Errors escape.
+                        if e.message
+                            .ends_with("must not be accessed before initialization")
+                        {
+                            Ok(false)
+                        } else {
+                            Err(e)
+                        }
+                    }
+                    Err(_) => Ok(false),
+                }
             }
             _ => {
                 let v = self.eval(e)?;
@@ -2598,6 +2770,10 @@ impl<'a> Interp<'a> {
                 ov: Value,
                 name: Option<PropName>,
             },
+            PropStr {
+                ov: Value,
+                pn: String,
+            },
             Index {
                 base: Cell,
                 key: Option<Value>,
@@ -2625,17 +2801,18 @@ impl<'a> Interp<'a> {
             Expr::Prop { obj, name, .. } => {
                 match self.eval(obj) {
                     Ok(ov) => {
-                        // A {dynamic} name expr runs now (side effects); its
-                        // effective name is overwritten by the RHS at write
-                        // time. A plain $var name keeps its value.
-                        let dyn_name = matches!(name, PropName::Expr(_));
-                        if dyn_name {
-                            let _ = self.prop_name(name);
+                        // A {dynamic} name expr resolves now (side effects +
+                        // the var-var temp is read early, matching Zend);
+                        // a plain $var name reads late at write time.
+                        if matches!(name, PropName::Expr(_)) {
+                            let pn = self.prop_name(name)?;
+                            late = Late::PropStr { ov, pn };
+                        } else {
+                            late = Late::Prop {
+                                ov,
+                                name: Some(name.clone()),
+                            };
                         }
-                        late = Late::Prop {
-                            ov,
-                            name: if dyn_name { None } else { Some(name.clone()) },
-                        };
                         None
                     }
                     Err(_) => None,
@@ -2761,11 +2938,13 @@ impl<'a> Interp<'a> {
         };
         match late {
             Late::Prop { ov, name } => {
-                // Dynamic name: the RHS value lands in the name register.
                 let pn = match name {
                     Some(n) => self.prop_name(&n)?,
                     None => self.conv_str(&newv)?,
                 };
+                self.store_prop(ov, &pn, newv.clone())?;
+            }
+            Late::PropStr { ov, pn } => {
                 self.store_prop(ov, &pn, newv.clone())?;
             }
             Late::Index { base, key, append } => {
@@ -2980,6 +3159,18 @@ impl<'a> Interp<'a> {
     fn store_prop(&mut self, ov: Value, pn: &str, v: Value) -> Result<(), PhpError> {
         match ov {
             Value::Object(o) => {
+                if !self.in_own_hook(&o, pn) {
+                    if let Some((pd, hs)) = self.hooked_prop(&o, pn) {
+                        return self.hook_write(&o, &pd, &hs, v);
+                    }
+                    if let Some((pd, dcls)) = self.decl_prop(&o, pn) {
+                        if let Some(sv) = pd.set_vis {
+                            if !self.hook_scope_allows(&dcls, sv) {
+                                return self.set_visibility_error(&dcls, &pd.name, sv);
+                            }
+                        }
+                    }
+                }
                 let cls = o.borrow().class.clone();
                 if let Some(k) = self.obj_prop_key(&o, pn) {
                     o.borrow_mut().props.insert(k, cell(v));
@@ -4072,7 +4263,14 @@ impl<'a> Interp<'a> {
             }
             _ => {
                 let v = self.eval(name)?;
-                self.conv_str(&v).unwrap_or_default()
+                match v {
+                    // `(expr)()` — IIFE on a closure/invokable value.
+                    Value::Callable(_) | Value::Object(_) => {
+                        let vals = self.arg_cells(args, &[], "")?;
+                        return self.call_value(&v, vals);
+                    }
+                    _ => self.conv_str(&v).unwrap_or_default(),
+                }
             }
         };
         self.call_named(&fname, args)
@@ -4176,6 +4374,11 @@ impl<'a> Interp<'a> {
                             variadic: false,
                             ty: None,
                             promoted: false,
+                            vis: None,
+                            readonly: false,
+                            is_final: false,
+                            set_vis: None,
+                            hooks: None,
                         })
                         .collect()
                 })
@@ -4607,15 +4810,13 @@ impl<'a> Interp<'a> {
             // Promoted ctor params: declare+assign $this->{name}
             // (error_2_exception_001).
             let is_ctor = decl.name.eq_ignore_ascii_case("__construct");
+            let this_obj = frame.this_obj.clone();
+            let mut promoted_writes: Vec<(Rc<RefCell<PhpObject>>, String, Value)> = Vec::new();
             for (i, p) in decl.params.iter().enumerate() {
                 if p.promoted && is_ctor {
-                    if let Some(obj) = &frame.this_obj {
+                    if let Some(obj) = &this_obj {
                         let v = binds[i].1.borrow().clone();
-                        let mut o = obj.borrow_mut();
-                        o.props.insert(p.name.clone(), cell(v));
-                        if !o.prop_order.contains(&p.name) {
-                            o.prop_order.push(p.name.clone());
-                        }
+                        promoted_writes.push((obj.clone(), p.name.clone(), v));
                     }
                 }
             }
@@ -4623,6 +4824,11 @@ impl<'a> Interp<'a> {
                 frame.vars.insert(n, c);
             }
             frame.args = fa;
+            for (obj, pname, v) in promoted_writes {
+                // Promoted assignment goes through prop write semantics —
+                // hooked promoted props run their set hook (gh15438_1).
+                self.store_prop(Value::Object(obj), &pname, v)?;
+            }
         }
         let flow = self.exec_block(&decl.body);
         self.stack.pop();
@@ -4690,6 +4896,7 @@ impl<'a> Interp<'a> {
                 .insert("this".to_string(), cell(Value::Object(obj.clone())));
         }
         frame.decl_class = self.pending_decl_class.take();
+        frame.hook_prop = self.pending_hook_prop.take();
         frame.this_obj = this_obj;
         frame.scope_class = scope_class;
         frame.file = if decl.file.is_empty() {
@@ -4703,18 +4910,47 @@ impl<'a> Interp<'a> {
 
     // ----- classes -----
 
-    fn register_class(&mut self, decl: Rc<ClassDecl>) {
+    fn register_class(&mut self, decl: Rc<ClassDecl>) -> Result<(), PhpError> {
+        let mut d = (*decl).clone();
+        // Synthesize PropDecls from promoted constructor params
+        // (`__construct(public readonly int $x)`) — they behave as
+        // declared props for visibility/type/readonly and hooks.
+        if d.kind != ClassKind::Interface {
+            if let Some(ctor) = d
+                .methods
+                .iter()
+                .find(|m| m.decl.name.eq_ignore_ascii_case("__construct"))
+            {
+                for p in &ctor.decl.params {
+                    if p.promoted && !d.props.iter().any(|x| x.name == p.name) {
+                        d.props.push(PropDecl {
+                            name: p.name.clone(),
+                            default: None,
+                            is_static: false,
+                            visibility: p.vis.unwrap_or(crate::ast::Visibility::Public),
+                            readonly: p.readonly,
+                            ty: p.ty.clone(),
+                            is_abstract: false,
+                            is_final: p.is_final,
+                            set_vis: p.set_vis,
+                            decl_in: None,
+                            hooks: p.hooks.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        self.check_hooked_props(&d)?;
         let lname = decl.name.to_lowercase();
         match decl.kind {
             ClassKind::Interface => {
                 self.interfaces.insert(lname, decl);
             }
             ClassKind::Trait => {
-                self.traits.insert(lname, decl);
+                self.traits.insert(lname, Rc::new(d));
             }
             _ => {
                 // Apply traits: merge methods/props into the decl.
-                let mut d = (*decl).clone();
                 if !d.traits.is_empty() {
                     for t in d.traits.clone() {
                         if let Some(td) = self.traits.get(&t.to_lowercase()) {
@@ -4729,12 +4965,18 @@ impl<'a> Interp<'a> {
                             }
                             for p in &td.props {
                                 if !d.props.iter().any(|x| x.name == p.name) {
-                                    d.props.push(p.clone());
+                                    let mut np = p.clone();
+                                    // Trait origin survives the merge —
+                                    // `__METHOD__` prints `T::$p::get`.
+                                    np.decl_in = Some(t.clone());
+                                    d.props.push(np);
                                 }
                             }
                         }
                     }
                 }
+                self.check_abstract_hooks(&d)?;
+                self.check_final_override(&d)?;
                 self.classes.insert(
                     lname,
                     Rc::new(PhpClass {
@@ -4745,6 +4987,350 @@ impl<'a> Interp<'a> {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// `final` props/hooks may not be overridden by a subclass.
+    fn check_final_override(&self, d: &ClassDecl) -> Result<(), PhpError> {
+        let mut an = d.parent.clone();
+        while let Some(pname) = an {
+            let Some(pc) = self.classes.get(&pname.to_lowercase()) else {
+                break;
+            };
+            for cp in &d.props {
+                let Some(ap) = pc.decl.props.iter().find(|x| x.name == cp.name) else {
+                    continue;
+                };
+                if ap.is_final {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Cannot override final property {}::${}",
+                            pc.decl.name, cp.name
+                        ),
+                        self.cur_line,
+                    ));
+                }
+                if let (Some(chs), Some(ahs)) = (&cp.hooks, &ap.hooks) {
+                    for ch in chs {
+                        if ahs.iter().any(|ah| ah.is_get == ch.is_get && ah.is_final) {
+                            let kind = if ch.is_get { "get" } else { "set" };
+                            return Err(PhpError::fatal(
+                                format!(
+                                    "Cannot override final property hook {}::${}::{}()",
+                                    pc.decl.name, cp.name, kind
+                                ),
+                                self.cur_line,
+                            ));
+                        }
+                    }
+                }
+            }
+            an = pc.decl.parent.clone();
+        }
+        Ok(())
+    }
+
+    /// PHP 8.4 hooked-property decl checks (property_hooks tests): hooks
+    /// are forbidden on static/readonly props; a default requires a
+    /// *backed* prop; `set(T)` must be type-compatible; `final`/`abstract`
+    /// and interface restrictions produce link-time fatals.
+    fn check_hooked_props(&self, d: &ClassDecl) -> Result<(), PhpError> {
+        let in_iface = d.kind == ClassKind::Interface;
+        for p in &d.props {
+            if in_iface && p.is_abstract {
+                return Err(PhpError::fatal(
+                    "Property in interface cannot be explicitly abstract. All interface members are implicitly abstract",
+                    self.cur_line,
+                ));
+            }
+            if in_iface && p.visibility != crate::ast::Visibility::Public {
+                return Err(PhpError::fatal(
+                    "Property in interface cannot be protected or private",
+                    self.cur_line,
+                ));
+            }
+            if in_iface && p.is_final {
+                return Err(PhpError::fatal(
+                    "Property in interface cannot be final",
+                    self.cur_line,
+                ));
+            }
+            if p.is_abstract && p.hooks.is_none() {
+                return Err(PhpError::fatal(
+                    "Only hooked properties may be declared abstract",
+                    self.cur_line,
+                ));
+            }
+            if p.is_abstract && p.is_final {
+                return Err(PhpError::fatal(
+                    "Cannot use the final modifier on an abstract property",
+                    self.cur_line,
+                ));
+            }
+            if p.is_final && p.visibility == crate::ast::Visibility::Private {
+                return Err(PhpError::fatal(
+                    "Property cannot be both final and private",
+                    self.cur_line,
+                ));
+            }
+            // Untyped readonly faults before the hooked-property rules
+            // (the same message a plain readonly prop gets).
+            if p.readonly && p.ty.is_none() {
+                return Err(PhpError::fatal(
+                    format!("Readonly property {}::${} must have type", d.name, p.name),
+                    self.cur_line,
+                ));
+            }
+            let Some(hs) = &p.hooks else { continue };
+            if p.is_abstract && hs.iter().all(|h| h.body.is_some()) {
+                return Err(PhpError::fatal(
+                    format!(
+                        "Abstract property {}::${} must specify at least one abstract hook",
+                        d.name, p.name
+                    ),
+                    self.cur_line,
+                ));
+            }
+            for h in hs {
+                if let Some(v) = h.visibility {
+                    let vn = match v {
+                        crate::ast::Visibility::Public => "public",
+                        crate::ast::Visibility::Protected => "protected",
+                        crate::ast::Visibility::Private => "private",
+                    };
+                    return Err(PhpError::fatal(
+                        format!("Cannot use the {} modifier on a property hook", vn),
+                        self.cur_line,
+                    ));
+                }
+                if h.is_final && p.visibility == crate::ast::Visibility::Private {
+                    return Err(PhpError::fatal(
+                        "Property hook cannot be both final and private",
+                        self.cur_line,
+                    ));
+                }
+                if h.is_final && (in_iface || h.body.is_none()) {
+                    return Err(PhpError::fatal(
+                        "Property hook cannot be both abstract and final",
+                        self.cur_line,
+                    ));
+                }
+                if h.body.is_none() && p.visibility == crate::ast::Visibility::Private {
+                    return Err(PhpError::fatal(
+                        "Property hook cannot be both abstract and private",
+                        self.cur_line,
+                    ));
+                }
+                if h.is_get && (h.has_plist || !h.params.is_empty()) {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "get hook of property {}::${} must not have a parameter list",
+                            d.name, p.name
+                        ),
+                        self.cur_line,
+                    ));
+                }
+                if !h.is_get {
+                    if let Some(sp) = h.params.first() {
+                        if sp.default.is_some() {
+                            return Err(PhpError::fatal(
+                                format!(
+                                    "Parameter ${} of set hook {}::${} must not have a default value",
+                                    sp.name, d.name, p.name
+                                ),
+                                self.cur_line,
+                            ));
+                        }
+                        if sp.by_ref {
+                            return Err(PhpError::fatal(
+                                format!(
+                                    "Parameter ${} of set hook {}::${} must not be pass-by-reference",
+                                    sp.name, d.name, p.name
+                                ),
+                                self.cur_line,
+                            ));
+                        }
+                        if sp.variadic {
+                            return Err(PhpError::fatal(
+                                format!(
+                                    "Parameter ${} of set hook {}::${} must not be variadic",
+                                    sp.name, d.name, p.name
+                                ),
+                                self.cur_line,
+                            ));
+                        }
+                    }
+                }
+            }
+            if p.is_static {
+                return Err(PhpError::fatal(
+                    "Cannot declare hooks for static property",
+                    self.cur_line,
+                ));
+            }
+            if p.readonly {
+                return Err(PhpError::fatal(
+                    "Hooked properties cannot be readonly",
+                    self.cur_line,
+                ));
+            }
+            if p.default.is_some()
+                && !Self::prop_is_backed(p)
+                && !self.chain_prop_backed(d, &p.name)
+            {
+                return Err(PhpError::fatal(
+                    format!(
+                        "Cannot specify default value for virtual hooked property {}::${}",
+                        d.name, p.name
+                    ),
+                    self.cur_line,
+                ));
+            }
+            // `&get` is legal only without a set hook (Zend hardcodes
+            // "backed property" in the message even for virtual ones).
+            if hs.iter().any(|h| !h.is_get) && hs.iter().any(|h| h.is_get && h.by_ref) {
+                return Err(PhpError::fatal(
+                    format!(
+                        "Get hook of backed property {}::{} with set hook may not return by reference",
+                        d.name, p.name
+                    ),
+                    self.cur_line,
+                ));
+            }
+            // A hook without a body is only legal in an interface or on
+            // a prop declared `abstract`.
+            let abs_ok = d.kind == ClassKind::Interface || p.is_abstract;
+            if !abs_ok && hs.iter().any(|h| h.body.is_none()) {
+                return Err(PhpError::fatal(
+                    "Non-abstract property hook must have a body",
+                    self.cur_line,
+                ));
+            }
+            if let (Some(pty), Some(set)) = (&p.ty, hs.iter().find(|h| !h.is_get)) {
+                if let Some(sp) = set.params.first() {
+                    if let Some(sty) = &sp.ty {
+                        let compat = sty.iter().all(|m| pty.iter().any(|t| t == m));
+                        if !compat {
+                            return Err(PhpError::fatal(
+                                format!(
+                                    "Type of parameter ${} of hook {}::${}::set must be compatible with property type",
+                                    sp.name, d.name, p.name
+                                ),
+                                0,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// An abstract hook (`get;`/`set;` in an interface or `abstract`
+    /// prop) the class must implement — reported as abstract methods
+    /// (`A::$p::get`) at class-decl link time. Inherited but
+    /// unimplemented hooks still fault subclasses (v3-style:
+    /// `abstract A implements I` leaves `I::$p::get` for `B extends A`).
+    fn check_abstract_hooks(&self, d: &ClassDecl) -> Result<(), PhpError> {
+        if d.is_abstract {
+            return Ok(());
+        }
+        // Concrete hook impls available to this class: its own decl plus
+        // every ancestor.
+        let mut chain: Vec<&ClassDecl> = vec![d];
+        let mut pn = d.parent.clone();
+        while let Some(p) = pn {
+            let Some(pc) = self.classes.get(&p.to_lowercase()) else {
+                break;
+            };
+            chain.push(pc.decl.as_ref());
+            pn = pc.decl.parent.clone();
+        }
+        let implemented = |pname: &str, is_get: bool| {
+            chain.iter().any(|c| {
+                c.props.iter().any(|cp| {
+                    if cp.name != pname {
+                        return false;
+                    }
+                    if let Some(ch) = &cp.hooks {
+                        return ch.iter().any(|x| x.is_get == is_get && x.body.is_some());
+                    }
+                    // A plain prop satisfies `get` always; `set` only
+                    // when writable (not readonly / private(set)).
+                    if is_get {
+                        true
+                    } else {
+                        !cp.readonly && cp.set_vis.is_none()
+                    }
+                })
+            })
+        };
+        // Abstract hook decls owed by this class: its interfaces + every
+        // class/interface in the ancestor chain.
+        let mut sources: Vec<&ClassDecl> = Vec::new();
+        for c in &chain {
+            sources.push(*c);
+            for i in &c.implements {
+                if let Some(f) = self.interfaces.get(&i.to_lowercase()) {
+                    sources.push(f.as_ref());
+                }
+            }
+        }
+        let mut missing: Vec<String> = Vec::new();
+        for src in sources {
+            for p in &src.props {
+                let Some(hs) = &p.hooks else { continue };
+                for h in hs {
+                    if h.body.is_some() {
+                        continue;
+                    }
+                    let kind = if h.is_get { "get" } else { "set" };
+                    let label = format!("{}::${}::{}", src.name, p.name, kind);
+                    if implemented(&p.name, h.is_get) {
+                        continue;
+                    }
+                    // A readonly prop (implicit private(set)) can not
+                    // satisfy an interface `set` — a dedicated message,
+                    // not the abstract-method one.
+                    if !h.is_get && src.kind == ClassKind::Interface {
+                        let ro = chain.iter().any(|c| {
+                            c.props.iter().any(|cp| {
+                                cp.name == p.name
+                                    && cp.hooks.is_none()
+                                    && (cp.readonly || cp.set_vis.is_some())
+                            })
+                        });
+                        if ro {
+                            return Err(PhpError::fatal(
+                                format!(
+                                    "Set access level of {}::${} must be omitted (as in class {})",
+                                    d.name, p.name, src.name
+                                ),
+                                self.cur_line,
+                            ));
+                        }
+                    }
+                    if !missing.contains(&label) {
+                        missing.push(label);
+                    }
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let (n, list) = (missing.len(), missing.join(", "));
+        Err(PhpError::fatal(
+            format!(
+                "Class {} contains {} abstract method{} and must therefore be declared abstract or implement the remaining method{} ({})",
+                d.name,
+                n,
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "" } else { "s" },
+                list
+            ),
+            self.cur_line,
+        ))
     }
 
     /// Resolve a class expression to a class name.
@@ -4753,7 +5339,7 @@ impl<'a> Interp<'a> {
             Expr::Const(n) => Ok(self.resolve_class_name(n)),
             Expr::Str(s) => Ok(self.resolve_class_name(s)),
             Expr::AnonClass(d) => {
-                self.register_class(d.clone());
+                self.register_class(d.clone())?;
                 Ok(d.name.clone())
             }
             _ => {
@@ -4898,9 +5484,42 @@ impl<'a> Interp<'a> {
         chain.reverse();
         let mut props = HashMap::new();
         let mut prop_order = Vec::new();
-        for c in &chain {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (ci, c) in chain.iter().enumerate() {
             for p in &c.decl.props {
                 if p.is_static {
+                    continue;
+                }
+                let is_priv = p.visibility == crate::ast::Visibility::Private;
+                if !is_priv {
+                    // The NEAREST redecl is authoritative — defaults are
+                    // never inherited (default_value_inheritance): a later
+                    // decl replaces any slot a grandparent already made.
+                    if !seen.insert(p.name.clone()) {
+                        props.remove(&p.name);
+                        prop_order.retain(|k| k != &p.name);
+                    }
+                }
+                let backed = if p.hooks.is_some() {
+                    Self::prop_is_backed(p)
+                        || chain[..=ci].iter().any(|c2| {
+                            c2.decl.props.iter().any(|p2| {
+                                p2.name == p.name
+                                    && p2.hooks.is_none()
+                                    && p2.visibility != crate::ast::Visibility::Private
+                            })
+                        })
+                } else {
+                    true
+                };
+                // A virtual hooked prop has no backing slot at all.
+                if !backed {
+                    continue;
+                }
+                // A typed prop without a default starts *uninitialized* —
+                // no slot at all, so reads raise the "must not be accessed"
+                // Error instead of returning null.
+                if p.ty.is_some() && p.default.is_none() {
                     continue;
                 }
                 let default = match &p.default {
@@ -4909,7 +5528,7 @@ impl<'a> Interp<'a> {
                 };
                 // Private props live in a per-declaring-class slot
                 // ("\0Cls\0name"), so C::$e and E::$e are distinct.
-                let key = if p.visibility == crate::ast::Visibility::Private {
+                let key = if is_priv {
                     format!("\0{}\0{}", c.decl.name, p.name)
                 } else {
                     p.name.clone()
@@ -4979,6 +5598,848 @@ impl<'a> Interp<'a> {
         }
     }
 
+    // ----- property hooks (PHP 8.4, Zend/tests/property_hooks) -----
+
+    /// True while `o`'s own hook on `pn` is running — inside a hook body
+    /// `$this->pn` is the backing slot, not a re-entry into the hook.
+    fn in_own_hook(&self, o: &Rc<RefCell<PhpObject>>, pn: &str) -> bool {
+        self.stack
+            .last()
+            .and_then(|f| f.hook_prop.as_ref())
+            .is_some_and(|(id, n, _, _)| *id == o.borrow().id && n == pn)
+    }
+
+    /// Name of the class whose scope the current frame runs in —
+    /// private props are only visible to their own declaring class.
+    fn caller_scope_name(&self) -> Option<String> {
+        self.stack.last().and_then(|f| {
+            f.decl_class
+                .as_ref()
+                .or(f.scope_class.as_ref())
+                .map(|c| c.name().to_string())
+        })
+    }
+
+    /// A private prop of the caller's scope class: it is a *distinct*
+    /// property from same-name decls elsewhere in the chain and wins
+    /// outright when the caller's scope declares it (private_override).
+    fn scope_private_prop(
+        &self,
+        o: &Rc<RefCell<PhpObject>>,
+        pn: &str,
+    ) -> Option<(PropDecl, Rc<PhpClass>)> {
+        let scope = self.caller_scope_name()?;
+        let mut cur = Some(o.borrow().class.clone());
+        while let Some(c) = cur {
+            if c.name() == scope {
+                if let Some(p) = c
+                    .decl
+                    .props
+                    .iter()
+                    .find(|p| p.name == pn && p.visibility == crate::ast::Visibility::Private)
+                {
+                    return Some((p.clone(), c.clone()));
+                }
+                break;
+            }
+            let par = c.decl.parent.clone();
+            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        None
+    }
+
+    /// The effective hooked prop for `pn`: the nearest PropDecl (for
+    /// name/type/visibility) plus hooks merged along the chain — each
+    /// hook kind resolves to the nearest decl that provides it (a plain
+    /// child redecl still inherits parent hooks; per-hook origin class
+    /// drives `__METHOD__` and decl_class). Private props of other
+    /// scopes are skipped — they are different properties entirely.
+    fn hooked_prop(
+        &self,
+        o: &Rc<RefCell<PhpObject>>,
+        pn: &str,
+    ) -> Option<(PropDecl, MergedHooks)> {
+        if let Some((p, c)) = self.scope_private_prop(o, pn) {
+            return p.hooks.as_ref().map(|hs| {
+                (
+                    p.clone(),
+                    hs.iter().cloned().map(|h| (h, c.clone())).collect(),
+                )
+            });
+        }
+        let mut nearest: Option<PropDecl> = None;
+        let mut hooks: MergedHooks = Vec::new();
+        let mut cur = Some(o.borrow().class.clone());
+        while let Some(c) = cur {
+            for p in &c.decl.props {
+                if p.name != pn {
+                    continue;
+                }
+                if p.visibility == crate::ast::Visibility::Private {
+                    continue;
+                }
+                if nearest.is_none() {
+                    nearest = Some(p.clone());
+                }
+                if let Some(hs) = &p.hooks {
+                    for h in hs {
+                        if !hooks.iter().any(|(x, _)| x.is_get == h.is_get) {
+                            hooks.push((h.clone(), c.clone()));
+                        }
+                    }
+                }
+            }
+            let parent = c.decl.parent.clone();
+            cur = parent.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        let pd = nearest?;
+        if hooks.is_empty() {
+            return None;
+        }
+        Some((pd, hooks))
+    }
+
+    /// The nearest PropDecl for `pn` along the chain, honoring the same
+    /// private-scope rules as `hooked_prop` (hooked or plain).
+    fn decl_prop(&self, o: &Rc<RefCell<PhpObject>>, pn: &str) -> Option<(PropDecl, Rc<PhpClass>)> {
+        if let Some(x) = self.scope_private_prop(o, pn) {
+            return Some(x);
+        }
+        let mut cur = Some(o.borrow().class.clone());
+        while let Some(c) = cur {
+            for p in &c.decl.props {
+                if p.name == pn && p.visibility != crate::ast::Visibility::Private {
+                    return Some((p.clone(), c.clone()));
+                }
+            }
+            let parent = c.decl.parent.clone();
+            cur = parent.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        None
+    }
+
+    /// Backedness of the *merged* runtime prop: any merged hook body
+    /// referencing `$this->prop`, or any plain (unhooked) decl for it
+    /// anywhere in the chain — a hooked redecl over a plain parent prop
+    /// still shares its backing (parent_get_plain).
+    fn backed_for(
+        &self,
+        o: &Rc<RefCell<PhpObject>>,
+        pn: &str,
+        hs: &[(crate::ast::PropHook, Rc<PhpClass>)],
+    ) -> bool {
+        if hs.iter().any(|(h, _)| {
+            h.body
+                .as_deref()
+                .is_some_and(|b| Self::stmts_use_this_prop(b, pn))
+        }) {
+            return true;
+        }
+        let mut cur = Some(o.borrow().class.clone());
+        while let Some(c) = cur {
+            if c.decl
+                .props
+                .iter()
+                .any(|p| p.name == pn && p.hooks.is_none())
+            {
+                return true;
+            }
+            let par = c.decl.parent.clone();
+            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        false
+    }
+
+    /// Decl-time backedness via ancestors: nearest ancestor decl named
+    /// `name` — a plain prop is backed; a hooked one checks its bodies;
+    /// a virtual one defers deeper.
+    fn chain_prop_backed(&self, d: &ClassDecl, name: &str) -> bool {
+        let mut an = d.parent.clone();
+        while let Some(pn) = an {
+            let Some(pc) = self.classes.get(&pn.to_lowercase()) else {
+                break;
+            };
+            if let Some(ap) = pc.decl.props.iter().find(|x| x.name == name) {
+                if ap.hooks.is_none() || Self::prop_is_backed(ap) {
+                    return true;
+                }
+            }
+            an = pc.decl.parent.clone();
+        }
+        false
+    }
+
+    /// A hooked prop is *backed* (has a backing slot) iff some hook body
+    /// references `$this->prop`; otherwise it's virtual and has none.
+    fn prop_is_backed(p: &PropDecl) -> bool {
+        p.hooks.as_ref().is_some_and(|hs| {
+            hs.iter().any(|h| {
+                h.body
+                    .as_ref()
+                    .is_some_and(|b| Self::stmts_use_this_prop(b, &p.name))
+            })
+        })
+    }
+
+    fn stmts_use_this_prop(v: &[Stmt], pn: &str) -> bool {
+        v.iter().any(|s| Self::stmt_uses_this_prop(s, pn))
+    }
+
+    fn stmt_uses_this_prop(s: &Stmt, pn: &str) -> bool {
+        match s {
+            Stmt::Echo(v) | Stmt::Unset(v) | Stmt::Global(v) => {
+                v.iter().any(|e| Self::expr_uses_this_prop(e, pn))
+            }
+            Stmt::Expr(e) => Self::expr_uses_this_prop(e, pn),
+            Stmt::Block(b) => Self::stmts_use_this_prop(b, pn),
+            Stmt::If { cond, then, else_ } => {
+                Self::expr_uses_this_prop(cond, pn)
+                    || Self::stmts_use_this_prop(then, pn)
+                    || Self::stmts_use_this_prop(else_, pn)
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+                Self::expr_uses_this_prop(cond, pn) || Self::stmts_use_this_prop(body, pn)
+            }
+            Stmt::For {
+                init,
+                cond,
+                inc,
+                body,
+            } => {
+                init.iter()
+                    .chain(cond.iter())
+                    .chain(inc.iter())
+                    .any(|e| Self::expr_uses_this_prop(e, pn))
+                    || Self::stmts_use_this_prop(body, pn)
+            }
+            Stmt::Return(Some(e)) | Stmt::Break(Some(e)) | Stmt::Continue(Some(e)) => {
+                Self::expr_uses_this_prop(e, pn)
+            }
+            Stmt::Switch { cond, cases } => {
+                Self::expr_uses_this_prop(cond, pn)
+                    || cases.iter().any(|(c, b)| {
+                        c.as_ref().is_some_and(|e| Self::expr_uses_this_prop(e, pn))
+                            || Self::stmts_use_this_prop(b, pn)
+                    })
+            }
+            Stmt::Foreach { arr, body, .. } => {
+                Self::expr_uses_this_prop(arr, pn) || Self::stmts_use_this_prop(body, pn)
+            }
+            Stmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                Self::stmts_use_this_prop(body, pn)
+                    || catches
+                        .iter()
+                        .any(|c| Self::stmts_use_this_prop(&c.body, pn))
+                    || finally
+                        .as_ref()
+                        .is_some_and(|f| Self::stmts_use_this_prop(f, pn))
+            }
+            Stmt::Function(d) => {
+                d.params
+                    .iter()
+                    .filter_map(|p| p.default.as_ref())
+                    .any(|e| Self::expr_uses_this_prop(e, pn))
+                    || Self::stmts_use_this_prop(&d.body, pn)
+            }
+            Stmt::Static { vars, .. } => vars
+                .iter()
+                .filter_map(|(_, d)| d.as_ref())
+                .any(|e| Self::expr_uses_this_prop(e, pn)),
+            Stmt::Declare { value, .. } => Self::expr_uses_this_prop(value, pn),
+            _ => false,
+        }
+    }
+
+    fn expr_uses_this_prop(e: &Expr, pn: &str) -> bool {
+        match e {
+            Expr::Prop { obj, name, .. } => {
+                (matches!(obj.as_ref(), Expr::Var(v) if v == "this")
+                    && matches!(name, PropName::Name(n) if n == pn))
+                    || Self::expr_uses_this_prop(obj, pn)
+                    || matches!(name, PropName::Expr(x) if Self::expr_uses_this_prop(x, pn))
+            }
+            Expr::Assign { target, value, .. } => {
+                Self::expr_uses_this_prop(target, pn) || Self::expr_uses_this_prop(value, pn)
+            }
+            Expr::Binary { l, r, .. } => {
+                Self::expr_uses_this_prop(l, pn) || Self::expr_uses_this_prop(r, pn)
+            }
+            Expr::Unary { e, .. }
+            | Expr::Clone(e)
+            | Expr::ByRef(e)
+            | Expr::PreInc(e)
+            | Expr::PreDec(e)
+            | Expr::PostInc(e)
+            | Expr::PostDec(e)
+            | Expr::Empty(e)
+            | Expr::Print(e)
+            | Expr::VarVar(e)
+            | Expr::Cast { e, .. }
+            | Expr::Throw(e)
+            | Expr::Include { e, .. } => Self::expr_uses_this_prop(e, pn),
+            Expr::Ternary { c, t, f } => {
+                Self::expr_uses_this_prop(c, pn)
+                    || t.as_ref().is_some_and(|t| Self::expr_uses_this_prop(t, pn))
+                    || Self::expr_uses_this_prop(f, pn)
+            }
+            Expr::Call { name, args } => {
+                Self::expr_uses_this_prop(name, pn)
+                    || args.iter().any(|a| Self::expr_uses_this_prop(a, pn))
+            }
+            Expr::StaticCallDyn { class, name, args } => {
+                Self::expr_uses_this_prop(class, pn)
+                    || Self::expr_uses_this_prop(name, pn)
+                    || args.iter().any(|a| Self::expr_uses_this_prop(a, pn))
+            }
+            Expr::Index { e, i } => {
+                Self::expr_uses_this_prop(e, pn)
+                    || i.as_ref().is_some_and(|i| Self::expr_uses_this_prop(i, pn))
+            }
+            Expr::Isset(v) => v.iter().any(|e| Self::expr_uses_this_prop(e, pn)),
+            Expr::Exit(Some(e)) => Self::expr_uses_this_prop(e, pn),
+            Expr::ArrayLit(items) => items.iter().any(|(k, v)| {
+                k.as_ref().is_some_and(|k| Self::expr_uses_this_prop(k, pn))
+                    || Self::expr_uses_this_prop(v, pn)
+            }),
+            Expr::List(items) => items
+                .iter()
+                .flatten()
+                .any(|e| Self::expr_uses_this_prop(e, pn)),
+            Expr::Match { subject, arms } => {
+                Self::expr_uses_this_prop(subject, pn)
+                    || arms.iter().any(|a| {
+                        a.conds.iter().any(|c| Self::expr_uses_this_prop(c, pn))
+                            || Self::expr_uses_this_prop(&a.result, pn)
+                    })
+            }
+            Expr::Closure(c) => {
+                c.decl
+                    .params
+                    .iter()
+                    .filter_map(|p| p.default.as_ref())
+                    .any(|e| Self::expr_uses_this_prop(e, pn))
+                    || Self::stmts_use_this_prop(&c.decl.body, pn)
+            }
+            Expr::New { class, args } => {
+                Self::expr_uses_this_prop(class, pn)
+                    || args.iter().any(|a| Self::expr_uses_this_prop(a, pn))
+            }
+            Expr::MethodCall {
+                obj, name, args, ..
+            } => {
+                Self::expr_uses_this_prop(obj, pn)
+                    || matches!(name, PropName::Expr(x) if Self::expr_uses_this_prop(x, pn))
+                    || args.iter().any(|a| Self::expr_uses_this_prop(a, pn))
+            }
+            Expr::StaticProp { class, name } => {
+                Self::expr_uses_this_prop(class, pn)
+                    || matches!(name, PropName::Expr(x) if Self::expr_uses_this_prop(x, pn))
+            }
+            Expr::StaticCall { class, args, .. } => {
+                Self::expr_uses_this_prop(class, pn)
+                    || args.iter().any(|a| Self::expr_uses_this_prop(a, pn))
+            }
+            Expr::ClassConst { class, .. } => Self::expr_uses_this_prop(class, pn),
+            Expr::Instanceof { obj, class } => {
+                Self::expr_uses_this_prop(obj, pn) || Self::expr_uses_this_prop(class, pn)
+            }
+            Expr::Interp(parts) => parts.iter().any(|p| match p {
+                // Interpolated `{$expr}` parts are source strings — a
+                // substring check for `$this->prop` is close enough for
+                // the backed-prop heuristic.
+                crate::lexer::StringPart::Expr(s) => {
+                    s.contains(&format!("this->{pn}")) || s.contains(&format!("this->${pn}"))
+                }
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
+
+    /// Caller-scope check for a hook's effective visibility (the hook's
+    /// own `private get`/`protected set` or the prop's).
+    fn hook_scope_allows(&mut self, dcls: &Rc<PhpClass>, vis: crate::ast::Visibility) -> bool {
+        let scope = self.stack.last().and_then(|f| {
+            f.decl_class
+                .as_ref()
+                .or(f.scope_class.as_ref())
+                .map(|s| s.decl.name.clone())
+        });
+        match (vis, scope) {
+            (crate::ast::Visibility::Public, _) => true,
+            (crate::ast::Visibility::Private, Some(s)) => s == dcls.name(),
+            (crate::ast::Visibility::Protected, Some(s)) => {
+                self.is_a_str(&s, dcls.name()) || self.is_a_str(dcls.name(), &s)
+            }
+            _ => false,
+        }
+    }
+
+    fn hook_visibility_error<T>(
+        &mut self,
+        dcls: &Rc<PhpClass>,
+        pname: &str,
+        vis: crate::ast::Visibility,
+    ) -> Result<T, PhpError> {
+        self.fail(PhpError::uncaught(
+            "Error",
+            format!(
+                "Cannot access {} property {}::${}",
+                match vis {
+                    crate::ast::Visibility::Private => "private",
+                    crate::ast::Visibility::Protected => "protected",
+                    crate::ast::Visibility::Public => "public",
+                },
+                dcls.name(),
+                pname
+            ),
+            0,
+        ))
+    }
+
+    /// Run a `get`/`set` hook body: a method-like frame whose `hook_prop`
+    /// marker lets `$this->prop` hit the backing slot directly. `dcls` is
+    /// the class that declared this hook — it becomes the frame's
+    /// decl_class and names `__METHOD__`'s scope (via decl_in for traits).
+    fn run_hook(
+        &mut self,
+        o: &Rc<RefCell<PhpObject>>,
+        dcls: &Rc<PhpClass>,
+        pname: &str,
+        hook: &crate::ast::PropHook,
+        arg: Option<Cell>,
+    ) -> Result<Value, PhpError> {
+        let kind = if hook.is_get { "get" } else { "set" };
+        let params = if hook.is_get {
+            Vec::new()
+        } else if hook.params.is_empty() {
+            vec![crate::ast::Param {
+                name: "value".into(),
+                default: None,
+                by_ref: false,
+                variadic: false,
+                ty: None,
+                promoted: false,
+                vis: None,
+                readonly: false,
+                is_final: false,
+                set_vis: None,
+                hooks: None,
+            }]
+        } else {
+            hook.params.clone()
+        };
+        // PHP names hooks `$prop::set` — `__METHOD__` then composes the
+        // declaring class into `C::$prop::set` (backed_implicit_get).
+        let decl = Rc::new(FunctionDecl {
+            name: format!("${}::{}", pname, kind),
+            params,
+            body: hook.body.clone().unwrap_or_default(),
+            by_ref: hook.by_ref,
+            line: self.cur_line,
+            file: self.cur_file.clone(),
+        });
+        let owner = decl_owner(dcls, pname);
+        let args = arg.into_iter().collect::<Vec<Cell>>();
+        self.pending_decl_class = Some(dcls.clone());
+        self.pending_hook_prop = Some((o.borrow().id, pname.to_string(), hook.is_get, owner));
+        let scope = o.borrow().class.clone();
+        let r = self.invoke_fn(&decl, args, Some(o.clone()), Some(scope));
+        self.pending_decl_class = None;
+        self.pending_hook_prop = None;
+        r
+    }
+
+    /// Read through a hooked prop: `get` hook, backing slot, or the
+    /// write-only error.
+    fn hook_read(
+        &mut self,
+        o: &Rc<RefCell<PhpObject>>,
+        p: &PropDecl,
+        hs: &[(crate::ast::PropHook, Rc<PhpClass>)],
+    ) -> Result<Value, PhpError> {
+        let get = hs.iter().find(|(h, _)| h.is_get && h.body.is_some());
+        // Visibility: an explicit `private get`/`protected get` wins,
+        // else the prop's own visibility governs reads.
+        let vis = get.and_then(|(h, _)| h.visibility).unwrap_or(p.visibility);
+        let dcls = &get
+            .map(|(_, c)| c.clone())
+            .unwrap_or_else(|| o.borrow().class.clone());
+        if !self.hook_scope_allows(dcls, vis) {
+            return self.hook_visibility_error(dcls, &p.name, vis);
+        }
+        if let Some((h, c)) = get {
+            let v = self.run_hook(o, c, &p.name, h, None)?;
+            return self.hook_get_typecheck(p, dcls, v);
+        }
+        if self.backed_for(o, &p.name, hs) {
+            return Ok(o
+                .borrow()
+                .props
+                .get(&p.name)
+                .map(|c| c.borrow().clone())
+                .unwrap_or(Value::Null));
+        }
+        self.fail(PhpError::uncaught(
+            "Error",
+            format!("Property {}::${} is write-only", dcls.name(), p.name),
+            0,
+        ))
+    }
+
+    /// A `get` hook's return is coerced to the property's declared type
+    /// in weak mode ("C::$p::get(): Return value must be of type int,
+    /// string returned" TypeError otherwise).
+    fn hook_get_typecheck(
+        &mut self,
+        p: &PropDecl,
+        dcls: &Rc<PhpClass>,
+        v: Value,
+    ) -> Result<Value, PhpError> {
+        let Some(tys) = &p.ty else { return Ok(v) };
+        let ok = tys
+            .iter()
+            .any(|t| t == "mixed" || self.param_type_match(t, &v));
+        if ok {
+            return Ok(v);
+        }
+        // weak-mode coercion for scalar targets
+        for t in tys {
+            let coerced = match (t.as_str(), &v) {
+                ("int", Value::Str(s)) => {
+                    let tr = s.trim();
+                    let base = if let Some(h) = tr.strip_prefix("0x") {
+                        i64::from_str_radix(h, 16).ok()
+                    } else if let Some(o) = tr.strip_prefix("0o") {
+                        i64::from_str_radix(o, 8).ok()
+                    } else if let Some(b) = tr.strip_prefix("0b") {
+                        i64::from_str_radix(b, 2).ok()
+                    } else {
+                        tr.parse::<i64>().ok()
+                    };
+                    base.map(Value::Int)
+                }
+                ("int", Value::Float(f)) => Some(Value::Int(*f as i64)),
+                ("int", Value::Bool(b)) => Some(Value::Int(*b as i64)),
+                ("string", Value::Int(i)) => Some(Value::str(i.to_string())),
+                ("string", Value::Float(f)) => Some(Value::str(format_float_repr(*f))),
+                ("string", Value::Bool(b)) => Some(Value::str(if *b { "1" } else { "" })),
+                ("float", Value::Int(i)) => Some(Value::Float(*i as f64)),
+                ("float", Value::Str(s)) => s.trim().parse::<f64>().ok().map(Value::Float),
+                ("float", Value::Bool(b)) => Some(Value::Float(if *b { 1.0 } else { 0.0 })),
+                ("bool", _) => Some(Value::Bool(v.is_truthy())),
+                _ => None,
+            };
+            if let Some(c) = coerced {
+                return Ok(c);
+            }
+        }
+        let want = tys.join("|");
+        let got = self.zval_type_name(&v);
+        self.fail(PhpError::uncaught(
+            "TypeError",
+            format!(
+                "{}::${}::get(): Return value must be of type {}, {} returned",
+                dcls.name(),
+                p.name,
+                want,
+                got
+            ),
+            0,
+        ))
+    }
+
+    /// Write through a hooked prop: `set` hook, backing slot, or the
+    /// read-only error. `private(set)` narrows the write side.
+    fn hook_write(
+        &mut self,
+        o: &Rc<RefCell<PhpObject>>,
+        p: &PropDecl,
+        hs: &[(crate::ast::PropHook, Rc<PhpClass>)],
+        v: Value,
+    ) -> Result<(), PhpError> {
+        let set = hs.iter().find(|(h, _)| !h.is_get && h.body.is_some());
+        let dcls = &set
+            .map(|(_, c)| c.clone())
+            .unwrap_or_else(|| o.borrow().class.clone());
+        if let Some(sv) = p.set_vis {
+            if !self.hook_scope_allows(dcls, sv) {
+                return self.set_visibility_error(dcls, &p.name, sv);
+            }
+        }
+        let vis = set.and_then(|(h, _)| h.visibility).unwrap_or(p.visibility);
+        if !self.hook_scope_allows(dcls, vis) {
+            return self.hook_visibility_error(dcls, &p.name, vis);
+        }
+        if let Some((h, c)) = set {
+            self.run_hook(o, c, &p.name, h, Some(cell(v)))?;
+            return Ok(());
+        }
+        if self.backed_for(o, &p.name, hs) {
+            let mut ob = o.borrow_mut();
+            if !ob.prop_order.contains(&p.name) {
+                ob.prop_order.push(p.name.clone());
+            }
+            ob.props.insert(p.name.clone(), cell(v));
+            return Ok(());
+        }
+        self.fail(PhpError::uncaught(
+            "Error",
+            format!("Property {}::${} is read-only", dcls.name(), p.name),
+            0,
+        ))
+    }
+
+    /// `parent::$prop::get()/set()` inside a hook — runs the parent
+    /// class's hook for the same prop+kind, or reads/writes the
+    /// parent's plain prop (parent_property_hook tests).
+    fn hook_parent_call(
+        &mut self,
+        pn: &str,
+        is_get: bool,
+        args: &[Expr],
+    ) -> Result<Value, PhpError> {
+        let kind = if is_get { "get" } else { "set" };
+        // Borrow-free snapshot of the caller frame's hook context (the
+        // outside/different-prop/different-kind rules are parse-time).
+        let (f_this, f_dcls) = {
+            let f = self.stack.last();
+            (
+                f.and_then(|f| f.this_obj.clone()),
+                f.and_then(|f| f.decl_class.clone()),
+            )
+        };
+        let Some(o) = f_this else {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot use \"parent\" when no class scope is active",
+                0,
+            ));
+        };
+        let dcls = f_dcls.unwrap_or_else(|| o.borrow().class.clone());
+        let Some(parent_name) = dcls.decl.parent.clone() else {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot use \"parent\" when current class scope has no parent",
+                0,
+            ));
+        };
+        let Some(parent) = self.classes.get(&parent_name.to_lowercase()).cloned() else {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot use \"parent\" when current class scope has no parent",
+                0,
+            ));
+        };
+        // Resolve the prop on the parent chain: per-kind merged hooks.
+        let mut nearest: Option<(PropDecl, Rc<PhpClass>)> = None;
+        let mut hooks: MergedHooks = Vec::new();
+        let mut cur = Some(parent.clone());
+        while let Some(c) = cur {
+            for p in &c.decl.props {
+                if p.name != pn {
+                    continue;
+                }
+                if nearest.is_none() {
+                    nearest = Some((p.clone(), c.clone()));
+                }
+                if let Some(hs) = &p.hooks {
+                    for h in hs {
+                        if !hooks.iter().any(|(x, _)| x.is_get == h.is_get) {
+                            hooks.push((h.clone(), c.clone()));
+                        }
+                    }
+                }
+            }
+            let par = c.decl.parent.clone();
+            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        let Some((pd, pcls)) = nearest else {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!("Undefined property {}::${}", parent.name(), pn),
+                0,
+            ));
+        };
+        // private parent prop is invisible to the child scope
+        if pd.visibility == crate::ast::Visibility::Private && pcls.name() != dcls.name() {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!("Cannot access private property {}::${}", pcls.name(), pn),
+                0,
+            ));
+        }
+        let hook = hooks
+            .iter()
+            .find(|(h, _)| h.is_get == is_get && h.body.is_some())
+            .cloned();
+        // A user hook tolerates extra args (user-function semantics);
+        // the implicit hook of a *plain* parent prop is an internal
+        // function with a strict arg count (parent_superfluous_args).
+        if hook.is_none() {
+            let want = if is_get { 0 } else { 1 };
+            if args.len() != want {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    format!(
+                        "{}::${}::{}() expects exactly {} argument{}, {} given",
+                        parent_name,
+                        pn,
+                        kind,
+                        want,
+                        if want == 1 { "" } else { "s" },
+                        args.len()
+                    ),
+                    0,
+                ));
+            }
+        }
+        let argvals = {
+            let mut vs = Vec::new();
+            for a in args {
+                vs.push(self.eval(a)?);
+            }
+            vs
+        };
+        if let Some((h, c)) = hook {
+            return self.run_hook(&o, &c, pn, &h, argvals.into_iter().next().map(cell));
+        }
+        // Plain parent prop: get reads the slot, set writes it (and —
+        // like a plain assignment — the implicit set returns the value).
+        if is_get {
+            if !o.borrow().props.contains_key(pn) {
+                // Implicit get reads the shared backing slot; an
+                // uninitialized typed prop is a catchable Error naming
+                // the decl visible from the object (parent_get_plain_…).
+                if let Some((tpd, tdcls)) = self.decl_prop(&o, pn) {
+                    if tpd.ty.is_some() && tpd.default.is_none() {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Typed property {}::${} must not be accessed before initialization",
+                                tdcls.name(),
+                                pn
+                            ),
+                            0,
+                        ));
+                    }
+                }
+            }
+            Ok(o.borrow()
+                .props
+                .get(pn)
+                .map(|c| c.borrow().clone())
+                .unwrap_or(Value::Null))
+        } else {
+            let v = argvals.into_iter().next().unwrap_or(Value::Null);
+            let mut ob = o.borrow_mut();
+            if !ob.prop_order.iter().any(|k| k == pn) {
+                ob.prop_order.push(pn.to_string());
+            }
+            ob.props.insert(pn.to_string(), cell(v.clone()));
+            Ok(v)
+        }
+    }
+
+    /// `private(set)`/`protected(set)` violation message — distinct from
+    /// the read-side "Cannot access" (asymmetric_visibility).
+    fn set_visibility_error<T>(
+        &mut self,
+        dcls: &Rc<PhpClass>,
+        pname: &str,
+        sv: crate::ast::Visibility,
+    ) -> Result<T, PhpError> {
+        let visname = match sv {
+            crate::ast::Visibility::Private => "private",
+            crate::ast::Visibility::Protected => "protected",
+            crate::ast::Visibility::Public => "public",
+        };
+        let from = self
+            .stack
+            .last()
+            .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()))
+            .map(|c| format!("scope {}", c.name()))
+            .unwrap_or_else(|| "global scope".to_string());
+        self.fail(PhpError::uncaught(
+            "Error",
+            format!(
+                "Cannot modify {}(set) property {}::${} from {}",
+                visname,
+                dcls.name(),
+                pname,
+                from
+            ),
+            0,
+        ))
+    }
+
+    /// Native bodies for the ReflectionClass/ReflectionProperty stubs.
+    /// The reflected class/prop names live under `\0rc\0` prop keys.
+    fn reflection_method(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        name: &str,
+        args: &[Cell],
+    ) -> Result<Option<Value>, PhpError> {
+        let lname = name.to_lowercase();
+        match lname.as_str() {
+            "__construct" => {
+                let mut ob = obj.borrow_mut();
+                let cls = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let prop = args
+                    .get(1)
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                ob.props.insert("\0rc\0class".into(), cell(cls));
+                ob.props.insert("\0rc\0prop".into(), cell(prop));
+                Ok(Some(Value::Null))
+            }
+            "getname" => Ok(Some(
+                obj.borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null),
+            )),
+            "newinstancewithoutconstructor" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?;
+                Ok(Some(self.instantiate(&cn.to_lowercase(), &[])))
+            }
+            "isinitialized" => {
+                let pn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0prop")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let pn = self.conv_str(&pn)?;
+                let target = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                if let Value::Object(o) = target {
+                    Ok(Some(Value::Bool(self.obj_prop_key(&o, &pn).is_some())))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn prop_read(
         &mut self,
         obj: &Expr,
@@ -4991,8 +6452,28 @@ impl<'a> Interp<'a> {
             Value::Null if nullsafe => Ok(Value::Null),
             Value::Object(o) => {
                 let cls = o.borrow().class.clone();
+                if !self.in_own_hook(&o, &pn) {
+                    if let Some((pd, hs)) = self.hooked_prop(&o, &pn) {
+                        return self.hook_read(&o, &pd, &hs);
+                    }
+                }
                 if let Some(k) = self.obj_prop_key(&o, &pn) {
                     return Ok(o.borrow().props.get(&k).unwrap().borrow().clone());
+                }
+                // Typed prop whose slot was never initialized → Error
+                // (not __get, not a warning): parent_get_plain_typed_uninitialized.
+                if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
+                    if tpd.ty.is_some() && tpd.default.is_none() {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Typed property {}::${} must not be accessed before initialization",
+                                tdcls.name(),
+                                pn
+                            ),
+                            0,
+                        ));
+                    }
                 }
                 // __get magic
                 if cls.find_method("__get").is_some() {
@@ -5031,7 +6512,54 @@ impl<'a> Interp<'a> {
         let ov = self.eval(obj)?;
         match ov {
             Value::Object(o) => {
-                let key = self.obj_prop_key(&o, &pn).unwrap_or_else(|| pn.clone());
+                // Hooks intercept the cell path entirely — `[]`, `&`,
+                // `++`/`--` are "indirect modification", unless `&get`
+                // exists: the by-ref get's returned cell is used.
+                if !self.in_own_hook(&o, &pn) {
+                    if let Some((pd, hs)) = self.hooked_prop(&o, &pn) {
+                        let by_ref_get = hs
+                            .iter()
+                            .find(|(h, _)| h.is_get && h.by_ref && h.body.is_some());
+                        let dcls = by_ref_get
+                            .map(|(_, c)| c.clone())
+                            .unwrap_or_else(|| o.borrow().class.clone());
+                        if let Some((h, c)) = by_ref_get {
+                            let vis = h.visibility.unwrap_or(pd.visibility);
+                            if !self.hook_scope_allows(c, vis) {
+                                return self.hook_visibility_error(c, &pd.name, vis);
+                            }
+                            self.last_ret_cell = None;
+                            let v = self.run_hook(&o, c, &pd.name, h, None)?;
+                            return Ok(self.last_ret_cell.take().unwrap_or_else(|| cell(v)));
+                        }
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Indirect modification of {}::${} is not allowed",
+                                dcls.name(),
+                                pd.name
+                            ),
+                            0,
+                        ));
+                    }
+                }
+                let key = self.obj_prop_key(&o, &pn);
+                if key.is_none() {
+                    if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
+                        if tpd.ty.is_some() && tpd.default.is_none() {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Typed property {}::${} must not be accessed before initialization",
+                                    tdcls.name(),
+                                    pn
+                                ),
+                                0,
+                            ));
+                        }
+                    }
+                }
+                let key = key.unwrap_or_else(|| pn.clone());
                 let mut ob = o.borrow_mut();
                 if !ob.props.contains_key(&key) {
                     if !ob.prop_order.contains(&key) {
@@ -5076,6 +6604,20 @@ impl<'a> Interp<'a> {
             let pn = self.prop_name(name)?;
             let ov = self.eval(obj)?;
             if let Value::Object(o) = ov {
+                if !self.in_own_hook(&o, &pn) {
+                    if let Some((pd, hs)) = self.hooked_prop(&o, &pn) {
+                        let _dcls = &hs[0].1;
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Cannot unset hooked property {}::${}",
+                                o.borrow().class.name(),
+                                pd.name
+                            ),
+                            0,
+                        ));
+                    }
+                }
                 let cls = o.borrow().class.clone();
                 if let Some(k) = self.obj_prop_key(&o, &pn) {
                     o.borrow_mut().props.remove(&k);
@@ -5173,6 +6715,21 @@ impl<'a> Interp<'a> {
                 .unwrap_or(false);
             if stub {
                 if let Some(v) = self.throwable_method(&obj, name, &args) {
+                    return Ok(v);
+                }
+            }
+        }
+        // Reflection stubs are native: constructor stores the target
+        // name, methods act on it (gh15438_2).
+        if cls.name().eq_ignore_ascii_case("reflectionclass")
+            || cls.name().eq_ignore_ascii_case("reflectionproperty")
+        {
+            let stub = self
+                .find_method_in(&cls, name)
+                .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
+                .unwrap_or(false);
+            if stub {
+                if let Some(v) = self.reflection_method(&obj, name, &args)? {
                     return Ok(v);
                 }
             }
@@ -5737,7 +7294,10 @@ impl<'a> Interp<'a> {
         let stmts = match parser::parse(&src) {
             Ok(s) => s,
             Err(e) => {
-                self.print_parse_at(&e, &fname);
+                match e.kind {
+                    ErrorKind::Parse => self.print_parse_at(&e, &fname),
+                    _ => self.print_fatal(&e),
+                }
                 inc_pop(self);
                 return Ok(Value::Bool(false));
             }
@@ -6081,6 +7641,20 @@ impl<'a> Interp<'a> {
         o.borrow().class.name().to_string()
     }
 }
+
+/// `__METHOD__` scope name for a hook on `dcls`: a trait-origin hook
+/// keeps its trait name via `decl_in`, else the declaring class.
+fn decl_owner(dcls: &Rc<PhpClass>, pname: &str) -> String {
+    dcls.decl
+        .props
+        .iter()
+        .find(|p| p.name == pname)
+        .and_then(|p| p.decl_in.clone())
+        .unwrap_or_else(|| dcls.name().to_string())
+}
+
+/// Hooks merged along a chain (hook, declaring class), nearest first.
+type MergedHooks = Vec<(PropHook, Rc<PhpClass>)>;
 
 fn cell(v: Value) -> Cell {
     Rc::new(RefCell::new(v))
