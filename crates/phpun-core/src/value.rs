@@ -168,6 +168,36 @@ pub fn to_key(v: &Value) -> ArrKey {
 
 /// PHP's stack-trace argument printer: `'str'`, `Object(C)`, `Array`,
 /// scalars as their plain value (tests/lang/type_hints_001.phpt).
+/// Render Zend-style stack frames innermost-first, `#N {main}` last:
+/// `#0 file(7): fn('a', 2)` / `#0 [internal function]: cb('x')`.
+/// Internal callees hide their args (PHP: no arg info for builtins).
+pub fn format_trace(frames: &[TraceFrame]) -> String {
+    let mut t = String::new();
+    for (i, fr) in frames.iter().rev().enumerate() {
+        let site = if fr.file == "[internal function]" {
+            fr.file.clone()
+        } else {
+            format!("{}({})", fr.file, fr.line)
+        };
+        let callee = match &fr.class {
+            Some(c) => format!("{}{}{}", c, fr.ty, fr.function),
+            None => fr.function.clone(),
+        };
+        let args = if fr.internal {
+            String::new()
+        } else {
+            fr.args
+                .iter()
+                .map(|c| trace_arg(&c.borrow()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        t.push_str(&format!("#{} {}: {}({})\n", i, site, callee, args));
+    }
+    t.push_str(&format!("#{} {{main}}", frames.len()));
+    t
+}
+
 pub fn trace_arg(v: &Value) -> String {
     match v {
         Value::Object(o) => format!("Object({})", o.borrow().class.name()),
@@ -728,9 +758,14 @@ pub struct TraceFrame {
     pub class: Option<String>,
     /// `->` for object methods, `::` for static — empty for functions.
     pub ty: String,
-    /// Call-site file and line.
+    /// Call-site file and line; `"[internal function]"`/0 when the caller
+    /// is a builtin (e.g. a userland callback invoked from ob_end_clean).
     pub file: String,
     pub line: u32,
+    /// Call args (rendered with trace_arg; hidden for internal callees).
+    pub args: Vec<Cell>,
+    /// Callee is an internal/builtin function — PHP omits its args.
+    pub internal: bool,
 }
 
 #[derive(Debug)]

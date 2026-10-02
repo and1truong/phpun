@@ -1834,24 +1834,20 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
 
         // ----- output buffering -----
         "ob_start" => {
-            it.ob_push();
+            let h = args.first().map(|c| c.borrow().clone());
+            it.ob_push(h);
             Value::Bool(true)
         }
         "ob_end_clean" => {
-            it.ob_pop();
+            it.ob_end_clean()?;
             Value::Bool(true)
         }
         "ob_end_flush" => {
-            if let Some(buf) = it.ob_pop() {
-                let s = buf.clone();
-                it.emit(&s);
-            }
+            it.ob_end_flush()?;
             Value::Bool(true)
         }
-        "ob_get_clean" => match it.ob_pop() {
-            Some(b) => Value::str(b),
-            None => Value::Bool(false),
-        },
+        "ob_get_clean" => it.ob_get_clean(),
+        "ob_get_flush" => it.ob_get_flush()?,
         "ob_get_contents" => match it.ob_top() {
             Some(b) => Value::str(b.clone()),
             None => Value::Bool(false),
@@ -1862,12 +1858,13 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         },
         "ob_get_level" => Value::Int(it.ob_len() as i64),
         "ob_clean" => {
-            if it.ob_pop().is_some() {
-                it.ob_push();
-            }
+            it.ob_clean()?;
             Value::Bool(true)
         }
-        "ob_flush" | "flush" => Value::Null,
+        "ob_flush" | "flush" => {
+            it.ob_flush()?;
+            Value::Null
+        }
         "ob_implicit_flush" | "ob_list_handlers" => Value::Null,
         "ob_get_status" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
         "output_reset_rewrite_vars" => Value::Bool(true),

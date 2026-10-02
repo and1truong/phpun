@@ -10,9 +10,9 @@ use crate::error::{ErrorKind, PhpError};
 use crate::lexer::StringPart;
 use crate::parser;
 use crate::value::{
-    compare, format_float_repr, identical, numeric, to_key, trace_arg, ArrKey, CallableKind, Cell,
-    Numeric, ObjectInternal, PhpArray, PhpCallable, PhpClass, PhpObject, PhpResource, TraceFrame,
-    Value,
+    compare, format_float_repr, format_trace, identical, numeric, to_key, trace_arg, ArrKey,
+    CallableKind, Cell, Numeric, ObjectInternal, PhpArray, PhpCallable, PhpClass, PhpObject,
+    PhpResource, TraceFrame, Value,
 };
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -72,7 +72,7 @@ pub struct Interp<'a> {
     /// CLI, and the PHPT harness merges streams via 2>&1).
     pub out: String,
     /// Output buffer stack for ob_*().
-    ob_stack: Vec<String>,
+    ob_stack: Vec<ObLevel>,
     /// While >0, warnings are suppressed (implements `??`, `isset`,
     /// `empty`, `@`).
     silence: u32,
@@ -107,8 +107,19 @@ pub struct Interp<'a> {
     /// Live object handles for PHP's var_dump `#N` id: the lowest freed
     /// slot is reused, matching Zend's object store recycling.
     obj_handles: Vec<std::rc::Weak<RefCell<PhpObject>>>,
+    /// Object ptrs whose __destruct already ran (shutdown pass).
+    destructed: HashSet<usize>,
     /// `-d` ini settings (e.g. short_open_tag=on).
     pub ini: HashMap<String, String>,
+}
+
+/// One output-buffer level (ob_start) with its optional handler.
+pub struct ObLevel {
+    pub buf: String,
+    pub handler: Option<Value>,
+    /// Set after the handler's first invocation — PHP's
+    /// PHP_OUTPUT_HANDLER_START bit is only passed once (bug24951).
+    pub started: bool,
 }
 
 /// Result of a top-level program run.
@@ -150,6 +161,17 @@ impl<'a> Interp<'a> {
         constants.insert("E_USER_WARNING".into(), Value::Int(512));
         constants.insert("E_USER_NOTICE".into(), Value::Int(1024));
         constants.insert("E_USER_DEPRECATED".into(), Value::Int(16384));
+        constants.insert("PHP_OUTPUT_HANDLER_START".into(), Value::Int(1));
+        constants.insert("PHP_OUTPUT_HANDLER_WRITE".into(), Value::Int(0));
+        constants.insert("PHP_OUTPUT_HANDLER_CONT".into(), Value::Int(0));
+        constants.insert("PHP_OUTPUT_HANDLER_CLEAN".into(), Value::Int(2));
+        constants.insert("PHP_OUTPUT_HANDLER_FLUSH".into(), Value::Int(4));
+        constants.insert("PHP_OUTPUT_HANDLER_FINAL".into(), Value::Int(8));
+        constants.insert("PHP_OUTPUT_HANDLER_END".into(), Value::Int(8));
+        constants.insert("PHP_OUTPUT_HANDLER_CLEANABLE".into(), Value::Int(16));
+        constants.insert("PHP_OUTPUT_HANDLER_FLUSHABLE".into(), Value::Int(32));
+        constants.insert("PHP_OUTPUT_HANDLER_REMOVABLE".into(), Value::Int(64));
+        constants.insert("PHP_OUTPUT_HANDLER_STDFLAGS".into(), Value::Int(112));
         constants.insert("E_RECOVERABLE_ERROR".into(), Value::Int(4096));
         constants.insert("E_CORE_ERROR".into(), Value::Int(16));
         constants.insert("E_CORE_WARNING".into(), Value::Int(32));
@@ -191,8 +213,63 @@ impl<'a> Interp<'a> {
             cur_line: 1,
             pending_decl_class: None,
             obj_handles: Vec::new(),
+            destructed: HashSet::new(),
             ini: HashMap::new(),
         };
+        // Auto-globals. PHP's $_SERVER carries env + script metadata;
+        // the request arrays start empty (bug24908 counts on non-empty
+        // $_SERVER inside __destruct).
+        {
+            let mut server = PhpArray::new();
+            for (k, v) in std::env::vars() {
+                server.set(ArrKey::Str(k.into()), Value::str(v));
+            }
+            server.set(ArrKey::Str("SCRIPT_FILENAME".into()), Value::str(file));
+            server.set(ArrKey::Str("PHP_SELF".into()), Value::str(file));
+            server.set(ArrKey::Str("SCRIPT_NAME".into()), Value::str(file));
+            server.set(ArrKey::Str("SERVER_NAME".into()), Value::str("localhost"));
+            server.set(
+                ArrKey::Str("SERVER_SOFTWARE".into()),
+                Value::str("phpun/0.0.0"),
+            );
+            server.set(
+                ArrKey::Str("SERVER_PROTOCOL".into()),
+                Value::str("HTTP/1.1"),
+            );
+            server.set(ArrKey::Str("REQUEST_METHOD".into()), Value::str("GET"));
+            let mut argv = PhpArray::new();
+            argv.push(Value::str(file));
+            server.set(
+                ArrKey::Str("argv".into()),
+                Value::Array(Rc::new(RefCell::new(argv))),
+            );
+            server.set(ArrKey::Str("argc".into()), Value::Int(1));
+            it.globals.vars.insert(
+                "_SERVER".into(),
+                cell(Value::Array(Rc::new(RefCell::new(server)))),
+            );
+            let mut env = PhpArray::new();
+            for (k, v) in std::env::vars() {
+                env.set(ArrKey::Str(k.into()), Value::str(v));
+            }
+            it.globals.vars.insert(
+                "_ENV".into(),
+                cell(Value::Array(Rc::new(RefCell::new(env)))),
+            );
+            for n in ["_GET", "_POST", "_COOKIE", "_FILES", "_REQUEST", "_SESSION"] {
+                it.globals.vars.insert(
+                    n.into(),
+                    cell(Value::Array(Rc::new(RefCell::new(PhpArray::new())))),
+                );
+            }
+            let mut argv = PhpArray::new();
+            argv.push(Value::str(file));
+            it.globals.vars.insert(
+                "argv".into(),
+                cell(Value::Array(Rc::new(RefCell::new(argv)))),
+            );
+            it.globals.vars.insert("argc".into(), cell(Value::Int(1)));
+        }
         it.register_builtin_classes();
         it
     }
@@ -414,6 +491,23 @@ impl<'a> Interp<'a> {
         for (f, args) in fns {
             let _ = self.call_value(&f, args);
         }
+        // Zend calls __destruct on live objects after shutdown functions
+        // and before output buffers flush — destructors still see their
+        // buffers' contents (bug30578, bug24908).
+        for h in std::mem::take(&mut self.obj_handles) {
+            let Some(o) = h.upgrade() else { continue };
+            let key = Rc::as_ptr(&o) as usize;
+            if self.destructed.contains(&key) {
+                continue;
+            }
+            if self
+                .find_method_in(&o.borrow().class, "__destruct")
+                .is_some()
+            {
+                self.destructed.insert(key);
+                let _ = self.method_invoke(o.clone(), "__destruct", vec![]);
+            }
+        }
         self.flush_ob_all();
     }
 
@@ -448,20 +542,60 @@ impl<'a> Interp<'a> {
         self.stack.last_mut().unwrap_or(&mut self.globals)
     }
 
+    /// PHP auto-globals resolve in every scope; first access links the
+    /// global cell into the local table (bug24908).
+    fn is_superglobal(name: &str) -> bool {
+        matches!(
+            name,
+            "_GET"
+                | "_POST"
+                | "_COOKIE"
+                | "_FILES"
+                | "_ENV"
+                | "_SERVER"
+                | "_REQUEST"
+                | "_SESSION"
+                | "GLOBALS"
+                | "argc"
+                | "argv"
+        )
+    }
+
+    fn superglobal_cell(&mut self, name: &str) -> Option<Cell> {
+        if !Self::is_superglobal(name) {
+            return None;
+        }
+        let g = self
+            .globals
+            .vars
+            .entry(name.to_string())
+            .or_insert_with(|| cell(Value::Null))
+            .clone();
+        self.cur().vars.insert(name.to_string(), g.clone());
+        Some(g)
+    }
+
     fn var_get(&mut self, name: &str) -> Result<Value, PhpError> {
         match self.cur().vars.get(name) {
             Some(c) => Ok(c.borrow().clone()),
-            None => {
-                if self.silence == 0 {
-                    self.warn(&format!("Undefined variable ${}", name))?;
+            None => match self.superglobal_cell(name) {
+                Some(c) => Ok(c.borrow().clone()),
+                None => {
+                    if self.silence == 0 {
+                        self.warn(&format!("Undefined variable ${}", name))?;
+                    }
+                    Ok(Value::Null)
                 }
-                Ok(Value::Null)
-            }
+            },
         }
     }
 
     /// The cell behind a variable name — creating it on demand.
+    /// Superglobals resolve to the global cell (writes propagate).
     pub fn var_cell(&mut self, name: &str) -> Cell {
+        if let Some(c) = self.superglobal_cell(name) {
+            return c;
+        }
         self.cur()
             .vars
             .entry(name.to_string())
@@ -470,9 +604,11 @@ impl<'a> Interp<'a> {
     }
 
     /// Peek without creating.
-    fn var_cell_opt(&self, name: &str) -> Option<Cell> {
-        let f = self.stack.last().unwrap_or(&self.globals);
-        f.vars.get(name).cloned()
+    fn var_cell_opt(&mut self, name: &str) -> Option<Cell> {
+        match self.stack.last().unwrap_or(&self.globals).vars.get(name) {
+            Some(c) => Some(c.clone()),
+            None => self.superglobal_cell(name),
+        }
     }
 
     fn var_set(&mut self, name: &str, v: Value) {
@@ -496,7 +632,7 @@ impl<'a> Interp<'a> {
     /// Emit output through the output-buffer stack.
     pub fn emit(&mut self, s: &str) {
         if let Some(buf) = self.ob_stack.last_mut() {
-            buf.push_str(s);
+            buf.buf.push_str(s);
         } else {
             self.out.push_str(s);
         }
@@ -629,7 +765,10 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Print the uncaught-exception fatal for a Throwable value.
+    /// Print the uncaught-exception fatal for a Throwable value. Written
+    /// straight to `out` — reaching it means the script is ending, so it
+    /// must not be re-fed to an ob handler that may throw again
+    /// (bug32828).
     fn uncaught(&mut self, v: &Value) {
         if let Value::Object(o) = v {
             let o = o.borrow();
@@ -647,15 +786,17 @@ impl<'a> Interp<'a> {
                     thrown,
                     full_msg,
                     eval_ctx,
-                    ..
+                    frames,
                 }) => (
                     file.clone(),
                     *line,
                     *thrown,
-                    if trace.is_empty() {
+                    if !trace.is_empty() {
+                        trace.clone()
+                    } else if frames.is_empty() {
                         "#0 {main}".to_string()
                     } else {
-                        trace.clone()
+                        format_trace(frames)
                     },
                     if full_msg.is_empty() {
                         msg
@@ -673,6 +814,7 @@ impl<'a> Interp<'a> {
                     0,
                 ),
             };
+            drop(o);
             if eval_ctx > 0 {
                 // ParseError inside eval'd code prints the plain
                 // `Parse error:` form (tests/lang/019).
@@ -681,9 +823,14 @@ impl<'a> Interp<'a> {
                     msg, file, line, eval_ctx
                 ));
             } else {
-                self.emit(&format!(
-                    "\nFatal error: Uncaught {}: {} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
-                    class, msg, file, line, tr, file, thrown
+                // Buffered output precedes the fatal, as PHP's output
+                // layer would emit it (bug32828's throwing handler).
+                self.flush_ob_all();
+                // Zend prints `Uncaught C: msg` — no colon when msg empty.
+                let colon = if msg.is_empty() { "" } else { ": " };
+                self.out.push_str(&format!(
+                    "\nFatal error: Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
+                    class, colon, msg, file, line, tr, file, thrown
                 ));
             }
         } else {
@@ -752,6 +899,8 @@ impl<'a> Interp<'a> {
             ty: String::new(),
             file: self.file.to_string(),
             line: self.cur_line as u32,
+            args: args.to_vec(),
+            internal: true,
         });
         let r = builtins::call(self, name, args);
         self.call_trace.pop();
@@ -2060,6 +2209,13 @@ impl<'a> Interp<'a> {
     }
 
     fn assign(&mut self, target: &Expr, op: &'static str, value: &Expr) -> Result<Value, PhpError> {
+        // `$this` may never be an assignment target (compile fatal,
+        // bug24573); plain and compound assigns both route here.
+        if let Expr::Var(n) = target {
+            if n == "this" {
+                return self.fail(PhpError::fatal("Cannot re-assign $this", 0));
+            }
+        }
         if op == "=&" {
             // By-reference assignment: bind cells.
             let src = self.eval_cell(value)?;
@@ -2351,6 +2507,10 @@ impl<'a> Interp<'a> {
     fn store(&mut self, target: &Expr, v: Value) -> Result<(), PhpError> {
         match target {
             Expr::Var(name) => {
+                // `$this = x` is a compile-time fatal in Zend (bug24573).
+                if name == "this" {
+                    return self.fail(PhpError::fatal("Cannot re-assign $this", 0));
+                }
                 self.var_set(name, v);
                 Ok(())
             }
@@ -3654,6 +3814,14 @@ impl<'a> Interp<'a> {
         // Callee `Stmt::Line` markers must not leak into the caller:
         // diagnostics after the call report the call-site line.
         let saved_line = self.cur_line;
+        // A callback invoked FROM a builtin has call site
+        // `[internal function]` (bug32828's ob handler trace).
+        let from_builtin = self.call_trace.last().map(|f| f.internal).unwrap_or(false);
+        let (site_file, site_line) = if from_builtin {
+            ("[internal function]".to_string(), 0)
+        } else {
+            (self.file.to_string(), saved_line as u32)
+        };
         let fr = self
             .stack
             .last()
@@ -3668,15 +3836,19 @@ impl<'a> Interp<'a> {
                     ""
                 }
                 .to_string(),
-                file: self.file.to_string(),
-                line: saved_line as u32,
+                file: site_file.clone(),
+                line: site_line,
+                args: args.clone(),
+                internal: false,
             })
             .unwrap_or_else(|| TraceFrame {
                 function: decl.name.clone(),
                 class: None,
                 ty: String::new(),
-                file: self.file.to_string(),
-                line: saved_line as u32,
+                file: site_file,
+                line: site_line,
+                args: args.clone(),
+                internal: false,
             });
         self.call_trace.push(fr);
         let r = self.bind_and_run_inner(decl, args, unused);
@@ -4532,14 +4704,14 @@ impl<'a> Interp<'a> {
                     Some(ObjectInternal::Exception { frames, .. }) => (**frames).clone(),
                     _ => Vec::new(),
                 };
-                // PHP orders innermost call first (tests/lang/038).
+                // PHP orders innermost call first (tests/lang/038);
+                // internal-function call sites carry no file/line.
                 for fr in frames.iter().rev() {
                     let mut f = PhpArray::new();
-                    f.set(
-                        ArrKey::Str(fr.file.as_str().into()),
-                        Value::str(fr.file.clone()),
-                    );
-                    f.set(ArrKey::Str("line".into()), Value::Int(fr.line as i64));
+                    if fr.file != "[internal function]" {
+                        f.set(ArrKey::Str("file".into()), Value::str(fr.file.clone()));
+                        f.set(ArrKey::Str("line".into()), Value::Int(fr.line as i64));
+                    }
                     f.set(
                         ArrKey::Str("function".into()),
                         Value::str(fr.function.clone()),
@@ -4548,9 +4720,13 @@ impl<'a> Interp<'a> {
                         f.set(ArrKey::Str("class".into()), Value::str(c.clone()));
                         f.set(ArrKey::Str("type".into()), Value::str(fr.ty.clone()));
                     }
+                    let mut a = PhpArray::new();
+                    for av in &fr.args {
+                        a.push(av.borrow().clone());
+                    }
                     f.set(
                         ArrKey::Str("args".into()),
-                        Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+                        Value::Array(Rc::new(RefCell::new(a))),
                     );
                     arr.push(Value::Array(Rc::new(RefCell::new(f))));
                 }
@@ -4559,6 +4735,9 @@ impl<'a> Interp<'a> {
             "gettraceasstring" => match &ob.internal {
                 Some(ObjectInternal::Exception { trace, .. }) if !trace.is_empty() => {
                     Some(Value::str(trace.clone()))
+                }
+                Some(ObjectInternal::Exception { frames, .. }) if !frames.is_empty() => {
+                    Some(Value::str(format_trace(frames)))
                 }
                 _ => Some(Value::str("#0 {main}")),
             },
@@ -5000,10 +5179,41 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Flush all output buffers at script end.
+    /// Flush all output buffers at script end, innermost first so each
+    /// level's handler output lands in its parent's buffer (bug24951).
     fn flush_ob_all(&mut self) {
-        while let Some(buf) = self.ob_stack.pop() {
-            self.out.push_str(&buf);
+        while !self.ob_stack.is_empty() {
+            let r = self.ob_invoke(8);
+            self.ob_stack.pop();
+            if let Ok(Some(s)) = r {
+                self.emit(&s);
+            }
+        }
+    }
+
+    /// Invoke the top level's handler with `mode | START` on first call,
+    /// clearing the buffer first (bug24951 flag semantics:
+    /// START=1, CLEAN=2, FLUSH=4, FINAL=8). Returns the handler's output
+    /// — or the raw buffer when there is no handler.
+    fn ob_invoke(&mut self, mode: i64) -> Result<Option<String>, PhpError> {
+        let (handler, buf, already) = match self.ob_stack.last_mut() {
+            Some(l) => {
+                let buf = std::mem::take(&mut l.buf);
+                let st = l.started;
+                l.started = true;
+                (l.handler.clone(), buf, st)
+            }
+            None => return Ok(None),
+        };
+        match handler {
+            Some(h) => {
+                let m = mode | if already { 0 } else { 1 };
+                // A handler throwing inside ob_end_clean propagates as an
+                // uncaught exception (bug32828).
+                let out = self.call_value(&h, vec![cell(Value::str(buf)), cell(Value::Int(m))])?;
+                Ok(Some(out.to_php_string()))
+            }
+            None => Ok(Some(buf)),
         }
     }
 
@@ -5034,14 +5244,66 @@ impl<'a> Interp<'a> {
         }
     }
     // public helpers for builtins
-    pub fn ob_push(&mut self) {
-        self.ob_stack.push(String::new());
+    pub fn ob_push(&mut self, handler: Option<Value>) {
+        self.ob_stack.push(ObLevel {
+            buf: String::new(),
+            handler,
+            started: false,
+        });
     }
-    pub fn ob_pop(&mut self) -> Option<String> {
-        self.ob_stack.pop()
+    /// ob_end_clean: handler(mode=CLEAN|FINAL) result discarded, pop.
+    pub fn ob_end_clean(&mut self) -> Result<(), PhpError> {
+        self.ob_invoke(10)?;
+        self.ob_stack.pop();
+        Ok(())
+    }
+    /// ob_end_flush: handler(mode=FINAL) result emitted to parent, pop.
+    pub fn ob_end_flush(&mut self) -> Result<(), PhpError> {
+        let r = self.ob_invoke(8)?;
+        self.ob_stack.pop();
+        if let Some(s) = r {
+            self.emit(&s);
+        }
+        Ok(())
+    }
+    /// ob_flush: handler(mode=FLUSH) result emitted to the PARENT level
+    /// (the level is briefly popped so emit can't feed back into it),
+    /// buffer cleared, level stays open (bug24951).
+    pub fn ob_flush(&mut self) -> Result<(), PhpError> {
+        if let Some(s) = self.ob_invoke(4)? {
+            let level = self.ob_stack.pop();
+            self.emit(&s);
+            if let Some(l) = level {
+                self.ob_stack.push(l);
+            }
+        }
+        Ok(())
+    }
+    /// ob_clean: handler(mode=CLEAN) result discarded, buffer cleared.
+    pub fn ob_clean(&mut self) -> Result<(), PhpError> {
+        self.ob_invoke(2)?;
+        Ok(())
+    }
+    /// ob_get_clean: raw buffer, NO handler invocation, pop.
+    pub fn ob_get_clean(&mut self) -> Value {
+        self.ob_stack
+            .pop()
+            .map(|l| Value::str(l.buf))
+            .unwrap_or(Value::Bool(false))
+    }
+    /// ob_get_flush: handler(mode=FINAL) result emitted, RAW buffer
+    /// returned, level popped.
+    pub fn ob_get_flush(&mut self) -> Result<Value, PhpError> {
+        let raw = self.ob_stack.last().map(|l| l.buf.clone());
+        let r = self.ob_invoke(8)?;
+        self.ob_stack.pop();
+        if let Some(s) = r {
+            self.emit(&s);
+        }
+        Ok(raw.map(Value::str).unwrap_or(Value::Bool(false)))
     }
     pub fn ob_top(&self) -> Option<&String> {
-        self.ob_stack.last()
+        self.ob_stack.last().map(|l| &l.buf)
     }
     pub fn ob_len(&self) -> usize {
         self.ob_stack.len()
