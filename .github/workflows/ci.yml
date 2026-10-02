@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build --release
+
+  phpt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install PHP 8.5 reference
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y php-cli
+          php --version
+      - name: Vendor php-src PHPT tests
+        run: ./scripts/fetch-php-tests.sh php-8.5.11
+      - run: cargo build --release
+      - name: PHPT compatibility report (tests/lang)
+        run: |
+          ./target/release/phpun phpt vendor/php-tests/tests/lang \
+            --sut ./target/release/phpun --php "$(command -v php)" \
+            -j 8 --json phpt-report.json
+          echo "### PHPT compatibility (tests/lang)" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("phpt-report.json"))
+          s = r["summary"]
+          print(f"- passed: {s['passed']}\n- failed: {s['failed']}\n- skipped: {s['skipped']}\n- applicable: {s['applicable']}\n- compatibility: {s['compatibility_pct']}%")
+          EOF
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: phpt-report
+          path: phpt-report.json
