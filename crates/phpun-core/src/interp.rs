@@ -332,6 +332,12 @@ pub struct Interp<'a> {
     /// by property"; plain prop slots say "property"
     /// (typed_properties_034 first vs second foo() call).
     pub ref_cells: std::collections::HashSet<usize>,
+    /// Zend's per-op magic-property guards, keyed
+    /// (object-ptr, kind, prop-name): while `__get($o,$p)` runs, an
+    /// access to `$o->$p` bypasses magic and hits real storage
+    /// (bug63462/bug66609 — no infinite recursion). kinds: 0 get,
+    /// 1 set, 2 isset, 3 unset.
+    pub magic_guards: std::collections::HashSet<(usize, u8, String)>,
     /// Prop cells bound into an ArrayIterator whose decl is readonly —
     /// acquiring a `&` on one is "Cannot acquire reference to readonly
     /// property C::$p" (typed_properties_115). Value = (class, prop).
@@ -654,6 +660,7 @@ impl<'a> Interp<'a> {
             slot_merged: std::collections::HashMap::new(),
             slot_anchor: std::collections::HashMap::new(),
             ref_cells: std::collections::HashSet::new(),
+            magic_guards: std::collections::HashSet::new(),
             readonly_cells: std::collections::HashMap::new(),
             last_fresh_cell: None,
             builtin_ifaces: std::collections::HashSet::new(),
@@ -5229,7 +5236,70 @@ impl<'a> Interp<'a> {
                     _ => Ok(None),
                 }
             }
-            Expr::Prop { .. } => {
+            Expr::Prop { obj, name, .. } => {
+                // Missing/inaccessible props consult __isset first
+                // (bug63462, bug44899); a re-entrant isset inside
+                // __isset hits real storage only.
+                let pn = self.prop_name(name)?;
+                let ov = self.eval(obj)?;
+                if let Value::Object(o) = &ov {
+                    let cls = o.borrow().class.clone();
+                    // A declared prop checks its real slot unless it
+                    // was unset() — only then does __isset fire
+                    // (typed_properties_magic_set vs bug63462).
+                    let was_unset = {
+                        let ob = o.borrow();
+                        ob.unset_props.contains(&pn)
+                            || ob
+                                .unset_props
+                                .iter()
+                                .any(|k| k.ends_with(&format!("\0{}", pn)))
+                    };
+                    let declared_live = self.decl_prop(o, &pn).is_some() && !was_unset;
+                    if self.obj_prop_key(o, &pn).is_none()
+                        && !declared_live
+                        && cls.find_method("__isset").is_some()
+                    {
+                        let gkey = (Rc::as_ptr(o) as usize, 2u8, pn.clone());
+                        if self.magic_guards.insert(gkey.clone()) {
+                            let res = self.method_invoke(
+                                o.clone(),
+                                "__isset",
+                                CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
+                            );
+                            self.magic_guards.remove(&gkey);
+                            if !res?.is_truthy() {
+                                return Ok(None);
+                            }
+                            // __isset passed — zend fetches the value
+                            // through __get with the SAME bound name
+                            // (bug75420).
+                            self.silence += 1;
+                            let v = self.prop_read_value(ov.clone(), &pn, false);
+                            self.silence -= 1;
+                            return match v {
+                                Ok(v) => Ok(if matches!(v, Value::Null) {
+                                    None
+                                } else {
+                                    Some(v)
+                                }),
+                                Err(e)
+                                    if matches!(e.kind, ErrorKind::Throw)
+                                        && e.message.ends_with(
+                                            "must not be accessed before initialization",
+                                        ) =>
+                                {
+                                    Ok(None)
+                                }
+                                Err(e) if matches!(e.kind, ErrorKind::Throw) => Err(e),
+                                Err(_) => Ok(None),
+                            };
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                }
+                self.check_prop_name(&pn)?;
                 self.silence += 1;
                 let v = self.prop_read_loose(e);
                 self.silence -= 1;
@@ -6107,6 +6177,20 @@ impl<'a> Interp<'a> {
         self.fail(e)
     }
 
+    /// Dynamic property names starting with `\0` hit zend's
+    /// private-name-mangle check — a catchable Error, not magic
+    /// (bug52484).
+    fn check_prop_name(&mut self, pn: &str) -> Result<(), PhpError> {
+        if pn.starts_with('\0') {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot access property starting with \"\\0\"",
+                0,
+            ));
+        }
+        Ok(())
+    }
+
     fn store_prop(&mut self, ov: Value, pn: &str, mut v: Value) -> Result<Value, PhpError> {
         match ov {
             Value::Object(o) => {
@@ -6191,17 +6275,25 @@ impl<'a> Interp<'a> {
                     } else {
                         // A declared prop that was unset() is
                         // inaccessible — writes go through __set
-                        // (typed_properties_magic_set).
-                        if ob.unset_props.contains(&k) && cls.find_method("__set").is_some() {
+                        // (typed_properties_magic_set). The in-set
+                        // guard writes re-entrant assignments to real
+                        // storage instead of recursing (bug63462).
+                        let gkey = (Rc::as_ptr(&o) as usize, 1u8, pn.to_string());
+                        if ob.unset_props.contains(&k)
+                            && cls.find_method("__set").is_some()
+                            && self.magic_guards.insert(gkey.clone())
+                        {
                             drop(ob);
-                            self.method_invoke(
+                            let res = self.method_invoke(
                                 o.clone(),
                                 "__set",
                                 CallArgs::positional(vec![
                                     cell(Value::str(pn.to_string())),
                                     cell(v.clone()),
                                 ]),
-                            )?;
+                            );
+                            self.magic_guards.remove(&gkey);
+                            res?;
                             return Ok(v);
                         }
                         if !ob.prop_order.contains(&k) {
@@ -6210,17 +6302,27 @@ impl<'a> Interp<'a> {
                         ob.props.insert(k, cell(v.clone()));
                     }
                     Ok(v)
-                } else if cls.find_method("__set").is_some() {
-                    self.method_invoke(
+                } else if cls.find_method("__set").is_some()
+                    && self
+                        .magic_guards
+                        .insert((Rc::as_ptr(&o) as usize, 1u8, pn.to_string()))
+                {
+                    let res = self.method_invoke(
                         o.clone(),
                         "__set",
                         CallArgs::positional(vec![
                             cell(Value::str(pn.to_string())),
                             cell(v.clone()),
                         ]),
-                    )?;
+                    );
+                    self.magic_guards
+                        .remove(&(Rc::as_ptr(&o) as usize, 1u8, pn.to_string()));
+                    res?;
                     Ok(v)
                 } else {
+                    // `\0` names error on the real-storage path before
+                    // any deprecation (bug52484_2).
+                    self.check_prop_name(pn)?;
                     // E_DEPRECATED on first write to an undeclared prop
                     // (PHP 8.2+; stdClass is exempt).
                     let is_new = {
@@ -17612,16 +17714,23 @@ impl<'a> Interp<'a> {
     ) -> Result<Value, PhpError> {
         let ov = self.eval(obj)?;
         let pn = self.prop_name(name)?;
+        self.prop_read_value(ov, &pn, nullsafe)
+    }
+
+    /// prop_read with a pre-bound name — zend binds the operand once,
+    /// so a name mutation inside __isset/__get doesn't re-evaluate it
+    /// (bug75420).
+    fn prop_read_value(&mut self, ov: Value, pn: &str, nullsafe: bool) -> Result<Value, PhpError> {
         match ov {
             Value::Null if nullsafe => Ok(Value::Null),
             Value::Object(o) => {
                 let cls = o.borrow().class.clone();
-                if !self.in_own_hook(&o, &pn) {
-                    if let Some((pd, hs)) = self.hooked_prop(&o, &pn) {
+                if !self.in_own_hook(&o, pn) {
+                    if let Some((pd, hs)) = self.hooked_prop(&o, pn) {
                         return self.hook_read(&o, &pd, &hs);
                     }
                 }
-                if let Some(k) = self.obj_prop_key(&o, &pn) {
+                if let Some(k) = self.obj_prop_key(&o, pn) {
                     return Ok(o.borrow().props.get(&k).unwrap().borrow().clone());
                 }
                 // Typed prop whose slot was never initialized → Error
@@ -17630,7 +17739,7 @@ impl<'a> Interp<'a> {
                 // undefined property (typed_properties_009).
                 let was_unset = {
                     let ob = o.borrow();
-                    ob.unset_props.contains(&pn)
+                    ob.unset_props.contains(pn)
                         || ob
                             .unset_props
                             .iter()
@@ -17641,7 +17750,7 @@ impl<'a> Interp<'a> {
                 // (typed_properties_047 vs _009).
                 let has_get = cls.find_method("__get").is_some();
                 if !was_unset || !has_get {
-                    if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
+                    if let Some((tpd, tdcls)) = self.decl_prop(&o, pn) {
                         if tpd.ty.is_some() {
                             return self.fail(PhpError::uncaught(
                                 "Error",
@@ -17655,18 +17764,28 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                // __get magic
+                // __get magic — the (obj, prop) in-get guard keeps a
+                // re-entrant `$this->$pn` inside __get on real storage
+                // (bug63462/bug66609).
                 if has_get {
-                    let rv = self.method_invoke(
+                    let gkey = (Rc::as_ptr(&o) as usize, 0u8, pn.to_string());
+                    if !self.magic_guards.insert(gkey.clone()) {
+                        self.check_prop_name(pn)?;
+                        self.warn(&format!("Undefined property: {}::${}", cls.name(), pn))?;
+                        return Ok(Value::Null);
+                    }
+                    let res = self.method_invoke(
                         o.clone(),
                         "__get",
-                        CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
-                    )?;
+                        CallArgs::positional(vec![cell(Value::str(pn))]),
+                    );
+                    self.magic_guards.remove(&gkey);
+                    let rv = res?;
                     // A __get result for an unset() declared-typed prop
                     // must satisfy the declared type
                     // (typed_properties_030).
                     if was_unset {
-                        if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
+                        if let Some((tpd, tdcls)) = self.decl_prop(&o, pn) {
                             if let Some(tys) = &tpd.ty {
                                 if !self.ty_exact(tys, &rv) {
                                     if let Some(cv) = weak_ty_coerce(tys, &rv) {
@@ -17696,6 +17815,7 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(rv);
                 }
+                self.check_prop_name(pn)?;
                 self.warn(&format!("Undefined property: {}::${}", cls.name(), pn))?;
                 Ok(Value::Null)
             }
@@ -17799,12 +17919,26 @@ impl<'a> Interp<'a> {
                                     .map(|m| m.decl.by_ref)
                                     .unwrap_or(false);
                                 if get_by_ref {
+                                    let gkey = (Rc::as_ptr(&o) as usize, 0u8, pn.clone());
+                                    if !self.magic_guards.insert(gkey.clone()) {
+                                        return self.fail(PhpError::uncaught(
+                                            "Error",
+                                            format!(
+                                                "Cannot access uninitialized non-nullable property {}::${} by reference",
+                                                tdcls.name(),
+                                                pn
+                                            ),
+                                            0,
+                                        ));
+                                    }
                                     self.last_ret_cell = None;
-                                    let rv = self.method_invoke(
+                                    let res = self.method_invoke(
                                         o.clone(),
                                         "__get",
                                         CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
-                                    )?;
+                                    );
+                                    self.magic_guards.remove(&gkey);
+                                    let rv = res?;
                                     let got = self.last_ret_cell.take().unwrap_or_else(|| cell(rv));
                                     // The bound ref IS __get's cell —
                                     // its value is cast to the declared
@@ -17959,13 +18093,24 @@ impl<'a> Interp<'a> {
                     // __unset only fires for UNDECLARED props — a
                     // declared one is simply marked uninitialized
                     // (typed_properties_magic_set).
-                } else if cls.find_method("__unset").is_some() {
-                    self.method_invoke(
+                } else if cls.find_method("__unset").is_some()
+                    && self
+                        .magic_guards
+                        .insert((Rc::as_ptr(&o) as usize, 3u8, pn.clone()))
+                {
+                    let res = self.method_invoke(
                         o.clone(),
                         "__unset",
-                        CallArgs::positional(vec![cell(Value::str(pn))]),
-                    )?;
+                        CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
+                    );
+                    self.magic_guards
+                        .remove(&(Rc::as_ptr(&o) as usize, 3u8, pn.clone()));
+                    res?;
                 }
+                // Real-storage tail: `\0` names error here — magic
+                // already dispatched above when __unset existed
+                // (bug52484).
+                self.check_prop_name(&pn)?;
             }
         }
         Ok(())

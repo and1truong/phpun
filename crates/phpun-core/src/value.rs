@@ -228,11 +228,30 @@ pub fn trace_arg(v: &Value) -> String {
     match v {
         Value::Object(o) => format!("Object({})", o.borrow().class.name()),
         Value::Str(s) => {
-            let ls = String::from_utf8_lossy(s);
-            if ls.chars().count() > 15 {
-                format!("'{}...'", ls.chars().take(15).collect::<String>())
+            // Zend escapes args in stack traces: named escapes plus
+            // `\xNN` (uppercase) for other non-printables.
+            let esc: String = s
+                .iter()
+                .flat_map(|&b| {
+                    let mut out = String::new();
+                    match b {
+                        b'\n' => out.push_str("\\n"),
+                        b'\r' => out.push_str("\\r"),
+                        b'\t' => out.push_str("\\t"),
+                        0x0B => out.push_str("\\v"),
+                        0x0C => out.push_str("\\f"),
+                        0x1B => out.push_str("\\e"),
+                        b'\\' => out.push_str("\\\\"),
+                        0x20..=0x7E => out.push(b as char),
+                        _ => out.push_str(&format!("\\x{:02X}", b)),
+                    }
+                    out.chars().collect::<Vec<_>>()
+                })
+                .collect();
+            if esc.chars().count() > 15 {
+                format!("'{}...'", esc.chars().take(15).collect::<String>())
             } else {
-                format!("'{}'", ls)
+                format!("'{}'", esc)
             }
         }
         Value::Array(_) => "Array".into(),
