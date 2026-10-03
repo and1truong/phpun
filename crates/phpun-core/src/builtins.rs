@@ -3343,7 +3343,50 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             Value::str(".:/home/linuxbrew/.linuxbrew/share/pear")
         }
         "token_get_all" | "token_name" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
-        "highlight_string" | "highlight_file" | "php_strip_whitespace" => Value::Bool(true),
+        "highlight_string" => {
+            let src = arg(args, 0).to_php_string();
+            let h = crate::highlight::highlight_html(&src);
+            if arg(args, 1).is_truthy() {
+                Value::str(h)
+            } else {
+                it.emit(&h);
+                Value::Bool(true)
+            }
+        }
+        "highlight_file" | "show_source" => {
+            let path = arg(args, 0).to_php_string();
+            match std::fs::read(&path) {
+                Ok(b) => {
+                    let h = crate::highlight::highlight_html(&String::from_utf8_lossy(&b));
+                    if arg(args, 1).is_truthy() {
+                        Value::str(h)
+                    } else {
+                        it.emit(&h);
+                        Value::Bool(true)
+                    }
+                }
+                Err(_) => {
+                    it.warn_pub(&format!(
+                        "highlight_file({}): Failed to open stream: No such file or directory",
+                        path
+                    ))?;
+                    it.warn_pub(&format!(
+                        "highlight_file(): Failed opening '{}' for highlighting",
+                        path
+                    ))?;
+                    Value::Bool(false)
+                }
+            }
+        }
+        "php_strip_whitespace" => {
+            let path = arg(args, 0).to_php_string();
+            match std::fs::read(&path) {
+                Ok(b) => Value::str(crate::highlight::strip_whitespace(
+                    &String::from_utf8_lossy(&b),
+                )),
+                Err(_) => Value::str(""),
+            }
+        }
         "pack" | "unpack" => Value::Bool(false), // TODO
         "header" => {
             let h = arg_str(it, args, 0);
