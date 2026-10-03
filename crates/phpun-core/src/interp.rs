@@ -145,7 +145,7 @@ pub struct Interp<'a> {
     constants: HashMap<String, Value>,
     /// Accumulated program output (display_errors prints to stdout under
     /// CLI, and the PHPT harness merges streams via 2>&1).
-    pub out: String,
+    pub out: Vec<u8>,
     /// PHP CLI logs every diagnostic to stderr as `PHP <Level>: msg` when
     /// log_errors is on (default); the harness merges stderr after stdout.
     pub err_buf: String,
@@ -267,7 +267,7 @@ pub struct Interp<'a> {
 
 /// One output-buffer level (ob_start) with its optional handler.
 pub struct ObLevel {
-    pub buf: String,
+    pub buf: Vec<u8>,
     pub handler: Option<Value>,
     /// Set after the handler's first invocation — PHP's
     /// PHP_OUTPUT_HANDLER_START bit is only passed once (bug24951).
@@ -439,7 +439,7 @@ impl<'a> Interp<'a> {
             interfaces: HashMap::new(),
             early_bound_classes: HashSet::new(),
             constants,
-            out: String::new(),
+            out: Vec::new(),
             err_buf: String::new(),
             decl_file_ctx: None,
             out_headers: Vec::new(),
@@ -1658,14 +1658,20 @@ impl<'a> Interp<'a> {
 
     /// Emit output through the output-buffer stack.
     pub fn emit(&mut self, s: &str) {
+        self.emit_bytes(s.as_bytes());
+    }
+
+    /// Byte-faithful emit — program output is bytes (echo of binary
+    /// strings, file reads, preg results must not be UTF-8 validated).
+    pub fn emit_bytes(&mut self, b: &[u8]) {
         // memory_limit>0 turns into a deferred fatal once accumulated
         // writes pass it (bug45392); checked at the next statement.
-        self.mem_used += s.len() as u64;
-        self.mem_last = s.len() as u64;
+        self.mem_used += b.len() as u64;
+        self.mem_last = b.len() as u64;
         if let Some(buf) = self.ob_stack.last_mut() {
-            buf.buf.push_str(s);
+            buf.buf.extend_from_slice(b);
         } else {
-            self.out.push_str(s);
+            self.out.extend_from_slice(b);
         }
     }
 
@@ -1945,7 +1951,7 @@ impl<'a> Interp<'a> {
                 if self.mem_exceeded {
                     // Memory-exhausted: buffers are dropped, so the
                     // fatal goes straight to output (bug45392).
-                    self.out.push_str(&s);
+                    self.out.extend_from_slice(s.as_bytes());
                 } else {
                     self.emit(&s);
                 }
@@ -2026,15 +2032,15 @@ impl<'a> Interp<'a> {
                 // Zend prints `Uncaught C: msg` — no colon when msg empty.
                 let colon = if msg.is_empty() { "" } else { ": " };
                 if self.ini_on("html_errors") {
-                    self.out.push_str(&format!(
+                    self.out.extend_from_slice(format!(
                         "<br />\n<b>Fatal error</b>:  Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in <b>{}</b> on line <b>{}</b><br />\n",
                         class, colon, msg, file, line, tr, file, thrown
-                    ));
+                    ).as_bytes());
                 } else {
-                    self.out.push_str(&format!(
+                    self.out.extend_from_slice(format!(
                         "\nFatal error: Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
                         class, colon, msg, file, line, tr, file, thrown
-                    ));
+                    ).as_bytes());
                     // The PHP CLI SAPI also logs the uncaught to stderr
                     // when log_errors is on (its default); merged-output
                     // PHPT runs see it as a `PHP Fatal error:` copy of
@@ -2512,8 +2518,8 @@ impl<'a> Interp<'a> {
             Stmt::Echo(args) => {
                 for a in args {
                     match self.eval(a) {
-                        Ok(v) => match self.conv_str(&v) {
-                            Ok(s) => self.emit(&s),
+                        Ok(v) => match self.conv_bytes(&v) {
+                            Ok(s) => self.emit_bytes(&s),
                             Err(e) => return self.err_flow(e),
                         },
                         Err(e) => return self.err_flow(e),
@@ -3467,20 +3473,20 @@ impl<'a> Interp<'a> {
             Expr::Float(f) => Ok(Value::Float(*f)),
             Expr::Str(s) => Ok(Value::str(s.clone())),
             Expr::Interp(parts) => {
-                let mut s = String::new();
+                let mut s: Vec<u8> = Vec::new();
                 for p in parts {
                     match p {
-                        StringPart::Lit(t) => s.push_str(t),
+                        StringPart::Lit(t) => s.extend_from_slice(t),
                         StringPart::Var(name) => {
                             let v = self.var_get(name)?;
-                            let cs = self.conv_str(&v)?;
-                            s.push_str(&cs);
+                            let cs = self.conv_bytes(&v)?;
+                            s.extend_from_slice(&cs);
                         }
                         StringPart::Expr(src) => {
                             let (expr, _) = parser::parse_expr_src(src)
                                 .map_err(|e| PhpError::parse(e.message, e.line))?;
                             let v = self.eval(&expr)?;
-                            s.push_str(&self.conv_str(&v)?);
+                            s.extend_from_slice(&self.conv_bytes(&v)?);
                         }
                         StringPart::DollarBraceExpr(src) => {
                             // `${expr}` — deprecated variable-variable
@@ -3492,11 +3498,11 @@ impl<'a> Interp<'a> {
                             let nv = self.eval(&expr)?;
                             let name = self.conv_str(&nv)?;
                             let v = self.var_get(&name)?;
-                            s.push_str(&self.conv_str(&v)?);
+                            s.extend_from_slice(&self.conv_bytes(&v)?);
                         }
                     }
                 }
-                Ok(Value::str(s))
+                Ok(Value::bytes(s))
             }
             Expr::Var(name) => self.var_get(name),
             Expr::VarVar(inner) => {
@@ -3620,7 +3626,7 @@ impl<'a> Interp<'a> {
                     match self.eval(a)? {
                         Value::Int(i) => i as i32,
                         Value::Str(s) => {
-                            self.emit(&s);
+                            self.emit_bytes(&s);
                             0
                         }
                         _ => 0,
@@ -4038,6 +4044,15 @@ impl<'a> Interp<'a> {
             } => self.prop_read(obj, name, *nullsafe),
             _ => self.eval(e),
         }
+    }
+
+    /// Byte-faithful string coercion — strings pass through untouched;
+    /// other scalars go through conv_str (their output is ASCII anyway).
+    fn conv_bytes(&mut self, v: &Value) -> Result<Vec<u8>, PhpError> {
+        if let Value::Str(s) = v {
+            return Ok(s.to_vec());
+        }
+        Ok(self.conv_str(v)?.into_bytes())
     }
 
     /// Object→string with __toString, plus array warning.
@@ -4818,7 +4833,7 @@ impl<'a> Interp<'a> {
                         // String offset write (final level only).
                         let mut b = c.borrow_mut();
                         let mut bytes = match &*b {
-                            Value::Str(s) => s.as_bytes().to_vec(),
+                            Value::Str(s) => s.to_vec(),
                             _ => Vec::new(),
                         };
                         if matches!(*b, Value::Str(_)) {
@@ -4852,7 +4867,7 @@ impl<'a> Interp<'a> {
                                 b = c.borrow_mut();
                             }
                             if let Value::Str(s) = &mut *b {
-                                *s = String::from_utf8_lossy(&bytes).into_owned().into();
+                                *s = bytes.clone().into();
                             }
                             return Ok(Value::str(String::from_utf8_lossy(&[byte]).into_owned()));
                         }
@@ -4916,7 +4931,7 @@ impl<'a> Interp<'a> {
                         }
                     }
                     Value::Str(s) => {
-                        let mut bytes = s.as_bytes().to_vec();
+                        let mut bytes = s.to_vec();
                         match key {
                             Some(k) => {
                                 // PHP 8: negative offsets index from the
@@ -4977,7 +4992,7 @@ impl<'a> Interp<'a> {
                             let mut b = bc.borrow_mut();
                             if let Value::Str(s) = &mut *b {
                                 let vs = self.conv_str(&v).unwrap_or_default();
-                                let mut bytes = s.as_bytes().to_vec();
+                                let mut bytes = s.to_vec();
                                 let orig = key
                                     .as_ref()
                                     .map(|k| k.to_int())
@@ -4998,7 +5013,7 @@ impl<'a> Interp<'a> {
                                 }
                                 bytes[idx] = vs.as_bytes().first().copied().unwrap_or(b' ');
                                 let multi = vs.len() > 1;
-                                *s = String::from_utf8_lossy(&bytes).into_owned().into();
+                                *s = bytes.clone().into();
                                 if multi {
                                     drop(b);
                                     self.warn(
@@ -5162,7 +5177,7 @@ impl<'a> Interp<'a> {
                     Some(v) => Ok(v),
                     None => {
                         let shown = match &key {
-                            Value::Str(s) => format!("\"{}\"", s),
+                            Value::Str(s) => format!("\"{}\"", crate::value::lossy(s)),
                             other => other.to_php_string(),
                         };
                         if self.silence == 0 {
@@ -5179,17 +5194,20 @@ impl<'a> Interp<'a> {
                 // float-shaped one) is a TypeError (bug29566).
                 let idx = match &key {
                     Value::Str(k) => {
-                        let b = k.as_bytes();
+                        let b: &[u8] = k;
                         let mut i = usize::from(b.first() == Some(&b'-'));
                         let start = i;
                         while i < b.len() && b[i].is_ascii_digit() {
                             i += 1;
                         }
                         if i == b.len() && i > start {
-                            k.parse::<i64>().unwrap_or(0)
+                            crate::value::lossy(&k[..]).parse::<i64>().unwrap_or(0)
                         } else if i > start && matches!(numeric(k), Numeric::Leading(_, _)) {
-                            self.warn(&format!("Illegal string offset \"{}\"", k))?;
-                            k[..i].parse::<i64>().unwrap_or(0)
+                            self.warn(&format!(
+                                "Illegal string offset \"{}\"",
+                                crate::value::lossy(&k[..])
+                            ))?;
+                            crate::value::lossy(&k[..i]).parse::<i64>().unwrap_or(0)
                         } else {
                             return self.fail(PhpError::uncaught(
                                 "TypeError",
@@ -5200,7 +5218,7 @@ impl<'a> Interp<'a> {
                     }
                     _ => key.to_int(),
                 };
-                let bytes = s.as_bytes();
+                let bytes: &[u8] = &s[..];
                 let idx = if idx < 0 {
                     idx + bytes.len() as i64
                 } else {
@@ -5212,10 +5230,7 @@ impl<'a> Interp<'a> {
                     }
                     Ok(Value::Null)
                 } else {
-                    Ok(Value::str(
-                        String::from_utf8_lossy(&bytes[idx as usize..idx as usize + 1])
-                            .into_owned(),
-                    ))
+                    Ok(Value::bytes(bytes[idx as usize..idx as usize + 1].to_vec()))
                 }
             }
             Value::Null => {
@@ -5375,7 +5390,7 @@ impl<'a> Interp<'a> {
                         self.deprecated(
                             "Increment on non-numeric string is deprecated, use str_increment() instead",
                         )?;
-                        Value::str(perl_inc(s))
+                        Value::bytes(perl_inc(s))
                     } else {
                         self.deprecated(
                             "Decrement on non-numeric string has no effect and is deprecated",
@@ -5433,7 +5448,7 @@ impl<'a> Interp<'a> {
                 let v = self.eval(e)?;
                 Ok(match v {
                     Value::Int(_) | Value::Float(_) => v,
-                    other => match numeric(&other.to_php_string()) {
+                    other => match numeric(&other.to_php_bytes()) {
                         Numeric::Int(i) => Value::Int(i),
                         Numeric::Float(f) => Value::Float(f),
                         Numeric::Leading(f, is_int) => {
@@ -5458,9 +5473,7 @@ impl<'a> Interp<'a> {
                 let v = self.eval(e)?;
                 match &v {
                     // ~"abc" negates bytes.
-                    Value::Str(s) => Ok(Value::str(String::from_utf8_lossy(
-                        &s.bytes().map(|b| !b).collect::<Vec<u8>>(),
-                    ))),
+                    Value::Str(s) => Ok(Value::bytes(s.iter().map(|b| !b).collect::<Vec<u8>>())),
                     _ => Ok(Value::Int(!self.coerce_int(&v))),
                 }
             }
@@ -5510,9 +5523,10 @@ impl<'a> Interp<'a> {
             }
             "." => {
                 let (lv, rv) = self.binary_operands(l, r)?;
-                let ls = self.conv_str(&lv)?;
-                let rs = self.conv_str(&rv)?;
-                Ok(Value::str(format!("{}{}", ls, rs)))
+                let mut ls = self.conv_bytes(&lv)?;
+                let rs = self.conv_bytes(&rv)?;
+                ls.extend_from_slice(&rs);
+                Ok(Value::bytes(ls))
             }
             "==" | "!=" | "===" | "!==" | "<" | "<=" | ">" | ">=" | "<=>" => {
                 let (lv, rv) = self.binary_operands(l, r)?;
@@ -5579,7 +5593,7 @@ impl<'a> Interp<'a> {
         match op {
             "&" | "|" | "^" => {
                 if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
-                    return Ok(Value::str(bitwise_str(op, a, b)));
+                    return Ok(Value::bytes(bitwise_str(op, a, b)));
                 }
                 let li = match self.bit_operand(op, &l, &r) {
                     Ok(i) => i,
@@ -5986,7 +6000,7 @@ impl<'a> Interp<'a> {
                     let n = match l.as_ref() {
                         Expr::Str(s) => s.clone(),
                         _ => match self.eval(l)? {
-                            Value::Str(s) => s.to_string(),
+                            Value::Str(s) => crate::value::lossy(&s).into_owned(),
                             v => v.to_php_string(),
                         },
                     };
@@ -6229,7 +6243,7 @@ impl<'a> Interp<'a> {
                         .method_invoke(it.clone(), "key", CallArgs::empty())
                         .unwrap_or(Value::Null);
                     let n = match &key {
-                        Value::Str(s) => Some(s.clone()),
+                        Value::Str(s) => Some(crate::value::lossy(&s).into_owned().into()),
                         _ => None,
                     };
                     out.push((n, cell(val)));
@@ -6394,7 +6408,7 @@ impl<'a> Interp<'a> {
             Value::Str(s) => {
                 // Fully-qualified dynamic names carry a leading `\`
                 // (namespaces/ns_032).
-                let name = s.trim_start_matches('\\').to_string();
+                let name = crate::value::lossy(s).trim_start_matches('\\').to_string();
                 // "Class::method" string callables
                 if let Some((cls, m)) = name.split_once("::") {
                     if let Some(c) = self.resolve_class(cls) {
@@ -6431,13 +6445,13 @@ impl<'a> Interp<'a> {
                             Value::Object(o) => self.method_invoke(o.clone(), &mname, args),
                             Value::Str(cn) => {
                                 let cls = self
-                                    .resolve_class(&cn)
+                                    .resolve_class(&crate::value::lossy(&cn))
                                     .and_then(|c| self.classes.get(&c.to_lowercase()).cloned());
                                 match cls {
                                     Some(cls) => self.static_invoke(cls, &mname, args),
                                     None => self.fail(PhpError::uncaught(
                                         "Error",
-                                        format!("Class \"{}\" not found", cn),
+                                        format!("Class \"{}\" not found", crate::value::lossy(&cn)),
                                         0,
                                     )),
                                 }
@@ -6594,7 +6608,8 @@ impl<'a> Interp<'a> {
         match v {
             Value::Callable(_) => Ok(v.clone()),
             Value::Str(s) => {
-                let name = s.trim_start_matches('\\');
+                let name = crate::value::lossy(s);
+                let name = name.trim_start_matches('\\');
                 if let Some((cls, m)) = name.split_once("::") {
                     if let Some(rcn) = self.resolve_class(cls) {
                         if let Some(c) = self.classes.get(&rcn.to_lowercase()).cloned() {
@@ -6658,13 +6673,13 @@ impl<'a> Interp<'a> {
                     (Some(Value::Str(cn)), Some(mv)) => {
                         let mn = mv.to_php_string();
                         match self
-                            .resolve_class(&cn)
+                            .resolve_class(&crate::value::lossy(&cn))
                             .and_then(|c| self.classes.get(&c.to_lowercase()).cloned())
                         {
                             Some(c) => self.fcc_static(c, &mn),
                             None => self.fail(PhpError::uncaught(
                                 "Error",
-                                format!("Class \"{}\" not found", cn),
+                                format!("Class \"{}\" not found", crate::value::lossy(&cn)),
                                 0,
                             )),
                         }
@@ -9833,7 +9848,7 @@ impl<'a> Interp<'a> {
                         op: "named", l, r, ..
                     } => {
                         let n = match self.eval(l)? {
-                            Value::Str(s) => s.to_string(),
+                            Value::Str(s) => crate::value::lossy(&s).into_owned(),
                             v => v.to_php_string(),
                         };
                         match pnames.iter().position(|p| *p == n) {
@@ -11159,7 +11174,10 @@ impl<'a> Interp<'a> {
                         };
                         nc.scope_class = match &scope {
                             Some(Value::Object(o)) => Some(o.borrow().class.clone()),
-                            Some(Value::Str(s)) => self.classes.get(&s.to_lowercase()).cloned(),
+                            Some(Value::Str(s)) => self
+                                .classes
+                                .get(&crate::value::lossy(&s).to_lowercase())
+                                .cloned(),
                             _ => None,
                         };
                         return Ok(Value::Callable(Rc::new(nc)));
@@ -11740,7 +11758,7 @@ impl<'a> Interp<'a> {
             let r = self.ob_invoke(8);
             self.ob_stack.pop();
             if let Ok(Some(s)) = r {
-                self.emit(&s);
+                self.emit_bytes(&s);
             }
         }
     }
@@ -11749,7 +11767,7 @@ impl<'a> Interp<'a> {
     /// clearing the buffer first (bug24951 flag semantics:
     /// START=1, CLEAN=2, FLUSH=4, FINAL=8). Returns the handler's output
     /// — or the raw buffer when there is no handler.
-    fn ob_invoke(&mut self, mode: i64) -> Result<Option<String>, PhpError> {
+    fn ob_invoke(&mut self, mode: i64) -> Result<Option<Vec<u8>>, PhpError> {
         let (handler, buf, already) = match self.ob_stack.last_mut() {
             Some(l) => {
                 let buf = std::mem::take(&mut l.buf);
@@ -11767,10 +11785,10 @@ impl<'a> Interp<'a> {
                 self.internal_cb += 1;
                 let out = self.call_value(
                     &h,
-                    CallArgs::positional(vec![cell(Value::str(buf)), cell(Value::Int(m))]),
+                    CallArgs::positional(vec![cell(Value::bytes(buf)), cell(Value::Int(m))]),
                 );
                 self.internal_cb -= 1;
-                Ok(Some(out?.to_php_string()))
+                Ok(Some(out?.to_php_bytes()))
             }
             None => Ok(Some(buf)),
         }
@@ -11779,6 +11797,10 @@ impl<'a> Interp<'a> {
     /// String conversion for builtins (__toString-aware, never errors → "" on failure).
     pub fn to_string_of(&mut self, v: &Value) -> String {
         self.conv_str(v).unwrap_or_else(|_| v.to_php_string())
+    }
+    /// Byte-faithful variant — for binary-safe builtins.
+    pub fn to_bytes_of(&mut self, v: &Value) -> Vec<u8> {
+        self.conv_bytes(v).unwrap_or_else(|_| v.to_php_bytes())
     }
     /// Variable lookup for compact() — reads current scope quietly.
     pub fn lookup_var(&mut self, name: &str) -> Option<Value> {
@@ -11805,7 +11827,7 @@ impl<'a> Interp<'a> {
     // public helpers for builtins
     pub fn ob_push(&mut self, handler: Option<Value>) {
         self.ob_stack.push(ObLevel {
-            buf: String::new(),
+            buf: Vec::new(),
             handler,
             started: false,
         });
@@ -11821,7 +11843,7 @@ impl<'a> Interp<'a> {
         let r = self.ob_invoke(8)?;
         self.ob_stack.pop();
         if let Some(s) = r {
-            self.emit(&s);
+            self.emit_bytes(&s);
         }
         Ok(())
     }
@@ -11831,7 +11853,7 @@ impl<'a> Interp<'a> {
     pub fn ob_flush(&mut self) -> Result<(), PhpError> {
         if let Some(s) = self.ob_invoke(4)? {
             let level = self.ob_stack.pop();
-            self.emit(&s);
+            self.emit_bytes(&s);
             if let Some(l) = level {
                 self.ob_stack.push(l);
             }
@@ -11847,7 +11869,7 @@ impl<'a> Interp<'a> {
     pub fn ob_get_clean(&mut self) -> Value {
         self.ob_stack
             .pop()
-            .map(|l| Value::str(l.buf))
+            .map(|l| Value::bytes(l.buf))
             .unwrap_or(Value::Bool(false))
     }
     /// ob_get_flush: handler(mode=FINAL) result emitted, RAW buffer
@@ -11857,11 +11879,11 @@ impl<'a> Interp<'a> {
         let r = self.ob_invoke(8)?;
         self.ob_stack.pop();
         if let Some(s) = r {
-            self.emit(&s);
+            self.emit_bytes(&s);
         }
-        Ok(raw.map(Value::str).unwrap_or(Value::Bool(false)))
+        Ok(raw.map(Value::bytes).unwrap_or(Value::Bool(false)))
     }
-    pub fn ob_top(&self) -> Option<&String> {
+    pub fn ob_top(&self) -> Option<&Vec<u8>> {
         self.ob_stack.last().map(|l| &l.buf)
     }
     pub fn ob_len(&self) -> usize {
@@ -11978,7 +12000,7 @@ fn assert_arg_repr(v: &Value) -> String {
         Value::Null => "NULL".into(),
         Value::Int(i) => i.to_string(),
         Value::Float(f) => crate::value::trace_arg(&Value::Float(*f)),
-        Value::Str(s) => format!("'{}'", s),
+        Value::Str(s) => format!("'{}'", crate::value::lossy(&s)),
         Value::Array(_) => "Array".into(),
         Value::Object(o) => format!("Object({})", o.borrow().class.name()),
         Value::Callable(_) => "Object(Closure)".into(),
@@ -12024,8 +12046,8 @@ fn num_bin(a: Num, b: Num, fi: fn(i64, i64) -> Option<i64>, ff: fn(f64, f64) -> 
 }
 
 /// Perl-style string increment ("a"→"b", "z"→"aa", "A9"→"B0").
-fn perl_inc(s: &str) -> String {
-    let mut bytes = s.as_bytes().to_vec();
+fn perl_inc(s: &[u8]) -> Vec<u8> {
+    let mut bytes = s.to_vec();
     let mut i = bytes.len();
     let mut carry = true;
     while carry && i > 0 {
@@ -12066,7 +12088,7 @@ fn perl_inc(s: &str) -> String {
         };
         bytes.insert(0, c);
     }
-    String::from_utf8_lossy(&bytes).into_owned()
+    bytes
 }
 
 /// PHP float→int conversion (zend_dtoi64): warns on out-of-range,
@@ -12092,9 +12114,9 @@ fn coerce_float(f: f64, mut warn: impl FnMut(&str)) -> i64 {
     f as i64
 }
 
-fn bitwise_str(op: &str, a: &str, b: &str) -> String {
+fn bitwise_str(op: &str, a: &[u8], b: &[u8]) -> Vec<u8> {
     // `|` pads the shorter operand with NUL; `&`/`^` truncate to min length.
-    let (x, y) = (a.as_bytes(), b.as_bytes());
+    let (x, y) = (a, b);
     let n = if op == "|" {
         x.len().max(y.len())
     } else {
@@ -12110,7 +12132,7 @@ fn bitwise_str(op: &str, a: &str, b: &str) -> String {
             _ => xi ^ yi,
         });
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 /// By-ref flags for builtin parameters (only slots that accept references are
@@ -12144,7 +12166,8 @@ fn weak_ty_coerce(tys: &[String], v: &Value) -> Option<Value> {
     for t in tys {
         let coerced = match (t.as_str(), v) {
             ("int", Value::Str(s)) => {
-                let tr = s.trim();
+                let tr = crate::value::lossy(s);
+                let tr = tr.trim();
                 let base = if let Some(h) = tr.strip_prefix("0x") {
                     i64::from_str_radix(h, 16).ok()
                 } else if let Some(o) = tr.strip_prefix("0o") {
@@ -12162,7 +12185,11 @@ fn weak_ty_coerce(tys: &[String], v: &Value) -> Option<Value> {
             ("string", Value::Float(f)) => Some(Value::str(format_float_repr(*f))),
             ("string", Value::Bool(b)) => Some(Value::str(if *b { "1" } else { "" })),
             ("float", Value::Int(i)) => Some(Value::Float(*i as f64)),
-            ("float", Value::Str(s)) => s.trim().parse::<f64>().ok().map(Value::Float),
+            ("float", Value::Str(s)) => crate::value::lossy(s)
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .map(Value::Float),
             ("float", Value::Bool(b)) => Some(Value::Float(if *b { 1.0 } else { 0.0 })),
             ("bool", _) => Some(Value::Bool(v.is_truthy())),
             _ => None,

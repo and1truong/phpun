@@ -104,7 +104,7 @@ fn worker_loop(id: usize, rx: std::sync::mpsc::Receiver<TcpStream>, cfg: std::sy
     let mut it = Interp::new(&cfg.front);
     let (res, ret) = it.run_source_ret(&src);
     if !it.out.is_empty() {
-        eprint!("{}", it.out);
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), &it.out);
     }
     if !it.err_buf.is_empty() {
         eprint!("{}", it.err_buf);
@@ -240,18 +240,18 @@ fn respond_worker(mut stream: TcpStream, cfg: &Cfg, req: &Req, it: &mut Interp, 
                             }
                         }
                     }
-                    "body" => body.push_str(&v.to_php_string()),
+                    "body" => body.extend_from_slice(&v.to_php_bytes()),
                     _ => {}
                 }
             }
         }
-        Ok(Value::Str(s)) => body.push_str(&s),
+        Ok(Value::Str(s)) => body.extend_from_slice(&s),
         Ok(_) => {}
         Err(e) => {
             if code == 200 {
                 code = 500;
             }
-            body.push_str(&format!("\n{}", e.message));
+            body.extend_from_slice(format!("\n{}", e.message).as_bytes());
         }
     }
     if !lines
@@ -270,10 +270,11 @@ fn respond_worker(mut stream: TcpStream, cfg: &Cfg, req: &Req, it: &mut Interp, 
         "Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     ));
+    let mut resp = resp.into_bytes();
     if !head_req {
-        resp.push_str(&body);
+        resp.extend_from_slice(&body);
     }
-    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.write_all(&resp);
 }
 
 struct Cfg {
@@ -377,7 +378,7 @@ fn read_request(stream: &mut TcpStream, remote: (String, u16)) -> Result<Option<
     Ok(Some(Req {
         method,
         uri,
-        path: urldecode(&path, true),
+        path: crate::value::lossy(&urldecode(path.as_bytes(), true)).into_owned(),
         query,
         headers,
         body,
@@ -504,18 +505,20 @@ fn respond(mut stream: TcpStream, cfg: &Cfg, req: &Req) {
         lines.push("Content-Type: text/html; charset=UTF-8".to_string());
     }
     let head = req.method == "HEAD";
-    let body = if head { "" } else { it.out.as_str() };
     let mut resp = format!("HTTP/1.1 {} {}\r\n", code, reason(code));
     for h in &lines {
         resp.push_str(h);
         resp.push_str("\r\n");
     }
     resp.push_str(&format!(
-        "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-        if head { it.out.len() } else { body.len() },
-        body
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        it.out.len()
     ));
-    let _ = stream.write_all(resp.as_bytes());
+    let mut resp = resp.into_bytes();
+    if !head {
+        resp.extend_from_slice(&it.out);
+    }
+    let _ = stream.write_all(&resp);
 }
 
 /// Populate the request superglobals a PHP web script expects.
@@ -599,7 +602,7 @@ fn populate(it: &mut Interp, req: &Req, file: &str, cfg: &Cfg) {
             if let Some((k, val)) = pair.split_once('=') {
                 ck.set(
                     ArrKey::Str(k.trim().into()),
-                    Value::str(urldecode(val.trim(), false)),
+                    Value::bytes(urldecode(val.trim().as_bytes(), false)),
                 );
             }
         }
@@ -736,8 +739,8 @@ fn parse_query(s: &str, arr: &mut PhpArray) {
             continue;
         }
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        let k = urldecode(k, false);
-        let v = Value::str(urldecode(v, false));
+        let k = crate::value::lossy(&urldecode(k.as_bytes(), false)).into_owned();
+        let v = Value::bytes(urldecode(v.as_bytes(), false));
         // Nested keys: name[seg][seg2]… — first segment is the array name.
         let segs: Vec<String> = if let Some(open) = k.find('[') {
             let mut out = vec![k[..open].to_string()];

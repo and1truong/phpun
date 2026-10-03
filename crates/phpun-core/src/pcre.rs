@@ -25,7 +25,7 @@ pub struct PcreRe {
     /// group index -> name (index 0 = whole match, never named)
     names: Vec<Option<String>>,
     /// compiled with PCRE2_UTF — matches must stay on char boundaries
-    utf8: bool,
+    pub utf8: bool,
 }
 
 impl Drop for PcreRe {
@@ -147,7 +147,7 @@ impl PcreRe {
 /// Compile a PCRE2 pattern (without delimiters — options already
 /// inlined as `(?imsx)` or passed in `options` by the caller).
 /// Err is the engine's message plus the byte offset, PHP style.
-pub fn compile(src: &str, options: u32, extra_options: u32) -> Result<PcreRe, String> {
+pub fn compile(src: &[u8], options: u32, extra_options: u32) -> Result<PcreRe, String> {
     unsafe {
         let mut errcode: std::os::raw::c_int = 0;
         let mut erroff: usize = 0;

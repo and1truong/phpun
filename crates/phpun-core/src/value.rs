@@ -168,7 +168,9 @@ pub fn to_key(v: &Value) -> ArrKey {
             if let Some(i) = canonical_int(s) {
                 ArrKey::Int(i)
             } else {
-                ArrKey::Str(s.clone())
+                // PHP array keys are byte strings; ArrKey keeps UTF-8 for
+                // now — non-UTF8 keys collapse through the lossy path.
+                ArrKey::Str(String::from_utf8_lossy(s).into_owned().into())
             }
         }
         Value::Array(_) | Value::Object(_) | Value::Callable(_) | Value::Resource(_) => {
@@ -242,10 +244,11 @@ pub fn trace_arg(v: &Value) -> String {
     match v {
         Value::Object(o) => format!("Object({})", o.borrow().class.name()),
         Value::Str(s) => {
-            if s.chars().count() > 15 {
-                format!("'{}...'", s.chars().take(15).collect::<String>())
+            let ls = String::from_utf8_lossy(s);
+            if ls.chars().count() > 15 {
+                format!("'{}...'", ls.chars().take(15).collect::<String>())
             } else {
-                format!("'{}'", s)
+                format!("'{}'", ls)
             }
         }
         Value::Array(_) => "Array".into(),
@@ -256,22 +259,27 @@ pub fn trace_arg(v: &Value) -> String {
     }
 }
 
+/// Lossy UTF-8 view of a byte string — for APIs/names that are
+/// effectively always ASCII (function names, class names, identifiers).
+pub fn lossy<'a>(s: &'a (impl AsRef<[u8]> + ?Sized)) -> std::borrow::Cow<'a, str> {
+    String::from_utf8_lossy(s.as_ref())
+}
+
 /// Integer strings that PHP treats as int array keys: optional `-`, digits,
 /// no leading `+`, no whitespace, no leading zeros (except "0").
-pub fn canonical_int(s: &str) -> Option<i64> {
+pub fn canonical_int(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
-    if s == "0"
-        || (s.starts_with('-') && s[1..].chars().all(|c| c.is_ascii_digit()) && !s[1..].is_empty())
-    {
-        return s.parse().ok();
+    let t = || std::str::from_utf8(s).ok()?.parse::<i64>().ok();
+    if s == b"0" || (s[0] == b'-' && s[1..].iter().all(|c| c.is_ascii_digit()) && s.len() > 1) {
+        return t();
     }
-    if s.chars().all(|c| c.is_ascii_digit()) && !s.starts_with('0') {
-        return s.parse().ok();
+    if s.iter().all(|c| c.is_ascii_digit()) && s[0] != b'0' {
+        return t();
     }
-    if s.starts_with('-') && s.len() > 1 {
-        return s.parse().ok();
+    if s[0] == b'-' && s.len() > 1 {
+        return t();
     }
     None
 }
@@ -282,7 +290,8 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Float(f64),
-    Str(Rc<str>),
+    /// PHP strings are byte arrays — UTF-8 only at display boundaries.
+    Str(Rc<[u8]>),
     /// Copy-on-write via Rc: clones share until mutated (see interp::set_index).
     Array(Rc<RefCell<PhpArray>>),
     /// Instances of user-defined and builtin classes.
@@ -295,7 +304,34 @@ pub enum Value {
 
 impl Value {
     pub fn str(s: impl Into<String>) -> Self {
-        Value::Str(s.into().into())
+        Value::Str(s.into().into_bytes().into())
+    }
+
+    /// Build a string Value from raw bytes (binary literals, byte ops).
+    pub fn bytes(b: impl Into<Vec<u8>>) -> Self {
+        Value::Str(b.into().into())
+    }
+
+    /// Byte-faithful string coercion — the workhorse for concat, offsets,
+    /// preg, binary output. `to_php_string` is the lossy display variant.
+    pub fn to_php_bytes(&self) -> Vec<u8> {
+        match self {
+            Value::Null => Vec::new(),
+            Value::Bool(b) => {
+                if *b {
+                    b"1".to_vec()
+                } else {
+                    Vec::new()
+                }
+            }
+            Value::Int(i) => i.to_string().into_bytes(),
+            Value::Float(f) => format_float(*f).into_bytes(),
+            Value::Str(s) => s.to_vec(),
+            Value::Array(_) => b"Array".to_vec(),
+            Value::Object(o) => format!("Object id #{}", o.borrow().id).into_bytes(),
+            Value::Callable(_) => b"Closure".to_vec(),
+            Value::Resource(r) => format!("Resource id #{}", r.borrow().id()).into_bytes(),
+        }
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -348,7 +384,7 @@ impl Value {
             Value::Bool(b) => *b,
             Value::Int(i) => *i != 0,
             Value::Float(f) => *f != 0.0,
-            Value::Str(s) => !s.is_empty() && s.as_ref() != "0",
+            Value::Str(s) => !s.is_empty() && s.as_ref() != b"0".as_slice(),
             Value::Array(a) => !a.borrow().is_empty(),
             Value::Object(_) | Value::Callable(_) => true,
             Value::Resource(_) => true,
@@ -362,7 +398,7 @@ impl Value {
             Value::Bool(b) => if *b { "1" } else { "" }.to_string(),
             Value::Int(i) => i.to_string(),
             Value::Float(f) => format_float(*f),
-            Value::Str(s) => s.to_string(),
+            Value::Str(s) => String::from_utf8_lossy(s).into_owned(),
             // PHP raises "Array to string conversion" warning — caller emits it.
             Value::Array(_) => "Array".to_string(),
             Value::Object(o) => format!("Object id #{}", o.borrow().id),
@@ -444,12 +480,19 @@ impl Numeric {
 
 /// Parse a string the way PHP coerces it to a number.
 /// Accepts leading whitespace; trailing whitespace for fully-numeric forms.
-pub fn numeric(s: &str) -> Numeric {
-    let t = s.trim_start();
+pub fn numeric(s: &[u8]) -> Numeric {
+    // PHP numeric-string whitespace: space, \t, \n, \r, \v, \f.
+    let t = {
+        let mut i = 0;
+        while i < s.len() && matches!(s[i], b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
+            i += 1;
+        }
+        &s[i..]
+    };
     if t.is_empty() {
         return Numeric::NonNumeric;
     }
-    let bytes = t.as_bytes();
+    let bytes = t;
     let mut i = 0;
     if bytes[i] == b'+' || bytes[i] == b'-' {
         i += 1;
@@ -480,9 +523,12 @@ pub fn numeric(s: &str) -> Numeric {
     if !seen_digit {
         return Numeric::NonNumeric;
     }
-    let text = &t[..i];
+    let text = std::str::from_utf8(&t[..i]).unwrap_or("");
     let rest = &t[i..];
-    if rest.trim().is_empty() {
+    if rest
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+    {
         if !seen_dot && !seen_exp {
             if let Ok(v) = text.parse::<i64>() {
                 return Numeric::Int(v);
@@ -654,7 +700,7 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
                 // PHP 8: non-numeric (incl. leading-numeric) string →
                 // the number is cast to string and compared as strings.
                 Numeric::Leading(_, _) | Numeric::NonNumeric => {
-                    a.to_php_string().as_str().cmp(s.as_ref())
+                    a.to_php_bytes().as_slice().cmp(s.as_ref())
                 }
             }
         }

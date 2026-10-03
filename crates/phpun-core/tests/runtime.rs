@@ -18,7 +18,11 @@ fn eval(file: &str, src: &str, ini: &[(&str, &str)]) -> (String, String, i32) {
         it.ini.insert(k.to_string(), v.to_string());
     }
     let r = it.run_source(src);
-    (it.out, it.err_buf, r.exit_code)
+    (
+        String::from_utf8_lossy(&it.out).into_owned(),
+        it.err_buf,
+        r.exit_code,
+    )
 }
 
 fn expectf_matches(expected: &str, actual: &str) -> bool {

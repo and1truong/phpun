@@ -507,7 +507,10 @@ pub fn pdostmt_method(
                         bound[idx] = a(args, 1);
                     }
                     Value::Str(s) => {
-                        named.insert(format!(":{}", s.trim_start_matches(':')), a(args, 1));
+                        named.insert(
+                            format!(":{}", crate::value::lossy(&s).trim_start_matches(':')),
+                            a(args, 1),
+                        );
                     }
                     _ => {}
                 }

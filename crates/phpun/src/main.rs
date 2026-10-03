@@ -88,7 +88,7 @@ fn run_script(args: &[String]) -> ExitCode {
         }
     }
     let res = it.run_source(&src);
-    print!("{}", it.out);
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), &it.out);
     eprint!("{}", it.err_buf);
     ExitCode::from((res.exit_code & 0xff) as u8)
 }
@@ -257,7 +257,8 @@ fn run_tests(args: &[String]) -> ExitCode {
         } else {
             failed.push(name.clone());
             println!("FAIL {}", name);
-            let out = it.out.trim_end();
+            let out = String::from_utf8_lossy(&it.out);
+            let out = out.trim_end();
             if !out.is_empty() {
                 for line in out.lines().take(20) {
                     println!("    {}", line);
