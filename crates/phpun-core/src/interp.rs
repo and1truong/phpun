@@ -3166,7 +3166,7 @@ impl<'a> Interp<'a> {
                     }
                     if let Some((pd, dcls)) = self.decl_prop(&o, pn) {
                         if let Some(sv) = pd.set_vis {
-                            if !self.hook_scope_allows(&dcls, sv) {
+                            if !self.hook_scope_allows(&o, &dcls, pn, sv) {
                                 return self.set_visibility_error(&dcls, &pd.name, sv);
                             }
                         }
@@ -6067,7 +6067,38 @@ impl<'a> Interp<'a> {
 
     /// Caller-scope check for a hook's effective visibility (the hook's
     /// own `private get`/`protected set` or the prop's).
-    fn hook_scope_allows(&mut self, dcls: &Rc<PhpClass>, vis: crate::ast::Visibility) -> bool {
+    /// The class a *protected* prop is scoped to — the FURTHEST
+    /// ancestor in the object's chain declaring it (GH-19044: the check
+    /// uses the prototype's scope, so sibling subclasses descending
+    /// from that ancestor can access each other's instances).
+    fn prop_scope_class(
+        &self,
+        o: &Rc<RefCell<PhpObject>>,
+        pn: &str,
+    ) -> Option<Rc<PhpClass>> {
+        let mut found = None;
+        let mut cur = Some(o.borrow().class.clone());
+        while let Some(c) = cur {
+            if c.decl
+                .props
+                .iter()
+                .any(|p| p.name == pn && p.visibility != crate::ast::Visibility::Private)
+            {
+                found = Some(c.clone());
+            }
+            let par = c.decl.parent.clone();
+            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        found
+    }
+
+    fn hook_scope_allows(
+        &mut self,
+        o: &Rc<RefCell<PhpObject>>,
+        dcls: &Rc<PhpClass>,
+        pn: &str,
+        vis: crate::ast::Visibility,
+    ) -> bool {
         let scope = self.stack.last().and_then(|f| {
             f.decl_class
                 .as_ref()
@@ -6078,7 +6109,10 @@ impl<'a> Interp<'a> {
             (crate::ast::Visibility::Public, _) => true,
             (crate::ast::Visibility::Private, Some(s)) => s == dcls.name(),
             (crate::ast::Visibility::Protected, Some(s)) => {
-                self.is_a_str(&s, dcls.name()) || self.is_a_str(dcls.name(), &s)
+                let pcls = self
+                    .prop_scope_class(o, pn)
+                    .unwrap_or_else(|| dcls.clone());
+                self.is_a_str(&s, pcls.name()) || self.is_a_str(pcls.name(), &s)
             }
             _ => false,
         }
@@ -6174,7 +6208,7 @@ impl<'a> Interp<'a> {
         let dcls = &get
             .map(|(_, c)| c.clone())
             .unwrap_or_else(|| o.borrow().class.clone());
-        if !self.hook_scope_allows(dcls, vis) {
+        if !self.hook_scope_allows(o, dcls, &p.name, vis) {
             return self.hook_visibility_error(dcls, &p.name, vis);
         }
         if let Some((h, c)) = get {
@@ -6272,12 +6306,12 @@ impl<'a> Interp<'a> {
             .map(|(_, c)| c.clone())
             .unwrap_or_else(|| o.borrow().class.clone());
         if let Some(sv) = p.set_vis {
-            if !self.hook_scope_allows(dcls, sv) {
+            if !self.hook_scope_allows(o, dcls, &p.name, sv) {
                 return self.set_visibility_error(dcls, &p.name, sv);
             }
         }
         let vis = set.and_then(|(h, _)| h.visibility).unwrap_or(p.visibility);
-        if !self.hook_scope_allows(dcls, vis) {
+        if !self.hook_scope_allows(o, dcls, &p.name, vis) {
             return self.hook_visibility_error(dcls, &p.name, vis);
         }
         if let Some((h, c)) = set {
@@ -6630,7 +6664,7 @@ impl<'a> Interp<'a> {
                             .unwrap_or_else(|| o.borrow().class.clone());
                         if let Some((h, c)) = by_ref_get {
                             let vis = h.visibility.unwrap_or(pd.visibility);
-                            if !self.hook_scope_allows(c, vis) {
+                            if !self.hook_scope_allows(&o, c, &pd.name, vis) {
                                 return self.hook_visibility_error(c, &pd.name, vis);
                             }
                             self.last_ret_cell = None;
