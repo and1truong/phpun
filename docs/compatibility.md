@@ -2,6 +2,28 @@
 
 Reference: PHP 8.5.11 (cli). Harness: `phpun phpt … -j 8`.
 
+## Direction (2026-10): modern PHP application runtime
+
+phpun is a **modern PHP application runtime**, not a byte-for-byte
+reimplementation of legacy PHP. Compatibility with what modern
+applications need outranks compatibility with historical templating
+semantics. Source files are pure PHP from byte 0 — no `<?php` tag
+required (a leading tag still selects legacy tag mode so the PHPT
+corpus and embedded-HTML files keep running).
+
+### Test classification
+
+| Class | Meaning | Test areas |
+|---|---|---|
+| **required** | modern-app semantics; fix failures | tests/lang core, namespaces, exceptions/errors, arrays, functions/closures/FCC/arg_unpack, classes/objects/visibility/traits/magic methods, generators, enums, type_declarations, attributes, named_params, foreach/try/switch, references, SPL iterators, JSON/serialize, include/autoload |
+| **ecosystem-blocker** | whatever stops Composer/PHPUnit/frameworks from running — prioritized over test counts | discovered per-component (Composer autoload, PHPUnit bootstrap, Symfony components, Doctrine, Redis, PDO) rather than by directory |
+| **unsupported-legacy** | embedded-HTML / tag-transition semantics — skipped, adapters may revisit | short_tags.*, `<?=`/short-open-tag tests, inline-HTML preamble tests (e.g. tests/lang/023, 024), `html_errors` docref rendering, PHPT sections depending on HTML/PHP mode switching |
+| **deferred** | obscure historical engine internals — documented, not fixed | byte-string edge cases (unicode_escape_surrogates, bitwiseNot_variationStr), SEND_PREFER_REF (bug55754), zend_version/arginfo internals, fibers/SAPI-specific, exhaustive numeric formatting edge cases |
+
+North-Star metric is no longer raw PHPT percentage: it is
+**end-to-end demos** — Composer-style autoloading, a CLI app, an
+HTTP request→response path, and one real framework component running.
+
 ## Implemented so far (green areas)
 
 - Tags, literals (int/float/string/heredoc/nowdoc/interpolation), constants;
