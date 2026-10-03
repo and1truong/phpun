@@ -160,6 +160,10 @@ pub struct Interp<'a> {
     /// no-ops instead of recursing forever (autoload(D) → `D extends C`
     /// → autoload(C) while C's own autoload is still in flight).
     autoloading: std::collections::HashSet<String>,
+    /// (class, method) pairs of internal methods whose declared return
+    /// type is *tentative* — incompatible overrides get a Deprecated
+    /// notice, not a fatal (internal_parent/*).
+    tentative: HashSet<(String, String)>,
     pub interfaces: HashMap<String, Rc<ClassDecl>>,
     /// Declaration order of classes/interfaces/traits (lc names), for
     /// get_declared_*().
@@ -524,6 +528,11 @@ impl<'a> Interp<'a> {
             trait_statics: HashMap::new(),
             linking: Vec::new(),
             autoloading: std::collections::HashSet::new(),
+            tentative: {
+                let mut t = HashSet::new();
+                t.insert(("datetimezone".into(), "listidentifiers".into()));
+                t
+            },
             interfaces: HashMap::new(),
             decl_order: Vec::new(),
             enum_cases: std::collections::HashMap::new(),
@@ -1384,23 +1393,150 @@ impl<'a> Interp<'a> {
                 attrs: vec![],
                 traits: vec![],
                 adaptations: vec![],
+                methods: vec![
+                    Rc::new(MethodDecl {
+                        decl: FunctionDecl {
+                            ret: None,
+                            name: "__construct".into(),
+                            params: vec![Param {
+                                name: "datetime".into(),
+                                default: Some(Expr::Str("now".into())),
+                                by_ref: false,
+                                variadic: false,
+                                ty: Some(vec!["string".into()]),
+                                promoted: false,
+                                vis: None,
+                                readonly: false,
+                                is_final: false,
+                                set_vis: None,
+                                hooks: None,
+                            }],
+                            body: vec![],
+                            attrs: vec![],
+                            by_ref: false,
+                            line: 0,
+                            file: String::new(),
+                            ns: String::new(),
+                            decl_in: None,
+                        },
+                        is_static: false,
+                        is_abstract: false,
+                        is_final: false,
+                        visibility: Visibility::Public,
+                        trait_alias_of: None,
+                    }),
+                    Rc::new(MethodDecl {
+                        decl: FunctionDecl {
+                            ret: Some(vec!["DateTime".into(), "false".into()]),
+                            name: "createFromFormat".into(),
+                            params: vec![
+                                Param {
+                                    name: "format".into(),
+                                    default: None,
+                                    by_ref: false,
+                                    variadic: false,
+                                    ty: Some(vec!["string".into()]),
+                                    promoted: false,
+                                    vis: None,
+                                    readonly: false,
+                                    is_final: false,
+                                    set_vis: None,
+                                    hooks: None,
+                                },
+                                Param {
+                                    name: "datetime".into(),
+                                    default: None,
+                                    by_ref: false,
+                                    variadic: false,
+                                    ty: Some(vec!["string".into()]),
+                                    promoted: false,
+                                    vis: None,
+                                    readonly: false,
+                                    is_final: false,
+                                    set_vis: None,
+                                    hooks: None,
+                                },
+                                Param {
+                                    name: "timezone".into(),
+                                    default: Some(Expr::Null),
+                                    by_ref: false,
+                                    variadic: false,
+                                    ty: Some(vec!["DateTimeZone".into(), "null".into()]),
+                                    promoted: false,
+                                    vis: None,
+                                    readonly: false,
+                                    is_final: false,
+                                    set_vis: None,
+                                    hooks: None,
+                                },
+                            ],
+                            body: vec![],
+                            attrs: vec![],
+                            by_ref: false,
+                            line: 0,
+                            file: String::new(),
+                            ns: String::new(),
+                            decl_in: None,
+                        },
+                        is_static: true,
+                        is_abstract: false,
+                        is_final: false,
+                        visibility: Visibility::Public,
+                        trait_alias_of: None,
+                    }),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        // DateTimeZone — stub with the const + tentative-typed
+        // listIdentifiers the internal_parent variance tests override.
+        reg(
+            ClassDecl {
+                name: "DateTimeZone".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
                 methods: vec![Rc::new(MethodDecl {
                     decl: FunctionDecl {
-                        ret: None,
-                        name: "__construct".into(),
-                        params: vec![Param {
-                            name: "datetime".into(),
-                            default: Some(Expr::Str("now".into())),
-                            by_ref: false,
-                            variadic: false,
-                            ty: Some(vec!["string".into()]),
-                            promoted: false,
-                            vis: None,
-                            readonly: false,
-                            is_final: false,
-                            set_vis: None,
-                            hooks: None,
-                        }],
+                        ret: Some(vec!["array".into()]),
+                        name: "listIdentifiers".into(),
+                        params: vec![
+                            Param {
+                                name: "timezoneGroup".into(),
+                                default: Some(Expr::Const("DateTimeZone::ALL".into())),
+                                by_ref: false,
+                                variadic: false,
+                                ty: Some(vec!["int".into()]),
+                                promoted: false,
+                                vis: None,
+                                readonly: false,
+                                is_final: false,
+                                set_vis: None,
+                                hooks: None,
+                            },
+                            Param {
+                                name: "countryCode".into(),
+                                default: Some(Expr::Null),
+                                by_ref: false,
+                                variadic: false,
+                                ty: Some(vec!["string".into(), "null".into()]),
+                                promoted: false,
+                                vis: None,
+                                readonly: false,
+                                is_final: false,
+                                set_vis: None,
+                                hooks: None,
+                            },
+                        ],
                         body: vec![],
                         attrs: vec![],
                         by_ref: false,
@@ -1409,14 +1545,23 @@ impl<'a> Interp<'a> {
                         ns: String::new(),
                         decl_in: None,
                     },
-                    is_static: false,
+                    is_static: true,
                     is_abstract: false,
                     is_final: false,
                     visibility: Visibility::Public,
                     trait_alias_of: None,
                 })],
                 props: vec![],
-                consts: vec![],
+                consts: vec![ConstDecl {
+                    name: "ALL".into(),
+                    value: Expr::Int(2047),
+                    visibility: Visibility::Public,
+                    is_final: false,
+                    ty: None,
+                    attrs: vec![],
+                    decl_in: None,
+                    enum_case: false,
+                }],
                 file: String::new(),
             },
             false,
@@ -11126,6 +11271,21 @@ impl<'a> Interp<'a> {
     /// against the composing class (abstract_method_10), other members
     /// stay verbatim.
     fn sig_ty(ty: &[String], ctx: &str) -> String {
+        // `X|null` renders as `?X` in Zend signatures (internal_parent).
+        if ty.len() == 2 {
+            if let Some(other) = ty.iter().find(|t| !t.eq_ignore_ascii_case("null")) {
+                if ty.iter().any(|t| t.eq_ignore_ascii_case("null")) {
+                    return format!(
+                        "?{}",
+                        if other.eq_ignore_ascii_case("self") {
+                            ctx.to_string()
+                        } else {
+                            other.clone()
+                        }
+                    );
+                }
+            }
+        }
         ty.iter()
             .map(|t| {
                 if t.eq_ignore_ascii_case("self") {
@@ -11159,6 +11319,10 @@ impl<'a> Interp<'a> {
                     Some(Expr::Null) => " = null".to_string(),
                     Some(Expr::Bool(b)) => format!(" = {}", b),
                     Some(Expr::Const(c)) => format!(" = {}", c),
+                    Some(Expr::ClassConst { class, name }) => match class.as_ref() {
+                        Expr::Var(n) | Expr::Const(n) => format!(" = {}::{}", n, name),
+                        _ => format!(" = {}", name),
+                    },
                     Some(Expr::ArrayLit(_)) => " = []".to_string(),
                     _ => String::new(),
                 };
@@ -12630,6 +12794,32 @@ impl<'a> Interp<'a> {
                 ));
             }
             if let Some(e) = self.trait_sig_error(m, &am, &d.name, &aname, false) {
+                // An internal method's tentative return type warns
+                // instead of erroring unless the override carries
+                // #[ReturnTypeWillChange] (internal_parent/*).
+                if !e.message.starts_with("Could not check")
+                    && self
+                        .tentative
+                        .contains(&(aname.to_lowercase(), lname.clone()))
+                    && !m.decl.attrs.iter().any(|a| {
+                        a.name
+                            .rsplit('\\')
+                            .next()
+                            .unwrap_or(&a.name)
+                            .eq_ignore_ascii_case("ReturnTypeWillChange")
+                    })
+                {
+                    self.deprecated(&format!(
+                        "Return type of {}::{}{} should either be compatible with {}::{}{}, or the #[\\ReturnTypeWillChange] attribute should be used to temporarily suppress the notice",
+                        d.name,
+                        m.decl.name,
+                        Self::sig_str_full(&m.decl, &d.name),
+                        aname,
+                        am.decl.name,
+                        Self::sig_str_full(&am.decl, &d.name)
+                    ))?;
+                    continue;
+                }
                 return Err(e);
             }
         }
