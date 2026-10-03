@@ -110,6 +110,9 @@ pub struct Frame {
     /// backing slot directly; the owner names `__METHOD__`'s class part
     /// (trait origin too) (Zend/tests/property_hooks).
     hook_prop: Option<(u64, String, bool, String)>,
+    /// Trait the running method was merged from (`use T`) — drives
+    /// `__TRAIT__` and the owner part of `__METHOD__`.
+    trait_origin: Option<String>,
 }
 
 impl Frame {
@@ -126,6 +129,7 @@ impl Frame {
             ns: String::new(),
             ret_by_ref: false,
             hook_prop: None,
+            trait_origin: None,
         }
     }
 }
@@ -138,7 +142,28 @@ pub struct Interp<'a> {
     classes: HashMap<String, Rc<PhpClass>>,
     /// Traits by name — their methods are copied into using classes.
     pub traits: HashMap<String, Rc<ClassDecl>>,
+    /// Synthesized classes for direct `T::$s`/`T::m()` trait member
+    /// access (deprecated but functional in PHP) — one per trait so
+    /// statics share storage across accesses.
+    trait_statics: HashMap<String, Rc<PhpClass>>,
+    /// ClassDecls mid-registration — `is_a` ancestry checks during
+    /// signature verification resolve against these by name before the
+    /// class lands in `classes` (ret-covariance needs `B extends A`
+    /// while B is still linking).
+    linking: Vec<Rc<ClassDecl>>,
+    /// Class names whose autoloader callback is currently running —
+    /// Zend's in-linking guard: a re-entrant lookup of the same name
+    /// no-ops instead of recursing forever (autoload(D) → `D extends C`
+    /// → autoload(C) while C's own autoload is still in flight).
+    autoloading: std::collections::HashSet<String>,
     pub interfaces: HashMap<String, Rc<ClassDecl>>,
+    /// Declaration order of classes/interfaces/traits (lc names), for
+    /// get_declared_*().
+    pub decl_order: Vec<String>,
+    /// class_alias() display names (kind, lowercased alias) appended to
+    /// get_declared_{classes,interfaces,traits} output (Zend lists
+    /// aliases lowercased, right after real decls).
+    pub decl_aliases: Vec<(crate::ast::ClassKind, String)>,
     /// Top-level parentless classes registered by hoisting (early
     /// binding); their decl stmt then no-ops (namespaces/ns_060).
     early_bound_classes: HashSet<String>,
@@ -469,7 +494,12 @@ impl<'a> Interp<'a> {
             functions: HashMap::new(),
             classes: HashMap::new(),
             traits: HashMap::new(),
+            trait_statics: HashMap::new(),
+            linking: Vec::new(),
+            autoloading: std::collections::HashSet::new(),
             interfaces: HashMap::new(),
+            decl_order: Vec::new(),
+            decl_aliases: Vec::new(),
             early_bound_classes: HashSet::new(),
             constants,
             out: Vec::new(),
@@ -616,6 +646,7 @@ impl<'a> Interp<'a> {
                 implements: vec!["Throwable".into()],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     method("__construct", &["message", "code", "previous"]),
                     method("getMessage", &[]),
@@ -651,6 +682,7 @@ impl<'a> Interp<'a> {
         fn method(name: &str, _params: &[&str]) -> Rc<MethodDecl> {
             Rc::new(MethodDecl {
                 decl: FunctionDecl {
+                    ret: None,
                     name: name.into(),
                     params: vec![],
                     body: vec![],
@@ -659,11 +691,13 @@ impl<'a> Interp<'a> {
                     line: 0,
                     file: String::new(),
                     ns: String::new(),
+                    decl_in: None,
                 },
                 is_static: false,
                 is_abstract: false,
                 is_final: false,
                 visibility: Visibility::Public,
+                trait_alias_of: None,
             })
         }
         let mut reg = |d: ClassDecl, is_iface: bool| {
@@ -690,11 +724,13 @@ impl<'a> Interp<'a> {
             implements: parents.iter().map(|s| s.to_string()).collect(),
             attrs: vec![],
             traits: vec![],
+            adaptations: vec![],
             methods: methods
                 .iter()
                 .map(|m| {
                     Rc::new(MethodDecl {
                         decl: FunctionDecl {
+                            ret: None,
                             name: m.to_string(),
                             params: vec![],
                             body: vec![],
@@ -703,11 +739,13 @@ impl<'a> Interp<'a> {
                             line: 0,
                             file: String::new(),
                             ns: String::new(),
+                            decl_in: None,
                         },
                         is_static: false,
                         is_abstract: true,
                         is_final: false,
                         visibility: Visibility::Public,
+                        trait_alias_of: None,
                     })
                 })
                 .collect(),
@@ -731,6 +769,63 @@ impl<'a> Interp<'a> {
             true,
         );
         reg(iface("Countable", &[], &["count"]), true);
+        // Serializable's unserialize takes `string $data` — the iface()
+        // helper emits param-less methods, so patch the decl (the
+        // interface-sig check compares against it).
+        let mut sd = iface("Serializable", &[], &["serialize", "unserialize"]);
+        for m in sd.methods.iter_mut() {
+            if m.decl.name == "unserialize" {
+                let mut m2 = (**m).clone();
+                m2.decl.params = vec![Param {
+                    name: "data".into(),
+                    default: None,
+                    by_ref: false,
+                    variadic: false,
+                    ty: Some(vec!["string".into()]),
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                }];
+                *m = Rc::new(m2);
+            }
+        }
+        reg(sd, true);
+        // SPL Observer pair — param-typed per the real SPL stubs so
+        // interface-sig checks accept real-world impls (ns_054/056).
+        let spl_param = |n: &str, t: &str| Param {
+            name: n.into(),
+            default: None,
+            by_ref: false,
+            variadic: false,
+            ty: Some(vec![t.into()]),
+            promoted: false,
+            vis: None,
+            readonly: false,
+            is_final: false,
+            set_vis: None,
+            hooks: None,
+        };
+        let mut so = iface("SplObserver", &[], &["update"]);
+        so.methods[0] = {
+            let mut m = (*so.methods[0]).clone();
+            m.decl.params = vec![spl_param("subject", "SplSubject")];
+            Rc::new(m)
+        };
+        reg(so, true);
+        let mut ss = iface("SplSubject", &[], &["attach", "detach", "notify"]);
+        for (i, pn) in ["observer", "observer", ""].iter().enumerate() {
+            let mut m = (*ss.methods[i]).clone();
+            m.decl.params = if pn.is_empty() {
+                vec![]
+            } else {
+                vec![spl_param(pn, "SplObserver")]
+            };
+            ss.methods[i] = Rc::new(m);
+        }
+        reg(ss, true);
         reg(iface("SeekableIterator", &["Iterator"], &["seek"]), true);
         // ArrayIterator — SPL iterator over an array; methods are
         // native-dispatched (array_iter_method) on the ArrayIter
@@ -738,6 +833,7 @@ impl<'a> Interp<'a> {
         let stub_method = |name: &str, params: &[&str]| {
             Rc::new(MethodDecl {
                 decl: FunctionDecl {
+                    ret: None,
                     name: name.into(),
                     params: params
                         .iter()
@@ -761,11 +857,13 @@ impl<'a> Interp<'a> {
                     line: 0,
                     file: String::new(),
                     ns: String::new(),
+                    decl_in: None,
                 },
                 is_static: false,
                 is_abstract: false,
                 is_final: false,
                 visibility: Visibility::Public,
+                trait_alias_of: None,
             })
         };
         // stub where `req` params are required and `opt` have null defaults
@@ -784,6 +882,7 @@ impl<'a> Interp<'a> {
                 is_abstract: m.is_abstract,
                 is_final: m.is_final,
                 visibility: m.visibility,
+                trait_alias_of: None,
             })
         };
 
@@ -802,6 +901,7 @@ impl<'a> Interp<'a> {
                 ],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     stub_method("__construct", &["array", "flags"]),
                     stub_method("rewind", &[]),
@@ -842,6 +942,7 @@ impl<'a> Interp<'a> {
                 implements: vec!["Iterator".into()],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     stub_method("rewind", &[]),
                     stub_method("valid", &[]),
@@ -871,6 +972,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     stub_method("__construct", &["filename"]),
                     stub_method("getFilename", &[]),
@@ -907,6 +1009,7 @@ impl<'a> Interp<'a> {
                 implements: vec!["Iterator".into()],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     stub_method("rewind", &[]),
                     stub_method("valid", &[]),
@@ -946,6 +1049,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     stub_method_mix(
                         "__construct",
@@ -968,21 +1072,141 @@ impl<'a> Interp<'a> {
                 ],
                 props: vec![],
                 consts: vec![
-                    ("FETCH_ASSOC".into(), Expr::Int(2)),
-                    ("FETCH_NUM".into(), Expr::Int(3)),
-                    ("FETCH_BOTH".into(), Expr::Int(4)),
-                    ("FETCH_OBJ".into(), Expr::Int(5)),
-                    ("ATTR_ERRMODE".into(), Expr::Int(3)),
-                    ("ATTR_DEFAULT_FETCH_MODE".into(), Expr::Int(19)),
-                    ("ATTR_EMULATE_PREPARES".into(), Expr::Int(20)),
-                    ("ERRMODE_SILENT".into(), Expr::Int(0)),
-                    ("ERRMODE_WARNING".into(), Expr::Int(1)),
-                    ("ERRMODE_EXCEPTION".into(), Expr::Int(2)),
-                    ("PARAM_STR".into(), Expr::Int(2)),
-                    ("PARAM_INT".into(), Expr::Int(1)),
-                    ("PARAM_BOOL".into(), Expr::Int(5)),
-                    ("PARAM_NULL".into(), Expr::Int(0)),
-                    ("PARAM_LOB".into(), Expr::Int(3)),
+                    crate::ast::ConstDecl {
+                        name: "FETCH_ASSOC".into(),
+                        value: Expr::Int(2),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "FETCH_NUM".into(),
+                        value: Expr::Int(3),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "FETCH_BOTH".into(),
+                        value: Expr::Int(4),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "FETCH_OBJ".into(),
+                        value: Expr::Int(5),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "ATTR_ERRMODE".into(),
+                        value: Expr::Int(3),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "ATTR_DEFAULT_FETCH_MODE".into(),
+                        value: Expr::Int(19),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "ATTR_EMULATE_PREPARES".into(),
+                        value: Expr::Int(20),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "ERRMODE_SILENT".into(),
+                        value: Expr::Int(0),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "ERRMODE_WARNING".into(),
+                        value: Expr::Int(1),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "ERRMODE_EXCEPTION".into(),
+                        value: Expr::Int(2),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "PARAM_STR".into(),
+                        value: Expr::Int(2),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "PARAM_INT".into(),
+                        value: Expr::Int(1),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "PARAM_BOOL".into(),
+                        value: Expr::Int(5),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "PARAM_NULL".into(),
+                        value: Expr::Int(0),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "PARAM_LOB".into(),
+                        value: Expr::Int(3),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
                 ],
                 file: String::new(),
             },
@@ -999,6 +1223,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     stub_method_mix("execute", &[], &["params"]),
                     stub_method_mix("fetch", &[], &["mode", "cursorOrientation", "cursorOffset"]),
@@ -1037,6 +1262,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![],
                 props: vec![],
                 consts: vec![],
@@ -1062,11 +1288,28 @@ impl<'a> Interp<'a> {
                 ],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![],
                 props: vec![],
                 consts: vec![
-                    ("STD_PROP_LIST".into(), Expr::Int(1)),
-                    ("ARRAY_AS_PROPS".into(), Expr::Int(2)),
+                    crate::ast::ConstDecl {
+                        name: "STD_PROP_LIST".into(),
+                        value: Expr::Int(1),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "ARRAY_AS_PROPS".into(),
+                        value: Expr::Int(2),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
                 ],
                 file: String::new(),
             },
@@ -1086,8 +1329,10 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![Rc::new(MethodDecl {
                     decl: FunctionDecl {
+                        ret: None,
                         name: "__construct".into(),
                         params: vec![Param {
                             name: "datetime".into(),
@@ -1108,11 +1353,13 @@ impl<'a> Interp<'a> {
                         line: 0,
                         file: String::new(),
                         ns: String::new(),
+                        decl_in: None,
                     },
                     is_static: false,
                     is_abstract: false,
                     is_final: false,
                     visibility: Visibility::Public,
+                    trait_alias_of: None,
                 })],
                 props: vec![],
                 consts: vec![],
@@ -1127,6 +1374,7 @@ impl<'a> Interp<'a> {
         let mk_method = |name: &str, params: Vec<Param>| {
             Rc::new(MethodDecl {
                 decl: FunctionDecl {
+                    ret: None,
                     name: name.into(),
                     params,
                     body: vec![],
@@ -1135,11 +1383,13 @@ impl<'a> Interp<'a> {
                     line: 0,
                     file: String::new(),
                     ns: String::new(),
+                    decl_in: None,
                 },
                 is_static: false,
                 is_abstract: false,
                 is_final: false,
                 visibility: Visibility::Public,
+                trait_alias_of: None,
             })
         };
         let str_param = |n: &str| Param {
@@ -1179,6 +1429,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     mk_method("__construct", vec![any_param("class", false)]),
                     mk_method("newInstanceWithoutConstructor", vec![]),
@@ -1186,6 +1437,11 @@ impl<'a> Interp<'a> {
                     mk_method("newInstanceArgs", vec![any_param("args", false)]),
                     mk_method("getName", vec![]),
                     mk_method("getAttributes", vec![]),
+                    mk_method("getConstant", vec![str_param("name")]),
+                    mk_method("getConstants", vec![]),
+                    mk_method("getReflectionConstant", vec![str_param("name")]),
+                    mk_method("getReflectionConstants", vec![]),
+                    mk_method("getTraitAliases", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -1204,6 +1460,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     mk_method("__construct", vec![any_param("function", false)]),
                     mk_method("invoke", vec![any_param("args", true)]),
@@ -1228,6 +1485,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     mk_method(
                         "__construct",
@@ -1242,6 +1500,43 @@ impl<'a> Interp<'a> {
                         vec![any_param("object", false), any_param("args", false)],
                     ),
                     mk_method("getName", vec![]),
+                    mk_method("isFinal", vec![]),
+                    mk_method("isAbstract", vec![]),
+                    mk_method("isStatic", vec![]),
+                    mk_method("isPublic", vec![]),
+                    mk_method("isProtected", vec![]),
+                    mk_method("isPrivate", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        // ReflectionClassConstant — produced by ReflectionClass::
+        // getReflectionConstant(s) (constant_019-021).
+        reg(
+            ClassDecl {
+                name: "ReflectionClassConstant".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method(
+                        "__construct",
+                        vec![any_param("class", false), any_param("name", false)],
+                    ),
+                    mk_method("getName", vec![]),
+                    mk_method("getValue", vec![]),
+                    mk_method("getDocComment", vec![]),
+                    mk_method("getAttributes", vec![]),
+                    mk_method("getDeclaringClass", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -1262,6 +1557,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     mk_method("getName", vec![]),
                     mk_method("getArguments", vec![]),
@@ -1285,17 +1581,82 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![],
                 props: vec![],
                 consts: vec![
-                    ("TARGET_CLASS".into(), Expr::Int(1)),
-                    ("TARGET_FUNCTION".into(), Expr::Int(2)),
-                    ("TARGET_METHOD".into(), Expr::Int(4)),
-                    ("TARGET_PROPERTY".into(), Expr::Int(8)),
-                    ("TARGET_CLASS_CONSTANT".into(), Expr::Int(16)),
-                    ("TARGET_PARAMETER".into(), Expr::Int(32)),
-                    ("TARGET_ALL".into(), Expr::Int(63)),
-                    ("IS_REPEATABLE".into(), Expr::Int(64)),
+                    crate::ast::ConstDecl {
+                        name: "TARGET_CLASS".into(),
+                        value: Expr::Int(1),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "TARGET_FUNCTION".into(),
+                        value: Expr::Int(2),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "TARGET_METHOD".into(),
+                        value: Expr::Int(4),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "TARGET_PROPERTY".into(),
+                        value: Expr::Int(8),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "TARGET_CLASS_CONSTANT".into(),
+                        value: Expr::Int(16),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "TARGET_PARAMETER".into(),
+                        value: Expr::Int(32),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "TARGET_ALL".into(),
+                        value: Expr::Int(63),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "IS_REPEATABLE".into(),
+                        value: Expr::Int(64),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    },
                 ],
                 file: String::new(),
             },
@@ -1312,6 +1673,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     mk_method(
                         "__construct",
@@ -1363,6 +1725,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![],
                 props: vec![],
                 consts: vec![],
@@ -1802,7 +2165,16 @@ impl<'a> Interp<'a> {
     fn fn_statics_key(&self) -> String {
         self.stack
             .last()
-            .map(|f| f.fn_name.clone())
+            .map(|f| {
+                // Method statics are per-(function, declaring class):
+                // trait-merged methods get independent statics in each
+                // using class, while inherited methods share their
+                // declaring class's table (language013).
+                match &f.decl_class {
+                    Some(c) => format!("{}\u{0}{}", c.name(), f.fn_name),
+                    None => f.fn_name.clone(),
+                }
+            })
             .unwrap_or_else(|| "\u{0}global".into())
     }
 
@@ -2682,6 +3054,25 @@ impl<'a> Interp<'a> {
                 // undefined-variable warning (first_class_callable_dynamic).
                 Expr::Var(n) if self.var_lookup(n).is_none() => Flow::Normal,
                 _ => match self.eval(e) {
+                    // A discarded temporary object reaches refcount 0
+                    // here — Zend runs its __destruct immediately
+                    // (methods_003 `new bar;`).
+                    Ok(Value::Object(o)) if Rc::strong_count(&o) == 1 => {
+                        if self
+                            .find_method_in(&o.borrow().class, "__destruct")
+                            .is_some()
+                        {
+                            let oid = Rc::as_ptr(&o) as usize;
+                            if self.destructed.insert(oid) {
+                                match self.method_invoke(o.clone(), "__destruct", CallArgs::empty())
+                                {
+                                    Ok(_) => {}
+                                    Err(e) => return self.err_flow(e),
+                                }
+                            }
+                        }
+                        Flow::Normal
+                    }
                     Ok(_) => Flow::Normal,
                     Err(e) => self.err_flow(e),
                 },
@@ -2966,7 +3357,31 @@ impl<'a> Interp<'a> {
                 for x in xs {
                     match x {
                         Expr::Var(n) => {
-                            self.cur().vars.remove(n);
+                            if let Some(c) = self.cur().vars.remove(n) {
+                                // Removing the last handle to an object
+                                // runs its __destruct immediately (Zend
+                                // refcount semantics — gh16198_2).
+                                let v = c.borrow().clone();
+                                drop(c);
+                                if let Value::Object(o) = v {
+                                    if Rc::strong_count(&o) == 1 {
+                                        let oid = Rc::as_ptr(&o) as usize;
+                                        if self
+                                            .find_method_in(&o.borrow().class, "__destruct")
+                                            .is_some()
+                                            && self.destructed.insert(oid)
+                                        {
+                                            if let Err(e) = self.method_invoke(
+                                                o.clone(),
+                                                "__destruct",
+                                                CallArgs::empty(),
+                                            ) {
+                                                return self.err_flow(e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Expr::VarVar(inner) => {
                             if let Ok(n) = self.eval(inner) {
@@ -3092,6 +3507,17 @@ impl<'a> Interp<'a> {
         let mut cur = Some(cls.clone());
         while let Some(c) = cur {
             if c.name().eq_ignore_ascii_case(&lname) {
+                return true;
+            }
+            // Ancestor NAME match: a parent still mid-registration (an
+            // autoload cycle: `new C` → C's sig check autoloads D →
+            // `class D extends C`) isn't in `classes` yet, but its name
+            // is a known ancestor (abstract_method_9).
+            if c.decl
+                .parent
+                .as_deref()
+                .is_some_and(|p| p.trim_start_matches('\\').eq_ignore_ascii_case(&lname))
+            {
                 return true;
             }
             for i in &c.decl.implements {
@@ -3991,7 +4417,7 @@ impl<'a> Interp<'a> {
                 let n = self.conv_str(&nv)?;
                 let argvals =
                     self.arg_cells(args, &[], &format!("{}::{{closure}}()", cls.name()))?;
-                self.static_invoke(cls, &n, argvals, None)
+                self.static_invoke_vis(cls, &n, argvals, None)
             }
             Expr::ClassConst { class, name } => self.class_const(class, name),
             Expr::Clone(e) => {
@@ -4117,14 +4543,19 @@ impl<'a> Interp<'a> {
                         let (_, _, _, owner) = f.hook_prop.as_ref().unwrap();
                         Value::str(format!("{}::{}", owner, f.fn_name))
                     }
-                    Some(f) => match f
-                        .scope_class
-                        .as_ref()
-                        .map(|c| format!("{}::{}", c.name(), f.fn_name))
-                    {
-                        Some(s) => Value::str(s),
-                        None => Value::str(""),
-                    },
+                    Some(f) => {
+                        // `T::m` when the method was merged from trait T
+                        // (`__METHOD__` names the trait; `__CLASS__`
+                        // names the consuming class).
+                        let owner = f
+                            .trait_origin
+                            .clone()
+                            .or_else(|| f.scope_class.as_ref().map(|c| c.name().to_string()));
+                        match owner {
+                            Some(o) => Value::str(format!("{}::{}", o, f.fn_name)),
+                            None => Value::str(""),
+                        }
+                    }
                     None => Value::str(""),
                 }
             }
@@ -4132,6 +4563,7 @@ impl<'a> Interp<'a> {
                 self.stack
                     .last()
                     .and_then(|f| f.scope_class.as_ref().map(|c| c.name().to_string()))
+                    .or_else(|| self.const_self.as_ref().map(|c| c.name().to_string()))
                     .unwrap_or_default(),
             ),
             MagicConst::Namespace => Value::str(self.caller_ns()),
@@ -4141,6 +4573,14 @@ impl<'a> Interp<'a> {
                 self.stack
                     .last()
                     .and_then(|f| f.hook_prop.as_ref().map(|(_, pn, _, _)| pn.clone()))
+                    .unwrap_or_default(),
+            ),
+            // `__TRAIT__` names the trait a method was merged from;
+            // "" inside class-defined methods and at top level.
+            MagicConst::Trait => Value::str(
+                self.stack
+                    .last()
+                    .and_then(|f| f.trait_origin.clone())
                     .unwrap_or_default(),
             ),
         }
@@ -4417,6 +4857,7 @@ impl<'a> Interp<'a> {
         // effects but Zend's temp register is then overwritten by the
         // assignment value — so the ACTUAL name/key becomes the RHS value
         // (engine_assignExecutionOrder_001).
+        #[allow(clippy::large_enum_variant)]
         enum Late {
             Prop {
                 ov: Value,
@@ -6216,7 +6657,7 @@ impl<'a> Interp<'a> {
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
                 let vals = self.arg_cells(args, &params, &format!("{}()", mn))?;
-                return self.static_invoke(cls, &mn, vals, None);
+                return self.static_invoke_vis(cls, &mn, vals, None);
             }
             Expr::Prop { .. } | Expr::MethodCall { .. } | Expr::Index { .. } => {
                 let v = self.eval(name)?;
@@ -6682,7 +7123,7 @@ impl<'a> Interp<'a> {
                     if let Some(c) = self.resolve_class(cls) {
                         let cls = self.classes.get(&c.to_lowercase()).cloned();
                         if let Some(cls) = cls {
-                            return self.static_invoke(cls, m, args, None);
+                            return self.static_invoke_vis(cls, m, args, None);
                         }
                     }
                 }
@@ -6710,13 +7151,13 @@ impl<'a> Interp<'a> {
                     (Some(t), Some(mv)) => {
                         let mname = mv.to_php_string();
                         match t {
-                            Value::Object(o) => self.method_invoke(o.clone(), &mname, args),
+                            Value::Object(o) => self.method_invoke_vis(o.clone(), &mname, args),
                             Value::Str(cn) => {
                                 let cls = self
                                     .resolve_class(&crate::value::lossy(&cn))
                                     .and_then(|c| self.classes.get(&c.to_lowercase()).cloned());
                                 match cls {
-                                    Some(cls) => self.static_invoke(cls, &mname, args, None),
+                                    Some(cls) => self.static_invoke_vis(cls, &mname, args, None),
                                     None => self.fail(PhpError::uncaught(
                                         "Error",
                                         format!("Class \"{}\" not found", crate::value::lossy(&cn)),
@@ -6732,7 +7173,7 @@ impl<'a> Interp<'a> {
             }
             Value::Object(o) => {
                 if o.borrow().class.find_method("__invoke").is_some() {
-                    self.method_invoke(o.clone(), "__invoke", args)
+                    self.method_invoke_vis(o.clone(), "__invoke", args)
                 } else {
                     self.fail(PhpError::uncaught(
                         "Error",
@@ -7139,7 +7580,12 @@ impl<'a> Interp<'a> {
                 .unwrap_or(false),
             crate::ast::Visibility::Protected => scope
                 .as_ref()
-                .map(|s| self.is_a_str(s.name(), dc.name()))
+                .map(|s| {
+                    let proto = self.method_prototype(dc, &m.decl.name.to_lowercase());
+                    self.is_a_str(s.name(), dc.name())
+                        || self.is_a_str(dc.name(), s.name())
+                        || self.is_a_str(s.name(), &proto)
+                })
                 .unwrap_or(false),
         };
         if ok {
@@ -7295,14 +7741,24 @@ impl<'a> Interp<'a> {
     /// An exception thrown by an autoloader propagates to the code that
     /// triggered the load (PHP stops the chain on throw).
     pub fn run_autoload(&mut self, name: &str) -> Result<(), PhpError> {
+        let key = name.trim_start_matches('\\').to_lowercase();
+        if !self.autoloading.insert(key.clone()) {
+            return Ok(());
+        }
         let fns = self.autoload_fns.clone();
+        let mut res = Ok(());
         for f in fns {
-            self.call_value(&f, CallArgs::positional(vec![cell(Value::str(name))]))?;
+            if let Err(e) = self.call_value(&f, CallArgs::positional(vec![cell(Value::str(name))]))
+            {
+                res = Err(e);
+                break;
+            }
             if self.classes.contains_key(&name.to_lowercase()) {
-                return Ok(());
+                break;
             }
         }
-        Ok(())
+        self.autoloading.remove(&key);
+        res
     }
     /// Params binding + body run for a pushed frame context (closures).
     fn bind_and_run(
@@ -7499,8 +7955,27 @@ impl<'a> Interp<'a> {
         let l = m.to_lowercase();
         match l.as_str() {
             "null" => matches!(v, Value::Null),
-            "int" | "float" | "string" | "bool" | "mixed" | "void" | "never" | "false" | "true"
-            | "self" | "parent" | "static" => true,
+            "mixed" | "void" | "never" | "self" | "parent" | "static" => true,
+            "false" => matches!(v, Value::Bool(false)),
+            "true" => matches!(v, Value::Bool(true)),
+            // Weak-mode scalar params accept what coercion can convert:
+            // non-numeric strings are a TypeError, not silent (trait_type_errors).
+            "int" | "float" => match v {
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) => true,
+                Value::Str(b) => matches!(
+                    numeric(b),
+                    Numeric::Int(_) | Numeric::Float(_) | Numeric::Leading(..)
+                ),
+                _ => false,
+            },
+            "string" => matches!(
+                v,
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Object(_)
+            ),
+            "bool" => matches!(
+                v,
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_)
+            ),
             "array" => matches!(v, Value::Array(_)),
             "iterable" => {
                 matches!(v, Value::Array(_))
@@ -7519,6 +7994,50 @@ impl<'a> Interp<'a> {
                 _ => false,
             },
         }
+    }
+
+    /// Weak-mode scalar coercion for typed params/returns: returns the
+    /// coerced value, or None when no scalar member applies (objects
+    /// pass through unchanged).
+    fn coerce_scalar(&mut self, ty: &[String], v: &Value) -> Option<Value> {
+        for m in ty {
+            let l = m.to_lowercase();
+            match l.as_str() {
+                "int" => match v {
+                    Value::Int(_) => return Some(v.clone()),
+                    Value::Float(f) => return Some(Value::Int(*f as i64)),
+                    Value::Bool(b) => return Some(Value::Int(*b as i64)),
+                    Value::Str(b) => match numeric(b) {
+                        Numeric::Int(i) => return Some(Value::Int(i)),
+                        Numeric::Float(f) => return Some(Value::Int(f as i64)),
+                        Numeric::Leading(f, true) => return Some(Value::Int(f as i64)),
+                        Numeric::Leading(f, false) => return Some(Value::Float(f)),
+                        Numeric::NonNumeric => {}
+                    },
+                    _ => {}
+                },
+                "float" => match v {
+                    Value::Float(_) => return Some(v.clone()),
+                    Value::Int(i) => return Some(Value::Float(*i as f64)),
+                    Value::Bool(b) => return Some(Value::Float(*b as i64 as f64)),
+                    Value::Str(b) => match numeric(b) {
+                        Numeric::Int(i) => return Some(Value::Float(i as f64)),
+                        Numeric::Float(f) | Numeric::Leading(f, _) => return Some(Value::Float(f)),
+                        Numeric::NonNumeric => {}
+                    },
+                    _ => {}
+                },
+                "string" => {
+                    if let Ok(b) = self.conv_bytes(v) {
+                        return Some(Value::Str(b.into()));
+                    }
+                }
+                "bool" => return Some(Value::Bool(v.is_truthy())),
+                "null" if matches!(v, Value::Null) => return Some(Value::Null),
+                _ => {}
+            }
+        }
+        None
     }
 
     /// PHP's "given" type word in TypeError messages.
@@ -7621,6 +8140,11 @@ impl<'a> Interp<'a> {
                 };
             let ok = (implicit_null && matches!(v, Value::Null))
                 || ty.iter().any(|m| self.param_type_match(m, &v));
+            if ok {
+                if let Some(cv) = self.coerce_scalar(ty, &v) {
+                    *a.borrow_mut() = cv;
+                }
+            }
             if !ok {
                 let fname = self.decl_fname(decl);
                 let mut disp: Vec<String> = ty
@@ -7828,9 +8352,43 @@ impl<'a> Interp<'a> {
             }
         }
         let flow = self.exec_block(&decl.body);
+        let ret_fname = self.decl_fname(decl);
         self.stack.pop();
         match flow {
-            Flow::Return(v) => Ok(v),
+            Flow::Return(v) => {
+                if let Some(ty) = &decl.ret {
+                    let ok = ty
+                        .iter()
+                        .any(|m| self.param_type_match(m, &v) || m.eq_ignore_ascii_case("void"));
+                    if ok {
+                        match self.coerce_scalar(ty, &v) {
+                            Some(cv) => Ok(cv),
+                            None => Ok(v),
+                        }
+                    } else {
+                        let disp: Vec<String> = ty
+                            .iter()
+                            .filter(|m| !m.eq_ignore_ascii_case("null"))
+                            .cloned()
+                            .collect();
+                        let given = self.zval_type_name(&v);
+                        let msg = format!(
+                            "{}(): Return value must be of type {}, {} returned",
+                            ret_fname,
+                            disp.join("|"),
+                            given
+                        );
+                        let display =
+                            format!("{} and defined in {}:{}", msg, self.diag_file(), decl.line);
+                        let mut e = PhpError::uncaught("TypeError", msg, self.cur_line);
+                        e.display_msg = Some(display);
+                        e.thrown_line = Some(decl.line);
+                        self.fail(e)
+                    }
+                } else {
+                    Ok(v)
+                }
+            }
             Flow::Throw(v) => {
                 self.pending_exception = Some(v);
                 Err(PhpError {
@@ -7929,6 +8487,7 @@ impl<'a> Interp<'a> {
         frame.hook_prop = self.pending_hook_prop.take();
         frame.this_obj = this_obj;
         frame.scope_class = scope_class;
+        frame.trait_origin = decl.decl_in.clone();
         frame.file = if decl.file.is_empty() {
             self.cur_file.clone()
         } else {
@@ -8583,88 +9142,1182 @@ impl<'a> Interp<'a> {
         let lname = decl.name.to_lowercase();
         match decl.kind {
             ClassKind::Interface => {
-                self.interfaces.insert(lname, Rc::new(d));
+                if let Some(t0) = d.traits.first() {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Cannot use traits inside of interfaces. {} is used in {}",
+                            t0, d.name
+                        ),
+                        self.cur_line,
+                    ));
+                }
+                self.interfaces.insert(lname.clone(), Rc::new(d));
+                self.decl_order.push(lname);
             }
             ClassKind::Trait => {
-                self.traits.insert(lname, Rc::new(d));
-            }
-            _ => {
-                // Apply traits: merge methods/props into the decl.
+                // `trait _ {}` — deprecated since 8.4.
+                if d.name.rsplit('\\').next() == Some("_") {
+                    self.deprecated("Using \"_\" as a trait name is deprecated since 8.4")?;
+                }
+                // Traits may `use` traits — flatten recursively
+                // (flattening003). Origin chains keep the DEFINING
+                // trait's name via decl_in.
                 if !d.traits.is_empty() {
-                    for t in d.traits.clone() {
-                        if let Some(td) = self.traits.get(&t.to_lowercase()) {
-                            for m in &td.methods {
-                                if !d
-                                    .methods
-                                    .iter()
-                                    .any(|x| x.decl.name.eq_ignore_ascii_case(&m.decl.name))
-                                {
-                                    d.methods.push(m.clone());
-                                }
-                            }
-                            for p in &td.props {
-                                if let Some(ex) = d.props.iter().find(|x| x.name == p.name) {
-                                    // "hooked" means either side —
-                                    // a plain decl can't override a
-                                    // hooked trait prop either.
-                                    if ex.hooks.is_some() || p.hooks.is_some() {
-                                        // Hooked props cannot be
-                                        // conflict-resolved — zend
-                                        // fatals at composition
-                                        // (traits_conflict).
-                                        let ex_src =
-                                            ex.decl_in.clone().unwrap_or_else(|| d.name.clone());
-                                        return Err(PhpError::fatal(
-                                            format!(
-                                                "{} and {} define the same hooked property (${}) in the composition of {}. Conflict resolution between hooked properties is currently not supported. Class was composed",
-                                                ex_src, t, p.name, d.name
-                                            ),
-                                            self.cur_line,
-                                        ));
-                                    }
-                                    // Identical plain-prop defs merge
-                                    // silently; differing ones fatal.
-                                    let compat = ex.visibility == p.visibility
-                                        && ex.is_static == p.is_static
-                                        && ex.readonly == p.readonly
-                                        && ex.ty == p.ty
-                                        && format!("{:?}", ex.default)
-                                            == format!("{:?}", p.default);
-                                    if !compat {
-                                        let ex_src =
-                                            ex.decl_in.clone().unwrap_or_else(|| d.name.clone());
-                                        return Err(PhpError::fatal(
-                                            format!(
-                                                "{} and {} define the same property (${}) in the composition of {}. However, the definition differs and is considered incompatible. Class was composed",
-                                                ex_src, t, p.name, d.name
-                                            ),
-                                            self.cur_line,
-                                        ));
-                                    }
-                                    continue;
-                                }
-                                let mut np = p.clone();
-                                // Trait origin survives the merge —
-                                // `__METHOD__` prints `T::$p::get`.
-                                np.decl_in = Some(t.clone());
-                                d.props.push(np);
-                            }
+                    for t in &d.traits {
+                        if !self.traits.contains_key(&t.to_lowercase()) {
+                            let msg = if self.lookup_class(t).is_some()
+                                || self.interfaces.contains_key(&t.to_lowercase())
+                            {
+                                format!("{} cannot use {} - it is not a trait", d.name, t)
+                            } else {
+                                format!("Trait \"{}\" not found", t)
+                            };
+                            // Catchable Error, not a fatal (gh17959).
+                            let v = self.exception("Error", &msg);
+                            return Err(self.throw(v));
                         }
                     }
+                    self.linking.push(Rc::new(d.clone()));
+                    let merge_res = self.merge_trait_adaptations(&mut d);
+                    self.linking.pop();
+                    merge_res?;
                 }
-                self.check_abstract_hooks(&d)?;
-                self.check_final_override(&d)?;
+                self.traits.insert(lname.clone(), Rc::new(d));
+                self.decl_order.push(lname);
+            }
+            _ => {
+                // `use static|self|parent` — reserved, uncatchable
+                // (class_uses_static).
+                for t in &d.traits {
+                    if ["static", "self", "parent"]
+                        .iter()
+                        .any(|r| t.eq_ignore_ascii_case(r))
+                    {
+                        return Err(PhpError::fatal(
+                            format!("Cannot use \"{}\" as trait name, as it is reserved", t),
+                            self.cur_line,
+                        ));
+                    }
+                }
+                // Apply traits: merge methods/props into the decl.
+                if !d.traits.is_empty() {
+                    // Missing trait → catchable Error (gh17959).
+                    for t in &d.traits {
+                        if !self.traits.contains_key(&t.to_lowercase()) {
+                            let msg = if self.lookup_class(t).is_some()
+                                || self.interfaces.contains_key(&t.to_lowercase())
+                            {
+                                format!("{} cannot use {} - it is not a trait", d.name, t)
+                            } else {
+                                format!("Trait \"{}\" not found", t)
+                            };
+                            let v = self.exception("Error", &msg);
+                            return Err(self.throw(v));
+                        }
+                    }
+                    self.linking.push(Rc::new(d.clone()));
+                    let merge_res = self.merge_trait_adaptations(&mut d);
+                    self.linking.pop();
+                    merge_res?;
+                }
+                // `extends <trait>` → fatal (error_005-ish).
+                if let Some(pn) = &d.parent {
+                    if self.traits.contains_key(&pn.to_lowercase()) {
+                        return Err(PhpError::fatal(
+                            format!("Class {} cannot extend trait {}", d.name, pn),
+                            self.cur_line,
+                        ));
+                    }
+                }
+                // `implements <non-interface>` → fatal (error_008).
+                for i in &d.implements {
+                    if !self.interfaces.contains_key(&i.to_lowercase()) {
+                        let msg = if self.lookup_class(i).is_some()
+                            || self.traits.contains_key(&i.to_lowercase())
+                        {
+                            format!("{} cannot implement {} - it is not an interface", d.name, i)
+                        } else {
+                            format!("Interface \"{}\" not found", i)
+                        };
+                        return Err(PhpError::fatal(msg, self.cur_line));
+                    }
+                }
+                // Implementing Serializable is deprecated (8.1+) — the
+                // __serialize/__unserialize pair is the replacement.
+                if !d.name.eq_ignore_ascii_case("serializable")
+                    && self.implements_iface(&d, "serializable")
+                {
+                    self.deprecated(&format!(
+                        "{} implements the Serializable interface, which is deprecated. Implement __serialize() and __unserialize() instead (or in addition, if support for old PHP versions is necessary)",
+                        d.name
+                    ))?;
+                }
+                self.linking.push(Rc::new(d.clone()));
+                let checks_res = self
+                    .check_interface_sigs(&d)
+                    .and_then(|_| self.check_abstract_hooks(&d))
+                    .and_then(|_| self.check_abstract_methods(&d))
+                    .and_then(|_| self.check_final_override(&d))
+                    .and_then(|_| self.check_override_sigs(&d));
+                self.linking.pop();
+                checks_res?;
+                // A private+final method (declared outright or produced
+                // by `m as final` / `m as private` adaptations) warns
+                // once per class (gh12854).
+                if d.methods.iter().any(|m| {
+                    m.is_final
+                        && m.visibility == crate::ast::Visibility::Private
+                        && m.trait_alias_of.is_none()
+                }) {
+                    self.warn("Private methods cannot be final as they are never overridden by other classes")?;
+                }
                 self.classes.insert(
-                    lname,
+                    lname.clone(),
                     Rc::new(PhpClass {
                         decl: Rc::new(d),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(false),
                     }),
                 );
+                self.decl_order.push(lname);
             }
         }
         Ok(())
+    }
+
+    /// Merge used traits' methods into `d`, applying `insteadof`
+    /// exclusions, `as` aliases/visibility changes, and collision
+    /// detection. Trait origin is preserved on each merged method as
+    /// `decl.decl_in` (drives `__METHOD__`/`__TRAIT__`).
+    fn merge_trait_adaptations(&mut self, d: &mut ClassDecl) -> Result<(), PhpError> {
+        let used: Vec<(String, Rc<ClassDecl>)> = d
+            .traits
+            .iter()
+            .filter_map(|t| {
+                self.traits
+                    .get(&t.to_lowercase())
+                    .map(|td| (t.clone(), td.clone()))
+            })
+            .collect();
+        let cur_line = self.cur_line;
+        let dname = d.name.clone();
+        let is_used = |n: &str| d.traits.iter().any(|u| u.eq_ignore_ascii_case(n));
+        // `insteadof`/`as` on a trait that doesn't exist: distinct
+        // message from exists-but-not-used (precedence_unknown_class).
+        // Free-standing fn (not a closure) so later `&mut self` calls
+        // don't conflict with a captured borrow of `self.traits`.
+        fn not_found(
+            traits: &HashMap<String, Rc<ClassDecl>>,
+            n: &str,
+            dname: &str,
+            line: usize,
+        ) -> PhpError {
+            if traits.contains_key(&n.to_lowercase()) {
+                PhpError::fatal(
+                    format!("Required Trait {} wasn't added to {}", n, dname),
+                    line,
+                )
+            } else {
+                PhpError::fatal(format!("Could not find trait {}", n), line)
+            }
+        }
+        // `static`/`self`/`parent` are reserved — never valid trait
+        // names (static_in_trait_*).
+        let reserved = |n: &str| {
+            ["static", "self", "parent"]
+                .iter()
+                .any(|r| n.eq_ignore_ascii_case(r))
+        };
+        for t in &d.traits {
+            if reserved(t) {
+                return Err(PhpError::fatal(
+                    format!("Cannot use \"{}\" as trait name, as it is reserved", t),
+                    cur_line,
+                ));
+            }
+        }
+        // Validate adaptation trait references.
+        for ad in &d.adaptations {
+            match ad {
+                crate::ast::TraitAdaptation::Insteadof {
+                    trait_name,
+                    method,
+                    excludes,
+                } => {
+                    for n in std::iter::once(trait_name).chain(excludes.iter()) {
+                        if reserved(n) {
+                            return Err(PhpError::fatal(
+                                format!("Cannot use \"{}\" as trait name, as it is reserved", n),
+                                cur_line,
+                            ));
+                        }
+                        // A class name in `as`/`insteadof` is its own
+                        // error (bug64235).
+                        if !is_used(n) && self.classes.contains_key(&n.to_lowercase()) {
+                            return Err(PhpError::fatal(
+                                format!(
+                                    "Class {} is not a trait, Only traits may be used in 'as' and 'insteadof' statements",
+                                    n
+                                ),
+                                cur_line,
+                            ));
+                        }
+                    }
+                    if !is_used(trait_name) {
+                        return Err(not_found(&self.traits, trait_name, &dname, cur_line));
+                    }
+                    // `T::m insteadof ...` — the method must exist in T
+                    // (bug60165d).
+                    if let Some(td) = self.traits.get(&trait_name.to_lowercase()) {
+                        if !td
+                            .methods
+                            .iter()
+                            .any(|m| m.decl.name.eq_ignore_ascii_case(method))
+                        {
+                            return Err(PhpError::fatal(
+                                format!(
+                                    "A precedence rule was defined for {}::{} but this method does not exist",
+                                    trait_name, method
+                                ),
+                                cur_line,
+                            ));
+                        }
+                    }
+                    for e in excludes {
+                        if !is_used(e) {
+                            return Err(not_found(&self.traits, e, &dname, cur_line));
+                        }
+                    }
+                    if excludes.iter().any(|e| e.eq_ignore_ascii_case(trait_name)) {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Inconsistent insteadof definition. The method {} is to be used from {}, but {} is also on the exclude list",
+                                method, trait_name, trait_name
+                            ),
+                            cur_line,
+                        ));
+                    }
+                }
+                crate::ast::TraitAdaptation::Alias {
+                    trait_name: Some(tn),
+                    ..
+                } => {
+                    if !is_used(tn) {
+                        if self.classes.contains_key(&tn.to_lowercase()) {
+                            return Err(PhpError::fatal(
+                                format!(
+                                    "Class {} is not a trait, Only traits may be used in 'as' and 'insteadof' statements",
+                                    tn
+                                ),
+                                cur_line,
+                            ));
+                        }
+                        return Err(not_found(&self.traits, tn, &dname, cur_line));
+                    }
+                }
+                crate::ast::TraitAdaptation::Alias {
+                    trait_name: None,
+                    method,
+                    alias,
+                    ..
+                } => {
+                    // `method as alias` with no qualifier — method must
+                    // exist somewhere among the used traits.
+                    if alias.is_some()
+                        && !used.iter().any(|(_, td)| {
+                            td.methods
+                                .iter()
+                                .any(|m| m.decl.name.eq_ignore_ascii_case(method))
+                        })
+                    {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "An alias ({}) was defined for method {}(), but this method does not exist",
+                                alias.as_deref().unwrap_or_default(),
+                                method
+                            ),
+                            cur_line,
+                        ));
+                    }
+                }
+            }
+        }
+        // insteadof exclusions: (method_lname, suppressed trait_lname)
+        let mut exclusions: Vec<(String, String)> = Vec::new();
+        for ad in &d.adaptations {
+            if let crate::ast::TraitAdaptation::Insteadof {
+                method, excludes, ..
+            } = ad
+            {
+                for e in excludes {
+                    // Each trait's method may be excluded only once
+                    // (error_010).
+                    if exclusions
+                        .iter()
+                        .any(|(mn, et)| *mn == method.to_lowercase() && et.eq_ignore_ascii_case(e))
+                    {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Failed to evaluate a trait precedence ({}). Method of trait {} was defined to be excluded multiple times",
+                                method, e
+                            ),
+                            cur_line,
+                        ));
+                    }
+                    exclusions.push((method.to_lowercase(), e.to_lowercase()));
+                }
+            }
+        }
+        // Merge methods in `use` order. Class-own methods always win
+        // silently; a trait's ABSTRACT requirement is still checked
+        // against the class's implementation (abstract_method_*).
+        // `taken` = name -> (display trait, origin trait, own|abstract)
+        let mut taken: HashMap<String, (String, String)> = HashMap::new();
+        for m in &d.methods {
+            taken.insert(m.decl.name.to_lowercase(), (dname.clone(), String::new()));
+        }
+        for (t, td) in &used {
+            for m in &td.methods {
+                let lname = m.decl.name.to_lowercase();
+                if exclusions
+                    .iter()
+                    .any(|(mn, et)| *mn == lname && et.eq_ignore_ascii_case(t))
+                {
+                    continue;
+                }
+                let origin = m.decl.decl_in.clone().unwrap_or_else(|| t.clone());
+                // A trait abstract requirement already implemented by
+                // an ancestor stays inherited, not merged (bug55424) —
+                // but the inherited impl must still be signature-
+                // compatible with the abstract (gh14009_002).
+                if m.is_abstract {
+                    if let Some((aon, am)) = self.ancestor_concrete(d, &lname) {
+                        if let Some(e) = self.trait_sig_error(&am, m, &aon, &origin, false) {
+                            return Err(e);
+                        }
+                        continue;
+                    }
+                }
+                if let Some((pt, porig)) = taken.get(&lname).cloned() {
+                    // Diamond reuse of the same origin trait is fine
+                    // (bug63911).
+                    if porig.eq_ignore_ascii_case(&origin) {
+                        continue;
+                    }
+                    let class_own = porig.is_empty();
+                    let existing = d
+                        .methods
+                        .iter()
+                        .find(|x| x.decl.name.eq_ignore_ascii_case(&m.decl.name))
+                        .cloned();
+                    // Abstract requirements interplay with what holds
+                    // the name already.
+                    if m.is_abstract || existing.as_ref().is_some_and(|x| x.is_abstract) {
+                        if class_own {
+                            // Class impl must satisfy the abstract
+                            // (abstract_method_1/3/4/5).
+                            if let Some(ex) = existing {
+                                if let Some(e) =
+                                    self.trait_sig_error(&ex, m, &dname, &origin, false)
+                                {
+                                    return Err(e);
+                                }
+                            }
+                            continue;
+                        }
+                        if m.is_abstract && existing.as_ref().is_some_and(|x| x.is_abstract) {
+                            // Two abstract requirements: signatures must
+                            // agree in both directions (bug60217).
+                            let ex = existing.unwrap();
+                            if let Some(e) = self.trait_sig_error(&ex, m, &pt, &origin, true) {
+                                return Err(e);
+                            }
+                            continue;
+                        }
+                        // concrete-vs-abstract: concrete impl checked
+                        // against the abstract requirement; on success
+                        // the concrete replaces (or keeps) the slot.
+                        let (impl_m, abs_m, abs_owner) = if m.is_abstract {
+                            (existing.clone().unwrap(), m.clone(), &origin)
+                        } else {
+                            (m.clone(), existing.clone().unwrap(), &porig)
+                        };
+                        if let Some(e) =
+                            self.trait_sig_error(&impl_m, &abs_m, &dname, abs_owner, false)
+                        {
+                            return Err(e);
+                        }
+                        if m.is_abstract {
+                            continue;
+                        }
+                        // Concrete replaces the abstract slot.
+                        if let Some(slot) = d
+                            .methods
+                            .iter_mut()
+                            .find(|x| x.decl.name.eq_ignore_ascii_case(&m.decl.name))
+                        {
+                            let mut m2 = (**m).clone();
+                            m2.decl.decl_in = Some(origin.clone());
+                            *slot = Rc::new(m2);
+                            taken.insert(lname, (t.clone(), origin));
+                        }
+                        continue;
+                    }
+                    if class_own {
+                        continue;
+                    }
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Trait method {}::{} has not been applied as {}::{}, because of collision with {}::{}",
+                            t, m.decl.name, dname, m.decl.name, pt, m.decl.name
+                        ),
+                        cur_line,
+                    ));
+                }
+                let mut m2 = (**m).clone();
+                m2.decl.decl_in = Some(origin.clone());
+                taken.insert(lname, (t.clone(), origin));
+                d.methods.push(Rc::new(m2));
+            }
+        }
+        // Aliases: clone the source method under a new name and/or apply
+        // a visibility override to the merged original.
+        for ad in &d.adaptations {
+            let crate::ast::TraitAdaptation::Alias {
+                trait_name,
+                method,
+                alias,
+                vis,
+                is_final,
+            } = ad
+            else {
+                continue;
+            };
+            if let Some(tn) = trait_name {
+                if reserved(tn) {
+                    return Err(PhpError::fatal(
+                        format!("Cannot use \"{}\" as trait name, as it is reserved", tn),
+                        cur_line,
+                    ));
+                }
+                if !is_used(tn) {
+                    if self.classes.contains_key(&tn.to_lowercase()) {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Class {} is not a trait, Only traits may be used in 'as' and 'insteadof' statements",
+                                tn
+                            ),
+                            cur_line,
+                        ));
+                    }
+                    return Err(not_found(&self.traits, tn, &dname, cur_line));
+                }
+            }
+            let src: Option<Rc<MethodDecl>> = match trait_name {
+                Some(tn) => self.traits.get(&tn.to_lowercase()).and_then(|td| {
+                    td.methods
+                        .iter()
+                        .find(|m| m.decl.name.eq_ignore_ascii_case(method))
+                        .cloned()
+                }),
+                None => {
+                    // Unqualified `m as x` is ambiguous when >1 used
+                    // trait provides `m` (bug62069).
+                    let mut holders = used.iter().filter(|(_, td)| {
+                        td.methods
+                            .iter()
+                            .any(|m| m.decl.name.eq_ignore_ascii_case(method))
+                    });
+                    match (holders.next(), holders.next()) {
+                        (Some((n1, _)), Some((n2, _))) => {
+                            return Err(PhpError::fatal(
+                                format!(
+                                    "An alias was defined for method {}(), which exists in both {} and {}. Use {}::{} or {}::{} to resolve the ambiguity",
+                                    method, n1, n2, n1, method, n2, method
+                                ),
+                                cur_line,
+                            ));
+                        }
+                        (Some((_, td1)), None) => td1
+                            .methods
+                            .iter()
+                            .find(|m| m.decl.name.eq_ignore_ascii_case(method))
+                            .cloned(),
+                        _ => None,
+                    }
+                }
+            };
+            let Some(m) = src else {
+                // `T::m as x` cites the qualified name; `m as x` cites
+                // the alias (bug60165b); a bare `m as vis` modifier is
+                // the "modifiers changed" wording (bug54441).
+                if trait_name.is_some() {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "An alias was defined for {}::{} but this method does not exist",
+                            trait_name.as_deref().unwrap_or_default(),
+                            method
+                        ),
+                        cur_line,
+                    ));
+                }
+                if let Some(a) = alias {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "An alias ({}) was defined for method {}(), but this method does not exist",
+                            a, method
+                        ),
+                        cur_line,
+                    ));
+                }
+                return Err(PhpError::fatal(
+                    format!(
+                        "The modifiers of the trait method {}() are changed, but this method does not exist. Error in",
+                        method
+                    ),
+                    cur_line,
+                ));
+            };
+            // `as abstract|final|static` are not valid alias modifiers
+            // (language018/019) — PHP rejects them as alias names too.
+            for bad in ["abstract", "static"] {
+                if alias
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(bad))
+                {
+                    return Err(PhpError::fatal(
+                        format!("Cannot use \"{}\" as method modifier in trait alias", bad),
+                        cur_line,
+                    ));
+                }
+            }
+            let origin = m
+                .decl
+                .decl_in
+                .clone()
+                .or_else(|| trait_name.clone())
+                .unwrap_or_default();
+            if let Some(a) = alias {
+                let alname = a.to_lowercase();
+                // An aliased name collides like a real method
+                // (language010/014): a merged method or an earlier
+                // alias holding the name is fatal.
+                let src_trait = trait_name.clone().unwrap_or_else(|| {
+                    used.iter()
+                        .find(|(_, td)| {
+                            td.methods
+                                .iter()
+                                .any(|mm| mm.decl.name.eq_ignore_ascii_case(method))
+                        })
+                        .map(|(t, _)| t.clone())
+                        .unwrap_or_default()
+                });
+                if let Some((pt, porg)) = taken.get(&alname) {
+                    if !porg.is_empty() {
+                        // Trait order decides the loser: a slot held by
+                        // a trait merged LATER loses to the earlier
+                        // trait's alias (language010 vs language014).
+                        let ord =
+                            |n: &str| used.iter().position(|(u, _)| u.eq_ignore_ascii_case(n));
+                        let (lt, lm, wt) = match (ord(&src_trait), ord(pt)) {
+                            (Some(si), Some(pi)) if pi > si => {
+                                (pt.clone(), a.clone(), src_trait.clone())
+                            }
+                            _ => (src_trait.clone(), method.clone(), pt.clone()),
+                        };
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Trait method {}::{} has not been applied as {}::{}, because of collision with {}::{}",
+                                lt, lm, dname, a, wt, a
+                            ),
+                            cur_line,
+                        ));
+                    }
+                    // The class's own method wins silently (bug61998).
+                    continue;
+                }
+                let mut m2 = (*m).clone();
+                m2.decl.name = a.clone();
+                if let Some(v) = vis {
+                    m2.visibility = *v;
+                }
+                if *is_final {
+                    m2.is_final = true;
+                }
+                m2.decl.decl_in = Some(origin.clone());
+                m2.trait_alias_of = Some(m.decl.name.clone());
+                taken.insert(alname, (src_trait, origin));
+                d.methods.push(Rc::new(m2));
+            } else if vis.is_some() || *is_final {
+                // `m as private` / `m as final` — modifier change on the
+                // merged original itself.
+                for slot in d.methods.iter_mut() {
+                    if slot.decl.name.eq_ignore_ascii_case(method) {
+                        let mut m2 = (**slot).clone();
+                        if let Some(v) = vis {
+                            m2.visibility = *v;
+                        }
+                        if *is_final {
+                            m2.is_final = true;
+                        }
+                        *slot = Rc::new(m2);
+                        break;
+                    }
+                }
+            }
+        }
+        // Trait props merge with the identical-definition rule
+        // (property001/002, bug74922): differing decls fatal; hooked
+        // props can't be resolved at all.
+        for (t, td) in &used {
+            for p in &td.props {
+                if let Some(ex) = d.props.iter().find(|x| x.name == p.name) {
+                    if ex.hooks.is_some() || p.hooks.is_some() {
+                        let ex_src = ex.decl_in.clone().unwrap_or_else(|| dname.clone());
+                        return Err(PhpError::fatal(
+                            format!(
+                                "{} and {} define the same hooked property (${}) in the composition of {}. Conflict resolution between hooked properties is currently not supported. Class was composed",
+                                ex_src, t, p.name, dname
+                            ),
+                            cur_line,
+                        ));
+                    }
+                    let compat = ex.visibility == p.visibility
+                        && ex.is_static == p.is_static
+                        && ex.readonly == p.readonly
+                        && ex.ty == p.ty
+                        && self.const_exprs_eq(
+                            &ex.default,
+                            &ex.decl_in.clone().unwrap_or_else(|| dname.clone()),
+                            &p.default,
+                            t,
+                        );
+                    if !compat {
+                        let ex_src = ex.decl_in.clone().unwrap_or_else(|| dname.clone());
+                        return Err(PhpError::fatal(
+                            format!(
+                                "{} and {} define the same property (${}) in the composition of {}. However, the definition differs and is considered incompatible. Class was composed",
+                                ex_src, t, p.name, dname
+                            ),
+                            cur_line,
+                        ));
+                    }
+                    continue;
+                }
+                let mut np = p.clone();
+                np.decl_in = Some(t.clone());
+                d.props.push(np);
+            }
+        }
+        // Trait constants merge like props: same name+identical
+        // definition is fine, differing definitions are fatal
+        // (constant_*). `T::CONST` direct access is rejected at the
+        // lookup site instead.
+        for (t, td) in &used {
+            for cd in &td.consts {
+                if let Some(ex) = d.consts.iter().find(|x| x.name == cd.name) {
+                    let compat = ex.visibility == cd.visibility
+                        && ex.is_final == cd.is_final
+                        && self.const_exprs_eq(
+                            &Some(ex.value.clone()),
+                            &ex.decl_in.clone().unwrap_or_else(|| dname.clone()),
+                            &Some(cd.value.clone()),
+                            t,
+                        );
+                    if !compat {
+                        let ex_src = ex.decl_in.clone().unwrap_or_else(|| dname.clone());
+                        return Err(PhpError::fatal(
+                            format!(
+                                "{} and {} define the same constant ({}) in the composition of {}. However, the definition differs and is considered incompatible. Class was composed",
+                                ex_src, t, cd.name, dname
+                            ),
+                            cur_line,
+                        ));
+                    }
+                    continue;
+                }
+                let mut nc = cd.clone();
+                nc.decl_in = Some(t.clone());
+                d.consts.push(nc);
+            }
+        }
+        Ok(())
+    }
+
+    /// Two default-value exprs are compatible when their evaluated
+    /// values match loosely (bug74922, constant_016); falls back to a
+    /// textual compare when either side won't eval (both-None is fine).
+    /// Each side evals in its declaring trait's namespace so an
+    /// unqualified `FOO` in `Bug74922\T1` means `Bug74922\FOO`.
+    fn const_exprs_eq(
+        &mut self,
+        a: &Option<Expr>,
+        a_owner: &str,
+        b: &Option<Expr>,
+        b_owner: &str,
+    ) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(x), Some(y)) => {
+                match (self.eval_in_ns(x, a_owner), self.eval_in_ns(y, b_owner)) {
+                    (Ok(va), Ok(vb)) => identical(&va, &vb),
+                    _ => format!("{:?}", x) == format!("{:?}", y),
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Const-eval an expr as if inside `owner`'s namespace (trait prop/
+    /// const defaults resolve unqualified names against their declaring
+    /// namespace — bug74922b).
+    fn eval_in_ns(&mut self, e: &Expr, owner: &str) -> Result<Value, PhpError> {
+        let ns = owner
+            .rsplit_once('\\')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        let old = std::mem::replace(&mut self.globals.ns, ns);
+        let f = self.cur_file.clone();
+        let r = self.eval_decl_const(e, &f);
+        self.globals.ns = old;
+        r
+    }
+
+    /// Param-list render for "Declaration of X::m(...) must be
+    /// compatible" diagnostics (Zend prints the declared signature).
+    /// Render one type member for signature messages: `self` resolves
+    /// against the composing class (abstract_method_10), other members
+    /// stay verbatim.
+    fn sig_ty(ty: &[String], ctx: &str) -> String {
+        ty.iter()
+            .map(|t| {
+                if t.eq_ignore_ascii_case("self") {
+                    ctx.to_string()
+                } else {
+                    t.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    fn sig_str(f: &crate::ast::FunctionDecl, ctx: &str) -> String {
+        f.params
+            .iter()
+            .map(|p| {
+                let ty =
+                    p.ty.as_ref()
+                        .map(|t| Self::sig_ty(t, ctx) + " ")
+                        .unwrap_or_default();
+                let br = if p.by_ref { "&" } else { "" };
+                let var = if p.variadic {
+                    format!("...${}", p.name)
+                } else {
+                    format!("${}", p.name)
+                };
+                let def = match &p.default {
+                    Some(Expr::Int(i)) => format!(" = {}", i),
+                    Some(Expr::Float(f)) => format!(" = {}", f),
+                    Some(Expr::Str(b)) => format!(" = '{}'", b),
+                    Some(Expr::Null) => " = null".to_string(),
+                    Some(Expr::Bool(b)) => format!(" = {}", b),
+                    Some(Expr::Const(c)) => format!(" = {}", c),
+                    Some(Expr::ArrayLit(_)) => " = []".to_string(),
+                    _ => String::new(),
+                };
+                format!("{}{}{}{}", ty, br, var, def)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// `sig_str` variant that appends `: ret` OUTSIDE the paren — used
+    /// inside `({})` placeholders, so the signature is `(params): ret`.
+    fn sig_str_full(f: &crate::ast::FunctionDecl, ctx: &str) -> String {
+        let ps = Self::sig_str(f, ctx);
+        match &f.ret {
+            Some(r) => format!("({}): {}", ps, Self::sig_ty(r, ctx)),
+            None => format!("({})", ps),
+        }
+    }
+
+    /// The (declaring-class name, method) pair for `lname` provided by
+    /// a concrete method in `d`'s ancestor chain — nearest wins.
+    fn ancestor_concrete(&self, d: &ClassDecl, lname: &str) -> Option<(String, Rc<MethodDecl>)> {
+        let mut pn = d.parent.clone();
+        while let Some(p) = pn {
+            let Some(pc) = self.classes.get(&p.to_lowercase()).cloned() else {
+                break;
+            };
+            if let Some(m) = pc
+                .decl
+                .methods
+                .iter()
+                .find(|m| m.decl.name.to_lowercase() == lname && !m.is_abstract)
+            {
+                return Some((pc.decl.name.clone(), m.clone()));
+            }
+            pn = pc.decl.parent.clone();
+        }
+        None
+    }
+
+    /// Signature-compat check of an implementation against a trait's
+    /// abstract requirement (abstract_method_*). `both_abs` marks the
+    /// two-traits-both-abstract case where Zend cites trait names for
+    /// both sides.
+    fn trait_sig_error(
+        &mut self,
+        impl_m: &Rc<MethodDecl>,
+        abs_m: &Rc<MethodDecl>,
+        impl_disp: &str,
+        abs_disp: &str,
+        both_abs: bool,
+    ) -> Option<PhpError> {
+        let m = &impl_m.decl.name;
+        if impl_m.is_static != abs_m.is_static {
+            return Some(PhpError::fatal(
+                format!(
+                    "Cannot make {} method {}::{}() {} in class {}",
+                    if abs_m.is_static {
+                        "static"
+                    } else {
+                        "non static"
+                    },
+                    abs_disp,
+                    m,
+                    if impl_m.is_static {
+                        "static"
+                    } else {
+                        "non static"
+                    },
+                    // impl_disp is the using class for concrete impls;
+                    // for two abstract traits Zend still prints the
+                    // class being composed... using impl_disp for both.
+                    impl_disp
+                ),
+                self.cur_line,
+            ));
+        }
+        let req = |ms: &MethodDecl| {
+            ms.decl
+                .params
+                .iter()
+                .filter(|p| p.default.is_none() && !p.variadic)
+                .count()
+        };
+        let (ir, ar) = (req(impl_m), req(abs_m));
+        let count_ok = ir <= ar
+            && (impl_m.decl.params.iter().any(|p| p.variadic)
+                || (!abs_m.decl.params.iter().any(|p| p.variadic)
+                    && impl_m.decl.params.len() >= abs_m.decl.params.len()));
+        let mut ok = count_ok;
+        if ok {
+            for (i, ap) in abs_m.decl.params.iter().enumerate() {
+                if ap.variadic {
+                    break;
+                }
+                let Some(ip) = impl_m.decl.params.get(i) else {
+                    ok = false;
+                    break;
+                };
+                if ip.variadic {
+                    break;
+                }
+                if ip.by_ref != ap.by_ref {
+                    ok = false;
+                    break;
+                }
+                let it = ip.ty.clone().unwrap_or_else(|| vec!["mixed".into()]);
+                let at = ap.ty.clone().unwrap_or_else(|| vec!["mixed".into()]);
+                if !self.ty_sup(&it, &at) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            // Return-type covariance: an untyped impl fails a typed
+            // abstract; a typed impl must be a subtype of the abstract's
+            // (`never` bottoms out any requirement) (bug81192).
+            ok = match (&impl_m.decl.ret, &abs_m.decl.ret) {
+                (_, None) => true,
+                (None, Some(_)) => false,
+                (Some(ir), Some(ar)) => {
+                    let resolve = |ms: &[String]| -> Vec<String> {
+                        ms.iter()
+                            .map(|m| {
+                                if m.eq_ignore_ascii_case("self") {
+                                    impl_disp.to_string()
+                                } else {
+                                    m.clone()
+                                }
+                            })
+                            .collect()
+                    };
+                    let (ir2, ar2) = (resolve(ir), resolve(ar));
+                    ir2.iter().any(|m| m.eq_ignore_ascii_case("never")) || self.ty_sup(&ar2, &ir2)
+                }
+            };
+        }
+        if ok && both_abs {
+            // Requirements must agree in BOTH directions (bug60217c).
+            return self.trait_sig_error(abs_m, impl_m, abs_disp, impl_disp, false);
+        }
+        if ok {
+            return None;
+        }
+        // Zend cites the implementing method's declaration — for merged
+        // trait methods that's the trait's own file/line (bug81192).
+        let mut e = PhpError::fatal(
+            format!(
+                "Declaration of {}::{}{} must be compatible with {}::{}{}",
+                impl_disp,
+                m,
+                Self::sig_str_full(&impl_m.decl, impl_disp),
+                abs_disp,
+                m,
+                Self::sig_str_full(&abs_m.decl, impl_disp)
+            ),
+            impl_m.decl.line,
+        );
+        e.line = impl_m.decl.line;
+        if impl_m.decl.file != self.diag_file() {
+            self.last_err_file = impl_m.decl.file.clone();
+        }
+        Some(e)
+    }
+
+    /// Interface method signatures must be compatible with the class's
+    /// implementation (bug60153): same rules as trait abstracts.
+    fn check_interface_sigs(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
+        // (iface, display-for-errors): own `implements` cites the
+        // interface; an ancestor's requirement cites the ancestor
+        // (bug62358).
+        let mut ifaces: Vec<(Rc<ClassDecl>, String)> = Vec::new();
+        for iname in &d.implements {
+            if let Some(f) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+                ifaces.push((f, String::new()));
+            }
+        }
+        let mut chain: Vec<Rc<ClassDecl>> = Vec::new();
+        let mut pn = d.parent.clone();
+        while let Some(p) = pn {
+            let Some(pc) = self.classes.get(&p.to_lowercase()) else {
+                break;
+            };
+            chain.push(pc.decl.clone());
+            pn = pc.decl.parent.clone();
+        }
+        for c in &chain {
+            for iname in &c.implements {
+                if let Some(f) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+                    ifaces.push((f, c.name.clone()));
+                }
+            }
+        }
+        let mut seen = 0;
+        while seen < ifaces.len() {
+            let (f, disp) = ifaces[seen].clone();
+            seen += 1;
+            let cite = if disp.is_empty() {
+                f.name.clone()
+            } else {
+                disp
+            };
+            for im in &f.methods {
+                if let Some(impl_m) = d
+                    .methods
+                    .iter()
+                    .find(|m| m.decl.name.eq_ignore_ascii_case(&im.decl.name))
+                    .cloned()
+                {
+                    // Interface methods must stay public in the
+                    // implementation (bug69467).
+                    if !matches!(impl_m.visibility, crate::ast::Visibility::Public) {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Access level to {}::{}() must be public (as in class {})",
+                                d.name, im.decl.name, cite
+                            ),
+                            impl_m.decl.line,
+                        ));
+                    }
+                    if let Some(e) = self.trait_sig_error(&impl_m, im, &d.name, &cite, false) {
+                        return Err(e);
+                    }
+                }
+            }
+            for p2 in &f.implements {
+                if let Some(pp) = self.interfaces.get(&p2.to_lowercase()).cloned() {
+                    ifaces.push((pp, String::new()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Non-abstract classes must implement every abstract method: own/
+    /// trait-merged abstracts (labelled `C::m`), plus abstracts from
+    /// ancestor classes and interfaces (labelled `Src::m`).
+    fn check_abstract_methods(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
+        if d.kind != crate::ast::ClassKind::Class {
+            return Ok(());
+        }
+        // A private abstract requirement can't be delegated to a
+        // subclass — the composing class itself must implement it,
+        // even when abstract (abstract_method_6).
+        let priv_missing: Vec<String> = d
+            .methods
+            .iter()
+            .filter(|m| {
+                m.is_abstract
+                    && m.visibility == crate::ast::Visibility::Private
+                    && m.decl.decl_in.is_some()
+            })
+            .map(|m| format!("{}::{}", d.name, m.decl.name))
+            .collect();
+        if !priv_missing.is_empty() {
+            let n = priv_missing.len();
+            return Err(PhpError::fatal(
+                format!(
+                    "Class {} must implement {} abstract method{} ({})",
+                    d.name,
+                    n,
+                    if n == 1 { "" } else { "s" },
+                    priv_missing.join(", ")
+                ),
+                self.cur_line,
+            ));
+        }
+        if d.is_abstract {
+            return Ok(());
+        }
+        // Concrete impls visible to this class: own methods (incl.
+        // trait-merged) plus ancestor classes' methods.
+        let mut chain: Vec<Rc<ClassDecl>> = Vec::new();
+        let mut pn = d.parent.clone();
+        while let Some(p) = pn {
+            let Some(pc) = self.classes.get(&p.to_lowercase()) else {
+                break;
+            };
+            chain.push(pc.decl.clone());
+            pn = pc.decl.parent.clone();
+        }
+        // `end` = ancestors chain[0..end] that may satisfy the abstract
+        // (the declaring link itself plus everything below it).
+        let concrete = |lname: &str, end: usize| -> bool {
+            if d.methods
+                .iter()
+                .any(|m| m.decl.name.to_lowercase() == lname && !m.is_abstract)
+            {
+                return true;
+            }
+            chain.iter().take(end).any(|c| {
+                c.methods
+                    .iter()
+                    .any(|m| m.decl.name.to_lowercase() == lname && !m.is_abstract)
+            })
+        };
+        let mut missing: Vec<String> = Vec::new();
+        // Own + trait-merged abstracts first (label: this class).
+        for m in &d.methods {
+            if m.is_abstract {
+                let lname = m.decl.name.to_lowercase();
+                if concrete(&lname, chain.len()) {
+                    continue;
+                }
+                let label = format!("{}::{}", d.name, m.decl.name);
+                if !missing.contains(&label) {
+                    missing.push(label);
+                }
+            }
+        }
+        // Ancestor abstracts: an impl must also be signature-compat
+        // (bug62358) — find it in this class or a descendant link.
+        for (i, c) in chain.iter().enumerate() {
+            for m in &c.methods {
+                if !m.is_abstract {
+                    continue;
+                }
+                let impl_at =
+                    |m: &Rc<MethodDecl>| -> Option<(Rc<MethodDecl>, String)> {
+                        if let Some(x) = d.methods.iter().find(|x| {
+                            x.decl.name.eq_ignore_ascii_case(&m.decl.name) && !x.is_abstract
+                        }) {
+                            return Some((x.clone(), d.name.clone()));
+                        }
+                        chain.iter().take(i + 1).find_map(|c2| {
+                            c2.methods
+                                .iter()
+                                .find(|x| {
+                                    x.decl.name.eq_ignore_ascii_case(&m.decl.name) && !x.is_abstract
+                                })
+                                .map(|x| (x.clone(), c2.name.clone()))
+                        })
+                    };
+                if let Some((im, iname)) = impl_at(m) {
+                    if let Some(e) = self.trait_sig_error(&im, m, &iname, &c.name, false) {
+                        let mut e = e;
+                        e.line = im.decl.line;
+                        return Err(e);
+                    }
+                    continue;
+                }
+                let label = format!("{}::{}", c.name, m.decl.name);
+                if !missing.contains(&label) {
+                    missing.push(label);
+                }
+            }
+        }
+        // Interfaces implemented anywhere in the chain (including
+        // this class's own `implements`).
+        let mut ifaces: Vec<Rc<ClassDecl>> = Vec::new();
+        for iname in d
+            .implements
+            .iter()
+            .chain(chain.iter().flat_map(|c| c.implements.iter()))
+        {
+            if let Some(f) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+                ifaces.push(f);
+            }
+        }
+        let mut seen = 0;
+        while seen < ifaces.len() {
+            let f = ifaces[seen].clone();
+            seen += 1;
+            for m in &f.methods {
+                // Interface methods are implicitly abstract.
+                let lname = m.decl.name.to_lowercase();
+                if concrete(&lname, chain.len()) {
+                    continue;
+                }
+                let label = format!("{}::{}", f.name, m.decl.name);
+                if !missing.contains(&label) {
+                    missing.push(label);
+                }
+            }
+            for p2 in &f.implements {
+                if let Some(pp) = self.interfaces.get(&p2.to_lowercase()).cloned() {
+                    ifaces.push(pp);
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let (n, list) = (missing.len(), missing.join(", "));
+        Err(PhpError::fatal(
+            format!(
+                "Class {} contains {} abstract method{} and must therefore be declared abstract or implement the remaining method{} ({})",
+                d.name,
+                n,
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "" } else { "s" },
+                list
+            ),
+            self.cur_line,
+        ))
     }
 
     /// `final` props/hooks may not be overridden by a subclass.
@@ -8674,6 +10327,39 @@ impl<'a> Interp<'a> {
             let Some(pc) = self.classes.get(&pname.to_lowercase()).cloned() else {
                 break;
             };
+            for cm in &d.methods {
+                let Some(am) = pc
+                    .decl
+                    .methods
+                    .iter()
+                    .find(|x| x.decl.name.eq_ignore_ascii_case(&cm.decl.name))
+                else {
+                    continue;
+                };
+                if am.is_final && !cm.is_abstract {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Cannot override final method {}::{}()",
+                            pc.decl.name, cm.decl.name
+                        ),
+                        self.cur_line,
+                    ));
+                }
+            }
+            for cc in &d.consts {
+                let Some(ac) = pc.decl.consts.iter().find(|x| x.name == cc.name) else {
+                    continue;
+                };
+                if ac.is_final {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "{}::{} cannot override final constant {}::{}",
+                            d.name, cc.name, pc.decl.name, cc.name
+                        ),
+                        self.cur_line,
+                    ));
+                }
+            }
             for cp in &d.props {
                 let Some(ap) = pc.decl.props.iter().find(|x| x.name == cp.name) else {
                     continue;
@@ -9103,6 +10789,69 @@ impl<'a> Interp<'a> {
         self.is_a_str(t, s)
     }
 
+    /// Every visible override must be signature-compatible with the
+    /// nearest ancestor method of the same name — not just abstracts;
+    /// this also covers trait-merged methods vs concrete ancestors
+    /// (bug81192). `__construct` is exempt from LSP rules in PHP.
+    fn check_override_sigs(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
+        let mut chain: Vec<(String, Rc<ClassDecl>)> = Vec::new();
+        let mut pn = d.parent.clone();
+        while let Some(p) = pn {
+            let Some(pc) = self.classes.get(&p.to_lowercase()) else {
+                break;
+            };
+            chain.push((pc.decl.name.clone(), pc.decl.clone()));
+            pn = pc.decl.parent.clone();
+        }
+        if chain.is_empty() {
+            return Ok(());
+        }
+        let rank = |v: &crate::ast::Visibility| match v {
+            crate::ast::Visibility::Public => 2,
+            crate::ast::Visibility::Protected => 1,
+            crate::ast::Visibility::Private => 0,
+        };
+        for m in &d.methods {
+            if m.decl.name.eq_ignore_ascii_case("__construct")
+                || matches!(m.visibility, crate::ast::Visibility::Private)
+            {
+                continue;
+            }
+            let lname = m.decl.name.to_lowercase();
+            let Some((aname, am)) = chain.iter().find_map(|(pn, pc)| {
+                pc.methods
+                    .iter()
+                    .find(|x| x.decl.name.to_lowercase() == lname)
+                    .filter(|x| !matches!(x.visibility, crate::ast::Visibility::Private))
+                    .map(|x| (pn.clone(), x.clone()))
+            }) else {
+                continue;
+            };
+            if rank(&m.visibility) < rank(&am.visibility) {
+                let want = match am.visibility {
+                    crate::ast::Visibility::Public => {
+                        format!("public (as in class {})", aname)
+                    }
+                    crate::ast::Visibility::Protected => {
+                        format!("protected (as in class {}) or weaker", aname)
+                    }
+                    crate::ast::Visibility::Private => unreachable!(),
+                };
+                return Err(PhpError::fatal(
+                    format!(
+                        "Access level to {}::{}() must be {}",
+                        d.name, m.decl.name, want
+                    ),
+                    m.decl.line,
+                ));
+            }
+            if let Some(e) = self.trait_sig_error(m, &am, &d.name, &aname, false) {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     /// An abstract hook (`get;`/`set;` in an interface or `abstract`
     /// prop) the class must implement — reported as abstract methods
     /// (`A::$p::get`) at class-decl link time. Inherited but
@@ -9354,13 +11103,28 @@ impl<'a> Interp<'a> {
         let cls = match self.classes.get(&lname) {
             Some(c) => c.clone(),
             None => {
+                let t = name.trim_start_matches('\\');
+                if self.traits.contains_key(&t.to_lowercase()) {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Cannot instantiate trait {}", t),
+                        0,
+                    ));
+                }
                 return self.fail(PhpError::uncaught(
                     "Error",
                     format!("Class \"{}\" not found", name),
                     0,
-                ))
+                ));
             }
         };
+        if cls.decl.kind == ClassKind::Trait {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!("Cannot instantiate trait {}", cls.name()),
+                0,
+            ));
+        }
         if cls.decl.kind == ClassKind::Interface {
             return self.fail(PhpError::uncaught(
                 "Error",
@@ -9390,7 +11154,7 @@ impl<'a> Interp<'a> {
         // interception); the ctor may be inherited (property_hooks/foreach).
         if has_ctor {
             if let Value::Object(o) = &obj {
-                self.method_invoke(o.clone(), "__construct", args)?;
+                self.method_invoke_vis(o.clone(), "__construct", args)?;
             }
         }
         Ok(obj)
@@ -9414,6 +11178,7 @@ impl<'a> Interp<'a> {
                             implements: vec![],
                             attrs: vec![],
                             traits: vec![],
+                            adaptations: vec![],
                             methods: vec![],
                             props: vec![],
                             consts: vec![],
@@ -10359,6 +12124,7 @@ impl<'a> Interp<'a> {
         // PHP names hooks `$prop::set` — `__METHOD__` then composes the
         // declaring class into `C::$prop::set` (backed_implicit_get).
         let decl = Rc::new(FunctionDecl {
+            ret: None,
             name: format!("${}::{}", pname, kind),
             params,
             body: hook.body.clone().unwrap_or_default(),
@@ -10367,6 +12133,7 @@ impl<'a> Interp<'a> {
             line: self.cur_line,
             file: self.cur_file.clone(),
             ns: String::new(),
+            decl_in: None,
         });
         let owner = decl_owner(dcls, pname);
         let args = arg.into_iter().collect::<Vec<Cell>>();
@@ -11085,7 +12852,7 @@ impl<'a> Interp<'a> {
                     _ => String::new(),
                 };
                 match ob.class.name().to_lowercase().as_str() {
-                    "reflectionproperty" | "reflectionmethod" => {
+                    "reflectionproperty" | "reflectionmethod" | "reflectionclassconstant" => {
                         ob.props.insert("name".into(), cell(prop));
                         ob.props.insert("class".into(), cell(Value::str(&cname)));
                     }
@@ -11207,6 +12974,53 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let tn = self.conv_str(&tn)?.to_string();
+                let is_cc = obj
+                    .borrow()
+                    .class
+                    .name()
+                    .eq_ignore_ascii_case("reflectionclassconstant");
+                if is_cc {
+                    let cn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let cn = self.conv_str(&cn)?.to_string();
+                    let pn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0prop")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let pn = self.conv_str(&pn)?.to_string();
+                    let decls = self
+                        .find_const_decl(&cn, &pn)
+                        .map(|(cd, _)| cd.attrs.clone())
+                        .unwrap_or_default();
+                    let fname = args
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .map(|v| self.conv_str(&v).map(|s| s.to_string()))
+                        .transpose()?
+                        .unwrap_or_default();
+                    let mut arr = PhpArray::default();
+                    for a in decls {
+                        if !fname.is_empty() && !a.name.eq_ignore_ascii_case(&fname) {
+                            continue;
+                        }
+                        let v = self.instantiate("reflectionattribute", &[])?;
+                        if let Value::Object(o) = &v {
+                            o.borrow_mut().internal = Some(ObjectInternal::ReflectionAttribute {
+                                name: a.name.clone(),
+                                args: Rc::new(a.args.clone()),
+                                target: 16,
+                            });
+                        }
+                        arr.push(v);
+                    }
+                    return Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))));
+                }
                 let (decls, target): (Vec<crate::ast::AttrDecl>, i64) = if is_fn {
                     (
                         self.functions
@@ -11416,10 +13230,22 @@ impl<'a> Interp<'a> {
                 {
                     return Ok(Some(Value::str(name.clone())));
                 }
+                // ReflectionClassConstant::getName() is the const name;
+                // every other reflector reports its class/subject.
+                let key = if obj
+                    .borrow()
+                    .class
+                    .name()
+                    .eq_ignore_ascii_case("reflectionclassconstant")
+                {
+                    "name"
+                } else {
+                    "\0rc\0class"
+                };
                 Ok(Some(
                     obj.borrow()
                         .props
-                        .get("\0rc\0class")
+                        .get(key)
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null),
                 ))
@@ -11433,6 +13259,172 @@ impl<'a> Interp<'a> {
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?;
                 Ok(Some(self.instantiate(&cn.to_lowercase(), &[])?))
+            }
+            "isfinal" | "isabstract" | "isstatic" | "ispublic" | "isprotected" | "isprivate" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let mn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0prop")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let mn = self.conv_str(&mn)?.to_string();
+                let m = self
+                    .classes
+                    .get(&cn.to_lowercase())
+                    .cloned()
+                    .and_then(|c| self.find_method_in(&c, &mn).map(|(m, _)| m));
+                let b = match m {
+                    Some(m) => match lname.as_str() {
+                        "isfinal" => m.is_final,
+                        "isabstract" => m.is_abstract,
+                        "isstatic" => m.is_static,
+                        "ispublic" => m.visibility == crate::ast::Visibility::Public,
+                        "isprotected" => m.visibility == crate::ast::Visibility::Protected,
+                        _ => m.visibility == crate::ast::Visibility::Private,
+                    },
+                    None => false,
+                };
+                Ok(Some(Value::Bool(b)))
+            }
+            "gettraitaliases" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let mut arr = PhpArray::default();
+                if let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() {
+                    for m in &c.decl.methods {
+                        if let Some(orig) = &m.trait_alias_of {
+                            let v =
+                                format!("{}::{}", m.decl.decl_in.clone().unwrap_or_default(), orig);
+                            arr.set(ArrKey::Str(m.decl.name.as_str().into()), Value::str(v));
+                        }
+                    }
+                }
+                Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
+            }
+            "getconstant" | "getconstants" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                if lname == "getconstants" {
+                    let mut arr = PhpArray::default();
+                    for (n, cd) in self.all_const_decls(&cn) {
+                        let f = cd.1.clone();
+                        if let Ok(v) = self.eval_decl_const(&cd.0.value, &f) {
+                            arr.set(ArrKey::Str(n.into()), v);
+                        }
+                    }
+                    return Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))));
+                }
+                let pn = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let pn = self.conv_str(&pn)?.to_string();
+                match self.find_const_decl(&cn, &pn) {
+                    Some((cd, f)) => {
+                        let v = self.eval_decl_const(&cd.value, &f)?;
+                        Ok(Some(v))
+                    }
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "getreflectionconstant" | "getreflectionconstants" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let mk = |it: &mut Self, cname: &str, n: &str| -> Result<Value, PhpError> {
+                    let v = it.instantiate("reflectionclassconstant", &[])?;
+                    if let Value::Object(o) = &v {
+                        o.borrow_mut()
+                            .props
+                            .insert("\0rc\0class".into(), cell(Value::str(cname)));
+                        o.borrow_mut()
+                            .props
+                            .insert("\0rc\0prop".into(), cell(Value::str(n)));
+                        o.borrow_mut()
+                            .props
+                            .insert("name".into(), cell(Value::str(n)));
+                        o.borrow_mut()
+                            .props
+                            .insert("class".into(), cell(Value::str(cname)));
+                    }
+                    Ok(v)
+                };
+                if lname == "getreflectionconstants" {
+                    let mut arr = PhpArray::default();
+                    for (n, _) in self.all_const_decls(&cn) {
+                        arr.push(mk(self, &cn, &n)?);
+                    }
+                    return Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))));
+                }
+                let pn = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let pn = self.conv_str(&pn)?.to_string();
+                if self.find_const_decl(&cn, &pn).is_none() {
+                    return Ok(Some(Value::Bool(false)));
+                }
+                Ok(Some(mk(self, &cn, &pn)?))
+            }
+            "getvalue" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let pn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0prop")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let pn = self.conv_str(&pn)?.to_string();
+                match self.find_const_decl(&cn, &pn) {
+                    Some((cd, f)) => Ok(Some(self.eval_decl_const(&cd.value, &f)?)),
+                    None => Ok(Some(Value::Null)),
+                }
+            }
+            "getdeclaringclass" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let v = self.instantiate("reflectionclass", &[])?;
+                if let Value::Object(o) = &v {
+                    o.borrow_mut()
+                        .props
+                        .insert("\0rc\0class".into(), cell(Value::str(cn.clone())));
+                    o.borrow_mut()
+                        .props
+                        .insert("name".into(), cell(Value::str(cn)));
+                }
+                Ok(Some(v))
             }
             "isinitialized" => {
                 let pn = obj
@@ -11691,7 +13683,7 @@ impl<'a> Interp<'a> {
                     .unwrap_or_default();
                 let argvals = self.arg_cells(args, &params, &format!("{}()", mn))?;
                 // method_invoke handles builtin (Throwable), __call, undefined.
-                self.method_invoke(o.clone(), &mn, argvals)
+                self.method_invoke_vis(o.clone(), &mn, argvals)
             }
             Value::Null => {
                 if nullsafe {
@@ -11770,6 +13762,221 @@ impl<'a> Interp<'a> {
         self.pending_decl_class = None;
         self.pending_called_class = None;
         r
+    }
+
+    /// Dispatch `$obj->name($args)` through `__call(name, args)`.
+    fn call_via_magic(
+        &mut self,
+        obj: Rc<RefCell<PhpObject>>,
+        m: &Rc<MethodDecl>,
+        dc: Rc<PhpClass>,
+        name: &str,
+        args: CallArgs,
+    ) -> Result<Value, PhpError> {
+        let mut arr = PhpArray::new();
+        for a in &args.cells {
+            arr.push(a.borrow().clone());
+        }
+        for (n, a, ..) in &args.named {
+            arr.set(ArrKey::Str(Rc::from(n.as_str())), a.borrow().clone());
+        }
+        self.invoke_method(
+            obj,
+            m,
+            CallArgs::positional(vec![
+                cell(Value::str(name)),
+                cell(Value::Array(Rc::new(RefCell::new(arr)))),
+            ]),
+            dc,
+        )
+    }
+
+    /// A private method owned by the calling scope binds statically:
+    /// `$this->m()` inside `S::x` always resolves to `S::m`, bypassing
+    /// the object's override (zend private methods are not virtual).
+    fn scope_private_method(&mut self, name: &str) -> Option<(Rc<MethodDecl>, Rc<PhpClass>)> {
+        let scope = self
+            .stack
+            .last()
+            .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()).cloned())
+            .or_else(|| self.const_self.clone())?;
+        let m = scope.decl.find_method(&name.to_lowercase())?;
+        (m.visibility == crate::ast::Visibility::Private).then_some((m, scope))
+    }
+
+    /// Userland `Cls::name()` dispatch: gate visibility at the call
+    /// site, routing inaccessible methods through __callStatic.
+    fn static_invoke_vis(
+        &mut self,
+        cls: Rc<PhpClass>,
+        name: &str,
+        args: CallArgs,
+        called_class: Option<Rc<PhpClass>>,
+    ) -> Result<Value, PhpError> {
+        if let Some((m, sc)) = self.scope_private_method(name) {
+            let this_obj = if m.is_static {
+                None
+            } else {
+                self.stack
+                    .last()
+                    .and_then(|f| f.this_obj.clone())
+                    .filter(|o| {
+                        let cname = o.borrow().class.name().to_string();
+                        self.is_a_str(&cname, cls.name())
+                    })
+            };
+            self.pending_decl_class = Some(sc.clone());
+            self.pending_called_class = Some(called_class.unwrap_or(cls.clone()));
+            let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(sc));
+            self.pending_decl_class = None;
+            self.pending_called_class = None;
+            return r;
+        }
+        if let Some((m, dc)) = self.find_method_in(&cls, name) {
+            if !self.method_access_ok(&m, &dc) {
+                if let Some((cm, cdc)) = self.find_method_in(&cls, "__callstatic") {
+                    let mut arr = PhpArray::new();
+                    for a in &args.cells {
+                        arr.push(a.borrow().clone());
+                    }
+                    for (n, a, ..) in &args.named {
+                        arr.set(ArrKey::Str(Rc::from(n.as_str())), a.borrow().clone());
+                    }
+                    self.pending_decl_class = Some(cdc.clone());
+                    self.pending_called_class = Some(called_class.unwrap_or(cls.clone()));
+                    let r = self.invoke_fn(
+                        &Rc::new(cm.decl.clone()),
+                        CallArgs::positional(vec![
+                            cell(Value::str(name)),
+                            cell(Value::Array(Rc::new(RefCell::new(arr)))),
+                        ]),
+                        None,
+                        Some(cdc),
+                    );
+                    self.pending_decl_class = None;
+                    self.pending_called_class = None;
+                    return r;
+                }
+                let e = self.method_vis_error(&m, &dc);
+                return self.fail(e);
+            }
+        }
+        self.static_invoke(cls, name, args, called_class)
+    }
+
+    /// Userland `$obj->name()` dispatch: gate visibility at the call
+    /// site. Internal invocations (FCC bound scope, engine magic calls)
+    /// go through `method_invoke` unchecked.
+    fn method_invoke_vis(
+        &mut self,
+        obj: Rc<RefCell<PhpObject>>,
+        name: &str,
+        args: CallArgs,
+    ) -> Result<Value, PhpError> {
+        let cls = obj.borrow().class.clone();
+        // Scope-private binding takes precedence over the object's own
+        // method table (private methods are not virtual).
+        if let Some((m, sc)) = self.scope_private_method(name) {
+            if m.is_abstract {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    format!("Cannot call abstract method {}::{}()", sc.name(), name),
+                    0,
+                ));
+            }
+            return self.invoke_method(obj, &m, args, sc);
+        }
+        if let Some((m, dc)) = self.find_method_in(&cls, name) {
+            if !self.method_access_ok(&m, &dc) {
+                // Inaccessible method routes through __call when
+                // defined (zend_std_get_method fallback).
+                if let Some((cm, cdc)) = self.find_method_in(&cls, "__call") {
+                    return self.call_via_magic(obj, &cm, cdc, name, args);
+                }
+                let e = self.method_vis_error(&m, &dc);
+                return self.fail(e);
+            }
+        }
+        self.method_invoke(obj, name, args)
+    }
+
+    /// Method-call visibility against the current calling scope.
+    fn method_access_ok(&mut self, m: &MethodDecl, dc: &Rc<PhpClass>) -> bool {
+        let scope = self
+            .stack
+            .last()
+            .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()).cloned())
+            .or_else(|| self.const_self.clone());
+        match m.visibility {
+            crate::ast::Visibility::Public => true,
+            crate::ast::Visibility::Private => scope
+                .as_ref()
+                .map(|s| s.name() == dc.name())
+                .unwrap_or(false),
+            crate::ast::Visibility::Protected => scope
+                .as_ref()
+                .map(|s| {
+                    let proto = self.method_prototype(dc, &m.decl.name.to_lowercase());
+                    self.is_a_str(s.name(), dc.name())
+                        || self.is_a_str(dc.name(), s.name())
+                        // Sibling access: protected `B::m()` callable from
+                        // scope A when A is a descendant of the method's
+                        // PROTOTYPE owner (the ancestor that first
+                        // declared it — gh14009: A and B both extend P,
+                        // P first declared `common`).
+                        || self.is_a_str(s.name(), &proto)
+                })
+                .unwrap_or(false),
+        }
+    }
+
+    /// The ancestor class that first declared `lname` (non-private) —
+    /// the prototype owner for protected-member access rules.
+    fn method_prototype(&mut self, cls: &Rc<PhpClass>, lname: &str) -> String {
+        let mut owner = cls.name().to_string();
+        let mut cur = cls.decl.parent.clone();
+        while let Some(p) = cur {
+            let Some(pc) = self.classes.get(&p.to_lowercase()).cloned() else {
+                break;
+            };
+            if pc.decl.methods.iter().any(|m| {
+                m.decl.name.to_lowercase() == lname
+                    && !matches!(m.visibility, crate::ast::Visibility::Private)
+            }) {
+                owner = pc.decl.name.clone();
+            }
+            cur = pc.decl.parent.clone();
+        }
+        owner
+    }
+
+    /// `Call to private/protected method X::m() from scope Y` — catchable.
+    fn method_vis_error(&mut self, m: &MethodDecl, dc: &Rc<PhpClass>) -> PhpError {
+        let vis = match m.visibility {
+            crate::ast::Visibility::Public => "public",
+            crate::ast::Visibility::Protected => "protected",
+            crate::ast::Visibility::Private => "private",
+        };
+        let scope = self
+            .stack
+            .last()
+            .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()).cloned())
+            .or_else(|| self.const_self.clone());
+        let from = match &scope {
+            Some(s) => format!("scope {}", s.name()),
+            None => "global scope".to_string(),
+        };
+        PhpError::uncaught(
+            "Error",
+            format!(
+                "Call to {} method {}::{}() from {}",
+                vis,
+                dc.name(),
+                m.decl.name,
+                from
+            ),
+            0,
+        )
     }
 
     /// Calls a method by name through an object cell (magic methods, __call).
@@ -11876,22 +14083,7 @@ impl<'a> Interp<'a> {
             }
             None => {
                 if let Some((m, dc)) = self.find_method_in(&cls, "__call") {
-                    let mut arr = PhpArray::new();
-                    for a in &args.cells {
-                        arr.push(a.borrow().clone());
-                    }
-                    for (n, a, ..) in &args.named {
-                        arr.set(ArrKey::Str(Rc::from(n.as_str())), a.borrow().clone());
-                    }
-                    return self.invoke_method(
-                        obj,
-                        &m,
-                        CallArgs::positional(vec![
-                            cell(Value::str(name)),
-                            cell(Value::Array(Rc::new(RefCell::new(arr)))),
-                        ]),
-                        dc,
-                    );
+                    return self.call_via_magic(obj, &m, dc, name, args);
                 }
                 self.fail(PhpError::uncaught(
                     "Error",
@@ -12034,9 +14226,42 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `X::` member access where X may be a trait: traits resolve to a
+    /// synthesized class holding their statics; direct trait member
+    /// access is deprecated (direct_static_member_access). Returns the
+    /// resolved class plus the trait's display name when it is one.
+    fn member_class_of(
+        &mut self,
+        class: &Expr,
+    ) -> Result<(Rc<PhpClass>, Option<String>), PhpError> {
+        let name = self.class_name_of(class)?;
+        if let Some(td) = self.traits.get(&name.to_lowercase()).cloned() {
+            let key = td.name.to_lowercase();
+            let cls = self
+                .trait_statics
+                .entry(key)
+                .or_insert_with(|| {
+                    Rc::new(PhpClass {
+                        decl: td.clone(),
+                        statics: RefCell::new(HashMap::new()),
+                        statics_init: RefCell::new(false),
+                    })
+                })
+                .clone();
+            return Ok((cls, Some(td.name.clone())));
+        }
+        Ok((self.class_of(class)?, None))
+    }
+
     fn static_prop_read(&mut self, class: &Expr, name: &PropName) -> Result<Value, PhpError> {
         let name = self.prop_name(name)?;
-        let cls = self.class_of(class)?;
+        let (cls, tname) = self.member_class_of(class)?;
+        if let Some(t) = tname {
+            self.deprecated(&format!(
+                "Accessing static trait property {}::${} is deprecated, it should only be accessed on a class using the trait",
+                t, name
+            ))?;
+        }
         self.statics_init(&cls);
         let v = cls.statics.borrow().get(&name).map(|c| c.borrow().clone());
         match v {
@@ -12055,7 +14280,13 @@ impl<'a> Interp<'a> {
     }
 
     fn static_prop_named(&mut self, class: &Expr, name: &str) -> Result<Cell, PhpError> {
-        let cls = self.class_of(class)?;
+        let (cls, tname) = self.member_class_of(class)?;
+        if let Some(t) = tname {
+            self.deprecated(&format!(
+                "Accessing static trait property {}::${} is deprecated, it should only be accessed on a class using the trait",
+                t, name
+            ))?;
+        }
         self.statics_init(&cls);
         let found = cls.statics.borrow().get(name).cloned();
         match found {
@@ -12112,7 +14343,13 @@ impl<'a> Interp<'a> {
     }
 
     fn static_call(&mut self, class: &Expr, name: &str, args: &[Expr]) -> Result<Value, PhpError> {
-        let cls = self.class_of(class)?;
+        let (cls, tname) = self.member_class_of(class)?;
+        if let Some(t) = tname {
+            self.deprecated(&format!(
+                "Calling static trait method {}::{} is deprecated, it should only be called on a class using the trait",
+                t, name
+            ))?;
+        }
         let params = self
             .find_method_in(&cls, name)
             .map(|m| m.0.decl.params.clone())
@@ -12137,7 +14374,7 @@ impl<'a> Interp<'a> {
             }
             _ => None,
         };
-        self.static_invoke(cls, name, argvals, called)
+        self.static_invoke_vis(cls, name, argvals, called)
     }
 
     fn static_invoke(
@@ -12308,11 +14545,181 @@ impl<'a> Interp<'a> {
 
     /// Declared class/interface/trait names for get_declared_*().
     pub fn declared_names(&self, kind: crate::ast::ClassKind) -> Vec<String> {
-        self.classes
-            .values()
-            .filter(|c| c.decl.kind == kind)
-            .map(|c| c.name().to_string())
-            .collect()
+        let mut out = Vec::new();
+        for n in &self.decl_order {
+            let name = match kind {
+                crate::ast::ClassKind::Trait => self.traits.get(n).map(|d| d.name.clone()),
+                crate::ast::ClassKind::Interface => self.interfaces.get(n).map(|d| d.name.clone()),
+                _ => self
+                    .classes
+                    .get(n)
+                    .filter(|c| c.decl.kind == kind)
+                    .map(|c| c.name().to_string()),
+            };
+            if let Some(nm) = name {
+                out.push(nm);
+            }
+        }
+        for (k, a) in &self.decl_aliases {
+            if *k == kind {
+                out.push(a.clone());
+            }
+        }
+        out
+    }
+
+    /// class_alias($name, $alias): alias entries resolve like the
+    /// original (classes, interfaces and traits alike).
+    pub fn class_alias(&mut self, name: &str, alias: &str) -> Result<bool, PhpError> {
+        let alias_l = alias.trim_start_matches('\\').to_lowercase();
+        let key = name.trim_start_matches('\\').to_lowercase();
+        if let Some(c) = self.classes.get(&key).cloned() {
+            self.classes.insert(alias_l.clone(), c);
+            self.decl_aliases
+                .push((crate::ast::ClassKind::Class, alias_l));
+            return Ok(true);
+        }
+        if let Some(i) = self.interfaces.get(&key).cloned() {
+            self.interfaces.insert(alias_l.clone(), i);
+            self.decl_aliases
+                .push((crate::ast::ClassKind::Interface, alias_l));
+            return Ok(true);
+        }
+        if let Some(t) = self.traits.get(&key).cloned() {
+            self.traits.insert(alias_l.clone(), t);
+            self.decl_aliases
+                .push((crate::ast::ClassKind::Trait, alias_l));
+            return Ok(true);
+        }
+        self.warn(&format!("Class \"{}\" not found", name))?;
+        Ok(false)
+    }
+
+    /// Does this object's class implement `iname` (transitively)?
+    /// Used by serialize() for the Serializable C:-format branch.
+    pub fn obj_implements(&mut self, o: &Rc<RefCell<PhpObject>>, iname: &str) -> bool {
+        self.is_a(&o.borrow().class, iname)
+    }
+
+    /// Does `d` (a class decl) implement interface `iname`, directly or
+    /// through the implements chain of interfaces it names?
+    fn implements_iface(&self, d: &ClassDecl, iname: &str) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<String> = d.implements.clone();
+        while let Some(i) = stack.pop() {
+            let l = i.trim_start_matches('\\').to_lowercase();
+            if l == iname {
+                return true;
+            }
+            if !seen.insert(l.clone()) {
+                continue;
+            }
+            if let Some(id) = self.interfaces.get(&l) {
+                stack.extend(id.implements.iter().cloned());
+            }
+        }
+        false
+    }
+
+    /// Locate a class/interface/trait const decl by name — walks the
+    /// class chain, used traits' merged consts and implemented
+    /// interfaces (reflection APIs see trait consts on both sides).
+    fn find_const_decl(
+        &mut self,
+        cname: &str,
+        name: &str,
+    ) -> Option<(crate::ast::ConstDecl, String)> {
+        let key = cname.trim_start_matches('\\').to_lowercase();
+        if let Some(td) = self.traits.get(&key) {
+            for cd in &td.consts {
+                if cd.name == name {
+                    return Some((cd.clone(), td.file.clone()));
+                }
+            }
+            return None;
+        }
+        if let Some(id) = self.interfaces.get(&key) {
+            for cd in &id.consts {
+                if cd.name == name {
+                    return Some((cd.clone(), id.file.clone()));
+                }
+            }
+            return None;
+        }
+        let mut cur = self.classes.get(&key).cloned();
+        let mut ifaces: Vec<String> = Vec::new();
+        while let Some(c) = cur {
+            for cd in &c.decl.consts {
+                if cd.name == name {
+                    return Some((cd.clone(), c.decl.file.clone()));
+                }
+            }
+            ifaces.extend(c.decl.implements.iter().cloned());
+            cur = c
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        for iname in ifaces {
+            if let Some(id) = self.interfaces.get(&iname.to_lowercase()) {
+                for cd in &id.consts {
+                    if cd.name == name {
+                        return Some((cd.clone(), id.file.clone()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// All (name, (decl, file)) consts visible on `cname` — class chain
+    /// + interfaces; trait members appear via the class's merged decl.
+    fn all_const_decls(&mut self, cname: &str) -> Vec<(String, (crate::ast::ConstDecl, String))> {
+        let mut out: Vec<(String, (crate::ast::ConstDecl, String))> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let key = cname.trim_start_matches('\\').to_lowercase();
+        if let Some(td) = self.traits.get(&key).cloned() {
+            for cd in &td.consts {
+                if seen.insert(cd.name.clone()) {
+                    out.push((cd.name.clone(), (cd.clone(), td.file.clone())));
+                }
+            }
+            return out;
+        }
+        if let Some(id) = self.interfaces.get(&key).cloned() {
+            for cd in &id.consts {
+                if seen.insert(cd.name.clone()) {
+                    out.push((cd.name.clone(), (cd.clone(), id.file.clone())));
+                }
+            }
+            return out;
+        }
+        let mut cur = self.classes.get(&key).cloned();
+        let mut ifaces: Vec<String> = Vec::new();
+        while let Some(c) = cur {
+            for cd in &c.decl.consts {
+                if seen.insert(cd.name.clone()) {
+                    out.push((cd.name.clone(), (cd.clone(), c.decl.file.clone())));
+                }
+            }
+            ifaces.extend(c.decl.implements.iter().cloned());
+            cur = c
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        for iname in ifaces {
+            if let Some(id) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+                for cd in &id.consts {
+                    if seen.insert(cd.name.clone()) {
+                        out.push((cd.name.clone(), (cd.clone(), id.file.clone())));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Zend backtrace text for debug_print_backtrace(): innermost-first
@@ -12340,10 +14747,62 @@ impl<'a> Interp<'a> {
 
     /// is-a check between two class-name strings.
     fn is_a_str(&mut self, a: &str, b: &str) -> bool {
+        // Type-member checks during signature verification autoload the
+        // compared classes — Zend verifies covariance with the real
+        // hierarchy, so `C::m(): D` inside an autoloaded class sees `D`
+        // even when it is declared later (abstract_method_9).
+        if !self.classes.contains_key(&a.to_lowercase()) && self.run_autoload(a).is_err() {
+            // An autoload failure is a compile-time fatal everywhere
+            // else; inside a signature check a missing class just means
+            // "not a subtype".
+            self.pending_exception = None;
+        }
         match self.classes.get(&a.to_lowercase()).cloned() {
             Some(c) => self.is_a(&c, b),
-            None => a.eq_ignore_ascii_case(b),
+            None => self.is_a_unresolved(a, b, 0),
         }
+    }
+
+    /// Ancestry check by NAME for a class not (yet) in `self.classes`:
+    /// walks parent/implements names through `classes` and `linking`.
+    fn is_a_unresolved(&mut self, a: &str, b: &str, depth: u8) -> bool {
+        if a.trim_start_matches('\\').eq_ignore_ascii_case(b) {
+            return true;
+        }
+        if depth > 16 {
+            return false;
+        }
+        let d = self
+            .classes
+            .get(&a.to_lowercase())
+            .map(|c| c.decl.clone())
+            .or_else(|| {
+                self.linking
+                    .iter()
+                    .rev()
+                    .find(|d| d.name.eq_ignore_ascii_case(a))
+                    .cloned()
+            })
+            .or_else(|| {
+                self.interfaces
+                    .get(&a.to_lowercase())
+                    .cloned()
+                    .or_else(|| self.traits.get(&a.to_lowercase()).cloned())
+            });
+        let Some(d) = d else {
+            return false;
+        };
+        if let Some(p) = &d.parent {
+            if self.is_a_unresolved(p, b, depth + 1) {
+                return true;
+            }
+        }
+        for i in &d.implements {
+            if self.is_a_unresolved(i, b, depth + 1) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn find_method_in(
@@ -12383,6 +14842,73 @@ impl<'a> Interp<'a> {
 
     fn class_const(&mut self, class: &Expr, name: &str) -> Result<Value, PhpError> {
         let cname = self.class_name_of(class)?;
+        self.class_const_named(&cname, name)
+    }
+
+    /// is_callable(['Cls'|$obj, 'm']): 'parent'/'self'/'static' names
+    /// resolve against the caller's scope; "parent"/"self" string
+    /// callables are deprecated once they resolve (bug76773-deprecated).
+    pub fn is_callable_arr(&mut self, first: &Value, mname: &str) -> bool {
+        let cls = match first {
+            Value::Object(o) => Some(o.borrow().class.clone()),
+            Value::Str(n) => {
+                let n = crate::value::lossy(n);
+                let ln = n.trim_start_matches('\\').to_lowercase();
+                match ln.as_str() {
+                    "parent" | "self" | "static" => {
+                        let Some(scope) = self.caller_scope_name() else {
+                            return false;
+                        };
+                        let Some(sc) = self.classes.get(&scope.to_lowercase()).cloned() else {
+                            return false;
+                        };
+                        let target = match ln.as_str() {
+                            "parent" => sc
+                                .decl
+                                .parent
+                                .as_ref()
+                                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned()),
+                            "static" => self
+                                .stack
+                                .last()
+                                .and_then(|f| f.called_class.clone())
+                                .or(Some(sc)),
+                            _ => Some(sc),
+                        };
+                        if let Some(c) = &target {
+                            if self.find_method_in(c, mname).is_some() {
+                                self.deprecated(&format!(
+                                    "Use of \"{}\" in callables is deprecated",
+                                    ln
+                                ))
+                                .ok();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                    _ => {
+                        if !self.classes.contains_key(&ln) {
+                            let _ = self.run_autoload(&n);
+                            self.pending_exception = None;
+                        }
+                        self.classes.get(&ln).cloned()
+                    }
+                }
+            }
+            _ => None,
+        };
+        match cls {
+            Some(c) => self.find_method_in(&c, mname).is_some(),
+            None => false,
+        }
+    }
+
+    /// `Cls::CONST` lookup by plain class-name string (shared with the
+    /// constant() builtin so `constant('T::X')` honours the trait-const
+    /// rule — constant_018).
+    pub fn class_const_named(&mut self, cname: &str, name: &str) -> Result<Value, PhpError> {
+        let cname = cname.to_string();
         if name == "class" {
             return Ok(Value::str(cname));
         }
@@ -12392,6 +14918,16 @@ impl<'a> Interp<'a> {
             .resolve_class(&cname)
             .unwrap_or_else(|| cname.clone())
             .to_lowercase();
+        if let Some(td) = self.traits.get(&ckey).cloned() {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!(
+                    "Cannot access trait constant {}::{} directly",
+                    td.name, name
+                ),
+                0,
+            ));
+        }
         if let Some(iface) = self.interfaces.get(&ckey).cloned() {
             // Const on an interface (e.g. `FastRoute\Dispatcher::FOUND`):
             // walk it and its extended interfaces.
@@ -12401,10 +14937,10 @@ impl<'a> Interp<'a> {
                 if !seen.insert(c.name.to_lowercase()) {
                     continue;
                 }
-                for (n, e) in &c.consts {
-                    if n == name {
+                for cd in &c.consts {
+                    if cd.name == name {
                         self.class_const_ctx += 1;
-                        let r = self.eval_decl_const(e, &c.file);
+                        let r = self.eval_decl_const(&cd.value, &c.file);
                         self.class_const_ctx -= 1;
                         return r;
                     }
@@ -12441,11 +14977,11 @@ impl<'a> Interp<'a> {
         let mut cur = Some(cls.clone());
         let mut ifaces: Vec<String> = Vec::new();
         while let Some(c) = cur {
-            for (n, e) in &c.decl.consts {
-                if n == name {
+            for cd in &c.decl.consts {
+                if cd.name == name {
                     let old = self.const_self.replace(c.clone());
                     self.class_const_ctx += 1;
-                    let r = self.eval_decl_const(e, &c.decl.file);
+                    let r = self.eval_decl_const(&cd.value, &c.decl.file);
                     self.class_const_ctx -= 1;
                     self.const_self = old;
                     return r;
@@ -12465,11 +15001,11 @@ impl<'a> Interp<'a> {
                 continue;
             }
             if let Some(c) = self.interfaces.get(&iname.to_lowercase()).cloned() {
-                for (n, e) in &c.consts {
-                    if n == name {
+                for cd in &c.consts {
+                    if cd.name == name {
                         let old = self.const_self.replace(cls.clone());
                         self.class_const_ctx += 1;
-                        let r = self.eval_decl_const(e, &c.file);
+                        let r = self.eval_decl_const(&cd.value, &c.file);
                         self.class_const_ctx -= 1;
                         self.const_self = old;
                         return r;
@@ -12926,6 +15462,31 @@ impl<'a> Interp<'a> {
         self.classes
             .get(&name.trim_start_matches('\\').to_lowercase())
             .cloned()
+    }
+    /// get_called_class(): late-static-binding class of the current
+    /// frame, `false` outside a called-class context (static_get_called_class).
+    pub fn called_class_name(&mut self) -> Value {
+        match self.stack.last().and_then(|f| f.called_class.clone()) {
+            Some(c) => Value::str(c.name().to_string()),
+            None => Value::Bool(false),
+        }
+    }
+
+    /// property_exists(): instance prop declared on the class or any
+    /// ancestor (property002).
+    pub fn class_has_prop(&self, c: &Rc<PhpClass>, name: &str) -> bool {
+        let mut cur = Some(c.clone());
+        while let Some(k) = cur {
+            if k.decl.props.iter().any(|p| p.name == name) {
+                return true;
+            }
+            cur = k
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        false
     }
     pub fn instantiate_class(&mut self, name: &str, args: Vec<Cell>) -> Result<Value, PhpError> {
         self.new_instance(name, CallArgs::positional(args))

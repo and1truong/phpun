@@ -1404,6 +1404,20 @@ impl<'a> Parser<'a> {
         }
         let mut parent = None;
         let mut implements = Vec::new();
+        // `trait Foo extends ...` / `trait Foo implements ...` are
+        // syntax errors — traits can't inherit (bug55524).
+        if kind == ClassKind::Trait && self.ident_is("extends") {
+            return Err(PhpError::parse(
+                "syntax error, unexpected token \"extends\", expecting \"{\"",
+                self.line(),
+            ));
+        }
+        if kind == ClassKind::Trait && self.ident_is("implements") {
+            return Err(PhpError::parse(
+                "syntax error, unexpected token \"implements\", expecting \"{\"",
+                self.line(),
+            ));
+        }
         if self.eat_ident("extends") {
             if kind == ClassKind::Interface {
                 // `interface Y extends X, Z` — multiple interface parents
@@ -1431,6 +1445,7 @@ impl<'a> Parser<'a> {
         let mut props = Vec::new();
         let mut consts = Vec::new();
         let mut traits = Vec::new();
+        let mut adaptations = Vec::new();
         while !self.at_op("}") {
             if self.peek().is_none() {
                 return Err(PhpError::parse(
@@ -1438,7 +1453,9 @@ impl<'a> Parser<'a> {
                     self.line(),
                 ));
             }
-            self.skip_attrs()?;
+            // `#[Attr]` groups attach to the member that follows —
+            // consts keep them for ReflectionClassConstant (constant_020).
+            let member_attrs = self.parse_attrs()?;
             let mut vis = Visibility::Public;
             let mut is_static = false;
             let mut m_abstract = false;
@@ -1489,10 +1506,51 @@ impl<'a> Parser<'a> {
             if self.ident_is("const") {
                 self.pos += 1;
                 loop {
+                    // Typed class constants (PHP 8.3): `const string C`
+                    // — a type is present iff the run of type tokens is
+                    // followed by `=`: the last Ident before `=` is the
+                    // const's name, everything before it is the type.
+                    let ty = {
+                        let mut j = self.pos;
+                        let mut run = 0usize;
+                        loop {
+                            match self.toks.get(j).map(|l| &l.token) {
+                                Some(Token::Ident(_)) => {
+                                    j += 1;
+                                    run += 1;
+                                }
+                                Some(Token::Op(o))
+                                    if matches!(*o, "?" | "|" | "&" | "\\" | "(" | ")") =>
+                                {
+                                    j += 1;
+                                    run += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        if run > 1
+                            && matches!(
+                                self.toks.get(j).map(|l| &l.token),
+                                Some(Token::Op(o)) if *o == "="
+                            )
+                        {
+                            self.take_type()
+                        } else {
+                            None
+                        }
+                    };
                     let cname = self.ident().unwrap_or_default();
                     self.expect_op("=")?;
                     let cv = self.expr()?;
-                    consts.push((cname, cv));
+                    consts.push(crate::ast::ConstDecl {
+                        name: cname,
+                        value: cv,
+                        visibility: vis,
+                        is_final: m_final,
+                        ty,
+                        attrs: member_attrs.clone(),
+                        decl_in: None,
+                    });
                     if !self.eat_op(",") {
                         break;
                     }
@@ -1509,16 +1567,77 @@ impl<'a> Parser<'a> {
                     }
                 }
                 if self.eat_op("{") {
-                    // Trait adaptations (`insteadof`/`as`) — skip the block.
-                    let mut depth = 1i32;
-                    while depth > 0 {
-                        match self.next() {
-                            Some(Token::Op("{")) => depth += 1,
-                            Some(Token::Op("}")) => depth -= 1,
-                            Some(_) => {}
-                            None => break,
+                    // Trait adaptations: `T::m insteadof T2, T3;`
+                    // `m as alias;` `m as private;` `T::m as private alias;`
+                    while !self.at_op("}") {
+                        if self.peek().is_none() {
+                            return Err(PhpError::parse(
+                                "syntax error, unexpected end of file",
+                                self.line(),
+                            ));
                         }
+                        let first = self.name_path().unwrap_or_default();
+                        let (tname, mname) = if self.eat_op("::") {
+                            (
+                                Some(self.ns_resolve(&first, NsKind::Class)),
+                                self.ident().unwrap_or_default(),
+                            )
+                        } else {
+                            (None, first)
+                        };
+                        if self.ident_is("insteadof") {
+                            self.pos += 1;
+                            let mut excludes = Vec::new();
+                            while let Some(n) = self.name_path() {
+                                excludes.push(self.ns_resolve(&n, NsKind::Class));
+                                if !self.eat_op(",") {
+                                    break;
+                                }
+                            }
+                            adaptations.push(TraitAdaptation::Insteadof {
+                                trait_name: tname.unwrap_or_default(),
+                                method: mname,
+                                excludes,
+                            });
+                        } else if self.ident_is("as") {
+                            self.pos += 1;
+                            let mut vis = None;
+                            let mut is_final = false;
+                            loop {
+                                if self.ident_is("public") {
+                                    vis = Some(Visibility::Public);
+                                } else if self.ident_is("protected") {
+                                    vis = Some(Visibility::Protected);
+                                } else if self.ident_is("private") {
+                                    vis = Some(Visibility::Private);
+                                } else if self.ident_is("final") {
+                                    is_final = true;
+                                } else {
+                                    break;
+                                }
+                                self.pos += 1;
+                            }
+                            let alias = if matches!(self.peek(), Some(Token::Ident(_))) {
+                                Some(self.ident().unwrap_or_default())
+                            } else {
+                                None
+                            };
+                            adaptations.push(TraitAdaptation::Alias {
+                                trait_name: tname,
+                                method: mname,
+                                alias,
+                                vis,
+                                is_final,
+                            });
+                        } else {
+                            return Err(PhpError::parse(
+                                format!("syntax error, unexpected identifier \"{}\"", mname),
+                                self.line(),
+                            ));
+                        }
+                        self.expect_op(";")?;
                     }
+                    self.expect_op("}")?;
                 } else {
                     self.expect_op(";")?;
                 }
@@ -1533,7 +1652,15 @@ impl<'a> Parser<'a> {
                 } else {
                     Expr::Null
                 };
-                consts.push((cname, cv));
+                consts.push(crate::ast::ConstDecl {
+                    name: cname,
+                    value: cv,
+                    visibility: Visibility::Public,
+                    is_final: false,
+                    ty: None,
+                    attrs: vec![],
+                    decl_in: None,
+                });
                 self.expect_op(";")?;
                 continue;
             }
@@ -1605,6 +1732,7 @@ impl<'a> Parser<'a> {
             parent,
             implements,
             traits,
+            adaptations,
             methods,
             props,
             consts,
@@ -1625,9 +1753,11 @@ impl<'a> Parser<'a> {
         let name = self.ident().unwrap_or_default();
         let prev_hook = self.hook_ctx.take();
         let params = self.params()?;
-        if self.eat_op(":") {
-            self.skip_type()?;
-        }
+        let ret = if self.eat_op(":") {
+            self.take_type()
+        } else {
+            None
+        };
         let body = if self.eat_op(";") {
             Vec::new()
         } else {
@@ -1636,6 +1766,7 @@ impl<'a> Parser<'a> {
         self.hook_ctx = prev_hook;
         Ok(MethodDecl {
             decl: FunctionDecl {
+                ret,
                 name,
                 params,
                 body,
@@ -1644,11 +1775,13 @@ impl<'a> Parser<'a> {
                 line,
                 file: String::new(),
                 ns: self.cur_ns.clone(),
+                decl_in: None,
             },
             is_static,
             is_abstract,
             is_final,
             visibility: vis,
+            trait_alias_of: None,
         })
     }
 
@@ -2005,22 +2138,26 @@ impl<'a> Parser<'a> {
         })?;
         let prev_hook = self.hook_ctx.take();
         let params = self.params()?;
-        // Return type declarations (: int) — parse & ignore for now.
-        if self.eat_op(":") {
-            self.skip_type()?;
-        }
+        // Return type declarations (: int).
+        let ret = if self.eat_op(":") {
+            self.take_type()
+        } else {
+            None
+        };
         let body = self.body()?;
         self.hook_ctx = prev_hook;
         let name = self.ns_qualify(&name);
         Ok(Stmt::Function(FunctionDecl {
             name,
             params,
+            ret,
             body,
             attrs: std::mem::take(&mut self.pending_class_attrs),
             by_ref,
             line,
             file: String::new(),
             ns: self.cur_ns.clone(),
+            decl_in: None,
         }))
     }
 
@@ -2081,6 +2218,7 @@ impl<'a> Parser<'a> {
         self.hook_ctx = prev_hook;
         Ok(Expr::Closure(ClosureExpr {
             decl: FunctionDecl {
+                ret: None,
                 name: String::new(),
                 params,
                 body,
@@ -2089,6 +2227,7 @@ impl<'a> Parser<'a> {
                 line,
                 file: String::new(),
                 ns: self.cur_ns.clone(),
+                decl_in: None,
             },
             uses,
             arrow,
@@ -2192,7 +2331,15 @@ impl<'a> Parser<'a> {
                     loop {
                         let cname = self.ident().unwrap_or_default();
                         self.expect_op("=")?;
-                        consts.push((cname, self.expr()?));
+                        consts.push(crate::ast::ConstDecl {
+                            name: cname,
+                            value: self.expr()?,
+                            visibility: Visibility::Public,
+                            is_final: false,
+                            ty: None,
+                            attrs: vec![],
+                            decl_in: None,
+                        });
                         if !self.eat_op(",") {
                             break;
                         }
@@ -2231,7 +2378,15 @@ impl<'a> Parser<'a> {
                     } else {
                         Expr::Null
                     };
-                    consts.push((cname, cv));
+                    consts.push(crate::ast::ConstDecl {
+                        name: cname,
+                        value: cv,
+                        visibility: Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                    });
                     self.expect_op(";")?;
                     continue;
                 }
@@ -2301,6 +2456,7 @@ impl<'a> Parser<'a> {
                     parent,
                     implements,
                     traits,
+                    adaptations: vec![],
                     methods,
                     props,
                     consts,
@@ -3614,6 +3770,9 @@ impl<'a> Parser<'a> {
                 } else if self.ident_is("__class__") {
                     self.pos += 1;
                     Ok(Expr::MagicConst(MagicConst::Class))
+                } else if self.ident_is("__trait__") {
+                    self.pos += 1;
+                    Ok(Expr::MagicConst(MagicConst::Trait))
                 } else if self.ident_is("__namespace__") {
                     self.pos += 1;
                     // __NAMESPACE__ is compile-time per the file the

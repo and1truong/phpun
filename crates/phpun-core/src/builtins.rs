@@ -2703,10 +2703,28 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         )),
         "is_callable" => Value::Bool(match arg(args, 0) {
             Value::Callable(_) => true,
-            Value::Str(s) => it
-                .functions
-                .contains_key(&crate::value::lossy(&s).to_lowercase()),
-            Value::Array(a) => a.borrow().entries.len() == 2,
+            Value::Str(s) => {
+                it.functions
+                    .contains_key(&crate::value::lossy(&s).to_lowercase())
+                    || is_builtin(&crate::value::lossy(&s).to_lowercase())
+            }
+            Value::Array(a) => {
+                let e: Vec<Value> = a
+                    .borrow()
+                    .entries
+                    .iter()
+                    .map(|x| x.1.borrow().clone())
+                    .collect();
+                if e.len() != 2 {
+                    false
+                } else {
+                    let mname = match &e[1] {
+                        Value::Str(s) => crate::value::lossy(s).to_string(),
+                        _ => String::new(),
+                    };
+                    it.is_callable_arr(&e[0], &mname)
+                }
+            }
             _ => false,
         }),
         "is_iterable" => Value::Bool(matches!(arg(args, 0), Value::Array(_))),
@@ -2735,14 +2753,18 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "constant" => {
             let n = arg_str(it, args, 0);
-            if n.contains("::") {
-                let cls = n.split_once("::").map(|(c, _)| c).unwrap_or_default();
-                return err("Error", format!("Class \"{}\" not found", cls));
+            if let Some((cls, cn)) = n.split_once("::") {
+                return it.class_const_named(cls, cn).map(Some);
             }
             match it.const_get(&n) {
                 Some(v) => v,
                 None => return err("Error", format!("Undefined constant {}", n)),
             }
+        }
+        "class_alias" => {
+            let name = arg_str(it, args, 0);
+            let alias = arg_str(it, args, 1);
+            Value::Bool(it.class_alias(&name, &alias)?)
         }
         "function_exists" => {
             let n = arg_str(it, args, 0).trim_start_matches('\\').to_lowercase();
@@ -2782,7 +2804,19 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             _ => Value::Bool(false),
         },
         "property_exists" => match arg(args, 0) {
-            Value::Object(o) => Value::Bool(o.borrow().props.contains_key(&arg_str(it, args, 1))),
+            Value::Object(o) => {
+                let n = arg_str(it, args, 1);
+                Value::Bool(
+                    o.borrow().props.contains_key(&n) || it.class_has_prop(&o.borrow().class, &n),
+                )
+            }
+            Value::Str(cn) => {
+                let n = arg_str(it, args, 1);
+                match it.lookup_class(&crate::value::lossy(&cn)) {
+                    Some(c) => Value::Bool(it.class_has_prop(&c, &n)),
+                    None => Value::Bool(false),
+                }
+            }
             _ => Value::Bool(false),
         },
         "get_class" => match arg(args, 0) {
@@ -3187,7 +3221,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "output_reset_rewrite_vars" => Value::Bool(true),
 
         // ----- serialization -----
-        "serialize" => Value::str(serialize(&arg(args, 0))),
+        "serialize" => Value::str(serialize(it, &arg(args, 0))),
         "unserialize" => {
             let s = arg_str(it, args, 0);
             let mut pos = 0;
@@ -4213,7 +4247,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             }
         }
         "closure_from_callable" | "closure::fromcallable" => arg(args, 0),
-        "get_called_class" => Value::str(""),
+        "get_called_class" => it.called_class_name(),
         "spl_autoload_register" => {
             if let Some(v) = args.first() {
                 it.autoload_fns.push(v.borrow().clone());
@@ -5942,7 +5976,7 @@ fn sort_array(
 
 // ---------- serialize/json ----------
 
-fn serialize(v: &Value) -> String {
+fn serialize(it: &mut Interp, v: &Value) -> String {
     match v {
         Value::Null => "N;".into(),
         Value::Bool(b) => format!("b:{};", *b as i32),
@@ -5953,24 +5987,46 @@ fn serialize(v: &Value) -> String {
             let a = a.borrow();
             let mut s = format!("a:{}:{{", a.len());
             for (k, c) in a.iter() {
-                s.push_str(&serialize(&match k {
-                    ArrKey::Int(i) => Value::Int(*i),
-                    ArrKey::Str(st) => Value::str(st.to_string()),
-                    ArrKey::Tomb => Value::Null,
-                }));
-                s.push_str(&serialize(&c.borrow()));
+                s.push_str(&serialize(
+                    it,
+                    &match k {
+                        ArrKey::Int(i) => Value::Int(*i),
+                        ArrKey::Str(st) => Value::str(st.to_string()),
+                        ArrKey::Tomb => Value::Null,
+                    },
+                ));
+                s.push_str(&serialize(it, &c.borrow()));
             }
             s.push('}');
             s
         }
         Value::Object(o) => {
+            // Serializable implementors serialize as C:...{payload}
+            // where the payload is whatever ->serialize() returns.
+            if it.obj_implements(o, "serializable") {
+                if let Ok(payload) =
+                    it.method_invoke(o.clone(), "serialize", crate::interp::CallArgs::empty())
+                {
+                    let Value::Str(pb) = &payload else {
+                        return "N;".into();
+                    };
+                    let p = crate::value::lossy(pb);
+                    return format!(
+                        "C:{}:\"{}\":{}:{{{}}}",
+                        o.borrow().class.name().len(),
+                        o.borrow().class.name(),
+                        p.len(),
+                        p
+                    );
+                }
+            }
             let ob = o.borrow();
             let mut body = String::new();
             let mut n = 0;
             for name in &ob.prop_order {
                 if let Some(c) = ob.props.get(name) {
-                    body.push_str(&serialize(&Value::str(name.clone())));
-                    body.push_str(&serialize(&c.borrow()));
+                    body.push_str(&serialize(it, &Value::str(name.clone())));
+                    body.push_str(&serialize(it, &c.borrow()));
                     n += 1;
                 }
             }
@@ -6045,6 +6101,38 @@ fn unserialize(it: &mut Interp, s: &str, pos: &mut usize) -> Result<Value, ()> {
             }
             *pos += 1; // }
             Ok(Value::Array(Rc::new(RefCell::new(arr))))
+        }
+        Some(b'C') => {
+            // C:<clen>:"<class>":<plen>:{<payload>} — a Serializable
+            // payload; instantiate without ctor and call ->unserialize().
+            *pos += 2;
+            let clen: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
+            *pos += 1; // opening quote
+            if *pos + clen > b.len() {
+                return Err(());
+            }
+            let cname = String::from_utf8_lossy(&b[*pos..*pos + clen]).into_owned();
+            *pos += clen;
+            *pos += 1; // closing quote
+            *pos += 1; // :
+            let plen: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
+            *pos += 1; // {
+            if *pos + plen > b.len() {
+                return Err(());
+            }
+            let payload = String::from_utf8_lossy(&b[*pos..*pos + plen]).into_owned();
+            *pos += plen;
+            *pos += 1; // }
+            let obj = match it.instantiate(&cname.to_lowercase(), &[]) {
+                Ok(Value::Object(o)) => o,
+                _ => return Err(()),
+            };
+            let _ = it.method_invoke(
+                obj.clone(),
+                "unserialize",
+                crate::interp::CallArgs::positional(vec![cell(Value::str(payload))]),
+            );
+            Ok(Value::Object(obj))
         }
         Some(b'O') => {
             // O:<clen>:"<class>":<n>:{<pairs>}

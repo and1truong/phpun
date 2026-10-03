@@ -103,13 +103,36 @@ pub struct ClassDecl {
     pub attrs: Vec<AttrDecl>,
     /// `use`d traits (inside the body).
     pub traits: Vec<String>,
+    /// Adaptations inside `use T { ... }` blocks.
+    pub adaptations: Vec<TraitAdaptation>,
     pub methods: Vec<Rc<MethodDecl>>,
     /// (name, default value expr, flags)
     pub props: Vec<PropDecl>,
-    pub consts: Vec<(String, Expr)>,
+    pub consts: Vec<ConstDecl>,
     /// Declaring file — filled at registration; const-exprs inside
     /// (prop/const defaults) bind __FILE__/__DIR__ to it.
     pub file: String,
+}
+
+/// One rule inside a `use T { ... }` trait-use block.
+#[derive(Debug, Clone)]
+pub enum TraitAdaptation {
+    /// `T::m insteadof T2, T3` — T's m wins; the listed traits' m is
+    /// suppressed during composition.
+    Insteadof {
+        trait_name: String,
+        method: String,
+        excludes: Vec<String>,
+    },
+    /// `[T::]m as [visibility] [alias]` — clone m under a new name
+    /// and/or change its visibility; the original stays.
+    Alias {
+        trait_name: Option<String>,
+        method: String,
+        alias: Option<String>,
+        vis: Option<Visibility>,
+        is_final: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +152,22 @@ pub enum ClassKind {
     Interface,
     Trait,
     Enum,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstDecl {
+    pub name: String,
+    pub value: Expr,
+    pub visibility: Visibility,
+    pub is_final: bool,
+    /// Declared type members (`const string C1`, PHP 8.3 typed consts);
+    /// None = untyped.
+    pub ty: Option<Vec<String>>,
+    /// `#[Attr]` groups on the const (ReflectionClassConstant::
+    /// getAttributes — constant_020).
+    pub attrs: Vec<AttrDecl>,
+    /// Trait the const was merged from (`use T`); None = declared here.
+    pub decl_in: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +228,11 @@ pub struct MethodDecl {
     pub is_abstract: bool,
     pub is_final: bool,
     pub visibility: Visibility,
+    /// Created by a `T::m as vis alias` trait adaptation — holds the
+    /// ORIGINAL method name (ReflectionClass::getTraitAliases reports
+    /// `alias => "T::orig"`). The private-final warning skips alias
+    /// copies — gh17214 vs gh12854.
+    pub trait_alias_of: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +293,8 @@ pub struct AttrDecl {
 pub struct FunctionDecl {
     pub name: String,
     pub params: Vec<Param>,
+    /// Return type members (source order); None = no declaration.
+    pub ret: Option<Vec<String>>,
     pub body: Vec<Stmt>,
     /// `#[Attr]` groups preceding the declaration.
     pub attrs: Vec<AttrDecl>,
@@ -264,6 +310,10 @@ pub struct FunctionDecl {
     /// calls/consts inside this function try the namespaced name first,
     /// then fall back to global (Zend/tests/namespaces).
     pub ns: String,
+    /// Trait this method was merged from (`use T`) — `__METHOD__` and
+    /// `__TRAIT__` name the trait, `__CLASS__`/`self`/`static` the
+    /// consuming class.
+    pub decl_in: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -476,4 +526,6 @@ pub enum MagicConst {
     Namespace,
     /// `__PROPERTY__` — the hooked prop's name inside a hook, "" outside.
     Property,
+    /// `__TRAIT__` — the trait a method was merged from, "" outside.
+    Trait,
 }
