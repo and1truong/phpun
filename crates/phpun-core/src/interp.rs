@@ -2721,12 +2721,18 @@ impl<'a> Interp<'a> {
                 // Compile-time param checks for the closure's decl —
                 // `{closure:FILE:LINE}():` names it (namespaces/ns_073).
                 let cfile = if c.decl.file.is_empty() {
-                    self.file.to_string()
+                    self.cur_file.clone()
                 } else {
                     c.decl.file.clone()
                 };
                 let fname = format!("{{closure:{}:{}}}", cfile, c.decl.line);
-                let decl = c.decl.clone();
+                // The closure's decl.file = the file currently executing
+                // — __FILE__/__DIR__ inside it must resolve to where it
+                // was defined, not where it is later invoked (autoloaders).
+                let mut decl = c.decl.clone();
+                if decl.file.is_empty() {
+                    decl.file = cfile;
+                }
                 self.decl_type_checks(&fname, &decl)?;
                 let mut captures = Vec::new();
                 if c.arrow {
@@ -2751,7 +2757,7 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Callable(self.new_callable(PhpCallable {
                     id: std::cell::Cell::new(0),
-                    kind: CallableKind::Closure(Rc::new(c.decl.clone())),
+                    kind: CallableKind::Closure(Rc::new(decl)),
                     captures,
                     this_obj: self.stack.last().and_then(|f| f.this_obj.clone()),
                     scope_class: self.stack.last().and_then(|f| f.scope_class.clone()),
@@ -2896,11 +2902,21 @@ impl<'a> Interp<'a> {
     }
 
     fn magic(&mut self, m: MagicConst) -> Value {
+        // __FILE__/__DIR__ resolve against the DECLARING file of the
+        // code that runs them — a closure defined in vendor/autoload.php
+        // sees that file's dir even when invoked from elsewhere
+        // (composer-style PSR-4 autoloaders depend on this).
+        let decl_file = self
+            .stack
+            .last()
+            .map(|f| f.file.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.cur_file.clone());
         match m {
             MagicConst::Line => Value::Int(self.cur_line as i64),
-            MagicConst::File => Value::str(self.file),
+            MagicConst::File => Value::str(decl_file.clone()),
             MagicConst::Dir => Value::str(
-                std::path::Path::new(self.file)
+                std::path::Path::new(&decl_file)
                     .parent()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
@@ -5089,6 +5105,11 @@ impl<'a> Interp<'a> {
                         }
                         frame.this_obj = c.this_obj.clone();
                         frame.scope_class = c.scope_class.clone();
+                        frame.file = if decl.file.is_empty() {
+                            self.cur_file.clone()
+                        } else {
+                            decl.file.clone()
+                        };
                         let decl = decl.clone();
                         self.stack.push(frame);
                         // bind params manually (frame already pushed for captures)
@@ -6962,6 +6983,9 @@ impl<'a> Interp<'a> {
     /// `new X(args)` — instantiate + call __construct.
     fn new_instance(&mut self, name: &str, args: Vec<Cell>) -> Result<Value, PhpError> {
         let lname = name.to_lowercase();
+        if !self.classes.contains_key(&lname) {
+            self.run_autoload(name.trim_start_matches('\\'));
+        }
         let cls = match self.classes.get(&lname) {
             Some(c) => c.clone(),
             None => {
