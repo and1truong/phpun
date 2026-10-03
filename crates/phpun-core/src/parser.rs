@@ -2561,10 +2561,17 @@ impl<'a> Parser<'a> {
             }
             self.expect_op("}")?;
             self.class_ctx.pop();
+            // Zend names anonymous classes after their first base:
+            // `{Parent}@anonymous`, else `{FirstInterface}@anonymous`,
+            // else `class@anonymous` (typed_properties_065).
+            let anon_base = parent
+                .as_deref()
+                .or(implements.first().map(String::as_str))
+                .unwrap_or("class");
             return Ok((
                 Expr::AnonClass(Rc::new(ClassDecl {
                     attrs: vec![],
-                    name: format!("class@anonymous${}", self.line()),
+                    name: format!("{}@anonymous${}", anon_base, self.line()),
                     kind: ClassKind::Class,
                     is_abstract: false,
                     is_final: false,

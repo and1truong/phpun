@@ -298,7 +298,24 @@ pub struct Interp<'a> {
     pub typed_slots: std::collections::HashMap<usize, (Cell, Vec<String>, String, String)>,
     /// Additional typed-prop owners of a shared ref cell (the
     /// `typed_slots` entry holds the first) — `union_types/prop_ref_assign`.
-    pub slot_owners: std::collections::HashMap<usize, Vec<(Vec<String>, String, String)>>,
+    pub slot_owners: std::collections::HashMap<usize, Vec<SlotOwner>>,
+    /// The running intersection of every bound owner's declared type —
+    /// `typed_slots` keeps the holder's declared type for messages.
+    pub slot_merged: std::collections::HashMap<usize, Vec<String>>,
+    /// Where each typed cell came from: a prop slot stays a prop slot
+    /// even while aliased — the rejecting owner is reported as
+    /// "Cannot assign X to property" only for prop-born cells
+    /// (typed_properties_034 vs _078).
+    pub slot_anchor: std::collections::HashMap<usize, SlotAnchor>,
+    /// Cells reached through a `=&` bind / by-ref fetch — Zend
+    /// IS_REFERENCE zvals. Write-through errors say "a reference held
+    /// by property"; plain prop slots say "property"
+    /// (typed_properties_034 first vs second foo() call).
+    pub ref_cells: std::collections::HashSet<usize>,
+    /// Ptr of a typed prop slot eval_cell materialized to `null` just
+    /// now — a rejected array auto-init must leave the prop
+    /// uninitialized again (typed_properties_083).
+    last_fresh_cell: Option<usize>,
     /// Interfaces registered by the builtin-class table — their method
     /// signatures carry *tentative* return types: implementations may
     /// declare any return type (typed_properties_065).
@@ -328,6 +345,24 @@ pub struct Interp<'a> {
     /// `-d` ini settings (e.g. short_open_tag=on).
     pub ini: HashMap<String, String>,
 }
+
+/// Where a typed-slot owner lives — pruned when the named prop no
+/// longer points at the shared cell (static rebind 082, unset, dead
+/// object 094).
+#[derive(Clone)]
+pub enum SlotAnchor {
+    /// Object prop: weak object ref + the props-map slot key.
+    Obj(std::rc::Weak<RefCell<PhpObject>>, String),
+    /// Static prop: declaring class name + prop name.
+    Statics(String, String),
+    /// Unverifiable origin — kept unconditionally.
+    None,
+}
+
+/// One typed-prop owner of a shared cell: declared type members,
+/// declaring class name, prop name, and the anchor proving the owner
+/// still points at the cell.
+pub type SlotOwner = (Vec<String>, String, String, SlotAnchor);
 
 /// One output-buffer level (ob_start) with its optional handler.
 pub struct ObLevel {
@@ -583,6 +618,10 @@ impl<'a> Interp<'a> {
             strict_files: std::collections::HashSet::new(),
             typed_slots: std::collections::HashMap::new(),
             slot_owners: std::collections::HashMap::new(),
+            slot_merged: std::collections::HashMap::new(),
+            slot_anchor: std::collections::HashMap::new(),
+            ref_cells: std::collections::HashSet::new(),
+            last_fresh_cell: None,
             builtin_ifaces: std::collections::HashSet::new(),
             dep_seen: std::collections::HashSet::new(),
             last_err_file: String::new(),
@@ -1641,6 +1680,8 @@ impl<'a> Interp<'a> {
                     mk_method("getReflectionConstant", vec![str_param("name")]),
                     mk_method("getReflectionConstants", vec![]),
                     mk_method("getTraitAliases", vec![]),
+                    mk_method("getProperty", vec![str_param("name")]),
+                    mk_method("hasProperty", vec![str_param("name")]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -1928,6 +1969,33 @@ impl<'a> Interp<'a> {
                             hooks: None,
                         }],
                     ),
+                    mk_method("getName", vec![]),
+                    mk_method("getType", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        // ReflectionNamedType — produced by getType() on a property /
+        // parameter / return (typed_properties_018).
+        reg(
+            ClassDecl {
+                name: "ReflectionNamedType".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method("getName", vec![]),
+                    mk_method("allowsNull", vec![]),
+                    mk_method("isBuiltin", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -4005,7 +4073,14 @@ impl<'a> Interp<'a> {
                     }
                 }
                 if self.obj_is_a(&o, "Iterator") {
-                    if matches!(val, ForeachTarget::ByRef(_)) {
+                    // `function &gen()` generators DO support
+                    // `foreach .. as &$v` — their yields are cells
+                    // (typed_properties_033/034).
+                    let gen_byref = match &o.borrow().internal {
+                        Some(ObjectInternal::Generator(st)) => st.borrow().by_ref,
+                        _ => false,
+                    };
+                    if matches!(val, ForeachTarget::ByRef(_)) && !gen_byref {
                         let v = self.exception(
                             "Error",
                             "An iterator cannot be used with foreach by reference",
@@ -4165,8 +4240,9 @@ impl<'a> Interp<'a> {
                     if matches!(val, ForeachTarget::ByRef(_) | ForeachTarget::Lvalue(_)) {
                         if let Some((pd, dcls)) = self.decl_prop(&o, &dname) {
                             if let Some(tys) = &pd.ty {
+                                let p = Rc::as_ptr(&c) as usize;
                                 self.typed_slots.insert(
-                                    Rc::as_ptr(&c) as usize,
+                                    p,
                                     (
                                         c.clone(),
                                         tys.clone(),
@@ -4174,6 +4250,12 @@ impl<'a> Interp<'a> {
                                         dname.clone(),
                                     ),
                                 );
+                                let sk = self
+                                    .obj_prop_key(&o, &dname)
+                                    .unwrap_or_else(|| dname.clone());
+                                self.slot_anchor
+                                    .insert(p, SlotAnchor::Obj(Rc::downgrade(&o), sk));
+                                self.ref_cells.insert(p);
                             }
                         }
                     }
@@ -4183,6 +4265,7 @@ impl<'a> Interp<'a> {
                     match val {
                         ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
                         ForeachTarget::ByRef(n) => {
+                            self.ref_cells.insert(Rc::as_ptr(&c) as usize);
                             self.cur().vars.insert(n.clone(), c.clone());
                         }
                         ForeachTarget::Lvalue(e) => {
@@ -4256,7 +4339,19 @@ impl<'a> Interp<'a> {
             match val {
                 ForeachTarget::Var(n) => self.var_set(n, v),
                 ForeachTarget::ByRef(n) => {
-                    let c = cell(v);
+                    // A by-ref generator's current() is the yielded
+                    // cell itself — bind to it directly.
+                    let c = match &it.borrow().internal {
+                        Some(ObjectInternal::Generator(st)) => {
+                            let st = st.borrow();
+                            st.items
+                                .get(st.pos)
+                                .map(|(_, c)| c.clone())
+                                .unwrap_or_else(|| cell(v.clone()))
+                        }
+                        _ => cell(v),
+                    };
+                    self.ref_cells.insert(Rc::as_ptr(&c) as usize);
                     self.cur().vars.insert(n.clone(), c);
                 }
                 ForeachTarget::Lvalue(e) => {
@@ -4454,9 +4549,14 @@ impl<'a> Interp<'a> {
                 Ok(Value::Int(1))
             }
             Expr::Yield { key, val } => {
-                let v = match val {
-                    Some(e) => self.eval(e)?,
-                    None => Value::Null,
+                // `function &gen()` yields the value's own cell so
+                // `foreach ($gen as &$v)` writes back into it
+                // (typed_properties_033/034).
+                let by_ref = self.stack.last().map(|f| f.ret_by_ref).unwrap_or(false);
+                let vc = match val {
+                    Some(e) if by_ref => self.eval_cell(e)?,
+                    Some(e) => cell(self.eval(e)?),
+                    None => cell(Value::Null),
                 };
                 let k = match key {
                     Some(e) => self.eval(e)?,
@@ -4474,7 +4574,7 @@ impl<'a> Interp<'a> {
                 };
                 match &self.gen_sink {
                     Some(sink) => {
-                        sink.borrow_mut().push((k, v));
+                        sink.borrow_mut().push((k, vc));
                         Ok(self.gen_sends.pop_front().unwrap_or(Value::Null))
                     }
                     None => self.fail(PhpError::fatal(
@@ -5113,25 +5213,42 @@ impl<'a> Interp<'a> {
                         Expr::Prop { obj, name, .. } => {
                             let ov = self.eval(obj)?;
                             match (&ov, self.prop_name(name)) {
-                                (Value::Object(o), Ok(pn)) => self
-                                    .decl_prop(o, &pn)
-                                    .map(|(pd, dc)| (pd.ty.clone(), dc.name().to_string(), pn)),
+                                (Value::Object(o), Ok(pn)) => {
+                                    self.decl_prop(o, &pn).map(|(pd, dc)| {
+                                        let sk =
+                                            self.obj_prop_key(o, &pn).unwrap_or_else(|| pn.clone());
+                                        (
+                                            pd.ty.clone(),
+                                            dc.name().to_string(),
+                                            pn,
+                                            SlotAnchor::Obj(Rc::downgrade(o), sk),
+                                        )
+                                    })
+                                }
                                 _ => None,
                             }
                         }
                         Expr::StaticProp { class, name } => {
                             match (self.member_class_of(class), self.prop_name(name)) {
-                                (Ok((cls, _)), Ok(pn)) => self
-                                    .find_static_prop_decl(&cls, &pn)
-                                    .map(|(pd, dc)| (pd.ty.clone(), dc.name().to_string(), pn)),
+                                (Ok((cls, _)), Ok(pn)) => {
+                                    self.find_static_prop_decl(&cls, &pn).map(|(pd, dc)| {
+                                        (
+                                            pd.ty.clone(),
+                                            dc.name().to_string(),
+                                            pn.clone(),
+                                            SlotAnchor::Statics(dc.name().to_string(), pn),
+                                        )
+                                    })
+                                }
                                 _ => None,
                             }
                         }
                         _ => None,
                     };
-                    if let Some((Some(tys), dcn, dpn)) = decl {
-                        self.typed_slots
-                            .insert(Rc::as_ptr(&c) as usize, (c.clone(), tys, dcn, dpn));
+                    if let Some((Some(tys), dcn, dpn, anc)) = decl {
+                        let p = Rc::as_ptr(&c) as usize;
+                        self.typed_slots.insert(p, (c.clone(), tys, dcn, dpn));
+                        self.slot_anchor.insert(p, anc);
                     }
                     c
                 }
@@ -5344,13 +5461,15 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(newv);
                 }
-                {
-                    // Index writes mutate INSIDE the container — a typed
-                    // `array` prop keeps its type, no gate on the value.
+                if matches!(&*base.borrow(), Value::Null) {
+                    self.auto_init_gate(&base)?;
                     let mut b = base.borrow_mut();
                     if matches!(*b, Value::Null) {
                         *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
                     }
+                }
+                {
+                    let mut b = base.borrow_mut();
                     if let Value::Array(rc) = &mut *b {
                         let mut arr = rc.borrow_mut();
                         if append {
@@ -5419,6 +5538,14 @@ impl<'a> Interp<'a> {
     /// Evaluate a call expression, keeping the callee's returned cell when the
     /// function was declared `&name()` (returns by reference).
     fn eval_call_cell(&mut self, e: &Expr) -> Result<(Cell, bool), PhpError> {
+        let (c, was_ref) = self.eval_call_cell_inner(e)?;
+        if was_ref {
+            self.ref_cells.insert(Rc::as_ptr(&c) as usize);
+        }
+        Ok((c, was_ref))
+    }
+
+    fn eval_call_cell_inner(&mut self, e: &Expr) -> Result<(Cell, bool), PhpError> {
         self.last_ret_cell = None;
         self.last_call_by_ref = false;
         let v = self.eval(e)?;
@@ -5433,6 +5560,9 @@ impl<'a> Interp<'a> {
 
     /// `$target =& $cell`
     fn bind_cell(&mut self, target: &Expr, src: Cell) -> Result<(), PhpError> {
+        // `=&` creates Zend's IS_REFERENCE — writes through it say
+        // "a reference held by property", not "property" (034/078).
+        self.ref_cells.insert(Rc::as_ptr(&src) as usize);
         match target {
             Expr::Var(n) => {
                 // Binding an array by `=&` marks it referenced: later writes
@@ -5523,34 +5653,6 @@ impl<'a> Interp<'a> {
                         if let Some((pd, dcls)) = self.decl_prop(o, &pn) {
                             if let Some(pt) = &pd.ty {
                                 owner_ty = Some(pt.clone());
-                                // Binding a cell already owned by another
-                                // typed prop: the shared value must satisfy
-                                // the new type as-is
-                                // (union_types/prop_ref_assign).
-                                let sptr = Rc::as_ptr(&src) as usize;
-                                let owned = self
-                                    .typed_slots
-                                    .get(&sptr)
-                                    .map(|(_, t, n, p)| (t.clone(), n.clone(), p.clone()));
-                                if let Some((otys, ocn, opn)) = owned {
-                                    if !self.ty_weak_exact(pt, &src.borrow()) {
-                                        let sv = src.borrow().clone();
-                                        return self.fail(PhpError::uncaught(
-                                            "TypeError",
-                                            format!(
-                                                "Reference with value of type {} held by property {}::${} of type {} is not compatible with property {}::${} of type {}",
-                                                self.zval_type_name(&sv),
-                                                ocn,
-                                                opn,
-                                                ty_disp(&otys),
-                                                dcls.name(),
-                                                pn,
-                                                ty_disp(pt)
-                                            ),
-                                            0,
-                                        ));
-                                    }
-                                }
                                 merged = Some(self.bind_typed_check(&pd, &dcls, &src)?);
                             }
                         }
@@ -5559,22 +5661,37 @@ impl<'a> Interp<'a> {
                         if !ob.prop_order.contains(&key) {
                             ob.prop_order.push(key.clone());
                         }
-                        ob.props.insert(key, src.clone());
+                        ob.props.insert(key.clone(), src.clone());
                         drop(ob);
                         if let (Some(m), Some((_, dcls))) = (merged, self.decl_prop(o, &pn)) {
                             let sptr = Rc::as_ptr(&src) as usize;
-                            self.typed_slots.insert(
-                                sptr,
-                                (src.clone(), m, dcls.name().to_string(), pn.clone()),
-                            );
+                            // The FIRST owner is the ref's holder for
+                            // "held by property X of type T" messages —
+                            // later merges only narrow slot_merged.
+                            self.typed_slots.entry(sptr).or_insert_with(|| {
+                                (src.clone(), m.clone(), dcls.name().to_string(), pn.clone())
+                            });
+                            self.slot_anchor
+                                .entry(sptr)
+                                .or_insert_with(|| SlotAnchor::Obj(Rc::downgrade(o), key.clone()));
+                            self.slot_merged.insert(sptr, m);
                             // Owners keep their *declared* type — a
                             // shared write must satisfy each and yield
                             // one consistent result.
-                            self.slot_owners.entry(sptr).or_default().push((
-                                owner_ty.unwrap_or_default(),
-                                dcls.name().to_string(),
-                                pn.clone(),
-                            ));
+                            let ot = owner_ty.unwrap_or_default();
+                            let dcn = dcls.name().to_string();
+                            let owners = self.slot_owners.entry(sptr).or_default();
+                            if !owners
+                                .iter()
+                                .any(|(_, cn, pn2, _)| cn == &dcn && pn2 == &pn)
+                            {
+                                owners.push((
+                                    ot,
+                                    dcn,
+                                    pn.clone(),
+                                    SlotAnchor::Obj(Rc::downgrade(o), key.clone()),
+                                ));
+                            }
                         }
                         return Ok(());
                     }
@@ -5597,12 +5714,30 @@ impl<'a> Interp<'a> {
                     }
                 }
                 cls.statics.borrow_mut().insert(pn.clone(), src.clone());
-                if let (Some(m), Some((_, dcls))) = (merged, self.find_static_prop_decl(&cls, &pn))
+                if let (Some(m), Some((pd, dcls))) = (merged, self.find_static_prop_decl(&cls, &pn))
                 {
-                    self.typed_slots.insert(
-                        Rc::as_ptr(&src) as usize,
-                        (src.clone(), m, dcls.name().to_string(), pn),
-                    );
+                    let sptr = Rc::as_ptr(&src) as usize;
+                    self.typed_slots.entry(sptr).or_insert_with(|| {
+                        (src.clone(), m.clone(), dcls.name().to_string(), pn.clone())
+                    });
+                    self.slot_anchor.entry(sptr).or_insert_with(|| {
+                        SlotAnchor::Statics(dcls.name().to_string(), pn.clone())
+                    });
+                    self.slot_merged.insert(sptr, m);
+                    let ot = pd.ty.clone().unwrap_or_default();
+                    let dcn = dcls.name().to_string();
+                    let owners = self.slot_owners.entry(sptr).or_default();
+                    if !owners
+                        .iter()
+                        .any(|(_, cn, pn2, _)| cn == &dcn && pn2 == &pn)
+                    {
+                        owners.push((
+                            ot,
+                            dcn,
+                            pn.clone(),
+                            SlotAnchor::Statics(dcls.name().to_string(), pn.clone()),
+                        ));
+                    }
                 }
                 Ok(())
             }
@@ -5698,6 +5833,72 @@ impl<'a> Interp<'a> {
     /// Write `$ov->$pn = v` — private-slot, `__set` or dynamic-prop rules.
     /// Write `$ov->$pn = v`; returns the STORED value (typed props
     /// coerce — the assign expr yields the coerced result, 077).
+    /// `$cell[] = v` / `$cell[k] = v` on a null typed slot: Zend
+    /// auto-initializes an array only when `array` fits the merged
+    /// member type; otherwise `Cannot auto-initialize an array inside
+    /// ...` TypeError and a just-materialized slot reverts to
+    /// uninitialized (typed_properties_083).
+    fn auto_init_gate(&mut self, c: &Cell) -> Result<(), PhpError> {
+        let ptr = Rc::as_ptr(c) as usize;
+        self.prune_typed_slot(ptr);
+        let gated = self
+            .slot_merged
+            .get(&ptr)
+            .cloned()
+            .or_else(|| self.typed_slots.get(&ptr).map(|(_, t, _, _)| t.clone()));
+        let Some(tys) = gated else {
+            return Ok(());
+        };
+        if tys.iter().any(|m| self.ty_member_is_a("array", m)) {
+            *c.borrow_mut() = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+            return Ok(());
+        }
+        let (cn, pn) = self
+            .typed_slots
+            .get(&ptr)
+            .map(|(_, _, n, p)| (n.clone(), p.clone()))
+            .unwrap_or_default();
+        let where_ = if self.ref_cells.contains(&ptr) {
+            "a reference held by property"
+        } else {
+            "property"
+        };
+        let msg = format!(
+            "Cannot auto-initialize an array inside {} {}::${} of type {}",
+            where_,
+            cn,
+            pn,
+            ty_disp(&tys)
+        );
+        // A slot materialized for this write goes back to
+        // uninitialized — reads must still raise the uninit Error.
+        if self.last_fresh_cell == Some(ptr) {
+            if let Some(anc) = self.slot_anchor.get(&ptr).cloned() {
+                match anc {
+                    SlotAnchor::Obj(w, key) => {
+                        if let Some(o) = w.upgrade() {
+                            o.borrow_mut().props.remove(&key);
+                        }
+                    }
+                    SlotAnchor::Statics(ccn, ppn) => {
+                        if let Some(cc) = self.classes.get(&ccn.to_lowercase()) {
+                            cc.statics.borrow_mut().remove(&ppn);
+                        }
+                    }
+                    SlotAnchor::None => {}
+                }
+            }
+            self.typed_slots.remove(&ptr);
+            self.slot_anchor.remove(&ptr);
+            self.slot_owners.remove(&ptr);
+            self.slot_merged.remove(&ptr);
+            self.last_fresh_cell = None;
+        }
+        let mut e = PhpError::uncaught("TypeError", msg, 0);
+        e.thrown_line = Some(self.cur_line);
+        self.fail(e)
+    }
+
     fn store_prop(&mut self, ov: Value, pn: &str, mut v: Value) -> Result<Value, PhpError> {
         match ov {
             Value::Object(o) => {
@@ -5863,9 +6064,17 @@ impl<'a> Interp<'a> {
         keys: &[Option<Value>],
         v: Value,
     ) -> Result<Value, PhpError> {
+        self.last_fresh_cell = None;
         let mut c = self.eval_cell(e)?;
         let last = keys.len() - 1;
         for (n, k) in keys.iter().enumerate() {
+            // Auto-init gate: writing through a typed slot that is
+            // null (or a just-materialized uninit slot) must produce
+            // `Cannot auto-initialize an array inside property ...`
+            // unless its type accepts an array (typed_properties_083).
+            if matches!(&*c.borrow(), Value::Null) {
+                self.auto_init_gate(&c)?;
+            }
             // ArrayAccess object offset path: `$o[k]` dispatches to
             // offsetSet/offsetGet instead of writing through a cell.
             let as_obj = {
@@ -6488,11 +6697,91 @@ impl<'a> Interp<'a> {
         Ok(None)
     }
 
+    /// An owner is stale when the prop it names no longer holds this
+    /// cell — static rebinds (082), unsets, or a dead object (094).
+    fn slot_anchor_alive(&self, ptr: usize, anc: &SlotAnchor) -> bool {
+        match anc {
+            SlotAnchor::Obj(w, key) => w
+                .upgrade()
+                .map(|o| {
+                    o.borrow()
+                        .props
+                        .get(key)
+                        .map(|c| Rc::as_ptr(c) as usize == ptr)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false),
+            SlotAnchor::Statics(cn, pn) => self
+                .classes
+                .get(&cn.to_lowercase())
+                .map(|c| {
+                    c.statics
+                        .borrow()
+                        .get(pn)
+                        .map(|c2| Rc::as_ptr(c2) as usize == ptr)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false),
+            SlotAnchor::None => true,
+        }
+    }
+
+    /// Drop owners whose prop no longer points at `ptr`, then rebuild
+    /// the merged constraint from the live owners' declared types.
+    fn prune_typed_slot(&mut self, ptr: usize) {
+        let prim_dead = self
+            .slot_anchor
+            .get(&ptr)
+            .map(|a| !self.slot_anchor_alive(ptr, a))
+            .unwrap_or(false);
+        if prim_dead {
+            self.typed_slots.remove(&ptr);
+            self.slot_anchor.remove(&ptr);
+        }
+        if let Some(os) = self.slot_owners.get(&ptr) {
+            let os = os.clone();
+            let dead: Vec<usize> = os
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, _, _, a))| !self.slot_anchor_alive(ptr, a))
+                .map(|(i, _)| i)
+                .collect();
+            if !dead.is_empty() {
+                let os = self.slot_owners.get_mut(&ptr).unwrap();
+                for i in dead.into_iter().rev() {
+                    os.remove(i);
+                }
+                if os.is_empty() {
+                    self.slot_owners.remove(&ptr);
+                }
+            }
+        }
+        if let Some(os) = self.slot_owners.get(&ptr) {
+            let os = os.clone();
+            let mut acc: Vec<String> = Vec::new();
+            for (i, (t, _, _, _)) in os.iter().enumerate() {
+                acc = if i == 0 {
+                    t.clone()
+                } else {
+                    self.ty_bind_merge(&acc, t).unwrap_or_default()
+                };
+            }
+            self.slot_merged.insert(ptr, acc);
+        } else if let Some((_, t, _, _)) = self.typed_slots.get(&ptr) {
+            self.slot_merged.insert(ptr, t.clone());
+        } else {
+            self.slot_merged.remove(&ptr);
+        }
+    }
+
     fn typed_slot_store(&mut self, c: &Cell, v: Value) -> Result<Value, PhpError> {
         let ptr = Rc::as_ptr(c) as usize;
+        self.prune_typed_slot(ptr);
         let owners: Vec<(Vec<String>, String, String)> =
             if let Some(os) = self.slot_owners.get(&ptr) {
-                os.clone()
+                os.iter()
+                    .map(|(t, n, p, _)| (t.clone(), n.clone(), p.clone()))
+                    .collect()
             } else {
                 match self
                     .typed_slots
@@ -6520,11 +6809,17 @@ impl<'a> Interp<'a> {
         }
         if let Some(bad) = results.iter().position(|r| r.is_none()) {
             let (tys, cn, pn) = &owners[bad];
+            let where_ = if self.ref_cells.contains(&ptr) {
+                "reference held by property"
+            } else {
+                "property"
+            };
             let mut e = PhpError::uncaught(
                 "TypeError",
                 format!(
-                    "Cannot assign {} to reference held by property {}::${} of type {}",
+                    "Cannot assign {} to {} {}::${} of type {}",
                     self.zval_type_name(&v),
+                    where_,
                     cn,
                     pn,
                     ty_disp(tys)
@@ -6536,11 +6831,17 @@ impl<'a> Interp<'a> {
         }
         let mut e = if owners.len() == 1 {
             let (tys, cn, pn) = &owners[0];
+            let where_ = if self.ref_cells.contains(&ptr) {
+                "reference held by property"
+            } else {
+                "property"
+            };
             PhpError::uncaught(
                 "TypeError",
                 format!(
-                    "Cannot assign {} to reference held by property {}::${} of type {}",
+                    "Cannot assign {} to {} {}::${} of type {}",
                     self.zval_type_name(&v),
+                    where_,
                     cn,
                     pn,
                     ty_disp(tys)
@@ -6585,7 +6886,22 @@ impl<'a> Interp<'a> {
         // PHP warns on undefined vars/props/keys during ++/-- (bug25547).
         let old = match target {
             Expr::Var(name) => self.var_get(name).unwrap_or(Value::Null),
-            Expr::Index { e, i } => self.index_read(e, i.as_deref()).unwrap_or(Value::Null),
+            Expr::Index { e, i } => {
+                let base = self.eval(e)?;
+                let key = match i {
+                    Some(ie) => self.eval(ie)?,
+                    None => return self.fail(PhpError::fatal("[] used in read context", 0)),
+                };
+                // `++`/`--` on an ArrayAccess offset writes the by-ref
+                // offsetGet cell directly — no offsetSet call
+                // (typed_properties_065).
+                if let Value::Object(o) = &base {
+                    if self.obj_is_a(o, "ArrayAccess") {
+                        return self.incdec_aa(o.clone(), key, delta, post);
+                    }
+                }
+                self.index_read_base(base, key).unwrap_or(Value::Null)
+            }
             Expr::Prop { .. } => self.prop_read_loose(target).unwrap_or(Value::Null),
             Expr::VarVar(inner) => {
                 let n = self.eval(inner)?;
@@ -6607,7 +6923,21 @@ impl<'a> Interp<'a> {
         // The target's storage cell carries the owning prop's type —
         // "property" when the target IS that prop, "a reference held
         // by property" when reached through an alias/bound ref.
-        if matches!(old, Value::Int(i) if i.checked_add(delta).is_none()) {
+        // ++/-- on an *overloaded* prop (__get/__set magic) never
+        // touches the backing cell — it reads a value and calls __set
+        // (typed_properties_061); skip the ref-cell overflow check.
+        let prop_overloaded = match target {
+            Expr::Prop { obj, name, .. } => {
+                let ov = self.eval(obj)?;
+                let pn = self.prop_name(name)?;
+                match &ov {
+                    Value::Object(o) => self.decl_prop(o, &pn).is_none(),
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if !prop_overloaded && matches!(old, Value::Int(i) if i.checked_add(delta).is_none()) {
             let ent = self.eval_cell(target).ok().map(|c| {
                 // Unaliased count is 3 (storage + typed_slots + this
                 // temp); a `=&` bind adds a var slot -> "a reference
@@ -6662,6 +6992,89 @@ impl<'a> Interp<'a> {
         }
         let new = self.incdec_value(&old, delta)?;
         self.store(target, new.clone())?;
+        Ok(if post { old } else { new })
+    }
+
+    /// `$o[k]++` on an ArrayAccess: `&offsetGet` hands back the real
+    /// backing cell and ++/-- writes through it (no offsetSet);
+    /// a value-returning offsetGet falls back to offsetSet
+    /// (typed_properties_065).
+    fn incdec_aa(
+        &mut self,
+        o: Rc<RefCell<PhpObject>>,
+        key: Value,
+        delta: i64,
+        post: bool,
+    ) -> Result<Value, PhpError> {
+        self.last_ret_cell = None;
+        let rv = self.method_invoke(
+            o.clone(),
+            "offsetGet",
+            CallArgs::positional(vec![cell(key.clone())]),
+        )?;
+        let rc = self.last_ret_cell.take();
+        if let Some(c) = &rc {
+            self.ref_cells.insert(Rc::as_ptr(c) as usize);
+        }
+        let old = rc.as_ref().map(|c| c.borrow().clone()).unwrap_or(rv);
+        // int-typed backing cell can't overflow to float — dedicated
+        // "past its minimal/maximal value" Error (065).
+        if let (Value::Int(iv), Some(c)) = (old.clone(), rc.clone()) {
+            if iv.checked_add(delta).is_none() {
+                let ptr = Rc::as_ptr(&c) as usize;
+                self.prune_typed_slot(ptr);
+                let owners: Vec<(Vec<String>, String, String)> = self
+                    .slot_owners
+                    .get(&ptr)
+                    .map(|os| {
+                        os.iter()
+                            .map(|(t, n, p, _)| (t.clone(), n.clone(), p.clone()))
+                            .collect()
+                    })
+                    .or_else(|| {
+                        self.typed_slots
+                            .get(&ptr)
+                            .map(|(_, t, n, p)| vec![(t.clone(), n.clone(), p.clone())])
+                    })
+                    .unwrap_or_default();
+                for (tys, cn, cpn) in &owners {
+                    if tys.iter().any(|m| m.eq_ignore_ascii_case("int"))
+                        && !tys.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                    {
+                        let dir = if delta > 0 { "increment" } else { "decrement" };
+                        let bound = if delta > 0 { "maximal" } else { "minimal" };
+                        let mut e = PhpError::uncaught(
+                            "TypeError",
+                            format!(
+                                "Cannot {} a reference held by property {}::${} of type {} past its {} value",
+                                dir,
+                                cn,
+                                cpn,
+                                ty_disp(tys),
+                                bound
+                            ),
+                            0,
+                        );
+                        e.thrown_line = Some(self.cur_line);
+                        return self.fail(e);
+                    }
+                }
+            }
+        }
+        let new = self.incdec_value(&old, delta)?;
+        match rc {
+            Some(c) => {
+                let nv = self.typed_slot_store(&c, new.clone())?;
+                *c.borrow_mut() = nv;
+            }
+            None => {
+                self.method_invoke(
+                    o,
+                    "offsetSet",
+                    CallArgs::positional(vec![cell(key), cell(new.clone())]),
+                )?;
+            }
+        }
         Ok(if post { old } else { new })
     }
 
@@ -9253,8 +9666,8 @@ impl<'a> Interp<'a> {
             .flat_map(|m| {
                 if m.eq_ignore_ascii_case("iterable") {
                     vec!["Traversable".to_string(), "array".to_string()]
-                } else if m.starts_with("class@anonymous$") {
-                    vec!["class@anonymous".to_string()]
+                } else if let Some(pos) = m.find("@anonymous$") {
+                    vec![format!("{}@anonymous", &m[..pos])]
                 } else if m.contains('&') && ty.len() > 1 {
                     // Intersection members parenthesize inside a union
                     // ((X&Y)|(W&Z) — dnf_2_intersection).
@@ -9405,8 +9818,8 @@ impl<'a> Interp<'a> {
                 let mut fname = self.decl_fname(decl);
                 // Anonymous-class methods report args under just the
                 // class name (union_types/anonymous_class).
-                if fname.starts_with("class@anonymous::") {
-                    fname = "class@anonymous".into();
+                if let Some(pos) = fname.find("@anonymous::") {
+                    fname = fname[..pos + "@anonymous".len()].into();
                 }
                 // Implicit-nullable needs the phantom `null` member so
                 // an intersection renders `(X&Y)|null`
@@ -10066,6 +10479,7 @@ impl<'a> Interp<'a> {
         decl_class: Option<Rc<PhpClass>>,
         called_class: Option<Rc<PhpClass>>,
     ) -> Rc<RefCell<PhpObject>> {
+        let by_ref = decl.by_ref;
         let state = Rc::new(RefCell::new(GenState {
             setup: GenSetup::Invoke {
                 decl,
@@ -10080,6 +10494,7 @@ impl<'a> Interp<'a> {
             started: false,
             finished: false,
             return_val: Value::Null,
+            by_ref,
             auto_key: 0,
             sends: Vec::new(),
         }));
@@ -10371,7 +10786,10 @@ impl<'a> Interp<'a> {
                 self.gen_start(&state)?;
                 let st = state.borrow();
                 Ok(Some(
-                    st.items.get(st.pos).map(|(_, v)| v.clone()).unwrap_or(Value::Null),
+                    st.items
+                        .get(st.pos)
+                        .map(|(_, v)| v.borrow().clone())
+                        .unwrap_or(Value::Null),
                 ))
             }
             "key" => {
@@ -10408,7 +10826,7 @@ impl<'a> Interp<'a> {
                 Ok(Some(
                     st.items
                         .get(st.pos)
-                        .map(|(_, v)| v.clone())
+                        .map(|(_, v)| v.borrow().clone())
                         .unwrap_or(Value::Null),
                 ))
             }
@@ -10431,12 +10849,15 @@ impl<'a> Interp<'a> {
     }
 
     /// Materialize an iterable's (key, value) pairs for `yield from`.
-    pub fn yield_from_collect(&mut self, v: &Value) -> Result<Vec<(Value, Value)>, PhpError> {
+    pub fn yield_from_collect(
+        &mut self,
+        v: &Value,
+    ) -> Result<Vec<crate::value::GenItem>, PhpError> {
         match v {
             Value::Array(a) => Ok(a
                 .borrow()
                 .iter()
-                .map(|(k, c)| (key_value(k), c.borrow().clone()))
+                .map(|(k, c)| (key_value(k), c.clone()))
                 .collect()),
             Value::Object(o) => {
                 if self.obj_is_a(o, "IteratorAggregate") {
@@ -10462,7 +10883,7 @@ impl<'a> Interp<'a> {
                         let val = self
                             .method_invoke(o.clone(), "current", CallArgs::empty())
                             .unwrap_or(Value::Null);
-                        out.push((k, val));
+                        out.push((k, cell(val)));
                         let _ = self.method_invoke(o.clone(), "next", CallArgs::empty())?;
                     }
                     Ok(out)
@@ -12573,6 +12994,16 @@ impl<'a> Interp<'a> {
     /// name, `s` is `mixed`, or `t`'s class/interface ancestry includes
     /// `s` (interfaces live in `self.interfaces`, not `self.classes`).
     fn ty_member_is_a(&mut self, t: &str, s: &str) -> bool {
+        self.ty_member_is_a_impl(t, s, false)
+    }
+
+    /// Strict membership for ref-bind merges — `int ⊄ float` (scalar
+    /// coercions don't apply to declared-type sets, prop_ref_assign).
+    fn ty_member_is_a_strict(&mut self, t: &str, s: &str) -> bool {
+        self.ty_member_is_a_impl(t, s, true)
+    }
+
+    fn ty_member_is_a_impl(&mut self, t: &str, s: &str, strict: bool) -> bool {
         if s.eq_ignore_ascii_case(t) || s.eq_ignore_ascii_case("mixed") {
             return true;
         }
@@ -12580,9 +13011,11 @@ impl<'a> Interp<'a> {
             // `t ⊆ S1&S2&…` iff every conjunct of s is covered by some
             // conjunct of t (`A&B&C` is a subtype of `A&B`).
             let tparts: Vec<&str> = t.split('&').collect();
-            return s
-                .split('&')
-                .all(|sc| tparts.iter().any(|tc| self.ty_member_is_a(tc, sc)));
+            return s.split('&').all(|sc| {
+                tparts
+                    .iter()
+                    .any(|tc| self.ty_member_is_a_impl(tc, sc, strict))
+            });
         }
         if t.contains('&') {
             // `C1&C2 ⊆ s` when some conjunct already is-a `s` — but a
@@ -12595,7 +13028,7 @@ impl<'a> Interp<'a> {
                 if atomish && !self.ty_conj_resolvable(sm) {
                     return false;
                 }
-                self.ty_member_is_a(sm, s)
+                self.ty_member_is_a_impl(sm, s, strict)
             });
         }
         if t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("mixed") {
@@ -12615,7 +13048,7 @@ impl<'a> Interp<'a> {
         if sl == "object" && tl == "closure" {
             return true;
         }
-        if sl == "float" && tl == "int" {
+        if !strict && sl == "float" && tl == "int" {
             return true;
         }
         if sl == "object" {
@@ -14016,6 +14449,23 @@ impl<'a> Interp<'a> {
         None
     }
 
+    /// Instance-prop decl lookup on a class (Reflection, no object) —
+    /// any visibility, walking the parent chain.
+    fn find_prop_decl(&self, cls: &Rc<PhpClass>, pn: &str) -> Option<(PropDecl, Rc<PhpClass>)> {
+        let mut cur = Some(cls.clone());
+        while let Some(c) = cur {
+            if let Some(pd) = c.decl.props.iter().find(|p| p.name == pn && !p.is_static) {
+                return Some((pd.clone(), c.clone()));
+            }
+            cur = c
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        None
+    }
+
     fn decl_prop(&self, o: &Rc<RefCell<PhpObject>>, pn: &str) -> Option<(PropDecl, Rc<PhpClass>)> {
         if let Some(x) = self.scope_private_prop(o, pn) {
             return Some(x);
@@ -14695,6 +15145,8 @@ impl<'a> Interp<'a> {
     /// Non-empty member-wise type intersection of two declared types —
     /// returns the intersected member list, or None when disjoint
     /// (typed_properties_068/076 `=&` conflict check).
+    /// Ref-bind merge: the memberwise intersection of the two type
+    /// sets (`int|string ∩ float|string = string`).
     fn ty_bind_merge(&mut self, a: &[String], b: &[String]) -> Option<Vec<String>> {
         let mut inter: Vec<String> = Vec::new();
         for am in a {
@@ -14726,38 +15178,64 @@ impl<'a> Interp<'a> {
     ) -> Result<Vec<String>, PhpError> {
         let tys = pd.ty.clone().unwrap_or_default();
         let mut merged = tys.clone();
-        if let Some((_, otys, ocn, opn)) = self
-            .typed_slots
-            .get(&(Rc::as_ptr(src) as usize))
-            .map(|(c, t, n, p)| (c.clone(), t.clone(), n.clone(), p.clone()))
-        {
-            let ta = self.resolved_ty(&otys, dcls.as_ref());
-            let tb = self.resolved_ty(&tys, dcls.as_ref());
-            match self.ty_bind_merge(&ta, &tb) {
-                Some(m) => merged = m,
-                None => {
-                    let sv = src.borrow().clone();
-                    let mut e = PhpError::uncaught(
-                        "TypeError",
-                        format!(
-                            "Reference with value of type {} held by property {}::${} of type {} is not compatible with property {}::${} of type {}",
-                            self.zval_type_name(&sv),
-                            ocn,
-                            opn,
-                            ty_disp(&otys),
-                            dcls.name(),
-                            pd.name,
-                            ty_disp(&tys)
-                        ),
-                        0,
-                    );
-                    e.thrown_line = Some(self.cur_line);
-                    return self.fail(e);
-                }
-            }
-        }
+        // The value must satisfy the NEW owner's type first — a plain
+        // `Cannot assign X to property` error (typed_properties_034,
+        // union_types/prop_ref_assign); the held-by incompatible
+        // message only reports a type-SET conflict.
         let v = src.borrow().clone();
         let nv = self.prop_typed_write_check(pd, dcls, v)?;
+        let sptr = Rc::as_ptr(src) as usize;
+        // Drop owners whose prop stopped holding the cell (rebind/unset)
+        // before reading the prior constraint.
+        self.prune_typed_slot(sptr);
+        // The cell's current constraint: the last merge result, else
+        // the primary owner's declared type.
+        let prior = self
+            .slot_merged
+            .get(&sptr)
+            .cloned()
+            .or_else(|| self.typed_slots.get(&sptr).map(|(_, t, _, _)| t.clone()));
+        if let Some(cur) = prior {
+            let ta = self.resolved_ty(&cur, dcls.as_ref());
+            let tb = self.resolved_ty(&tys, dcls.as_ref());
+            let inter = self.ty_bind_merge(&ta, &tb);
+            // Bind fails when the sets are disjoint OR the current
+            // value isn't already in the intersection (prop_ref_assign
+            // B2-style held-by error naming the primary holder).
+            let fits = match &inter {
+                Some(m) => {
+                    let vty = self.zval_type_name(&src.borrow());
+                    m.iter().any(|mm| self.ty_member_is_a_strict(&vty, mm))
+                }
+                None => false,
+            };
+            if !fits {
+                let (otys, ocn, opn) = self
+                    .typed_slots
+                    .get(&sptr)
+                    .map(|(_, t, n, p)| (t.clone(), n.clone(), p.clone()))
+                    .unwrap_or((cur.clone(), String::new(), String::new()));
+                let sv = src.borrow().clone();
+                let mut e = PhpError::uncaught(
+                    "TypeError",
+                    format!(
+                        "Reference with value of type {} held by property {}::${} of type {} is not compatible with property {}::${} of type {}",
+                        self.zval_type_name(&sv),
+                        ocn,
+                        opn,
+                        ty_disp(&otys),
+                        dcls.name(),
+                        pd.name,
+                        ty_disp(&tys)
+                    ),
+                    0,
+                );
+                e.thrown_line = Some(self.cur_line);
+                return self.fail(e);
+            }
+            merged = inter.unwrap();
+        }
+        self.slot_merged.insert(sptr, merged.clone());
         *src.borrow_mut() = nv;
         Ok(merged)
     }
@@ -15495,6 +15973,119 @@ impl<'a> Interp<'a> {
                     Ok(Some(self.call_value(&cb, ca)?))
                 }
             }
+            // ReflectionClass::getProperty($name) -> ReflectionProperty
+            // carrying {\0rc\0class, \0rc\0prop} (typed_properties_018).
+            "getproperty" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let pn = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let pn = self.conv_str(&pn)?.to_string();
+                let cls = self.classes.get(&cn.to_lowercase()).cloned();
+                let found = cls.as_ref().and_then(|c| self.find_prop_decl(c, &pn));
+                match found {
+                    Some((_, dcls)) => {
+                        let rp = self.instantiate("reflectionproperty", &[])?;
+                        if let Value::Object(o) = &rp {
+                            let mut ob = o.borrow_mut();
+                            ob.props
+                                .insert("\0rc\0class".into(), cell(Value::str(dcls.name())));
+                            ob.props.insert("\0rc\0prop".into(), cell(Value::str(&pn)));
+                            ob.props.insert("name".into(), cell(Value::str(&pn)));
+                            ob.props
+                                .insert("class".into(), cell(Value::str(dcls.name())));
+                        }
+                        Ok(Some(rp))
+                    }
+                    None => self.fail(PhpError::uncaught(
+                        "ReflectionException",
+                        format!("Property {}::${} does not exist", cn, pn),
+                        0,
+                    )),
+                }
+            }
+            "hasproperty" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let pn = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let pn = self.conv_str(&pn)?.to_string();
+                let has = self
+                    .classes
+                    .get(&cn.to_lowercase())
+                    .cloned()
+                    .and_then(|c| self.find_prop_decl(&c, &pn))
+                    .is_some();
+                Ok(Some(Value::Bool(has)))
+            }
+            // ReflectionProperty::getType() -> ReflectionNamedType with
+            // the declared members under \0rp\0ty (same convention as
+            // ReflectionParameter).
+            "gettype" => {
+                let is_prop = obj
+                    .borrow()
+                    .class
+                    .name()
+                    .eq_ignore_ascii_case("reflectionproperty");
+                if is_prop {
+                    let cn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let cn = self.conv_str(&cn)?.to_string();
+                    let pn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0prop")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let pn = self.conv_str(&pn)?.to_string();
+                    let ty = self
+                        .classes
+                        .get(&cn.to_lowercase())
+                        .cloned()
+                        .and_then(|c| self.find_prop_decl(&c, &pn))
+                        .and_then(|(pd, _)| pd.ty);
+                    match ty {
+                        Some(tys) => {
+                            let nt = self.instantiate("reflectionnamedtype", &[])?;
+                            if let Value::Object(o) = &nt {
+                                let mut ta = PhpArray::default();
+                                for m in &tys {
+                                    ta.push(Value::str(m));
+                                }
+                                let mut ob = o.borrow_mut();
+                                ob.props.insert(
+                                    "\0rp\0ty".into(),
+                                    cell(Value::Array(Rc::new(RefCell::new(ta)))),
+                                );
+                                ob.props
+                                    .insert("name".into(), cell(Value::str(tys.first().unwrap())));
+                            }
+                            Ok(Some(nt))
+                        }
+                        None => Ok(Some(Value::Null)),
+                    }
+                } else {
+                    Ok(Some(Value::Null))
+                }
+            }
             "getparameters" => {
                 // Each param becomes a ReflectionParameter carrying its
                 // declared type members under \0rp\0ty (callable_002).
@@ -15871,17 +16462,24 @@ impl<'a> Interp<'a> {
                 {
                     return Ok(Some(Value::str(name.clone())));
                 }
+                let clsname = obj.borrow().class.name().to_lowercase();
+                // ReflectionNamedType::getName() -> the stored type name.
+                if clsname == "reflectionnamedtype" {
+                    return Ok(Some(
+                        obj.borrow()
+                            .props
+                            .get("name")
+                            .map(|c| c.borrow().clone())
+                            .unwrap_or(Value::Null),
+                    ));
+                }
                 // ReflectionClassConstant::getName() is the const name;
-                // every other reflector reports its class/subject.
-                let key = if obj
-                    .borrow()
-                    .class
-                    .name()
-                    .eq_ignore_ascii_case("reflectionclassconstant")
-                {
-                    "name"
-                } else {
-                    "\0rc\0class"
+                // ReflectionProperty::getName() the prop name; every
+                // other reflector reports its class/subject.
+                let key = match clsname.as_str() {
+                    "reflectionclassconstant" => "name",
+                    "reflectionproperty" => "\0rc\0prop",
+                    _ => "\0rc\0class",
                 };
                 Ok(Some(
                     obj.borrow()
@@ -16309,12 +16907,15 @@ impl<'a> Interp<'a> {
                                         if !ob.prop_order.contains(&key) {
                                             ob.prop_order.push(key.clone());
                                         }
-                                        ob.props.insert(key, slot.clone());
+                                        ob.props.insert(key.clone(), slot.clone());
                                     }
+                                    let p = Rc::as_ptr(&slot) as usize;
                                     self.typed_slots.insert(
-                                        Rc::as_ptr(&slot) as usize,
+                                        p,
                                         (slot.clone(), tys, tdcls.name().to_string(), pn.clone()),
                                     );
+                                    self.slot_anchor
+                                        .insert(p, SlotAnchor::Obj(Rc::downgrade(&o), key.clone()));
                                     return Ok(slot);
                                 }
                                 return self.fail(PhpError::uncaught(
@@ -16328,7 +16929,9 @@ impl<'a> Interp<'a> {
                                 ));
                             }
                             // Nullable uninit slots byref-init to null.
-                            o.borrow_mut().props.insert(pn.clone(), cell(Value::Null));
+                            let nc = cell(Value::Null);
+                            self.last_fresh_cell = Some(Rc::as_ptr(&nc) as usize);
+                            o.borrow_mut().props.insert(pn.clone(), nc);
                         }
                     }
                 }
@@ -16338,14 +16941,17 @@ impl<'a> Interp<'a> {
                     if !ob.prop_order.contains(&key) {
                         ob.prop_order.push(key.clone());
                     }
-                    ob.props.insert(key.clone(), cell(Value::Null));
+                    let nc = cell(Value::Null);
+                    self.last_fresh_cell = Some(Rc::as_ptr(&nc) as usize);
+                    ob.props.insert(key.clone(), nc);
                 }
                 let slot = ob.props.get(&key).unwrap().clone();
                 drop(ob);
                 if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
                     if let Some(tys) = &pd.ty {
+                        let p = Rc::as_ptr(&slot) as usize;
                         self.typed_slots.insert(
-                            Rc::as_ptr(&slot) as usize,
+                            p,
                             (
                                 slot.clone(),
                                 tys.clone(),
@@ -16353,6 +16959,8 @@ impl<'a> Interp<'a> {
                                 pn.clone(),
                             ),
                         );
+                        self.slot_anchor
+                            .insert(p, SlotAnchor::Obj(Rc::downgrade(&o), key.clone()));
                     }
                 }
                 Ok(slot)
@@ -16409,12 +17017,12 @@ impl<'a> Interp<'a> {
                 let cls = o.borrow().class.clone();
                 if let Some(k) = self.obj_prop_key(&o, &pn) {
                     let mut ob = o.borrow_mut();
-                    if let Some(c) = ob.props.remove(&k) {
+                    let prune = if let Some(c) = ob.props.remove(&k) {
                         // unset() severs the typed slot: refs bound to it
                         // become plain variables again (typed_properties_090).
                         let ptr = Rc::as_ptr(&c) as usize;
                         if let Some(os) = self.slot_owners.get_mut(&ptr) {
-                            os.retain(|(_, _, op)| op != &pn);
+                            os.retain(|(_, _, op, _)| op != &pn);
                             if os.is_empty() {
                                 self.slot_owners.remove(&ptr);
                             }
@@ -16426,9 +17034,17 @@ impl<'a> Interp<'a> {
                             .unwrap_or(false)
                         {
                             self.typed_slots.remove(&ptr);
+                            self.slot_anchor.remove(&ptr);
                         }
-                    }
+                        Some(ptr)
+                    } else {
+                        None
+                    };
                     ob.unset_props.insert(k);
+                    drop(ob);
+                    if let Some(ptr) = prune {
+                        self.prune_typed_slot(ptr);
+                    }
                 } else if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
                     // unset() on an uninitialized declared prop still
                     // marks it unset — reads then route to __get
@@ -17105,14 +17721,19 @@ impl<'a> Interp<'a> {
             Some(c) => {
                 if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
                     if let Some(tys) = &pd.ty {
+                        let p = Rc::as_ptr(&c) as usize;
                         self.typed_slots.insert(
-                            Rc::as_ptr(&c) as usize,
+                            p,
                             (
                                 c.clone(),
                                 tys.clone(),
                                 dcls.name().to_string(),
                                 name.to_string(),
                             ),
+                        );
+                        self.slot_anchor.insert(
+                            p,
+                            SlotAnchor::Statics(dcls.name().to_string(), name.to_string()),
                         );
                     }
                 }
@@ -17125,14 +17746,20 @@ impl<'a> Interp<'a> {
                     let c = cell(Value::Null);
                     cls.statics.borrow_mut().insert(name.to_string(), c.clone());
                     if let Some(tys) = &pd.ty {
+                        self.last_fresh_cell = Some(Rc::as_ptr(&c) as usize);
+                        let p = Rc::as_ptr(&c) as usize;
                         self.typed_slots.insert(
-                            Rc::as_ptr(&c) as usize,
+                            p,
                             (
                                 c.clone(),
                                 tys.clone(),
                                 dcls.name().to_string(),
                                 name.to_string(),
                             ),
+                        );
+                        self.slot_anchor.insert(
+                            p,
+                            SlotAnchor::Statics(dcls.name().to_string(), name.to_string()),
                         );
                     }
                     return Ok(c);
@@ -17635,6 +18262,13 @@ impl<'a> Interp<'a> {
             // "not a subtype".
             self.pending_exception = None;
         }
+        // Aliases canonicalize through the class table: `Bar` (an
+        // alias of Foo) compares as `Foo` (typed_properties_084).
+        let canon_b = self
+            .classes
+            .get(&b.trim_start_matches('\\').to_lowercase())
+            .map(|c| c.name().to_string());
+        let b = canon_b.as_deref().unwrap_or(b);
         match self.classes.get(&a.to_lowercase()).cloned() {
             Some(c) => self.is_a(&c, b),
             None => self.is_a_unresolved(a, b, 0),
@@ -18666,8 +19300,8 @@ fn ty_disp(ty: &[String]) -> String {
                 m.split('&')
                     .map(|p| {
                         let p = p.trim_start_matches('\\');
-                        if p.starts_with("class@anonymous$") {
-                            "class@anonymous".to_string()
+                        if let Some(pos) = p.find("@anonymous$") {
+                            format!("{}@anonymous", &p[..pos])
                         } else {
                             p.to_string()
                         }

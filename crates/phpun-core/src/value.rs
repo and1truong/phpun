@@ -824,9 +824,9 @@ pub struct PhpClass {
 impl PhpClass {
     pub fn name(&self) -> &str {
         // Anonymous classes carry a `$LINE` uniquifier internally;
-        // Zend's public name is just `class@anonymous`.
-        if self.decl.name.starts_with("class@anonymous") {
-            "class@anonymous"
+        // Zend's public name is `{Base}@anonymous`.
+        if let Some(pos) = self.decl.name.find("@anonymous$") {
+            &self.decl.name[..pos + "@anonymous".len()]
         } else {
             &self.decl.name
         }
@@ -939,8 +939,9 @@ pub enum ObjectInternal {
     None,
 }
 
-/// One yielded pair.
-pub type GenItem = (Value, Value);
+/// One yielded pair — the value cell so `&function` generators can
+/// yield by reference (typed_properties_033/034).
+pub type GenItem = (Value, Cell);
 
 /// Generator internal state (object internal behind the `Generator`
 /// class, which implements `Iterator`).
@@ -957,6 +958,8 @@ pub struct GenState {
     pub finished: bool,
     /// `return` value — read by getReturn().
     pub return_val: Value,
+    /// `function &gen()` — yields expose their cells to `foreach ..&`.
+    pub by_ref: bool,
     /// Auto keys for keyless `yield $v` (0, 1, 2…).
     pub auto_key: i64,
     /// Every send() value ever passed, in call order — the k-th send
