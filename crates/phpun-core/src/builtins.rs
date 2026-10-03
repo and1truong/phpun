@@ -427,6 +427,50 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             }
             Value::str(out)
         }
+        "addcslashes" => {
+            // Escapes chars in the charlist (with `a..z` ranges) as
+            // C-escapes or \ooo octal (heredoc_nowdoc/bug79934).
+            let s = arg_str(it, args, 0);
+            let list = arg_str(it, args, 1);
+            let lb = list.as_bytes();
+            let mut set = [false; 256];
+            let mut i = 0;
+            while i < lb.len() {
+                if i + 3 < lb.len() && lb[i + 1] == b'.' && lb[i + 2] == b'.' {
+                    let (lo, hi) = (lb[i], lb[i + 3]);
+                    if lo <= hi {
+                        for c in lo..=hi {
+                            set[c as usize] = true;
+                        }
+                    }
+                    i += 4;
+                } else {
+                    set[lb[i] as usize] = true;
+                    i += 1;
+                }
+            }
+            let mut out = String::new();
+            for c in s.chars() {
+                let cp = c as u32;
+                if cp < 256 && set[cp as usize] {
+                    match c {
+                        '\0' => out.push_str("\\0"),
+                        '\x07' => out.push_str("\\a"),
+                        '\x08' => out.push_str("\\b"),
+                        '\t' => out.push_str("\\t"),
+                        '\n' => out.push_str("\\n"),
+                        '\x0b' => out.push_str("\\v"),
+                        '\x0c' => out.push_str("\\f"),
+                        '\r' => out.push_str("\\r"),
+                        _ if (0x20..0x7f).contains(&cp) => out.push_str(&format!("\\{}", c)),
+                        _ => out.push_str(&format!("\\{:03o}", cp)),
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            Value::str(out)
+        }
         "stripslashes" => {
             let s = arg_str(it, args, 0);
             let mut out = String::new();
@@ -2303,6 +2347,100 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             out.set(ArrKey::Str("filename".into()), Value::str(stem));
             Value::Array(Rc::new(RefCell::new(out)))
         }
+        // scheme://user:pass@host:port/path?query#fragment — component arg
+        // selects one part (PHP_URL_*), -1 returns the present parts.
+        "parse_url" => {
+            let url = arg_str(it, args, 0);
+            let comp = arg(args, 1).to_int();
+            let (rest, fragment) = match url.split_once('#') {
+                Some((a, b)) => (a.to_string(), Some(b.to_string())),
+                None => (url.clone(), None),
+            };
+            let (rest, query) = match rest.split_once('?') {
+                Some((a, b)) => (a.to_string(), Some(b.to_string())),
+                None => (rest, None),
+            };
+            let (scheme, rest) = match rest.split_once("://") {
+                Some((s, r)) => (Some(s.to_lowercase()), r.to_string()),
+                None => (None, rest),
+            };
+            let (authority, path) = if scheme.is_some() || rest.starts_with("//") {
+                let rest = rest.trim_start_matches('/');
+                match rest.split_once('/') {
+                    Some((a, p)) => (Some(a.to_string()), format!("/{}", p)),
+                    None => (
+                        if rest.is_empty() {
+                            None
+                        } else {
+                            Some(rest.to_string())
+                        },
+                        String::new(),
+                    ),
+                }
+            } else {
+                (None, rest)
+            };
+            let (user, pass, host, port) = match &authority {
+                Some(auth) => {
+                    let (up, hp) = match auth.split_once('@') {
+                        Some((u, h)) => (Some(u), h),
+                        None => (None, auth.as_str()),
+                    };
+                    let (user, pass) = up
+                        .map(|u| match u.split_once(':') {
+                            Some((a, b)) => (Some(a.to_string()), Some(b.to_string())),
+                            None => (Some(u.to_string()), None),
+                        })
+                        .unwrap_or((None, None));
+                    let (host, port) = match hp.rsplit_once(':') {
+                        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+                            (h.to_string(), p.parse::<i64>().ok())
+                        }
+                        _ => (hp.to_string(), None),
+                    };
+                    (user, pass, Some(host), port)
+                }
+                None => (None, None, None, None),
+            };
+            let part = |i: i64| -> Option<Value> {
+                match i {
+                    0 => scheme.clone().map(Value::str),
+                    1 => host.clone().map(Value::str),
+                    2 => port.map(Value::Int),
+                    3 => user.clone().map(Value::str),
+                    4 => pass.clone().map(Value::str),
+                    5 => {
+                        if path.is_empty() {
+                            None
+                        } else {
+                            Some(Value::str(path.clone()))
+                        }
+                    }
+                    6 => query.clone().map(Value::str),
+                    7 => fragment.clone().map(Value::str),
+                    _ => None,
+                }
+            };
+            if comp >= 0 {
+                return Ok(Some(part(comp).unwrap_or(Value::Null)));
+            }
+            let mut out = PhpArray::new();
+            for (i, key) in [
+                (0, "scheme"),
+                (1, "host"),
+                (2, "port"),
+                (3, "user"),
+                (4, "pass"),
+                (5, "path"),
+                (6, "query"),
+                (7, "fragment"),
+            ] {
+                if let Some(v) = part(i) {
+                    out.set(ArrKey::Str(key.into()), v);
+                }
+            }
+            Value::Array(Rc::new(RefCell::new(out)))
+        }
         "tempnam" => {
             let dir = arg_str(it, args, 0);
             let prefix = arg_str(it, args, 1);
@@ -2861,10 +2999,33 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         },
         "closure_from_callable" | "closure::fromcallable" => arg(args, 0),
         "get_called_class" => Value::str(""),
-        "spl_autoload_register"
-        | "spl_autoload_unregister"
-        | "spl_autoload_functions"
-        | "spl_autoload_call" => Value::Bool(true),
+        "spl_autoload_register" => {
+            if let Some(v) = args.first() {
+                it.autoload_fns.push(v.borrow().clone());
+            }
+            Value::Bool(true)
+        }
+        "spl_autoload_unregister" => {
+            // exact-value match — autoload lists are tiny in practice.
+            if let Some(v) = args.first() {
+                let target = v.borrow().clone();
+                it.autoload_fns
+                    .retain(|f| !crate::value::identical(f, &target));
+            }
+            Value::Bool(true)
+        }
+        "spl_autoload_functions" => {
+            let mut a = PhpArray::new();
+            for f in &it.autoload_fns {
+                a.push(f.clone());
+            }
+            Value::Array(Rc::new(RefCell::new(a)))
+        }
+        "spl_autoload_call" => {
+            let n = arg_str(it, args, 0);
+            it.run_autoload(&n);
+            Value::Bool(true)
+        }
         "array_key_exists_slow" => Value::Null,
         "ctype_digit" => Value::Bool(
             !arg_str(it, args, 0).is_empty()
@@ -2907,12 +3068,133 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "token_get_all" | "token_name" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
         "highlight_string" | "highlight_file" | "php_strip_whitespace" => Value::Bool(true),
         "pack" | "unpack" => Value::Bool(false), // TODO
-        "headers_sent"
-        | "headers_list"
-        | "header"
-        | "header_remove"
-        | "header_register_callback" => Value::Bool(false),
-        "setcookie" | "setrawcookie" => Value::Bool(true),
+        "header" => {
+            let h = arg_str(it, args, 0);
+            let replace = args.get(1).map(|c| c.borrow().is_truthy()).unwrap_or(true);
+            let code = arg(args, 2).to_int();
+            let lower = h.to_lowercase();
+            if lower.starts_with("http/") {
+                // Status-line form: header("HTTP/1.1 404 Not Found").
+                if let Some(c) = h
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    it.resp_code = c;
+                }
+            } else {
+                let name = h.split(':').next().unwrap_or("").trim().to_lowercase();
+                if replace && !name.is_empty() {
+                    let prefix = format!("{}:", name);
+                    it.out_headers
+                        .retain(|x| !x.to_lowercase().starts_with(&prefix));
+                }
+                it.out_headers.push(h);
+                if code > 0 {
+                    it.resp_code = code;
+                } else if name == "location" {
+                    it.resp_code = 302;
+                }
+            }
+            Value::Null
+        }
+        "headers_sent" => Value::Bool(false),
+        "headers_list" => {
+            let mut a = PhpArray::new();
+            for h in &it.out_headers {
+                a.push(Value::str(h.clone()));
+            }
+            Value::Array(Rc::new(RefCell::new(a)))
+        }
+        "header_remove" => {
+            if args.is_empty() {
+                it.out_headers.clear();
+            } else {
+                let prefix = format!("{}:", arg_str(it, args, 0).to_lowercase());
+                it.out_headers
+                    .retain(|x| !x.to_lowercase().starts_with(&prefix));
+            }
+            Value::Null
+        }
+        "header_register_callback" => Value::Bool(false),
+        "http_response_code" => {
+            if args.is_empty() {
+                Value::Int(it.resp_code)
+            } else {
+                let code = arg(args, 0).to_int();
+                it.resp_code = code;
+                Value::Int(code)
+            }
+        }
+        "setcookie" | "setrawcookie" => {
+            let cname = arg_str(it, args, 0);
+            let cval = if name == "setcookie" {
+                urlencode(&arg_str(it, args, 1), true)
+            } else {
+                arg_str(it, args, 1)
+            };
+            let mut line = format!("Set-Cookie: {}={}", cname, cval);
+            let opts = arg(args, 2);
+            let (expires, path, domain, secure, httponly, samesite) = match &opts {
+                Value::Array(a) => {
+                    let a = a.borrow();
+                    let get = |k: &str| {
+                        a.entries
+                            .iter()
+                            .find(|(ek, _)| matches!(ek, ArrKey::Str(s) if s.as_ref() == k))
+                            .map(|(_, c)| c.borrow().clone())
+                    };
+                    (
+                        get("expires").map(|v| v.to_int()).unwrap_or(0),
+                        get("path").map(|v| it.to_string_of(&v)).unwrap_or_default(),
+                        get("domain")
+                            .map(|v| it.to_string_of(&v))
+                            .unwrap_or_default(),
+                        get("secure").map(|v| v.is_truthy()).unwrap_or(false),
+                        get("httponly").map(|v| v.is_truthy()).unwrap_or(false),
+                        get("samesite")
+                            .map(|v| it.to_string_of(&v))
+                            .unwrap_or_default(),
+                    )
+                }
+                v => (
+                    v.to_int(),
+                    arg_str(it, args, 3),
+                    arg_str(it, args, 4),
+                    arg(args, 5).is_truthy(),
+                    arg(args, 6).is_truthy(),
+                    String::new(),
+                ),
+            };
+            if expires > 0 {
+                line.push_str(&format!(
+                    "; expires={}; Max-Age={}",
+                    date_format("D, d M Y H:i:s", expires),
+                    expires
+                        - std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0)
+                ));
+            }
+            if !path.is_empty() {
+                line.push_str(&format!("; path={}", path));
+            }
+            if !domain.is_empty() {
+                line.push_str(&format!("; domain={}", domain));
+            }
+            if secure {
+                line.push_str("; secure");
+            }
+            if httponly {
+                line.push_str("; HttpOnly");
+            }
+            if !samesite.is_empty() {
+                line.push_str(&format!("; SameSite={}", samesite));
+            }
+            it.out_headers.push(line);
+            Value::Bool(true)
+        }
         "connection_status" | "connection_aborted" => Value::Int(0),
         "fastcgi_finish_request" => Value::Bool(true),
         "preg_jit" => Value::Bool(false),
@@ -2965,23 +3247,337 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
     }))
 }
 
-fn is_builtin(n: &str) -> bool {
+/// Parameter names/requiredness for a handful of builtins whose FCC
+/// closures appear in var_dump output (Zend/tests/first_class_callable).
+/// `(name, required)`.
+fn builtin_sig(n: &str) -> Option<Vec<(String, bool)>> {
+    let ps: &[(&str, bool)] = match n {
+        "strlen" | "strrev" | "strtoupper" | "strtolower" | "md5" | "sha1" => &[("string", true)],
+        "sprintf" => &[("format", true), ("args", false)],
+        "str_repeat" => &[("string", true), ("times" /* multi */, true)],
+        "substr" => &[("string", true), ("offset", true), ("length", false)],
+        "strpos" => &[("haystack", true), ("needle", true), ("offset", false)],
+        "assert" => &[("assertion", true), ("description", false)],
+        "count" => &[("value", true), ("mode", false)],
+        "implode" => &[("separator", false), ("array", true)],
+        "explode" => &[("separator", true), ("string", true), ("limit", false)],
+        _ => return Some(Vec::new()),
+    };
+    Some(ps.iter().map(|(n, r)| (n.to_string(), *r)).collect())
+}
+
+pub(crate) fn is_builtin(n: &str) -> bool {
     matches!(
         n,
-        "strlen"
-            | "var_dump"
-            | "print_r"
-            | "echo"
-            | "print"
-            | "count"
-            | "implode"
-            | "explode"
-            | "abs"
-            | "max"
-            | "min"
+        "abs"
+            | "acos"
+            | "addcslashes"
+            | "addslashes"
+            | "array_change_key_case"
+            | "array_chunk"
+            | "array_column"
+            | "array_combine"
+            | "array_count_values"
+            | "array_diff"
+            | "array_diff_key"
+            | "array_fill"
+            | "array_fill_keys"
+            | "array_filter"
+            | "array_flip"
+            | "array_intersect"
+            | "array_intersect_key"
+            | "array_is_list"
+            | "array_key_exists_slow"
+            | "array_key_last"
+            | "array_keys"
+            | "array_map"
+            | "array_multisort"
+            | "array_pad"
+            | "array_pop"
+            | "array_product"
             | "array_push"
-            | "sprintf"
+            | "array_rand"
+            | "array_reduce"
+            | "array_replace"
+            | "array_reverse"
+            | "array_search"
+            | "array_shift"
+            | "array_slice"
+            | "array_splice"
+            | "array_sum"
+            | "array_unique"
+            | "array_unshift"
+            | "array_values"
+            | "array_walk"
+            | "asin"
+            | "assert"
+            | "assert_options"
+            | "assert_options_now"
+            | "atan"
+            | "atan2"
+            | "base64_decode"
+            | "base64_encode"
+            | "base_convert"
+            | "basename"
+            | "bin2hex"
+            | "bindec"
+            | "boolval"
+            | "call_func"
+            | "ceil"
+            | "chdir"
+            | "checkdate"
+            | "chr"
+            | "chunk_split"
+            | "class_exists"
+            | "clone"
+            | "compact"
+            | "compact_obj"
+            | "constant"
+            | "copy"
+            | "cos"
+            | "cosh"
+            | "count_chars"
+            | "crc32"
+            | "crc32_combine"
+            | "ctype_alnum"
+            | "ctype_alpha"
+            | "ctype_digit"
+            | "ctype_lower"
+            | "ctype_space"
+            | "ctype_upper"
+            | "date_parse"
+            | "debug_backtrace"
+            | "debug_print_backtrace"
+            | "debug_zval_dump"
+            | "decbin"
+            | "dechex"
+            | "decoct"
+            | "define"
+            | "defined"
+            | "deg2rad"
+            | "divmod"
+            | "dl"
+            | "each"
+            | "end"
+            | "enum_exists"
+            | "error_reporting"
+            | "exp"
+            | "explode"
+            | "extension_loaded"
+            | "extract"
+            | "fastcgi_finish_request"
+            | "fclose"
+            | "fdiv"
+            | "feof"
+            | "fflush"
+            | "fgetc"
+            | "fgetcsv"
+            | "fgets"
+            | "file"
+            | "file_exists"
+            | "file_get_contents"
+            | "file_put_contents"
+            | "fileperms"
+            | "filesize"
+            | "flock"
+            | "floor"
+            | "fmod"
+            | "fnmatch"
+            | "fopen"
+            | "fpassthru"
+            | "fprintf"
+            | "fread"
+            | "fseek"
+            | "fstat"
+            | "ftell"
+            | "ftruncate"
+            | "function_exists"
+            | "gc_enabled"
+            | "gc_status"
+            | "get_called_class"
+            | "get_class"
+            | "get_class_methods"
+            | "get_class_vars"
+            | "get_current_user"
+            | "get_debug_type"
+            | "get_declared_classes"
+            | "get_declared_interfaces"
+            | "get_declared_traits"
+            | "get_extension_funcs"
+            | "get_loaded_extensions"
+            | "get_parent_class"
+            | "getcwd"
+            | "getenv"
+            | "getmypid"
+            | "gettype"
+            | "glob"
+            | "hash"
+            | "hash_equals"
+            | "header"
+            | "header_register_callback"
+            | "header_remove"
+            | "headers_list"
+            | "headers_sent"
+            | "hex2bin"
+            | "hexdec"
+            | "hrtime"
+            | "http_build_query"
+            | "http_response_code"
+            | "hypot"
+            | "ignore_user_abort"
+            | "in_array"
+            | "ini_get"
+            | "ini_get_all"
+            | "ini_parse_quantity"
+            | "ini_restore"
+            | "ini_set"
+            | "intdiv"
+            | "interface_exists"
+            | "is_a"
+            | "is_array"
+            | "is_bool"
+            | "is_callable"
+            | "is_countable"
+            | "is_dir"
+            | "is_executable"
+            | "is_file"
+            | "is_finite"
+            | "is_infinite"
+            | "is_iterable"
+            | "is_link"
+            | "is_nan"
+            | "is_null"
+            | "is_numeric"
+            | "is_object"
+            | "is_readable"
+            | "is_resource"
+            | "is_scalar"
+            | "is_string"
+            | "is_subclass_of"
+            | "iterator_from_array"
+            | "json_decode"
+            | "json_encode"
+            | "json_validate"
+            | "key"
+            | "lcfirst"
+            | "lcg_value"
+            | "levenshtein"
+            | "log10"
+            | "log2"
+            | "ltrim"
+            | "mb_convert_case"
+            | "mb_strlen"
+            | "mb_strtolower_nc"
+            | "md5"
+            | "memory_get_peak_usage"
+            | "memory_get_usage"
+            | "memory_reset_peak_usage"
+            | "method_exists"
+            | "microtime"
+            | "microtime_float"
+            | "mkdir"
+            | "nl2br"
+            | "number_format"
+            | "ob_clean"
+            | "ob_end_clean"
+            | "ob_end_flush"
+            | "ob_get_clean"
+            | "ob_get_contents"
+            | "ob_get_flush"
+            | "ob_get_length"
+            | "ob_get_level"
+            | "ob_get_status"
+            | "ob_start"
+            | "octdec"
+            | "ord"
+            | "output_reset_rewrite_vars"
+            | "parse_str"
+            | "parse_url"
+            | "pathinfo"
+            | "php_check_syntax"
+            | "php_sapi_name"
+            | "php_uname"
+            | "pi"
+            | "pow"
+            | "preg_jit"
+            | "print"
+            | "print_r"
             | "printf"
+            | "property_exists"
+            | "putenv"
+            | "quotemeta"
+            | "rad2deg"
+            | "range"
+            | "rawurldecode"
+            | "rawurlencode"
+            | "readfile"
+            | "realpath"
+            | "register_shutdown_function"
+            | "rename"
+            | "reset"
+            | "rewind"
+            | "rmdir"
+            | "round"
+            | "scandir"
+            | "serialize"
+            | "set_error_handler"
+            | "set_exception_handler"
+            | "set_time_limit"
+            | "setcookie"
+            | "setlocale"
+            | "setrawcookie"
+            | "settype"
+            | "sha1"
+            | "similar_text"
+            | "sin"
+            | "sinh"
+            | "sleep"
+            | "soundex"
+            | "sprintf"
+            | "sqrt"
+            | "str_contains"
+            | "str_ends_with"
+            | "str_ireplace"
+            | "str_pad"
+            | "str_repeat"
+            | "str_replace"
+            | "str_rot13"
+            | "str_starts_with"
+            | "str_word_count"
+            | "stream_get_contents"
+            | "strip_tags"
+            | "stripslashes"
+            | "strlen"
+            | "strrev"
+            | "strtotime"
+            | "strtr"
+            | "strval"
+            | "substr_count"
+            | "substr_replace"
+            | "sys_get_temp_dir"
+            | "tan"
+            | "tanh"
+            | "tempnam"
+            | "time_nanosleep"
+            | "tmpfile"
+            | "trait_exists"
+            | "trim"
+            | "ucfirst"
+            | "ucwords"
+            | "umask"
+            | "uniqid"
+            | "unlink"
+            | "unserialize"
+            | "urldecode"
+            | "urlencode"
+            | "usleep"
+            | "var_dump"
+            | "var_export"
+            | "version_compare"
+            | "vprintf"
+            | "vsprintf"
+            | "wordwrap"
+            | "zend_version"
     )
 }
 
@@ -3125,7 +3721,124 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
             }
             it.emit(&format!("{}}}\n", pad));
         }
-        Value::Callable(_) => it.emit(&format!("{}object(Closure)#1 (0) {{\n{}}}\n", pad, pad)),
+        Value::Callable(c) => {
+            // Closure debug info (zend_closures.c): function/name key +
+            // bound $this + file/line for literals + parameter map.
+            let pad2 = format!("{}  ", pad);
+            let pad3 = format!("{}    ", pad);
+            let mut keys: Vec<(String, String)> = Vec::new();
+            let mut this_obj = None;
+            let params: Option<Vec<(String, bool)>> = match &c.kind {
+                crate::value::CallableKind::Named(n) => {
+                    keys.push(("function".into(), n.clone()));
+                    it.functions
+                        .get(&n.to_lowercase())
+                        .map(|d| {
+                            d.params
+                                .iter()
+                                .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
+                                .collect()
+                        })
+                        .or_else(|| builtin_sig(&n.to_lowercase()))
+                }
+                crate::value::CallableKind::Method { obj, class, name } => {
+                    let cn = c
+                        .scope_class
+                        .as_ref()
+                        .map(|sc| sc.name().to_string())
+                        .or_else(|| {
+                            obj.as_ref()
+                                .map(|o| o.borrow().class.name().to_string())
+                                .or_else(|| class.as_ref().map(|cl| cl.name().to_string()))
+                        })
+                        .unwrap_or_default();
+                    keys.push(("function".into(), format!("{}::{}", cn, name)));
+                    if let Some(o) = obj {
+                        this_obj = Some(o.clone());
+                    }
+                    let cls = obj
+                        .as_ref()
+                        .map(|o| o.borrow().class.clone())
+                        .or_else(|| class.clone());
+                    cls.and_then(|cl| {
+                        it.find_method_in(&cl, name).map(|(m, _)| {
+                            m.decl
+                                .params
+                                .iter()
+                                .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
+                                .collect()
+                        })
+                    })
+                }
+                crate::value::CallableKind::Closure(d) => {
+                    keys.push(("name".into(), format!("{{closure:{}:{}}}", d.file, d.line)));
+                    keys.push(("file".into(), d.file.clone()));
+                    keys.push(("line".into(), String::new())); // int below
+                    Some(
+                        d.params
+                            .iter()
+                            .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
+                            .collect(),
+                    )
+                }
+            };
+            let has_params = params.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
+            let nfields = keys.len() + this_obj.is_some() as usize + has_params as usize;
+            it.emit(&format!(
+                "{}object(Closure)#{} ({}) {{\n",
+                pad,
+                c.id.get(),
+                nfields
+            ));
+            let mut line_int = 0i64;
+            if let crate::value::CallableKind::Closure(d) = &c.kind {
+                line_int = d.line as i64;
+            }
+            for (k, v) in &keys {
+                if k == "line" {
+                    it.emit(&format!(
+                        "{}[\"line\"]=>\n{}int({})\n",
+                        pad2, pad2, line_int
+                    ));
+                } else {
+                    it.emit(&format!(
+                        "{}[\"{}\"]=>\n{}string({}) \"{}\"\n",
+                        pad2,
+                        k,
+                        pad2,
+                        v.len(),
+                        v
+                    ));
+                }
+            }
+            if let Some(o) = &this_obj {
+                it.emit(&format!("{}[\"this\"]=>\n", pad2));
+                var_dump(it, &Value::Object(o.clone()), indent + 1, zval, false);
+            }
+            if let Some(ps) = &params {
+                if has_params {
+                    it.emit(&format!(
+                        "{}[\"parameter\"]=>\n{}array({}) {{\n",
+                        pad2,
+                        pad2,
+                        ps.len()
+                    ));
+                    for (pn, req) in ps {
+                        let word = if *req { "<required>" } else { "<optional>" };
+                        it.emit(&format!(
+                            "{}[\"${}\"]=>\n{}string({}) \"{}\"\n",
+                            pad3,
+                            pn,
+                            pad3,
+                            word.len(),
+                            word
+                        ));
+                    }
+                    it.emit(&format!("{}}}\n", pad2));
+                }
+            }
+            it.emit(&format!("{}}}\n", pad));
+        }
         Value::Resource(r) => it.emit(&format!(
             "{}resource({}) of type (stream)\n",
             pad,
@@ -3992,7 +4705,7 @@ fn unserialize(it: &mut Interp, s: &str, pos: &mut usize) -> Result<Value, ()> {
             let n: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
             *pos += 1; // {
             let obj = match it.instantiate(&cname.to_lowercase(), &[]) {
-                Value::Object(o) => o,
+                Ok(Value::Object(o)) => o,
                 _ => return Err(()),
             };
             for _ in 0..n {
@@ -4398,7 +5111,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn urlencode(s: &str, raw: bool) -> String {
+pub(crate) fn urlencode(s: &str, raw: bool) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
@@ -4411,7 +5124,7 @@ fn urlencode(s: &str, raw: bool) -> String {
     out
 }
 
-fn urldecode(s: &str, raw: bool) -> String {
+pub(crate) fn urldecode(s: &str, raw: bool) -> String {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -4466,39 +5179,107 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                 }
             };
             let all = name == "preg_match_all";
+            let flags = arg(args, 3).to_int();
+            let offset = arg(args, 4).to_int().max(0) as usize;
+            let hay = subj.get(offset..).unwrap_or("");
             let mut matches_arr = PhpArray::new();
             let mut count = 0i64;
+            let caps = re.caps(hay);
+            // A capture group -> PHP value honoring OFFSET_CAPTURE and
+            // UNMATCHED_AS_NULL; offsets are absolute on the subject.
+            let entry = |span: Option<(usize, usize)>| -> Value {
+                match span {
+                    Some((a, b)) if flags & 256 != 0 => {
+                        let mut pair = PhpArray::new();
+                        pair.push(hay.get(a..b).map(Value::str).unwrap_or(Value::str("")));
+                        pair.push(Value::Int((a + offset) as i64));
+                        Value::Array(Rc::new(RefCell::new(pair)))
+                    }
+                    Some((a, b)) => hay.get(a..b).map(Value::str).unwrap_or(Value::str("")),
+                    None if flags & 512 != 0 => Value::Null,
+                    None => Value::str(""),
+                }
+            };
             if all {
-                // group by capture index
                 let ngroups = re.captures_len();
-                let mut groups: Vec<PhpArray> = (0..ngroups).map(|_| PhpArray::new()).collect();
-                for cap in re.captures_iter(&subj) {
-                    count += 1;
-                    for (g, grp) in groups.iter_mut().enumerate().take(ngroups) {
-                        let m = cap
-                            .get(g)
-                            .map(|m| m.as_str().to_string())
-                            .unwrap_or_default();
-                        grp.push(Value::str(m));
+                if flags & 2 != 0 {
+                    // PREG_SET_ORDER: one row per match.
+                    for cap in &caps {
+                        count += 1;
+                        let mut row = PhpArray::new();
+                        for g in 0..cap.spans.len().max(ngroups) {
+                            let span = cap.spans.get(g).copied().flatten();
+                            // PHP omits unmatched groups entirely unless
+                            // PREG_UNMATCHED_AS_NULL asked for nulls.
+                            if span.is_none() && flags & 512 == 0 {
+                                continue;
+                            }
+                            let v = entry(span);
+                            if let Some(n) = re.group_name(g) {
+                                row.set(ArrKey::Str(n.into()), v.clone());
+                            }
+                            row.set(ArrKey::Int(g as i64), v);
+                        }
+                        if let Some(m) = &cap.mark {
+                            row.set(ArrKey::Str("MARK".into()), Value::str(m.clone()));
+                        }
+                        matches_arr.push(Value::Array(Rc::new(RefCell::new(row))));
+                    }
+                } else {
+                    // PREG_PATTERN_ORDER (default): one column per group.
+                    let mut groups: Vec<PhpArray> = (0..ngroups).map(|_| PhpArray::new()).collect();
+                    for cap in &caps {
+                        count += 1;
+                        for (g, grp) in groups.iter_mut().enumerate().take(ngroups) {
+                            grp.push(entry(cap.spans.get(g).copied().flatten()));
+                        }
+                    }
+                    for (g, grp) in groups.into_iter().enumerate() {
+                        if let Some(n) = re.group_name(g) {
+                            matches_arr.set(
+                                ArrKey::Str(n.into()),
+                                Value::Array(Rc::new(RefCell::new(grp.clone()))),
+                            );
+                        }
+                        matches_arr.push(Value::Array(Rc::new(RefCell::new(grp))));
+                    }
+                    if caps.iter().any(|c| c.mark.is_some()) {
+                        let mut marks = PhpArray::new();
+                        for c in &caps {
+                            marks.push(
+                                c.mark
+                                    .as_ref()
+                                    .map(|m| Value::str(m.clone()))
+                                    .unwrap_or(Value::Bool(false)),
+                            );
+                        }
+                        matches_arr.set(
+                            ArrKey::Str("MARK".into()),
+                            Value::Array(Rc::new(RefCell::new(marks))),
+                        );
                     }
                 }
-                for g in groups {
-                    matches_arr.push(Value::Array(Rc::new(RefCell::new(g))));
-                }
-            } else if let Some(cap) = re.captures(&subj) {
+            } else if let Some(cap) = caps.into_iter().next() {
                 count = 1;
-                for g in 0..cap.len() {
-                    matches_arr.push(
-                        cap.get(g)
-                            .map(|m| Value::str(m.as_str()))
-                            .unwrap_or(Value::str("")),
-                    );
+                for g in 0..cap.spans.len() {
+                    let span = cap.spans.get(g).copied().flatten();
+                    if span.is_none() && flags & 512 == 0 {
+                        continue;
+                    }
+                    let v = entry(span);
+                    if let Some(n) = re.group_name(g) {
+                        matches_arr.set(ArrKey::Str(n.into()), v.clone());
+                    }
+                    matches_arr.set(ArrKey::Int(g as i64), v);
+                }
+                if let Some(m) = &cap.mark {
+                    matches_arr.set(ArrKey::Str("MARK".into()), Value::str(m.clone()));
                 }
             }
             if let Some(c) = args.get(2) {
                 *c.borrow_mut() = Value::Array(Rc::new(RefCell::new(matches_arr)));
             }
-            Ok(Value::Int(count.min(1)))
+            Ok(Value::Int(count))
         }
         "preg_replace" | "preg_replace_callback" => {
             let pat = arg(args, 0);
@@ -4523,18 +5304,24 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                     let cb = arg(args, 1);
                     let mut out = String::new();
                     let mut last = 0;
-                    for (n, cap) in re.captures_iter(&result).enumerate() {
+                    for (n, cap) in re.caps(&result).into_iter().enumerate() {
                         let n = n as i64;
                         if limit > 0 && n >= limit {
                             break;
                         }
-                        let m = cap.get(0).unwrap();
-                        out.push_str(&result[last..m.start()]);
+                        let Some(Some((ms, me))) = cap.spans.first() else {
+                            continue;
+                        };
+                        out.push_str(result.get(last..*ms).unwrap_or(""));
                         let mut group_arr = PhpArray::new();
-                        for g in 0..cap.len() {
+                        for g in 0..cap.spans.len() {
                             group_arr.push(
-                                cap.get(g)
-                                    .map(|m| Value::str(m.as_str()))
+                                cap.spans
+                                    .get(g)
+                                    .copied()
+                                    .flatten()
+                                    .and_then(|(a, b)| result.get(a..b))
+                                    .map(Value::str)
                                     .unwrap_or(Value::str("")),
                             );
                         }
@@ -4543,23 +5330,28 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                             vec![cell(Value::Array(Rc::new(RefCell::new(group_arr))))],
                         )?;
                         out.push_str(&r.to_php_string());
-                        last = m.end();
+                        last = *me;
                         let _ = n;
                     }
                     out.push_str(&result[last..]);
                     out
                 } else {
                     let repl = arg(args, 1).to_php_string();
-                    let r = re.replace_all(&result, |caps: &regex::Captures| {
+                    re.replace_all(&result, &mut |caps: &PhpCap| {
                         let mut out = repl.clone();
-                        for g in (0..caps.len()).rev() {
-                            let m = caps.get(g).map(|m| m.as_str()).unwrap_or("");
+                        for g in (0..caps.spans.len()).rev() {
+                            let m = caps
+                                .spans
+                                .get(g)
+                                .copied()
+                                .flatten()
+                                .and_then(|(a, b)| result.get(a..b))
+                                .unwrap_or("");
                             out = out.replace(&format!("${}", g), m);
                             out = out.replace(&format!("\\{}", g), m);
                         }
                         out
-                    });
-                    r.to_string()
+                    })
                 };
             }
             Ok(Value::str(result))
@@ -4567,18 +5359,67 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
         "preg_split" => {
             let pat = arg_str(it, args, 0);
             let subj = arg_str(it, args, 1);
+            let flags = arg(args, 3).to_int();
+            let limit = arg(args, 2).to_int();
             let re = match php_regex(&pat) {
                 Some(r) => r,
                 None => return Ok(Value::Bool(false)),
             };
             let mut out = PhpArray::new();
-            for part in re.split(&subj) {
-                out.push(Value::str(part));
+            let mut last = 0usize;
+            for cap in re.caps(&subj) {
+                let Some(Some((a, b))) = cap.spans.first() else {
+                    continue;
+                };
+                // limit reached: emit the rest as one piece and stop
+                if limit > 0 && out.entries.len() as i64 >= limit - 1 {
+                    out.push(Value::str(subj.get(last..).unwrap_or("")));
+                    return Ok(Value::Array(Rc::new(RefCell::new(out))));
+                }
+                let piece = subj.get(last..*a).unwrap_or("");
+                if flags & 1 == 0 || !piece.is_empty() {
+                    if flags & 4 != 0 {
+                        let mut pair = PhpArray::new();
+                        pair.push(Value::str(piece));
+                        pair.push(Value::Int(last as i64));
+                        out.push(Value::Array(Rc::new(RefCell::new(pair))));
+                    } else {
+                        out.push(Value::str(piece));
+                    }
+                }
+                if flags & 2 != 0 {
+                    for (ga, gb) in cap.spans.iter().skip(1).flatten() {
+                        if flags & 1 == 0 || ga != gb {
+                            let g = subj.get(*ga..*gb).unwrap_or("");
+                            if flags & 4 != 0 {
+                                let mut pair = PhpArray::new();
+                                pair.push(Value::str(g));
+                                pair.push(Value::Int(*ga as i64));
+                                out.push(Value::Array(Rc::new(RefCell::new(pair))));
+                            } else {
+                                out.push(Value::str(g));
+                            }
+                        }
+                    }
+                }
+                last = *b;
+            }
+            let tail = subj.get(last..).unwrap_or("");
+            if flags & 1 == 0 || !tail.is_empty() {
+                if flags & 4 != 0 {
+                    let mut pair = PhpArray::new();
+                    pair.push(Value::str(tail));
+                    pair.push(Value::Int(last as i64));
+                    out.push(Value::Array(Rc::new(RefCell::new(pair))));
+                } else {
+                    out.push(Value::str(tail));
+                }
             }
             Ok(Value::Array(Rc::new(RefCell::new(out))))
         }
         "preg_grep" => {
             let pat = arg_str(it, args, 0);
+            let flags = arg(args, 2).to_int();
             let re = match php_regex(&pat) {
                 Some(r) => r,
                 None => return Ok(Value::Bool(false)),
@@ -4587,7 +5428,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
             if let Value::Array(a) = arg(args, 1) {
                 for (k, c) in a.borrow().iter() {
                     let v = c.borrow().to_php_string();
-                    if re.is_match(&v) {
+                    if re.is_match(&v) != (flags & 1 != 0) {
                         out.set(k.clone(), Value::str(v));
                     }
                 }
@@ -4598,8 +5439,80 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
     }
 }
 
-/// Translate a PHP `/pat/flags` regex to a `regex::Regex`.
-fn php_regex(pat: &str) -> Option<regex::Regex> {
+/// Match-group byte spans; `spans[0]` is the whole match. `mark` is
+/// the `(*MARK:x)` verb payload when one fired (PCRE2 only).
+struct PhpCap {
+    spans: Vec<Option<(usize, usize)>>,
+    mark: Option<String>,
+}
+
+/// A PHP pattern compiled for one of the two engines we carry: `regex`
+/// (pure Rust) for the common syntax subset, or PCRE2 — PHP's own
+/// engine — for anything it can't express (backtracking verbs like
+/// `(*SKIP)(*F)`, recursion `(?-n)`, lookbehind, etc.).
+enum PhpRe {
+    Re(regex::Regex),
+    Pcre(crate::pcre::PcreRe),
+}
+
+impl PhpRe {
+    fn captures_len(&self) -> usize {
+        match self {
+            PhpRe::Re(r) => r.captures_len(),
+            PhpRe::Pcre(r) => r.captures_len(),
+        }
+    }
+    fn group_name(&self, g: usize) -> Option<String> {
+        match self {
+            PhpRe::Re(r) => r.capture_names().nth(g).flatten().map(|s| s.to_string()),
+            PhpRe::Pcre(r) => r.group_name(g),
+        }
+    }
+    /// All matches in order, normalized to group byte spans.
+    fn caps(&self, s: &str) -> Vec<PhpCap> {
+        match self {
+            PhpRe::Re(r) => r
+                .captures_iter(s)
+                .map(|c| PhpCap {
+                    spans: (0..c.len())
+                        .map(|g| c.get(g).map(|m| (m.start(), m.end())))
+                        .collect(),
+                    mark: None,
+                })
+                .collect(),
+            PhpRe::Pcre(r) => r
+                .match_all(s.as_bytes())
+                .into_iter()
+                .map(|m| PhpCap {
+                    spans: m.spans,
+                    mark: m.mark,
+                })
+                .collect(),
+        }
+    }
+    fn is_match(&self, s: &str) -> bool {
+        match self {
+            PhpRe::Re(r) => r.is_match(s),
+            PhpRe::Pcre(r) => !r.match_all(s.as_bytes()).is_empty(),
+        }
+    }
+    fn replace_all(&self, s: &str, repl: &mut dyn FnMut(&PhpCap) -> String) -> String {
+        let mut out = String::new();
+        let mut last = 0usize;
+        for c in self.caps(s) {
+            if let Some(Some((a, b))) = c.spans.first() {
+                out.push_str(s.get(last..*a).unwrap_or(""));
+                out.push_str(&repl(&c));
+                last = *b;
+            }
+        }
+        out.push_str(&s[last..]);
+        out
+    }
+}
+
+/// Translate a PHP `/pat/flags` regex to a `PhpRe`.
+fn php_regex(pat: &str) -> Option<PhpRe> {
     let b = pat.as_bytes();
     if b.len() < 2 {
         return None;
@@ -4622,8 +5535,28 @@ fn php_regex(pat: &str) -> Option<regex::Regex> {
             _ => {}
         }
     }
+    // PHP compiles patterns with PCRE2; use it for anything the `regex`
+    // crate can't express rather than trying to emulate backtracking.
+    let pcre_only = [
+        "(*", "\\K", "\\G", "(?<", "(?R", "(?-", "(?+", "(?|", "(?'", "(?P>", "(?#",
+    ];
+    let mut has_backref = false;
+    let bb = body.as_bytes();
+    for i in 0..bb.len().saturating_sub(1) {
+        if bb[i] == b'\\' && bb[i + 1].is_ascii_digit() {
+            has_backref = true;
+            break;
+        }
+    }
+    if has_backref || pcre_only.iter().any(|t| body.contains(t)) {
+        let src = format!("{}{}", wrapped, body);
+        return crate::pcre::compile(&src).map(PhpRe::Pcre);
+    }
     wrapped.push_str(body);
-    regex::Regex::new(&wrapped).ok()
+    regex::Regex::new(&wrapped)
+        .ok()
+        .map(PhpRe::Re)
+        .or_else(|| crate::pcre::compile(&wrapped).map(PhpRe::Pcre))
 }
 
 // ---------- filesystem ----------

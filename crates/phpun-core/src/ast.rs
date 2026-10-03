@@ -7,6 +7,13 @@ pub enum Stmt {
     Line(usize),
     /// Parser-injected compile-time deprecation (e.g. `case e;` —
     /// tests/lang/033). PHP prints these before execution begins.
+    /// Compile-time diagnostic drained from `Token::Diag`: printed
+    /// before execution, like Zend's compile warnings (octal overflow).
+    Diag {
+        level: &'static str,
+        msg: String,
+        line: usize,
+    },
     Deprecated {
         msg: String,
         line: usize,
@@ -386,6 +393,15 @@ pub enum Expr {
     MagicConst(MagicConst),
     /// `$$x` / `${expr}` — variable variable.
     VarVar(Box<Expr>),
+    /// `expr(...)` — first-class callable syntax (PHP 8.1): wraps the
+    /// call node whose arg list was the bare `...` (Call/MethodCall/
+    /// StaticCall/StaticCallDyn, args emptied at parse time).
+    Fcc(Box<Expr>),
+    /// `...$expr` inside a call's argument list — argument unpacking.
+    Unpack(Box<Expr>),
+    /// Internal parse marker: a call arg list that was exactly `...`
+    /// (rewritten to `Fcc` at the call-construction sites).
+    FccMark,
     /// Anonymous class declaration (`new class { ... }`).
     AnonClass(Rc<ClassDecl>),
 }

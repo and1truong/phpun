@@ -809,6 +809,8 @@ pub enum ObjectInternal {
 
 #[derive(Debug)]
 pub struct PhpCallable {
+    /// Zend object-store handle id (var_dump `object(Closure)#N`).
+    pub id: std::cell::Cell<u64>,
     /// None for plain closures built from a decl.
     pub kind: CallableKind,
     /// Captured `use`/`fn` scope: name → cell.

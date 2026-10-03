@@ -51,6 +51,46 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
 /// `parse` honoring `short_open_tag` (INI `short_open_tag=On`).
 pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
     let toks = lex_with(src, short_open)?;
+    parse_toks(toks)
+}
+
+/// phpun source mode: PHP code from byte 0, no `<?php` required (a
+/// leading tag falls back to classic tag mode for legacy sources).
+/// If pure-source parsing fails and the source contains a `<?` tag
+/// anywhere, the legacy tag-mode parse is tried so HTML-embedded PHP
+/// keeps working; the pure-mode error is preferred if both fail.
+pub fn parse_source(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
+    parse_pure(src, short_open).or_else(|e| {
+        if src.contains("<?") {
+            if let Ok(stmts) = parse_with(src, short_open) {
+                return Ok(stmts);
+            }
+        }
+        Err(e)
+    })
+}
+
+/// Strict pure-source parse — no tag-mode detection or retry. Used for
+/// eval()'d code, which in PHP is always tag-free source.
+pub fn parse_pure(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
+    let toks = crate::lexer::lex_php_source(src, short_open)?;
+    parse_toks(toks)
+}
+
+fn parse_toks(toks: Vec<Lexed>) -> Result<Vec<Stmt>, PhpError> {
+    // Compile-time diagnostics ride the token stream; drain them and
+    // emit before execution (Zend emits compile warnings upfront).
+    let mut lex_diags: Vec<(String, &'static str, usize)> = Vec::new();
+    let toks: Vec<Lexed> = toks
+        .into_iter()
+        .filter_map(|t| match t.token {
+            Token::Diag(level, msg) => {
+                lex_diags.push((msg, level, t.line));
+                None
+            }
+            _ => Some(t),
+        })
+        .collect();
     bracket_check(&toks)?;
     let mut p = Parser {
         toks: &toks,
@@ -68,8 +108,15 @@ pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
         ns_style: 0,
     };
     let mut stmts = p.program()?;
-    for (i, (msg, line)) in std::mem::take(&mut p.deprecations).into_iter().enumerate() {
-        stmts.insert(i, Stmt::Deprecated { msg, line });
+    let mut diags: Vec<(String, &'static str, usize)> = lex_diags;
+    diags.extend(
+        std::mem::take(&mut p.deprecations)
+            .into_iter()
+            .map(|(msg, line)| (msg, "Deprecated", line)),
+    );
+    diags.sort_by_key(|(_, _, line)| *line);
+    for (i, (msg, level, line)) in diags.into_iter().enumerate() {
+        stmts.insert(i, Stmt::Diag { level, msg, line });
     }
     Ok(stmts)
 }
@@ -118,10 +165,28 @@ fn bracket_check(toks: &[crate::lexer::Lexed]) -> Result<(), PhpError> {
     Ok(())
 }
 
-/// Parse a standalone PHP expression source (used for string interpolation).
-pub fn parse_expr_src(src: &str) -> Result<Expr, PhpError> {
+/// A compile-time diagnostic produced while re-lexing an embedded
+/// source: (level, message, line).
+pub type SrcDiags = Vec<(&'static str, String, usize)>;
+
+/// Parse a standalone PHP expression source (used for string
+/// interpolation). Diagnostics produced while re-lexing the embedded
+/// source (e.g. octal overflow inside `${"\400"}`) come back in the
+/// second tuple element so the evaluator can print them inline.
+pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
     let wrapped = format!("<?php {};", src);
     let toks = lex(&wrapped)?;
+    let mut diags = Vec::new();
+    let toks: Vec<Lexed> = toks
+        .into_iter()
+        .filter_map(|t| match t.token {
+            Token::Diag(level, msg) => {
+                diags.push((level, msg, t.line));
+                None
+            }
+            _ => Some(t),
+        })
+        .collect();
     let mut p = Parser {
         toks: &toks,
         pos: 0,
@@ -138,7 +203,7 @@ pub fn parse_expr_src(src: &str) -> Result<Expr, PhpError> {
         ns_style: 0,
     };
     let e = p.expr()?;
-    Ok(e)
+    Ok((e, diags))
 }
 
 impl<'a> Parser<'a> {
@@ -352,7 +417,7 @@ impl<'a> Parser<'a> {
     fn stmt(&mut self) -> Result<Stmt, PhpError> {
         // `#[Attr]` may precede any declaration statement.
         if self.at_op("#[") {
-            self.pending_class_attrs = self.parse_attrs();
+            self.pending_class_attrs = self.parse_attrs()?;
         }
         match self.peek().cloned() {
             Some(Token::Inline(s)) => {
@@ -1150,13 +1215,14 @@ impl<'a> Parser<'a> {
     }
 
     /// Skip `#[Attr(...)]` groups (attributes are parsed but discarded).
-    fn skip_attrs(&mut self) {
-        let _ = self.parse_attrs();
+    fn skip_attrs(&mut self) -> Result<(), PhpError> {
+        self.parse_attrs()?;
+        Ok(())
     }
 
     /// Parse `#[Attr(...)]` groups and return the top-level attribute
     /// names (possibly `\Qualified`; args are discarded).
-    fn parse_attrs(&mut self) -> Vec<String> {
+    fn parse_attrs(&mut self) -> Result<Vec<String>, PhpError> {
         let mut names = Vec::new();
         while self.eat_op("#[") {
             let mut depth = 1i32;
@@ -1181,24 +1247,53 @@ impl<'a> Parser<'a> {
                         cur = String::new();
                         in_name = true;
                     }
-                    Some(Token::Op("(")) if depth == 1 => {
+                    Some(Token::Op("(")) => {
+                        // `(` followed by `...` is FCC syntax —
+                        // a compile-time fatal inside attribute
+                        // args (first_class_callable_011).
+                        if self.at_op("...") {
+                            // Zend reports the line of the attributed
+                            // declaration (the stmt after `]`), not the
+                            // arg itself (first_class_callable_011).
+                            let mut i = self.pos;
+                            let mut d = 1i32;
+                            while i < self.toks.len() && d > 0 {
+                                match &self.toks[i].token {
+                                    Token::Op("(") | Token::Op("[") | Token::Op("#[") => d += 1,
+                                    Token::Op(")") | Token::Op("]") => d -= 1,
+                                    _ => {}
+                                }
+                                i += 1;
+                            }
+                            // `i` now sits on the group's closing
+                            // `]` — the attributed stmt follows it.
+                            while self.toks.get(i).is_some_and(|t| t.token == Token::Op("]")) {
+                                i += 1;
+                            }
+                            let line = self.toks.get(i).map(|t| t.line).unwrap_or(0);
+                            return Err(PhpError::fatal(
+                                "Cannot create Closure as attribute argument",
+                                line,
+                            ));
+                        }
+                        depth += 1;
                         in_name = false;
                     }
                     Some(Token::Ident(n)) if in_name => cur.push_str(&n),
                     Some(Token::Op("\\")) if in_name => cur.push('\\'),
                     Some(_) => {}
-                    None => return names,
+                    None => return Ok(names),
                 }
             }
         }
-        names
+        Ok(names)
     }
 
     fn class_decl(&mut self) -> Result<Stmt, PhpError> {
         // `#[Attr]` groups may precede the class modifiers (or were
         // already consumed at the statement level).
         let attrs = if self.pending_class_attrs.is_empty() {
-            self.parse_attrs()
+            self.parse_attrs()?
         } else {
             std::mem::take(&mut self.pending_class_attrs)
         };
@@ -1294,7 +1389,7 @@ impl<'a> Parser<'a> {
                     self.line(),
                 ));
             }
-            self.skip_attrs();
+            self.skip_attrs()?;
             let mut vis = Visibility::Public;
             let mut is_static = false;
             let mut m_abstract = false;
@@ -1525,7 +1620,7 @@ impl<'a> Parser<'a> {
                     self.line(),
                 ));
             }
-            self.skip_attrs();
+            self.skip_attrs()?;
             let mut hvis = None;
             let mut hfinal = false;
             loop {
@@ -1661,7 +1756,7 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let mut params = Vec::new();
         while !self.at_op(")") {
-            self.skip_attrs();
+            self.skip_attrs()?;
             // promoted ctor params: visibility/readonly precede the type
             // (`public int $x`, `public $errno` — error_2_exception_001).
             let mut promoted = false;
@@ -1959,7 +2054,7 @@ impl<'a> Parser<'a> {
             };
             // delegate: parse `extends`/`implements`/body by simulating
             self.cur_class = "class@anonymous".into();
-            self.skip_attrs();
+            self.skip_attrs()?;
             let mut parent = None;
             if self.eat_ident("extends") {
                 parent = self.name_path();
@@ -1986,7 +2081,7 @@ impl<'a> Parser<'a> {
                         self.line(),
                     ));
                 }
-                self.skip_attrs();
+                self.skip_attrs()?;
                 let mut vis = Visibility::Public;
                 let mut is_static = false;
                 let mut m_abstract = false;
@@ -2827,10 +2922,10 @@ impl<'a> Parser<'a> {
                 e = Expr::Index { e: Box::new(e), i };
             } else if self.eat_op("(") {
                 let args = self.args()?;
-                e = Expr::Call {
+                e = Self::fcc_wrap(Expr::Call {
                     name: Box::new(e),
                     args,
-                };
+                })?;
             } else if self.at_op("->") || self.at_op("?->") {
                 let nullsafe = self.at_op("?->");
                 self.pos += 1;
@@ -2838,12 +2933,12 @@ impl<'a> Parser<'a> {
                 if self.at_op("(") {
                     self.pos += 1;
                     let args = self.args()?;
-                    e = Expr::MethodCall {
+                    e = Self::fcc_wrap(Expr::MethodCall {
                         obj: Box::new(e),
                         name,
                         args,
                         nullsafe,
-                    };
+                    })?;
                 } else {
                     e = Expr::Prop {
                         obj: Box::new(e),
@@ -2936,11 +3031,11 @@ impl<'a> Parser<'a> {
                                 }
                             }
                             let args = self.args()?;
-                            e = Expr::StaticCall {
+                            e = Self::fcc_wrap(Expr::StaticCall {
                                 class: Box::new(e),
                                 name: n,
                                 args,
-                            };
+                            })?;
                         } else {
                             e = Expr::ClassConst {
                                 class: Box::new(e),
@@ -2955,11 +3050,11 @@ impl<'a> Parser<'a> {
                             // (tests/lang/044).
                             self.pos += 1;
                             let args = self.args()?;
-                            e = Expr::StaticCallDyn {
+                            e = Self::fcc_wrap(Expr::StaticCallDyn {
                                 class: Box::new(e),
                                 name: Box::new(Expr::Var(n)),
                                 args,
-                            };
+                            })?;
                         } else {
                             // `C::$name` — a literal static prop name
                             // (unlike `$o->$name`, which reads the var).
@@ -3037,13 +3132,74 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `expr(...)` — first-class-callable arg lists rewrite their call
+    /// node into `Expr::Fcc`; everything else keeps its args.
+    fn has_nullsafe(e: &Expr) -> bool {
+        match e {
+            Expr::MethodCall { obj, nullsafe, .. } => *nullsafe || Self::has_nullsafe(obj),
+            Expr::Prop { obj, nullsafe, .. } => *nullsafe || Self::has_nullsafe(obj),
+            _ => false,
+        }
+    }
+
+    fn fcc_wrap(node: Expr) -> Result<Expr, PhpError> {
+        let is_fcc = match &node {
+            Expr::Call { args, .. }
+            | Expr::MethodCall { args, .. }
+            | Expr::StaticCall { args, .. }
+            | Expr::StaticCallDyn { args, .. } => {
+                args.len() == 1 && matches!(args[0], Expr::FccMark)
+            }
+            _ => false,
+        };
+        if !is_fcc {
+            return Ok(node);
+        }
+        // `$o?->m(...)` — and any nullsafe link in the receiver chain
+        // (`$o?->p->m(...)`) — is a compile-time fatal
+        // (first_class_callable_012/013).
+        if Self::has_nullsafe(&node) {
+            return Err(PhpError::fatal(
+                "Cannot combine nullsafe operator with Closure creation",
+                0,
+            ));
+        }
+        Ok(Expr::Fcc(Box::new(node)))
+    }
+
+    /// Bare `...` inside ctor args is a compile-time fatal
+    /// ("Cannot create Closure for new expression" — zend_compile.c).
+    fn check_no_fcc_ctor(&self, args: &[Expr]) -> Result<(), PhpError> {
+        if args.len() == 1 && matches!(args[0], Expr::FccMark) {
+            return Err(PhpError::fatal(
+                "Cannot create Closure for new expression",
+                self.line(),
+            ));
+        }
+        Ok(())
+    }
+
     fn args(&mut self) -> Result<Vec<Expr>, PhpError> {
         let mut args = Vec::new();
+        let mut unpacked = false;
         while !self.at_op(")") {
-            // named arguments `name:` — name recorded via Str marker
-            if matches!(self.peek(), Some(Token::Ident(_)))
-                && matches!(self.peek2(), Some(Token::Op(":")))
-            {
+            if self.at_op("...") {
+                self.pos += 1;
+                if args.is_empty() && self.eat_op(")") {
+                    // `f(...)` — first-class callable marker.
+                    return Ok(vec![Expr::FccMark]);
+                }
+                args.push(Expr::Unpack(Box::new(self.expr()?)));
+                unpacked = true;
+                if !self.eat_op(",") {
+                    break;
+                }
+                continue;
+            }
+            let named = matches!(self.peek(), Some(Token::Ident(_)))
+                && matches!(self.peek2(), Some(Token::Op(":")));
+            if named {
+                // named arguments `name:` — name recorded via Str marker
                 let n = self.ident().unwrap();
                 self.pos += 1; // :
                 let v = self.expr()?;
@@ -3053,6 +3209,12 @@ impl<'a> Parser<'a> {
                     r: Box::new(v),
                 });
             } else {
+                if unpacked {
+                    return Err(PhpError::fatal(
+                        "Cannot use positional argument after argument unpacking",
+                        self.line(),
+                    ));
+                }
                 args.push(self.expr()?);
             }
             if !self.eat_op(",") {
@@ -3236,6 +3398,7 @@ impl<'a> Parser<'a> {
                     if self.at_op("(") {
                         self.pos += 1;
                         ctor_args = self.args()?;
+                        self.check_no_fcc_ctor(&ctor_args)?;
                     }
                     Ok(Expr::New {
                         class: Box::new(class),
@@ -3338,7 +3501,7 @@ impl<'a> Parser<'a> {
                         } else {
                             format!("{}{}", '\u{1}', resolved)
                         };
-                        Ok(Expr::Call {
+                        Self::fcc_wrap(Expr::Call {
                             name: Box::new(Expr::Str(resolved)),
                             args,
                         })
@@ -3371,7 +3534,7 @@ impl<'a> Parser<'a> {
                 if self.at_op("(") {
                     self.pos += 1;
                     let args = self.args()?;
-                    Ok(Expr::Call {
+                    Self::fcc_wrap(Expr::Call {
                         name: Box::new(Expr::Str(name)),
                         args,
                     })

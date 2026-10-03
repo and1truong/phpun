@@ -5,6 +5,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
         Some("phpt") => phpun_phpt::cli(args[1..].to_vec()),
+        Some("serve") => serve(&args[1..]),
         Some("--version") | Some("-v") => {
             println!("phpun 0.0.1 (php compat target: 8.5)");
             ExitCode::SUCCESS
@@ -12,6 +13,7 @@ fn main() -> ExitCode {
         Some("--help") | Some("-h") | None => {
             eprintln!("Usage:");
             eprintln!("  phpun <file.php> [args...]   run a PHP script");
+            eprintln!("  phpun serve <file.php>       dev HTTP server (default :8000)");
             eprintln!("  phpun phpt <paths> [flags]   run PHPT tests");
             ExitCode::SUCCESS
         }
@@ -82,4 +84,45 @@ fn run_script(args: &[String]) -> ExitCode {
     let res = it.run_source(&src);
     print!("{}", it.out);
     ExitCode::from((res.exit_code & 0xff) as u8)
+}
+
+/// `phpun serve <file.php> [--host H] [--port N | -p N]`
+fn serve(args: &[String]) -> ExitCode {
+    let mut file: Option<&str> = None;
+    let mut host = "127.0.0.1".to_string();
+    let mut port = 8000u16;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" => {
+                if i + 1 < args.len() {
+                    host = args[i + 1].clone();
+                }
+                i += 2;
+            }
+            "--port" | "-p" => {
+                if i + 1 < args.len() {
+                    port = args[i + 1].parse().unwrap_or(8000);
+                }
+                i += 2;
+            }
+            s if s.starts_with("--port=") => {
+                port = s[7..].parse().unwrap_or(8000);
+                i += 1;
+            }
+            s if s.starts_with("--host=") => {
+                host = s[7..].to_string();
+                i += 1;
+            }
+            a => {
+                file = Some(a);
+                i += 1;
+            }
+        }
+    }
+    let Some(file) = file else {
+        eprintln!("usage: phpun serve <file.php> [--host H] [--port N]");
+        return ExitCode::FAILURE;
+    };
+    ExitCode::from(phpun_core::serve::serve(file, &host, port) as u8)
 }

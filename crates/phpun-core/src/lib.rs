@@ -10,6 +10,8 @@ pub mod error;
 pub mod interp;
 pub mod lexer;
 pub mod parser;
+mod pcre;
+pub mod serve;
 pub mod value;
 
 pub use error::PhpError;
