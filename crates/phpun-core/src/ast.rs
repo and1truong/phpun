@@ -84,6 +84,9 @@ pub struct ClassDecl {
     pub is_final: bool,
     pub parent: Option<String>,
     pub implements: Vec<String>,
+    /// `#[Attr]` names preceding the declaration (AllowDynamicProperties
+    /// detection; args are not preserved).
+    pub attrs: Vec<String>,
     /// `use`d traits (inside the body).
     pub traits: Vec<String>,
     pub methods: Vec<Rc<MethodDecl>>,

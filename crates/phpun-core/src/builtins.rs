@@ -1127,6 +1127,42 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_walk" => {
             let cb = arg(args, 1);
             let extra = arg(args, 2);
+            // array_walk on an object iterates its property entries
+            // (gh18268: hooked props yield their serialized value).
+            let obj = match &*args[0].borrow() {
+                Value::Object(o) => Some(o.clone()),
+                _ => None,
+            };
+            if let Some(o) = obj {
+                let mut walked = false;
+                for (n, slot, decl) in it.object_serial_entries(&o) {
+                    walked = true;
+                    let v = match &decl {
+                        Some((p, dcls)) => it
+                            .serial_entry_value(&o, p, dcls, &slot)
+                            .unwrap_or(Value::Null),
+                        None => o
+                            .borrow()
+                            .props
+                            .get(&slot)
+                            .map(|c| c.borrow().clone())
+                            .unwrap_or(Value::Null),
+                    };
+                    let plain = n
+                        .trim_start_matches('\0')
+                        .split('\0')
+                        .next_back()
+                        .unwrap_or(&n)
+                        .to_string();
+                    it.call_value(
+                        &cb,
+                        vec![cell(v), cell(Value::str(plain)), cell(extra.clone())],
+                    )?;
+                }
+                if walked {
+                    return Ok(Some(Value::Bool(true)));
+                }
+            }
             if let Value::Array(rc) = &mut *args[0].borrow_mut() {
                 let cells: Vec<(ArrKey, Cell)> = rc.borrow().iter().cloned().collect();
                 for (k, c) in cells {

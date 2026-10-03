@@ -336,6 +336,7 @@ impl<'a> Interp<'a> {
                 is_final: false,
                 parent: parent.map(|s| s.to_string()),
                 implements: vec!["Throwable".into()],
+                attrs: vec![],
                 traits: vec![],
                 methods: vec![
                     method("__construct", &["message", "code", "previous"]),
@@ -405,6 +406,7 @@ impl<'a> Interp<'a> {
             is_final: false,
             parent: None,
             implements: parents.iter().map(|s| s.to_string()).collect(),
+            attrs: vec![],
             traits: vec![],
             methods: methods
                 .iter()
@@ -466,6 +468,7 @@ impl<'a> Interp<'a> {
                 is_final: false,
                 parent: None,
                 implements: vec![],
+                attrs: vec![],
                 traits: vec![],
                 methods: vec![],
                 props: vec![],
@@ -484,6 +487,7 @@ impl<'a> Interp<'a> {
                 is_final: false,
                 parent: None,
                 implements: vec![],
+                attrs: vec![],
                 traits: vec![],
                 methods: vec![Rc::new(MethodDecl {
                     decl: FunctionDecl {
@@ -557,6 +561,7 @@ impl<'a> Interp<'a> {
                 is_final: false,
                 parent: None,
                 implements: vec![],
+                attrs: vec![],
                 traits: vec![],
                 methods: vec![
                     mk_method("__construct", vec![str_param("class")]),
@@ -576,6 +581,7 @@ impl<'a> Interp<'a> {
                 is_final: false,
                 parent: None,
                 implements: vec![],
+                attrs: vec![],
                 traits: vec![],
                 methods: vec![
                     mk_method(
@@ -2055,13 +2061,27 @@ impl<'a> Interp<'a> {
                     // props read the live slot (unset() tombstones).
                     let mut writeback: Option<(PropDecl, MergedHooks, Value)> = None;
                     let c: Cell = if let Some((pd, hs)) = self.hooked_prop(&o, &dname) {
-                        // Write-only hooked props aren't in the readable
-                        // property table — foreach skips them
+                        // Write-only *virtual* hooked props aren't in the
+                        // readable property table — foreach skips them
                         // (virtualSetOnly in property_hooks/foreach).
-                        if !hs.iter().any(|(h, _)| h.is_get && h.body.is_some()) {
+                        // A set-only BACKED prop still has a table slot
+                        // and iterates as its raw value (gh15187).
+                        if !hs.iter().any(|(h, _)| h.is_get && h.body.is_some())
+                            && !self.backed_for(&o, &dname, &hs)
+                        {
                             continue;
                         }
-                        if matches!(val, ForeachTarget::ByRef(_)) {
+                        if !hs.iter().any(|(h, _)| h.is_get && h.body.is_some()) {
+                            // Set-only backed prop: iterate the raw
+                            // backing slot, no hook write-back. An
+                            // uninitialized typed slot isn't iterated
+                            // (gh15187_2).
+                            match o.borrow().props.get(&slot_key).cloned() {
+                                Some(c) => c,
+                                None if pd.ty.is_some() => continue,
+                                None => cell(Value::Null),
+                            }
+                        } else if matches!(val, ForeachTarget::ByRef(_)) {
                             // By-ref binds a managed reference: virtual
                             // props read via get and write back through
                             // set; a backed prop is only bindable when a
@@ -2087,9 +2107,7 @@ impl<'a> Interp<'a> {
                                 let e = self.throw(v);
                                 return self.err_flow(e);
                             }
-                            if let Some((h, hc)) = by_ref_get.filter(|_| {
-                                backed || !hs.iter().any(|(h2, _)| !h2.is_get && h2.body.is_some())
-                            }) {
+                            if let Some((h, hc)) = by_ref_get {
                                 self.last_ret_cell = None;
                                 match self.run_hook(&o, hc, &dname, h, None) {
                                     Ok(_) => self
@@ -3412,6 +3430,29 @@ impl<'a> Interp<'a> {
                     )?;
                     Ok(())
                 } else {
+                    // E_DEPRECATED on first write to an undeclared prop
+                    // (PHP 8.2+; stdClass is exempt).
+                    let is_new = {
+                        let ob = o.borrow();
+                        !ob.props.contains_key(pn)
+                    };
+                    // stdClass (and its subclasses) plus
+                    // #[AllowDynamicProperties] opt out of the
+                    // deprecation (property_hooks/foreach_002).
+                    let exempt = self.obj_is_a(&o, "stdclass")
+                        || cls.decl.attrs.iter().any(|a| {
+                            a.rsplit('\\')
+                                .next()
+                                .unwrap_or(a)
+                                .eq_ignore_ascii_case("AllowDynamicProperties")
+                        });
+                    if is_new && !exempt {
+                        self.deprecated(&format!(
+                            "Creation of dynamic property {}::${} is deprecated",
+                            cls.name(),
+                            pn
+                        ))?;
+                    }
                     let mut ob = o.borrow_mut();
                     let pn = pn.to_string();
                     if !ob.prop_order.contains(&pn) {
@@ -5993,6 +6034,7 @@ impl<'a> Interp<'a> {
                             is_final: false,
                             parent: None,
                             implements: vec![],
+                            attrs: vec![],
                             traits: vec![],
                             methods: vec![],
                             props: vec![],

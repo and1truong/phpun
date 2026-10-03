@@ -14,6 +14,9 @@ pub struct Parser<'a> {
     /// (prop name, is_get) while inside a hook body — gates
     /// `parent::$p::get()/set()` syntax.
     hook_ctx: Option<(String, bool)>,
+    /// `#[Attr]` names consumed at the statement level, pending the
+    /// following class declaration.
+    pending_class_attrs: Vec<String>,
 }
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
@@ -30,6 +33,7 @@ pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
         deprecations: Vec::new(),
         cur_class: String::new(),
         hook_ctx: None,
+        pending_class_attrs: Vec::new(),
     };
     let mut stmts = p.program()?;
     for (i, (msg, line)) in std::mem::take(&mut p.deprecations).into_iter().enumerate() {
@@ -92,6 +96,7 @@ pub fn parse_expr_src(src: &str) -> Result<Expr, PhpError> {
         deprecations: Vec::new(),
         cur_class: String::new(),
         hook_ctx: None,
+        pending_class_attrs: Vec::new(),
     };
     let e = p.expr()?;
     Ok(e)
@@ -249,7 +254,7 @@ impl<'a> Parser<'a> {
     fn stmt(&mut self) -> Result<Stmt, PhpError> {
         // `#[Attr]` may precede any declaration statement.
         if self.at_op("#[") {
-            self.skip_attrs();
+            self.pending_class_attrs = self.parse_attrs();
         }
         match self.peek().cloned() {
             Some(Token::Inline(s)) => {
@@ -763,22 +768,57 @@ impl<'a> Parser<'a> {
 
     /// Skip `#[Attr(...)]` groups (attributes are parsed but discarded).
     fn skip_attrs(&mut self) {
+        let _ = self.parse_attrs();
+    }
+
+    /// Parse `#[Attr(...)]` groups and return the top-level attribute
+    /// names (possibly `\Qualified`; args are discarded).
+    fn parse_attrs(&mut self) -> Vec<String> {
+        let mut names = Vec::new();
         while self.eat_op("#[") {
             let mut depth = 1i32;
+            let mut cur = String::new();
+            let mut in_name = true;
             while depth > 0 {
                 match self.next() {
-                    Some(Token::Op("[")) | Some(Token::Op("#[")) => depth += 1,
-                    Some(Token::Op("]")) => depth -= 1,
+                    Some(Token::Op("[")) | Some(Token::Op("#[")) => {
+                        depth += 1;
+                        in_name = false;
+                    }
+                    Some(Token::Op("]")) => {
+                        depth -= 1;
+                        if depth == 0 && !cur.is_empty() {
+                            names.push(cur.clone());
+                        }
+                    }
+                    Some(Token::Op(",")) if depth == 1 => {
+                        if !cur.is_empty() {
+                            names.push(cur.clone());
+                        }
+                        cur = String::new();
+                        in_name = true;
+                    }
+                    Some(Token::Op("(")) if depth == 1 => {
+                        in_name = false;
+                    }
+                    Some(Token::Ident(n)) if in_name => cur.push_str(&n),
+                    Some(Token::Op("\\")) if in_name => cur.push('\\'),
                     Some(_) => {}
-                    None => return,
+                    None => return names,
                 }
             }
         }
+        names
     }
 
     fn class_decl(&mut self) -> Result<Stmt, PhpError> {
-        // `#[Attr]` groups may precede the class modifiers.
-        self.skip_attrs();
+        // `#[Attr]` groups may precede the class modifiers (or were
+        // already consumed at the statement level).
+        let attrs = if self.pending_class_attrs.is_empty() {
+            self.parse_attrs()
+        } else {
+            std::mem::take(&mut self.pending_class_attrs)
+        };
         let mut is_abstract = false;
         let mut is_final = false;
         loop {
@@ -1011,6 +1051,7 @@ impl<'a> Parser<'a> {
         self.expect_op("}")?;
         Ok(Stmt::Class(Rc::new(ClassDecl {
             name,
+            attrs,
             kind,
             is_abstract,
             is_final,
@@ -1692,6 +1733,7 @@ impl<'a> Parser<'a> {
             self.expect_op("}")?;
             return Ok((
                 Expr::AnonClass(Rc::new(ClassDecl {
+                    attrs: vec![],
                     name: format!("class@anonymous${}", self.line()),
                     kind: ClassKind::Class,
                     is_abstract: false,
