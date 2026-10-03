@@ -30,6 +30,22 @@ pub enum Flow {
     Exit(i32),
 }
 
+/// Weak slot in the shared object-store handle space — objects and
+/// closures draw ids from the same vector, like Zend's EG(objects_store).
+enum ObjHandle {
+    Obj(std::rc::Weak<RefCell<PhpObject>>),
+    Callable(std::rc::Weak<PhpCallable>),
+}
+
+impl ObjHandle {
+    fn alive(&self) -> bool {
+        match self {
+            Self::Obj(w) => w.upgrade().is_some(),
+            Self::Callable(w) => w.upgrade().is_some(),
+        }
+    }
+}
+
 pub struct Frame {
     vars: HashMap<String, Cell>,
     /// Actual call args for func_get_args().
@@ -38,8 +54,11 @@ pub struct Frame {
     fn_name: String,
     /// `$this` in method calls.
     this_obj: Option<Rc<RefCell<PhpObject>>>,
-    /// Class context for self::/static::/parent::.
+    /// Class context for self::/parent:: (the method's declaring class).
     scope_class: Option<Rc<PhpClass>>,
+    /// Late-static-binding class — `static::`/`new static`/`get_called_class`
+    /// resolve here; falls back to scope_class when unset.
+    called_class: Option<Rc<PhpClass>>,
     /// Class the running method was declared in — PHP's private
     /// property slot is keyed by the declaring class (`\0Cls\0prop`).
     decl_class: Option<Rc<PhpClass>>,
@@ -65,6 +84,7 @@ impl Frame {
             fn_name,
             this_obj: None,
             scope_class: None,
+            called_class: None,
             decl_class: None,
             file: String::new(),
             ns: String::new(),
@@ -131,17 +151,37 @@ pub struct Interp<'a> {
     /// Declaring class of the method about to be invoked (set by
     /// invoke_method, consumed by invoke_fn to fill Frame::decl_class).
     pending_decl_class: Option<Rc<PhpClass>>,
+    /// Called-scope (LSB) for the next invoke_fn frame — set by
+    /// invoke_method/static_invoke, consumed like pending_decl_class.
+    pending_called_class: Option<Rc<PhpClass>>,
     /// (object id, prop, is_get, owner) whose hook is about to run —
     /// consumed by invoke_fn to fill Frame::hook_prop.
     pending_hook_prop: Option<(u64, String, bool, String)>,
     /// Live object handles for PHP's var_dump `#N` id: the lowest freed
     /// slot is reused, matching Zend's object store recycling.
-    obj_handles: Vec<std::rc::Weak<RefCell<PhpObject>>>,
+    obj_handles: Vec<ObjHandle>,
+    /// Per-callsite unqualified fn resolution cache — Zend resolves
+    /// `ns\f -> f` once per call site (constexpr/namespace_004).
+    fcc_fn_cache: HashMap<(String, String, String), Option<String>>,
     /// Object ptrs whose __destruct already ran (shutdown pass).
     destructed: HashSet<usize>,
     /// Nonzero while a callable is invoked from inside a builtin's
     /// internals (ob handlers) — marks its trace site internal-function.
     internal_cb: u32,
+    /// Nonzero while evaluating a compile-time constant expression
+    /// (const/class-const defaults, prop/param defaults): `...`-FCC and
+    /// `self`/`parent` resolution follow const-expr rules.
+    in_const_expr: u32,
+    /// Nonzero while a class-init const expr (prop default, static init,
+    /// class const) is being evaluated — errors get a synthetic
+    /// `[constant expression]` trace frame; top-level `const` decls
+    /// don't (constexpr/error_*).
+    class_const_ctx: u32,
+    /// The class whose const/prop initializer is being evaluated —
+    /// `self`/`parent` inside it bind to this class, not the caller.
+    const_self: Option<Rc<PhpClass>>,
+    /// spl_autoload_register() callbacks, in registration order.
+    pub autoload_fns: Vec<Value>,
     /// File currently executing — include resolution uses its directory
     /// (PHP checks include_path, then the calling file's dir, then cwd).
     cur_file: String,
@@ -268,8 +308,14 @@ impl<'a> Interp<'a> {
             in_handler: false,
             cur_line: 1,
             pending_decl_class: None,
+            pending_called_class: None,
             pending_hook_prop: None,
+            in_const_expr: 0,
+            class_const_ctx: 0,
+            const_self: None,
+            autoload_fns: Vec::new(),
             obj_handles: Vec::new(),
+            fcc_fn_cache: HashMap::new(),
             destructed: HashSet::new(),
             internal_cb: 0,
             cur_file: file.to_string(),
@@ -802,7 +848,8 @@ impl<'a> Interp<'a> {
         // and before output buffers flush — destructors still see their
         // buffers' contents (bug30578, bug24908).
         for h in std::mem::take(&mut self.obj_handles) {
-            let Some(o) = h.upgrade() else { continue };
+            let ObjHandle::Obj(w) = h else { continue };
+            let Some(o) = w.upgrade() else { continue };
             let key = Rc::as_ptr(&o) as usize;
             if self.destructed.contains(&key) {
                 continue;
@@ -891,6 +938,15 @@ impl<'a> Interp<'a> {
             .clone();
         self.cur().vars.insert(name.to_string(), g.clone());
         Some(g)
+    }
+
+    /// Does the variable name resolve to an existing cell?
+    fn var_lookup(&mut self, name: &str) -> Option<Cell> {
+        self.cur()
+            .vars
+            .get(name)
+            .cloned()
+            .or_else(|| self.superglobal_cell(name))
     }
 
     fn var_get(&mut self, name: &str) -> Result<Value, PhpError> {
@@ -1318,7 +1374,7 @@ impl<'a> Interp<'a> {
         let resolved = self
             .resolve_class(class)
             .unwrap_or_else(|| "Exception".into());
-        let obj = self.instantiate(&resolved, &[]);
+        let obj = self.instantiate(&resolved, &[]).unwrap_or(Value::Null);
         if let Value::Object(o) = &obj {
             let mut o = o.borrow_mut();
             o.props.insert("message".into(), cell(Value::str(msg)));
@@ -1374,6 +1430,20 @@ impl<'a> Interp<'a> {
 
     fn fail<T>(&mut self, e: PhpError) -> Result<T, PhpError> {
         if let ErrorKind::Uncaught { class } = e.kind {
+            // Errors raised mid-const-expr get a pseudo-frame for the
+            // constant expression itself (property_initializer_scope_002:
+            // `#0 %s(%d): [constant expression]()`).
+            let e = if self.class_const_ctx > 0 {
+                let fr = format!("{}({}): [constant expression]()", self.file, self.cur_line);
+                let mut frames = e.trace.clone().unwrap_or_default();
+                frames.insert(0, fr);
+                PhpError {
+                    trace: Some(frames),
+                    ..e
+                }
+            } else {
+                e
+            };
             // Internal errors raised as exceptions become real throwables so
             // userland `catch` blocks can intercept them.
             let v = self.exception(class, &e.message);
@@ -1492,9 +1562,14 @@ impl<'a> Interp<'a> {
                 }
                 Flow::Normal
             }
-            Stmt::Expr(e) => match self.eval(e) {
-                Ok(_) => Flow::Normal,
-                Err(e) => self.err_flow(e),
+            Stmt::Expr(e) => match e {
+                // A lone `$x;` compiles to a dead FREE op in Zend — no
+                // undefined-variable warning (first_class_callable_dynamic).
+                Expr::Var(n) if self.var_lookup(n).is_none() => Flow::Normal,
+                _ => match self.eval(e) {
+                    Ok(_) => Flow::Normal,
+                    Err(e) => self.err_flow(e),
+                },
             },
             Stmt::Block(b) => self.exec_block(b),
             Stmt::If { cond, then, else_ } => match self.eval(cond) {
@@ -1650,7 +1725,7 @@ impl<'a> Interp<'a> {
                         Some(c) => c,
                         None => {
                             let v = match default {
-                                Some(d) => self.eval(d).unwrap_or(Value::Null),
+                                Some(d) => self.eval_const(d).unwrap_or(Value::Null),
                                 None => Value::Null,
                             };
                             let c = cell(v);
@@ -1868,7 +1943,7 @@ impl<'a> Interp<'a> {
                             self.cur_line,
                         ));
                     }
-                    match self.eval(e) {
+                    match self.eval_const(e) {
                         Ok(v) => self.define_const(n, v),
                         Err(e) => return self.err_flow(e),
                     }
@@ -2515,6 +2590,10 @@ impl<'a> Interp<'a> {
                 }
             }
             Expr::Call { name, args } => self.call(name, args),
+            Expr::Fcc(inner) => self.fcc(inner),
+            Expr::Unpack(_) | Expr::FccMark => {
+                self.fail(PhpError::fatal("argument unpacking/FCC outside of call", 0))
+            }
             Expr::Index { e, i } => self.index_read(e, i.as_deref()),
             Expr::PreInc(t) => self.incdec(t, 1, false),
             Expr::PreDec(t) => self.incdec(t, -1, false),
@@ -2670,7 +2749,8 @@ impl<'a> Interp<'a> {
                         captures.push((n.clone(), cap));
                     }
                 }
-                Ok(Value::Callable(Rc::new(PhpCallable {
+                Ok(Value::Callable(self.new_callable(PhpCallable {
+                    id: std::cell::Cell::new(0),
                     kind: CallableKind::Closure(Rc::new(c.decl.clone())),
                     captures,
                     this_obj: self.stack.last().and_then(|f| f.this_obj.clone()),
@@ -4751,6 +4831,31 @@ impl<'a> Interp<'a> {
 
     // ----- calls -----
 
+    /// Param decls a callable Value will bind against — needed so
+    /// arg_cells aliases by-ref params (first_class_callable_refs).
+    fn callable_params(&mut self, v: &Value) -> Vec<Param> {
+        match v {
+            Value::Callable(c) => match &c.kind {
+                CallableKind::Closure(d) => d.params.clone(),
+                CallableKind::Named(n) => self
+                    .functions
+                    .get(&n.trim_start_matches('\\').to_lowercase())
+                    .map(|d| d.params.clone())
+                    .unwrap_or_default(),
+                CallableKind::Method { obj, class, name } => {
+                    let cls = match obj {
+                        Some(o) => Some(o.borrow().class.clone()),
+                        None => class.clone(),
+                    };
+                    cls.and_then(|c| self.find_method_in(&c, name))
+                        .map(|(m, _)| m.decl.params.clone())
+                        .unwrap_or_default()
+                }
+            },
+            _ => vec![],
+        }
+    }
+
     fn call(&mut self, name: &Expr, args: &[Expr]) -> Result<Value, PhpError> {
         // Resolve callee name/value.
         let fname = match name {
@@ -4760,12 +4865,14 @@ impl<'a> Interp<'a> {
                 match v {
                     Value::Callable(_) | Value::Object(_) => {
                         // $closure() / $obj->__invoke()
-                        let vals = self.arg_cells(args, &[], "")?;
+                        let params = self.callable_params(&v);
+                        let vals = self.arg_cells(args, &params, "")?;
                         return self.call_value(&v, vals);
                     }
                     _ => self.conv_str(&v).unwrap_or_default(),
                 }
             }
+
             Expr::StaticProp { class, name } => {
                 // `C::$var()` — dynamic static method call.
                 let cls = self.class_of(class)?;
@@ -4779,7 +4886,8 @@ impl<'a> Interp<'a> {
             }
             Expr::Prop { .. } | Expr::MethodCall { .. } | Expr::Index { .. } => {
                 let v = self.eval(name)?;
-                let vals = self.arg_cells(args, &[], "")?;
+                let params = self.callable_params(&v);
+                let vals = self.arg_cells(args, &params, "")?;
                 return self.call_value(&v, vals);
             }
             _ => {
@@ -4787,7 +4895,8 @@ impl<'a> Interp<'a> {
                 match v {
                     // `(expr)()` — IIFE on a closure/invokable value.
                     Value::Callable(_) | Value::Object(_) => {
-                        let vals = self.arg_cells(args, &[], "")?;
+                        let params = self.callable_params(&v);
+                        let vals = self.arg_cells(args, &params, "")?;
                         return self.call_value(&v, vals);
                     }
                     _ => self.conv_str(&v).unwrap_or_default(),
@@ -5083,7 +5192,562 @@ impl<'a> Interp<'a> {
             _ => self.fail(PhpError::uncaught("Error", "Value is not callable", 0)),
         }
     }
+    /// `expr(...)` — first-class callable creation (PHP 8.1). Errors at
+    /// creation are thrown `Error`s (catchable); abstract methods fail
+    /// only when the closure is invoked (constexpr/error_abstract).
+    fn fcc(&mut self, e: &Expr) -> Result<Value, PhpError> {
+        match e {
+            Expr::Call { name, .. } => match name.as_ref() {
+                Expr::Str(s) => self.fcc_named(s),
+                other => {
+                    let v = self.eval(other)?;
+                    self.fcc_val(&v)
+                }
+            },
+            Expr::MethodCall { obj, name, .. } => {
+                let ov = self.eval(obj)?;
+                let mn = self.prop_name(name)?;
+                self.fcc_method(&ov, &mn)
+            }
+            Expr::StaticCall { class, name, .. } => {
+                let cls = self.fcc_class_of(class)?;
+                self.fcc_static(cls, name)
+            }
+            Expr::StaticCallDyn { class, name, .. } => {
+                let cls = self.fcc_class_of(class)?;
+                let nv = self.eval(name)?;
+                let mn = self.conv_str(&nv)?;
+                self.fcc_static(cls, &mn)
+            }
+            other => {
+                let v = self.eval(other)?;
+                self.fcc_val(&v)
+            }
+        }
+    }
 
+    /// `C::m(...)` class resolution — traits resolve too (calling a
+    /// static trait method directly is deprecated, not undefined;
+    /// constexpr/error_static_call_trait_method).
+    fn fcc_class_of(&mut self, e: &Expr) -> Result<Rc<PhpClass>, PhpError> {
+        if let Expr::Const(n) | Expr::Str(n) = e {
+            let rn = self.resolve_class_name(n);
+            if let Some(t) = self.traits.get(&rn.to_lowercase()).cloned() {
+                // Traits aren't PhpClass-registered; wrap the decl so
+                // find_method_in/late-static binding see the trait's
+                // own methods (constexpr/error_static_call_trait_method).
+                return Ok(Rc::new(PhpClass {
+                    decl: t,
+                    statics: std::cell::RefCell::new(std::collections::HashMap::new()),
+                    statics_init: std::cell::RefCell::new(false),
+                }));
+            }
+        }
+        self.class_of(e)
+    }
+
+    /// `name(...)` — fn-name FCC with the same resolution as call_named
+    /// (ns fallback for unqualified literals, \u{1} marker).
+    fn fcc_named(&mut self, fname: &str) -> Result<Value, PhpError> {
+        let (unqualified, lname) = match fname.strip_prefix('\u{1}') {
+            Some(n) => (true, n.to_lowercase()),
+            None => (false, fname.trim_start_matches('\\').to_lowercase()),
+        };
+        // Zend resolves unqualified FCC names ns\f -> f once per call
+        // site and caches it — a later-conditionally-defined ns\f does
+        // NOT rebind existing sites (constexpr/namespace_004).
+        let caller = self
+            .stack
+            .last()
+            .map(|f| f.fn_name.clone())
+            .unwrap_or_else(|| "{main}".to_string());
+        let cache_key = if unqualified {
+            Some((caller, self.caller_ns().to_lowercase(), lname.clone()))
+        } else {
+            None
+        };
+        if let Some(k) = &cache_key {
+            if let Some(hit) = self.fcc_fn_cache.get(k).cloned() {
+                return self.fcc_named_emit(hit, fname);
+            }
+        }
+        // Zend resolves unqualified FCC names ns\f -> f at creation;
+        // a namespaced user function outranks the global builtin
+        // (constexpr/namespace_003).
+        let mut resolved: Option<String> = None;
+        let mut miss = fname
+            .trim_start_matches('\u{1}')
+            .trim_start_matches('\\')
+            .to_string();
+        if unqualified {
+            let ns = self.caller_ns();
+            if !ns.is_empty() {
+                let cand = format!("{}\\{}", ns.to_lowercase(), lname);
+                if self.functions.contains_key(&cand) {
+                    resolved = Some(cand);
+                } else {
+                    miss = format!("{}\\{}", ns, fname.trim_start_matches('\u{1}'));
+                }
+            }
+        }
+        if resolved.is_none()
+            && (self.functions.contains_key(&lname) || builtins::is_builtin(&lname))
+        {
+            resolved = Some(lname.clone());
+        }
+        if let Some(k) = cache_key {
+            self.fcc_fn_cache.insert(k, resolved.clone());
+        }
+        self.fcc_named_emit(resolved, &miss)
+    }
+
+    fn fcc_named_emit(&mut self, resolved: Option<String>, miss: &str) -> Result<Value, PhpError> {
+        match resolved {
+            Some(r) => Ok(Value::Callable(self.new_callable(PhpCallable {
+                id: std::cell::Cell::new(0),
+                kind: CallableKind::Named(r),
+                captures: Vec::new(),
+                this_obj: None,
+                scope_class: None,
+            }))),
+            None => self.fail(PhpError::uncaught(
+                "Error",
+                format!("Call to undefined function {}()", miss),
+                0,
+            )),
+        }
+    }
+
+    /// Any value → callable coercion for FCC (`$fn(...)`, `($c)(...)`,
+    /// `[$o,'m'](...)`). Non-callables throw `Error` (Zend "not callable").
+    fn fcc_val(&mut self, v: &Value) -> Result<Value, PhpError> {
+        match v {
+            Value::Callable(_) => Ok(v.clone()),
+            Value::Str(s) => {
+                let name = s.trim_start_matches('\\');
+                if let Some((cls, m)) = name.split_once("::") {
+                    if let Some(rcn) = self.resolve_class(cls) {
+                        if let Some(c) = self.classes.get(&rcn.to_lowercase()).cloned() {
+                            return self.fcc_static(c, m);
+                        }
+                    }
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Class \"{}\" not found", cls),
+                        0,
+                    ));
+                }
+                if self.functions.contains_key(&name.to_lowercase())
+                    || builtins::is_builtin(&name.to_lowercase())
+                {
+                    Ok(Value::Callable(self.new_callable(PhpCallable {
+                        id: std::cell::Cell::new(0),
+                        kind: CallableKind::Named(name.to_lowercase()),
+                        captures: Vec::new(),
+                        this_obj: None,
+                        scope_class: None,
+                    })))
+                } else {
+                    self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Call to undefined function {}()", name),
+                        0,
+                    ))
+                }
+            }
+            Value::Object(o) => {
+                if o.borrow().class.find_method("__invoke").is_some() {
+                    Ok(Value::Callable(self.new_callable(PhpCallable {
+                        id: std::cell::Cell::new(0),
+                        kind: CallableKind::Method {
+                            obj: Some(o.clone()),
+                            class: None,
+                            name: "__invoke".to_string(),
+                        },
+                        captures: Vec::new(),
+                        this_obj: Some(o.clone()),
+                        scope_class: Some(o.borrow().class.clone()),
+                    })))
+                } else {
+                    self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Object of type {} is not callable", o.borrow().class.name()),
+                        0,
+                    ))
+                }
+            }
+            Value::Array(a) => {
+                let a = a.borrow();
+                let t = a.get(&ArrKey::Int(0));
+                let m = a.get(&ArrKey::Int(1));
+                match (t, m) {
+                    (Some(Value::Object(o)), Some(mv)) => {
+                        let mn = mv.to_php_string();
+                        self.fcc_method(&Value::Object(o.clone()), &mn)
+                    }
+                    (Some(Value::Str(cn)), Some(mv)) => {
+                        let mn = mv.to_php_string();
+                        match self
+                            .resolve_class(&cn)
+                            .and_then(|c| self.classes.get(&c.to_lowercase()).cloned())
+                        {
+                            Some(c) => self.fcc_static(c, &mn),
+                            None => self.fail(PhpError::uncaught(
+                                "Error",
+                                format!("Class \"{}\" not found", cn),
+                                0,
+                            )),
+                        }
+                    }
+                    _ => self.fail(PhpError::uncaught(
+                        "Error",
+                        format!(
+                            "Value of type {} is not callable",
+                            v.type_name().to_lowercase()
+                        ),
+                        0,
+                    )),
+                }
+            }
+            _ => self.fail(PhpError::uncaught(
+                "Error",
+                format!(
+                    "Value of type {} is not callable",
+                    v.type_name().to_lowercase()
+                ),
+                0,
+            )),
+        }
+    }
+
+    /// `$obj->method(...)` — bound method closure. Visibility is checked
+    /// at creation from the calling scope (zend_closures).
+    fn fcc_method(&mut self, ov: &Value, mn: &str) -> Result<Value, PhpError> {
+        let o = match ov {
+            Value::Object(o) => o.clone(),
+            Value::Callable(_) if mn.eq_ignore_ascii_case("__invoke") => {
+                // `$closure->__invoke(...)` — the closure itself.
+                return Ok(ov.clone());
+            }
+            other => {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    format!(
+                        "Call to a member function {}() on {}",
+                        mn,
+                        other.type_name().to_lowercase()
+                    ),
+                    0,
+                ))
+            }
+        };
+        let cls = o.borrow().class.clone();
+        match self.find_method_in(&cls, mn) {
+            Some((m, dc)) => {
+                if m.is_abstract {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Cannot call abstract method {}::{}()", dc.name(), mn),
+                        0,
+                    ));
+                }
+                self.fcc_vis_check(&m, &dc)?;
+                Ok(Value::Callable(self.new_callable(PhpCallable {
+                    id: std::cell::Cell::new(0),
+                    kind: CallableKind::Method {
+                        obj: Some(o.clone()),
+                        class: None,
+                        name: mn.to_string(),
+                    },
+                    captures: Vec::new(),
+                    this_obj: Some(o),
+                    scope_class: Some(dc),
+                })))
+            }
+            None => {
+                if self.find_method_in(&cls, "__call").is_some() {
+                    // `Foo::doesNotExist` routes through __call at call
+                    // time (first_class_callable_005).
+                    Ok(Value::Callable(self.new_callable(PhpCallable {
+                        id: std::cell::Cell::new(0),
+                        kind: CallableKind::Method {
+                            obj: Some(o.clone()),
+                            class: None,
+                            name: mn.to_string(),
+                        },
+                        captures: Vec::new(),
+                        this_obj: Some(o),
+                        scope_class: Some(cls),
+                    })))
+                } else {
+                    self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Call to undefined method {}::{}()", cls.name(), mn),
+                        0,
+                    ))
+                }
+            }
+        }
+    }
+
+    /// `C::method(...)` — static method closure; non-static methods fail
+    /// "cannot be called statically" at creation (Error, catchable).
+    fn fcc_static(&mut self, cls: Rc<PhpClass>, mn: &str) -> Result<Value, PhpError> {
+        match self.find_method_in(&cls, mn) {
+            Some((m, dc)) => {
+                if m.is_abstract {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Cannot call abstract method {}::{}()", dc.name(), mn),
+                        0,
+                    ));
+                }
+                if !m.is_static {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!(
+                            "Non-static method {}::{}() cannot be called statically",
+                            cls.name(),
+                            mn
+                        ),
+                        0,
+                    ));
+                }
+                // `Foo::m(...)` where Foo is a trait: allowed but
+                // deprecated outside a using class (8.4+;
+                // constexpr/error_static_call_trait_method).
+                if self.traits.contains_key(&dc.name().to_lowercase()) {
+                    self.deprecated(&format!(
+                        "Calling static trait method {}::{} is deprecated, it should only be called on a class using the trait",
+                        dc.name(),
+                        m.decl.name
+                    ))?;
+                }
+                self.fcc_vis_check(&m, &dc)?;
+                Ok(Value::Callable(self.new_callable(PhpCallable {
+                    id: std::cell::Cell::new(0),
+                    // `class` is the called class for late static
+                    // binding (`Bar::method(...)` -> static::class
+                    // is Bar; first_class_callable_010).
+                    kind: CallableKind::Method {
+                        obj: None,
+                        class: Some(cls.clone()),
+                        name: mn.to_string(),
+                    },
+                    captures: Vec::new(),
+                    this_obj: None,
+                    scope_class: Some(dc),
+                })))
+            }
+            None => {
+                if self.find_method_in(&cls, "__callstatic").is_some() {
+                    if self.in_const_expr > 0 {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            "Creating a callable for the magic __callStatic() method is not supported in constant expressions",
+                            0,
+                        ));
+                    }
+                    Ok(Value::Callable(self.new_callable(PhpCallable {
+                        id: std::cell::Cell::new(0),
+                        kind: CallableKind::Method {
+                            obj: None,
+                            class: Some(cls.clone()),
+                            name: mn.to_string(),
+                        },
+                        captures: Vec::new(),
+                        this_obj: None,
+                        scope_class: Some(cls),
+                    })))
+                } else {
+                    self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Call to undefined method {}::{}()", cls.name(), mn),
+                        0,
+                    ))
+                }
+            }
+        }
+    }
+
+    /// FCC visibility gate (zend_closures): checked at creation from the
+    /// calling scope; `const_self` covers class-const initializers.
+    fn fcc_vis_check(&mut self, m: &MethodDecl, dc: &Rc<PhpClass>) -> Result<(), PhpError> {
+        let scope = self
+            .stack
+            .last()
+            .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()).cloned())
+            .or_else(|| self.const_self.clone());
+        let ok = match m.visibility {
+            crate::ast::Visibility::Public => true,
+            crate::ast::Visibility::Private => scope
+                .as_ref()
+                .map(|s| s.name() == dc.name())
+                .unwrap_or(false),
+            crate::ast::Visibility::Protected => scope
+                .as_ref()
+                .map(|s| self.is_a_str(s.name(), dc.name()))
+                .unwrap_or(false),
+        };
+        if ok {
+            return Ok(());
+        }
+        let vis = match m.visibility {
+            crate::ast::Visibility::Public => "public",
+            crate::ast::Visibility::Protected => "protected",
+            crate::ast::Visibility::Private => "private",
+        };
+        let from = match &scope {
+            Some(s) => format!("scope {}", s.name()),
+            None => "global scope".to_string(),
+        };
+        self.fail(PhpError::uncaught(
+            "Error",
+            format!(
+                "Call to {} method {}::{}() from {}",
+                vis,
+                dc.name(),
+                m.decl.name,
+                from
+            ),
+            0,
+        ))
+    }
+
+    /// Compile-time constant-expression eval: FCC shape rules apply,
+    /// `self`/`parent` bind to `const_self`, magic __callStatic is
+    /// rejected (constexpr/*).
+    fn eval_const(&mut self, e: &Expr) -> Result<Value, PhpError> {
+        self.const_fcc_check(e)?;
+        self.in_const_expr += 1;
+        let r = self.eval(e);
+        self.in_const_expr -= 1;
+        r
+    }
+
+    /// Scalar-literal callees (`(0)(...)`, `(1.5)(...)`) fail "Illegal
+    /// function name"; everything else non-literal is `msg`.
+    fn const_scalar_callee(&self, e: &Expr, msg: &str) -> Result<(), PhpError> {
+        match e {
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null => {
+                Err(PhpError::fatal("Illegal function name", self.cur_line))
+            }
+            _ => Err(PhpError::fatal(msg, self.cur_line)),
+        }
+    }
+
+    /// FCC-in-constant-expression shape rules (zend_compile): the callee
+    /// must be a literal function name or `LiteralClass::literalMethod`.
+    /// Recursed so FCCs nested in const exprs get the same check.
+    fn const_fcc_check(&self, e: &Expr) -> Result<(), PhpError> {
+        match e {
+            Expr::Fcc(inner) => match inner.as_ref() {
+                Expr::Call { name, .. } => match name.as_ref() {
+                    Expr::Str(_) => Ok(()),
+                    Expr::Paren(p) => self.const_scalar_callee(
+                        p.as_ref(),
+                        "Cannot use dynamic function name in constant expression",
+                    ),
+                    other => self.const_scalar_callee(
+                        other,
+                        "Cannot use dynamic function name in constant expression",
+                    ),
+                },
+                Expr::StaticCall { class, .. } | Expr::StaticCallDyn { class, .. } => {
+                    match class.as_ref() {
+                        Expr::Const(c) | Expr::Str(c) => {
+                            if c.eq_ignore_ascii_case("static") {
+                                Err(PhpError::fatal(
+                                    "\"static\" is not allowed in compile-time constants",
+                                    self.cur_line,
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        _ => Err(PhpError::fatal(
+                            "Constant expression contains invalid operations",
+                            self.cur_line,
+                        )),
+                    }
+                }
+                _ => Err(PhpError::fatal(
+                    "Constant expression contains invalid operations",
+                    self.cur_line,
+                )),
+            },
+            Expr::Paren(inner) | Expr::Assign { value: inner, .. } => self.const_fcc_check(inner),
+            Expr::Binary { l, r, .. } => {
+                self.const_fcc_check(l)?;
+                self.const_fcc_check(r)
+            }
+            Expr::Unary { e, .. } => self.const_fcc_check(e),
+            Expr::Ternary { c, t, f, .. } => {
+                self.const_fcc_check(c)?;
+                if let Some(t) = t.as_ref() {
+                    self.const_fcc_check(t)?;
+                }
+                self.const_fcc_check(f)
+            }
+            Expr::Index { e, i, .. } => {
+                self.const_fcc_check(e)?;
+                if let Some(i) = i.as_ref() {
+                    self.const_fcc_check(i)?;
+                }
+                Ok(())
+            }
+            Expr::ArrayLit(items) => {
+                for (k, v) in items {
+                    if let Some(k) = k {
+                        self.const_fcc_check(k)?;
+                    }
+                    self.const_fcc_check(v)?;
+                }
+                Ok(())
+            }
+            Expr::Call { name, args, .. } => {
+                self.const_fcc_check(name)?;
+                for a in args {
+                    self.const_fcc_check(a)?;
+                }
+                Ok(())
+            }
+            Expr::MethodCall { obj, args, .. } => {
+                self.const_fcc_check(obj)?;
+                for a in args {
+                    self.const_fcc_check(a)?;
+                }
+                Ok(())
+            }
+            Expr::StaticCall { class, args, .. } | Expr::StaticCallDyn { class, args, .. } => {
+                self.const_fcc_check(class)?;
+                for a in args {
+                    self.const_fcc_check(a)?;
+                }
+                Ok(())
+            }
+            Expr::New { class, args, .. } => {
+                self.const_fcc_check(class)?;
+                for a in args {
+                    self.const_fcc_check(a)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// spl_autoload: invoke each registered loader until `name`
+    /// resolves (resolve_class/class_of retry on miss).
+    pub fn run_autoload(&mut self, name: &str) {
+        let fns = self.autoload_fns.clone();
+        for f in fns {
+            let _ = self.call_value(&f, vec![cell(Value::str(name))]);
+            if self.classes.contains_key(&name.to_lowercase()) {
+                return;
+            }
+        }
+    }
     /// Params binding + body run for a pushed frame context (closures).
     fn bind_and_run(
         &mut self,
@@ -5222,8 +5886,10 @@ impl<'a> Interp<'a> {
                 Value::Callable(_) | Value::Str(_) | Value::Object(_) | Value::Array(_)
             ),
             "object" => matches!(v, Value::Object(_)),
-            // Named class/interface — instanceof check.
+            // Named class/interface — instanceof check. `Closure` is
+            // our Callable value's class (constexpr/default_args).
             _ => match v {
+                Value::Callable(_) => m.eq_ignore_ascii_case("closure"),
                 Value::Object(o) => self.obj_is_a(o, m),
                 _ => false,
             },
@@ -5363,7 +6029,17 @@ impl<'a> Interp<'a> {
                     // Default exprs are evaluated at call time; an error
                     // (e.g. an undefined constant) propagates as the
                     // call's failure (namespaces/ns_077).
-                    let dv = match self.eval(d) {
+                    let prev = self
+                        .stack
+                        .last()
+                        .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()).cloned());
+                    let old = match prev {
+                        Some(c) => self.const_self.replace(c),
+                        None => self.const_self.take(),
+                    };
+                    let r = self.eval_const(d);
+                    self.const_self = old;
+                    let dv = match r {
                         Ok(v) => v,
                         Err(e) => {
                             self.stack.pop();
@@ -5478,6 +6154,7 @@ impl<'a> Interp<'a> {
                 .insert("this".to_string(), cell(Value::Object(obj.clone())));
         }
         frame.decl_class = self.pending_decl_class.take();
+        frame.called_class = self.pending_called_class.take();
         frame.hook_prop = self.pending_hook_prop.take();
         frame.this_obj = this_obj;
         frame.scope_class = scope_class;
@@ -6177,24 +6854,60 @@ impl<'a> Interp<'a> {
     pub fn resolve_class_name(&mut self, n: &str) -> String {
         let lname = n.trim_start_matches('\\');
         match lname.to_lowercase().as_str() {
-            "self" | "static" => self
-                .stack
-                .last()
-                .and_then(|f| f.scope_class.as_ref().map(|c| c.name().to_string()))
-                .unwrap_or_else(|| lname.to_string()),
-            "parent" => self
-                .stack
-                .last()
-                .and_then(|f| f.scope_class.clone())
-                .and_then(|c| c.decl.parent.clone())
-                .unwrap_or_else(|| lname.to_string()),
+            "static" => {
+                if self.in_const_expr > 0 {
+                    if let Some(c) = &self.const_self {
+                        return c.name().to_string();
+                    }
+                }
+                self.stack
+                    .last()
+                    .and_then(|f| {
+                        f.called_class
+                            .as_ref()
+                            .map(|c| c.name().to_string())
+                            .or_else(|| f.scope_class.as_ref().map(|c| c.name().to_string()))
+                    })
+                    .unwrap_or_else(|| lname.to_string())
+            }
+            "self" => {
+                if self.in_const_expr > 0 {
+                    if let Some(c) = &self.const_self {
+                        return c.name().to_string();
+                    }
+                }
+                self.stack
+                    .last()
+                    .and_then(|f| f.scope_class.as_ref().map(|c| c.name().to_string()))
+                    .unwrap_or_else(|| lname.to_string())
+            }
+            "parent" => {
+                if self.in_const_expr > 0 {
+                    if let Some(cself) = &self.const_self {
+                        return cself
+                            .decl
+                            .parent
+                            .clone()
+                            .unwrap_or_else(|| lname.to_string());
+                    }
+                }
+                self.stack
+                    .last()
+                    .and_then(|f| f.scope_class.clone())
+                    .and_then(|c| c.decl.parent.clone())
+                    .unwrap_or_else(|| lname.to_string())
+            }
             _ => lname.to_string(),
         }
     }
 
-    /// name → registered class name (handles nothing special yet — no autoload).
+    /// name → registered class name; a miss runs the autoloaders
+    /// once (FCC string args, class_exists).
     fn resolve_class(&mut self, name: &str) -> Option<String> {
         let n = name.trim_start_matches('\\');
+        if !self.classes.contains_key(&n.to_lowercase()) {
+            self.run_autoload(n);
+        }
         if self.classes.contains_key(&n.to_lowercase()) {
             Some(n.to_string())
         } else {
@@ -6202,18 +6915,40 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Allocate a PHP object handle id: reuse the lowest dead slot,
-    /// like Zend's object store recycling freed handles.
+    /// Allocate a PHP object/closure handle id: reuse the lowest dead
+    /// slot, like Zend's object store recycling freed handles (closures
+    /// share the store — `object(Closure)#N` interleaves with objects).
     fn next_obj_id(&mut self, rc: &Rc<RefCell<PhpObject>>) -> u64 {
-        let w = Rc::downgrade(rc);
-        for (i, h) in self.obj_handles.iter_mut().enumerate() {
-            if h.upgrade().is_none() {
-                *h = w.clone();
+        let w = ObjHandle::Obj(Rc::downgrade(rc));
+        self.push_handle(w)
+    }
+
+    fn next_callable_id(&mut self, c: &Rc<PhpCallable>) -> u64 {
+        self.push_handle(ObjHandle::Callable(Rc::downgrade(c)))
+    }
+
+    fn push_handle(&mut self, w: ObjHandle) -> u64 {
+        // Zend reuses the most recently freed handle first (its free
+        // list is a LIFO stack), so scan dead slots back-to-front
+        // (namespace_004: call2's $c reuses call1's $d handle, then
+        // $d reuses call1's $c — not the other way around).
+        let n = self.obj_handles.len();
+        for i in (0..n).rev() {
+            if !self.obj_handles[i].alive() {
+                self.obj_handles[i] = w;
                 return (i + 1) as u64;
             }
         }
         self.obj_handles.push(w);
         self.obj_handles.len() as u64
+    }
+
+    /// Wrap a PhpCallable assigning its object-store id.
+    fn new_callable(&mut self, inner: PhpCallable) -> Rc<PhpCallable> {
+        let c = Rc::new(inner);
+        let id = self.next_callable_id(&c);
+        c.id.set(id);
+        c
     }
 
     /// Wrap a PhpObject in Rc and assign its handle id.
@@ -6251,7 +6986,7 @@ impl<'a> Interp<'a> {
                 0,
             ));
         }
-        let obj = self.instantiate(&lname, &[]);
+        let obj = self.instantiate(&lname, &[])?;
         // __construct (native for builtins via method_invoke's
         // interception); the ctor may be inherited (property_hooks/foreach).
         if self.find_method_in(&cls, "__construct").is_some() {
@@ -6263,12 +6998,12 @@ impl<'a> Interp<'a> {
     }
 
     /// Build the object shell: init props along the whole parent chain.
-    pub fn instantiate(&mut self, lname: &str, _args: &[Value]) -> Value {
+    pub fn instantiate(&mut self, lname: &str, _args: &[Value]) -> Result<Value, PhpError> {
         let cls = self.classes.get(&lname.to_lowercase()).cloned();
         let cls = match cls {
             Some(c) => c,
             None => {
-                return Value::Object(Rc::new(RefCell::new(PhpObject {
+                return Ok(Value::Object(Rc::new(RefCell::new(PhpObject {
                     class: Rc::new(PhpClass {
                         decl: Rc::new(ClassDecl {
                             name: lname.into(),
@@ -6291,7 +7026,7 @@ impl<'a> Interp<'a> {
                     prop_order: vec![],
                     id: 0,
                     internal: None,
-                })))
+                }))))
             }
         };
         // Collect decl chain (self + parents, parent-first for prop order).
@@ -6357,7 +7092,14 @@ impl<'a> Interp<'a> {
                     continue;
                 }
                 let default = match &p.default {
-                    Some(d) => self.eval(d).unwrap_or(Value::Null),
+                    Some(d) => {
+                        let old = self.const_self.replace(c.clone());
+                        self.class_const_ctx += 1;
+                        let r = self.eval_const(d);
+                        self.class_const_ctx -= 1;
+                        self.const_self = old;
+                        r?
+                    }
                     None => Value::Null,
                 };
                 // Private props live in a per-declaring-class slot
@@ -6386,13 +7128,13 @@ impl<'a> Interp<'a> {
         } else {
             None
         };
-        Value::Object(self.alloc_obj(PhpObject {
+        Ok(Value::Object(self.alloc_obj(PhpObject {
             class: cls,
             props,
             prop_order,
             id: 0,
             internal,
-        }))
+        })))
     }
 
     fn is_throwable_name(&mut self, name: &str) -> bool {
@@ -6794,7 +7536,14 @@ impl<'a> Interp<'a> {
                     continue;
                 }
                 let v = match &p.default {
-                    Some(d) => self.eval(d).unwrap_or(Value::Null),
+                    Some(d) => {
+                        let old = self.const_self.replace(c.clone());
+                        self.class_const_ctx += 1;
+                        let v = self.eval_const(d).unwrap_or(Value::Null);
+                        self.class_const_ctx -= 1;
+                        self.const_self = old;
+                        v
+                    }
                     None => Value::Null,
                 };
                 out.push((p.name.clone(), v));
@@ -7222,9 +7971,11 @@ impl<'a> Interp<'a> {
         let args = arg.into_iter().collect::<Vec<Cell>>();
         self.pending_decl_class = Some(dcls.clone());
         self.pending_hook_prop = Some((o.borrow().id, pname.to_string(), hook.is_get, owner));
-        let scope = o.borrow().class.clone();
-        let r = self.invoke_fn(&decl, args, Some(o.clone()), Some(scope));
+        let called = o.borrow().class.clone();
+        self.pending_called_class = Some(called);
+        let r = self.invoke_fn(&decl, args, Some(o.clone()), Some(dcls.clone()));
         self.pending_decl_class = None;
+        self.pending_called_class = None;
         self.pending_hook_prop = None;
         r
     }
@@ -7720,7 +8471,7 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?;
-                Ok(Some(self.instantiate(&cn.to_lowercase(), &[])))
+                Ok(Some(self.instantiate(&cn.to_lowercase(), &[])?))
             }
             "isinitialized" => {
                 let pn = obj
@@ -8000,14 +8751,16 @@ impl<'a> Interp<'a> {
         args: Vec<Cell>,
         dc: Rc<PhpClass>,
     ) -> Result<Value, PhpError> {
-        let scope = obj.borrow().class.clone();
-        self.pending_decl_class = Some(dc);
+        let called = obj.borrow().class.clone();
+        self.pending_decl_class = Some(dc.clone());
+        self.pending_called_class = Some(called);
         let r = if m.is_static {
-            self.invoke_fn(&Rc::new(m.decl.clone()), args, None, Some(scope))
+            self.invoke_fn(&Rc::new(m.decl.clone()), args, None, Some(dc))
         } else {
-            self.invoke_fn(&Rc::new(m.decl.clone()), args, Some(obj), Some(scope))
+            self.invoke_fn(&Rc::new(m.decl.clone()), args, Some(obj), Some(dc))
         };
         self.pending_decl_class = None;
+        self.pending_called_class = None;
         r
     }
 
@@ -8059,7 +8812,16 @@ impl<'a> Interp<'a> {
             }
         }
         match self.find_method_in(&cls, name) {
-            Some((m, dc)) => self.invoke_method(obj, &m, args, dc),
+            Some((m, dc)) => {
+                if m.is_abstract {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Cannot call abstract method {}::{}()", dc.name(), name),
+                        0,
+                    ));
+                }
+                self.invoke_method(obj, &m, args, dc)
+            }
             None => {
                 if let Some((m, dc)) = self.find_method_in(&cls, "__call") {
                     let mut arr = PhpArray::new();
@@ -8246,7 +9008,14 @@ impl<'a> Interp<'a> {
                 continue;
             }
             let default = match &p.default {
-                Some(d) => self.eval(d).unwrap_or(Value::Null),
+                Some(d) => {
+                    let old = self.const_self.replace(cls.clone());
+                    self.class_const_ctx += 1;
+                    let v = self.eval_const(d).unwrap_or(Value::Null);
+                    self.class_const_ctx -= 1;
+                    self.const_self = old;
+                    v
+                }
                 None => Value::Null,
             };
             cls.statics
@@ -8274,6 +9043,13 @@ impl<'a> Interp<'a> {
         // Throwable methods are instance-only; look up incl. parents.
         match self.find_method_in(&cls, name) {
             Some((m, dc)) => {
+                if m.is_abstract {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Cannot call abstract method {}::{}()", dc.name(), name),
+                        0,
+                    ));
+                }
                 // Forwarding call: a non-static method invoked statically
                 // still receives $this when the caller's $this is an
                 // instance of the callee's class (bug21961).
@@ -8288,9 +9064,11 @@ impl<'a> Interp<'a> {
                             self.is_a_str(&cname, cls.name())
                         })
                 };
-                self.pending_decl_class = Some(dc);
-                let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(cls.clone()));
+                self.pending_decl_class = Some(dc.clone());
+                self.pending_called_class = Some(cls.clone());
+                let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(dc));
                 self.pending_decl_class = None;
+                self.pending_called_class = None;
                 r
             }
             None => {
@@ -8299,7 +9077,8 @@ impl<'a> Interp<'a> {
                     for a in &args {
                         arr.push(a.borrow().clone());
                     }
-                    self.pending_decl_class = Some(dc);
+                    self.pending_decl_class = Some(dc.clone());
+                    self.pending_called_class = Some(cls.clone());
                     let r = self.invoke_fn(
                         &Rc::new(m.decl.clone()),
                         vec![
@@ -8307,9 +9086,10 @@ impl<'a> Interp<'a> {
                             cell(Value::Array(Rc::new(RefCell::new(arr)))),
                         ],
                         None,
-                        Some(cls.clone()),
+                        Some(dc),
                     );
                     self.pending_decl_class = None;
+                    self.pending_called_class = None;
                     return r;
                 }
                 self.fail(PhpError::uncaught(
@@ -8434,6 +9214,9 @@ impl<'a> Interp<'a> {
 
     fn class_of(&mut self, e: &Expr) -> Result<Rc<PhpClass>, PhpError> {
         let name = self.class_name_of(e)?;
+        if !self.classes.contains_key(&name.to_lowercase()) {
+            self.run_autoload(&name);
+        }
         match self.classes.get(&name.to_lowercase()) {
             Some(c) => Ok(c.clone()),
             None => self.fail(PhpError::uncaught(
@@ -8464,7 +9247,12 @@ impl<'a> Interp<'a> {
         while let Some(c) = cur {
             for (n, e) in &c.decl.consts {
                 if n == name {
-                    return self.eval(e);
+                    let old = self.const_self.replace(c.clone());
+                    self.class_const_ctx += 1;
+                    let r = self.eval_const(e);
+                    self.class_const_ctx -= 1;
+                    self.const_self = old;
+                    return r;
                 }
             }
             cur = c

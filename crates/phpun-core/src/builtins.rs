@@ -2905,10 +2905,33 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         },
         "closure_from_callable" | "closure::fromcallable" => arg(args, 0),
         "get_called_class" => Value::str(""),
-        "spl_autoload_register"
-        | "spl_autoload_unregister"
-        | "spl_autoload_functions"
-        | "spl_autoload_call" => Value::Bool(true),
+        "spl_autoload_register" => {
+            if let Some(v) = args.first() {
+                it.autoload_fns.push(v.borrow().clone());
+            }
+            Value::Bool(true)
+        }
+        "spl_autoload_unregister" => {
+            // exact-value match — autoload lists are tiny in practice.
+            if let Some(v) = args.first() {
+                let target = v.borrow().clone();
+                it.autoload_fns
+                    .retain(|f| !crate::value::identical(f, &target));
+            }
+            Value::Bool(true)
+        }
+        "spl_autoload_functions" => {
+            let mut a = PhpArray::new();
+            for f in &it.autoload_fns {
+                a.push(f.clone());
+            }
+            Value::Array(Rc::new(RefCell::new(a)))
+        }
+        "spl_autoload_call" => {
+            let n = arg_str(it, args, 0);
+            it.run_autoload(&n);
+            Value::Bool(true)
+        }
         "array_key_exists_slow" => Value::Null,
         "ctype_digit" => Value::Bool(
             !arg_str(it, args, 0).is_empty()
@@ -3009,23 +3032,328 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
     }))
 }
 
-fn is_builtin(n: &str) -> bool {
+/// Parameter names/requiredness for a handful of builtins whose FCC
+/// closures appear in var_dump output (Zend/tests/first_class_callable).
+/// `(name, required)`.
+fn builtin_sig(n: &str) -> Option<Vec<(String, bool)>> {
+    let ps: &[(&str, bool)] = match n {
+        "strlen" | "strrev" | "strtoupper" | "strtolower" | "md5" | "sha1" => &[("string", true)],
+        "sprintf" => &[("format", true), ("args", false)],
+        "str_repeat" => &[("string", true), ("times" /* multi */, true)],
+        "substr" => &[("string", true), ("offset", true), ("length", false)],
+        "strpos" => &[("haystack", true), ("needle", true), ("offset", false)],
+        "assert" => &[("assertion", true), ("description", false)],
+        "count" => &[("value", true), ("mode", false)],
+        "implode" => &[("separator", false), ("array", true)],
+        "explode" => &[("separator", true), ("string", true), ("limit", false)],
+        _ => return Some(Vec::new()),
+    };
+    Some(ps.iter().map(|(n, r)| (n.to_string(), *r)).collect())
+}
+
+pub(crate) fn is_builtin(n: &str) -> bool {
     matches!(
         n,
-        "strlen"
-            | "var_dump"
-            | "print_r"
-            | "echo"
-            | "print"
-            | "count"
-            | "implode"
-            | "explode"
-            | "abs"
-            | "max"
-            | "min"
+        "abs"
+            | "acos"
+            | "addcslashes"
+            | "addslashes"
+            | "array_change_key_case"
+            | "array_chunk"
+            | "array_column"
+            | "array_combine"
+            | "array_count_values"
+            | "array_diff"
+            | "array_diff_key"
+            | "array_fill"
+            | "array_fill_keys"
+            | "array_filter"
+            | "array_flip"
+            | "array_intersect"
+            | "array_intersect_key"
+            | "array_is_list"
+            | "array_key_exists_slow"
+            | "array_key_last"
+            | "array_keys"
+            | "array_map"
+            | "array_multisort"
+            | "array_pad"
+            | "array_pop"
+            | "array_product"
             | "array_push"
-            | "sprintf"
+            | "array_rand"
+            | "array_reduce"
+            | "array_replace"
+            | "array_reverse"
+            | "array_search"
+            | "array_shift"
+            | "array_slice"
+            | "array_splice"
+            | "array_sum"
+            | "array_unique"
+            | "array_unshift"
+            | "array_values"
+            | "array_walk"
+            | "asin"
+            | "assert"
+            | "assert_options"
+            | "assert_options_now"
+            | "atan"
+            | "atan2"
+            | "base64_decode"
+            | "base64_encode"
+            | "base_convert"
+            | "basename"
+            | "bin2hex"
+            | "bindec"
+            | "boolval"
+            | "call_func"
+            | "ceil"
+            | "chdir"
+            | "checkdate"
+            | "chr"
+            | "chunk_split"
+            | "class_exists"
+            | "clone"
+            | "compact"
+            | "compact_obj"
+            | "constant"
+            | "copy"
+            | "cos"
+            | "cosh"
+            | "count_chars"
+            | "crc32"
+            | "crc32_combine"
+            | "ctype_alnum"
+            | "ctype_alpha"
+            | "ctype_digit"
+            | "ctype_lower"
+            | "ctype_space"
+            | "ctype_upper"
+            | "date_parse"
+            | "debug_backtrace"
+            | "debug_print_backtrace"
+            | "debug_zval_dump"
+            | "decbin"
+            | "dechex"
+            | "decoct"
+            | "define"
+            | "defined"
+            | "deg2rad"
+            | "divmod"
+            | "dl"
+            | "each"
+            | "end"
+            | "enum_exists"
+            | "error_reporting"
+            | "exp"
+            | "explode"
+            | "extension_loaded"
+            | "extract"
+            | "fastcgi_finish_request"
+            | "fclose"
+            | "fdiv"
+            | "feof"
+            | "fflush"
+            | "fgetc"
+            | "fgetcsv"
+            | "fgets"
+            | "file"
+            | "file_exists"
+            | "file_get_contents"
+            | "file_put_contents"
+            | "fileperms"
+            | "filesize"
+            | "flock"
+            | "floor"
+            | "fmod"
+            | "fnmatch"
+            | "fopen"
+            | "fpassthru"
+            | "fprintf"
+            | "fread"
+            | "fseek"
+            | "fstat"
+            | "ftell"
+            | "ftruncate"
+            | "function_exists"
+            | "gc_enabled"
+            | "gc_status"
+            | "get_called_class"
+            | "get_class"
+            | "get_class_methods"
+            | "get_class_vars"
+            | "get_current_user"
+            | "get_debug_type"
+            | "get_declared_classes"
+            | "get_declared_interfaces"
+            | "get_declared_traits"
+            | "get_extension_funcs"
+            | "get_loaded_extensions"
+            | "get_parent_class"
+            | "getcwd"
+            | "getenv"
+            | "getmypid"
+            | "gettype"
+            | "glob"
+            | "hash"
+            | "hash_equals"
+            | "hex2bin"
+            | "hexdec"
+            | "hrtime"
+            | "http_build_query"
+            | "hypot"
+            | "ignore_user_abort"
+            | "in_array"
+            | "ini_get"
+            | "ini_get_all"
+            | "ini_parse_quantity"
+            | "ini_restore"
+            | "ini_set"
+            | "intdiv"
+            | "interface_exists"
+            | "is_a"
+            | "is_array"
+            | "is_bool"
+            | "is_callable"
+            | "is_countable"
+            | "is_dir"
+            | "is_executable"
+            | "is_file"
+            | "is_finite"
+            | "is_infinite"
+            | "is_iterable"
+            | "is_link"
+            | "is_nan"
+            | "is_null"
+            | "is_numeric"
+            | "is_object"
+            | "is_readable"
+            | "is_resource"
+            | "is_scalar"
+            | "is_string"
+            | "is_subclass_of"
+            | "iterator_from_array"
+            | "json_decode"
+            | "json_encode"
+            | "json_validate"
+            | "key"
+            | "lcfirst"
+            | "lcg_value"
+            | "levenshtein"
+            | "log10"
+            | "log2"
+            | "ltrim"
+            | "mb_convert_case"
+            | "mb_strlen"
+            | "mb_strtolower_nc"
+            | "md5"
+            | "memory_get_peak_usage"
+            | "memory_get_usage"
+            | "memory_reset_peak_usage"
+            | "method_exists"
+            | "microtime"
+            | "microtime_float"
+            | "mkdir"
+            | "nl2br"
+            | "number_format"
+            | "ob_clean"
+            | "ob_end_clean"
+            | "ob_end_flush"
+            | "ob_get_clean"
+            | "ob_get_contents"
+            | "ob_get_flush"
+            | "ob_get_length"
+            | "ob_get_level"
+            | "ob_get_status"
+            | "ob_start"
+            | "octdec"
+            | "ord"
+            | "output_reset_rewrite_vars"
+            | "parse_str"
+            | "pathinfo"
+            | "php_check_syntax"
+            | "php_sapi_name"
+            | "php_uname"
+            | "pi"
+            | "pow"
+            | "preg_jit"
+            | "print"
+            | "print_r"
             | "printf"
+            | "property_exists"
+            | "putenv"
+            | "quotemeta"
+            | "rad2deg"
+            | "range"
+            | "rawurldecode"
+            | "rawurlencode"
+            | "readfile"
+            | "realpath"
+            | "register_shutdown_function"
+            | "rename"
+            | "reset"
+            | "rewind"
+            | "rmdir"
+            | "round"
+            | "scandir"
+            | "serialize"
+            | "set_error_handler"
+            | "set_exception_handler"
+            | "set_time_limit"
+            | "setlocale"
+            | "settype"
+            | "sha1"
+            | "similar_text"
+            | "sin"
+            | "sinh"
+            | "sleep"
+            | "soundex"
+            | "sprintf"
+            | "sqrt"
+            | "str_contains"
+            | "str_ends_with"
+            | "str_ireplace"
+            | "str_pad"
+            | "str_repeat"
+            | "str_replace"
+            | "str_rot13"
+            | "str_starts_with"
+            | "str_word_count"
+            | "stream_get_contents"
+            | "strip_tags"
+            | "stripslashes"
+            | "strlen"
+            | "strrev"
+            | "strtotime"
+            | "strtr"
+            | "strval"
+            | "substr_count"
+            | "substr_replace"
+            | "sys_get_temp_dir"
+            | "tan"
+            | "tanh"
+            | "tempnam"
+            | "time_nanosleep"
+            | "tmpfile"
+            | "trait_exists"
+            | "trim"
+            | "ucfirst"
+            | "ucwords"
+            | "umask"
+            | "uniqid"
+            | "unlink"
+            | "unserialize"
+            | "urldecode"
+            | "urlencode"
+            | "usleep"
+            | "var_dump"
+            | "var_export"
+            | "version_compare"
+            | "vprintf"
+            | "vsprintf"
+            | "wordwrap"
+            | "zend_version"
     )
 }
 
@@ -3169,7 +3497,126 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
             }
             it.emit(&format!("{}}}\n", pad));
         }
-        Value::Callable(_) => it.emit(&format!("{}object(Closure)#1 (0) {{\n{}}}\n", pad, pad)),
+        Value::Callable(c) => {
+            // Closure debug info (zend_closures.c): function/name key +
+            // bound $this + file/line for literals + parameter map.
+            let pad2 = format!("{}  ", pad);
+            let pad3 = format!("{}    ", pad);
+            let mut keys: Vec<(String, String)> = Vec::new();
+            let mut this_obj = None;
+            let params: Option<Vec<(String, bool)>>;
+            match &c.kind {
+                crate::value::CallableKind::Named(n) => {
+                    keys.push(("function".into(), n.clone()));
+                    params = it
+                        .functions
+                        .get(&n.to_lowercase())
+                        .map(|d| {
+                            d.params
+                                .iter()
+                                .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
+                                .collect()
+                        })
+                        .or_else(|| builtin_sig(&n.to_lowercase()));
+                }
+                crate::value::CallableKind::Method { obj, class, name } => {
+                    let cn = c
+                        .scope_class
+                        .as_ref()
+                        .map(|sc| sc.name().to_string())
+                        .or_else(|| {
+                            obj.as_ref()
+                                .map(|o| o.borrow().class.name().to_string())
+                                .or_else(|| class.as_ref().map(|cl| cl.name().to_string()))
+                        })
+                        .unwrap_or_default();
+                    keys.push(("function".into(), format!("{}::{}", cn, name)));
+                    if let Some(o) = obj {
+                        this_obj = Some(o.clone());
+                    }
+                    let cls = obj
+                        .as_ref()
+                        .map(|o| o.borrow().class.clone())
+                        .or_else(|| class.clone());
+                    params = cls.and_then(|cl| {
+                        it.find_method_in(&cl, name).map(|(m, _)| {
+                            m.decl
+                                .params
+                                .iter()
+                                .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
+                                .collect()
+                        })
+                    });
+                }
+                crate::value::CallableKind::Closure(d) => {
+                    keys.push(("name".into(), format!("{{closure:{}:{}}}", d.file, d.line)));
+                    keys.push(("file".into(), d.file.clone()));
+                    keys.push(("line".into(), String::new())); // int below
+                    params = Some(
+                        d.params
+                            .iter()
+                            .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
+                            .collect(),
+                    );
+                }
+            }
+            let has_params = params.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
+            let nfields = keys.len() + this_obj.is_some() as usize + has_params as usize;
+            it.emit(&format!(
+                "{}object(Closure)#{} ({}) {{\n",
+                pad,
+                c.id.get(),
+                nfields
+            ));
+            let mut line_int = 0i64;
+            if let crate::value::CallableKind::Closure(d) = &c.kind {
+                line_int = d.line as i64;
+            }
+            for (k, v) in &keys {
+                if k == "line" {
+                    it.emit(&format!(
+                        "{}[\"line\"]=>\n{}int({})\n",
+                        pad2, pad2, line_int
+                    ));
+                } else {
+                    it.emit(&format!(
+                        "{}[\"{}\"]=>\n{}string({}) \"{}\"\n",
+                        pad2,
+                        k,
+                        pad2,
+                        v.len(),
+                        v
+                    ));
+                }
+            }
+            if let Some(o) = &this_obj {
+                it.emit(&format!("{}[\"this\"]=>\n", pad2));
+                var_dump(it, &Value::Object(o.clone()), indent + 1, zval, false);
+            }
+            if let Some(ps) = &params {
+                if has_params {
+                    it.emit(&format!(
+                        "{}[\"parameter\"]=>\n{}array({}) {{\n",
+                        pad2,
+                        pad2,
+                        ps.len()
+                    ));
+                    for (pn, req) in ps {
+                        let word = if *req { "<required>" } else { "<optional>" };
+                        it.emit(&format!(
+                            "{}[\"${}\"]=>\n{}string({}) \"{}\"\n",
+                            pad3,
+                            pn,
+                            pad3,
+                            word.len(),
+                            word
+                        ));
+                    }
+                    it.emit(&format!("{}}}\n", pad2));
+                }
+            }
+            it.emit(&format!("{}}}\n", pad));
+        }
         Value::Resource(r) => it.emit(&format!(
             "{}resource({}) of type (stream)\n",
             pad,
@@ -4036,7 +4483,7 @@ fn unserialize(it: &mut Interp, s: &str, pos: &mut usize) -> Result<Value, ()> {
             let n: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
             *pos += 1; // {
             let obj = match it.instantiate(&cname.to_lowercase(), &[]) {
-                Value::Object(o) => o,
+                Ok(Value::Object(o)) => o,
                 _ => return Err(()),
             };
             for _ in 0..n {
