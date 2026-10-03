@@ -3,6 +3,13 @@ use crate::error::PhpError;
 use crate::lexer::{lex, lex_with, Lexed, Token};
 use std::rc::Rc;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NsKind {
+    Class,
+    Func,
+    Const,
+}
+
 pub struct Parser<'a> {
     toks: &'a [Lexed],
     pos: usize,
@@ -17,6 +24,17 @@ pub struct Parser<'a> {
     /// `#[Attr]` names consumed at the statement level, pending the
     /// following class declaration.
     pending_class_attrs: Vec<String>,
+    /// Current `namespace` name ("" = global scope).
+    cur_ns: String,
+    /// `use` import maps for the current namespace block, keyed by
+    /// alias — lowercase for classes/functions, exact for constants.
+    use_map: std::collections::HashMap<String, String>,
+    use_fn_map: std::collections::HashMap<String, String>,
+    use_const_map: std::collections::HashMap<String, String>,
+    /// Short names (lowercase) of classes/interfaces/traits/enums
+    /// declared in this file — a `use` alias colliding with one is a
+    /// compile-time fatal (namespaces/ns_030).
+    declared_types: std::collections::HashSet<String>,
 }
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
@@ -34,6 +52,11 @@ pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
         cur_class: String::new(),
         hook_ctx: None,
         pending_class_attrs: Vec::new(),
+        cur_ns: String::new(),
+        use_map: std::collections::HashMap::new(),
+        use_fn_map: std::collections::HashMap::new(),
+        use_const_map: std::collections::HashMap::new(),
+        declared_types: std::collections::HashSet::new(),
     };
     let mut stmts = p.program()?;
     for (i, (msg, line)) in std::mem::take(&mut p.deprecations).into_iter().enumerate() {
@@ -97,6 +120,11 @@ pub fn parse_expr_src(src: &str) -> Result<Expr, PhpError> {
         cur_class: String::new(),
         hook_ctx: None,
         pending_class_attrs: Vec::new(),
+        cur_ns: String::new(),
+        use_map: std::collections::HashMap::new(),
+        use_fn_map: std::collections::HashMap::new(),
+        use_const_map: std::collections::HashMap::new(),
+        declared_types: std::collections::HashSet::new(),
     };
     let e = p.expr()?;
     Ok(e)
@@ -377,9 +405,19 @@ impl<'a> Parser<'a> {
                     self.declare_stmt()
                 } else if self.ident_is("namespace") {
                     self.pos += 1;
-                    let name = self.name_path().unwrap_or_default();
+                    let name = self
+                        .name_path()
+                        .unwrap_or_default()
+                        .trim_start_matches('\\')
+                        .to_string();
+                    self.cur_ns = name.clone();
+                    self.use_map.clear();
+                    self.use_fn_map.clear();
+                    self.use_const_map.clear();
                     if self.eat_op("{") {
-                        // `namespace Foo { ... }` — body parsed inline.
+                        // `namespace Foo { ... }` — body parsed inline
+                        // while cur_ns is set, then the enclosing scope
+                        // is restored.
                         let mut v = Vec::new();
                         while !self.eat_op("}") {
                             if self.peek().is_none() {
@@ -390,6 +428,10 @@ impl<'a> Parser<'a> {
                             }
                             v.push(self.stmt()?);
                         }
+                        self.cur_ns.clear();
+                        self.use_map.clear();
+                        self.use_fn_map.clear();
+                        self.use_const_map.clear();
                         return Ok(Stmt::Block(vec![Stmt::Namespace(name), Stmt::Block(v)]));
                     }
                     self.expect_op(";")?;
@@ -404,6 +446,28 @@ impl<'a> Parser<'a> {
                         && matches!(self.peek2(), Some(Token::Ident(k)) if k.eq_ignore_ascii_case("class")))
                 {
                     self.class_decl()
+                } else if self.ident_is("const")
+                    && !matches!(self.peek2(), Some(Token::Ident(k)) if k.eq_ignore_ascii_case("function"))
+                {
+                    // `const FOO = v, ...;` — declares namespaced global
+                    // constants (namespaces/ns_042).
+                    self.pos += 1;
+                    let mut defs = Vec::new();
+                    loop {
+                        let n = self
+                            .name_path()
+                            .unwrap_or_default()
+                            .trim_start_matches('\\')
+                            .to_string();
+                        let n = self.ns_qualify(&n);
+                        self.expect_op("=")?;
+                        defs.push((n, self.expr()?));
+                        if !self.eat_op(",") {
+                            break;
+                        }
+                    }
+                    self.expect_op(";")?;
+                    Ok(Stmt::ConstDecl(defs))
                 } else if self.ident_is("use")
                     && matches!(self.peek2(), Some(Token::Ident(_)) | Some(Token::Op("\\")))
                 {
@@ -668,7 +732,7 @@ impl<'a> Parser<'a> {
             let mut types = Vec::new();
             loop {
                 if let Some(n) = self.name_path() {
-                    types.push(n);
+                    types.push(self.ns_resolve(&n, NsKind::Class));
                 }
                 if !self.eat_op("|") {
                     break;
@@ -721,21 +785,65 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Top-level `use A\B, C as D;` (namespace import). Names collected but
-    /// aliasing is not applied yet (no namespace support).
+    /// Top-level `use` import: `use A\B, C as D, function f\g, const H\I;`
+    /// and group form `use A\{B, C as D}`. Aliases populate the
+    /// per-namespace maps `ns_resolve` consults (Zend/tests/namespaces);
+    /// the raw paths ride along in `Stmt::Use` so the interpreter can
+    /// warn on non-compound imports (`use A;` — ns_033).
     fn use_stmt(&mut self) -> Result<Stmt, PhpError> {
         self.pos += 1; // use
-        if self.ident_is("function") || self.ident_is("const") {
+        let mut kind = NsKind::Class;
+        if self.ident_is("function") {
             self.pos += 1;
+            kind = NsKind::Func;
+        } else if self.ident_is("const") {
+            self.pos += 1;
+            kind = NsKind::Const;
         }
         let mut names = Vec::new();
-        loop {
-            if let Some(n) = self.name_path() {
-                names.push(n);
-            }
-            if self.ident_is("as") {
-                self.pos += 1;
-                self.ident();
+        while let Some(n) = self.name_path() {
+            let path = n.trim_start_matches('\\').to_string();
+            if self.eat_op("{") {
+                // Group use: `use A\{B, C as D}` — prefix applies to
+                // every entry and does not itself warn.
+                loop {
+                    let mut ekind = kind;
+                    if self.ident_is("function") {
+                        self.pos += 1;
+                        ekind = NsKind::Func;
+                    } else if self.ident_is("const") {
+                        self.pos += 1;
+                        ekind = NsKind::Const;
+                    }
+                    if let Some(sub) = self.name_path() {
+                        let sub = sub.trim_start_matches('\\');
+                        let fq = format!("{}\\{}", path, sub);
+                        let alias = if self.ident_is("as") {
+                            self.pos += 1;
+                            self.ident().unwrap_or_default()
+                        } else {
+                            sub.rsplit('\\').next().unwrap_or(sub).to_string()
+                        };
+                        self.insert_use_alias(ekind, &alias, &fq)?;
+                        names.push(fq);
+                    }
+                    if self.eat_op("}") {
+                        break;
+                    }
+                    self.expect_op(",")?;
+                }
+            } else {
+                let aliased = self.ident_is("as");
+                let alias = if aliased {
+                    self.pos += 1;
+                    self.ident().unwrap_or_default()
+                } else {
+                    path.rsplit('\\').next().unwrap_or(&path).to_string()
+                };
+                self.insert_use_alias(kind, &alias, &path)?;
+                if !path.contains('\\') && !aliased && self.cur_ns.is_empty() {
+                    names.push(path);
+                }
             }
             if !self.eat_op(",") {
                 break;
@@ -743,6 +851,34 @@ impl<'a> Parser<'a> {
         }
         self.expect_op(";")?;
         Ok(Stmt::Use(names))
+    }
+
+    /// A `use` with no `function`/`const` prefix imports the alias for
+    /// every symbol kind (Zend/tests/namespaces/ns_012).
+    fn insert_use_alias(&mut self, kind: NsKind, alias: &str, fq: &str) -> Result<(), PhpError> {
+        if kind == NsKind::Class && self.declared_types.contains(&alias.to_lowercase()) {
+            return Err(PhpError::fatal(
+                format!(
+                    "Cannot use {} as {} because the name is already in use",
+                    fq, alias
+                ),
+                self.line(),
+            ));
+        }
+        match kind {
+            NsKind::Class => {
+                self.use_map.insert(alias.to_lowercase(), fq.to_string());
+                self.use_fn_map.insert(alias.to_lowercase(), fq.to_string());
+                self.use_const_map.insert(alias.to_string(), fq.to_string());
+            }
+            NsKind::Func => {
+                self.use_fn_map.insert(alias.to_lowercase(), fq.to_string());
+            }
+            NsKind::Const => {
+                self.use_const_map.insert(alias.to_string(), fq.to_string());
+            }
+        };
+        Ok(())
     }
 
     /// `Foo\Bar\Baz` — backslash-joined qualified name.
@@ -764,6 +900,77 @@ impl<'a> Parser<'a> {
             s = format!("\\{}", s);
         }
         Some(s)
+    }
+
+    /// Name of a declared symbol inside the current namespace:
+    /// `Foo` in `namespace A` -> `A\Foo` (Zend/tests/namespaces).
+    fn ns_qualify(&self, name: &str) -> String {
+        let name = name.trim_start_matches('\\');
+        if self.cur_ns.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}\\{}", self.cur_ns, name)
+        }
+    }
+
+    /// Compile-time name resolution matching Zend's rules:
+    /// `\A\B` is used verbatim; `namespace\A` expands to `A\<cur>`;
+    /// qualified `a\b` checks `a` against the alias table then prepends
+    /// the namespace; an unqualified `a` checks aliases then — for
+    /// classes only — prepends the namespace (function/const names fall
+    /// back to global at runtime instead).
+    fn ns_resolve(&self, raw: &str, kind: NsKind) -> String {
+        if raw.starts_with('\\') {
+            return raw.trim_start_matches('\\').to_string();
+        }
+        let lower = raw.to_lowercase();
+        if matches!(lower.as_str(), "self" | "static" | "parent") {
+            return raw.to_string();
+        }
+        let segs: Vec<&str> = raw.split('\\').collect();
+        let mut from_ns = false;
+        let segs: Vec<&str> = if segs[0].eq_ignore_ascii_case("namespace") {
+            from_ns = true;
+            segs[1..].to_vec()
+        } else {
+            segs
+        };
+        if segs.is_empty() {
+            return self.cur_ns.clone();
+        }
+        // Already-resolved names (the `X::` postfix re-runs resolution on
+        // the ident branch's output) must not double-prepend.
+        if !self.cur_ns.is_empty() && raw.starts_with(&format!("{}\\", self.cur_ns)) {
+            return raw.to_string();
+        }
+        let map = match kind {
+            NsKind::Class => &self.use_map,
+            NsKind::Func => &self.use_fn_map,
+            NsKind::Const => &self.use_const_map,
+        };
+        let key = if kind == NsKind::Const {
+            segs[0].to_string()
+        } else {
+            segs[0].to_lowercase()
+        };
+        if !from_ns {
+            if let Some(target) = map.get(&key) {
+                if segs.len() == 1 {
+                    return target.clone();
+                }
+                return format!("{}\\{}", target, segs[1..].join("\\"));
+            }
+        }
+        if segs.len() == 1 && kind != NsKind::Class && !from_ns {
+            // Unqualified function/const: resolved at runtime with a
+            // global fallback, so keep the bare name.
+            return segs[0].to_string();
+        }
+        if self.cur_ns.is_empty() {
+            segs.join("\\")
+        } else {
+            format!("{}\\{}", self.cur_ns, segs.join("\\"))
+        }
     }
 
     /// Skip `#[Attr(...)]` groups (attributes are parsed but discarded).
@@ -853,6 +1060,23 @@ impl<'a> Parser<'a> {
         let name = self
             .ident()
             .unwrap_or_else(|| "class@anonymous".to_string());
+        let name = self.ns_qualify(&name);
+        // `use A\B as Foo; class Foo {}` — the alias already occupies
+        // the short name (namespaces/ns_029).
+        if self
+            .use_map
+            .contains_key(&name.rsplit('\\').next().unwrap_or(&name).to_lowercase())
+        {
+            return Err(PhpError::fatal(
+                format!(
+                    "Cannot redeclare class {} (previously declared as local import)",
+                    name
+                ),
+                self.line(),
+            ));
+        }
+        self.declared_types
+            .insert(name.rsplit('\\').next().unwrap_or(&name).to_lowercase());
         self.cur_class = name.clone();
         // enum backing type `enum X: int`
         if self.eat_op(":") {
@@ -865,18 +1089,18 @@ impl<'a> Parser<'a> {
                 // `interface Y extends X, Z` — multiple interface parents
                 // recorded in `implements` (what instanceof/iface walks use).
                 while let Some(n) = self.name_path() {
-                    implements.push(n);
+                    implements.push(self.ns_resolve(&n, NsKind::Class));
                     if !self.eat_op(",") {
                         break;
                     }
                 }
             } else {
-                parent = self.name_path();
+                parent = self.name_path().map(|n| self.ns_resolve(&n, NsKind::Class));
             }
         }
         if self.eat_ident("implements") {
             while let Some(n) = self.name_path() {
-                implements.push(n);
+                implements.push(self.ns_resolve(&n, NsKind::Class));
                 if !self.eat_op(",") {
                     break;
                 }
@@ -959,7 +1183,7 @@ impl<'a> Parser<'a> {
             if self.ident_is("use") {
                 self.pos += 1;
                 while let Some(n) = self.name_path() {
-                    traits.push(n);
+                    traits.push(self.ns_resolve(&n, NsKind::Class));
                     if !self.eat_op(",") {
                         break;
                     }
@@ -1097,6 +1321,7 @@ impl<'a> Parser<'a> {
                 by_ref,
                 line,
                 file: String::new(),
+                ns: self.cur_ns.clone(),
             },
             is_static,
             is_abstract,
@@ -1464,6 +1689,7 @@ impl<'a> Parser<'a> {
         }
         let body = self.body()?;
         self.hook_ctx = prev_hook;
+        let name = self.ns_qualify(&name);
         Ok(Stmt::Function(FunctionDecl {
             name,
             params,
@@ -1471,6 +1697,7 @@ impl<'a> Parser<'a> {
             by_ref,
             line,
             file: String::new(),
+            ns: self.cur_ns.clone(),
         }))
     }
 
@@ -1533,6 +1760,7 @@ impl<'a> Parser<'a> {
                 by_ref,
                 line,
                 file: String::new(),
+                ns: self.cur_ns.clone(),
             },
             uses,
             arrow,
@@ -1759,7 +1987,7 @@ impl<'a> Parser<'a> {
         match self.peek().cloned() {
             Some(Token::Ident(_)) | Some(Token::Op("\\")) => {
                 let n = self.name_path().unwrap_or_default();
-                Ok((Expr::Const(n), Vec::new()))
+                Ok((Expr::Const(self.ns_resolve(&n, NsKind::Class)), Vec::new()))
             }
             Some(Token::Variable(n)) => {
                 self.pos += 1;
@@ -2351,7 +2579,10 @@ impl<'a> Parser<'a> {
         // `instanceof` binds between unary and relational ops.
         while self.ident_is("instanceof") {
             self.pos += 1;
-            let c = self.unary()?;
+            let mut c = self.unary()?;
+            if let Expr::Const(n) = &c {
+                c = Expr::Const(self.ns_resolve(n, NsKind::Class));
+            }
             e = Expr::Instanceof {
                 obj: Box::new(e),
                 class: Box::new(c),
@@ -2893,39 +3124,44 @@ impl<'a> Parser<'a> {
                     Ok(Expr::Const("parent".into()))
                 } else {
                     // Bare identifier: constant or function name target. Qualified
-                    // names (\A\B) and function call args go through here.
-                    let start = self.pos;
-                    let name = if self.at_op("\\") {
-                        self.name_path().unwrap_or_default()
-                    } else {
-                        self.ident().unwrap()
-                    };
-                    let name = name.trim_start_matches('\\').to_string();
+                    // names (A\B) and function call args go through here.
+                    let name = self.name_path().unwrap_or_default();
                     if self.at_op("(") {
                         self.pos += 1;
                         let args = self.args()?;
+                        let resolved = self.ns_resolve(&name, NsKind::Func);
+                        // Unqualified literal names carry a \u{1} marker:
+                        // call_named then applies the ns\f -> f fallback.
+                        // Qualified/FQ-resolved names are exact already.
+                        let resolved = if resolved.contains('\\') {
+                            resolved
+                        } else {
+                            format!("{}{}", '\u{1}', resolved)
+                        };
                         Ok(Expr::Call {
-                            name: Box::new(Expr::Str(name)),
+                            name: Box::new(Expr::Str(resolved)),
                             args,
                         })
                     } else if self.at_op("::") {
-                        // reset: `X::` handled by postfix on Const
-                        self.pos = start;
-                        let name = self.ident().unwrap();
-                        Ok(Expr::Const(name))
+                        // `X::…` — a class name in every form.
+                        Ok(Expr::Const(self.ns_resolve(&name, NsKind::Class)))
                     } else {
-                        // Unqualified constant (e.g. PHP_EOL) or undefined constant.
-                        Ok(Expr::Const(name))
+                        // Constant read: fully qualified `\A` stays
+                        // `\`-marked so const_read skips the namespace
+                        // fallback; qualified `A\B` resolves now.
+                        if name.contains('\\') && !name.starts_with('\\') {
+                            Ok(Expr::Const(self.ns_resolve(&name, NsKind::Const)))
+                        } else {
+                            Ok(Expr::Const(name))
+                        }
                     }
                 }
             }
             Some(Token::Op("\\")) => {
                 // Fully-qualified name: \PHP_EOL, \Foo\Bar::baz, \func().
-                let name = self
-                    .name_path()
-                    .unwrap_or_default()
-                    .trim_start_matches('\\')
-                    .to_string();
+                // The `\` marker is kept — downstream lookups treat a
+                // backslash-prefixed name as exact (no ns fallback).
+                let name = self.name_path().unwrap_or_default();
                 if name.is_empty() {
                     return Err(PhpError::parse(
                         "syntax error, unexpected token \"\\\"",

@@ -45,6 +45,9 @@ pub struct Frame {
     decl_class: Option<Rc<PhpClass>>,
     /// File this frame's code was declared in (include resolution base).
     file: String,
+    /// Namespace the running code was declared in — unqualified
+    /// function/const lookups try `ns\name` before the global name.
+    ns: String,
     /// Function declared `&name()` — returns bind cells, not values.
     ret_by_ref: bool,
     /// While running a property hook: (object id, prop name, is_get,
@@ -64,6 +67,7 @@ impl Frame {
             scope_class: None,
             decl_class: None,
             file: String::new(),
+            ns: String::new(),
             ret_by_ref: false,
             hook_prop: None,
         }
@@ -180,6 +184,10 @@ impl<'a> Interp<'a> {
         constants.insert("PHP_OS_FAMILY".into(), Value::str("Linux"));
         constants.insert("PHP_SAPI".into(), Value::str("cli"));
         constants.insert("DIRECTORY_SEPARATOR".into(), Value::str("/"));
+        constants.insert("INI_USER".into(), Value::Int(1));
+        constants.insert("INI_PERDIR".into(), Value::Int(2));
+        constants.insert("INI_SYSTEM".into(), Value::Int(4));
+        constants.insert("INI_ALL".into(), Value::Int(7));
         constants.insert("PHP_INT_MAX".into(), Value::Int(i64::MAX));
         constants.insert("PHP_INT_MIN".into(), Value::Int(i64::MIN));
         constants.insert("PHP_INT_SIZE".into(), Value::Int(8));
@@ -379,6 +387,7 @@ impl<'a> Interp<'a> {
                     by_ref: false,
                     line: 0,
                     file: String::new(),
+                    ns: String::new(),
                 },
                 is_static: false,
                 is_abstract: false,
@@ -421,6 +430,7 @@ impl<'a> Interp<'a> {
                             by_ref: false,
                             line: 0,
                             file: String::new(),
+                            ns: String::new(),
                         },
                         is_static: false,
                         is_abstract: true,
@@ -513,6 +523,7 @@ impl<'a> Interp<'a> {
                         by_ref: false,
                         line: 0,
                         file: String::new(),
+                        ns: String::new(),
                     },
                     is_static: false,
                     is_abstract: false,
@@ -537,6 +548,7 @@ impl<'a> Interp<'a> {
                     by_ref: false,
                     line: 0,
                     file: String::new(),
+                    ns: String::new(),
                 },
                 is_static: false,
                 is_abstract: false,
@@ -658,11 +670,23 @@ impl<'a> Interp<'a> {
     /// decls before executing it (bug23279's later-declared handler).
     fn hoist_funcs(&mut self, stmts: &[Stmt]) {
         for s in stmts {
-            if let Stmt::Function(d) = s {
-                let _ = self.decl_type_checks(&d.name, d);
-                let mut d = d.clone();
-                d.file = self.cur_file.clone();
-                self.functions.insert(d.name.to_lowercase(), Rc::new(d));
+            match s {
+                Stmt::Function(d) => {
+                    let _ = self.decl_type_checks(&d.name, d);
+                    let mut d = d.clone();
+                    d.file = self.cur_file.clone();
+                    self.functions.insert(d.name.to_lowercase(), Rc::new(d));
+                }
+                // Top-level `const` binds early like functions
+                // (namespaces/ns_041).
+                Stmt::ConstDecl(defs) => {
+                    for (n, e) in defs {
+                        if let Ok(v) = self.eval(e) {
+                            self.define_const(n, v);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1745,7 +1769,37 @@ impl<'a> Interp<'a> {
                     out
                 }
             }
-            Stmt::Declare { .. } | Stmt::Namespace(_) | Stmt::Use(_) => Flow::Normal,
+            Stmt::Namespace(n) => {
+                // Top-level scope follows `namespace` declarations —
+                // unqualified calls/consts resolve relative to it.
+                self.globals.ns = n.clone();
+                Flow::Normal
+            }
+            Stmt::Use(names) => {
+                // `use A;` / `use \B;` with no compound name has no
+                // effect and warns (namespaces/ns_033).
+                for n in names {
+                    if !n.contains('\\') {
+                        if let Err(e) = self.warn(&format!(
+                            "The use statement with non-compound name '{}' has no effect",
+                            n
+                        )) {
+                            return self.err_flow(e);
+                        }
+                    }
+                }
+                Flow::Normal
+            }
+            Stmt::ConstDecl(defs) => {
+                for (n, e) in defs {
+                    match self.eval(e) {
+                        Ok(v) => self.define_const(n, v),
+                        Err(e) => return self.err_flow(e),
+                    }
+                }
+                Flow::Normal
+            }
+            Stmt::Declare { .. } => Flow::Normal,
         }
     }
 
@@ -2701,7 +2755,7 @@ impl<'a> Interp<'a> {
                     .and_then(|f| f.scope_class.as_ref().map(|c| c.name().to_string()))
                     .unwrap_or_default(),
             ),
-            MagicConst::Namespace => Value::str(""),
+            MagicConst::Namespace => Value::str(self.caller_ns()),
             // `__PROPERTY__` inside a hook names its prop; anywhere else
             // (methods, closures nested in a hook, top level) it is "".
             MagicConst::Property => Value::str(
@@ -2853,6 +2907,16 @@ impl<'a> Interp<'a> {
             _ => {}
         }
         let key = name.trim_start_matches('\\');
+        if !name.contains('\\') {
+            // Unqualified constant inside a namespace: `ns\NAME` first,
+            // then the global constant (Zend/tests/namespaces).
+            let ns = self.caller_ns();
+            if !ns.is_empty() {
+                if let Some(v) = self.constants.get(&format!("{}\\{}", ns, key)) {
+                    return Ok(v.clone());
+                }
+            }
+        }
         if let Some(v) = self.constants.get(key) {
             return Ok(v.clone());
         }
@@ -4710,8 +4774,24 @@ impl<'a> Interp<'a> {
 
     /// Call a named function (builtin or user-defined).
     fn call_named(&mut self, fname: &str, args: &[Expr]) -> Result<Value, PhpError> {
-        let lname = fname.trim_start_matches('\\').to_lowercase();
-        let decl = self.functions.get(&lname).cloned();
+        // `\u{1}f` marks a source-literal unqualified call — only it may
+        // fall back `ns\f` -> `f`; dynamic names are fully qualified.
+        let (unqualified, lname) = match fname.strip_prefix('\u{1}') {
+            Some(n) => (true, n.to_lowercase()),
+            None => (false, fname.trim_start_matches('\\').to_lowercase()),
+        };
+        let mut decl = self.functions.get(&lname).cloned();
+        // A namespaced user function outranks the global/builtin one for
+        // unqualified calls (namespaces/ns_013).
+        let mut ns_resolved = false;
+        if decl.is_none() && unqualified {
+            let ns = self.caller_ns();
+            if !ns.is_empty() {
+                let cand = format!("{}\\{}", ns.to_lowercase(), lname);
+                decl = self.functions.get(&cand).cloned();
+                ns_resolved = decl.is_some();
+            }
+        }
         // Synthetic params carrying builtin by-ref flags so call results in
         // by-ref slots emit "Only variables should be passed by reference"
         // (passByReference_012, array_shift(array_shift($a))).
@@ -4744,17 +4824,22 @@ impl<'a> Interp<'a> {
             decl.as_deref()
                 .map(|d| d.params.as_slice())
                 .unwrap_or(&builtin_params),
-            &format!("{}()", fname),
+            &format!("{}()", fname.trim_start_matches('\u{1}')),
         )?;
-        if let Some(v) = self.call_builtin(&lname, &argvals)? {
-            return Ok(v);
+        if !ns_resolved {
+            if let Some(v) = self.call_builtin(&lname, &argvals)? {
+                return Ok(v);
+            }
         }
         let decl = match decl {
             Some(d) => d,
             None => {
                 return self.fail(PhpError::uncaught(
                     "Error",
-                    format!("Call to undefined function {}()", fname),
+                    format!(
+                        "Call to undefined function {}()",
+                        fname.trim_start_matches('\u{1}')
+                    ),
                     0,
                 ))
             }
@@ -4784,6 +4869,7 @@ impl<'a> Interp<'a> {
                         self.bind_and_run(&decl, args, frame_args.split_off(0))
                     }
                     CallableKind::Named(n) => {
+                        let n = n.trim_start_matches('\\');
                         if let Some(v) = self.call_builtin(&n.to_lowercase(), &args)? {
                             return Ok(v);
                         }
@@ -5242,6 +5328,7 @@ impl<'a> Interp<'a> {
             ));
         }
         let mut frame = Frame::new(decl.name.clone());
+        frame.ns = decl.ns.clone();
         frame.ret_by_ref = decl.by_ref;
         if let Some(obj) = &this_obj {
             frame
@@ -6216,6 +6303,16 @@ impl<'a> Interp<'a> {
 
     /// Name of the class whose scope the current frame runs in —
     /// private props are only visible to their own declaring class.
+    /// Namespace of the currently executing code — the running
+    /// function's declaring namespace, or the file-level `namespace`
+    /// for top-level statements (Zend/tests/namespaces).
+    pub fn caller_ns(&self) -> String {
+        self.stack
+            .last()
+            .map(|f| f.ns.clone())
+            .unwrap_or_else(|| self.globals.ns.clone())
+    }
+
     pub fn caller_scope_name(&self) -> Option<String> {
         self.stack.last().and_then(|f| {
             f.decl_class
@@ -6977,6 +7074,7 @@ impl<'a> Interp<'a> {
             by_ref: hook.by_ref,
             line: self.cur_line,
             file: self.cur_file.clone(),
+            ns: String::new(),
         });
         let owner = decl_owner(dcls, pname);
         let args = arg.into_iter().collect::<Vec<Cell>>();

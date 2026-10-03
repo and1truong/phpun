@@ -72,7 +72,12 @@ pub enum Stmt {
     Namespace(String),
     Class(Rc<ClassDecl>),
     /// `use TraitA, TraitB;` (top-level `use function`/`use const` too).
+    /// Names listed are only the ones needing the non-compound-name
+    /// warning (e.g. `use A;`) — the parser already applied aliases.
     Use(Vec<String>),
+    /// Top-level `const NAME = expr, ...;` — declares global constants;
+    /// names arrive already namespace-qualified (namespaces/ns_042).
+    ConstDecl(Vec<(String, Expr)>),
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +236,10 @@ pub struct FunctionDecl {
     /// File the decl was registered from — PHP resolves includes relative
     /// to the file containing the call site (include_variation2).
     pub file: String,
+    /// Declaring namespace (`test\ns1` or "" for global) — unqualified
+    /// calls/consts inside this function try the namespaced name first,
+    /// then fall back to global (Zend/tests/namespaces).
+    pub ns: String,
 }
 
 #[derive(Debug, Clone)]
