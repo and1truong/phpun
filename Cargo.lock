@@ -135,6 +135,7 @@ name = "phpun-core"
 version = "0.0.0"
 dependencies = [
  "md5",
+ "phpun-phpt",
  "regex",
  "sha1",
  "vivacity-pcre2-sys",

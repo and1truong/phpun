@@ -3991,6 +3991,10 @@ fn print_r(_it: &mut Interp, v: &Value, indent: usize) -> String {
 }
 
 fn var_export(it: &mut Interp, v: &Value) -> String {
+    var_export_depth(it, v, 0)
+}
+
+fn var_export_depth(it: &mut Interp, v: &Value, depth: usize) -> String {
     match v {
         Value::Null => "NULL".into(),
         Value::Bool(b) => b.to_string(),
@@ -4008,9 +4012,10 @@ fn var_export(it: &mut Interp, v: &Value) -> String {
         Value::Str(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")),
         Value::Array(a) => {
             let a = a.borrow();
+            let pad = "  ".repeat(depth + 1);
             let mut s = String::from("array (\n");
             for (k, c) in a.iter() {
-                s.push_str("  ");
+                s.push_str(&pad);
                 s.push_str(&match k {
                     ArrKey::Int(i) => i.to_string(),
                     ArrKey::Str(st) => {
@@ -4019,9 +4024,17 @@ fn var_export(it: &mut Interp, v: &Value) -> String {
                     ArrKey::Tomb => continue,
                 });
                 s.push_str(" => ");
-                s.push_str(&var_export(it, &c.borrow()));
+                // A nested array value renders on its own line at key depth
+                // ('key' => \n  array (...)) — matches zend var_export.
+                let inner = c.borrow();
+                if matches!(&*inner, Value::Array(_)) {
+                    s.push('\n');
+                    s.push_str(&pad);
+                }
+                s.push_str(&var_export_depth(it, &inner, depth + 1));
                 s.push_str(",\n");
             }
+            s.push_str(&"  ".repeat(depth));
             s.push(')');
             s
         }
@@ -4036,7 +4049,7 @@ fn var_export(it: &mut Interp, v: &Value) -> String {
                 };
                 if let Some(v) = v {
                     s.push_str(&format!("   '{}' => ", out));
-                    s.push_str(&var_export(it, &v));
+                    s.push_str(&var_export_depth(it, &v, depth + 1));
                     s.push_str(",\n");
                 }
             }
