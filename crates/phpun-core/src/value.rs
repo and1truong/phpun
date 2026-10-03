@@ -218,23 +218,7 @@ pub fn format_backtrace_frames(frames: &[TraceFrame]) -> String {
         if trace_frame_hidden(fr) {
             continue;
         }
-        let site = if fr.file == "[internal function]" {
-            fr.file.clone()
-        } else {
-            format!("{}({})", fr.file, fr.line)
-        };
-        let callee = match &fr.class {
-            Some(c) => format!("{}{}{}", c, fr.ty, fr.function),
-            None => fr.function.clone(),
-        };
-        // Internal callees render their args too (PHP 8 shows
-        // `strlen('a', 'b')`); named args render `name: value`.
-        let mut arg_strs: Vec<String> = fr.args.iter().map(|c| trace_arg(&c.borrow())).collect();
-        for (n, c) in &fr.named_args {
-            arg_strs.push(format!("{}: {}", n, trace_arg(&c.borrow())));
-        }
-        let args = arg_strs.join(", ");
-        t.push_str(&format!("#{} {}: {}({})\n", i, site, callee, args));
+        t.push_str(&format!("#{} {}\n", i, trace_frame_str(fr)));
         i += 1;
     }
     t
@@ -255,8 +239,35 @@ pub fn trace_arg(v: &Value) -> String {
         Value::Null => "NULL".into(),
         Value::Callable(_) => "Object(Closure)".into(),
         Value::Resource(_) => "Resource id #1".into(),
+        Value::Float(f) => {
+            if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e16 {
+                format!("{f:.1}")
+            } else {
+                format_float_repr(*f)
+            }
+        }
         other => other.to_php_string(),
     }
+}
+
+/// `#N`-less frame body `file(line): Fn(args)` used by both
+/// `format_backtrace_frames` and synthetic exception traces (arg-type
+/// TypeErrors carry real callee frames below the call site).
+pub fn trace_frame_str(fr: &TraceFrame) -> String {
+    let site = if fr.file == "[internal function]" {
+        fr.file.clone()
+    } else {
+        format!("{}({})", fr.file, fr.line)
+    };
+    let callee = match &fr.class {
+        Some(c) => format!("{}{}{}", c, fr.ty, fr.function),
+        None => fr.function.clone(),
+    };
+    let mut arg_strs: Vec<String> = fr.args.iter().map(|c| trace_arg(&c.borrow())).collect();
+    for (n, c) in &fr.named_args {
+        arg_strs.push(format!("{}: {}", n, trace_arg(&c.borrow())));
+    }
+    format!("{}: {}({})", site, callee, arg_strs.join(", "))
 }
 
 /// Lossy UTF-8 view of a byte string — for APIs/names that are
@@ -812,7 +823,13 @@ pub struct PhpClass {
 
 impl PhpClass {
     pub fn name(&self) -> &str {
-        &self.decl.name
+        // Anonymous classes carry a `$LINE` uniquifier internally;
+        // Zend's public name is `{Base}@anonymous`.
+        if let Some(pos) = self.decl.name.find("@anonymous$") {
+            &self.decl.name[..pos + "@anonymous".len()]
+        } else {
+            &self.decl.name
+        }
     }
 
     /// Method lookup walking the parent chain.
@@ -833,6 +850,9 @@ pub struct PhpObject {
     pub id: u64,
     /// Internal payload for builtin classes (e.g. Exception fields).
     pub internal: Option<ObjectInternal>,
+    /// Typed props that were `unset()` — reads route to `__get` like
+    /// undefined props instead of the uninitialized-typed Error.
+    pub unset_props: std::collections::HashSet<String>,
 }
 
 /// One recorded call for exception backtraces (getTrace()).
@@ -909,8 +929,54 @@ pub enum ObjectInternal {
         /// named binds (':' stripped)
         named: HashMap<String, Value>,
     },
+    /// `yield`-function deferred execution: the call returns a Generator
+    /// object; the body runs on the first Iterator method and every
+    /// yielded (key, value) lands in `items`.
+    Generator(Rc<RefCell<GenState>>),
+    /// DirectoryIterator state: the dir's entry paths + cursor.
+    DirIter { entries: Vec<String>, pos: usize },
     /// DateTime, closures-as-objects, etc. — opaque marker.
     None,
+}
+
+/// One yielded pair — the value cell so `&function` generators can
+/// yield by reference (typed_properties_033/034).
+pub type GenItem = (Value, Cell);
+
+/// Generator internal state (object internal behind the `Generator`
+/// class, which implements `Iterator`).
+pub struct GenState {
+    /// Everything needed to re-enter the function frame later.
+    pub setup: GenSetup,
+    /// Materialized (key, value) pairs after the body ran.
+    pub items: Vec<GenItem>,
+    /// Iteration cursor.
+    pub pos: usize,
+    /// Body has been started (ran eagerly on first use).
+    pub started: bool,
+    /// Body completed (items final).
+    pub finished: bool,
+    /// `return` value — read by getReturn().
+    pub return_val: Value,
+    /// `function &gen()` — yields expose their cells to `foreach ..&`.
+    pub by_ref: bool,
+    /// Auto keys for keyless `yield $v` (0, 1, 2…).
+    pub auto_key: i64,
+    /// Every send() value ever passed, in call order — the k-th send
+    /// feeds the k-th yield expression when the body (re)runs.
+    pub sends: Vec<Value>,
+}
+
+pub enum GenSetup {
+    /// invoke_fn capture: decl + evaluated args + call context.
+    Invoke {
+        decl: Rc<crate::ast::FunctionDecl>,
+        args: crate::interp::CallArgs,
+        this_obj: Option<Rc<RefCell<PhpObject>>>,
+        scope_class: Option<Rc<PhpClass>>,
+        decl_class: Option<Rc<PhpClass>>,
+        called_class: Option<Rc<PhpClass>>,
+    },
 }
 
 impl std::fmt::Debug for ObjectInternal {
@@ -919,6 +985,8 @@ impl std::fmt::Debug for ObjectInternal {
             ObjectInternal::Exception { .. } => f.write_str("Exception"),
             ObjectInternal::ArrayIter { .. } => f.write_str("ArrayIter"),
             ObjectInternal::ReflectionAttribute { .. } => f.write_str("ReflectionAttribute"),
+            ObjectInternal::Generator { .. } => f.write_str("Generator"),
+            ObjectInternal::DirIter { .. } => f.write_str("DirIter"),
             ObjectInternal::Sqlite { .. } => f.write_str("Sqlite"),
             ObjectInternal::SqliteStmt { .. } => f.write_str("SqliteStmt"),
             ObjectInternal::None => f.write_str("None"),

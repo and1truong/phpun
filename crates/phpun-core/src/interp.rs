@@ -11,8 +11,8 @@ use crate::lexer::StringPart;
 use crate::parser;
 use crate::value::{
     compare, format_backtrace_frames, format_float_repr, format_trace, identical, numeric, to_key,
-    trace_arg, ArrKey, CallableKind, Cell, Numeric, ObjectInternal, PhpArray, PhpCallable,
-    PhpClass, PhpObject, PhpResource, TraceFrame, Value,
+    trace_arg, ArrKey, CallableKind, Cell, GenSetup, GenState, Numeric, ObjectInternal, PhpArray,
+    PhpCallable, PhpClass, PhpObject, PhpResource, TraceFrame, Value,
 };
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -98,6 +98,9 @@ pub struct Frame {
     /// Class the running method was declared in — PHP's private
     /// property slot is keyed by the declaring class (`\0Cls\0prop`).
     decl_class: Option<Rc<PhpClass>>,
+    /// Declaration line — closures render in traces as
+    /// `{closure:FILE:LINE}` (typed_properties_055).
+    fn_line: usize,
     /// File this frame's code was declared in (include resolution base).
     file: String,
     /// Namespace the running code was declared in — unqualified
@@ -110,6 +113,9 @@ pub struct Frame {
     /// backing slot directly; the owner names `__METHOD__`'s class part
     /// (trait origin too) (Zend/tests/property_hooks).
     hook_prop: Option<(u64, String, bool, String)>,
+    /// Trait the running method was merged from (`use T`) — drives
+    /// `__TRAIT__` and the owner part of `__METHOD__`.
+    trait_origin: Option<String>,
 }
 
 impl Frame {
@@ -122,10 +128,12 @@ impl Frame {
             scope_class: None,
             called_class: None,
             decl_class: None,
+            fn_line: 0,
             file: String::new(),
             ns: String::new(),
             ret_by_ref: false,
             hook_prop: None,
+            trait_origin: None,
         }
     }
 }
@@ -138,7 +146,36 @@ pub struct Interp<'a> {
     classes: HashMap<String, Rc<PhpClass>>,
     /// Traits by name — their methods are copied into using classes.
     pub traits: HashMap<String, Rc<ClassDecl>>,
+    /// Synthesized classes for direct `T::$s`/`T::m()` trait member
+    /// access (deprecated but functional in PHP) — one per trait so
+    /// statics share storage across accesses.
+    trait_statics: HashMap<String, Rc<PhpClass>>,
+    /// ClassDecls mid-registration — `is_a` ancestry checks during
+    /// signature verification resolve against these by name before the
+    /// class lands in `classes` (ret-covariance needs `B extends A`
+    /// while B is still linking).
+    linking: Vec<Rc<ClassDecl>>,
+    /// Class names whose autoloader callback is currently running —
+    /// Zend's in-linking guard: a re-entrant lookup of the same name
+    /// no-ops instead of recursing forever (autoload(D) → `D extends C`
+    /// → autoload(C) while C's own autoload is still in flight).
+    autoloading: std::collections::HashSet<String>,
+    /// (class, method) pairs of internal methods whose declared return
+    /// type is *tentative* — incompatible overrides get a Deprecated
+    /// notice, not a fatal (internal_parent/*).
+    tentative: HashSet<(String, String)>,
     pub interfaces: HashMap<String, Rc<ClassDecl>>,
+    /// Declaration order of classes/interfaces/traits (lc names), for
+    /// get_declared_*().
+    pub decl_order: Vec<String>,
+    /// class_alias() display names (kind, lowercased alias) appended to
+    /// get_declared_{classes,interfaces,traits} output (Zend lists
+    /// aliases lowercased, right after real decls).
+    pub decl_aliases: Vec<(crate::ast::ClassKind, String)>,
+    /// Enum case singletons keyed `"cls\0case"` — `E::Foo === E::Foo`.
+    enum_cases: std::collections::HashMap<String, Value>,
+    /// Classes whose const initializers were already link-evaluated.
+    consts_linked: std::collections::HashSet<String>,
     /// Top-level parentless classes registered by hoisting (early
     /// binding); their decl stmt then no-ops (namespaces/ns_060).
     early_bound_classes: HashSet<String>,
@@ -206,6 +243,14 @@ pub struct Interp<'a> {
     in_handler: bool,
     /// Current line estimate for error messages (best-effort).
     pub cur_line: usize,
+    /// Active generator body's yield collector — `Expr::Yield` pushes
+    /// (key, value) here while a generator function's body runs.
+    gen_sink: Option<Rc<RefCell<Vec<crate::value::GenItem>>>>,
+    /// send() queue feeding `yield`-expr results in the running body.
+    gen_sends: std::collections::VecDeque<Value>,
+    /// Auto-key counter for keyless `yield $v` — counts keyless yields
+    /// only (explicit keys and `yield from` items don't advance it).
+    gen_auto: i64,
     /// Declaring class of the method about to be invoked (set by
     /// invoke_method, consumed by invoke_fn to fill Frame::decl_class).
     pending_decl_class: Option<Rc<PhpClass>>,
@@ -243,6 +288,42 @@ pub struct Interp<'a> {
     /// File currently executing — include resolution uses its directory
     /// (PHP checks include_path, then the calling file's dir, then cwd).
     cur_file: String,
+    /// Files that ran `declare(strict_types=1)` — scalar arg/prop/return
+    /// coercion is off for code executing inside them.
+    strict_files: std::collections::HashSet<String>,
+    /// Cells backing declared-typed props, keyed by their Rc pointer —
+    /// writes *through a reference* to a typed slot stay checked
+    /// (typed_properties_045). The stored clone keeps the slot alive so
+    /// the pointer key stays unique.
+    pub typed_slots: std::collections::HashMap<usize, (Cell, Vec<String>, String, String)>,
+    /// Additional typed-prop owners of a shared ref cell (the
+    /// `typed_slots` entry holds the first) — `union_types/prop_ref_assign`.
+    pub slot_owners: std::collections::HashMap<usize, Vec<SlotOwner>>,
+    /// The running intersection of every bound owner's declared type —
+    /// `typed_slots` keeps the holder's declared type for messages.
+    pub slot_merged: std::collections::HashMap<usize, Vec<String>>,
+    /// Where each typed cell came from: a prop slot stays a prop slot
+    /// even while aliased — the rejecting owner is reported as
+    /// "Cannot assign X to property" only for prop-born cells
+    /// (typed_properties_034 vs _078).
+    pub slot_anchor: std::collections::HashMap<usize, SlotAnchor>,
+    /// Cells reached through a `=&` bind / by-ref fetch — Zend
+    /// IS_REFERENCE zvals. Write-through errors say "a reference held
+    /// by property"; plain prop slots say "property"
+    /// (typed_properties_034 first vs second foo() call).
+    pub ref_cells: std::collections::HashSet<usize>,
+    /// Ptr of a typed prop slot eval_cell materialized to `null` just
+    /// now — a rejected array auto-init must leave the prop
+    /// uninitialized again (typed_properties_083).
+    last_fresh_cell: Option<usize>,
+    /// Interfaces registered by the builtin-class table — their method
+    /// signatures carry *tentative* return types: implementations may
+    /// declare any return type (typed_properties_065).
+    builtin_ifaces: std::collections::HashSet<String>,
+    /// Implicit-nullable deprecations already emitted (function
+    /// declarations evaluate at both collect and `Stmt::Function`
+    /// time — Zend compiles once, so each param warns once).
+    dep_seen: std::collections::HashSet<String>,
     /// File the last `fail()` was raised in (uncaught-print attribution
     /// for engine errors — `self.file` is always the entry script).
     last_err_file: String,
@@ -264,6 +345,24 @@ pub struct Interp<'a> {
     /// `-d` ini settings (e.g. short_open_tag=on).
     pub ini: HashMap<String, String>,
 }
+
+/// Where a typed-slot owner lives — pruned when the named prop no
+/// longer points at the shared cell (static rebind 082, unset, dead
+/// object 094).
+#[derive(Clone)]
+pub enum SlotAnchor {
+    /// Object prop: weak object ref + the props-map slot key.
+    Obj(std::rc::Weak<RefCell<PhpObject>>, String),
+    /// Static prop: declaring class name + prop name.
+    Statics(String, String),
+    /// Unverifiable origin — kept unconditionally.
+    None,
+}
+
+/// One typed-prop owner of a shared cell: declared type members,
+/// declaring class name, prop name, and the anchor proving the owner
+/// still points at the cell.
+pub type SlotOwner = (Vec<String>, String, String, SlotAnchor);
 
 /// One output-buffer level (ob_start) with its optional handler.
 pub struct ObLevel {
@@ -304,6 +403,9 @@ impl<'a> Interp<'a> {
             );
         }
         constants.insert("DIRECTORY_SEPARATOR".into(), Value::str("/"));
+        // Reported as the engine's target PCRE2 level — feature checks
+        // like symfony's `>= 10.39` gate on this, not the vendored lib.
+        constants.insert("PCRE_VERSION".into(), Value::str("10.49 2026-09-28"));
         constants.insert("INI_USER".into(), Value::Int(1));
         constants.insert("INI_PERDIR".into(), Value::Int(2));
         constants.insert("INI_SYSTEM".into(), Value::Int(4));
@@ -311,6 +413,18 @@ impl<'a> Interp<'a> {
         constants.insert("STR_PAD_RIGHT".into(), Value::Int(1));
         constants.insert("STR_PAD_LEFT".into(), Value::Int(0));
         constants.insert("STR_PAD_BOTH".into(), Value::Int(2));
+        constants.insert("MB_CASE_UPPER".into(), Value::Int(0));
+        constants.insert("MB_CASE_LOWER".into(), Value::Int(1));
+        constants.insert("MB_CASE_TITLE".into(), Value::Int(2));
+        constants.insert("MB_CASE_FOLD".into(), Value::Int(3));
+        constants.insert("MB_CASE_UPPER_SIMPLE".into(), Value::Int(4));
+        constants.insert("MB_CASE_LOWER_SIMPLE".into(), Value::Int(5));
+        constants.insert("MB_CASE_TITLE_SIMPLE".into(), Value::Int(6));
+        constants.insert("MB_CASE_FOLD_SIMPLE".into(), Value::Int(7));
+        constants.insert("MB_OVERLOAD_MAIL".into(), Value::Int(1));
+        constants.insert("MB_OVERLOAD_STRING".into(), Value::Int(2));
+        constants.insert("MB_OVERLOAD_REGEX".into(), Value::Int(4));
+        constants.insert("MB_ONIGURUMA_VERSION".into(), Value::str("6.9.10"));
         constants.insert("PHP_INT_MAX".into(), Value::Int(i64::MAX));
         constants.insert("PHP_INT_MIN".into(), Value::Int(i64::MIN));
         constants.insert("PHP_INT_SIZE".into(), Value::Int(8));
@@ -368,6 +482,16 @@ impl<'a> Interp<'a> {
         constants.insert("PREG_BAD_UTF8_OFFSET_ERROR".into(), Value::Int(5));
         constants.insert("PREG_JIT_STACKLIMIT_ERROR".into(), Value::Int(6));
         constants.insert("PREG_BAD_MODE_LIMIT_ERROR".into(), Value::Int(7));
+        // ext/standard sort flags (used by sort-family builtins and
+        // symfony console's command sorting).
+        constants.insert("SORT_REGULAR".into(), Value::Int(0));
+        constants.insert("SORT_NUMERIC".into(), Value::Int(1));
+        constants.insert("SORT_STRING".into(), Value::Int(2));
+        constants.insert("SORT_DESC".into(), Value::Int(3));
+        constants.insert("SORT_ASC".into(), Value::Int(4));
+        constants.insert("SORT_LOCALE_STRING".into(), Value::Int(5));
+        constants.insert("SORT_NATURAL".into(), Value::Int(6));
+        constants.insert("SORT_FLAG_CASE".into(), Value::Int(8));
         // ext/filter.
         constants.insert("FILTER_VALIDATE_INT".into(), Value::Int(257));
         constants.insert("FILTER_VALIDATE_BOOL".into(), Value::Int(258));
@@ -436,7 +560,19 @@ impl<'a> Interp<'a> {
             functions: HashMap::new(),
             classes: HashMap::new(),
             traits: HashMap::new(),
+            trait_statics: HashMap::new(),
+            linking: Vec::new(),
+            autoloading: std::collections::HashSet::new(),
+            tentative: {
+                let mut t = HashSet::new();
+                t.insert(("datetimezone".into(), "listidentifiers".into()));
+                t
+            },
             interfaces: HashMap::new(),
+            decl_order: Vec::new(),
+            enum_cases: std::collections::HashMap::new(),
+            consts_linked: std::collections::HashSet::new(),
+            decl_aliases: Vec::new(),
             early_bound_classes: HashSet::new(),
             constants,
             out: Vec::new(),
@@ -464,6 +600,9 @@ impl<'a> Interp<'a> {
             exception_handler: None,
             in_handler: false,
             cur_line: 1,
+            gen_sink: None,
+            gen_sends: std::collections::VecDeque::new(),
+            gen_auto: 0,
             pending_decl_class: None,
             pending_called_class: None,
             pending_hook_prop: None,
@@ -476,6 +615,15 @@ impl<'a> Interp<'a> {
             destructed: HashSet::new(),
             internal_cb: 0,
             cur_file: file.to_string(),
+            strict_files: std::collections::HashSet::new(),
+            typed_slots: std::collections::HashMap::new(),
+            slot_owners: std::collections::HashMap::new(),
+            slot_merged: std::collections::HashMap::new(),
+            slot_anchor: std::collections::HashMap::new(),
+            ref_cells: std::collections::HashSet::new(),
+            last_fresh_cell: None,
+            builtin_ifaces: std::collections::HashSet::new(),
+            dep_seen: std::collections::HashSet::new(),
             last_err_file: String::new(),
             assert_src: String::new(),
             mem_used: 0,
@@ -539,8 +687,33 @@ impl<'a> Interp<'a> {
             );
             it.globals.vars.insert("argc".into(), cell(Value::Int(1)));
         }
+        it.globals.file = file.to_string();
         it.register_builtin_classes();
         it
+    }
+
+    /// `phpun file.php a b c` — CLI args after the script name land in
+    /// `$argv`/`$argc`/`$_SERVER['argv']` like reference php.
+    pub fn set_script_args(&mut self, script: &str, args: &[String]) {
+        let mut argv = PhpArray::new();
+        argv.push(Value::str(script));
+        for a in args {
+            argv.push(Value::str(a));
+        }
+        let argc = argv.len() as i64;
+        let argv_v = Value::Array(Rc::new(RefCell::new(argv)));
+        if let Some(c) = self.globals.vars.get("_SERVER") {
+            if let Value::Array(srv) = &*c.borrow() {
+                srv.borrow_mut()
+                    .set(ArrKey::Str("argv".into()), argv_v.clone());
+                srv.borrow_mut()
+                    .set(ArrKey::Str("argc".into()), Value::Int(argc));
+            }
+        }
+        self.globals.vars.insert("argv".into(), cell(argv_v));
+        self.globals
+            .vars
+            .insert("argc".into(), cell(Value::Int(argc)));
     }
 
     /// Builtin exception classes + interfaces needed by try/catch.
@@ -556,6 +729,7 @@ impl<'a> Interp<'a> {
                 implements: vec!["Throwable".into()],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     method("__construct", &["message", "code", "previous"]),
                     method("getMessage", &[]),
@@ -581,6 +755,7 @@ impl<'a> Interp<'a> {
                         set_vis: None,
                         decl_in: None,
                         hooks: None,
+                        attrs: vec![],
                         line: 0,
                     })
                     .collect(),
@@ -591,6 +766,7 @@ impl<'a> Interp<'a> {
         fn method(name: &str, _params: &[&str]) -> Rc<MethodDecl> {
             Rc::new(MethodDecl {
                 decl: FunctionDecl {
+                    ret: None,
                     name: name.into(),
                     params: vec![],
                     body: vec![],
@@ -599,11 +775,13 @@ impl<'a> Interp<'a> {
                     line: 0,
                     file: String::new(),
                     ns: String::new(),
+                    decl_in: None,
                 },
                 is_static: false,
                 is_abstract: false,
                 is_final: false,
                 visibility: Visibility::Public,
+                trait_alias_of: None,
             })
         }
         let mut reg = |d: ClassDecl, is_iface: bool| {
@@ -613,6 +791,7 @@ impl<'a> Interp<'a> {
                 statics_init: RefCell::new(true),
             });
             if is_iface {
+                self.builtin_ifaces.insert(c.decl.name.to_lowercase());
                 self.interfaces
                     .insert(c.name().to_lowercase(), c.decl.clone());
             } else {
@@ -630,11 +809,13 @@ impl<'a> Interp<'a> {
             implements: parents.iter().map(|s| s.to_string()).collect(),
             attrs: vec![],
             traits: vec![],
+            adaptations: vec![],
             methods: methods
                 .iter()
                 .map(|m| {
                     Rc::new(MethodDecl {
                         decl: FunctionDecl {
+                            ret: None,
                             name: m.to_string(),
                             params: vec![],
                             body: vec![],
@@ -643,11 +824,13 @@ impl<'a> Interp<'a> {
                             line: 0,
                             file: String::new(),
                             ns: String::new(),
+                            decl_in: None,
                         },
                         is_static: false,
                         is_abstract: true,
                         is_final: false,
                         visibility: Visibility::Public,
+                        trait_alias_of: None,
                     })
                 })
                 .collect(),
@@ -671,6 +854,63 @@ impl<'a> Interp<'a> {
             true,
         );
         reg(iface("Countable", &[], &["count"]), true);
+        // Serializable's unserialize takes `string $data` — the iface()
+        // helper emits param-less methods, so patch the decl (the
+        // interface-sig check compares against it).
+        let mut sd = iface("Serializable", &[], &["serialize", "unserialize"]);
+        for m in sd.methods.iter_mut() {
+            if m.decl.name == "unserialize" {
+                let mut m2 = (**m).clone();
+                m2.decl.params = vec![Param {
+                    name: "data".into(),
+                    default: None,
+                    by_ref: false,
+                    variadic: false,
+                    ty: Some(vec!["string".into()]),
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                }];
+                *m = Rc::new(m2);
+            }
+        }
+        reg(sd, true);
+        // SPL Observer pair — param-typed per the real SPL stubs so
+        // interface-sig checks accept real-world impls (ns_054/056).
+        let spl_param = |n: &str, t: &str| Param {
+            name: n.into(),
+            default: None,
+            by_ref: false,
+            variadic: false,
+            ty: Some(vec![t.into()]),
+            promoted: false,
+            vis: None,
+            readonly: false,
+            is_final: false,
+            set_vis: None,
+            hooks: None,
+        };
+        let mut so = iface("SplObserver", &[], &["update"]);
+        so.methods[0] = {
+            let mut m = (*so.methods[0]).clone();
+            m.decl.params = vec![spl_param("subject", "SplSubject")];
+            Rc::new(m)
+        };
+        reg(so, true);
+        let mut ss = iface("SplSubject", &[], &["attach", "detach", "notify"]);
+        for (i, pn) in ["observer", "observer", ""].iter().enumerate() {
+            let mut m = (*ss.methods[i]).clone();
+            m.decl.params = if pn.is_empty() {
+                vec![]
+            } else {
+                vec![spl_param(pn, "SplObserver")]
+            };
+            ss.methods[i] = Rc::new(m);
+        }
+        reg(ss, true);
         reg(iface("SeekableIterator", &["Iterator"], &["seek"]), true);
         // ArrayIterator — SPL iterator over an array; methods are
         // native-dispatched (array_iter_method) on the ArrayIter
@@ -678,6 +918,7 @@ impl<'a> Interp<'a> {
         let stub_method = |name: &str, params: &[&str]| {
             Rc::new(MethodDecl {
                 decl: FunctionDecl {
+                    ret: None,
                     name: name.into(),
                     params: params
                         .iter()
@@ -701,11 +942,13 @@ impl<'a> Interp<'a> {
                     line: 0,
                     file: String::new(),
                     ns: String::new(),
+                    decl_in: None,
                 },
                 is_static: false,
                 is_abstract: false,
                 is_final: false,
                 visibility: Visibility::Public,
+                trait_alias_of: None,
             })
         };
         // stub where `req` params are required and `opt` have null defaults
@@ -724,6 +967,7 @@ impl<'a> Interp<'a> {
                 is_abstract: m.is_abstract,
                 is_final: m.is_final,
                 visibility: m.visibility,
+                trait_alias_of: None,
             })
         };
 
@@ -742,6 +986,7 @@ impl<'a> Interp<'a> {
                 ],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     stub_method("__construct", &["array", "flags"]),
                     stub_method("rewind", &[]),
@@ -762,6 +1007,101 @@ impl<'a> Interp<'a> {
                     stub_method("ksort", &["flags"]),
                     stub_method("natcasesort", &[]),
                     stub_method("natsort", &[]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        // Generator — engine iterator produced by `yield` functions;
+        // methods native-dispatch on the Generator internal.
+        reg(
+            ClassDecl {
+                name: "Generator".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: true,
+                readonly: false,
+                parent: None,
+                implements: vec!["Iterator".into()],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    stub_method("rewind", &[]),
+                    stub_method("valid", &[]),
+                    stub_method("current", &[]),
+                    stub_method("key", &[]),
+                    stub_method("next", &[]),
+                    stub_method("send", &["value"]),
+                    stub_method("throw", &["exception"]),
+                    stub_method("getReturn", &[]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        // SplFileInfo / DirectoryIterator — SPL filesystem surface;
+        // methods native-dispatch on \0fi\0path / DirIter internals.
+        reg(
+            ClassDecl {
+                name: "SplFileInfo".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    stub_method("__construct", &["filename"]),
+                    stub_method("getFilename", &[]),
+                    stub_method("getBasename", &[]),
+                    stub_method("getPathname", &[]),
+                    stub_method("getPath", &[]),
+                    stub_method("getExtension", &[]),
+                    stub_method("getRealPath", &[]),
+                    stub_method("isFile", &[]),
+                    stub_method("isDir", &[]),
+                    stub_method("isLink", &[]),
+                    stub_method("isReadable", &[]),
+                    stub_method("isWritable", &[]),
+                    stub_method("isExecutable", &[]),
+                    stub_method("getSize", &[]),
+                    stub_method("getMTime", &[]),
+                    stub_method("getType", &[]),
+                    stub_method("__toString", &[]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        reg(
+            ClassDecl {
+                name: "DirectoryIterator".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: Some("SplFileInfo".into()),
+                implements: vec!["Iterator".into()],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    stub_method("rewind", &[]),
+                    stub_method("valid", &[]),
+                    stub_method("current", &[]),
+                    stub_method("key", &[]),
+                    stub_method("next", &[]),
+                    stub_method("isDot", &[]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -794,6 +1134,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     stub_method_mix(
                         "__construct",
@@ -816,21 +1157,156 @@ impl<'a> Interp<'a> {
                 ],
                 props: vec![],
                 consts: vec![
-                    ("FETCH_ASSOC".into(), Expr::Int(2)),
-                    ("FETCH_NUM".into(), Expr::Int(3)),
-                    ("FETCH_BOTH".into(), Expr::Int(4)),
-                    ("FETCH_OBJ".into(), Expr::Int(5)),
-                    ("ATTR_ERRMODE".into(), Expr::Int(3)),
-                    ("ATTR_DEFAULT_FETCH_MODE".into(), Expr::Int(19)),
-                    ("ATTR_EMULATE_PREPARES".into(), Expr::Int(20)),
-                    ("ERRMODE_SILENT".into(), Expr::Int(0)),
-                    ("ERRMODE_WARNING".into(), Expr::Int(1)),
-                    ("ERRMODE_EXCEPTION".into(), Expr::Int(2)),
-                    ("PARAM_STR".into(), Expr::Int(2)),
-                    ("PARAM_INT".into(), Expr::Int(1)),
-                    ("PARAM_BOOL".into(), Expr::Int(5)),
-                    ("PARAM_NULL".into(), Expr::Int(0)),
-                    ("PARAM_LOB".into(), Expr::Int(3)),
+                    crate::ast::ConstDecl {
+                        name: "FETCH_ASSOC".into(),
+                        value: Expr::Int(2),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "FETCH_NUM".into(),
+                        value: Expr::Int(3),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "FETCH_BOTH".into(),
+                        value: Expr::Int(4),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "FETCH_OBJ".into(),
+                        value: Expr::Int(5),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "ATTR_ERRMODE".into(),
+                        value: Expr::Int(3),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "ATTR_DEFAULT_FETCH_MODE".into(),
+                        value: Expr::Int(19),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "ATTR_EMULATE_PREPARES".into(),
+                        value: Expr::Int(20),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "ERRMODE_SILENT".into(),
+                        value: Expr::Int(0),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "ERRMODE_WARNING".into(),
+                        value: Expr::Int(1),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "ERRMODE_EXCEPTION".into(),
+                        value: Expr::Int(2),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "PARAM_STR".into(),
+                        value: Expr::Int(2),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "PARAM_INT".into(),
+                        value: Expr::Int(1),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "PARAM_BOOL".into(),
+                        value: Expr::Int(5),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "PARAM_NULL".into(),
+                        value: Expr::Int(0),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "PARAM_LOB".into(),
+                        value: Expr::Int(3),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
                 ],
                 file: String::new(),
             },
@@ -847,6 +1323,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     stub_method_mix("execute", &[], &["params"]),
                     stub_method_mix("fetch", &[], &["mode", "cursorOrientation", "cursorOffset"]),
@@ -885,6 +1362,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![],
                 props: vec![],
                 consts: vec![],
@@ -910,11 +1388,30 @@ impl<'a> Interp<'a> {
                 ],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![],
                 props: vec![],
                 consts: vec![
-                    ("STD_PROP_LIST".into(), Expr::Int(1)),
-                    ("ARRAY_AS_PROPS".into(), Expr::Int(2)),
+                    crate::ast::ConstDecl {
+                        name: "STD_PROP_LIST".into(),
+                        value: Expr::Int(1),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "ARRAY_AS_PROPS".into(),
+                        value: Expr::Int(2),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
                 ],
                 file: String::new(),
             },
@@ -934,36 +1431,176 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    Rc::new(MethodDecl {
+                        decl: FunctionDecl {
+                            ret: None,
+                            name: "__construct".into(),
+                            params: vec![Param {
+                                name: "datetime".into(),
+                                default: Some(Expr::Str("now".into())),
+                                by_ref: false,
+                                variadic: false,
+                                ty: Some(vec!["string".into()]),
+                                promoted: false,
+                                vis: None,
+                                readonly: false,
+                                is_final: false,
+                                set_vis: None,
+                                hooks: None,
+                            }],
+                            body: vec![],
+                            attrs: vec![],
+                            by_ref: false,
+                            line: 0,
+                            file: String::new(),
+                            ns: String::new(),
+                            decl_in: None,
+                        },
+                        is_static: false,
+                        is_abstract: false,
+                        is_final: false,
+                        visibility: Visibility::Public,
+                        trait_alias_of: None,
+                    }),
+                    Rc::new(MethodDecl {
+                        decl: FunctionDecl {
+                            ret: Some(vec!["DateTime".into(), "false".into()]),
+                            name: "createFromFormat".into(),
+                            params: vec![
+                                Param {
+                                    name: "format".into(),
+                                    default: None,
+                                    by_ref: false,
+                                    variadic: false,
+                                    ty: Some(vec!["string".into()]),
+                                    promoted: false,
+                                    vis: None,
+                                    readonly: false,
+                                    is_final: false,
+                                    set_vis: None,
+                                    hooks: None,
+                                },
+                                Param {
+                                    name: "datetime".into(),
+                                    default: None,
+                                    by_ref: false,
+                                    variadic: false,
+                                    ty: Some(vec!["string".into()]),
+                                    promoted: false,
+                                    vis: None,
+                                    readonly: false,
+                                    is_final: false,
+                                    set_vis: None,
+                                    hooks: None,
+                                },
+                                Param {
+                                    name: "timezone".into(),
+                                    default: Some(Expr::Null),
+                                    by_ref: false,
+                                    variadic: false,
+                                    ty: Some(vec!["DateTimeZone".into(), "null".into()]),
+                                    promoted: false,
+                                    vis: None,
+                                    readonly: false,
+                                    is_final: false,
+                                    set_vis: None,
+                                    hooks: None,
+                                },
+                            ],
+                            body: vec![],
+                            attrs: vec![],
+                            by_ref: false,
+                            line: 0,
+                            file: String::new(),
+                            ns: String::new(),
+                            decl_in: None,
+                        },
+                        is_static: true,
+                        is_abstract: false,
+                        is_final: false,
+                        visibility: Visibility::Public,
+                        trait_alias_of: None,
+                    }),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        // DateTimeZone — stub with the const + tentative-typed
+        // listIdentifiers the internal_parent variance tests override.
+        reg(
+            ClassDecl {
+                name: "DateTimeZone".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
                 methods: vec![Rc::new(MethodDecl {
                     decl: FunctionDecl {
-                        name: "__construct".into(),
-                        params: vec![Param {
-                            name: "datetime".into(),
-                            default: Some(Expr::Str("now".into())),
-                            by_ref: false,
-                            variadic: false,
-                            ty: Some(vec!["string".into()]),
-                            promoted: false,
-                            vis: None,
-                            readonly: false,
-                            is_final: false,
-                            set_vis: None,
-                            hooks: None,
-                        }],
+                        ret: Some(vec!["array".into()]),
+                        name: "listIdentifiers".into(),
+                        params: vec![
+                            Param {
+                                name: "timezoneGroup".into(),
+                                default: Some(Expr::Const("DateTimeZone::ALL".into())),
+                                by_ref: false,
+                                variadic: false,
+                                ty: Some(vec!["int".into()]),
+                                promoted: false,
+                                vis: None,
+                                readonly: false,
+                                is_final: false,
+                                set_vis: None,
+                                hooks: None,
+                            },
+                            Param {
+                                name: "countryCode".into(),
+                                default: Some(Expr::Null),
+                                by_ref: false,
+                                variadic: false,
+                                ty: Some(vec!["string".into(), "null".into()]),
+                                promoted: false,
+                                vis: None,
+                                readonly: false,
+                                is_final: false,
+                                set_vis: None,
+                                hooks: None,
+                            },
+                        ],
                         body: vec![],
                         attrs: vec![],
                         by_ref: false,
                         line: 0,
                         file: String::new(),
                         ns: String::new(),
+                        decl_in: None,
                     },
-                    is_static: false,
+                    is_static: true,
                     is_abstract: false,
                     is_final: false,
                     visibility: Visibility::Public,
+                    trait_alias_of: None,
                 })],
                 props: vec![],
-                consts: vec![],
+                consts: vec![ConstDecl {
+                    name: "ALL".into(),
+                    value: Expr::Int(2047),
+                    visibility: Visibility::Public,
+                    is_final: false,
+                    ty: None,
+                    attrs: vec![],
+                    decl_in: None,
+                    enum_case: false,
+                }],
                 file: String::new(),
             },
             false,
@@ -975,6 +1612,7 @@ impl<'a> Interp<'a> {
         let mk_method = |name: &str, params: Vec<Param>| {
             Rc::new(MethodDecl {
                 decl: FunctionDecl {
+                    ret: None,
                     name: name.into(),
                     params,
                     body: vec![],
@@ -983,11 +1621,13 @@ impl<'a> Interp<'a> {
                     line: 0,
                     file: String::new(),
                     ns: String::new(),
+                    decl_in: None,
                 },
                 is_static: false,
                 is_abstract: false,
                 is_final: false,
                 visibility: Visibility::Public,
+                trait_alias_of: None,
             })
         };
         let str_param = |n: &str| Param {
@@ -1027,6 +1667,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     mk_method("__construct", vec![any_param("class", false)]),
                     mk_method("newInstanceWithoutConstructor", vec![]),
@@ -1034,6 +1675,13 @@ impl<'a> Interp<'a> {
                     mk_method("newInstanceArgs", vec![any_param("args", false)]),
                     mk_method("getName", vec![]),
                     mk_method("getAttributes", vec![]),
+                    mk_method("getConstant", vec![str_param("name")]),
+                    mk_method("getConstants", vec![]),
+                    mk_method("getReflectionConstant", vec![str_param("name")]),
+                    mk_method("getReflectionConstants", vec![]),
+                    mk_method("getTraitAliases", vec![]),
+                    mk_method("getProperty", vec![str_param("name")]),
+                    mk_method("hasProperty", vec![str_param("name")]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -1052,12 +1700,14 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     mk_method("__construct", vec![any_param("function", false)]),
                     mk_method("invoke", vec![any_param("args", true)]),
                     mk_method("invokeArgs", vec![any_param("args", false)]),
                     mk_method("getName", vec![]),
                     mk_method("getAttributes", vec![]),
+                    mk_method("getParameters", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -1076,6 +1726,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     mk_method(
                         "__construct",
@@ -1090,6 +1741,68 @@ impl<'a> Interp<'a> {
                         vec![any_param("object", false), any_param("args", false)],
                     ),
                     mk_method("getName", vec![]),
+                    mk_method("isFinal", vec![]),
+                    mk_method("isAbstract", vec![]),
+                    mk_method("isStatic", vec![]),
+                    mk_method("isPublic", vec![]),
+                    mk_method("isProtected", vec![]),
+                    mk_method("isPrivate", vec![]),
+                    mk_method("getParameters", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        // ReflectionParameter — produced by getParameters();
+        // per-param data lives under \0rp\0* props.
+        reg(
+            ClassDecl {
+                name: "ReflectionParameter".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method("isCallable", vec![]),
+                    mk_method("getName", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        // ReflectionClassConstant — produced by ReflectionClass::
+        // getReflectionConstant(s) (constant_019-021).
+        reg(
+            ClassDecl {
+                name: "ReflectionClassConstant".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method(
+                        "__construct",
+                        vec![any_param("class", false), any_param("name", false)],
+                    ),
+                    mk_method("getName", vec![]),
+                    mk_method("getValue", vec![]),
+                    mk_method("getDocComment", vec![]),
+                    mk_method("getAttributes", vec![]),
+                    mk_method("getDeclaringClass", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -1110,6 +1823,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     mk_method("getName", vec![]),
                     mk_method("getArguments", vec![]),
@@ -1133,17 +1847,90 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![],
                 props: vec![],
                 consts: vec![
-                    ("TARGET_CLASS".into(), Expr::Int(1)),
-                    ("TARGET_FUNCTION".into(), Expr::Int(2)),
-                    ("TARGET_METHOD".into(), Expr::Int(4)),
-                    ("TARGET_PROPERTY".into(), Expr::Int(8)),
-                    ("TARGET_CLASS_CONSTANT".into(), Expr::Int(16)),
-                    ("TARGET_PARAMETER".into(), Expr::Int(32)),
-                    ("TARGET_ALL".into(), Expr::Int(63)),
-                    ("IS_REPEATABLE".into(), Expr::Int(64)),
+                    crate::ast::ConstDecl {
+                        name: "TARGET_CLASS".into(),
+                        value: Expr::Int(1),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "TARGET_FUNCTION".into(),
+                        value: Expr::Int(2),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "TARGET_METHOD".into(),
+                        value: Expr::Int(4),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "TARGET_PROPERTY".into(),
+                        value: Expr::Int(8),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "TARGET_CLASS_CONSTANT".into(),
+                        value: Expr::Int(16),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "TARGET_PARAMETER".into(),
+                        value: Expr::Int(32),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "TARGET_ALL".into(),
+                        value: Expr::Int(63),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
+                    crate::ast::ConstDecl {
+                        name: "IS_REPEATABLE".into(),
+                        value: Expr::Int(64),
+                        visibility: crate::ast::Visibility::Public,
+                        is_final: false,
+                        ty: None,
+                        attrs: vec![],
+                        decl_in: None,
+                        enum_case: false,
+                    },
                 ],
                 file: String::new(),
             },
@@ -1160,6 +1947,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![
                     mk_method(
                         "__construct",
@@ -1181,6 +1969,33 @@ impl<'a> Interp<'a> {
                             hooks: None,
                         }],
                     ),
+                    mk_method("getName", vec![]),
+                    mk_method("getType", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        // ReflectionNamedType — produced by getType() on a property /
+        // parameter / return (typed_properties_018).
+        reg(
+            ClassDecl {
+                name: "ReflectionNamedType".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method("getName", vec![]),
+                    mk_method("allowsNull", vec![]),
+                    mk_method("isBuiltin", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -1211,6 +2026,7 @@ impl<'a> Interp<'a> {
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
+                adaptations: vec![],
                 methods: vec![],
                 props: vec![],
                 consts: vec![],
@@ -1266,7 +2082,7 @@ impl<'a> Interp<'a> {
         for s in stmts {
             match s {
                 Stmt::Function(d) => {
-                    let _ = self.decl_type_checks(&d.name, d);
+                    let _ = self.decl_type_checks(&d.name, d, None);
                     let mut d = d.clone();
                     d.file = self.cur_file.clone();
                     self.functions.insert(d.name.to_lowercase(), Rc::new(d));
@@ -1515,8 +2331,6 @@ impl<'a> Interp<'a> {
                 | "_REQUEST"
                 | "_SESSION"
                 | "GLOBALS"
-                | "argc"
-                | "argv"
         )
     }
 
@@ -1652,7 +2466,16 @@ impl<'a> Interp<'a> {
     fn fn_statics_key(&self) -> String {
         self.stack
             .last()
-            .map(|f| f.fn_name.clone())
+            .map(|f| {
+                // Method statics are per-(function, declaring class):
+                // trait-merged methods get independent statics in each
+                // using class, while inherited methods share their
+                // declaring class's table (language013).
+                match &f.decl_class {
+                    Some(c) => format!("{}\u{0}{}", c.name(), f.fn_name),
+                    None => f.fn_name.clone(),
+                }
+            })
             .unwrap_or_else(|| "\u{0}global".into())
     }
 
@@ -2532,6 +3355,25 @@ impl<'a> Interp<'a> {
                 // undefined-variable warning (first_class_callable_dynamic).
                 Expr::Var(n) if self.var_lookup(n).is_none() => Flow::Normal,
                 _ => match self.eval(e) {
+                    // A discarded temporary object reaches refcount 0
+                    // here — Zend runs its __destruct immediately
+                    // (methods_003 `new bar;`).
+                    Ok(Value::Object(o)) if Rc::strong_count(&o) == 1 => {
+                        if self
+                            .find_method_in(&o.borrow().class, "__destruct")
+                            .is_some()
+                        {
+                            let oid = Rc::as_ptr(&o) as usize;
+                            if self.destructed.insert(oid) {
+                                match self.method_invoke(o.clone(), "__destruct", CallArgs::empty())
+                                {
+                                    Ok(_) => {}
+                                    Err(e) => return self.err_flow(e),
+                                }
+                            }
+                        }
+                        Flow::Normal
+                    }
                     Ok(_) => Flow::Normal,
                     Err(e) => self.err_flow(e),
                 },
@@ -2630,7 +3472,7 @@ impl<'a> Interp<'a> {
                 Flow::Normal
             }
             Stmt::Function(d) => {
-                if let Err(e) = self.decl_type_checks(&d.name, d) {
+                if let Err(e) = self.decl_type_checks(&d.name, d, None) {
                     return self.err_flow(e);
                 }
                 let mut d = d.clone();
@@ -2641,7 +3483,9 @@ impl<'a> Interp<'a> {
             Stmt::Class(d) => {
                 for m in &d.methods {
                     let fname = format!("{}::{}", d.name, m.decl.name);
-                    if let Err(e) = self.decl_type_checks(&fname, &m.decl) {
+                    if let Err(e) =
+                        self.decl_type_checks(&fname, &m.decl, Some((&d.name, d.parent.clone())))
+                    {
                         return self.err_flow(e);
                     }
                 }
@@ -2816,7 +3660,31 @@ impl<'a> Interp<'a> {
                 for x in xs {
                     match x {
                         Expr::Var(n) => {
-                            self.cur().vars.remove(n);
+                            if let Some(c) = self.cur().vars.remove(n) {
+                                // Removing the last handle to an object
+                                // runs its __destruct immediately (Zend
+                                // refcount semantics — gh16198_2).
+                                let v = c.borrow().clone();
+                                drop(c);
+                                if let Value::Object(o) = v {
+                                    if Rc::strong_count(&o) == 1 {
+                                        let oid = Rc::as_ptr(&o) as usize;
+                                        if self
+                                            .find_method_in(&o.borrow().class, "__destruct")
+                                            .is_some()
+                                            && self.destructed.insert(oid)
+                                        {
+                                            if let Err(e) = self.method_invoke(
+                                                o.clone(),
+                                                "__destruct",
+                                                CallArgs::empty(),
+                                            ) {
+                                                return self.err_flow(e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Expr::VarVar(inner) => {
                             if let Ok(n) = self.eval(inner) {
@@ -2915,7 +3783,14 @@ impl<'a> Interp<'a> {
                 }
                 Flow::Normal
             }
-            Stmt::Declare { .. } => Flow::Normal,
+            Stmt::Declare { name, value } => {
+                if name.eq_ignore_ascii_case("strict_types")
+                    && matches!(self.eval(value), Ok(Value::Int(1)))
+                {
+                    self.strict_files.insert(self.cur_file.clone());
+                }
+                Flow::Normal
+            }
         }
     }
 
@@ -2942,6 +3817,17 @@ impl<'a> Interp<'a> {
         let mut cur = Some(cls.clone());
         while let Some(c) = cur {
             if c.name().eq_ignore_ascii_case(&lname) {
+                return true;
+            }
+            // Ancestor NAME match: a parent still mid-registration (an
+            // autoload cycle: `new C` → C's sig check autoloads D →
+            // `class D extends C`) isn't in `classes` yet, but its name
+            // is a known ancestor (abstract_method_9).
+            if c.decl
+                .parent
+                .as_deref()
+                .is_some_and(|p| p.trim_start_matches('\\').eq_ignore_ascii_case(&lname))
+            {
                 return true;
             }
             for i in &c.decl.implements {
@@ -3117,8 +4003,9 @@ impl<'a> Interp<'a> {
                 let snapshot: Vec<(ArrKey, Cell)> = if by_ref {
                     rc.borrow().iter().cloned().collect()
                 } else {
+                    // .iter() skips tombstoned buckets — a value-foreach
+                    // never sees shifted/unset elements.
                     rc.borrow()
-                        .entries
                         .iter()
                         .map(|(k, c)| (k.clone(), cell(c.borrow().clone())))
                         .collect()
@@ -3186,7 +4073,14 @@ impl<'a> Interp<'a> {
                     }
                 }
                 if self.obj_is_a(&o, "Iterator") {
-                    if matches!(val, ForeachTarget::ByRef(_)) {
+                    // `function &gen()` generators DO support
+                    // `foreach .. as &$v` — their yields are cells
+                    // (typed_properties_033/034).
+                    let gen_byref = match &o.borrow().internal {
+                        Some(ObjectInternal::Generator(st)) => st.borrow().by_ref,
+                        _ => false,
+                    };
+                    if matches!(val, ForeachTarget::ByRef(_)) && !gen_byref {
                         let v = self.exception(
                             "Error",
                             "An iterator cannot be used with foreach by reference",
@@ -3341,12 +4235,37 @@ impl<'a> Interp<'a> {
                             None => continue, // tombstoned by unset()
                         }
                     };
+                    // `&$val` binds the prop cell — register it so
+                    // writes stay type-gated (typed_properties_045).
+                    if matches!(val, ForeachTarget::ByRef(_) | ForeachTarget::Lvalue(_)) {
+                        if let Some((pd, dcls)) = self.decl_prop(&o, &dname) {
+                            if let Some(tys) = &pd.ty {
+                                let p = Rc::as_ptr(&c) as usize;
+                                self.typed_slots.insert(
+                                    p,
+                                    (
+                                        c.clone(),
+                                        tys.clone(),
+                                        dcls.name().to_string(),
+                                        dname.clone(),
+                                    ),
+                                );
+                                let sk = self
+                                    .obj_prop_key(&o, &dname)
+                                    .unwrap_or_else(|| dname.clone());
+                                self.slot_anchor
+                                    .insert(p, SlotAnchor::Obj(Rc::downgrade(&o), sk));
+                                self.ref_cells.insert(p);
+                            }
+                        }
+                    }
                     if let Some(ForeachKey::Var(kn)) = key {
                         self.var_set(kn, Value::str(n.clone()));
                     }
                     match val {
                         ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
                         ForeachTarget::ByRef(n) => {
+                            self.ref_cells.insert(Rc::as_ptr(&c) as usize);
                             self.cur().vars.insert(n.clone(), c.clone());
                         }
                         ForeachTarget::Lvalue(e) => {
@@ -3396,7 +4315,9 @@ impl<'a> Interp<'a> {
         val: &ForeachTarget,
         body: &[Stmt],
     ) -> Flow {
-        let _ = self.method_invoke(it.clone(), "rewind", CallArgs::empty());
+        if let Err(e) = self.method_invoke(it.clone(), "rewind", CallArgs::empty()) {
+            return self.err_flow(e);
+        }
         loop {
             let ok = self
                 .method_invoke(it.clone(), "valid", CallArgs::empty())
@@ -3418,7 +4339,19 @@ impl<'a> Interp<'a> {
             match val {
                 ForeachTarget::Var(n) => self.var_set(n, v),
                 ForeachTarget::ByRef(n) => {
-                    let c = cell(v);
+                    // A by-ref generator's current() is the yielded
+                    // cell itself — bind to it directly.
+                    let c = match &it.borrow().internal {
+                        Some(ObjectInternal::Generator(st)) => {
+                            let st = st.borrow();
+                            st.items
+                                .get(st.pos)
+                                .map(|(_, c)| c.clone())
+                                .unwrap_or_else(|| cell(v.clone()))
+                        }
+                        _ => cell(v),
+                    };
+                    self.ref_cells.insert(Rc::as_ptr(&c) as usize);
                     self.cur().vars.insert(n.clone(), c);
                 }
                 ForeachTarget::Lvalue(e) => {
@@ -3436,7 +4369,9 @@ impl<'a> Interp<'a> {
                 Flow::Normal => {}
                 f => return f,
             }
-            let _ = self.method_invoke(it.clone(), "next", CallArgs::empty());
+            if let Err(e) = self.method_invoke(it.clone(), "next", CallArgs::empty()) {
+                return self.err_flow(e);
+            }
         }
         Flow::Normal
     }
@@ -3582,9 +4517,9 @@ impl<'a> Interp<'a> {
                 self.silence += 1;
                 let mut ok = true;
                 for a in args {
-                    match self.isset_eval(a) {
-                        Ok(true) => {}
-                        Ok(false) => {
+                    match self.isset_val(a) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
                             ok = false;
                             break;
                         }
@@ -3599,19 +4534,11 @@ impl<'a> Interp<'a> {
             }
             Expr::Empty(e) => {
                 self.silence += 1;
-                let v = self.isset_eval(e);
+                let v = self.isset_val(e);
                 self.silence -= 1;
                 match v {
-                    Ok(true) => {
-                        self.silence += 1;
-                        let v = self.eval(e);
-                        self.silence -= 1;
-                        match v {
-                            Ok(v) => Ok(Value::Bool(!v.is_truthy())),
-                            Err(e) => Err(e),
-                        }
-                    }
-                    Ok(false) => Ok(Value::Bool(true)),
+                    Ok(Some(v)) => Ok(Value::Bool(!v.is_truthy())),
+                    Ok(None) => Ok(Value::Bool(true)),
                     Err(e) => Err(e),
                 }
             }
@@ -3620,6 +4547,59 @@ impl<'a> Interp<'a> {
                 let s = self.conv_str(&v)?;
                 self.emit(&s);
                 Ok(Value::Int(1))
+            }
+            Expr::Yield { key, val } => {
+                // `function &gen()` yields the value's own cell so
+                // `foreach ($gen as &$v)` writes back into it
+                // (typed_properties_033/034).
+                let by_ref = self.stack.last().map(|f| f.ret_by_ref).unwrap_or(false);
+                let vc = match val {
+                    Some(e) if by_ref => self.eval_cell(e)?,
+                    Some(e) => cell(self.eval(e)?),
+                    None => cell(Value::Null),
+                };
+                let k = match key {
+                    Some(e) => self.eval(e)?,
+                    None => {
+                        if self.gen_sink.is_none() {
+                            return self.fail(PhpError::fatal(
+                                "The \"yield\" expression can only be used inside a function",
+                                self.cur_line,
+                            ));
+                        }
+                        let i = self.gen_auto;
+                        self.gen_auto += 1;
+                        Value::Int(i)
+                    }
+                };
+                match &self.gen_sink {
+                    Some(sink) => {
+                        sink.borrow_mut().push((k, vc));
+                        Ok(self.gen_sends.pop_front().unwrap_or(Value::Null))
+                    }
+                    None => self.fail(PhpError::fatal(
+                        "The \"yield\" expression can only be used inside a function",
+                        self.cur_line,
+                    )),
+                }
+            }
+            Expr::YieldFrom(e) => {
+                let v = self.eval(e)?;
+                let sink = self.gen_sink.clone();
+                match sink {
+                    Some(sink) => {
+                        // `yield from` splices the inner keys verbatim —
+                        // duplicates and all — and doesn't touch the
+                        // keyless auto counter.
+                        let items = self.yield_from_collect(&v)?;
+                        sink.borrow_mut().extend(items);
+                        Ok(Value::Null)
+                    }
+                    None => self.fail(PhpError::fatal(
+                        "The \"yield from\" expression can only be used inside a function",
+                        self.cur_line,
+                    )),
+                }
             }
             Expr::Exit(arg) => {
                 let code = if let Some(a) = arg {
@@ -3712,7 +4692,7 @@ impl<'a> Interp<'a> {
                 if decl.file.is_empty() {
                     decl.file = cfile;
                 }
-                self.decl_type_checks(&fname, &decl)?;
+                self.decl_type_checks(&fname, &decl, None)?;
                 let mut captures = Vec::new();
                 if c.arrow {
                     // `fn` captures whole scope by value.
@@ -3796,7 +4776,7 @@ impl<'a> Interp<'a> {
                 let n = self.conv_str(&nv)?;
                 let argvals =
                     self.arg_cells(args, &[], &format!("{}::{{closure}}()", cls.name()))?;
-                self.static_invoke(cls, &n, argvals)
+                self.static_invoke_vis(cls, &n, argvals, None)
             }
             Expr::ClassConst { class, name } => self.class_const(class, name),
             Expr::Clone(e) => {
@@ -3833,6 +4813,7 @@ impl<'a> Interp<'a> {
                                 }),
                                 _ => None,
                             },
+                            unset_props: std::collections::HashSet::new(),
                         };
                         drop(ob);
                         let nv = Value::Object(self.alloc_obj(new_obj));
@@ -3870,6 +4851,8 @@ impl<'a> Interp<'a> {
                         let cls = o.borrow().class.clone();
                         Ok(Value::Bool(self.is_a(&cls, &cname)))
                     }
+                    // A closure literal IS a Closure object.
+                    Value::Callable(_) => Ok(Value::Bool(cname.eq_ignore_ascii_case("closure"))),
                     _ => Ok(Value::Bool(false)),
                 }
             }
@@ -3920,14 +4903,19 @@ impl<'a> Interp<'a> {
                         let (_, _, _, owner) = f.hook_prop.as_ref().unwrap();
                         Value::str(format!("{}::{}", owner, f.fn_name))
                     }
-                    Some(f) => match f
-                        .scope_class
-                        .as_ref()
-                        .map(|c| format!("{}::{}", c.name(), f.fn_name))
-                    {
-                        Some(s) => Value::str(s),
-                        None => Value::str(""),
-                    },
+                    Some(f) => {
+                        // `T::m` when the method was merged from trait T
+                        // (`__METHOD__` names the trait; `__CLASS__`
+                        // names the consuming class).
+                        let owner = f
+                            .trait_origin
+                            .clone()
+                            .or_else(|| f.scope_class.as_ref().map(|c| c.name().to_string()));
+                        match owner {
+                            Some(o) => Value::str(format!("{}::{}", o, f.fn_name)),
+                            None => Value::str(""),
+                        }
+                    }
                     None => Value::str(""),
                 }
             }
@@ -3935,6 +4923,7 @@ impl<'a> Interp<'a> {
                 self.stack
                     .last()
                     .and_then(|f| f.scope_class.as_ref().map(|c| c.name().to_string()))
+                    .or_else(|| self.const_self.as_ref().map(|c| c.name().to_string()))
                     .unwrap_or_default(),
             ),
             MagicConst::Namespace => Value::str(self.caller_ns()),
@@ -3946,15 +4935,29 @@ impl<'a> Interp<'a> {
                     .and_then(|f| f.hook_prop.as_ref().map(|(_, pn, _, _)| pn.clone()))
                     .unwrap_or_default(),
             ),
+            // `__TRAIT__` names the trait a method was merged from;
+            // "" inside class-defined methods and at top level.
+            MagicConst::Trait => Value::str(
+                self.stack
+                    .last()
+                    .and_then(|f| f.trait_origin.clone())
+                    .unwrap_or_default(),
+            ),
         }
     }
 
     /// Whether the expr is "set" — for isset()/empty() without warnings.
-    fn isset_eval(&mut self, e: &Expr) -> Result<bool, PhpError> {
+    /// `isset()` semantics returning the read value — `Some(v)` when the
+    /// operand exists and isn't null. `??`/`empty` consume the value
+    /// directly so calls and prop-getters evaluate exactly once.
+    fn isset_val(&mut self, e: &Expr) -> Result<Option<Value>, PhpError> {
         match e {
             Expr::Var(n) => Ok(match self.var_cell_opt(n) {
-                Some(c) => !matches!(*c.borrow(), Value::Null),
-                None => false,
+                Some(c) => match &*c.borrow() {
+                    Value::Null => None,
+                    v => Some(v.clone()),
+                },
+                None => None,
             }),
             Expr::Index { e, i } => {
                 // `isset($this->uninitTyped['k'])` and `$x ?? y` must not
@@ -3969,40 +4972,61 @@ impl<'a> Interp<'a> {
                             .message
                             .ends_with("must not be accessed before initialization")
                         {
-                            return Ok(false);
+                            return Ok(None);
                         }
                         return Err(err);
                     }
-                    Err(_) => return Ok(false),
+                    Err(_) => return Ok(None),
                 };
                 let key = match i {
                     Some(k) => self.eval(k)?,
-                    None => return Ok(false),
+                    None => return Ok(None),
                 };
                 match base {
                     Value::Array(a) => Ok(match a.borrow().get(&to_key(&key)) {
-                        Some(v) => !matches!(v, Value::Null),
-                        None => false,
+                        Some(v) => match v {
+                            Value::Null => None,
+                            _ => Some(v.clone()),
+                        },
+                        None => None,
                     }),
                     Value::Str(s) => {
                         let i = key.to_int();
-                        Ok(i >= 0 && (i as usize) < s.len())
+                        Ok(if i >= 0 && (i as usize) < s.len() {
+                            Some(Value::bytes(vec![s[i as usize]]))
+                        } else {
+                            None
+                        })
                     }
                     Value::Object(o) => {
                         if self.obj_is_a(&o, "ArrayAccess") {
                             match self.method_invoke(
-                                o,
+                                o.clone(),
                                 "offsetExists",
-                                CallArgs::positional(vec![cell(key)]),
+                                CallArgs::positional(vec![cell(key.clone())]),
                             ) {
-                                Ok(v) => Ok(v.is_truthy()),
+                                Ok(v) if v.is_truthy() => {
+                                    match self.method_invoke(
+                                        o,
+                                        "offsetGet",
+                                        CallArgs::positional(vec![cell(key)]),
+                                    ) {
+                                        Ok(v) => Ok(if matches!(v, Value::Null) {
+                                            None
+                                        } else {
+                                            Some(v)
+                                        }),
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                                Ok(_) => Ok(None),
                                 Err(e) => Err(e),
                             }
                         } else {
-                            Ok(false)
+                            Ok(None)
                         }
                     }
-                    _ => Ok(false),
+                    _ => Ok(None),
                 }
             }
             Expr::Prop { .. } => {
@@ -4010,7 +5034,11 @@ impl<'a> Interp<'a> {
                 let v = self.prop_read_loose(e);
                 self.silence -= 1;
                 match v {
-                    Ok(v) => Ok(!matches!(v, Value::Null)),
+                    Ok(v) => Ok(if matches!(v, Value::Null) {
+                        None
+                    } else {
+                        Some(v)
+                    }),
                     // A hooked get runs inside isset — its exceptions
                     // escape (write-only prop throws through the
                     // try/catch, not `false`).
@@ -4020,17 +5048,21 @@ impl<'a> Interp<'a> {
                         if e.message
                             .ends_with("must not be accessed before initialization")
                         {
-                            Ok(false)
+                            Ok(None)
                         } else {
                             Err(e)
                         }
                     }
-                    Err(_) => Ok(false),
+                    Err(_) => Ok(None),
                 }
             }
             _ => {
                 let v = self.eval(e)?;
-                Ok(!matches!(v, Value::Null))
+                Ok(if matches!(v, Value::Null) {
+                    None
+                } else {
+                    Some(v)
+                })
             }
         }
     }
@@ -4064,7 +5096,10 @@ impl<'a> Interp<'a> {
             }
             Value::Object(o) => {
                 let class = o.borrow().class.clone();
-                if class.find_method("__tostring").is_some() {
+                // __toString may be inherited — walk the chain, not just
+                // the leaf decl (AbstractString defines it for
+                // UnicodeString).
+                if self.find_method_in(&class, "__tostring").is_some() {
                     let r = self.method_invoke(o.clone(), "__tostring", CallArgs::empty())?;
                     Ok(r.to_php_string())
                 } else {
@@ -4169,7 +5204,54 @@ impl<'a> Interp<'a> {
                     }
                     c
                 }
-                _ => self.eval_cell(value)?,
+                _ => {
+                    let c = self.eval_cell(value)?;
+                    // A `=&` source that is itself a typed-prop slot
+                    // carries that prop's declared type into the
+                    // conflict check (typed_properties_068/076).
+                    let decl = match value {
+                        Expr::Prop { obj, name, .. } => {
+                            let ov = self.eval(obj)?;
+                            match (&ov, self.prop_name(name)) {
+                                (Value::Object(o), Ok(pn)) => {
+                                    self.decl_prop(o, &pn).map(|(pd, dc)| {
+                                        let sk =
+                                            self.obj_prop_key(o, &pn).unwrap_or_else(|| pn.clone());
+                                        (
+                                            pd.ty.clone(),
+                                            dc.name().to_string(),
+                                            pn,
+                                            SlotAnchor::Obj(Rc::downgrade(o), sk),
+                                        )
+                                    })
+                                }
+                                _ => None,
+                            }
+                        }
+                        Expr::StaticProp { class, name } => {
+                            match (self.member_class_of(class), self.prop_name(name)) {
+                                (Ok((cls, _)), Ok(pn)) => {
+                                    self.find_static_prop_decl(&cls, &pn).map(|(pd, dc)| {
+                                        (
+                                            pd.ty.clone(),
+                                            dc.name().to_string(),
+                                            pn.clone(),
+                                            SlotAnchor::Statics(dc.name().to_string(), pn),
+                                        )
+                                    })
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((Some(tys), dcn, dpn, anc)) = decl {
+                        let p = Rc::as_ptr(&c) as usize;
+                        self.typed_slots.insert(p, (c.clone(), tys, dcn, dpn));
+                        self.slot_anchor.insert(p, anc);
+                    }
+                    c
+                }
             };
             self.bind_cell(target, src.clone())?;
             return Ok(src.borrow().clone());
@@ -4182,6 +5264,7 @@ impl<'a> Interp<'a> {
         // effects but Zend's temp register is then overwritten by the
         // assignment value — so the ACTUAL name/key becomes the RHS value
         // (engine_assignExecutionOrder_001).
+        #[allow(clippy::large_enum_variant)]
         enum Late {
             Prop {
                 ov: Value,
@@ -4236,23 +5319,14 @@ impl<'a> Interp<'a> {
                 }
             }
             Expr::Index { e, i } if has_prop(e) => {
-                // Prop-chain index: container resolved early; a dynamic index
-                // expr runs for side effects and its effective key is replaced
-                // by the RHS (register quirk), a literal keeps its value.
+                // Prop-chain index: the container resolves early; the dim
+                // expr's own value is always the key — `$o->a[${f()}]` is a
+                // variable-variable, not a register quirk
+                // (engine_assignExecutionOrder_001 reads $name that way).
                 match self.eval_cell(e) {
                     Ok(c) => {
-                        // The register quirk only hits call-result dims
-                        // (engine_assignExecutionOrder_001): literals, plain
-                        // vars and binary-op dims keep their evaluated value.
-                        let clobber = matches!(
-                            i.as_deref(),
-                            Some(Expr::Call { .. })
-                                | Some(Expr::MethodCall { .. })
-                                | Some(Expr::StaticCall { .. })
-                                | Some(Expr::New { .. })
-                        );
                         let key = match i.as_deref() {
-                            Some(ie) => self.eval(ie).ok().filter(|_| !clobber),
+                            Some(ie) => self.eval(ie).ok(),
                             None => None,
                         };
                         late = Late::Index {
@@ -4359,10 +5433,10 @@ impl<'a> Interp<'a> {
                     Some(n) => self.prop_name(&n)?,
                     None => self.conv_str(&newv)?,
                 };
-                self.store_prop(ov, &pn, newv.clone())?;
+                newv = self.store_prop(ov, &pn, newv.clone())?;
             }
             Late::PropStr { ov, pn } => {
-                self.store_prop(ov, &pn, newv.clone())?;
+                newv = self.store_prop(ov, &pn, newv.clone())?;
             }
             Late::Index { base, key, append } => {
                 // A clobbered (call-result) dim falls back to the RHS
@@ -4387,31 +5461,45 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(newv);
                 }
-                let mut b = base.borrow_mut();
-                if matches!(*b, Value::Null) {
-                    *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
-                }
-                if let Value::Array(rc) = &mut *b {
-                    let mut arr = rc.borrow_mut();
-                    if append {
-                        arr.push(newv.clone());
-                    } else {
-                        let key = key.map(|k| to_key(&k)).unwrap_or(to_key(&newv));
-                        arr.set(key, newv.clone());
+                if matches!(&*base.borrow(), Value::Null) {
+                    self.auto_init_gate(&base)?;
+                    let mut b = base.borrow_mut();
+                    if matches!(*b, Value::Null) {
+                        *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
                     }
                 }
-                drop(b);
+                {
+                    let mut b = base.borrow_mut();
+                    if let Value::Array(rc) = &mut *b {
+                        let mut arr = rc.borrow_mut();
+                        if append {
+                            arr.push(newv.clone());
+                        } else {
+                            let key = key.map(|k| to_key(&k)).unwrap_or(to_key(&newv));
+                            arr.set(key, newv.clone());
+                        }
+                    }
+                }
             }
             Late::Static { class, pn } => {
                 let c = self.static_prop_named(&class, &pn)?;
-                *c.borrow_mut() = newv.clone();
+                // Static prop writes coerce to the declared type like
+                // instance props (typed_properties_023).
+                if let Ok((cls, _)) = self.member_class_of(&class) {
+                    if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pn) {
+                        newv = self.prop_typed_write_check(&pd, &dcls, newv)?;
+                    }
+                }
+                let nv = self.typed_slot_store(&c, newv.clone())?;
+                *c.borrow_mut() = nv;
             }
             Late::Keyed { e, keys } => {
                 newv = self.assign_index_path(&e, &keys, newv)?;
             }
             Late::None => match target_cell {
                 Some(c) => {
-                    *c.borrow_mut() = newv.clone();
+                    let nv = self.typed_slot_store(&c, newv.clone())?;
+                    *c.borrow_mut() = nv;
                 }
                 None => self.store(target, newv.clone())?,
             },
@@ -4450,6 +5538,14 @@ impl<'a> Interp<'a> {
     /// Evaluate a call expression, keeping the callee's returned cell when the
     /// function was declared `&name()` (returns by reference).
     fn eval_call_cell(&mut self, e: &Expr) -> Result<(Cell, bool), PhpError> {
+        let (c, was_ref) = self.eval_call_cell_inner(e)?;
+        if was_ref {
+            self.ref_cells.insert(Rc::as_ptr(&c) as usize);
+        }
+        Ok((c, was_ref))
+    }
+
+    fn eval_call_cell_inner(&mut self, e: &Expr) -> Result<(Cell, bool), PhpError> {
         self.last_ret_cell = None;
         self.last_call_by_ref = false;
         let v = self.eval(e)?;
@@ -4464,6 +5560,9 @@ impl<'a> Interp<'a> {
 
     /// `$target =& $cell`
     fn bind_cell(&mut self, target: &Expr, src: Cell) -> Result<(), PhpError> {
+        // `=&` creates Zend's IS_REFERENCE — writes through it say
+        // "a reference held by property", not "property" (034/078).
+        self.ref_cells.insert(Rc::as_ptr(&src) as usize);
         match target {
             Expr::Var(n) => {
                 // Binding an array by `=&` marks it referenced: later writes
@@ -4546,17 +5645,100 @@ impl<'a> Interp<'a> {
                         if let Value::Array(rc) = &*src.borrow() {
                             rc.borrow_mut().is_ref = true;
                         }
+                        // Binding a ref into a TYPED prop validates the
+                        // source (076/068 conflict); the shared cell
+                        // then stays gated through typed_slots (071).
+                        let mut merged: Option<Vec<String>> = None;
+                        let mut owner_ty: Option<Vec<String>> = None;
+                        if let Some((pd, dcls)) = self.decl_prop(o, &pn) {
+                            if let Some(pt) = &pd.ty {
+                                owner_ty = Some(pt.clone());
+                                merged = Some(self.bind_typed_check(&pd, &dcls, &src)?);
+                            }
+                        }
                         let key = self.obj_prop_key(o, &pn).unwrap_or_else(|| pn.clone());
                         let mut ob = o.borrow_mut();
                         if !ob.prop_order.contains(&key) {
                             ob.prop_order.push(key.clone());
                         }
-                        ob.props.insert(key, src);
+                        ob.props.insert(key.clone(), src.clone());
+                        drop(ob);
+                        if let (Some(m), Some((_, dcls))) = (merged, self.decl_prop(o, &pn)) {
+                            let sptr = Rc::as_ptr(&src) as usize;
+                            // The FIRST owner is the ref's holder for
+                            // "held by property X of type T" messages —
+                            // later merges only narrow slot_merged.
+                            self.typed_slots.entry(sptr).or_insert_with(|| {
+                                (src.clone(), m.clone(), dcls.name().to_string(), pn.clone())
+                            });
+                            self.slot_anchor
+                                .entry(sptr)
+                                .or_insert_with(|| SlotAnchor::Obj(Rc::downgrade(o), key.clone()));
+                            self.slot_merged.insert(sptr, m);
+                            // Owners keep their *declared* type — a
+                            // shared write must satisfy each and yield
+                            // one consistent result.
+                            let ot = owner_ty.unwrap_or_default();
+                            let dcn = dcls.name().to_string();
+                            let owners = self.slot_owners.entry(sptr).or_default();
+                            if !owners
+                                .iter()
+                                .any(|(_, cn, pn2, _)| cn == &dcn && pn2 == &pn)
+                            {
+                                owners.push((
+                                    ot,
+                                    dcn,
+                                    pn.clone(),
+                                    SlotAnchor::Obj(Rc::downgrade(o), key.clone()),
+                                ));
+                            }
+                        }
                         return Ok(());
                     }
                 }
                 let c = self.eval_cell(target)?;
                 *c.borrow_mut() = src.borrow().clone();
+                Ok(())
+            }
+            Expr::StaticProp { class, name } => {
+                let pn = self.prop_name(name)?;
+                let (cls, _t) = self.member_class_of(class)?;
+                self.statics_init(&cls);
+                let mut merged: Option<Vec<String>> = None;
+                if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pn) {
+                    if pd.ty.is_some() {
+                        // Binding a ref to a typed static validates the
+                        // source (catchable TypeError — 068/069); the
+                        // cell then stays gated via typed_slots.
+                        merged = Some(self.bind_typed_check(&pd, &dcls, &src)?);
+                    }
+                }
+                cls.statics.borrow_mut().insert(pn.clone(), src.clone());
+                if let (Some(m), Some((pd, dcls))) = (merged, self.find_static_prop_decl(&cls, &pn))
+                {
+                    let sptr = Rc::as_ptr(&src) as usize;
+                    self.typed_slots.entry(sptr).or_insert_with(|| {
+                        (src.clone(), m.clone(), dcls.name().to_string(), pn.clone())
+                    });
+                    self.slot_anchor.entry(sptr).or_insert_with(|| {
+                        SlotAnchor::Statics(dcls.name().to_string(), pn.clone())
+                    });
+                    self.slot_merged.insert(sptr, m);
+                    let ot = pd.ty.clone().unwrap_or_default();
+                    let dcn = dcls.name().to_string();
+                    let owners = self.slot_owners.entry(sptr).or_default();
+                    if !owners
+                        .iter()
+                        .any(|(_, cn, pn2, _)| cn == &dcn && pn2 == &pn)
+                    {
+                        owners.push((
+                            ot,
+                            dcn,
+                            pn.clone(),
+                            SlotAnchor::Statics(dcls.name().to_string(), pn.clone()),
+                        ));
+                    }
+                }
                 Ok(())
             }
             Expr::VarVar(..) => {
@@ -4587,7 +5769,19 @@ impl<'a> Interp<'a> {
             Expr::Index { e, i } => self.set_index(e, i.as_deref(), v),
             Expr::StaticProp { class, name } => {
                 let c = self.static_prop_cell(class, name)?;
-                *c.borrow_mut() = v;
+                let (cls, _) = self.member_class_of(class)?;
+                let pname = self.prop_name(name)?;
+                // The stored cell may be a `=&`-bound cell shared with a
+                // DIFFERENT typed prop — typed_slots gates that write
+                // (typed_properties_107).
+                if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pname) {
+                    let v2 = self.prop_typed_write_check(&pd, &dcls, v)?;
+                    let nv = self.typed_slot_store(&c, v2)?;
+                    *c.borrow_mut() = nv;
+                } else {
+                    let nv = self.typed_slot_store(&c, v)?;
+                    *c.borrow_mut() = nv;
+                }
                 Ok(())
             }
             Expr::List(items) => {
@@ -4630,19 +5824,90 @@ impl<'a> Interp<'a> {
             } => {
                 let pn = self.prop_name(name)?;
                 let ov = self.eval(obj)?;
-                self.store_prop(ov, &pn, v)
+                self.store_prop(ov, &pn, v).map(|_| ())
             }
             _ => self.fail(PhpError::fatal("Cannot assign to this expression", 0)),
         }
     }
 
     /// Write `$ov->$pn = v` — private-slot, `__set` or dynamic-prop rules.
-    fn store_prop(&mut self, ov: Value, pn: &str, mut v: Value) -> Result<(), PhpError> {
+    /// Write `$ov->$pn = v`; returns the STORED value (typed props
+    /// coerce — the assign expr yields the coerced result, 077).
+    /// `$cell[] = v` / `$cell[k] = v` on a null typed slot: Zend
+    /// auto-initializes an array only when `array` fits the merged
+    /// member type; otherwise `Cannot auto-initialize an array inside
+    /// ...` TypeError and a just-materialized slot reverts to
+    /// uninitialized (typed_properties_083).
+    fn auto_init_gate(&mut self, c: &Cell) -> Result<(), PhpError> {
+        let ptr = Rc::as_ptr(c) as usize;
+        self.prune_typed_slot(ptr);
+        let gated = self
+            .slot_merged
+            .get(&ptr)
+            .cloned()
+            .or_else(|| self.typed_slots.get(&ptr).map(|(_, t, _, _)| t.clone()));
+        let Some(tys) = gated else {
+            return Ok(());
+        };
+        if tys.iter().any(|m| self.ty_member_is_a("array", m)) {
+            *c.borrow_mut() = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+            return Ok(());
+        }
+        let (cn, pn) = self
+            .typed_slots
+            .get(&ptr)
+            .map(|(_, _, n, p)| (n.clone(), p.clone()))
+            .unwrap_or_default();
+        let where_ = if self.ref_cells.contains(&ptr) {
+            "a reference held by property"
+        } else {
+            "property"
+        };
+        let msg = format!(
+            "Cannot auto-initialize an array inside {} {}::${} of type {}",
+            where_,
+            cn,
+            pn,
+            ty_disp(&tys)
+        );
+        // A slot materialized for this write goes back to
+        // uninitialized — reads must still raise the uninit Error.
+        if self.last_fresh_cell == Some(ptr) {
+            if let Some(anc) = self.slot_anchor.get(&ptr).cloned() {
+                match anc {
+                    SlotAnchor::Obj(w, key) => {
+                        if let Some(o) = w.upgrade() {
+                            o.borrow_mut().props.remove(&key);
+                        }
+                    }
+                    SlotAnchor::Statics(ccn, ppn) => {
+                        if let Some(cc) = self.classes.get(&ccn.to_lowercase()) {
+                            cc.statics.borrow_mut().remove(&ppn);
+                        }
+                    }
+                    SlotAnchor::None => {}
+                }
+            }
+            self.typed_slots.remove(&ptr);
+            self.slot_anchor.remove(&ptr);
+            self.slot_owners.remove(&ptr);
+            self.slot_merged.remove(&ptr);
+            self.last_fresh_cell = None;
+        }
+        let mut e = PhpError::uncaught("TypeError", msg, 0);
+        e.thrown_line = Some(self.cur_line);
+        self.fail(e)
+    }
+
+    fn store_prop(&mut self, ov: Value, pn: &str, mut v: Value) -> Result<Value, PhpError> {
         match ov {
             Value::Object(o) => {
                 if !self.in_own_hook(&o, pn) {
                     if let Some((pd, hs)) = self.hooked_prop(&o, pn) {
-                        return self.hook_write(&o, &pd, &hs, v);
+                        {
+                            self.hook_write(&o, &pd, &hs, v.clone())?;
+                            return Ok(v);
+                        }
                     }
                     if let Some((pd, dcls)) = self.decl_prop(&o, pn) {
                         if let Some(sv) = pd.set_vis {
@@ -4704,18 +5969,34 @@ impl<'a> Interp<'a> {
                 let cls = o.borrow().class.clone();
                 if let Some(k) = k {
                     let mut ob = o.borrow_mut();
-                    if !ob.prop_order.contains(&k) {
-                        ob.prop_order.push(k.clone());
+                    // Write into the existing slot — a `&`-bound
+                    // reference must see the update (typed_properties_010).
+                    if let Some(existing) = ob.props.get(&k) {
+                        let existing = existing.clone();
+                        drop(ob);
+                        // The slot may be shared with a DIFFERENT typed
+                        // prop via `=&` — that prop's type still gates
+                        // the write (typed_properties_062).
+                        let nv = self.typed_slot_store(&existing, v)?;
+                        *existing.borrow_mut() = nv.clone();
+                        v = nv;
+                    } else {
+                        if !ob.prop_order.contains(&k) {
+                            ob.prop_order.push(k.clone());
+                        }
+                        ob.props.insert(k, cell(v.clone()));
                     }
-                    ob.props.insert(k, cell(v));
-                    Ok(())
+                    Ok(v)
                 } else if cls.find_method("__set").is_some() {
                     self.method_invoke(
                         o.clone(),
                         "__set",
-                        CallArgs::positional(vec![cell(Value::str(pn.to_string())), cell(v)]),
+                        CallArgs::positional(vec![
+                            cell(Value::str(pn.to_string())),
+                            cell(v.clone()),
+                        ]),
                     )?;
-                    Ok(())
+                    Ok(v)
                 } else {
                     // E_DEPRECATED on first write to an undeclared prop
                     // (PHP 8.2+; stdClass is exempt).
@@ -4746,8 +6027,8 @@ impl<'a> Interp<'a> {
                     if !ob.prop_order.contains(&pn) {
                         ob.prop_order.push(pn.clone());
                     }
-                    ob.props.insert(pn, cell(v));
-                    Ok(())
+                    ob.props.insert(pn, cell(v.clone()));
+                    Ok(v)
                 }
             }
             _ => {
@@ -4756,7 +6037,7 @@ impl<'a> Interp<'a> {
                     pn,
                     ov.gettype()
                 ))?;
-                Ok(())
+                Ok(Value::Null)
             }
         }
     }
@@ -4783,9 +6064,17 @@ impl<'a> Interp<'a> {
         keys: &[Option<Value>],
         v: Value,
     ) -> Result<Value, PhpError> {
+        self.last_fresh_cell = None;
         let mut c = self.eval_cell(e)?;
         let last = keys.len() - 1;
         for (n, k) in keys.iter().enumerate() {
+            // Auto-init gate: writing through a typed slot that is
+            // null (or a just-materialized uninit slot) must produce
+            // `Cannot auto-initialize an array inside property ...`
+            // unless its type accepts an array (typed_properties_083).
+            if matches!(&*c.borrow(), Value::Null) {
+                self.auto_init_gate(&c)?;
+            }
             // ArrayAccess object offset path: `$o[k]` dispatches to
             // offsetSet/offsetGet instead of writing through a cell.
             let as_obj = {
@@ -4822,7 +6111,10 @@ impl<'a> Interp<'a> {
             match self.index_into_key(c.clone(), k.clone()) {
                 Ok(nc) => {
                     if n == last {
-                        *nc.borrow_mut() = v.clone();
+                        // `$ref[k] = v` where the element cell is bound to
+                        // a typed prop stays type-gated (064).
+                        let nv = self.typed_slot_store(&nc, v.clone())?;
+                        *nc.borrow_mut() = nv;
                         return Ok(v);
                     }
                     c = nc;
@@ -5056,6 +6348,25 @@ impl<'a> Interp<'a> {
             }
             _ => self.fail(PhpError::fatal("Cannot use expression as array", 0)),
         }
+    }
+
+    /// Writable array handle for by-ref builtin args: PHP COW-separates
+    /// a shared array at the callee boundary, so a builtin mutating
+    /// `&$array` replaces the caller's slot with a private copy while
+    /// other variables keep the old contents. is_ref arrays (true `=&`
+    /// bindings) write through to every alias instead.
+    pub fn arr_mut(&self, c: &Cell) -> Option<Rc<RefCell<PhpArray>>> {
+        let mut b = c.borrow_mut();
+        if let Value::Array(rc) = &mut *b {
+            if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
+                let fresh = rc.borrow().clone();
+                *b = Value::Array(Rc::new(RefCell::new(fresh)));
+            }
+            if let Value::Array(rc) = &*b {
+                return Some(rc.clone());
+            }
+        }
+        None
     }
 
     /// Index into `c`'s array value, taking a cell for `key`/`[]`.
@@ -5297,8 +6608,19 @@ impl<'a> Interp<'a> {
                 if let Some(c) = self.var_cell_opt(name) {
                     let mut b = c.borrow_mut();
                     if let Value::Array(rc) = &mut *b {
-                        if let Some(k) = key {
-                            rc.borrow_mut().unset(&to_key(&k));
+                        // `unset($copy[$k])` must cow-separate a shared
+                        // array like a write does — PHP copies `$a = $b`
+                        // lazily; mutating the shared table would corrupt
+                        // the source (InputDefinition::parseArgument
+                        // unsets on its own copy of getArguments()).
+                        if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
+                            let fresh = rc.borrow().clone();
+                            *b = Value::Array(Rc::new(RefCell::new(fresh)));
+                        }
+                        if let Value::Array(rc) = &*b {
+                            if let Some(k) = key {
+                                rc.borrow_mut().unset(&to_key(&k));
+                            }
                         }
                     }
                 }
@@ -5321,8 +6643,14 @@ impl<'a> Interp<'a> {
                 if let Ok(c) = self.index_cell(inner, ii.as_deref()) {
                     let mut b = c.borrow_mut();
                     if let Value::Array(rc) = &mut *b {
-                        if let Some(k) = key {
-                            rc.borrow_mut().unset(&to_key(&k));
+                        if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
+                            let fresh = rc.borrow().clone();
+                            *b = Value::Array(Rc::new(RefCell::new(fresh)));
+                        }
+                        if let Value::Array(rc) = &*b {
+                            if let Some(k) = key {
+                                rc.borrow_mut().unset(&to_key(&k));
+                            }
                         }
                     }
                 }
@@ -5332,11 +6660,248 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// The write result one typed-slot owner would produce — exact
+    /// match widens `int` into a `float` member, weak files coerce;
+    /// `None` when the type can't be satisfied (union_types/prop_ref_assign).
+    fn slot_write_one(&mut self, tys: &[String], v: &Value) -> Result<Option<Value>, PhpError> {
+        if self.ty_exact(tys, v) {
+            if tys.iter().any(|t| t.eq_ignore_ascii_case("float")) {
+                if let Value::Int(i) = v {
+                    return Ok(Some(Value::Float(*i as f64)));
+                }
+            }
+            return Ok(Some(v.clone()));
+        }
+        if !self.exec_file_strict() {
+            // Object with __toString coerces into a `string` slot (107).
+            if let Value::Object(o) = v {
+                if tys.iter().any(|t| t.eq_ignore_ascii_case("string"))
+                    && (self
+                        .find_method_in(&o.borrow().class, "__tostring")
+                        .is_some()
+                        || self
+                            .find_method_in(&o.borrow().class, "__toString")
+                            .is_some())
+                {
+                    let sv =
+                        self.method_invoke(o.clone(), "__toString", CallArgs::positional(vec![]))?;
+                    let svs = self.conv_str(&sv)?;
+                    return Ok(Some(Value::str(svs)));
+                }
+            }
+            if let Some(cv) = weak_ty_coerce(tys, v) {
+                self.deprecate_lossy_int(tys, v, &cv);
+                return Ok(Some(cv));
+            }
+        }
+        Ok(None)
+    }
+
+    /// An owner is stale when the prop it names no longer holds this
+    /// cell — static rebinds (082), unsets, or a dead object (094).
+    fn slot_anchor_alive(&self, ptr: usize, anc: &SlotAnchor) -> bool {
+        match anc {
+            SlotAnchor::Obj(w, key) => w
+                .upgrade()
+                .map(|o| {
+                    o.borrow()
+                        .props
+                        .get(key)
+                        .map(|c| Rc::as_ptr(c) as usize == ptr)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false),
+            SlotAnchor::Statics(cn, pn) => self
+                .classes
+                .get(&cn.to_lowercase())
+                .map(|c| {
+                    c.statics
+                        .borrow()
+                        .get(pn)
+                        .map(|c2| Rc::as_ptr(c2) as usize == ptr)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false),
+            SlotAnchor::None => true,
+        }
+    }
+
+    /// Drop owners whose prop no longer points at `ptr`, then rebuild
+    /// the merged constraint from the live owners' declared types.
+    fn prune_typed_slot(&mut self, ptr: usize) {
+        let prim_dead = self
+            .slot_anchor
+            .get(&ptr)
+            .map(|a| !self.slot_anchor_alive(ptr, a))
+            .unwrap_or(false);
+        if prim_dead {
+            self.typed_slots.remove(&ptr);
+            self.slot_anchor.remove(&ptr);
+        }
+        if let Some(os) = self.slot_owners.get(&ptr) {
+            let os = os.clone();
+            let dead: Vec<usize> = os
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, _, _, a))| !self.slot_anchor_alive(ptr, a))
+                .map(|(i, _)| i)
+                .collect();
+            if !dead.is_empty() {
+                let os = self.slot_owners.get_mut(&ptr).unwrap();
+                for i in dead.into_iter().rev() {
+                    os.remove(i);
+                }
+                if os.is_empty() {
+                    self.slot_owners.remove(&ptr);
+                }
+            }
+        }
+        if let Some(os) = self.slot_owners.get(&ptr) {
+            let os = os.clone();
+            let mut acc: Vec<String> = Vec::new();
+            for (i, (t, _, _, _)) in os.iter().enumerate() {
+                acc = if i == 0 {
+                    t.clone()
+                } else {
+                    self.ty_bind_merge(&acc, t).unwrap_or_default()
+                };
+            }
+            self.slot_merged.insert(ptr, acc);
+        } else if let Some((_, t, _, _)) = self.typed_slots.get(&ptr) {
+            self.slot_merged.insert(ptr, t.clone());
+        } else {
+            self.slot_merged.remove(&ptr);
+        }
+    }
+
+    fn typed_slot_store(&mut self, c: &Cell, v: Value) -> Result<Value, PhpError> {
+        let ptr = Rc::as_ptr(c) as usize;
+        self.prune_typed_slot(ptr);
+        let owners: Vec<(Vec<String>, String, String)> =
+            if let Some(os) = self.slot_owners.get(&ptr) {
+                os.iter()
+                    .map(|(t, n, p, _)| (t.clone(), n.clone(), p.clone()))
+                    .collect()
+            } else {
+                match self
+                    .typed_slots
+                    .get(&ptr)
+                    .map(|(_, t, n, p)| (t.clone(), n.clone(), p.clone()))
+                {
+                    Some(o) => vec![o],
+                    None => return Ok(v),
+                }
+            };
+        let mut results: Vec<Option<Value>> = Vec::with_capacity(owners.len());
+        for (tys, _, _) in &owners {
+            results.push(self.slot_write_one(tys, &v)?);
+        }
+        // A value an owner rejects outright reports that owner; only
+        // all-accepted-but-divergent coercions are "inconsistent"
+        // (typed_reference).
+        let consistent = results.iter().all(|r| r.is_some())
+            && results
+                .iter()
+                .map(|r| r.clone().unwrap())
+                .all(|rv| Self::value_identical(&rv, results[0].as_ref().unwrap()));
+        if consistent {
+            return Ok(results.into_iter().next().unwrap().unwrap());
+        }
+        if let Some(bad) = results.iter().position(|r| r.is_none()) {
+            let (tys, cn, pn) = &owners[bad];
+            let where_ = if self.ref_cells.contains(&ptr) {
+                "reference held by property"
+            } else {
+                "property"
+            };
+            let mut e = PhpError::uncaught(
+                "TypeError",
+                format!(
+                    "Cannot assign {} to {} {}::${} of type {}",
+                    self.zval_type_name(&v),
+                    where_,
+                    cn,
+                    pn,
+                    ty_disp(tys)
+                ),
+                0,
+            );
+            e.thrown_line = Some(self.cur_line);
+            return self.fail(e);
+        }
+        let mut e = if owners.len() == 1 {
+            let (tys, cn, pn) = &owners[0];
+            let where_ = if self.ref_cells.contains(&ptr) {
+                "reference held by property"
+            } else {
+                "property"
+            };
+            PhpError::uncaught(
+                "TypeError",
+                format!(
+                    "Cannot assign {} to {} {}::${} of type {}",
+                    self.zval_type_name(&v),
+                    where_,
+                    cn,
+                    pn,
+                    ty_disp(tys)
+                ),
+                0,
+            )
+        } else {
+            let held: Vec<String> = owners
+                .iter()
+                .map(|(tys, cn, pn)| format!("property {}::${} of type {}", cn, pn, ty_disp(tys)))
+                .collect();
+            PhpError::uncaught(
+                "TypeError",
+                format!(
+                    "Cannot assign {} to reference held by {}, as this would result in an inconsistent type conversion",
+                    self.zval_type_name(&v),
+                    held.join(" and ")
+                ),
+                0,
+            )
+        };
+        e.thrown_line = Some(self.cur_line);
+        self.fail(e)
+    }
+
+    /// Same-type same-value — owners must agree on the *exact* result
+    /// (int(42) vs float(42.0) is inconsistent).
+    fn value_identical(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            (Value::Int(x), Value::Int(y)) => x == y,
+            (Value::Float(x), Value::Float(y)) => x == y,
+            (Value::Str(x), Value::Str(y)) => x == y,
+            (Value::Object(x), Value::Object(y)) => Rc::ptr_eq(x, y),
+            (Value::Array(x), Value::Array(y)) => Rc::ptr_eq(x, y),
+            _ => false,
+        }
+    }
+
     fn incdec(&mut self, target: &Expr, delta: i64, post: bool) -> Result<Value, PhpError> {
         // PHP warns on undefined vars/props/keys during ++/-- (bug25547).
         let old = match target {
             Expr::Var(name) => self.var_get(name).unwrap_or(Value::Null),
-            Expr::Index { e, i } => self.index_read(e, i.as_deref()).unwrap_or(Value::Null),
+            Expr::Index { e, i } => {
+                let base = self.eval(e)?;
+                let key = match i {
+                    Some(ie) => self.eval(ie)?,
+                    None => return self.fail(PhpError::fatal("[] used in read context", 0)),
+                };
+                // `++`/`--` on an ArrayAccess offset writes the by-ref
+                // offsetGet cell directly — no offsetSet call
+                // (typed_properties_065).
+                if let Value::Object(o) = &base {
+                    if self.obj_is_a(o, "ArrayAccess") {
+                        return self.incdec_aa(o.clone(), key, delta, post);
+                    }
+                }
+                self.index_read_base(base, key).unwrap_or(Value::Null)
+            }
             Expr::Prop { .. } => self.prop_read_loose(target).unwrap_or(Value::Null),
             Expr::VarVar(inner) => {
                 let n = self.eval(inner)?;
@@ -5353,8 +6918,163 @@ impl<'a> Interp<'a> {
                 ))
             }
         };
+        // Typed `int` prop can't overflow to float — a dedicated Error
+        // instead of the generic assign TypeError (typed_properties_019).
+        // The target's storage cell carries the owning prop's type —
+        // "property" when the target IS that prop, "a reference held
+        // by property" when reached through an alias/bound ref.
+        // ++/-- on an *overloaded* prop (__get/__set magic) never
+        // touches the backing cell — it reads a value and calls __set
+        // (typed_properties_061); skip the ref-cell overflow check.
+        let prop_overloaded = match target {
+            Expr::Prop { obj, name, .. } => {
+                let ov = self.eval(obj)?;
+                let pn = self.prop_name(name)?;
+                match &ov {
+                    Value::Object(o) => self.decl_prop(o, &pn).is_none(),
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if !prop_overloaded && matches!(old, Value::Int(i) if i.checked_add(delta).is_none()) {
+            let ent = self.eval_cell(target).ok().map(|c| {
+                // Unaliased count is 3 (storage + typed_slots + this
+                // temp); a `=&` bind adds a var slot -> "a reference
+                // held by" (union_types/incdec_prop).
+                let shared = Rc::strong_count(&c) > 3;
+                let e = self
+                    .typed_slots
+                    .get(&(Rc::as_ptr(&c) as usize))
+                    .map(|(cc, t, n, p)| (cc.clone(), t.clone(), n.clone(), p.clone()));
+                (shared, e)
+            });
+            if let Some((shared, Some((_, tys, cn, cpn)))) = ent {
+                if tys.iter().any(|m| m.eq_ignore_ascii_case("int"))
+                    && !tys.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                {
+                    let dir = if delta > 0 { "increment" } else { "decrement" };
+                    let bound = if delta > 0 { "maximal" } else { "minimal" };
+                    // "a reference held by" once the slot is aliased —
+                    // a `&$prop` bind makes the storage cell shared
+                    // (union_types/incdec_prop).
+                    let own = !shared
+                        && match target {
+                            Expr::Prop { name, .. } | Expr::StaticProp { name, .. } => {
+                                self.prop_name(name).map(|pn| pn == cpn).unwrap_or(false)
+                            }
+                            _ => false,
+                        };
+                    let msg = if own {
+                        format!(
+                            "Cannot {} property {}::${} of type {} past its {} value",
+                            dir,
+                            cn,
+                            cpn,
+                            ty_disp(&tys),
+                            bound
+                        )
+                    } else {
+                        format!(
+                            "Cannot {} a reference held by property {}::${} of type {} past its {} value",
+                            dir,
+                            cn,
+                            cpn,
+                            ty_disp(&tys),
+                            bound
+                        )
+                    };
+                    let mut e = PhpError::uncaught("TypeError", msg, 0);
+                    e.thrown_line = Some(self.cur_line);
+                    return self.fail(e);
+                }
+            }
+        }
         let new = self.incdec_value(&old, delta)?;
         self.store(target, new.clone())?;
+        Ok(if post { old } else { new })
+    }
+
+    /// `$o[k]++` on an ArrayAccess: `&offsetGet` hands back the real
+    /// backing cell and ++/-- writes through it (no offsetSet);
+    /// a value-returning offsetGet falls back to offsetSet
+    /// (typed_properties_065).
+    fn incdec_aa(
+        &mut self,
+        o: Rc<RefCell<PhpObject>>,
+        key: Value,
+        delta: i64,
+        post: bool,
+    ) -> Result<Value, PhpError> {
+        self.last_ret_cell = None;
+        let rv = self.method_invoke(
+            o.clone(),
+            "offsetGet",
+            CallArgs::positional(vec![cell(key.clone())]),
+        )?;
+        let rc = self.last_ret_cell.take();
+        if let Some(c) = &rc {
+            self.ref_cells.insert(Rc::as_ptr(c) as usize);
+        }
+        let old = rc.as_ref().map(|c| c.borrow().clone()).unwrap_or(rv);
+        // int-typed backing cell can't overflow to float — dedicated
+        // "past its minimal/maximal value" Error (065).
+        if let (Value::Int(iv), Some(c)) = (old.clone(), rc.clone()) {
+            if iv.checked_add(delta).is_none() {
+                let ptr = Rc::as_ptr(&c) as usize;
+                self.prune_typed_slot(ptr);
+                let owners: Vec<(Vec<String>, String, String)> = self
+                    .slot_owners
+                    .get(&ptr)
+                    .map(|os| {
+                        os.iter()
+                            .map(|(t, n, p, _)| (t.clone(), n.clone(), p.clone()))
+                            .collect()
+                    })
+                    .or_else(|| {
+                        self.typed_slots
+                            .get(&ptr)
+                            .map(|(_, t, n, p)| vec![(t.clone(), n.clone(), p.clone())])
+                    })
+                    .unwrap_or_default();
+                for (tys, cn, cpn) in &owners {
+                    if tys.iter().any(|m| m.eq_ignore_ascii_case("int"))
+                        && !tys.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                    {
+                        let dir = if delta > 0 { "increment" } else { "decrement" };
+                        let bound = if delta > 0 { "maximal" } else { "minimal" };
+                        let mut e = PhpError::uncaught(
+                            "TypeError",
+                            format!(
+                                "Cannot {} a reference held by property {}::${} of type {} past its {} value",
+                                dir,
+                                cn,
+                                cpn,
+                                ty_disp(tys),
+                                bound
+                            ),
+                            0,
+                        );
+                        e.thrown_line = Some(self.cur_line);
+                        return self.fail(e);
+                    }
+                }
+            }
+        }
+        let new = self.incdec_value(&old, delta)?;
+        match rc {
+            Some(c) => {
+                let nv = self.typed_slot_store(&c, new.clone())?;
+                *c.borrow_mut() = nv;
+            }
+            None => {
+                self.method_invoke(
+                    o,
+                    "offsetSet",
+                    CallArgs::positional(vec![cell(key), cell(new.clone())]),
+                )?;
+            }
+        }
         Ok(if post { old } else { new })
     }
 
@@ -5513,12 +7233,11 @@ impl<'a> Interp<'a> {
             "??" => {
                 // isset() semantics: undefined vars, missing offsets and
                 // uninitialized typed props fall through to the right.
-                if !self.isset_eval(l)? {
-                    return self.eval(r);
-                }
-                match self.eval(l)? {
-                    Value::Null => self.eval(r),
-                    v => Ok(v),
+                // isset_val returns the read value so calls and getters
+                // evaluate exactly once.
+                match self.isset_val(l)? {
+                    Some(v) => Ok(v),
+                    None => self.eval(r),
                 }
             }
             "." => {
@@ -5896,6 +7615,7 @@ impl<'a> Interp<'a> {
                         prop_order: order,
                         id: 0,
                         internal: None,
+                        unset_props: std::collections::HashSet::new(),
                     }))
                 }
             },
@@ -5955,7 +7675,7 @@ impl<'a> Interp<'a> {
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
                 let vals = self.arg_cells(args, &params, &format!("{}()", mn))?;
-                return self.static_invoke(cls, &mn, vals);
+                return self.static_invoke_vis(cls, &mn, vals, None);
             }
             Expr::Prop { .. } | Expr::MethodCall { .. } | Expr::Index { .. } => {
                 let v = self.eval(name)?;
@@ -6362,12 +8082,21 @@ impl<'a> Interp<'a> {
                     CallableKind::Closure(decl) => {
                         let mut frame_args = Vec::new();
                         let mut frame = Frame::new("{closure}".into());
+                        frame.fn_line = decl.line;
+                        frame.file = decl.file.clone();
                         frame.ret_by_ref = decl.by_ref;
                         for (n, cap) in &c.captures {
                             frame.vars.insert(n.clone(), cap.clone());
                         }
                         frame.this_obj = c.this_obj.clone();
                         frame.scope_class = c.scope_class.clone();
+                        // $this binds like a normal method frame —
+                        // closures defined in an object context auto-capture it.
+                        if let Some(o) = &c.this_obj {
+                            frame
+                                .vars
+                                .insert("this".to_string(), cell(Value::Object(o.clone())));
+                        }
                         frame.file = if decl.file.is_empty() {
                             self.cur_file.clone()
                         } else {
@@ -6399,7 +8128,7 @@ impl<'a> Interp<'a> {
                     CallableKind::Method { obj, class, name } => match obj {
                         Some(o) => self.method_invoke(o.clone(), name, args),
                         None => match class {
-                            Some(cls) => self.static_invoke(cls.clone(), name, args),
+                            Some(cls) => self.static_invoke(cls.clone(), name, args, None),
                             None => self.fail(PhpError::fatal("bad callable", 0)),
                         },
                     },
@@ -6414,7 +8143,7 @@ impl<'a> Interp<'a> {
                     if let Some(c) = self.resolve_class(cls) {
                         let cls = self.classes.get(&c.to_lowercase()).cloned();
                         if let Some(cls) = cls {
-                            return self.static_invoke(cls, m, args);
+                            return self.static_invoke_vis(cls, m, args, None);
                         }
                     }
                 }
@@ -6442,13 +8171,13 @@ impl<'a> Interp<'a> {
                     (Some(t), Some(mv)) => {
                         let mname = mv.to_php_string();
                         match t {
-                            Value::Object(o) => self.method_invoke(o.clone(), &mname, args),
+                            Value::Object(o) => self.method_invoke_vis(o.clone(), &mname, args),
                             Value::Str(cn) => {
                                 let cls = self
                                     .resolve_class(&crate::value::lossy(&cn))
                                     .and_then(|c| self.classes.get(&c.to_lowercase()).cloned());
                                 match cls {
-                                    Some(cls) => self.static_invoke(cls, &mname, args),
+                                    Some(cls) => self.static_invoke_vis(cls, &mname, args, None),
                                     None => self.fail(PhpError::uncaught(
                                         "Error",
                                         format!("Class \"{}\" not found", crate::value::lossy(&cn)),
@@ -6464,7 +8193,7 @@ impl<'a> Interp<'a> {
             }
             Value::Object(o) => {
                 if o.borrow().class.find_method("__invoke").is_some() {
-                    self.method_invoke(o.clone(), "__invoke", args)
+                    self.method_invoke_vis(o.clone(), "__invoke", args)
                 } else {
                     self.fail(PhpError::uncaught(
                         "Error",
@@ -6871,7 +8600,12 @@ impl<'a> Interp<'a> {
                 .unwrap_or(false),
             crate::ast::Visibility::Protected => scope
                 .as_ref()
-                .map(|s| self.is_a_str(s.name(), dc.name()))
+                .map(|s| {
+                    let proto = self.method_prototype(dc, &m.decl.name.to_lowercase());
+                    self.is_a_str(s.name(), dc.name())
+                        || self.is_a_str(dc.name(), s.name())
+                        || self.is_a_str(s.name(), &proto)
+                })
                 .unwrap_or(false),
         };
         if ok {
@@ -7024,14 +8758,27 @@ impl<'a> Interp<'a> {
 
     /// spl_autoload: invoke each registered loader until `name`
     /// resolves (resolve_class/class_of retry on miss).
-    pub fn run_autoload(&mut self, name: &str) {
+    /// An exception thrown by an autoloader propagates to the code that
+    /// triggered the load (PHP stops the chain on throw).
+    pub fn run_autoload(&mut self, name: &str) -> Result<(), PhpError> {
+        let key = name.trim_start_matches('\\').to_lowercase();
+        if !self.autoloading.insert(key.clone()) {
+            return Ok(());
+        }
         let fns = self.autoload_fns.clone();
+        let mut res = Ok(());
         for f in fns {
-            let _ = self.call_value(&f, CallArgs::positional(vec![cell(Value::str(name))]));
+            if let Err(e) = self.call_value(&f, CallArgs::positional(vec![cell(Value::str(name))]))
+            {
+                res = Err(e);
+                break;
+            }
             if self.classes.contains_key(&name.to_lowercase()) {
-                return;
+                break;
             }
         }
+        self.autoloading.remove(&key);
+        res
     }
     /// Params binding + body run for a pushed frame context (closures).
     fn bind_and_run(
@@ -7122,7 +8869,11 @@ impl<'a> Interp<'a> {
             .stack
             .last()
             .map(|f| TraceFrame {
-                function: f.fn_name.clone(),
+                function: if f.fn_name == "{closure}" {
+                    format!("{{closure:{}:{}}}", f.file, f.fn_line)
+                } else {
+                    f.fn_name.clone()
+                },
                 class: f.scope_class.as_ref().map(|c| c.name().to_string()),
                 ty: if f.this_obj.is_some() {
                     "->"
@@ -7162,7 +8913,37 @@ impl<'a> Interp<'a> {
     /// PHP's compile-time checks on typed params (tests/lang/type_hints_*):
     /// `= null` on a non-nullable type is the implicit-nullable deprecation;
     /// a scalar literal default on a class type is a fatal.
-    fn decl_type_checks(&mut self, fname: &str, decl: &FunctionDecl) -> Result<(), PhpError> {
+    /// `#[ReturnTypeWillChange]` is method-only — any other target is
+    /// a compile fatal (variance/return_type_will_change_*).
+    fn check_rtwc_attr(
+        &self,
+        attrs: &[crate::ast::AttrDecl],
+        target: &str,
+    ) -> Result<(), PhpError> {
+        for a in attrs {
+            let short = a.name.rsplit('\\').next().unwrap_or(&a.name);
+            if short.eq_ignore_ascii_case("ReturnTypeWillChange") {
+                return Err(PhpError::compile_fatal(
+                    format!(
+                        "Attribute \"ReturnTypeWillChange\" cannot target {} (allowed targets: method)",
+                        target
+                    ),
+                    a.line,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn decl_type_checks(
+        &mut self,
+        fname: &str,
+        decl: &FunctionDecl,
+        cls_ctx: Option<(&str, Option<String>)>,
+    ) -> Result<(), PhpError> {
+        if cls_ctx.is_none() {
+            self.check_rtwc_attr(&decl.attrs, "function")?;
+        }
         let builtins = [
             "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed",
             "void", "never", "false", "true", "self", "parent", "static", "null",
@@ -7171,7 +8952,11 @@ impl<'a> Interp<'a> {
         for p in &decl.params {
             let Some(ty) = &p.ty else { continue };
             self.cur_line = decl.line;
-            let nullable = ty.iter().any(|m| m.eq_ignore_ascii_case("null"));
+            // `mixed` already spans null (and `?mixed` is a parse error),
+            // so `mixed $x = null` is never the implicit-nullable case.
+            let nullable = ty
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case("null") || m.eq_ignore_ascii_case("mixed"));
             let null_default = match &p.default {
                 Some(Expr::Null) => true,
                 Some(Expr::Const(c)) => c.eq_ignore_ascii_case("null"),
@@ -7179,28 +8964,64 @@ impl<'a> Interp<'a> {
             };
             match &p.default {
                 _ if null_default => {
-                    if !nullable {
+                    if !nullable
+                        && self
+                            .dep_seen
+                            .insert(format!("{}\0{}\0{}", decl.file, decl.line, p.name))
+                    {
                         self.deprecated(&format!(
                             "{}(): Implicitly marking parameter ${} as nullable is deprecated, the explicit nullable type must be used instead",
                             fname, p.name
                         ))?;
                     }
                 }
-                Some(Expr::Int(_)) | Some(Expr::Float(_)) | Some(Expr::Str(_))
-                | Some(Expr::Bool(_)) => {
+                Some(Expr::Int(_))
+                | Some(Expr::Float(_))
+                | Some(Expr::Str(_))
+                | Some(Expr::Bool(_))
+                | Some(Expr::Interp(_)) => {
+                    // An Interp made of only literal parts is still a
+                    // string literal default (`"x"` lexes as Interp);
+                    // one with real interpolations isn't a literal.
+                    let literal_interp = !matches!(
+                        &p.default,
+                        Some(Expr::Interp(parts)) if !parts
+                            .iter()
+                            .all(|p| matches!(p, crate::lexer::StringPart::Lit(_)))
+                    );
                     let kind = match p.default {
                         Some(Expr::Int(_)) => "int",
                         Some(Expr::Float(_)) => "float",
-                        Some(Expr::Str(_)) => "string",
+                        Some(Expr::Str(_)) | Some(Expr::Interp(_)) => "string",
                         _ => "bool",
                     };
-                    let mut disp = ty.clone();
+                    if !literal_interp {
+                        if let Some(ty) = &p.ty {
+                            if let Err(e) = self.check_ty_redundant(ty, &cls_ctx) {
+                                self.cur_line = saved;
+                                return Err(e);
+                            }
+                        }
+                        continue;
+                    }
+                    let mut disp = Self::zpp_ty_disp(ty);
                     disp.retain(|m| !m.eq_ignore_ascii_case("null"));
                     let tn = disp.join("|");
-                    if disp
+                    // A literal default must satisfy a member EXACTLY —
+                    // the only widening is int -> float
+                    // (scalar_float_with_invalid_default).
+                    let lit_ok = disp
                         .iter()
-                        .any(|m| !builtins.contains(&m.to_lowercase().as_str()))
-                    {
+                        .all(|m| builtins.contains(&m.to_lowercase().as_str()))
+                        && match kind {
+                            "int" => disp.iter().any(|m| {
+                                m.eq_ignore_ascii_case("int") || m.eq_ignore_ascii_case("float")
+                            }),
+                            "float" => disp.iter().any(|m| m.eq_ignore_ascii_case("float")),
+                            "string" => disp.iter().any(|m| m.eq_ignore_ascii_case("string")),
+                            _ => disp.iter().any(|m| m.eq_ignore_ascii_case("bool")),
+                        };
+                    if !lit_ok {
                         self.cur_line = saved;
                         return Err(PhpError::fatal(
                             format!(
@@ -7213,28 +9034,376 @@ impl<'a> Interp<'a> {
                 }
                 _ => {}
             }
+            if let Some(ty) = &p.ty {
+                if let Err(e) = self.check_ty_redundant(ty, &cls_ctx) {
+                    self.cur_line = saved;
+                    return Err(e);
+                }
+            }
+        }
+        if let Some(ty) = &decl.ret {
+            if let Err(e) = self.check_ty_redundant(ty, &cls_ctx) {
+                self.cur_line = saved;
+                return Err(e);
+            }
+            // `return;` (or any `return` under `never`) is a compile
+            // error in typed functions — generators are exempt
+            // (typed_return_without_value, never).
+            if !Self::decl_contains_yield(&decl.body) {
+                let never = ty.iter().any(|m| m.eq_ignore_ascii_case("never"));
+                let void = ty.iter().all(|m| m.eq_ignore_ascii_case("void"));
+                if never {
+                    if let Some(l) = Self::first_return_line(&decl.body, decl.line, false) {
+                        self.cur_line = saved;
+                        return Err(PhpError::compile_fatal(
+                            "A never-returning function must not return",
+                            l,
+                        ));
+                    }
+                } else if !void {
+                    if let Some(l) = Self::first_return_line(&decl.body, decl.line, true) {
+                        self.cur_line = saved;
+                        let hint = if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) {
+                            " (did you mean \"return null;\" instead of \"return;\"?)"
+                        } else {
+                            ""
+                        };
+                        return Err(PhpError::compile_fatal(
+                            format!("A function with return type must return a value{hint}"),
+                            l,
+                        ));
+                    }
+                }
+            }
         }
         self.cur_line = saved;
+        Ok(())
+    }
+
+    /// First `return`'s line within a body — `bare_only` restricts to
+    /// value-less `return;`. Nested function/closure/class bodies are
+    /// their own scope and skipped (typed_return_without_value).
+    fn first_return_line(stmts: &[Stmt], mut cur: usize, bare_only: bool) -> Option<usize> {
+        for s in stmts {
+            match s {
+                Stmt::Line(l) => cur = *l,
+                Stmt::Return(e) if e.is_none() || !bare_only => return Some(cur),
+                Stmt::Return(_) => {}
+                Stmt::Block(b) => {
+                    if let Some(l) = Self::first_return_line(b, cur, bare_only) {
+                        return Some(l);
+                    }
+                }
+                Stmt::If { then, else_, .. } => {
+                    if let Some(l) = Self::first_return_line(then, cur, bare_only)
+                        .or_else(|| Self::first_return_line(else_, cur, bare_only))
+                    {
+                        return Some(l);
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::Foreach { body, .. } => {
+                    if let Some(l) = Self::first_return_line(body, cur, bare_only) {
+                        return Some(l);
+                    }
+                }
+                Stmt::Switch { cases, .. } => {
+                    for (_, b) in cases {
+                        if let Some(l) = Self::first_return_line(b, cur, bare_only) {
+                            return Some(l);
+                        }
+                    }
+                }
+                Stmt::Try {
+                    body,
+                    catches,
+                    finally,
+                } => {
+                    if let Some(l) = Self::first_return_line(body, cur, bare_only)
+                        .or_else(|| {
+                            catches
+                                .iter()
+                                .find_map(|c| Self::first_return_line(&c.body, cur, bare_only))
+                        })
+                        .or_else(|| {
+                            finally
+                                .as_ref()
+                                .and_then(|b| Self::first_return_line(b, cur, bare_only))
+                        })
+                    {
+                        return Some(l);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Union-type redundancy rules at decl time (PHP 8.x compile
+    /// checks): iterable expands to array|Traversable; self/parent/
+    /// static resolve against the declaring class; reports the member
+    /// as written (or the expanded member it collides with).
+    fn check_ty_redundant(
+        &mut self,
+        ty: &[String],
+        cls: &Option<(&str, Option<String>)>,
+    ) -> Result<(), PhpError> {
+        for m in ty {
+            if m.contains('\\') || m.contains('&') {
+                continue;
+            }
+            let msg = match m.to_lowercase().as_str() {
+                "integer" => format!(
+                    "\"{m}\" will be interpreted as a class name. Did you mean \"int\"? Write \"\\{m}\" to suppress this warning"
+                ),
+                "double" => format!(
+                    "\"{m}\" will be interpreted as a class name. Did you mean \"float\"? Write \"\\{m}\" to suppress this warning"
+                ),
+                "boolean" => format!(
+                    "\"{m}\" will be interpreted as a class name. Did you mean \"bool\"? Write \"\\{m}\" to suppress this warning"
+                ),
+                "resource" => format!(
+                    "\"{m}\" is not a supported builtin type and will be interpreted as a class name. Write \"\\{m}\" to suppress this warning"
+                ),
+                _ => continue,
+            };
+            self.warn(&msg)?;
+        }
+        // Intersection conjuncts may only be class-like names — any
+        // builtin scalar/compound member is a compile error
+        // (invalid_types/*).
+        const NON_CLASS: &[&str] = &[
+            "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed",
+            "void", "never", "false", "true", "null", "numeric", "resource",
+        ];
+        for m in ty {
+            if !m.contains('&') {
+                continue;
+            }
+            for part in m.split('&') {
+                let p = part.trim_start_matches('\\');
+                if NON_CLASS.contains(&p.to_lowercase().as_str()) {
+                    return Err(PhpError::fatal(
+                        format!("Type {p} cannot be part of an intersection type"),
+                        self.cur_line,
+                    ));
+                }
+            }
+        }
+        // Conjunct-level dedupe inside an intersection member:
+        // `A&A` (or `A&B` where B aliases A via `use`) is redundant.
+        for m in ty {
+            if !m.contains('&') {
+                continue;
+            }
+            let mut conj: Vec<String> = Vec::new();
+            for c in m.split('&') {
+                if conj.iter().any(|x| x.eq_ignore_ascii_case(c)) {
+                    return Err(PhpError::fatal(
+                        format!("Duplicate type {} is redundant", c),
+                        self.cur_line,
+                    ));
+                }
+                conj.push(c.to_string());
+            }
+        }
+        if ty.len() < 2 {
+            return Ok(());
+        }
+        let builtins = [
+            "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed",
+            "void", "never", "false", "true", "null",
+        ];
+        // `T|object` — a class member (incl. an intersection of
+        // classes) alongside `object` is redundant
+        // (dnf_types/redundant_types/object_and_dnf_type).
+        if ty.iter().any(|m| m.eq_ignore_ascii_case("object"))
+            && ty
+                .iter()
+                .any(|m| !builtins.contains(&m.to_lowercase().as_str()))
+        {
+            return Err(PhpError::fatal(
+                format!(
+                    "Type {} contains both object and a class type, which is redundant",
+                    ty_norm_disp(ty)
+                ),
+                self.cur_line,
+            ));
+        }
+        // `A&B|A` / `(A&B&C)|(A&B)` — an intersection member is
+        // redundant when another member already covers it by name
+        // (less_restrive_type_constraint_already_present*).
+        for (i, m) in ty.iter().enumerate() {
+            if !m.contains('&') {
+                continue;
+            }
+            let conj: Vec<&str> = m.split('&').collect();
+            for (j, s) in ty.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                // Identical members are the seen-loop's "redundant
+                // with" case, not the restrictive one.
+                if m.eq_ignore_ascii_case(s) {
+                    continue;
+                }
+                let covers = if s.contains('&') {
+                    s.split('&')
+                        .all(|sc| conj.iter().any(|c| c.eq_ignore_ascii_case(sc)))
+                } else {
+                    conj.iter().any(|c| c.eq_ignore_ascii_case(s))
+                };
+                if covers {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Type {} is redundant as it is more restrictive than type {}",
+                            m, s
+                        ),
+                        self.cur_line,
+                    ));
+                }
+            }
+        }
+        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut seen_true = false;
+        let mut seen_false = false;
+        for m in ty {
+            let l = m.to_lowercase();
+            let exps: Vec<String> = if l == "iterable" {
+                vec!["array".into(), "Traversable".into()]
+            } else {
+                vec![m.clone()]
+            };
+            for e in exps {
+                // self/parent resolve for comparison only — `static`
+                // stays itself (`static|self` is not redundant;
+                // static_to_self_to_unions).
+                let cmp = {
+                    let el = e.to_lowercase();
+                    match (el.as_str(), cls.as_ref()) {
+                        ("self", Some((c, _))) => c.to_string(),
+                        ("parent", Some((_, p))) => p.clone().unwrap_or_else(|| e.clone()),
+                        _ => e.clone(),
+                    }
+                };
+                let dup = seen.iter().any(|(s, _)| {
+                    s.eq_ignore_ascii_case(&cmp)
+                        || (cmp.eq_ignore_ascii_case("false") || cmp.eq_ignore_ascii_case("true"))
+                            && s.eq_ignore_ascii_case("bool")
+                        || cmp.eq_ignore_ascii_case("closure") && s.eq_ignore_ascii_case("callable")
+                });
+                if dup {
+                    // Identical intersection members report differently
+                    // from plain dups (duplicate_class_alias_type).
+                    if cmp.contains('&') {
+                        let other = seen
+                            .iter()
+                            .find(|(s, _)| s.eq_ignore_ascii_case(&cmp))
+                            .map(|(_, w)| w.clone())
+                            .unwrap_or_else(|| e.clone());
+                        return Err(PhpError::fatal(
+                            format!("Type {} is redundant with type {}", e, other),
+                            self.cur_line,
+                        ));
+                    }
+                    if cmp.eq_ignore_ascii_case("null") {
+                        return Err(PhpError::fatal(
+                            "null cannot be marked as nullable".to_string(),
+                            self.cur_line,
+                        ));
+                    }
+                    let el = e.to_lowercase();
+                    let builtin = [
+                        "int", "float", "string", "bool", "array", "object", "callable",
+                        "iterable", "mixed", "void", "never", "false", "true", "null",
+                    ]
+                    .contains(&el.as_str());
+                    let shown = if el == "static" {
+                        e.clone()
+                    } else if ["self", "parent"].contains(&el.as_str()) {
+                        cmp.clone()
+                    } else if builtin {
+                        el.clone()
+                    } else {
+                        e.clone()
+                    };
+                    return Err(PhpError::fatal(
+                        format!("Duplicate type {} is redundant", shown),
+                        self.cur_line,
+                    ));
+                }
+                if cmp.eq_ignore_ascii_case("true") {
+                    seen_true = true;
+                }
+                if cmp.eq_ignore_ascii_case("false") {
+                    seen_false = true;
+                }
+                seen.push((cmp, e));
+            }
+        }
+        if seen_true && seen_false {
+            return Err(PhpError::fatal(
+                "Type contains both true and false, bool must be used instead".to_string(),
+                self.cur_line,
+            ));
+        }
         Ok(())
     }
 
     /// Scalar literal default check context ends; whether `v` satisfies a
     /// type member — scalar builtins pass (weak-mode coercion territory).
     fn param_type_match(&mut self, m: &str, v: &Value) -> bool {
+        // Intersection member `A&B`: every part must match
+        // (intersection_types/variance).
+        if m.contains('&') && !m.starts_with('(') {
+            let parts: Vec<String> = m.split('&').map(|p| p.to_string()).collect();
+            return parts.iter().all(|p| self.param_type_match(p, v));
+        }
         let l = m.to_lowercase();
         match l.as_str() {
             "null" => matches!(v, Value::Null),
-            "int" | "float" | "string" | "bool" | "mixed" | "void" | "never" | "false" | "true"
-            | "self" | "parent" | "static" => true,
+            "mixed" | "void" | "never" | "self" | "parent" | "static" => true,
+            "false" => matches!(v, Value::Bool(false)),
+            "true" => matches!(v, Value::Bool(true)),
+            // Weak-mode scalar params accept what coercion can convert:
+            // non-numeric strings are a TypeError, not silent (trait_type_errors).
+            "int" => match v {
+                Value::Int(_) | Value::Bool(_) => true,
+                // Out-of-range/NaN floats can't coerce -> TypeError
+                // (scalar_return_basic_64bit).
+                Value::Float(f) => {
+                    f.is_finite() && *f < 9.223372036854776e18 && *f >= -9.223372036854776e18
+                }
+                // Only well-formed numeric strings pass — `"1a"` and
+                // `"0x1A"` are a TypeError in PHP 8 weak mode.
+                Value::Str(b) => matches!(numeric(b), Numeric::Int(_) | Numeric::Float(_)),
+                _ => false,
+            },
+            "float" => match v {
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) => true,
+                Value::Str(b) => matches!(numeric(b), Numeric::Int(_) | Numeric::Float(_)),
+                _ => false,
+            },
+            "string" => match v {
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) => true,
+                // Objects coerce via __toString only — a stdClass is a
+                // TypeError, not "" (scalar_return_basic_64bit).
+                Value::Object(o) => o.borrow().class.find_method("__tostring").is_some(),
+                _ => false,
+            },
+            "bool" => matches!(
+                v,
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_)
+            ),
             "array" => matches!(v, Value::Array(_)),
             "iterable" => {
                 matches!(v, Value::Array(_))
                     || matches!(v, Value::Object(o) if self.obj_is_a(o, "Traversable"))
             }
-            "callable" => matches!(
-                v,
-                Value::Callable(_) | Value::Str(_) | Value::Object(_) | Value::Array(_)
-            ),
+            "callable" => self.is_callable_value(v),
             "object" => matches!(v, Value::Object(_)),
             // Named class/interface — instanceof check. `Closure` is
             // our Callable value's class (constexpr/default_args).
@@ -7246,11 +9415,240 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Weak-mode scalar coercion for typed params/returns: returns the
+    /// coerced value, or None when no scalar member applies (objects
+    /// pass through unchanged).
+    fn coerce_scalar(&mut self, ty: &[String], v: &Value) -> Option<Value> {
+        // A null value is never coerced to a scalar — `?T` params keep
+        // null (scalar_null). The caller's `ok` check gates the member.
+        if matches!(v, Value::Null) {
+            return if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) {
+                Some(Value::Null)
+            } else {
+                None
+            };
+        }
+        // Zend weak-union coercion preference (type_checking_weak): a
+        // numeric string picks the member matching its own kind first
+        // (`"42.0"` prefers `float`), then members are tried in scalar
+        // order int -> float -> string -> bool family. Non-scalar
+        // members never coerce.
+        let has = |n: &str| ty.iter().any(|m| m.eq_ignore_ascii_case(n));
+        let kind_flt = matches!(v, Value::Str(b) if matches!(numeric(b), Numeric::Float(_)));
+        let mut order: Vec<String> = Vec::with_capacity(4);
+        if kind_flt && has("float") {
+            order.push("float".into());
+        }
+        for n in ["int", "float", "string"] {
+            if has(n) && !order.iter().any(|o| o == n) {
+                order.push(n.into());
+            }
+        }
+        if let Some(b) = ty
+            .iter()
+            .find(|m| matches!(m.to_lowercase().as_str(), "bool" | "false" | "true"))
+        {
+            order.push(b.clone());
+        }
+        for m in &order {
+            let l = m.to_lowercase();
+            match l.as_str() {
+                "int" => match v {
+                    Value::Int(_) => return Some(v.clone()),
+                    Value::Float(f)
+                        if f.is_finite()
+                            && *f < 9.223372036854776e18
+                            && *f >= -9.223372036854776e18 =>
+                    {
+                        return Some(Value::Int(*f as i64));
+                    }
+                    Value::Bool(b) => return Some(Value::Int(*b as i64)),
+                    Value::Str(b) => match numeric(b) {
+                        Numeric::Int(i) => return Some(Value::Int(i)),
+                        Numeric::Float(f) => return Some(Value::Int(f as i64)),
+                        _ => {}
+                    },
+                    _ => {}
+                },
+                "float" => match v {
+                    Value::Float(_) => return Some(v.clone()),
+                    Value::Int(i) => return Some(Value::Float(*i as f64)),
+                    Value::Bool(b) => return Some(Value::Float(*b as i64 as f64)),
+                    Value::Str(b) => match numeric(b) {
+                        Numeric::Int(i) => return Some(Value::Float(i as f64)),
+                        Numeric::Float(f) => return Some(Value::Float(f)),
+                        _ => {}
+                    },
+                    _ => {}
+                },
+                "string" => {
+                    if let Value::Float(f) = v {
+                        if f.is_nan() {
+                            let _ = self.emit_diag(
+                                "Warning",
+                                2,
+                                "unexpected NAN value was coerced to string",
+                            );
+                        }
+                    }
+                    if let Ok(b) = self.conv_bytes(v) {
+                        return Some(Value::Str(b.into()));
+                    }
+                }
+                "bool" | "false" | "true" => {
+                    if let Value::Float(f) = v {
+                        if f.is_nan() {
+                            let _ = self.emit_diag(
+                                "Warning",
+                                2,
+                                "unexpected NAN value was coerced to bool",
+                            );
+                        }
+                    }
+                    let t = v.is_truthy();
+                    // Standalone `false`/`true` members only accept
+                    // values that coerce to exactly that bool.
+                    if l == "bool" || t == (l == "true") {
+                        return Some(Value::Bool(t));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Strict value-in-members test for the weak path: weak union
+    /// coercion only applies when the value doesn't exactly match a
+    /// member — `bool|array` + `[]` stays `[]`, `float|int` + 1 stays
+    /// int(1) (union_types/type_checking_weak, legal_default_values).
+    /// Unlike `ty_exact` (strict boundary), an int is NOT exact for
+    /// `float` — it still widens through coercion.
+    fn ty_weak_exact(&mut self, ty: &[String], v: &Value) -> bool {
+        ty.iter().any(|m| {
+            let l = m.to_lowercase();
+            match l.as_str() {
+                "int" => matches!(v, Value::Int(_)),
+                "float" => matches!(v, Value::Float(_)),
+                "string" => matches!(v, Value::Str(_)),
+                "bool" => matches!(v, Value::Bool(_)),
+                "false" => matches!(v, Value::Bool(false)),
+                "true" => matches!(v, Value::Bool(true)),
+                "null" => matches!(v, Value::Null),
+                "array" => matches!(v, Value::Array(_)),
+                "iterable" => {
+                    matches!(v, Value::Array(_))
+                        || matches!(v, Value::Object(o) if self.obj_is_a(o, "Traversable"))
+                }
+                "object" => matches!(v, Value::Object(_)),
+                "callable" => self.is_callable_value(v),
+                "mixed" | "void" | "never" | "self" | "static" | "parent" => true,
+                _ if m.contains('&') => {
+                    let ok = m
+                        .trim_start_matches('(')
+                        .trim_end_matches(')')
+                        .split('&')
+                        .all(|p| self.ty_weak_exact(&[p.to_string()], v));
+                    ok
+                }
+                _ => match v {
+                    Value::Callable(_) => m.eq_ignore_ascii_case("closure"),
+                    Value::Object(o) => self.obj_is_a(o, m),
+                    _ => false,
+                },
+            }
+        })
+    }
+
+    /// Is the currently-executing code inside a `strict_types=1` file?
+    /// (prop writes, const writes, incdec — Zend uses the writer's file.)
+    fn exec_file_strict(&self) -> bool {
+        self.stack
+            .last()
+            .map(|f| self.strict_files.contains(&f.file))
+            .unwrap_or_else(|| self.strict_files.contains(&self.cur_file))
+    }
+
+    /// Strictness for argument checks is determined by the file holding
+    /// the call site — the frame just below the callee's own.
+    fn caller_file_strict(&self) -> bool {
+        if self.stack.len() < 2 {
+            // Top-level call site: `self.globals` lives off `self.stack`,
+            // so the caller is the top-level file currently executing
+            // (`cur_file` swaps for includes mid-eval).
+            return self.strict_files.contains(&self.cur_file);
+        }
+        self.strict_files
+            .contains(&self.stack[self.stack.len() - 2].file)
+    }
+
+    /// `callable` accepts an actual callable: a Closure/FCC value, a
+    /// function-name string, a `"Class::method"` string, a `[cls|obj, m]`
+    /// pair, or an object with `__invoke` (callable_001).
+    fn is_callable_value(&mut self, v: &Value) -> bool {
+        match v {
+            Value::Callable(_) => true,
+            Value::Str(s) => {
+                let s = String::from_utf8_lossy(s).to_string();
+                if self.functions.contains_key(&s.to_lowercase())
+                    || builtins::is_builtin(&s.to_lowercase())
+                    || builtins::builtin_params(&s.to_lowercase()).is_some()
+                {
+                    return true;
+                }
+                let Some((cn, mn)) = s.split_once("::") else {
+                    return false;
+                };
+                let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() else {
+                    return false;
+                };
+                // "Class::method" strings only call statics
+                // (callable_001).
+                self.find_method_in(&c, mn)
+                    .map(|(mm, _)| mm.is_static)
+                    .unwrap_or(false)
+            }
+            Value::Object(o) => {
+                let cn = o.borrow().class.decl.name.clone();
+                let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() else {
+                    return false;
+                };
+                self.find_method_in(&c, "__invoke").is_some()
+            }
+            Value::Array(a) => {
+                let arr = a.borrow();
+                let first = arr.get(&crate::value::ArrKey::Int(0));
+                let second = arr.get(&crate::value::ArrKey::Int(1));
+                let (Some(first), Some(second)) = (first, second) else {
+                    return false;
+                };
+                let Value::Str(mn) = &second else {
+                    return false;
+                };
+                let mn = String::from_utf8_lossy(mn).to_string();
+                let (cn, need_static) = match &first {
+                    Value::Str(cn) => (String::from_utf8_lossy(cn).to_string(), true),
+                    Value::Object(o) => (o.borrow().class.decl.name.clone(), false),
+                    _ => return false,
+                };
+                let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() else {
+                    return false;
+                };
+                // [class-string, method] only calls statics; [obj, m]
+                // calls any (callable_001).
+                self.find_method_in(&c, &mn)
+                    .map(|(mm, _)| mm.is_static || !need_static)
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
     /// PHP's "given" type word in TypeError messages.
     fn zval_type_name(&self, v: &Value) -> String {
         match v {
             Value::Null => "null".into(),
-            Value::Bool(_) => "bool".into(),
+            Value::Bool(b) => if *b { "true" } else { "false" }.into(),
             Value::Int(_) => "int".into(),
             Value::Float(_) => "float".into(),
             Value::Str(_) => "string".into(),
@@ -7259,6 +9657,26 @@ impl<'a> Interp<'a> {
             Value::Callable(_) => "Closure".into(),
             Value::Resource(_) => "resource".into(),
         }
+    }
+
+    /// ZPP-style type display: `iterable` expands to `Traversable|array`
+    /// in param/return TypeErrors and default-value fatals (iterable_*).
+    fn zpp_ty_disp(ty: &[String]) -> Vec<String> {
+        ty.iter()
+            .flat_map(|m| {
+                if m.eq_ignore_ascii_case("iterable") {
+                    vec!["Traversable".to_string(), "array".to_string()]
+                } else if let Some(pos) = m.find("@anonymous$") {
+                    vec![format!("{}@anonymous", &m[..pos])]
+                } else if m.contains('&') && ty.len() > 1 {
+                    // Intersection members parenthesize inside a union
+                    // ((X&Y)|(W&Z) — dnf_2_intersection).
+                    vec![format!("({m})")]
+                } else {
+                    vec![m.clone()]
+                }
+            })
+            .collect()
     }
 
     /// Display name for a decl in diagnostics — closures are named
@@ -7294,7 +9712,15 @@ impl<'a> Interp<'a> {
             self.stack.pop();
             return self.fail(PhpError::uncaught(
                 "ArgumentCountError",
-                format!("Too few arguments to function, {} passed", args.len()),
+                format!(
+                    "Too few arguments to function {}(), {} passed in {} on line {} and {} {} expected",
+                    self.decl_fname(decl),
+                    args.len(),
+                    self.diag_file(),
+                    self.cur_line,
+                    if required == decl.params.len() { "exactly" } else { "at least" },
+                    required
+                ),
                 0,
             ));
         }
@@ -7337,6 +9763,21 @@ impl<'a> Interp<'a> {
             ) else {
                 continue;
             };
+            if p.by_ref {
+                // By-ref params bind cells, not values — the contained
+                // value isn't checked at the boundary (typed_properties_010),
+                // but weak scalar args still coerce into the caller's
+                // cell (scalar_weak_reference).
+                if !self.caller_file_strict() {
+                    let bv = a.borrow().clone();
+                    if !self.ty_weak_exact(ty, &bv) {
+                        if let Some(cv) = self.coerce_scalar(ty, &bv) {
+                            *a.borrow_mut() = cv;
+                        }
+                    }
+                }
+                continue;
+            }
             let v = a.borrow().clone();
             let implicit_null = !ty.iter().any(|m| m.eq_ignore_ascii_case("null"))
                 && match &p.default {
@@ -7345,16 +9786,55 @@ impl<'a> Interp<'a> {
                     _ => false,
                 };
             let ok = (implicit_null && matches!(v, Value::Null))
-                || ty.iter().any(|m| self.param_type_match(m, &v));
+                || if self.caller_file_strict() {
+                    self.ty_exact(ty, &v)
+                } else {
+                    ty.iter().any(|m| self.param_type_match(m, &v))
+                };
+            let caller_strict = self.caller_file_strict();
+            if ok && !caller_strict && !self.ty_weak_exact(ty, &v) {
+                if let Some(cv) = self.coerce_scalar(ty, &v) {
+                    // Arg-coercion deprecations attribute to the
+                    // callee's declaration line (scalar_basic).
+                    let pl = self.cur_line;
+                    self.cur_line = decl.line;
+                    self.deprecate_lossy_int(ty, &v, &cv);
+                    self.cur_line = pl;
+                    *a.borrow_mut() = cv;
+                }
+            }
+            // strict mode still allows the int->float widening stored
+            // back for visibility in the callee.
+            if ok
+                && caller_strict
+                && ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                && !self.ty_weak_exact(ty, &v)
+            {
+                if let Value::Int(i) = v {
+                    *a.borrow_mut() = Value::Float(i as f64);
+                }
+            }
             if !ok {
-                let fname = self.decl_fname(decl);
-                let mut disp: Vec<String> = ty
-                    .iter()
-                    .filter(|m| !m.eq_ignore_ascii_case("null"))
-                    .cloned()
-                    .collect();
+                let mut fname = self.decl_fname(decl);
+                // Anonymous-class methods report args under just the
+                // class name (union_types/anonymous_class).
+                if let Some(pos) = fname.find("@anonymous::") {
+                    fname = fname[..pos + "@anonymous".len()].into();
+                }
+                // Implicit-nullable needs the phantom `null` member so
+                // an intersection renders `(X&Y)|null`
+                // (implicit_nullable_intersection_type_error).
+                let tyv: Vec<String> = if implicit_null {
+                    let mut t = ty.to_vec();
+                    t.push("null".into());
+                    t
+                } else {
+                    ty.to_vec()
+                };
+                let mut disp: Vec<String> = Self::zpp_ty_disp(&tyv);
+                disp.retain(|m| !m.eq_ignore_ascii_case("null"));
                 if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) || implicit_null {
-                    if disp.len() == 1 {
+                    if disp.len() == 1 && !disp[0].contains('&') {
                         disp[0] = format!("?{}", disp[0]);
                     } else {
                         disp.push("null".into());
@@ -7400,12 +9880,31 @@ impl<'a> Interp<'a> {
                     argdesc
                 );
                 let call_line = self.cur_line;
+                // Frames below the call site (include/require and
+                // outer calls) join the synthetic #0 — the callee's
+                // own trace frame is the top of call_trace.
+                let mut frs = vec![frame];
+                for fr in self.call_trace.iter().rev().skip(1) {
+                    if crate::value::trace_frame_hidden(fr) {
+                        continue;
+                    }
+                    frs.push(crate::value::trace_frame_str(fr));
+                }
                 self.stack.pop();
                 let mut e = PhpError::uncaught("TypeError", msg, call_line);
-                e.trace = Some(vec![frame]);
+                e.trace = Some(frs);
                 e.thrown_line = Some(decl.line);
                 e.display_msg = Some(display);
-                return self.fail(e);
+                let r = self.fail(e);
+                if let Some(Value::Object(o)) = &self.pending_exception {
+                    if let Some(crate::value::ObjectInternal::Exception { file, .. }) =
+                        &mut o.borrow_mut().internal
+                    {
+                        *file = decl.file.clone();
+                    }
+                }
+                self.last_err_file = decl.file.clone();
+                return r;
             }
         }
         {
@@ -7488,13 +9987,76 @@ impl<'a> Interp<'a> {
                     let r = self.eval_decl_const(d, &decl.file);
                     self.const_self = old;
                     self.cur_line = prev_line;
-                    let dv = match r {
+                    let mut dv = match r {
                         Ok(v) => v,
                         Err(e) => {
                             self.stack.pop();
                             return self.fail(e);
                         }
                     };
+                    // `float $f = 0` — the int default widens to float
+                    // at bind time, even under strict_types
+                    // (scalar_float_with_integer_default_strict). In a
+                    // union this applies whenever no `int` member can
+                    // take it exactly (`float|string` = 3 -> float(3);
+                    // `int|float` = 1 stays int — legal_default_values).
+                    if let Some(ty) = &p.ty {
+                        let float_widens = ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                            && !ty.iter().any(|m| m.eq_ignore_ascii_case("int"));
+                        if float_widens {
+                            if let Value::Int(i) = &dv {
+                                dv = Value::Float(*i as f64);
+                            }
+                        }
+                        // A non-literal default (const, expr) is checked
+                        // like a passed arg — `int $a = NULL_CONST`
+                        // TypeErrors when the default binds
+                        // (scalar_constant_defaults).
+                        let implicit_null = !ty.iter().any(|m| m.eq_ignore_ascii_case("null"))
+                            && match &p.default {
+                                Some(Expr::Null) => true,
+                                Some(Expr::Const(c)) => c.eq_ignore_ascii_case("null"),
+                                _ => false,
+                            };
+                        let ok = (implicit_null && matches!(dv, Value::Null))
+                            || ty.iter().any(|m| self.param_type_match(m, &dv));
+                        if !ok {
+                            self.stack.pop();
+                            let tyv: Vec<String> = if implicit_null {
+                                let mut t = ty.to_vec();
+                                t.push("null".into());
+                                t
+                            } else {
+                                ty.to_vec()
+                            };
+                            let mut disp: Vec<String> = Self::zpp_ty_disp(&tyv);
+                            disp.retain(|m| !m.eq_ignore_ascii_case("null"));
+                            if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) || implicit_null {
+                                if disp.len() == 1 && !disp[0].contains('&') {
+                                    disp[0] = format!("?{}", disp[0]);
+                                } else {
+                                    disp.push("null".into());
+                                }
+                            }
+                            let fname = self.decl_fname(decl);
+                            let msg = format!(
+                                "{}(): Argument #{} (${}) must be of type {}, {} given, called in {} on line {}",
+                                fname,
+                                i + 1,
+                                p.name,
+                                disp.join("|"),
+                                self.zval_type_name(&dv),
+                                self.diag_file(),
+                                self.cur_line
+                            );
+                            return self.fail(PhpError::uncaught("TypeError", msg, self.cur_line));
+                        }
+                        if !self.caller_file_strict() && !self.ty_weak_exact(ty, &dv) {
+                            if let Some(cv) = self.coerce_scalar(ty, &dv) {
+                                dv = cv;
+                            }
+                        }
+                    }
                     binds.push((p.name.clone(), cell(dv)));
                 } else {
                     // Unbound required param — only reachable via named
@@ -7549,13 +10111,63 @@ impl<'a> Interp<'a> {
             for (obj, pname, v) in promoted_writes {
                 // Promoted assignment goes through prop write semantics —
                 // hooked promoted props run their set hook (gh15438_1).
-                self.store_prop(Value::Object(obj), &pname, v)?;
+                let _ = self.store_prop(Value::Object(obj), &pname, v)?;
             }
         }
         let flow = self.exec_block(&decl.body);
+        let ret_fname = self.decl_fname(decl);
         self.stack.pop();
         match flow {
-            Flow::Return(v) => Ok(v),
+            Flow::Return(v) => {
+                // In a generator body `return v` is the iterator's
+                // getReturn() payload — the declared return type binds
+                // the produced Generator object, not this value
+                // (generator_return_return_type).
+                if decl.ret.is_some() && Self::decl_contains_yield(&decl.body) {
+                    return Ok(v);
+                }
+                if let Some(ty) = &decl.ret {
+                    let ret_strict = self.strict_files.contains(&decl.file);
+                    let ok = ty
+                        .iter()
+                        .any(|m| self.param_type_match(m, &v) || m.eq_ignore_ascii_case("void"))
+                        && (!ret_strict || self.ty_exact(ty, &v));
+                    if ok {
+                        if !ret_strict && !self.ty_weak_exact(ty, &v) {
+                            match self.coerce_scalar(ty, &v) {
+                                Some(cv) => {
+                                    let pl = self.cur_line;
+                                    self.cur_line = decl.line;
+                                    self.deprecate_lossy_int(ty, &v, &cv);
+                                    self.cur_line = pl;
+                                    Ok(cv)
+                                }
+                                None => Ok(v),
+                            }
+                        } else {
+                            Ok(v)
+                        }
+                    } else {
+                        let mut disp: Vec<String> = Self::zpp_ty_disp(ty);
+                        disp.retain(|m| !m.eq_ignore_ascii_case("null"));
+                        let given = self.zval_type_name(&v);
+                        let msg = format!(
+                            "{}(): Return value must be of type {}, {} returned",
+                            ret_fname,
+                            disp.join("|"),
+                            given
+                        );
+                        let display =
+                            format!("{} and defined in {}:{}", msg, self.diag_file(), decl.line);
+                        let mut e = PhpError::uncaught("TypeError", msg, self.cur_line);
+                        e.display_msg = Some(display);
+                        e.thrown_line = Some(decl.line);
+                        self.fail(e)
+                    }
+                } else {
+                    Ok(v)
+                }
+            }
             Flow::Throw(v) => {
                 self.pending_exception = Some(v);
                 Err(PhpError {
@@ -7579,7 +10191,42 @@ impl<'a> Interp<'a> {
                 "'break' or 'continue' outside of loop or switch context",
                 0,
             )),
-            Flow::Normal => Ok(Value::Null),
+            Flow::Normal => {
+                // Falling off the end of a typed function still checks
+                // the return type: `none returned` TypeError for real
+                // types, `must not implicitly return` for `never`
+                // (typed_return*_without_value). Generators are exempt —
+                // their declared type describes the produced object.
+                if decl.ret.is_some() && Self::decl_contains_yield(&decl.body) {
+                    return Ok(Value::Null);
+                }
+                if let Some(ty) = &decl.ret {
+                    let never = ty.iter().any(|m| m.eq_ignore_ascii_case("never"));
+                    let void = ty.iter().all(|m| m.eq_ignore_ascii_case("void"));
+                    if never {
+                        let msg = format!(
+                            "{}: never-returning function must not implicitly return",
+                            ret_fname
+                        );
+                        let mut e = PhpError::uncaught("TypeError", msg, self.cur_line);
+                        e.thrown_line = Some(decl.line);
+                        return self.fail(e);
+                    }
+                    if !void {
+                        let mut disp_v = Self::zpp_ty_disp(ty);
+                        disp_v.retain(|m| !m.eq_ignore_ascii_case("null"));
+                        let disp = disp_v.join("|");
+                        let msg = format!(
+                            "{}(): Return value must be of type {}, none returned",
+                            ret_fname, disp
+                        );
+                        let mut e = PhpError::uncaught("TypeError", msg, self.cur_line);
+                        e.thrown_line = Some(decl.line);
+                        return self.fail(e);
+                    }
+                }
+                Ok(Value::Null)
+            }
         }
     }
 
@@ -7600,7 +10247,7 @@ impl<'a> Interp<'a> {
                 "ArgumentCountError",
                 format!(
                     "Too few arguments to function {}(), {} passed in {} on line {} and {} {} expected",
-                    decl.name,
+                    self.decl_fname(decl),
                     args.len(),
                     self.diag_file(),
                     self.cur_line,
@@ -7610,7 +10257,40 @@ impl<'a> Interp<'a> {
                 0,
             ));
         }
+        // A `yield`-bearing body makes the call a Generator factory:
+        // the caller gets a Generator object immediately and the body
+        // only runs when iteration first demands it.
+        if Self::decl_contains_yield(&decl.body) {
+            let dc = self.pending_decl_class.take();
+            let cc = self.pending_called_class.take();
+            return Ok(Value::Object(self.make_generator(
+                decl.clone(),
+                args,
+                this_obj,
+                scope_class,
+                dc,
+                cc,
+            )));
+        }
+        let dc = self.pending_decl_class.take();
+        let cc = self.pending_called_class.take();
+        self.invoke_fn_run(decl, args, this_obj, scope_class, dc, cc)
+    }
+
+    /// Frame push + body run — the part of invoke_fn the Generator
+    /// start path also uses (the yield check must not re-trip here).
+    fn invoke_fn_run(
+        &mut self,
+        decl: &Rc<FunctionDecl>,
+        args: CallArgs,
+        this_obj: Option<Rc<RefCell<PhpObject>>>,
+        scope_class: Option<Rc<PhpClass>>,
+        decl_class: Option<Rc<PhpClass>>,
+        called_class: Option<Rc<PhpClass>>,
+    ) -> Result<Value, PhpError> {
         let mut frame = Frame::new(decl.name.clone());
+        frame.fn_line = decl.line;
+        frame.file = decl.file.clone();
         frame.ns = decl.ns.clone();
         frame.ret_by_ref = decl.by_ref;
         if let Some(obj) = &this_obj {
@@ -7618,11 +10298,12 @@ impl<'a> Interp<'a> {
                 .vars
                 .insert("this".to_string(), cell(Value::Object(obj.clone())));
         }
-        frame.decl_class = self.pending_decl_class.take();
-        frame.called_class = self.pending_called_class.take();
+        frame.decl_class = decl_class;
+        frame.called_class = called_class;
         frame.hook_prop = self.pending_hook_prop.take();
         frame.this_obj = this_obj;
         frame.scope_class = scope_class;
+        frame.trait_origin = decl.decl_in.clone();
         frame.file = if decl.file.is_empty() {
             self.cur_file.clone()
         } else {
@@ -7632,29 +10313,675 @@ impl<'a> Interp<'a> {
         self.bind_and_run(decl, args, Vec::new())
     }
 
+    // ----- generators -----
+
+    /// Whether a function body yields — scanning skips nested closures
+    /// and function decls (each is its own generator context).
+    fn decl_contains_yield(stmts: &[Stmt]) -> bool {
+        stmts.iter().any(Self::stmt_contains_yield)
+    }
+
+    fn stmt_contains_yield(s: &Stmt) -> bool {
+        match s {
+            Stmt::Expr(e) => Self::expr_contains_yield(e),
+            Stmt::Echo(es) => es.iter().any(Self::expr_contains_yield),
+            Stmt::Return(Some(e)) => Self::expr_contains_yield(e),
+            Stmt::Block(b) => Self::decl_contains_yield(b),
+            Stmt::If { cond, then, else_ } => {
+                Self::expr_contains_yield(cond)
+                    || Self::decl_contains_yield(then)
+                    || Self::decl_contains_yield(else_)
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+                Self::expr_contains_yield(cond) || Self::decl_contains_yield(body)
+            }
+            Stmt::For {
+                init,
+                cond,
+                inc,
+                body,
+            } => {
+                init.iter()
+                    .chain(cond.iter())
+                    .chain(inc.iter())
+                    .any(Self::expr_contains_yield)
+                    || Self::decl_contains_yield(body)
+            }
+            Stmt::Foreach { arr, val, body, .. } => {
+                Self::expr_contains_yield(arr)
+                    || matches!(val, ForeachTarget::Lvalue(e) if Self::expr_contains_yield(e))
+                    || Self::decl_contains_yield(body)
+            }
+            Stmt::Switch { cond, cases } => {
+                Self::expr_contains_yield(cond)
+                    || cases.iter().any(|(c, b)| {
+                        c.as_ref().is_some_and(Self::expr_contains_yield)
+                            || Self::decl_contains_yield(b)
+                    })
+            }
+            Stmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                Self::decl_contains_yield(body)
+                    || catches.iter().any(|c| Self::decl_contains_yield(&c.body))
+                    || finally
+                        .as_ref()
+                        .is_some_and(|b| Self::decl_contains_yield(b))
+            }
+            Stmt::Static { vars, .. } => vars
+                .iter()
+                .any(|(_, e)| e.as_ref().is_some_and(Self::expr_contains_yield)),
+            Stmt::Unset(v) | Stmt::Global(v) => v.iter().any(Self::expr_contains_yield),
+            Stmt::ConstDecl(v) => v.iter().any(|(_, e)| Self::expr_contains_yield(e)),
+            Stmt::Declare { value, .. } => Self::expr_contains_yield(value),
+            // A nested `function` decl is its own generator context
+            // (its yields don't make the outer fn a generator).
+            Stmt::Function(_) | Stmt::Class(_) => false,
+            _ => false,
+        }
+    }
+
+    fn expr_contains_yield(e: &Expr) -> bool {
+        match e {
+            Expr::Yield { .. } | Expr::YieldFrom(_) => true,
+            // Nested closures/arrow fns are their own generator context.
+            Expr::Closure(_) | Expr::AnonClass(_) => false,
+            Expr::Assign { target, value, .. } => {
+                Self::expr_contains_yield(target) || Self::expr_contains_yield(value)
+            }
+            Expr::Binary { l, r, .. } => {
+                Self::expr_contains_yield(l) || Self::expr_contains_yield(r)
+            }
+            Expr::Unary { e, .. }
+            | Expr::Clone(e)
+            | Expr::ByRef(e)
+            | Expr::PreInc(e)
+            | Expr::PreDec(e)
+            | Expr::PostInc(e)
+            | Expr::PostDec(e)
+            | Expr::Empty(e)
+            | Expr::Print(e)
+            | Expr::VarVar(e)
+            | Expr::Paren(e)
+            | Expr::Fcc(e)
+            | Expr::Unpack(e)
+            | Expr::Cast { e, .. }
+            | Expr::Throw(e)
+            | Expr::Include { e, .. } => Self::expr_contains_yield(e),
+            Expr::Ternary { c, t, f } => {
+                Self::expr_contains_yield(c)
+                    || t.as_ref().is_some_and(|t| Self::expr_contains_yield(t))
+                    || Self::expr_contains_yield(f)
+            }
+            Expr::Call { name, args } => {
+                Self::expr_contains_yield(name) || args.iter().any(Self::expr_contains_yield)
+            }
+            Expr::MethodCall {
+                obj, name, args, ..
+            } => {
+                Self::expr_contains_yield(obj)
+                    || matches!(name, PropName::Expr(e) if Self::expr_contains_yield(e))
+                    || args.iter().any(Self::expr_contains_yield)
+            }
+            Expr::StaticCall { class, args, .. } => {
+                Self::expr_contains_yield(class) || args.iter().any(Self::expr_contains_yield)
+            }
+            Expr::StaticCallDyn { class, name, args } => {
+                Self::expr_contains_yield(class)
+                    || Self::expr_contains_yield(name)
+                    || args.iter().any(Self::expr_contains_yield)
+            }
+            Expr::Index { e, i } => {
+                Self::expr_contains_yield(e)
+                    || i.as_ref().is_some_and(|i| Self::expr_contains_yield(i))
+            }
+            Expr::Prop { obj, name, .. } => {
+                Self::expr_contains_yield(obj)
+                    || matches!(name, PropName::Expr(e) if Self::expr_contains_yield(e))
+            }
+            Expr::StaticProp { class, name } => {
+                Self::expr_contains_yield(class)
+                    || matches!(name, PropName::Expr(e) if Self::expr_contains_yield(e))
+            }
+            Expr::Isset(v) => v.iter().any(Self::expr_contains_yield),
+            Expr::List(v) => v.iter().flatten().any(Self::expr_contains_yield),
+            Expr::Exit(Some(e)) => Self::expr_contains_yield(e),
+            Expr::ArrayLit(items) => items.iter().any(|(k, v)| {
+                k.as_ref().is_some_and(Self::expr_contains_yield) || Self::expr_contains_yield(v)
+            }),
+            Expr::Match { subject, arms } => {
+                Self::expr_contains_yield(subject)
+                    || arms.iter().any(|a| {
+                        a.conds.iter().any(Self::expr_contains_yield)
+                            || Self::expr_contains_yield(&a.result)
+                    })
+            }
+            Expr::New { class, args } => {
+                Self::expr_contains_yield(class) || args.iter().any(Self::expr_contains_yield)
+            }
+            Expr::ClassConst { class, .. } => Self::expr_contains_yield(class),
+            Expr::Instanceof { obj, class } => {
+                Self::expr_contains_yield(obj) || Self::expr_contains_yield(class)
+            }
+            _ => false,
+        }
+    }
+
+    /// Build the deferred Generator object for a yielding call.
+    fn make_generator(
+        &mut self,
+        decl: Rc<FunctionDecl>,
+        args: CallArgs,
+        this_obj: Option<Rc<RefCell<PhpObject>>>,
+        scope_class: Option<Rc<PhpClass>>,
+        decl_class: Option<Rc<PhpClass>>,
+        called_class: Option<Rc<PhpClass>>,
+    ) -> Rc<RefCell<PhpObject>> {
+        let by_ref = decl.by_ref;
+        let state = Rc::new(RefCell::new(GenState {
+            setup: GenSetup::Invoke {
+                decl,
+                args,
+                this_obj,
+                scope_class,
+                decl_class,
+                called_class,
+            },
+            items: Vec::new(),
+            pos: 0,
+            started: false,
+            finished: false,
+            return_val: Value::Null,
+            by_ref,
+            auto_key: 0,
+            sends: Vec::new(),
+        }));
+        let cls = self
+            .classes
+            .get("generator")
+            .cloned()
+            .expect("Generator class registered");
+        self.alloc_obj(PhpObject {
+            class: cls,
+            props: HashMap::new(),
+            prop_order: Vec::new(),
+            id: 0,
+            internal: Some(ObjectInternal::Generator(state)),
+            unset_props: std::collections::HashSet::new(),
+        })
+    }
+
+    /// Run a not-yet-started generator body to completion, collecting
+    /// every yield into `state.items`. PHP defers body execution to the
+    /// first iterator access, which this mirrors (eager collection on
+    /// first use).
+    fn gen_start(&mut self, state: &Rc<RefCell<GenState>>) -> Result<(), PhpError> {
+        let (setup, sends) = {
+            let mut st = state.borrow_mut();
+            if st.started {
+                return Ok(());
+            }
+            st.started = true;
+            let setup = match &st.setup {
+                GenSetup::Invoke {
+                    decl,
+                    this_obj,
+                    scope_class,
+                    decl_class,
+                    called_class,
+                    ..
+                } => (
+                    decl.clone(),
+                    this_obj.clone(),
+                    scope_class.clone(),
+                    decl_class.clone(),
+                    called_class.clone(),
+                ),
+            };
+            (setup, st.sends.clone())
+        };
+        let (decl, this_obj, scope_class, decl_class, called_class) = setup;
+        // Re-evaluating stored arg cells is unnecessary — bind_and_run
+        // consumes the cells captured at call time.
+        let args = {
+            let mut st = state.borrow_mut();
+            match &mut st.setup {
+                GenSetup::Invoke { args, .. } => std::mem::replace(args, CallArgs::empty()),
+            }
+        };
+        let items = Rc::new(RefCell::new(Vec::new()));
+        let saved_sink = self.gen_sink.replace(items.clone());
+        let saved_sends = std::mem::replace(&mut self.gen_sends, sends.into_iter().collect());
+        let saved_auto = std::mem::replace(&mut self.gen_auto, 0);
+        let r = self.invoke_fn_run(&decl, args, this_obj, scope_class, decl_class, called_class);
+        self.gen_sink = saved_sink;
+        self.gen_sends = saved_sends;
+        self.gen_auto = saved_auto;
+        let collected = std::mem::take(&mut *items.borrow_mut());
+        let mut st = state.borrow_mut();
+        st.items = collected;
+        st.finished = true;
+        match r {
+            Ok(rv) => {
+                st.return_val = rv;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// SplFileInfo / DirectoryIterator native methods. SplFileInfo
+    /// state is a `\0fi\0path` prop; DirectoryIterator additionally
+    /// carries a DirIter internal (sorted dir entries + cursor).
+    fn spl_method(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        name: &str,
+        args: &CallArgs,
+    ) -> Result<Option<Value>, PhpError> {
+        let lname = name.to_lowercase();
+        match lname.as_str() {
+            "__construct" => {
+                let path_v = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let path = self.conv_str(&path_v)?.to_string();
+                let is_iter = matches!(
+                    obj.borrow().class.name().to_lowercase().as_str(),
+                    "directoryiterator" | "filesystemiterator"
+                );
+                if is_iter {
+                    let mut entries: Vec<String> = Vec::new();
+                    match std::fs::read_dir(&path) {
+                        Ok(rd) => {
+                            for e in rd.flatten() {
+                                let n = e.file_name().to_string_lossy().to_string();
+                                if n == "." || n == ".." {
+                                    continue;
+                                }
+                                entries.push(format!("{}/{}", path.trim_end_matches('/'), n));
+                            }
+                            entries.sort();
+                        }
+                        Err(_) => {
+                            return self.fail::<Option<Value>>(PhpError::uncaught(
+                                "UnexpectedValueException",
+                                format!(
+                                    "DirectoryIterator::__construct({}): failed to open dir",
+                                    path
+                                ),
+                                0,
+                            ));
+                        }
+                    }
+                    let mut ob = obj.borrow_mut();
+                    ob.props
+                        .insert("\0fi\0path".into(), cell(Value::str(&path)));
+                    ob.internal = Some(ObjectInternal::DirIter { entries, pos: 0 });
+                } else {
+                    obj.borrow_mut()
+                        .props
+                        .insert("\0fi\0path".into(), cell(Value::str(&path)));
+                }
+                Ok(Some(Value::Null))
+            }
+            "rewind" => {
+                if let Some(ObjectInternal::DirIter { pos, .. }) = &mut obj.borrow_mut().internal {
+                    *pos = 0;
+                }
+                Ok(Some(Value::Null))
+            }
+            "valid" => Ok(Some(Value::Bool(match &obj.borrow().internal {
+                Some(ObjectInternal::DirIter { entries, pos }) => *pos < entries.len(),
+                _ => false,
+            }))),
+            "current" => {
+                // PHP yields SplFileInfo instances for each entry.
+                let path = match &obj.borrow().internal {
+                    Some(ObjectInternal::DirIter { entries, pos }) if *pos < entries.len() => {
+                        Some(entries[*pos].clone())
+                    }
+                    _ => None,
+                };
+                match path {
+                    Some(p) => {
+                        let v = self.instantiate("splfileinfo", &[])?;
+                        if let Value::Object(o) = &v {
+                            o.borrow_mut()
+                                .props
+                                .insert("\0fi\0path".into(), cell(Value::str(&p)));
+                        }
+                        Ok(Some(v))
+                    }
+                    None => Ok(Some(Value::Null)),
+                }
+            }
+            "key" => Ok(Some(match &obj.borrow().internal {
+                Some(ObjectInternal::DirIter { pos, .. }) => Value::Int(*pos as i64),
+                _ => Value::Null,
+            })),
+            "next" => {
+                if let Some(ObjectInternal::DirIter { pos, .. }) = &mut obj.borrow_mut().internal {
+                    *pos += 1;
+                }
+                Ok(Some(Value::Null))
+            }
+            // Dots are filtered out at construct time, so the current
+            // entry is never `.`/`..`.
+            "isdot" => Ok(Some(Value::Bool(false))),
+            _ => {
+                let path_v = obj
+                    .borrow()
+                    .props
+                    .get("\0fi\0path")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let path = self.conv_str(&path_v)?.to_string();
+                let base = path.rsplit('/').next().unwrap_or(&path).to_string();
+                let md = std::fs::metadata(&path).ok();
+                let v = match lname.as_str() {
+                    "getfilename" => Value::str(&base),
+                    "getbasename" => {
+                        let suffix = args
+                            .first()
+                            .map(|c| c.borrow().clone())
+                            .map(|v| self.conv_str(&v).map(|s| s.to_string()))
+                            .transpose()?
+                            .unwrap_or_default();
+                        Value::str(
+                            base.strip_suffix(&suffix)
+                                .filter(|_| !suffix.is_empty())
+                                .unwrap_or(&base),
+                        )
+                    }
+                    "getpathname" => Value::str(&path),
+                    "getpath" => Value::str(match path.rfind('/') {
+                        Some(i) => &path[..i],
+                        None => "",
+                    }),
+                    "getextension" => Value::str(
+                        base.rsplit_once('.')
+                            .filter(|(h, _)| !h.is_empty())
+                            .map(|(_, e)| e)
+                            .unwrap_or(""),
+                    ),
+                    "getrealpath" => match std::fs::canonicalize(&path) {
+                        Ok(p) => Value::str(p.display().to_string()),
+                        Err(_) => Value::Bool(false),
+                    },
+                    "isfile" => Value::Bool(md.as_ref().is_some_and(|m| m.is_file())),
+                    "isdir" => Value::Bool(md.as_ref().is_some_and(|m| m.is_dir())),
+                    "islink" => Value::Bool(
+                        std::fs::symlink_metadata(&path)
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false),
+                    ),
+                    "isreadable" | "iswritable" | "isexecutable" => Value::Bool(md.is_some()),
+                    "getsize" => md
+                        .as_ref()
+                        .map(|m| Value::Int(m.len() as i64))
+                        .unwrap_or(Value::Bool(false)),
+                    "getmtime" => md
+                        .as_ref()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| Value::Int(d.as_secs() as i64))
+                        .unwrap_or(Value::Bool(false)),
+                    "gettype" => Value::str(if md.as_ref().is_some_and(|m| m.is_dir()) {
+                        "dir"
+                    } else {
+                        "file"
+                    }),
+                    "__tostring" => Value::str(&path),
+                    _ => return Ok(None),
+                };
+                Ok(Some(v))
+            }
+        }
+    }
+
+    /// Native dispatch for the `Generator` class (Iterator + send/throw/
+    /// getReturn). `obj` must carry a Generator internal.
+    fn generator_method(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        name: &str,
+        args: &CallArgs,
+    ) -> Result<Option<Value>, PhpError> {
+        let state = match &obj.borrow().internal {
+            Some(ObjectInternal::Generator(st)) => st.clone(),
+            _ => return Ok(None),
+        };
+        let lname = name.to_lowercase();
+        match lname.as_str() {
+            "rewind" => {
+                let (started, finished) = {
+                    let st = state.borrow();
+                    (st.started, st.finished)
+                };
+                if finished {
+                    let v =
+                        self.exception("Exception", "Cannot traverse an already closed generator");
+                    return Err(self.throw(v));
+                }
+                if started {
+                    let v = self.exception(
+                        "Exception",
+                        "Cannot rewind a generator that was already run",
+                    );
+                    return Err(self.throw(v));
+                }
+                self.gen_start(&state)?;
+                Ok(Some(Value::Null))
+            }
+            "valid" => {
+                self.gen_start(&state)?;
+                let st = state.borrow();
+                Ok(Some(Value::Bool(st.pos < st.items.len())))
+            }
+            "current" => {
+                self.gen_start(&state)?;
+                let st = state.borrow();
+                Ok(Some(
+                    st.items
+                        .get(st.pos)
+                        .map(|(_, v)| v.borrow().clone())
+                        .unwrap_or(Value::Null),
+                ))
+            }
+            "key" => {
+                self.gen_start(&state)?;
+                let st = state.borrow();
+                Ok(Some(
+                    st.items.get(st.pos).map(|(k, _)| k.clone()).unwrap_or(Value::Null),
+                ))
+            }
+            "next" => {
+                self.gen_start(&state)?;
+                state.borrow_mut().pos += 1;
+                Ok(Some(Value::Null))
+            }
+            "send" => {
+                let v = args.cells.first().map(|c| c.borrow().clone()).unwrap_or(Value::Null);
+                {
+                    let mut st = state.borrow_mut();
+                    st.sends.push(v);
+                    if st.started {
+                        // Eager model: re-run the body so queued sends
+                        // reach their yield expressions (the k-th send
+                        // feeds the k-th yield expr).
+                        st.started = false;
+                        st.finished = false;
+                        st.items.clear();
+                        st.pos = 0;
+                    }
+                }
+                self.gen_start(&state)?;
+                // The k-th send resumes at item k.
+                let mut st = state.borrow_mut();
+                st.pos = st.sends.len();
+                Ok(Some(
+                    st.items
+                        .get(st.pos)
+                        .map(|(_, v)| v.borrow().clone())
+                        .unwrap_or(Value::Null),
+                ))
+            }
+            "throw" => {
+                let e = args.cells.first().map(|c| c.borrow().clone()).unwrap_or(Value::Null);
+                state.borrow_mut().finished = true;
+                Err(self.throw(e))
+            }
+            "getreturn" => {
+                let st = state.borrow();
+                Ok(Some(st.return_val.clone()))
+            }
+            "__construct" => self.fail(PhpError::uncaught(
+                "Error",
+                "The \"Generator\" class is reserved for internal use and cannot be manually instantiated",
+                0,
+            )),
+            _ => Ok(None),
+        }
+    }
+
+    /// Materialize an iterable's (key, value) pairs for `yield from`.
+    pub fn yield_from_collect(
+        &mut self,
+        v: &Value,
+    ) -> Result<Vec<crate::value::GenItem>, PhpError> {
+        match v {
+            Value::Array(a) => Ok(a
+                .borrow()
+                .iter()
+                .map(|(k, c)| (key_value(k), c.clone()))
+                .collect()),
+            Value::Object(o) => {
+                if self.obj_is_a(o, "IteratorAggregate") {
+                    let it = self.method_invoke(o.clone(), "getIterator", CallArgs::empty())?;
+                    return self.yield_from_collect(&it);
+                }
+                if self.obj_is_a(o, "Iterator")
+                    || o.borrow().class.name().eq_ignore_ascii_case("generator")
+                {
+                    let mut out = Vec::new();
+                    let _ = self.method_invoke(o.clone(), "rewind", CallArgs::empty())?;
+                    loop {
+                        let ok = self
+                            .method_invoke(o.clone(), "valid", CallArgs::empty())
+                            .map(|v| v.is_truthy())
+                            .unwrap_or(false);
+                        if !ok {
+                            break;
+                        }
+                        let k = self
+                            .method_invoke(o.clone(), "key", CallArgs::empty())
+                            .unwrap_or(Value::Null);
+                        let val = self
+                            .method_invoke(o.clone(), "current", CallArgs::empty())
+                            .unwrap_or(Value::Null);
+                        out.push((k, cell(val)));
+                        let _ = self.method_invoke(o.clone(), "next", CallArgs::empty())?;
+                    }
+                    Ok(out)
+                } else {
+                    self.fail(PhpError::uncaught(
+                        "TypeError",
+                        "Argument #1 must be of type Traversable|array",
+                        0,
+                    ))
+                }
+            }
+            _ => self.fail(PhpError::uncaught(
+                "TypeError",
+                "Argument #1 must be of type Traversable|array",
+                0,
+            )),
+        }
+    }
+
     // ----- classes -----
 
     fn register_class(&mut self, decl: Rc<ClassDecl>) -> Result<(), PhpError> {
+        // Reserved scalar names can't name a class/interface/trait/enum
+        // (scalar_reserved*): `class int {}` is a compile fatal.
+        let short = decl.name.rsplit('\\').next().unwrap_or(&decl.name);
+        const RESERVED_DECL: &[&str] = &[
+            "int", "float", "string", "bool", "void", "iterable", "object", "mixed", "never",
+            "null", "false", "true",
+        ];
+        if RESERVED_DECL.contains(&short.to_lowercase().as_str()) {
+            let kind = match decl.kind {
+                ClassKind::Interface => "an interface",
+                ClassKind::Trait => "a trait",
+                ClassKind::Enum => "an enum",
+                ClassKind::Class => "a class",
+            };
+            return Err(PhpError::compile_fatal(
+                format!(
+                    "Cannot use \"{}\" as {} name as it is reserved",
+                    short, kind
+                ),
+                self.cur_line,
+            ));
+        }
         // PHP links a declared class eagerly: the parent class, every
         // implemented interface, and every used trait must resolve at
         // declaration time, autoloading them when unregistered
         // (composer PSR-4 trees depend on this — MarkBased links
         // RegexBasedAbstract and the DataGenerator interface here).
         if let Some(p) = &decl.parent {
-            if !self.classes.contains_key(&p.to_lowercase()) {
-                self.run_autoload(p.trim_start_matches('\\'));
+            let pl = p.to_lowercase();
+            // Kind-mismatched parents (a trait/interface under
+            // `extends`) count as "found" so the dedicated fatals
+            // below report them (error_009). Names still on the
+            // linking stack are mid-registration CEs — resolvable
+            // (traits/abstract_method_9).
+            let mut found = if decl.kind == ClassKind::Interface {
+                self.interfaces.contains_key(&pl)
+            } else {
+                self.classes.contains_key(&pl)
+                    || self.traits.contains_key(&pl)
+                    || self.interfaces.contains_key(&pl)
+                    || self
+                        .linking
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(&pl))
+            };
+            if !found {
+                self.run_autoload(p.trim_start_matches('\\'))?;
+                found = if decl.kind == ClassKind::Interface {
+                    self.interfaces.contains_key(&pl)
+                } else {
+                    self.classes.contains_key(&pl)
+                        || self.traits.contains_key(&pl)
+                        || self.interfaces.contains_key(&pl)
+                        || self
+                            .linking
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(&pl))
+                };
+            }
+            // Still unlinked after autoload — catchable Error
+            // (variance/unlinked_parent_1).
+            if !found {
+                let v = self.exception("Error", &format!("Class \"{}\" not found", p));
+                return Err(self.throw(v));
             }
         }
         for i in &decl.implements {
             if !self.interfaces.contains_key(&i.to_lowercase())
                 && !self.classes.contains_key(&i.to_lowercase())
             {
-                self.run_autoload(i.trim_start_matches('\\'));
+                self.run_autoload(i.trim_start_matches('\\'))?;
             }
         }
         for t in &decl.traits {
             if !self.traits.contains_key(&t.to_lowercase()) {
-                self.run_autoload(t.trim_start_matches('\\'));
+                self.run_autoload(t.trim_start_matches('\\'))?;
             }
         }
         let mut d = (*decl).clone();
@@ -7663,6 +10990,7 @@ impl<'a> Interp<'a> {
         if d.file.is_empty() {
             d.file = self.cur_file.clone();
         }
+
         // Synthesize PropDecls from promoted constructor params
         // (`__construct(public readonly int $x)`) — they behave as
         // declared props for visibility/type/readonly and hooks.
@@ -7686,6 +11014,7 @@ impl<'a> Interp<'a> {
                             set_vis: p.set_vis,
                             decl_in: None,
                             hooks: p.hooks.clone(),
+                            attrs: vec![],
                             line: 0,
                         });
                     }
@@ -7696,88 +11025,1406 @@ impl<'a> Interp<'a> {
         let lname = decl.name.to_lowercase();
         match decl.kind {
             ClassKind::Interface => {
-                self.interfaces.insert(lname, Rc::new(d));
+                if let Some(t0) = d.traits.first() {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Cannot use traits inside of interfaces. {} is used in {}",
+                            t0, d.name
+                        ),
+                        self.cur_line,
+                    ));
+                }
+                Self::resolve_scope_tys(&mut d);
+                // `interface B extends A` — B's methods must stay
+                // compatible with A's (invalid_covariance_*).
+                self.linking.push(Rc::new(d.clone()));
+                let checks_res = self.check_interface_sigs(&d);
+                self.linking.pop();
+                checks_res?;
+                self.interfaces.insert(lname.clone(), Rc::new(d));
+                self.decl_order.push(lname);
             }
             ClassKind::Trait => {
-                self.traits.insert(lname, Rc::new(d));
-            }
-            _ => {
-                // Apply traits: merge methods/props into the decl.
+                // `trait _ {}` — deprecated since 8.4.
+                if d.name.rsplit('\\').next() == Some("_") {
+                    self.deprecated("Using \"_\" as a trait name is deprecated since 8.4")?;
+                }
+                // Traits may `use` traits — flatten recursively
+                // (flattening003). Origin chains keep the DEFINING
+                // trait's name via decl_in.
                 if !d.traits.is_empty() {
-                    for t in d.traits.clone() {
-                        if let Some(td) = self.traits.get(&t.to_lowercase()) {
-                            for m in &td.methods {
-                                if !d
-                                    .methods
-                                    .iter()
-                                    .any(|x| x.decl.name.eq_ignore_ascii_case(&m.decl.name))
-                                {
-                                    d.methods.push(m.clone());
-                                }
-                            }
-                            for p in &td.props {
-                                if let Some(ex) = d.props.iter().find(|x| x.name == p.name) {
-                                    // "hooked" means either side —
-                                    // a plain decl can't override a
-                                    // hooked trait prop either.
-                                    if ex.hooks.is_some() || p.hooks.is_some() {
-                                        // Hooked props cannot be
-                                        // conflict-resolved — zend
-                                        // fatals at composition
-                                        // (traits_conflict).
-                                        let ex_src =
-                                            ex.decl_in.clone().unwrap_or_else(|| d.name.clone());
-                                        return Err(PhpError::fatal(
-                                            format!(
-                                                "{} and {} define the same hooked property (${}) in the composition of {}. Conflict resolution between hooked properties is currently not supported. Class was composed",
-                                                ex_src, t, p.name, d.name
-                                            ),
-                                            self.cur_line,
-                                        ));
-                                    }
-                                    // Identical plain-prop defs merge
-                                    // silently; differing ones fatal.
-                                    let compat = ex.visibility == p.visibility
-                                        && ex.is_static == p.is_static
-                                        && ex.readonly == p.readonly
-                                        && ex.ty == p.ty
-                                        && format!("{:?}", ex.default)
-                                            == format!("{:?}", p.default);
-                                    if !compat {
-                                        let ex_src =
-                                            ex.decl_in.clone().unwrap_or_else(|| d.name.clone());
-                                        return Err(PhpError::fatal(
-                                            format!(
-                                                "{} and {} define the same property (${}) in the composition of {}. However, the definition differs and is considered incompatible. Class was composed",
-                                                ex_src, t, p.name, d.name
-                                            ),
-                                            self.cur_line,
-                                        ));
-                                    }
-                                    continue;
-                                }
-                                let mut np = p.clone();
-                                // Trait origin survives the merge —
-                                // `__METHOD__` prints `T::$p::get`.
-                                np.decl_in = Some(t.clone());
-                                d.props.push(np);
-                            }
+                    for t in &d.traits {
+                        if !self.traits.contains_key(&t.to_lowercase()) {
+                            let msg = if self.lookup_class(t).is_some()
+                                || self.interfaces.contains_key(&t.to_lowercase())
+                            {
+                                format!("{} cannot use {} - it is not a trait", d.name, t)
+                            } else {
+                                format!("Trait \"{}\" not found", t)
+                            };
+                            // Catchable Error, not a fatal (gh17959).
+                            let v = self.exception("Error", &msg);
+                            return Err(self.throw(v));
                         }
                     }
+                    self.linking.push(Rc::new(d.clone()));
+                    let merge_res = self.merge_trait_adaptations(&mut d);
+                    self.linking.pop();
+                    merge_res?;
                 }
-                self.check_abstract_hooks(&d)?;
-                self.check_final_override(&d)?;
+                self.traits.insert(lname.clone(), Rc::new(d));
+                self.decl_order.push(lname);
+            }
+            _ => {
+                // `use static|self|parent` — reserved, uncatchable
+                // (class_uses_static).
+                for t in &d.traits {
+                    if ["static", "self", "parent"]
+                        .iter()
+                        .any(|r| t.eq_ignore_ascii_case(r))
+                    {
+                        return Err(PhpError::fatal(
+                            format!("Cannot use \"{}\" as trait name, as it is reserved", t),
+                            self.cur_line,
+                        ));
+                    }
+                }
+                // Apply traits: merge methods/props into the decl.
+                if !d.traits.is_empty() {
+                    // Missing trait → catchable Error (gh17959).
+                    for t in &d.traits {
+                        if !self.traits.contains_key(&t.to_lowercase()) {
+                            let msg = if self.lookup_class(t).is_some()
+                                || self.interfaces.contains_key(&t.to_lowercase())
+                            {
+                                format!("{} cannot use {} - it is not a trait", d.name, t)
+                            } else {
+                                format!("Trait \"{}\" not found", t)
+                            };
+                            let v = self.exception("Error", &msg);
+                            return Err(self.throw(v));
+                        }
+                    }
+                    self.linking.push(Rc::new(d.clone()));
+                    let merge_res = self.merge_trait_adaptations(&mut d);
+                    self.linking.pop();
+                    merge_res?;
+                }
+                // `self`/`static`/`parent` in member types bind to the
+                // declaring class at registration — a `self` member
+                // otherwise wildcard-matches everything
+                // (union_types/anonymous_class). This runs AFTER trait
+                // merge so trait methods' `self` resolves to the
+                // consuming class (traits/abstract_method_8). `static`
+                // loses late-static nuance, which type checks don't
+                // distinguish anyway.
+                Self::resolve_scope_tys(&mut d);
+                self.check_rtwc_attr(&d.attrs, "class")?;
+                for p in &d.props {
+                    self.check_rtwc_attr(&p.attrs, "property")?;
+                }
+                // `extends <trait>` / `extends <interface>` → fatal
+                // (error_009/error_010).
+                if let Some(pn) = &d.parent {
+                    let pl = pn.to_lowercase();
+                    if self.traits.contains_key(&pl) {
+                        return Err(PhpError::fatal(
+                            format!("Class {} cannot extend trait {}", d.name, pn),
+                            self.cur_line,
+                        ));
+                    }
+                    if self.interfaces.contains_key(&pl) {
+                        return Err(PhpError::fatal(
+                            format!("Class {} cannot extend interface {}", d.name, pn),
+                            self.cur_line,
+                        ));
+                    }
+                }
+                // `implements <non-interface>` → fatal (error_008).
+                for i in &d.implements {
+                    if !self.interfaces.contains_key(&i.to_lowercase()) {
+                        let missing = !(self.lookup_class(i).is_some()
+                            || self.traits.contains_key(&i.to_lowercase()));
+                        if missing {
+                            // Catchable Error like a missing trait
+                            // (variance/unlinked_parent_2).
+                            let v =
+                                self.exception("Error", &format!("Interface \"{}\" not found", i));
+                            return Err(self.throw(v));
+                        }
+                        return Err(PhpError::fatal(
+                            format!("{} cannot implement {} - it is not an interface", d.name, i),
+                            self.cur_line,
+                        ));
+                    }
+                }
+                // Implementing Serializable is deprecated (8.1+) — the
+                // __serialize/__unserialize pair is the replacement.
+                if !d.name.eq_ignore_ascii_case("serializable")
+                    && self.implements_iface(&d, "serializable")
+                {
+                    self.deprecated(&format!(
+                        "{} implements the Serializable interface, which is deprecated. Implement __serialize() and __unserialize() instead (or in addition, if support for old PHP versions is necessary)",
+                        d.name
+                    ))?;
+                }
+                self.linking.push(Rc::new(d.clone()));
+                let checks_res = self
+                    .check_interface_sigs(&d)
+                    .and_then(|_| self.check_abstract_hooks(&d))
+                    .and_then(|_| self.check_abstract_methods(&d))
+                    .and_then(|_| self.check_final_override(&d))
+                    .and_then(|_| self.check_override_sigs(&d))
+                    .and_then(|_| self.check_const_types(&d));
+                self.linking.pop();
+                checks_res?;
+                // A private+final method (declared outright or produced
+                // by `m as final` / `m as private` adaptations) warns
+                // once per class (gh12854).
+                if d.methods.iter().any(|m| {
+                    m.is_final
+                        && m.visibility == crate::ast::Visibility::Private
+                        && m.trait_alias_of.is_none()
+                }) {
+                    self.warn("Private methods cannot be final as they are never overridden by other classes")?;
+                }
                 self.classes.insert(
-                    lname,
+                    lname.clone(),
                     Rc::new(PhpClass {
                         decl: Rc::new(d),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(false),
                     }),
                 );
+                self.decl_order.push(lname);
             }
         }
         Ok(())
+    }
+
+    /// `self`/`static`/`parent` members in method/prop types bind to
+    /// the declaring class name at registration (anonymous_class).
+    fn resolve_scope_tys(d: &mut ClassDecl) {
+        let (dn, dp) = (d.name.clone(), d.parent.clone());
+        let resolve = |ms: &mut Vec<String>| {
+            for m in ms.iter_mut() {
+                let l = m.to_lowercase();
+                // `static` stays literal — late-static binds to the
+                // called class, resolved at check time.
+                if l == "self" {
+                    *m = dn.clone();
+                } else if l == "parent" {
+                    if let Some(p) = &dp {
+                        *m = p.clone();
+                    }
+                }
+            }
+        };
+        for m in d.methods.iter_mut() {
+            let mut mm = (**m).clone();
+            for p in mm.decl.params.iter_mut() {
+                if let Some(ty) = &mut p.ty {
+                    resolve(ty);
+                }
+            }
+            if let Some(ty) = &mut mm.decl.ret {
+                resolve(ty);
+            }
+            *m = Rc::new(mm);
+        }
+        for p in d.props.iter_mut() {
+            if let Some(ty) = &mut p.ty {
+                resolve(ty);
+            }
+        }
+    }
+
+    /// Merge used traits' methods into `d`, applying `insteadof`
+    /// exclusions, `as` aliases/visibility changes, and collision
+    /// detection. Trait origin is preserved on each merged method as
+    /// `decl.decl_in` (drives `__METHOD__`/`__TRAIT__`).
+    fn merge_trait_adaptations(&mut self, d: &mut ClassDecl) -> Result<(), PhpError> {
+        let used: Vec<(String, Rc<ClassDecl>)> = d
+            .traits
+            .iter()
+            .filter_map(|t| {
+                self.traits
+                    .get(&t.to_lowercase())
+                    .map(|td| (t.clone(), td.clone()))
+            })
+            .collect();
+        let cur_line = self.cur_line;
+        let dname = d.name.clone();
+        let is_used = |n: &str| d.traits.iter().any(|u| u.eq_ignore_ascii_case(n));
+        // `insteadof`/`as` on a trait that doesn't exist: distinct
+        // message from exists-but-not-used (precedence_unknown_class).
+        // Free-standing fn (not a closure) so later `&mut self` calls
+        // don't conflict with a captured borrow of `self.traits`.
+        fn not_found(
+            traits: &HashMap<String, Rc<ClassDecl>>,
+            n: &str,
+            dname: &str,
+            line: usize,
+        ) -> PhpError {
+            if traits.contains_key(&n.to_lowercase()) {
+                PhpError::fatal(
+                    format!("Required Trait {} wasn't added to {}", n, dname),
+                    line,
+                )
+            } else {
+                PhpError::fatal(format!("Could not find trait {}", n), line)
+            }
+        }
+        // `static`/`self`/`parent` are reserved — never valid trait
+        // names (static_in_trait_*).
+        let reserved = |n: &str| {
+            ["static", "self", "parent"]
+                .iter()
+                .any(|r| n.eq_ignore_ascii_case(r))
+        };
+        for t in &d.traits {
+            if reserved(t) {
+                return Err(PhpError::fatal(
+                    format!("Cannot use \"{}\" as trait name, as it is reserved", t),
+                    cur_line,
+                ));
+            }
+        }
+        // Validate adaptation trait references.
+        for ad in &d.adaptations {
+            match ad {
+                crate::ast::TraitAdaptation::Insteadof {
+                    trait_name,
+                    method,
+                    excludes,
+                } => {
+                    for n in std::iter::once(trait_name).chain(excludes.iter()) {
+                        if reserved(n) {
+                            return Err(PhpError::fatal(
+                                format!("Cannot use \"{}\" as trait name, as it is reserved", n),
+                                cur_line,
+                            ));
+                        }
+                        // A class name in `as`/`insteadof` is its own
+                        // error (bug64235).
+                        if !is_used(n) && self.classes.contains_key(&n.to_lowercase()) {
+                            return Err(PhpError::fatal(
+                                format!(
+                                    "Class {} is not a trait, Only traits may be used in 'as' and 'insteadof' statements",
+                                    n
+                                ),
+                                cur_line,
+                            ));
+                        }
+                    }
+                    if !is_used(trait_name) {
+                        return Err(not_found(&self.traits, trait_name, &dname, cur_line));
+                    }
+                    // `T::m insteadof ...` — the method must exist in T
+                    // (bug60165d).
+                    if let Some(td) = self.traits.get(&trait_name.to_lowercase()) {
+                        if !td
+                            .methods
+                            .iter()
+                            .any(|m| m.decl.name.eq_ignore_ascii_case(method))
+                        {
+                            return Err(PhpError::fatal(
+                                format!(
+                                    "A precedence rule was defined for {}::{} but this method does not exist",
+                                    trait_name, method
+                                ),
+                                cur_line,
+                            ));
+                        }
+                    }
+                    for e in excludes {
+                        if !is_used(e) {
+                            return Err(not_found(&self.traits, e, &dname, cur_line));
+                        }
+                    }
+                    if excludes.iter().any(|e| e.eq_ignore_ascii_case(trait_name)) {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Inconsistent insteadof definition. The method {} is to be used from {}, but {} is also on the exclude list",
+                                method, trait_name, trait_name
+                            ),
+                            cur_line,
+                        ));
+                    }
+                }
+                crate::ast::TraitAdaptation::Alias {
+                    trait_name: Some(tn),
+                    ..
+                } => {
+                    if !is_used(tn) {
+                        if self.classes.contains_key(&tn.to_lowercase()) {
+                            return Err(PhpError::fatal(
+                                format!(
+                                    "Class {} is not a trait, Only traits may be used in 'as' and 'insteadof' statements",
+                                    tn
+                                ),
+                                cur_line,
+                            ));
+                        }
+                        return Err(not_found(&self.traits, tn, &dname, cur_line));
+                    }
+                }
+                crate::ast::TraitAdaptation::Alias {
+                    trait_name: None,
+                    method,
+                    alias,
+                    ..
+                } => {
+                    // `method as alias` with no qualifier — method must
+                    // exist somewhere among the used traits.
+                    if alias.is_some()
+                        && !used.iter().any(|(_, td)| {
+                            td.methods
+                                .iter()
+                                .any(|m| m.decl.name.eq_ignore_ascii_case(method))
+                        })
+                    {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "An alias ({}) was defined for method {}(), but this method does not exist",
+                                alias.as_deref().unwrap_or_default(),
+                                method
+                            ),
+                            cur_line,
+                        ));
+                    }
+                }
+            }
+        }
+        // insteadof exclusions: (method_lname, suppressed trait_lname)
+        let mut exclusions: Vec<(String, String)> = Vec::new();
+        for ad in &d.adaptations {
+            if let crate::ast::TraitAdaptation::Insteadof {
+                method, excludes, ..
+            } = ad
+            {
+                for e in excludes {
+                    // Each trait's method may be excluded only once
+                    // (error_010).
+                    if exclusions
+                        .iter()
+                        .any(|(mn, et)| *mn == method.to_lowercase() && et.eq_ignore_ascii_case(e))
+                    {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Failed to evaluate a trait precedence ({}). Method of trait {} was defined to be excluded multiple times",
+                                method, e
+                            ),
+                            cur_line,
+                        ));
+                    }
+                    exclusions.push((method.to_lowercase(), e.to_lowercase()));
+                }
+            }
+        }
+        // Merge methods in `use` order. Class-own methods always win
+        // silently; a trait's ABSTRACT requirement is still checked
+        // against the class's implementation (abstract_method_*).
+        // `taken` = name -> (display trait, origin trait, own|abstract)
+        let mut taken: HashMap<String, (String, String)> = HashMap::new();
+        for m in &d.methods {
+            taken.insert(m.decl.name.to_lowercase(), (dname.clone(), String::new()));
+        }
+        for (t, td) in &used {
+            for m in &td.methods {
+                let lname = m.decl.name.to_lowercase();
+                if exclusions
+                    .iter()
+                    .any(|(mn, et)| *mn == lname && et.eq_ignore_ascii_case(t))
+                {
+                    continue;
+                }
+                let origin = m.decl.decl_in.clone().unwrap_or_else(|| t.clone());
+                // A trait abstract requirement already implemented by
+                // an ancestor stays inherited, not merged (bug55424) —
+                // but the inherited impl must still be signature-
+                // compatible with the abstract (gh14009_002).
+                if m.is_abstract {
+                    if let Some((aon, am)) = self.ancestor_concrete(d, &lname) {
+                        if let Some(e) = self.trait_sig_error(&am, m, &aon, &origin, false) {
+                            return Err(e);
+                        }
+                        continue;
+                    }
+                }
+                if let Some((pt, porig)) = taken.get(&lname).cloned() {
+                    // Diamond reuse of the same origin trait is fine
+                    // (bug63911).
+                    if porig.eq_ignore_ascii_case(&origin) {
+                        continue;
+                    }
+                    let class_own = porig.is_empty();
+                    let existing = d
+                        .methods
+                        .iter()
+                        .find(|x| x.decl.name.eq_ignore_ascii_case(&m.decl.name))
+                        .cloned();
+                    // Abstract requirements interplay with what holds
+                    // the name already.
+                    if m.is_abstract || existing.as_ref().is_some_and(|x| x.is_abstract) {
+                        if class_own {
+                            // Class impl must satisfy the abstract
+                            // (abstract_method_1/3/4/5).
+                            if let Some(ex) = existing {
+                                if let Some(e) =
+                                    self.trait_sig_error(&ex, m, &dname, &origin, false)
+                                {
+                                    return Err(e);
+                                }
+                            }
+                            continue;
+                        }
+                        if m.is_abstract && existing.as_ref().is_some_and(|x| x.is_abstract) {
+                            // Two abstract requirements: signatures must
+                            // agree in both directions (bug60217).
+                            let ex = existing.unwrap();
+                            if let Some(e) = self.trait_sig_error(&ex, m, &pt, &origin, true) {
+                                return Err(e);
+                            }
+                            continue;
+                        }
+                        // concrete-vs-abstract: concrete impl checked
+                        // against the abstract requirement; on success
+                        // the concrete replaces (or keeps) the slot.
+                        let (impl_m, abs_m, abs_owner) = if m.is_abstract {
+                            (existing.clone().unwrap(), m.clone(), &origin)
+                        } else {
+                            (m.clone(), existing.clone().unwrap(), &porig)
+                        };
+                        if let Some(e) =
+                            self.trait_sig_error(&impl_m, &abs_m, &dname, abs_owner, false)
+                        {
+                            return Err(e);
+                        }
+                        if m.is_abstract {
+                            continue;
+                        }
+                        // Concrete replaces the abstract slot.
+                        if let Some(slot) = d
+                            .methods
+                            .iter_mut()
+                            .find(|x| x.decl.name.eq_ignore_ascii_case(&m.decl.name))
+                        {
+                            let mut m2 = (**m).clone();
+                            m2.decl.decl_in = Some(origin.clone());
+                            *slot = Rc::new(m2);
+                            taken.insert(lname, (t.clone(), origin));
+                        }
+                        continue;
+                    }
+                    if class_own {
+                        continue;
+                    }
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Trait method {}::{} has not been applied as {}::{}, because of collision with {}::{}",
+                            t, m.decl.name, dname, m.decl.name, pt, m.decl.name
+                        ),
+                        cur_line,
+                    ));
+                }
+                let mut m2 = (**m).clone();
+                m2.decl.decl_in = Some(origin.clone());
+                taken.insert(lname, (t.clone(), origin));
+                d.methods.push(Rc::new(m2));
+            }
+        }
+        // Aliases: clone the source method under a new name and/or apply
+        // a visibility override to the merged original.
+        for ad in &d.adaptations {
+            let crate::ast::TraitAdaptation::Alias {
+                trait_name,
+                method,
+                alias,
+                vis,
+                is_final,
+            } = ad
+            else {
+                continue;
+            };
+            if let Some(tn) = trait_name {
+                if reserved(tn) {
+                    return Err(PhpError::fatal(
+                        format!("Cannot use \"{}\" as trait name, as it is reserved", tn),
+                        cur_line,
+                    ));
+                }
+                if !is_used(tn) {
+                    if self.classes.contains_key(&tn.to_lowercase()) {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Class {} is not a trait, Only traits may be used in 'as' and 'insteadof' statements",
+                                tn
+                            ),
+                            cur_line,
+                        ));
+                    }
+                    return Err(not_found(&self.traits, tn, &dname, cur_line));
+                }
+            }
+            let src: Option<Rc<MethodDecl>> = match trait_name {
+                Some(tn) => self.traits.get(&tn.to_lowercase()).and_then(|td| {
+                    td.methods
+                        .iter()
+                        .find(|m| m.decl.name.eq_ignore_ascii_case(method))
+                        .cloned()
+                }),
+                None => {
+                    // Unqualified `m as x` is ambiguous when >1 used
+                    // trait provides `m` (bug62069).
+                    let mut holders = used.iter().filter(|(_, td)| {
+                        td.methods
+                            .iter()
+                            .any(|m| m.decl.name.eq_ignore_ascii_case(method))
+                    });
+                    match (holders.next(), holders.next()) {
+                        (Some((n1, _)), Some((n2, _))) => {
+                            return Err(PhpError::fatal(
+                                format!(
+                                    "An alias was defined for method {}(), which exists in both {} and {}. Use {}::{} or {}::{} to resolve the ambiguity",
+                                    method, n1, n2, n1, method, n2, method
+                                ),
+                                cur_line,
+                            ));
+                        }
+                        (Some((_, td1)), None) => td1
+                            .methods
+                            .iter()
+                            .find(|m| m.decl.name.eq_ignore_ascii_case(method))
+                            .cloned(),
+                        _ => None,
+                    }
+                }
+            };
+            let Some(m) = src else {
+                // `T::m as x` cites the qualified name; `m as x` cites
+                // the alias (bug60165b); a bare `m as vis` modifier is
+                // the "modifiers changed" wording (bug54441).
+                if trait_name.is_some() {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "An alias was defined for {}::{} but this method does not exist",
+                            trait_name.as_deref().unwrap_or_default(),
+                            method
+                        ),
+                        cur_line,
+                    ));
+                }
+                if let Some(a) = alias {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "An alias ({}) was defined for method {}(), but this method does not exist",
+                            a, method
+                        ),
+                        cur_line,
+                    ));
+                }
+                return Err(PhpError::fatal(
+                    format!(
+                        "The modifiers of the trait method {}() are changed, but this method does not exist. Error in",
+                        method
+                    ),
+                    cur_line,
+                ));
+            };
+            // `as abstract|final|static` are not valid alias modifiers
+            // (language018/019) — PHP rejects them as alias names too.
+            for bad in ["abstract", "static"] {
+                if alias
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(bad))
+                {
+                    return Err(PhpError::fatal(
+                        format!("Cannot use \"{}\" as method modifier in trait alias", bad),
+                        cur_line,
+                    ));
+                }
+            }
+            let origin = m
+                .decl
+                .decl_in
+                .clone()
+                .or_else(|| trait_name.clone())
+                .unwrap_or_default();
+            if let Some(a) = alias {
+                let alname = a.to_lowercase();
+                // An aliased name collides like a real method
+                // (language010/014): a merged method or an earlier
+                // alias holding the name is fatal.
+                let src_trait = trait_name.clone().unwrap_or_else(|| {
+                    used.iter()
+                        .find(|(_, td)| {
+                            td.methods
+                                .iter()
+                                .any(|mm| mm.decl.name.eq_ignore_ascii_case(method))
+                        })
+                        .map(|(t, _)| t.clone())
+                        .unwrap_or_default()
+                });
+                if let Some((pt, porg)) = taken.get(&alname) {
+                    if !porg.is_empty() {
+                        // Trait order decides the loser: a slot held by
+                        // a trait merged LATER loses to the earlier
+                        // trait's alias (language010 vs language014).
+                        let ord =
+                            |n: &str| used.iter().position(|(u, _)| u.eq_ignore_ascii_case(n));
+                        let (lt, lm, wt) = match (ord(&src_trait), ord(pt)) {
+                            (Some(si), Some(pi)) if pi > si => {
+                                (pt.clone(), a.clone(), src_trait.clone())
+                            }
+                            _ => (src_trait.clone(), method.clone(), pt.clone()),
+                        };
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Trait method {}::{} has not been applied as {}::{}, because of collision with {}::{}",
+                                lt, lm, dname, a, wt, a
+                            ),
+                            cur_line,
+                        ));
+                    }
+                    // The class's own method wins silently (bug61998).
+                    continue;
+                }
+                let mut m2 = (*m).clone();
+                m2.decl.name = a.clone();
+                if let Some(v) = vis {
+                    m2.visibility = *v;
+                }
+                if *is_final {
+                    m2.is_final = true;
+                }
+                m2.decl.decl_in = Some(origin.clone());
+                m2.trait_alias_of = Some(m.decl.name.clone());
+                taken.insert(alname, (src_trait, origin));
+                d.methods.push(Rc::new(m2));
+            } else if vis.is_some() || *is_final {
+                // `m as private` / `m as final` — modifier change on the
+                // merged original itself.
+                for slot in d.methods.iter_mut() {
+                    if slot.decl.name.eq_ignore_ascii_case(method) {
+                        let mut m2 = (**slot).clone();
+                        if let Some(v) = vis {
+                            m2.visibility = *v;
+                        }
+                        if *is_final {
+                            m2.is_final = true;
+                        }
+                        *slot = Rc::new(m2);
+                        break;
+                    }
+                }
+            }
+        }
+        // Trait props merge with the identical-definition rule
+        // (property001/002, bug74922): differing decls fatal; hooked
+        // props can't be resolved at all.
+        for (t, td) in &used {
+            for p in &td.props {
+                if let Some(ex) = d.props.iter().find(|x| x.name == p.name) {
+                    if ex.hooks.is_some() || p.hooks.is_some() {
+                        let ex_src = ex.decl_in.clone().unwrap_or_else(|| dname.clone());
+                        return Err(PhpError::fatal(
+                            format!(
+                                "{} and {} define the same hooked property (${}) in the composition of {}. Conflict resolution between hooked properties is currently not supported. Class was composed",
+                                ex_src, t, p.name, dname
+                            ),
+                            cur_line,
+                        ));
+                    }
+                    let compat = ex.visibility == p.visibility
+                        && ex.is_static == p.is_static
+                        && ex.readonly == p.readonly
+                        && ex.ty == p.ty
+                        && self.const_exprs_eq(
+                            &ex.default,
+                            &ex.decl_in.clone().unwrap_or_else(|| dname.clone()),
+                            &p.default,
+                            t,
+                        );
+                    if !compat {
+                        let ex_src = ex.decl_in.clone().unwrap_or_else(|| dname.clone());
+                        return Err(PhpError::fatal(
+                            format!(
+                                "{} and {} define the same property (${}) in the composition of {}. However, the definition differs and is considered incompatible. Class was composed",
+                                ex_src, t, p.name, dname
+                            ),
+                            cur_line,
+                        ));
+                    }
+                    continue;
+                }
+                let mut np = p.clone();
+                np.decl_in = Some(t.clone());
+                d.props.push(np);
+            }
+        }
+        // Trait constants merge like props: same name+identical
+        // definition is fine, differing definitions are fatal
+        // (constant_*). `T::CONST` direct access is rejected at the
+        // lookup site instead.
+        for (t, td) in &used {
+            for cd in &td.consts {
+                if let Some(ex) = d.consts.iter().find(|x| x.name == cd.name) {
+                    let compat = ex.visibility == cd.visibility
+                        && ex.is_final == cd.is_final
+                        && ty_list_eq(&ex.ty, &cd.ty)
+                        && self.const_exprs_eq(
+                            &Some(ex.value.clone()),
+                            &ex.decl_in.clone().unwrap_or_else(|| dname.clone()),
+                            &Some(cd.value.clone()),
+                            t,
+                        );
+                    if !compat {
+                        let ex_src = ex.decl_in.clone().unwrap_or_else(|| dname.clone());
+                        return Err(PhpError::fatal(
+                            format!(
+                                "{} and {} define the same constant ({}) in the composition of {}. However, the definition differs and is considered incompatible. Class was composed",
+                                ex_src, t, cd.name, dname
+                            ),
+                            cur_line,
+                        ));
+                    }
+                    continue;
+                }
+                let mut nc = cd.clone();
+                nc.decl_in = Some(t.clone());
+                d.consts.push(nc);
+            }
+        }
+        Ok(())
+    }
+
+    /// Two default-value exprs are compatible when their evaluated
+    /// values match loosely (bug74922, constant_016); falls back to a
+    /// textual compare when either side won't eval (both-None is fine).
+    /// Each side evals in its declaring trait's namespace so an
+    /// unqualified `FOO` in `Bug74922\T1` means `Bug74922\FOO`.
+    fn const_exprs_eq(
+        &mut self,
+        a: &Option<Expr>,
+        a_owner: &str,
+        b: &Option<Expr>,
+        b_owner: &str,
+    ) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(x), Some(y)) => {
+                match (self.eval_in_ns(x, a_owner), self.eval_in_ns(y, b_owner)) {
+                    (Ok(va), Ok(vb)) => identical(&va, &vb),
+                    _ => format!("{:?}", x) == format!("{:?}", y),
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Const-eval an expr as if inside `owner`'s namespace (trait prop/
+    /// const defaults resolve unqualified names against their declaring
+    /// namespace — bug74922b).
+    fn eval_in_ns(&mut self, e: &Expr, owner: &str) -> Result<Value, PhpError> {
+        let ns = owner
+            .rsplit_once('\\')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_default();
+        let old = std::mem::replace(&mut self.globals.ns, ns);
+        let f = self.cur_file.clone();
+        let r = self.eval_decl_const(e, &f);
+        self.globals.ns = old;
+        r
+    }
+
+    /// Param-list render for "Declaration of X::m(...) must be
+    /// compatible" diagnostics (Zend prints the declared signature).
+    /// Render one type member for signature messages: `self` resolves
+    /// against the composing class (abstract_method_10), other members
+    /// stay verbatim.
+    fn sig_ty(ty: &[String], ctx: &str) -> String {
+        // `X|null` renders as `?X` in Zend signatures (internal_parent).
+        if ty.len() == 2 {
+            if let Some(other) = ty.iter().find(|t| !t.eq_ignore_ascii_case("null")) {
+                if ty.iter().any(|t| t.eq_ignore_ascii_case("null")) && !other.contains('&') {
+                    return format!(
+                        "?{}",
+                        if other.eq_ignore_ascii_case("self") {
+                            ctx.to_string()
+                        } else {
+                            other.clone()
+                        }
+                    );
+                }
+            }
+        }
+        ty.iter()
+            .map(|t| {
+                if t.eq_ignore_ascii_case("self") {
+                    ctx.to_string()
+                } else if t.eq_ignore_ascii_case("iterable") {
+                    // Compatibility messages render the normalized
+                    // form (invalid5).
+                    "Traversable|array".to_string()
+                } else if t.contains('&') && ty.len() > 1 {
+                    format!("({t})")
+                } else {
+                    t.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    fn sig_str(f: &crate::ast::FunctionDecl, ctx: &str) -> String {
+        f.params
+            .iter()
+            .map(|p| {
+                let ty =
+                    p.ty.as_ref()
+                        .map(|t| Self::sig_ty(t, ctx) + " ")
+                        .unwrap_or_default();
+                let br = if p.by_ref { "&" } else { "" };
+                let var = if p.variadic {
+                    format!("...${}", p.name)
+                } else {
+                    format!("${}", p.name)
+                };
+                let def = match &p.default {
+                    Some(Expr::Int(i)) => format!(" = {}", i),
+                    Some(Expr::Float(f)) => format!(" = {}", f),
+                    Some(Expr::Str(b)) => format!(" = '{}'", b),
+                    Some(Expr::Null) => " = null".to_string(),
+                    Some(Expr::Bool(b)) => format!(" = {}", b),
+                    Some(Expr::Const(c)) => format!(" = {}", c),
+                    Some(Expr::ClassConst { class, name }) => match class.as_ref() {
+                        Expr::Var(n) | Expr::Const(n) => format!(" = {}::{}", n, name),
+                        _ => format!(" = {}", name),
+                    },
+                    Some(Expr::ArrayLit(_)) => " = []".to_string(),
+                    _ => String::new(),
+                };
+                format!("{}{}{}{}", ty, br, var, def)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// `sig_str` variant that appends `: ret` OUTSIDE the paren — used
+    /// inside `({})` placeholders, so the signature is `(params): ret`.
+    fn sig_str_full(f: &crate::ast::FunctionDecl, ctx: &str) -> String {
+        let ps = Self::sig_str(f, ctx);
+        match &f.ret {
+            Some(r) => format!("({}): {}", ps, Self::sig_ty(r, ctx)),
+            None => format!("({})", ps),
+        }
+    }
+
+    /// The (declaring-class name, method) pair for `lname` provided by
+    /// a concrete method in `d`'s ancestor chain — nearest wins.
+    fn ancestor_concrete(&self, d: &ClassDecl, lname: &str) -> Option<(String, Rc<MethodDecl>)> {
+        let mut pn = d.parent.clone();
+        while let Some(p) = pn {
+            let Some(pc) = self.classes.get(&p.to_lowercase()).cloned() else {
+                break;
+            };
+            if let Some(m) = pc
+                .decl
+                .methods
+                .iter()
+                .find(|m| m.decl.name.to_lowercase() == lname && !m.is_abstract)
+            {
+                return Some((pc.decl.name.clone(), m.clone()));
+            }
+            pn = pc.decl.parent.clone();
+        }
+        None
+    }
+
+    /// Signature-compat check of an implementation against a trait's
+    /// abstract requirement (abstract_method_*). `both_abs` marks the
+    /// two-traits-both-abstract case where Zend cites trait names for
+    /// both sides.
+    fn trait_sig_error(
+        &mut self,
+        impl_m: &Rc<MethodDecl>,
+        abs_m: &Rc<MethodDecl>,
+        impl_disp: &str,
+        abs_disp: &str,
+        both_abs: bool,
+    ) -> Option<PhpError> {
+        let m = &impl_m.decl.name;
+        if impl_m.is_static != abs_m.is_static {
+            return Some(PhpError::fatal(
+                format!(
+                    "Cannot make {} method {}::{}() {} in class {}",
+                    if abs_m.is_static {
+                        "static"
+                    } else {
+                        "non static"
+                    },
+                    abs_disp,
+                    m,
+                    if impl_m.is_static {
+                        "static"
+                    } else {
+                        "non static"
+                    },
+                    // impl_disp is the using class for concrete impls;
+                    // for two abstract traits Zend still prints the
+                    // class being composed... using impl_disp for both.
+                    impl_disp
+                ),
+                self.cur_line,
+            ));
+        }
+        let req = |ms: &MethodDecl| {
+            ms.decl
+                .params
+                .iter()
+                .filter(|p| p.default.is_none() && !p.variadic)
+                .count()
+        };
+        let (ir, ar) = (req(impl_m), req(abs_m));
+        let count_ok = ir <= ar
+            && (impl_m.decl.params.iter().any(|p| p.variadic)
+                || (!abs_m.decl.params.iter().any(|p| p.variadic)
+                    && impl_m.decl.params.len() >= abs_m.decl.params.len()));
+        let mut ok = count_ok;
+        // An unresolvable class member makes the check impossible
+        // rather than incompatible — Zend reports which class it
+        // couldn't load (variance/trait_error, abstract_constructor).
+        let mut miss: Option<String> = None;
+        if ok {
+            for (i, ap) in abs_m.decl.params.iter().enumerate() {
+                if ap.variadic {
+                    break;
+                }
+                let Some(ip) = impl_m.decl.params.get(i) else {
+                    ok = false;
+                    break;
+                };
+                if ip.variadic {
+                    break;
+                }
+                if ip.by_ref != ap.by_ref {
+                    ok = false;
+                    break;
+                }
+                let it = ip.ty.clone().unwrap_or_else(|| vec!["mixed".into()]);
+                let at = ap.ty.clone().unwrap_or_else(|| vec!["mixed".into()]);
+                if !self.ty_sup(&it, &at) {
+                    miss = self.first_unres(&it).or_else(|| self.first_unres(&at));
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            // Return-type covariance: an untyped impl fails a typed
+            // abstract; a typed impl must be a subtype of the abstract's
+            // (`never` bottoms out any requirement) (bug81192).
+            ok = match (&impl_m.decl.ret, &abs_m.decl.ret) {
+                (_, None) => true,
+                (None, Some(_)) => false,
+                (Some(ir), Some(ar)) => {
+                    let resolve = |ms: &[String]| -> Vec<String> {
+                        ms.iter()
+                            .map(|m| {
+                                if m.eq_ignore_ascii_case("self") {
+                                    impl_disp.to_string()
+                                } else {
+                                    m.clone()
+                                }
+                            })
+                            .collect()
+                    };
+                    let (ir2, ar2) = (resolve(ir), resolve(ar));
+                    // `static` in the abstract keeps its late-static
+                    // meaning: the impl's own class satisfies it only
+                    // when the class is final (self == static then);
+                    // a real subclass member always narrows it
+                    // (override_static_with_self/*).
+                    let impl_final = self.linking.last().map(|c| c.is_final).unwrap_or(false);
+                    let covers = ir2.iter().all(|t| {
+                        ar2.iter().any(|s| {
+                            if s.eq_ignore_ascii_case("static") {
+                                t.eq_ignore_ascii_case("static")
+                                    || (t.eq_ignore_ascii_case(impl_disp) && impl_final)
+                                    || self.ty_member_is_a(t, impl_disp)
+                                        && !t.eq_ignore_ascii_case(impl_disp)
+                            } else if t.eq_ignore_ascii_case("static") {
+                                // impl-side `static` ⊆ s when the impl
+                                // class is-a s (any late-static callee
+                                // is still an s) (static_variance_success).
+                                self.ty_member_is_a(impl_disp, s)
+                            } else {
+                                self.ty_member_is_a(t, s)
+                            }
+                        })
+                    });
+                    let pass = ir2.iter().any(|m| m.eq_ignore_ascii_case("never")) || covers;
+                    if !pass {
+                        miss = self.first_unres(&ir2).or_else(|| self.first_unres(&ar2));
+                    }
+                    pass
+                }
+            };
+        }
+        if ok && both_abs {
+            // Requirements must agree in BOTH directions (bug60217c).
+            return self.trait_sig_error(abs_m, impl_m, abs_disp, impl_disp, false);
+        }
+        if ok {
+            return None;
+        }
+        // An unresolvable class member makes the check impossible
+        // rather than incompatible — Zend reports which class it
+        // couldn't load (variance/trait_error, abstract_constructor).
+        if let Some(cn) = miss {
+            let mut e = PhpError::fatal(
+                format!(
+                    "Could not check compatibility between {}::{}{} and {}::{}{}, because class {} is not available",
+                    impl_disp,
+                    m,
+                    Self::sig_str_full(&impl_m.decl, impl_disp),
+                    abs_disp,
+                    m,
+                    Self::sig_str_full(&abs_m.decl, impl_disp),
+                    cn
+                ),
+                impl_m.decl.line,
+            );
+            e.line = impl_m.decl.line;
+            if impl_m.decl.file != self.diag_file() {
+                self.last_err_file = impl_m.decl.file.clone();
+            }
+            return Some(e);
+        }
+        // Zend cites the implementing method's declaration — for merged
+        // trait methods that's the trait's own file/line (bug81192).
+        let mut e = PhpError::fatal(
+            format!(
+                "Declaration of {}::{}{} must be compatible with {}::{}{}",
+                impl_disp,
+                m,
+                Self::sig_str_full(&impl_m.decl, impl_disp),
+                abs_disp,
+                m,
+                Self::sig_str_full(&abs_m.decl, impl_disp)
+            ),
+            impl_m.decl.line,
+        );
+        e.line = impl_m.decl.line;
+        if impl_m.decl.file != self.diag_file() {
+            self.last_err_file = impl_m.decl.file.clone();
+        }
+        Some(e)
+    }
+
+    /// Interface method signatures must be compatible with the class's
+    /// implementation (bug60153): same rules as trait abstracts.
+    fn check_interface_sigs(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
+        // (iface, display-for-errors): own `implements` cites the
+        // interface; an ancestor's requirement cites the ancestor
+        // (bug62358).
+        let mut ifaces: Vec<(Rc<ClassDecl>, String)> = Vec::new();
+        for iname in &d.implements {
+            if let Some(f) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+                ifaces.push((f, String::new()));
+            }
+        }
+        let mut chain: Vec<Rc<ClassDecl>> = Vec::new();
+        let mut pn = d.parent.clone();
+        while let Some(p) = pn {
+            let Some(pc) = self.classes.get(&p.to_lowercase()) else {
+                break;
+            };
+            chain.push(pc.decl.clone());
+            pn = pc.decl.parent.clone();
+        }
+        for c in &chain {
+            for iname in &c.implements {
+                if let Some(f) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+                    ifaces.push((f, c.name.clone()));
+                }
+            }
+        }
+        let mut seen = 0;
+        while seen < ifaces.len() {
+            let (f, disp) = ifaces[seen].clone();
+            seen += 1;
+            let cite = if disp.is_empty() {
+                f.name.clone()
+            } else {
+                disp
+            };
+            for im in &f.methods {
+                if let Some(impl_m) = d
+                    .methods
+                    .iter()
+                    .find(|m| m.decl.name.eq_ignore_ascii_case(&im.decl.name))
+                    .cloned()
+                {
+                    // Interface methods must stay public in the
+                    // implementation (bug69467).
+                    if !matches!(impl_m.visibility, crate::ast::Visibility::Public) {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Access level to {}::{}() must be public (as in class {})",
+                                d.name, im.decl.name, cite
+                            ),
+                            impl_m.decl.line,
+                        ));
+                    }
+                    if !self.builtin_ifaces.contains(&f.name.to_lowercase()) {
+                        if let Some(e) = self.trait_sig_error(&impl_m, im, &d.name, &cite, false) {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            for p2 in &f.implements {
+                if let Some(pp) = self.interfaces.get(&p2.to_lowercase()).cloned() {
+                    ifaces.push((pp, String::new()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Non-abstract classes must implement every abstract method: own/
+    /// trait-merged abstracts (labelled `C::m`), plus abstracts from
+    /// ancestor classes and interfaces (labelled `Src::m`).
+    fn check_abstract_methods(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
+        if d.kind != crate::ast::ClassKind::Class {
+            return Ok(());
+        }
+        // A private abstract requirement can't be delegated to a
+        // subclass — the composing class itself must implement it,
+        // even when abstract (abstract_method_6).
+        let priv_missing: Vec<String> = d
+            .methods
+            .iter()
+            .filter(|m| {
+                m.is_abstract
+                    && m.visibility == crate::ast::Visibility::Private
+                    && m.decl.decl_in.is_some()
+            })
+            .map(|m| format!("{}::{}", d.name, m.decl.name))
+            .collect();
+        if !priv_missing.is_empty() {
+            let n = priv_missing.len();
+            return Err(PhpError::fatal(
+                format!(
+                    "Class {} must implement {} abstract method{} ({})",
+                    d.name,
+                    n,
+                    if n == 1 { "" } else { "s" },
+                    priv_missing.join(", ")
+                ),
+                self.cur_line,
+            ));
+        }
+        if d.is_abstract {
+            return Ok(());
+        }
+        // Concrete impls visible to this class: own methods (incl.
+        // trait-merged) plus ancestor classes' methods.
+        let mut chain: Vec<Rc<ClassDecl>> = Vec::new();
+        let mut pn = d.parent.clone();
+        while let Some(p) = pn {
+            let Some(pc) = self.classes.get(&p.to_lowercase()) else {
+                break;
+            };
+            chain.push(pc.decl.clone());
+            pn = pc.decl.parent.clone();
+        }
+        // `end` = ancestors chain[0..end] that may satisfy the abstract
+        // (the declaring link itself plus everything below it).
+        let concrete = |lname: &str, end: usize| -> bool {
+            if d.methods
+                .iter()
+                .any(|m| m.decl.name.to_lowercase() == lname && !m.is_abstract)
+            {
+                return true;
+            }
+            chain.iter().take(end).any(|c| {
+                c.methods
+                    .iter()
+                    .any(|m| m.decl.name.to_lowercase() == lname && !m.is_abstract)
+            })
+        };
+        let mut missing: Vec<String> = Vec::new();
+        // Own + trait-merged abstracts first (label: this class).
+        for m in &d.methods {
+            if m.is_abstract {
+                let lname = m.decl.name.to_lowercase();
+                if concrete(&lname, chain.len()) {
+                    continue;
+                }
+                let label = format!("{}::{}", d.name, m.decl.name);
+                if !missing.contains(&label) {
+                    missing.push(label);
+                }
+            }
+        }
+        // Ancestor abstracts: an impl must also be signature-compat
+        // (bug62358) — find it in this class or a descendant link.
+        for (i, c) in chain.iter().enumerate() {
+            for m in &c.methods {
+                if !m.is_abstract {
+                    continue;
+                }
+                let impl_at =
+                    |m: &Rc<MethodDecl>| -> Option<(Rc<MethodDecl>, String)> {
+                        if let Some(x) = d.methods.iter().find(|x| {
+                            x.decl.name.eq_ignore_ascii_case(&m.decl.name) && !x.is_abstract
+                        }) {
+                            return Some((x.clone(), d.name.clone()));
+                        }
+                        chain.iter().take(i + 1).find_map(|c2| {
+                            c2.methods
+                                .iter()
+                                .find(|x| {
+                                    x.decl.name.eq_ignore_ascii_case(&m.decl.name) && !x.is_abstract
+                                })
+                                .map(|x| (x.clone(), c2.name.clone()))
+                        })
+                    };
+                if let Some((im, iname)) = impl_at(m) {
+                    if let Some(e) = self.trait_sig_error(&im, m, &iname, &c.name, false) {
+                        let mut e = e;
+                        e.line = im.decl.line;
+                        return Err(e);
+                    }
+                    continue;
+                }
+                let label = format!("{}::{}", c.name, m.decl.name);
+                if !missing.contains(&label) {
+                    missing.push(label);
+                }
+            }
+        }
+        // Interfaces implemented anywhere in the chain (including
+        // this class's own `implements`).
+        let mut ifaces: Vec<Rc<ClassDecl>> = Vec::new();
+        for iname in d
+            .implements
+            .iter()
+            .chain(chain.iter().flat_map(|c| c.implements.iter()))
+        {
+            if let Some(f) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+                ifaces.push(f);
+            }
+        }
+        let mut seen = 0;
+        while seen < ifaces.len() {
+            let f = ifaces[seen].clone();
+            seen += 1;
+            for m in &f.methods {
+                // Interface methods are implicitly abstract.
+                let lname = m.decl.name.to_lowercase();
+                if concrete(&lname, chain.len()) {
+                    continue;
+                }
+                let label = format!("{}::{}", f.name, m.decl.name);
+                if !missing.contains(&label) {
+                    missing.push(label);
+                }
+            }
+            for p2 in &f.implements {
+                if let Some(pp) = self.interfaces.get(&p2.to_lowercase()).cloned() {
+                    ifaces.push(pp);
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let (n, list) = (missing.len(), missing.join(", "));
+        Err(PhpError::fatal(
+            format!(
+                "Class {} contains {} abstract method{} and must therefore be declared abstract or implement the remaining method{} ({})",
+                d.name,
+                n,
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "" } else { "s" },
+                list
+            ),
+            self.cur_line,
+        ))
+    }
+
+    /// Resolve `self`/`static`/`parent` members against a declaring
+    /// class given only its name + parent name (variance checks run
+    /// while the child class is still mid-registration).
+    fn ty_scope_resolve(&self, ty: &[String], name: &str, parent: &Option<String>) -> Vec<String> {
+        ty.iter()
+            .map(|m| match m.to_lowercase().as_str() {
+                "self" | "static" => name.to_string(),
+                "parent" => parent.clone().unwrap_or_else(|| "\\0parent".to_string()),
+                _ => m.clone(),
+            })
+            .collect()
+    }
+
+    /// `iterable` ≡ `Traversable|array` for type-set comparisons.
+    fn ty_expand_iterable(ty: &[String]) -> Vec<String> {
+        let mut out = Vec::with_capacity(ty.len() + 1);
+        for m in ty {
+            if m.eq_ignore_ascii_case("iterable") {
+                out.push("Traversable".into());
+                out.push("array".into());
+            } else {
+                out.push(m.clone());
+            }
+        }
+        out
+    }
+
+    /// Member coverage: `covers(big, small)` — every value matching
+    /// `small` also matches `big`. Drives semantic type equality for
+    /// prop variance (union_types/variance/valid).
+    fn ty_covers(&mut self, big: &str, small: &str) -> bool {
+        let bl = big.to_lowercase();
+        let sl = small.to_lowercase();
+        if bl == sl {
+            return true;
+        }
+        let b_inner = big.trim_start_matches('(').trim_end_matches(')');
+        let s_inner = small.trim_start_matches('(').trim_end_matches(')');
+        if b_inner.contains('&') {
+            // `small ⊆ B1&B2` iff every conjunct of big is covered by
+            // some conjunct of small (`B&A` ⊆ `A&B` — commutative).
+            let sparts: Vec<&str> = s_inner.split('&').collect();
+            return b_inner
+                .split('&')
+                .all(|b| sparts.iter().any(|p| self.ty_covers(b, p)));
+        }
+        if s_inner.contains('&') {
+            // `A&B` ⊆ anything covering one of its parts.
+            return s_inner.split('&').any(|p| self.ty_covers(big, p));
+        }
+        const SCALARS: &[&str] = &[
+            "int", "float", "string", "bool", "array", "callable", "object", "mixed", "void",
+            "never", "null", "false", "true", "iterable", "resource", "numeric",
+        ];
+        match bl.as_str() {
+            "mixed" => true,
+            "bool" => sl == "false" || sl == "true",
+            "float" => sl == "int",
+            "object" => !SCALARS.contains(&sl.as_str()),
+            "callable" => sl == "closure" || sl == "callable",
+            _ => {
+                if SCALARS.contains(&sl.as_str()) || SCALARS.contains(&bl.as_str()) {
+                    false
+                } else {
+                    self.is_a_str(&sl, &bl)
+                }
+            }
+        }
     }
 
     /// `final` props/hooks may not be overridden by a subclass.
@@ -7787,8 +12434,45 @@ impl<'a> Interp<'a> {
             let Some(pc) = self.classes.get(&pname.to_lowercase()).cloned() else {
                 break;
             };
+            for cm in &d.methods {
+                let Some(am) = pc
+                    .decl
+                    .methods
+                    .iter()
+                    .find(|x| x.decl.name.eq_ignore_ascii_case(&cm.decl.name))
+                else {
+                    continue;
+                };
+                if am.is_final && !cm.is_abstract {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Cannot override final method {}::{}()",
+                            pc.decl.name, cm.decl.name
+                        ),
+                        self.cur_line,
+                    ));
+                }
+            }
+            for cc in &d.consts {
+                let Some(ac) = pc.decl.consts.iter().find(|x| x.name == cc.name) else {
+                    continue;
+                };
+                if ac.is_final {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "{}::{} cannot override final constant {}::{}",
+                            d.name, cc.name, pc.decl.name, cc.name
+                        ),
+                        self.cur_line,
+                    ));
+                }
+            }
             for cp in &d.props {
-                let Some(ap) = pc.decl.props.iter().find(|x| x.name == cp.name) else {
+                let Some(ap) =
+                    pc.decl.props.iter().find(|x| {
+                        x.name == cp.name && x.visibility != crate::ast::Visibility::Private
+                    })
+                else {
                     continue;
                 };
                 if ap.is_final {
@@ -7808,24 +12492,58 @@ impl<'a> Interp<'a> {
                     || Self::prop_is_backed(ap)
                     || cp.hooks.is_none()
                     || Self::prop_is_backed(cp);
-                let norm = |t: &Option<Vec<String>>| {
-                    let mut v = t.clone().unwrap_or_default();
-                    v.sort();
-                    v.dedup();
-                    v
-                };
-                if backed && norm(&cp.ty) != norm(&ap.ty) {
+                // Prop types are invariant but compared SEMANTICALLY:
+                // `X|Y` ≡ `X` when Y extends X (dropping a member
+                // subsumed by another is identity), and `iterable`
+                // expands to `Traversable|array` (union variance
+                // valid.phpt). Untyped props stay exact `==`.
+                let mut ty_equiv =
+                    |ct: &Option<Vec<String>>, at: &Option<Vec<String>>| match (ct, at) {
+                        (None, None) => true,
+                        (Some(c), Some(a)) => {
+                            let ce = self.ty_scope_resolve(c, &d.name, &d.parent);
+                            let ae = self.ty_scope_resolve(a, &pc.decl.name, &pc.decl.parent);
+                            let ce = Self::ty_expand_iterable(&ce);
+                            let ae = Self::ty_expand_iterable(&ae);
+                            ce.iter().all(|c| ae.iter().any(|a| self.ty_covers(a, c)))
+                                && ae.iter().all(|a| ce.iter().any(|c| self.ty_covers(c, a)))
+                        }
+                        _ => false,
+                    };
+                if backed && !ty_equiv(&cp.ty, &ap.ty) {
+                    // Child re-types an untyped parent prop → "must be
+                    // omitted"; typed-vs-typed mismatch → "must be T".
+                    if ap.ty.is_none() && cp.ty.is_some() {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Type of {}::${} must be omitted to match the parent definition in class {}",
+                                d.name, cp.name, pc.decl.name
+                            ),
+                            self.cur_line,
+                        ));
+                    }
                     let aty = ap
                         .ty
                         .as_ref()
-                        .map(|m| m.join("|"))
+                        .map(|m| {
+                            m.iter()
+                                .map(|t| {
+                                    if t.contains('&') && m.len() > 1 {
+                                        format!("({})", t)
+                                    } else {
+                                        t.clone()
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("|")
+                        })
                         .unwrap_or_else(|| "mixed".into());
                     return Err(PhpError::fatal(
                         format!(
                             "Type of {}::${} must be {} (as in class {})",
                             d.name, cp.name, aty, pc.decl.name
                         ),
-                        cp.line,
+                        self.cur_line,
                     ));
                 }
                 if let (Some(chs), Some(ahs)) = (&cp.hooks, &ap.hooks) {
@@ -8181,6 +12899,38 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// First type member naming a class that can't be resolved even
+    /// after an autoload attempt — builtins, `self`/`parent`/`static`,
+    /// registered classes/interfaces, and names on the linking stack
+    /// all count as resolvable (variance/mixed_return_type: members
+    /// covered without resolution never reach here).
+    fn first_unres(&mut self, tys: &[String]) -> Option<String> {
+        const BUILTIN_T: &[&str] = &[
+            "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed",
+            "void", "never", "false", "true", "null", "resource", "self", "parent", "static",
+        ];
+        tys.iter()
+            .flat_map(|m| m.split('&').map(str::to_string).collect::<Vec<_>>())
+            .find(|m| {
+                let ml = m.trim_start_matches('\\').to_lowercase();
+                if BUILTIN_T.contains(&ml.as_str())
+                    || self.classes.contains_key(&ml)
+                    || self.interfaces.contains_key(&ml)
+                    || self
+                        .linking
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(&ml))
+                {
+                    return false;
+                }
+                if self.run_autoload(m.trim_start_matches('\\')).is_err() {
+                    self.pending_exception = None;
+                }
+                !self.classes.contains_key(&ml) && !self.interfaces.contains_key(&ml)
+            })
+            .map(|m| m.trim_start_matches('\\').to_string())
+    }
+
     /// `sup` is a supertype of `sub` when every `sub` member is admitted
     /// by some `sup` member — equal names, `mixed`, or a class/interface
     /// the member is-a (set_value_parameter_type_variance_006).
@@ -8189,17 +12939,147 @@ impl<'a> Interp<'a> {
             .all(|t| sup.iter().any(|s| self.ty_member_is_a(t, s)))
     }
 
+    /// Whether a single type conjunct resolves to a registered (or
+    /// mid-linking / autoloadable) class-like name or builtin. Used
+    /// to gate `&`-member coverage of `object`/`iterable`/`callable`.
+    fn ty_conj_resolvable(&mut self, c: &str) -> bool {
+        let cl = c.to_lowercase();
+        const BUILTIN: &[&str] = &[
+            "int",
+            "float",
+            "string",
+            "bool",
+            "array",
+            "object",
+            "callable",
+            "iterable",
+            "mixed",
+            "void",
+            "never",
+            "false",
+            "true",
+            "null",
+            "numeric",
+            "resource",
+            "self",
+            "static",
+            "parent",
+            "closure",
+            "traversable",
+            "iterator",
+            "generator",
+        ];
+        if BUILTIN.contains(&cl.as_str()) {
+            return true;
+        }
+        if self.classes.contains_key(&cl)
+            || self.interfaces.contains_key(&cl)
+            || self.traits.contains_key(&cl)
+            || self.linking.iter().any(|d| d.name.to_lowercase() == cl)
+        {
+            return true;
+        }
+        // Autoload errors must not surface here — resolvability is a
+        // yes/no probe (invalid4 "could not check" is raised by the
+        // caller). Preserve any pre-existing pending exception.
+        let prior = self.pending_exception.take();
+        let _ = self.run_autoload(c);
+        self.pending_exception = prior;
+        self.classes.contains_key(&cl)
+            || self.interfaces.contains_key(&cl)
+            || self.traits.contains_key(&cl)
+    }
+
     /// Type-member acceptance: `t` is admitted by `s` when they match by
     /// name, `s` is `mixed`, or `t`'s class/interface ancestry includes
     /// `s` (interfaces live in `self.interfaces`, not `self.classes`).
     fn ty_member_is_a(&mut self, t: &str, s: &str) -> bool {
+        self.ty_member_is_a_impl(t, s, false)
+    }
+
+    /// Strict membership for ref-bind merges — `int ⊄ float` (scalar
+    /// coercions don't apply to declared-type sets, prop_ref_assign).
+    fn ty_member_is_a_strict(&mut self, t: &str, s: &str) -> bool {
+        self.ty_member_is_a_impl(t, s, true)
+    }
+
+    fn ty_member_is_a_impl(&mut self, t: &str, s: &str, strict: bool) -> bool {
         if s.eq_ignore_ascii_case(t) || s.eq_ignore_ascii_case("mixed") {
             return true;
+        }
+        if s.contains('&') {
+            // `t ⊆ S1&S2&…` iff every conjunct of s is covered by some
+            // conjunct of t (`A&B&C` is a subtype of `A&B`).
+            let tparts: Vec<&str> = t.split('&').collect();
+            return s.split('&').all(|sc| {
+                tparts
+                    .iter()
+                    .any(|tc| self.ty_member_is_a_impl(tc, sc, strict))
+            });
+        }
+        if t.contains('&') {
+            // `C1&C2 ⊆ s` when some conjunct already is-a `s` — but a
+            // conjunct covering `object`/`iterable`/`callable` must be
+            // a resolvable class-like name; an unloadable conjunct
+            // can't prove the member is object-like (invalid4).
+            return t.split('&').any(|sm| {
+                let atomish =
+                    ["object", "iterable", "callable"].contains(&s.to_lowercase().as_str());
+                if atomish && !self.ty_conj_resolvable(sm) {
+                    return false;
+                }
+                self.ty_member_is_a_impl(sm, s, strict)
+            });
         }
         if t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("mixed") {
             return false;
         }
-        if let Some(iface) = self.interfaces.get(&t.to_lowercase()).cloned() {
+        let tl = t.to_lowercase();
+        let sl = s.to_lowercase();
+        if sl == "iterable"
+            && (["array", "traversable", "iterator", "generator"].contains(&tl.as_str())
+                || self.is_a_str(&tl, "traversable"))
+        {
+            return true;
+        }
+        if sl == "callable" && tl == "closure" {
+            return true;
+        }
+        if sl == "object" && tl == "closure" {
+            return true;
+        }
+        if !strict && sl == "float" && tl == "int" {
+            return true;
+        }
+        if sl == "object" {
+            const SCALARS: &[&str] = &[
+                "int", "float", "string", "bool", "array", "callable", "iterable", "void", "never",
+                "null", "false", "true", "resource", "numeric",
+            ];
+            if !SCALARS.contains(&tl.as_str()) {
+                return true;
+            }
+        }
+        if sl == "bool" && (tl == "true" || tl == "false") {
+            return true;
+        }
+        // A class declaring __toString implicitly implements
+        // Stringable for variance (variance/stringable).
+        if sl == "stringable"
+            && (self
+                .lookup_class(t)
+                .map(|c| c.find_method("__tostring").is_some())
+                .unwrap_or(false)
+                || self.linking.iter().any(|c| {
+                    c.name.eq_ignore_ascii_case(t)
+                        && c.methods
+                            .iter()
+                            .any(|mm| mm.decl.name.eq_ignore_ascii_case("__tostring"))
+                }))
+        {
+            return true;
+        }
+        if let Some(iface) = self.interfaces.get(&tl).cloned() {
             let mut stack = vec![iface];
             while let Some(f) = stack.pop() {
                 for p in &f.implements {
@@ -8214,6 +13094,420 @@ impl<'a> Interp<'a> {
             return false;
         }
         self.is_a_str(t, s)
+    }
+
+    /// Typed class constants (PHP 8.3): forbidden members, the
+    /// declared-value check (strict — no coercion), and the
+    /// inheritance variance rule (child ⊆ parent when the parent side
+    /// declares a type; private consts exempt).
+    fn check_const_types(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
+        for cd in &d.consts {
+            let Some(ty) = &cd.ty else { continue };
+            for m in ty {
+                let l = m.to_lowercase();
+                if ["callable", "void", "never"].contains(&l.as_str()) {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Class constant {}::{} cannot have type {}",
+                            d.name, cd.name, m
+                        ),
+                        self.cur_line,
+                    ));
+                }
+            }
+            // Compile-time values: fatal now. Runtime values (define'd
+            // consts, `new`) defer to the access-time TypeError below.
+            if is_compile_const(&cd.value) {
+                if let Ok(v) = self.eval_decl_const(&cd.value, &d.file) {
+                    if !self.const_ty_accepts(ty, &v, &d.name) {
+                        let tn = self.zval_type_name(&v);
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Cannot use {} as value for class constant {}::{} of type {}",
+                                tn,
+                                d.name,
+                                cd.name,
+                                ty_disp(ty)
+                            ),
+                            self.cur_line,
+                        ));
+                    }
+                }
+            }
+        }
+        for pd in &d.props {
+            if let Some(ty) = &pd.ty {
+                for m in ty {
+                    let l = m.to_lowercase();
+                    if ["callable", "void", "never"].contains(&l.as_str()) {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Property {}::${} cannot have type {}",
+                                d.name,
+                                pd.name,
+                                ty_disp(ty)
+                            ),
+                            pd.line,
+                        ));
+                    }
+                }
+                let ctx = Some((d.name.as_str(), d.parent.clone()));
+                self.check_ty_redundant(ty, &ctx)?;
+                if let Some(def) = &pd.default {
+                    if is_compile_const(def) {
+                        if let Ok(v) = self.eval_decl_const(def, &d.file) {
+                            // `= null` on a non-nullable prop needs `?T`
+                            // (typed_properties_015).
+                            if matches!(v, Value::Null)
+                                && !ty.iter().any(|m| m.eq_ignore_ascii_case("null"))
+                            {
+                                // Implicit nullable is only hinted for
+                                // single non-`&` types — unions and
+                                // intersections report the plain
+                                // "Cannot use null" (bug81268).
+                                if ty.len() > 1 || ty.iter().any(|m| m.contains('&')) {
+                                    return Err(PhpError::fatal(
+                                        format!(
+                                            "Cannot use null as default value for property {}::${} of type {}",
+                                            d.name,
+                                            pd.name,
+                                            ty_disp(ty)
+                                        ),
+                                        pd.line,
+                                    ));
+                                }
+                                let hint = if ty.len() == 1 {
+                                    format!("?{}", ty_disp(ty))
+                                } else {
+                                    format!("{}|null", ty_disp(ty))
+                                };
+                                return Err(PhpError::fatal(
+                                    format!(
+                                        "Default value for property of type {} may not be null. Use the nullable type {} to allow null default value",
+                                        ty_disp(ty),
+                                        hint
+                                    ),
+                                    pd.line,
+                                ));
+                            }
+                            // int→float is the only allowed widening.
+                            if !(self.const_ty_accepts(ty, &v, &d.name)
+                                || (matches!(v, Value::Int(_))
+                                    && ty.iter().any(|m| m.eq_ignore_ascii_case("float"))))
+                            {
+                                return Err(PhpError::fatal(
+                                    format!(
+                                        "Cannot use {} as default value for property {}::${} of type {}",
+                                        self.zval_type_name(&v),
+                                        d.name,
+                                        pd.name,
+                                        ty_disp(ty)
+                                    ),
+                                    pd.line,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Inheritance variance — parent classes and implemented
+        // interfaces' same-name consts constrain this class's.
+        let mut supers: Vec<(String, crate::ast::ConstDecl)> = Vec::new();
+        let mut pn = d.parent.clone();
+        while let Some(p) = pn {
+            let Some(pc) = self.classes.get(&p.to_lowercase()).cloned() else {
+                break;
+            };
+            for cd in &pc.decl.consts {
+                if cd.visibility != crate::ast::Visibility::Private {
+                    supers.push((pc.decl.name.clone(), cd.clone()));
+                }
+            }
+            pn = pc.decl.parent.clone();
+        }
+        for i in &d.implements {
+            if let Some(id) = self.interfaces.get(&i.to_lowercase()).cloned() {
+                for cd in &id.consts {
+                    supers.push((id.name.clone(), cd.clone()));
+                }
+            }
+        }
+        for cd in &d.consts {
+            if cd.visibility == crate::ast::Visibility::Private {
+                continue;
+            }
+            for (sn, scd) in &supers {
+                if scd.name != cd.name {
+                    continue;
+                }
+                let Some(pty) = &scd.ty else { continue };
+                let ok = match &cd.ty {
+                    Some(cty) => self.ty_sup(pty, cty),
+                    None => false,
+                };
+                if !ok {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Type of {}::{} must be compatible with {}::{} of type {}",
+                            d.name,
+                            cd.name,
+                            sn,
+                            cd.name,
+                            ty_disp(pty)
+                        ),
+                        self.cur_line,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Strict const-value acceptance: any union member (intersections
+    /// are flattened to union members by take_type — DNF types in const
+    /// positions behave the same for the tests at hand). `self`/`static`
+    ////`parent` resolve against the declaring class.
+    fn const_ty_accepts(&mut self, ty: &[String], v: &Value, dname: &str) -> bool {
+        ty.iter().any(|m| {
+            if m.contains('&') {
+                return m
+                    .split('&')
+                    .all(|sm| self.const_ty_accepts(&[sm.to_string()], v, dname));
+            }
+            let l = m.to_lowercase();
+            match l.as_str() {
+                "null" => matches!(v, Value::Null),
+                "bool" | "true" | "false" => {
+                    matches!(v, Value::Bool(b) if l == "bool" || (*b) == (l == "true"))
+                }
+                "int" => matches!(v, Value::Int(_)),
+                "float" => matches!(v, Value::Float(_) | Value::Int(_)),
+                "string" => matches!(v, Value::Str(_)),
+                "array" => matches!(v, Value::Array(_)),
+                "object" => matches!(v, Value::Object(_)),
+                "iterable" => {
+                    matches!(v, Value::Array(_))
+                        || matches!(v, Value::Object(o) if self.obj_is_a(o, "Traversable"))
+                }
+                "mixed" => true,
+                "self" | "static" => match v {
+                    Value::Object(o) => self.obj_is_a(o, dname),
+                    _ => false,
+                },
+                "parent" => match v {
+                    Value::Object(o) => {
+                        let p = self
+                            .classes
+                            .get(&dname.to_lowercase())
+                            .and_then(|c| c.decl.parent.clone());
+                        match p {
+                            Some(pn) => self.obj_is_a(o, &pn),
+                            None => false,
+                        }
+                    }
+                    _ => false,
+                },
+                _ => match v {
+                    Value::Object(o) => self.obj_is_a(o, m),
+                    Value::Callable(_) => m.eq_ignore_ascii_case("closure"),
+                    _ => false,
+                },
+            }
+        })
+    }
+
+    /// Zend link semantics: at a class's first use, every const
+    /// initializer is evaluated — eval errors (undefined constant)
+    /// propagate as Errors, then typed checks raise TypeErrors.
+    fn link_const_inits(&mut self, cls: &Rc<PhpClass>) -> Result<(), PhpError> {
+        let lname = cls.decl.name.to_lowercase();
+        if !self.consts_linked.insert(lname) {
+            return Ok(());
+        }
+        let mut chain = vec![cls.clone()];
+        let mut pn = cls.decl.parent.clone();
+        while let Some(p) = pn {
+            let Some(pc) = self.classes.get(&p.to_lowercase()).cloned() else {
+                break;
+            };
+            if !self.consts_linked.insert(pc.decl.name.to_lowercase()) {
+                break;
+            }
+            pn = pc.decl.parent.clone();
+            chain.push(pc);
+        }
+        for c in chain {
+            for cd in &c.decl.consts {
+                if cd.enum_case {
+                    continue;
+                }
+                let file = c.decl.file.clone();
+                self.class_const_ctx += 1;
+                let r = self.eval_decl_const(&cd.value, &file);
+                self.class_const_ctx -= 1;
+                let v = r?;
+                self.const_apply_ty(cd, &c.decl.name, v)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Unit/backed enum case singleton: `E::Foo` is an object of class
+    /// E with `name` (+ `value` for backed enums) props; one instance
+    /// per case so `===` holds.
+    fn enum_case_value(
+        &mut self,
+        cls: &str,
+        case: &str,
+        cd: &crate::ast::ConstDecl,
+    ) -> Result<Value, PhpError> {
+        let key = format!("{}\0{}", cls.to_lowercase(), case);
+        if let Some(v) = self.enum_cases.get(&key) {
+            return Ok(v.clone());
+        }
+        let mut props = std::collections::HashMap::new();
+        props.insert("name".to_string(), Value::str(case));
+        let is_unit = matches!(cd.value, Expr::Null);
+        if !is_unit {
+            let file = self
+                .classes
+                .get(&cls.to_lowercase())
+                .map(|c| c.decl.file.clone())
+                .unwrap_or_default();
+            let v = self.eval_decl_const(&cd.value, &file)?;
+            props.insert("value".to_string(), v);
+        }
+        let o = self.instantiate(cls, &[])?;
+        if let Value::Object(h) = &o {
+            for (k, v) in props {
+                h.borrow_mut().props.insert(k, cell(v));
+            }
+        }
+        self.enum_cases.insert(key, o.clone());
+        Ok(o)
+    }
+
+    /// Access-time typed-const enforcement: int→float widening, else
+    /// a catchable TypeError ("Cannot assign ...").
+    fn const_apply_ty(
+        &mut self,
+        cd: &crate::ast::ConstDecl,
+        owner: &str,
+        v: Value,
+    ) -> Result<Value, PhpError> {
+        let Some(ty) = &cd.ty else { return Ok(v) };
+        let v = if ty.iter().any(|m| m.eq_ignore_ascii_case("float")) {
+            match v {
+                Value::Int(i) => Value::Float(i as f64),
+                _ => v,
+            }
+        } else {
+            v
+        };
+        if !self.const_ty_accepts(ty, &v, owner) {
+            return self.fail(PhpError::uncaught(
+                "TypeError",
+                format!(
+                    "Cannot assign {} to class constant {}::{} of type {}",
+                    self.zval_type_name(&v),
+                    owner,
+                    cd.name,
+                    ty_disp(ty)
+                ),
+                0,
+            ));
+        }
+        Ok(v)
+    }
+
+    /// Every visible override must be signature-compatible with the
+    /// nearest ancestor method of the same name — not just abstracts;
+    /// this also covers trait-merged methods vs concrete ancestors
+    /// (bug81192). `__construct` is exempt from LSP rules in PHP.
+    fn check_override_sigs(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
+        let mut chain: Vec<(String, Rc<ClassDecl>)> = Vec::new();
+        let mut pn = d.parent.clone();
+        while let Some(p) = pn {
+            let Some(pc) = self.classes.get(&p.to_lowercase()) else {
+                break;
+            };
+            chain.push((pc.decl.name.clone(), pc.decl.clone()));
+            pn = pc.decl.parent.clone();
+        }
+        if chain.is_empty() {
+            return Ok(());
+        }
+        let rank = |v: &crate::ast::Visibility| match v {
+            crate::ast::Visibility::Public => 2,
+            crate::ast::Visibility::Protected => 1,
+            crate::ast::Visibility::Private => 0,
+        };
+        for m in &d.methods {
+            if m.decl.name.eq_ignore_ascii_case("__construct")
+                || matches!(m.visibility, crate::ast::Visibility::Private)
+            {
+                continue;
+            }
+            let lname = m.decl.name.to_lowercase();
+            let Some((aname, am)) = chain.iter().find_map(|(pn, pc)| {
+                pc.methods
+                    .iter()
+                    .find(|x| x.decl.name.to_lowercase() == lname)
+                    .filter(|x| !matches!(x.visibility, crate::ast::Visibility::Private))
+                    .map(|x| (pn.clone(), x.clone()))
+            }) else {
+                continue;
+            };
+            if rank(&m.visibility) < rank(&am.visibility) {
+                let want = match am.visibility {
+                    crate::ast::Visibility::Public => {
+                        format!("public (as in class {})", aname)
+                    }
+                    crate::ast::Visibility::Protected => {
+                        format!("protected (as in class {}) or weaker", aname)
+                    }
+                    crate::ast::Visibility::Private => unreachable!(),
+                };
+                return Err(PhpError::fatal(
+                    format!(
+                        "Access level to {}::{}() must be {}",
+                        d.name, m.decl.name, want
+                    ),
+                    m.decl.line,
+                ));
+            }
+            if let Some(e) = self.trait_sig_error(m, &am, &d.name, &aname, false) {
+                // An internal method's tentative return type warns
+                // instead of erroring unless the override carries
+                // #[ReturnTypeWillChange] (internal_parent/*).
+                if !e.message.starts_with("Could not check")
+                    && self
+                        .tentative
+                        .contains(&(aname.to_lowercase(), lname.clone()))
+                    && !m.decl.attrs.iter().any(|a| {
+                        a.name
+                            .rsplit('\\')
+                            .next()
+                            .unwrap_or(&a.name)
+                            .eq_ignore_ascii_case("ReturnTypeWillChange")
+                    })
+                {
+                    self.deprecated(&format!(
+                        "Return type of {}::{}{} should either be compatible with {}::{}{}, or the #[\\ReturnTypeWillChange] attribute should be used to temporarily suppress the notice",
+                        d.name,
+                        m.decl.name,
+                        Self::sig_str_full(&m.decl, &d.name),
+                        aname,
+                        am.decl.name,
+                        Self::sig_str_full(&am.decl, &d.name)
+                    ))?;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     /// An abstract hook (`get;`/`set;` in an interface or `abstract`
@@ -8397,10 +13691,17 @@ impl<'a> Interp<'a> {
     /// once (FCC string args, class_exists).
     fn resolve_class(&mut self, name: &str) -> Option<String> {
         let n = name.trim_start_matches('\\');
-        if !self.classes.contains_key(&n.to_lowercase()) {
-            self.run_autoload(n);
+        if !self.classes.contains_key(&n.to_lowercase())
+            && !self.interfaces.contains_key(&n.to_lowercase())
+        {
+            // Option-typed: a throwing autoloader can't surface here —
+            // PHP propagates it, but callers of resolve_class (e.g.
+            // class_exists) mostly can't throw either; keep the swallow.
+            let _ = self.run_autoload(n);
         }
-        if self.classes.contains_key(&n.to_lowercase()) {
+        if self.classes.contains_key(&n.to_lowercase())
+            || self.interfaces.contains_key(&n.to_lowercase())
+        {
             Some(n.to_string())
         } else {
             None
@@ -8455,18 +13756,33 @@ impl<'a> Interp<'a> {
     fn new_instance(&mut self, name: &str, args: CallArgs) -> Result<Value, PhpError> {
         let lname = name.to_lowercase();
         if !self.classes.contains_key(&lname) {
-            self.run_autoload(name.trim_start_matches('\\'));
+            self.run_autoload(name.trim_start_matches('\\'))?;
         }
         let cls = match self.classes.get(&lname) {
             Some(c) => c.clone(),
             None => {
+                let t = name.trim_start_matches('\\');
+                if self.traits.contains_key(&t.to_lowercase()) {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Cannot instantiate trait {}", t),
+                        0,
+                    ));
+                }
                 return self.fail(PhpError::uncaught(
                     "Error",
                     format!("Class \"{}\" not found", name),
                     0,
-                ))
+                ));
             }
         };
+        if cls.decl.kind == ClassKind::Trait {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!("Cannot instantiate trait {}", cls.name()),
+                0,
+            ));
+        }
         if cls.decl.kind == ClassKind::Interface {
             return self.fail(PhpError::uncaught(
                 "Error",
@@ -8481,6 +13797,7 @@ impl<'a> Interp<'a> {
                 0,
             ));
         }
+        self.link_const_inits(&cls)?;
         let has_ctor = self.find_method_in(&cls, "__construct").is_some();
         if !has_ctor {
             if let Some((n, ..)) = args.named.first() {
@@ -8496,7 +13813,7 @@ impl<'a> Interp<'a> {
         // interception); the ctor may be inherited (property_hooks/foreach).
         if has_ctor {
             if let Value::Object(o) = &obj {
-                self.method_invoke(o.clone(), "__construct", args)?;
+                self.method_invoke_vis(o.clone(), "__construct", args)?;
             }
         }
         Ok(obj)
@@ -8520,6 +13837,7 @@ impl<'a> Interp<'a> {
                             implements: vec![],
                             attrs: vec![],
                             traits: vec![],
+                            adaptations: vec![],
                             methods: vec![],
                             props: vec![],
                             consts: vec![],
@@ -8532,6 +13850,7 @@ impl<'a> Interp<'a> {
                     prop_order: vec![],
                     id: 0,
                     internal: None,
+                    unset_props: std::collections::HashSet::new(),
                 }))))
             }
         };
@@ -8597,7 +13916,7 @@ impl<'a> Interp<'a> {
                     }
                     continue;
                 }
-                let default = match &p.default {
+                let mut default = match &p.default {
                     Some(d) => {
                         let old = self.const_self.replace(c.clone());
                         self.class_const_ctx += 1;
@@ -8608,6 +13927,12 @@ impl<'a> Interp<'a> {
                     }
                     None => Value::Null,
                 };
+                // Runtime defaults (define()'d consts etc.) go through
+                // the same write check as assignments — strict files
+                // TypeError here (typed_properties_058).
+                if p.ty.is_some() {
+                    default = self.prop_typed_write_check(p, c, default)?;
+                }
                 // Private props live in a per-declaring-class slot
                 // ("\0Cls\0name"), so C::$e and E::$e are distinct.
                 let key = if is_priv {
@@ -8640,6 +13965,7 @@ impl<'a> Interp<'a> {
             prop_order,
             id: 0,
             internal,
+            unset_props: std::collections::HashSet::new(),
         })))
     }
 
@@ -9097,6 +14423,49 @@ impl<'a> Interp<'a> {
 
     /// The nearest PropDecl for `pn` along the chain, honoring the same
     /// private-scope rules as `hooked_prop` (hooked or plain).
+    /// Declared *static* prop lookup across the class chain
+    /// (`Foo::$i = v` write checks).
+    fn find_static_prop_decl(
+        &self,
+        cls: &Rc<PhpClass>,
+        pn: &str,
+    ) -> Option<(PropDecl, Rc<PhpClass>)> {
+        let mut cur = Some(cls.clone());
+        while let Some(c) = cur {
+            let priv_ok = std::rc::Rc::ptr_eq(&c, cls);
+            if let Some(pd) = c.decl.props.iter().find(|p| {
+                p.name == pn
+                    && p.is_static
+                    && (priv_ok || p.visibility != crate::ast::Visibility::Private)
+            }) {
+                return Some((pd.clone(), c.clone()));
+            }
+            cur = c
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        None
+    }
+
+    /// Instance-prop decl lookup on a class (Reflection, no object) —
+    /// any visibility, walking the parent chain.
+    fn find_prop_decl(&self, cls: &Rc<PhpClass>, pn: &str) -> Option<(PropDecl, Rc<PhpClass>)> {
+        let mut cur = Some(cls.clone());
+        while let Some(c) = cur {
+            if let Some(pd) = c.decl.props.iter().find(|p| p.name == pn && !p.is_static) {
+                return Some((pd.clone(), c.clone()));
+            }
+            cur = c
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        None
+    }
+
     fn decl_prop(&self, o: &Rc<RefCell<PhpObject>>, pn: &str) -> Option<(PropDecl, Rc<PhpClass>)> {
         if let Some(x) = self.scope_private_prop(o, pn) {
             return Some(x);
@@ -9465,6 +14834,7 @@ impl<'a> Interp<'a> {
         // PHP names hooks `$prop::set` — `__METHOD__` then composes the
         // declaring class into `C::$prop::set` (backed_implicit_get).
         let decl = Rc::new(FunctionDecl {
+            ret: None,
             name: format!("${}::{}", pname, kind),
             params,
             body: hook.body.clone().unwrap_or_default(),
@@ -9473,6 +14843,7 @@ impl<'a> Interp<'a> {
             line: self.cur_line,
             file: self.cur_file.clone(),
             ns: String::new(),
+            decl_in: None,
         });
         let owner = decl_owner(dcls, pname);
         let args = arg.into_iter().collect::<Vec<Cell>>();
@@ -9551,8 +14922,8 @@ impl<'a> Interp<'a> {
         if !matches!(c, Value::Int(_)) || !tys.iter().any(|t| t.eq_ignore_ascii_case("int")) {
             return;
         }
-        if let Value::Float(f) = v {
-            if f.fract() != 0.0 {
+        match v {
+            Value::Float(f) if f.fract() != 0.0 => {
                 let _ = self.emit_diag(
                     "Deprecated",
                     8192,
@@ -9562,6 +14933,23 @@ impl<'a> Interp<'a> {
                     ),
                 );
             }
+            // Float-strings name the value `float-string "1.5"`
+            // (scalar_return_basic_64bit).
+            Value::Str(b) => {
+                if let Numeric::Float(f) = numeric(b) {
+                    if f.fract() != 0.0 {
+                        let _ = self.emit_diag(
+                            "Deprecated",
+                            8192,
+                            &format!(
+                                "Implicit conversion from float-string \"{}\" to int loses precision",
+                                String::from_utf8_lossy(b)
+                            ),
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -9575,6 +14963,24 @@ impl<'a> Interp<'a> {
         v: Value,
     ) -> Result<Value, PhpError> {
         let Some(tys) = &p.ty else { return Ok(v) };
+        // self/parent/static in a prop type resolve against the
+        // DECLARING class (typed_properties_043); keep the literal
+        // members for error display.
+        let resolved = self.resolved_ty(tys, dcls.as_ref());
+        // Object with __toString coerces into a `string` prop weakly
+        // (typed_properties_051).
+        if let Value::Object(o) = &v {
+            if tys.iter().any(|t| t.eq_ignore_ascii_case("string")) {
+                let tostr = o.borrow().class.find_method("__tostring").is_some()
+                    || o.borrow().class.find_method("__toString").is_some();
+                if tostr {
+                    let sv =
+                        self.method_invoke(o.clone(), "__toString", CallArgs::positional(vec![]))?;
+                    return Ok(sv);
+                }
+            }
+        }
+        let tys = &resolved;
         if self.ty_exact(tys, &v) {
             return Ok(v);
         }
@@ -9598,6 +15004,242 @@ impl<'a> Interp<'a> {
         ))
     }
 
+    /// Resolve `self`/`parent`/`static` members of a declared type to
+    /// concrete class names for the declaring class.
+    fn resolved_ty(&self, tys: &[String], dcls: &PhpClass) -> Vec<String> {
+        tys.iter()
+            .map(|m| {
+                let l = m.to_lowercase();
+                match l.as_str() {
+                    "self" | "static" => dcls.name().to_string(),
+                    "parent" => dcls
+                        .decl
+                        .parent
+                        .clone()
+                        .unwrap_or_else(|| "\\0parent".to_string()),
+                    _ => m.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Intersect two single type members for `=&` slot-compat: same
+    /// name → itself; class types narrow by hierarchy; `object` accepts
+    /// any class; `iterable` accepts array/Traversable. Disjoint atoms
+    /// (`int` ∩ `float`) return None (typed_properties_076).
+    fn ty_member_intersect(&mut self, a: &str, b: &str) -> Option<String> {
+        let al = a.to_lowercase();
+        let bl = b.to_lowercase();
+        if al == bl {
+            return Some(a.to_string());
+        }
+        if al == "mixed" {
+            return Some(b.to_string());
+        }
+        if bl == "mixed" {
+            return Some(a.to_string());
+        }
+        if al.contains('&') || bl.contains('&') {
+            // `(X&Y) ∩ (X&Z)` = `X&Y&Z` — conjunct sets merge
+            // (typed_reference). A scalar builtin can't coexist with
+            // class conjuncts; `object`/`mixed` absorb; two unrelated
+            // concrete classes can't both hold.
+            let scalarish = |c: &str| {
+                matches!(
+                    c.to_lowercase().as_str(),
+                    "int"
+                        | "float"
+                        | "string"
+                        | "bool"
+                        | "array"
+                        | "null"
+                        | "false"
+                        | "true"
+                        | "void"
+                        | "never"
+                        | "resource"
+                        | "numeric"
+                )
+            };
+            let mut conj: Vec<String> = Vec::new();
+            for c in a.split('&').chain(b.split('&')) {
+                let cl = c.to_lowercase();
+                if cl == "object" || cl == "mixed" {
+                    continue;
+                }
+                if conj.iter().any(|x| x.eq_ignore_ascii_case(c)) {
+                    continue;
+                }
+                conj.push(c.to_string());
+            }
+            if conj.is_empty() {
+                return Some("object".to_string());
+            }
+            if conj.iter().any(|c| scalarish(c)) && conj.iter().any(|c| !scalarish(c)) {
+                return None;
+            }
+            for i in 0..conj.len() {
+                for j in (i + 1)..conj.len() {
+                    let (x, y) = (conj[i].to_lowercase(), conj[j].to_lowercase());
+                    if self.interfaces.contains_key(&x) || self.interfaces.contains_key(&y) {
+                        continue;
+                    }
+                    if self.classes.contains_key(&x)
+                        && self.classes.contains_key(&y)
+                        && !self.ty_member_is_a(&x, &y)
+                        && !self.ty_member_is_a(&y, &x)
+                    {
+                        return None;
+                    }
+                }
+            }
+            return Some(conj.join("&"));
+        }
+        const ATOMS: &[&str] = &[
+            "int", "float", "string", "bool", "array", "null", "false", "true", "void", "never",
+            "resource", "callable", "iterable", "object",
+        ];
+        let a_atom = ATOMS.contains(&al.as_str());
+        let b_atom = ATOMS.contains(&bl.as_str());
+        if !a_atom && !b_atom {
+            // Both class-like: compatible when one is a subtype of the
+            // other — the narrower type wins (A&B refs, 076).
+            return if self.ty_member_is_a(&al, &bl) {
+                Some(a.to_string())
+            } else if self.ty_member_is_a(&bl, &al) {
+                Some(b.to_string())
+            } else {
+                None
+            };
+        }
+        if a_atom && b_atom {
+            return match (al.as_str(), bl.as_str()) {
+                ("iterable", "array") | ("array", "iterable") => Some("array".to_string()),
+                ("iterable", "object") | ("object", "iterable") => Some("Traversable".to_string()),
+                _ => None,
+            };
+        }
+        // Exactly one side is a class-like name.
+        let (cls, atom) = if a_atom { (b, a) } else { (a, b) };
+        let cl = cls.to_lowercase();
+        match atom.to_lowercase().as_str() {
+            "object" => Some(cls.to_string()),
+            "iterable" => {
+                if self.ty_member_is_a(&cl, "Traversable") || self.ty_member_is_a(&cl, "iterable") {
+                    Some(cls.to_string())
+                } else {
+                    None
+                }
+            }
+            "callable" => {
+                if self.ty_member_is_a(&cl, "Closure") {
+                    Some(cls.to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Non-empty member-wise type intersection of two declared types —
+    /// returns the intersected member list, or None when disjoint
+    /// (typed_properties_068/076 `=&` conflict check).
+    /// Ref-bind merge: the memberwise intersection of the two type
+    /// sets (`int|string ∩ float|string = string`).
+    fn ty_bind_merge(&mut self, a: &[String], b: &[String]) -> Option<Vec<String>> {
+        let mut inter: Vec<String> = Vec::new();
+        for am in a {
+            for bm in b {
+                if let Some(m) = self.ty_member_intersect(am, bm) {
+                    if !inter.iter().any(|x| x.eq_ignore_ascii_case(&m)) {
+                        inter.push(m);
+                    }
+                }
+            }
+        }
+        if inter.is_empty() {
+            None
+        } else {
+            Some(inter)
+        }
+    }
+
+    /// Binding `src` into a typed prop (`$p =& $src`): when src is
+    /// another typed prop's slot, the two declared types must
+    /// intersect ("Reference ... not compatible", 068/076); the
+    /// current value is weak-checked like a normal write ("Cannot
+    /// assign X to property"). Returns the merged member list.
+    fn bind_typed_check(
+        &mut self,
+        pd: &PropDecl,
+        dcls: &Rc<PhpClass>,
+        src: &Cell,
+    ) -> Result<Vec<String>, PhpError> {
+        let tys = pd.ty.clone().unwrap_or_default();
+        let mut merged = tys.clone();
+        // The value must satisfy the NEW owner's type first — a plain
+        // `Cannot assign X to property` error (typed_properties_034,
+        // union_types/prop_ref_assign); the held-by incompatible
+        // message only reports a type-SET conflict.
+        let v = src.borrow().clone();
+        let nv = self.prop_typed_write_check(pd, dcls, v)?;
+        let sptr = Rc::as_ptr(src) as usize;
+        // Drop owners whose prop stopped holding the cell (rebind/unset)
+        // before reading the prior constraint.
+        self.prune_typed_slot(sptr);
+        // The cell's current constraint: the last merge result, else
+        // the primary owner's declared type.
+        let prior = self
+            .slot_merged
+            .get(&sptr)
+            .cloned()
+            .or_else(|| self.typed_slots.get(&sptr).map(|(_, t, _, _)| t.clone()));
+        if let Some(cur) = prior {
+            let ta = self.resolved_ty(&cur, dcls.as_ref());
+            let tb = self.resolved_ty(&tys, dcls.as_ref());
+            let inter = self.ty_bind_merge(&ta, &tb);
+            // Bind fails when the sets are disjoint OR the current
+            // value isn't already in the intersection (prop_ref_assign
+            // B2-style held-by error naming the primary holder).
+            let fits = match &inter {
+                Some(m) => {
+                    let vty = self.zval_type_name(&src.borrow());
+                    m.iter().any(|mm| self.ty_member_is_a_strict(&vty, mm))
+                }
+                None => false,
+            };
+            if !fits {
+                let (otys, ocn, opn) = self
+                    .typed_slots
+                    .get(&sptr)
+                    .map(|(_, t, n, p)| (t.clone(), n.clone(), p.clone()))
+                    .unwrap_or((cur.clone(), String::new(), String::new()));
+                let sv = src.borrow().clone();
+                let mut e = PhpError::uncaught(
+                    "TypeError",
+                    format!(
+                        "Reference with value of type {} held by property {}::${} of type {} is not compatible with property {}::${} of type {}",
+                        self.zval_type_name(&sv),
+                        ocn,
+                        opn,
+                        ty_disp(&otys),
+                        dcls.name(),
+                        pd.name,
+                        ty_disp(&tys)
+                    ),
+                    0,
+                );
+                e.thrown_line = Some(self.cur_line);
+                return self.fail(e);
+            }
+            merged = inter.unwrap();
+        }
+        self.slot_merged.insert(sptr, merged.clone());
+        *src.borrow_mut() = nv;
+        Ok(merged)
+    }
+
     /// Typed-property write check (plain and backing writes): the
     /// assigned value is coerced in weak mode, else a catchable
     /// `Cannot assign T to property C::$p of type U` TypeError.
@@ -9608,12 +15250,43 @@ impl<'a> Interp<'a> {
         v: Value,
     ) -> Result<Value, PhpError> {
         let Some(tys) = &p.ty else { return Ok(v) };
+        // self/parent/static in a prop type resolve against the
+        // DECLARING class (typed_properties_043); keep the literal
+        // members for error display.
+        let resolved = self.resolved_ty(tys, dcls.as_ref());
+        // Object with __toString coerces into a `string` prop weakly
+        // (typed_properties_051).
+        if let Value::Object(o) = &v {
+            if tys.iter().any(|t| t.eq_ignore_ascii_case("string")) {
+                let tostr = o.borrow().class.find_method("__tostring").is_some()
+                    || o.borrow().class.find_method("__toString").is_some();
+                if tostr {
+                    let sv =
+                        self.method_invoke(o.clone(), "__toString", CallArgs::positional(vec![]))?;
+                    return Ok(sv);
+                }
+            }
+        }
+        let tys = &resolved;
         if self.ty_exact(tys, &v) {
+            // int stored into a `float` prop widens to a float even in
+            // strict mode (typed_properties_031) — but only when no
+            // `int` member takes it exactly (`int|float` keeps int,
+            // legal_default_values).
+            if tys.iter().any(|t| t.eq_ignore_ascii_case("float"))
+                && !tys.iter().any(|t| t.eq_ignore_ascii_case("int"))
+            {
+                if let Value::Int(i) = v {
+                    return Ok(Value::Float(i as f64));
+                }
+            }
             return Ok(v);
         }
-        if let Some(c) = weak_ty_coerce(tys, &v) {
-            self.deprecate_lossy_int(tys, &v, &c);
-            return Ok(c);
+        if !self.exec_file_strict() {
+            if let Some(c) = weak_ty_coerce(tys, &v) {
+                self.deprecate_lossy_int(tys, &v, &c);
+                return Ok(c);
+            }
         }
         let mut e = PhpError::uncaught(
             "TypeError",
@@ -9622,7 +15295,7 @@ impl<'a> Interp<'a> {
                 self.zval_type_name(&v),
                 dcls.name(),
                 p.name,
-                tys.join("|")
+                ty_disp(p.ty.as_deref().unwrap_or(&[]))
             ),
             0,
         );
@@ -10172,8 +15845,34 @@ impl<'a> Interp<'a> {
                     .get(1)
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
-                ob.props.insert("\0rc\0class".into(), cell(cls));
-                ob.props.insert("\0rc\0prop".into(), cell(prop));
+                ob.props.insert("\0rc\0class".into(), cell(cls.clone()));
+                ob.props.insert("\0rc\0prop".into(), cell(prop.clone()));
+                // Public metadata props the real reflectors expose:
+                // ReflectionProperty::{class,name}, ReflectionMethod::
+                // {class,name}, ReflectionClass/Function::name. `class`
+                // keeps the canonical (declared-case) class name.
+                let cname = match &cls {
+                    Value::Object(o) => o.borrow().class.name().to_string(),
+                    Value::Str(s) => {
+                        let raw = String::from_utf8_lossy(s).to_string();
+                        let resolved = self.resolve_class(&raw).unwrap_or_else(|| raw.clone());
+                        self.classes
+                            .get(&resolved.to_lowercase())
+                            .map(|c| c.decl.name.clone())
+                            .unwrap_or(resolved)
+                    }
+                    _ => String::new(),
+                };
+                match ob.class.name().to_lowercase().as_str() {
+                    "reflectionproperty" | "reflectionmethod" | "reflectionclassconstant" => {
+                        ob.props.insert("name".into(), cell(prop));
+                        ob.props.insert("class".into(), cell(Value::str(&cname)));
+                    }
+                    "reflectionclass" | "reflectionfunction" => {
+                        ob.props.insert("name".into(), cell(cls));
+                    }
+                    _ => {}
+                }
                 Ok(Some(Value::Null))
             }
             // ReflectionFunction::invoke(...$args) and
@@ -10274,6 +15973,226 @@ impl<'a> Interp<'a> {
                     Ok(Some(self.call_value(&cb, ca)?))
                 }
             }
+            // ReflectionClass::getProperty($name) -> ReflectionProperty
+            // carrying {\0rc\0class, \0rc\0prop} (typed_properties_018).
+            "getproperty" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let pn = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let pn = self.conv_str(&pn)?.to_string();
+                let cls = self.classes.get(&cn.to_lowercase()).cloned();
+                let found = cls.as_ref().and_then(|c| self.find_prop_decl(c, &pn));
+                match found {
+                    Some((_, dcls)) => {
+                        let rp = self.instantiate("reflectionproperty", &[])?;
+                        if let Value::Object(o) = &rp {
+                            let mut ob = o.borrow_mut();
+                            ob.props
+                                .insert("\0rc\0class".into(), cell(Value::str(dcls.name())));
+                            ob.props.insert("\0rc\0prop".into(), cell(Value::str(&pn)));
+                            ob.props.insert("name".into(), cell(Value::str(&pn)));
+                            ob.props
+                                .insert("class".into(), cell(Value::str(dcls.name())));
+                        }
+                        Ok(Some(rp))
+                    }
+                    None => self.fail(PhpError::uncaught(
+                        "ReflectionException",
+                        format!("Property {}::${} does not exist", cn, pn),
+                        0,
+                    )),
+                }
+            }
+            "hasproperty" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let pn = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let pn = self.conv_str(&pn)?.to_string();
+                let has = self
+                    .classes
+                    .get(&cn.to_lowercase())
+                    .cloned()
+                    .and_then(|c| self.find_prop_decl(&c, &pn))
+                    .is_some();
+                Ok(Some(Value::Bool(has)))
+            }
+            // ReflectionProperty::getType() -> ReflectionNamedType with
+            // the declared members under \0rp\0ty (same convention as
+            // ReflectionParameter).
+            "gettype" => {
+                let is_prop = obj
+                    .borrow()
+                    .class
+                    .name()
+                    .eq_ignore_ascii_case("reflectionproperty");
+                if is_prop {
+                    let cn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let cn = self.conv_str(&cn)?.to_string();
+                    let pn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0prop")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let pn = self.conv_str(&pn)?.to_string();
+                    let ty = self
+                        .classes
+                        .get(&cn.to_lowercase())
+                        .cloned()
+                        .and_then(|c| self.find_prop_decl(&c, &pn))
+                        .and_then(|(pd, _)| pd.ty);
+                    match ty {
+                        Some(tys) => {
+                            let nt = self.instantiate("reflectionnamedtype", &[])?;
+                            if let Value::Object(o) = &nt {
+                                let mut ta = PhpArray::default();
+                                for m in &tys {
+                                    ta.push(Value::str(m));
+                                }
+                                let mut ob = o.borrow_mut();
+                                ob.props.insert(
+                                    "\0rp\0ty".into(),
+                                    cell(Value::Array(Rc::new(RefCell::new(ta)))),
+                                );
+                                ob.props
+                                    .insert("name".into(), cell(Value::str(tys.first().unwrap())));
+                            }
+                            Ok(Some(nt))
+                        }
+                        None => Ok(Some(Value::Null)),
+                    }
+                } else {
+                    Ok(Some(Value::Null))
+                }
+            }
+            "getparameters" => {
+                // Each param becomes a ReflectionParameter carrying its
+                // declared type members under \0rp\0ty (callable_002).
+                let is_method = obj
+                    .borrow()
+                    .class
+                    .name()
+                    .eq_ignore_ascii_case("reflectionmethod");
+                let decl: Option<Rc<crate::ast::FunctionDecl>> = if is_method {
+                    let cn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let cn = self.conv_str(&cn)?.to_string();
+                    let mn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0prop")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let mn = self.conv_str(&mn)?.to_string();
+                    let c = self.classes.get(&cn.to_lowercase()).cloned();
+                    match c {
+                        Some(c) => self
+                            .find_method_in(&c, &mn)
+                            .map(|(m, _)| Rc::new(m.decl.clone())),
+                        None => None,
+                    }
+                } else {
+                    let cb = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    match &cb {
+                        Value::Str(s) => self
+                            .functions
+                            .get(&String::from_utf8_lossy(s).to_lowercase())
+                            .cloned(),
+                        Value::Callable(c) => match &c.kind {
+                            crate::value::CallableKind::Closure(d) => Some(d.clone()),
+                            crate::value::CallableKind::Named(n) => {
+                                self.functions.get(&n.to_lowercase()).cloned()
+                            }
+                            crate::value::CallableKind::Method { name, obj, class } => {
+                                let c = class
+                                    .clone()
+                                    .or_else(|| obj.as_ref().map(|o| o.borrow().class.clone()));
+                                match c {
+                                    Some(c) => self
+                                        .find_method_in(&c, name)
+                                        .map(|(m, _)| Rc::new(m.decl.clone())),
+                                    None => None,
+                                }
+                            }
+                        },
+                        _ => None,
+                    }
+                };
+                let mut arr = PhpArray::default();
+                if let Some(d) = decl {
+                    for p in &d.params {
+                        let rp = self.instantiate("reflectionparameter", &[])?;
+                        if let Value::Object(o) = &rp {
+                            o.borrow_mut()
+                                .props
+                                .insert("\0rp\0name".into(), cell(Value::str(&p.name)));
+                            let mut ta = PhpArray::default();
+                            if let Some(ty) = &p.ty {
+                                for m in ty {
+                                    ta.push(Value::str(m));
+                                }
+                            }
+                            o.borrow_mut().props.insert(
+                                "\0rp\0ty".into(),
+                                cell(Value::Array(Rc::new(RefCell::new(ta)))),
+                            );
+                        }
+                        arr.push(rp);
+                    }
+                }
+                Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
+            }
+            "iscallable" => {
+                self.deprecated(
+                    "Method ReflectionParameter::isCallable() is deprecated since 8.0, use ReflectionParameter::getType() instead",
+                )?;
+                let has = obj
+                    .borrow()
+                    .props
+                    .get("\0rp\0ty")
+                    .map(|c| c.borrow().clone())
+                    .and_then(|v| match v {
+                        Value::Array(a) => Some(a),
+                        _ => None,
+                    })
+                    .map(|a| {
+                        a.borrow().entries.iter().any(|(_, c)| {
+                            matches!(&*c.borrow(), Value::Str(s) if s.eq_ignore_ascii_case(b"callable"))
+                        })
+                    })
+                    .unwrap_or(false);
+                Ok(Some(Value::Bool(has)))
+            }
             "getattributes" => {
                 let is_fn = obj
                     .borrow()
@@ -10287,6 +16206,53 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let tn = self.conv_str(&tn)?.to_string();
+                let is_cc = obj
+                    .borrow()
+                    .class
+                    .name()
+                    .eq_ignore_ascii_case("reflectionclassconstant");
+                if is_cc {
+                    let cn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let cn = self.conv_str(&cn)?.to_string();
+                    let pn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0prop")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let pn = self.conv_str(&pn)?.to_string();
+                    let decls = self
+                        .find_const_decl(&cn, &pn)
+                        .map(|(cd, _)| cd.attrs.clone())
+                        .unwrap_or_default();
+                    let fname = args
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .map(|v| self.conv_str(&v).map(|s| s.to_string()))
+                        .transpose()?
+                        .unwrap_or_default();
+                    let mut arr = PhpArray::default();
+                    for a in decls {
+                        if !fname.is_empty() && !a.name.eq_ignore_ascii_case(&fname) {
+                            continue;
+                        }
+                        let v = self.instantiate("reflectionattribute", &[])?;
+                        if let Value::Object(o) = &v {
+                            o.borrow_mut().internal = Some(ObjectInternal::ReflectionAttribute {
+                                name: a.name.clone(),
+                                args: Rc::new(a.args.clone()),
+                                target: 16,
+                            });
+                        }
+                        arr.push(v);
+                    }
+                    return Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))));
+                }
                 let (decls, target): (Vec<crate::ast::AttrDecl>, i64) = if is_fn {
                     (
                         self.functions
@@ -10304,8 +16270,18 @@ impl<'a> Interp<'a> {
                         1,
                     )
                 };
+                // Optional class-name filter arg.
+                let fname = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .map(|v| self.conv_str(&v).map(|s| s.to_string()))
+                    .transpose()?
+                    .unwrap_or_default();
                 let mut arr = PhpArray::default();
                 for a in decls {
+                    if !fname.is_empty() && !a.name.eq_ignore_ascii_case(&fname) {
+                        continue;
+                    }
                     let v = self.instantiate("reflectionattribute", &[])?;
                     if let Value::Object(o) = &v {
                         o.borrow_mut().internal = Some(ObjectInternal::ReflectionAttribute {
@@ -10348,13 +16324,23 @@ impl<'a> Interp<'a> {
                     let cls = match self.classes.get(&lname).cloned() {
                         Some(c) => c,
                         None => {
-                            return self
-                                .fail::<Option<Value>>(PhpError::uncaught(
-                                    "Error",
-                                    format!("Class \"{}\" not found", name),
-                                    0,
-                                ))
-                                .map(|_| None);
+                            // `new ReflectionClass` may not have loaded
+                            // the attribute class yet — trigger autoload.
+                            let resolved = self
+                                .resolve_class(name.trim_start_matches('\\'))
+                                .unwrap_or_else(|| name.clone());
+                            match self.classes.get(&resolved.to_lowercase()).cloned() {
+                                Some(c) => c,
+                                None => {
+                                    return self
+                                        .fail::<Option<Value>>(PhpError::uncaught(
+                                            "Error",
+                                            format!("Class \"{}\" not found", name),
+                                            0,
+                                        ))
+                                        .map(|_| None);
+                                }
+                            }
                         }
                     };
                     let short = |n: &str| n.rsplit('\\').next().unwrap_or(n).to_string();
@@ -10476,10 +16462,29 @@ impl<'a> Interp<'a> {
                 {
                     return Ok(Some(Value::str(name.clone())));
                 }
+                let clsname = obj.borrow().class.name().to_lowercase();
+                // ReflectionNamedType::getName() -> the stored type name.
+                if clsname == "reflectionnamedtype" {
+                    return Ok(Some(
+                        obj.borrow()
+                            .props
+                            .get("name")
+                            .map(|c| c.borrow().clone())
+                            .unwrap_or(Value::Null),
+                    ));
+                }
+                // ReflectionClassConstant::getName() is the const name;
+                // ReflectionProperty::getName() the prop name; every
+                // other reflector reports its class/subject.
+                let key = match clsname.as_str() {
+                    "reflectionclassconstant" => "name",
+                    "reflectionproperty" => "\0rc\0prop",
+                    _ => "\0rc\0class",
+                };
                 Ok(Some(
                     obj.borrow()
                         .props
-                        .get("\0rc\0class")
+                        .get(key)
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null),
                 ))
@@ -10493,6 +16498,172 @@ impl<'a> Interp<'a> {
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?;
                 Ok(Some(self.instantiate(&cn.to_lowercase(), &[])?))
+            }
+            "isfinal" | "isabstract" | "isstatic" | "ispublic" | "isprotected" | "isprivate" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let mn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0prop")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let mn = self.conv_str(&mn)?.to_string();
+                let m = self
+                    .classes
+                    .get(&cn.to_lowercase())
+                    .cloned()
+                    .and_then(|c| self.find_method_in(&c, &mn).map(|(m, _)| m));
+                let b = match m {
+                    Some(m) => match lname.as_str() {
+                        "isfinal" => m.is_final,
+                        "isabstract" => m.is_abstract,
+                        "isstatic" => m.is_static,
+                        "ispublic" => m.visibility == crate::ast::Visibility::Public,
+                        "isprotected" => m.visibility == crate::ast::Visibility::Protected,
+                        _ => m.visibility == crate::ast::Visibility::Private,
+                    },
+                    None => false,
+                };
+                Ok(Some(Value::Bool(b)))
+            }
+            "gettraitaliases" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let mut arr = PhpArray::default();
+                if let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() {
+                    for m in &c.decl.methods {
+                        if let Some(orig) = &m.trait_alias_of {
+                            let v =
+                                format!("{}::{}", m.decl.decl_in.clone().unwrap_or_default(), orig);
+                            arr.set(ArrKey::Str(m.decl.name.as_str().into()), Value::str(v));
+                        }
+                    }
+                }
+                Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
+            }
+            "getconstant" | "getconstants" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                if lname == "getconstants" {
+                    let mut arr = PhpArray::default();
+                    for (n, cd) in self.all_const_decls(&cn) {
+                        let f = cd.1.clone();
+                        if let Ok(v) = self.eval_decl_const(&cd.0.value, &f) {
+                            arr.set(ArrKey::Str(n.into()), v);
+                        }
+                    }
+                    return Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))));
+                }
+                let pn = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let pn = self.conv_str(&pn)?.to_string();
+                match self.find_const_decl(&cn, &pn) {
+                    Some((cd, f)) => {
+                        let v = self.eval_decl_const(&cd.value, &f)?;
+                        Ok(Some(v))
+                    }
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "getreflectionconstant" | "getreflectionconstants" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let mk = |it: &mut Self, cname: &str, n: &str| -> Result<Value, PhpError> {
+                    let v = it.instantiate("reflectionclassconstant", &[])?;
+                    if let Value::Object(o) = &v {
+                        o.borrow_mut()
+                            .props
+                            .insert("\0rc\0class".into(), cell(Value::str(cname)));
+                        o.borrow_mut()
+                            .props
+                            .insert("\0rc\0prop".into(), cell(Value::str(n)));
+                        o.borrow_mut()
+                            .props
+                            .insert("name".into(), cell(Value::str(n)));
+                        o.borrow_mut()
+                            .props
+                            .insert("class".into(), cell(Value::str(cname)));
+                    }
+                    Ok(v)
+                };
+                if lname == "getreflectionconstants" {
+                    let mut arr = PhpArray::default();
+                    for (n, _) in self.all_const_decls(&cn) {
+                        arr.push(mk(self, &cn, &n)?);
+                    }
+                    return Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))));
+                }
+                let pn = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let pn = self.conv_str(&pn)?.to_string();
+                if self.find_const_decl(&cn, &pn).is_none() {
+                    return Ok(Some(Value::Bool(false)));
+                }
+                Ok(Some(mk(self, &cn, &pn)?))
+            }
+            "getvalue" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let pn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0prop")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let pn = self.conv_str(&pn)?.to_string();
+                match self.find_const_decl(&cn, &pn) {
+                    Some((cd, f)) => Ok(Some(self.eval_decl_const(&cd.value, &f)?)),
+                    None => Ok(Some(Value::Null)),
+                }
+            }
+            "getdeclaringclass" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let v = self.instantiate("reflectionclass", &[])?;
+                if let Value::Object(o) = &v {
+                    o.borrow_mut()
+                        .props
+                        .insert("\0rc\0class".into(), cell(Value::str(cn.clone())));
+                    o.borrow_mut()
+                        .props
+                        .insert("name".into(), cell(Value::str(cn)));
+                }
+                Ok(Some(v))
             }
             "isinitialized" => {
                 let pn = obj
@@ -10538,26 +16709,75 @@ impl<'a> Interp<'a> {
                 }
                 // Typed prop whose slot was never initialized → Error
                 // (not __get, not a warning): parent_get_plain_typed_uninitialized.
-                if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
-                    if tpd.ty.is_some() && tpd.default.is_none() {
-                        return self.fail(PhpError::uncaught(
-                            "Error",
-                            format!(
-                                "Typed property {}::${} must not be accessed before initialization",
-                                tdcls.name(),
-                                pn
-                            ),
-                            0,
-                        ));
+                // One that was unset() routes to __get like an
+                // undefined property (typed_properties_009).
+                let was_unset = {
+                    let ob = o.borrow();
+                    ob.unset_props.contains(&pn)
+                        || ob
+                            .unset_props
+                            .iter()
+                            .any(|k| k.ends_with(&format!("\0{}", pn)))
+                };
+                // Without __get, an unset() declared prop still reads
+                // as uninitialized; with __get it routes to magic
+                // (typed_properties_047 vs _009).
+                let has_get = cls.find_method("__get").is_some();
+                if !was_unset || !has_get {
+                    if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
+                        if tpd.ty.is_some() {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Typed property {}::${} must not be accessed before initialization",
+                                    tdcls.name(),
+                                    pn
+                                ),
+                                0,
+                            ));
+                        }
                     }
                 }
                 // __get magic
-                if cls.find_method("__get").is_some() {
-                    return self.method_invoke(
+                if has_get {
+                    let rv = self.method_invoke(
                         o.clone(),
                         "__get",
-                        CallArgs::positional(vec![cell(Value::str(pn))]),
-                    );
+                        CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
+                    )?;
+                    // A __get result for an unset() declared-typed prop
+                    // must satisfy the declared type
+                    // (typed_properties_030).
+                    if was_unset {
+                        if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
+                            if let Some(tys) = &tpd.ty {
+                                if !self.ty_exact(tys, &rv) {
+                                    if let Some(cv) = weak_ty_coerce(tys, &rv) {
+                                        return Ok(cv);
+                                    }
+                                }
+                                let ok =
+                                    self.ty_exact(tys, &rv) || weak_ty_coerce(tys, &rv).is_some();
+                                if !ok {
+                                    let mut e = PhpError::uncaught(
+                                        "TypeError",
+                                        format!(
+                                            "Value of type {} returned from {}::__get() must be compatible with unset property {}::${} of type {}",
+                                            self.zval_type_name(&rv),
+                                            tdcls.name(),
+                                            tdcls.name(),
+                                            pn,
+                                            ty_disp(tys)
+                                        ),
+                                        0,
+                                    );
+                                    e.thrown_line = Some(self.cur_line);
+                                    return self.fail(e);
+                                }
+                            }
+                        }
+                    }
+                    return Ok(rv);
                 }
                 self.warn(&format!("Undefined property: {}::${}", cls.name(), pn))?;
                 Ok(Value::Null)
@@ -10647,15 +16867,71 @@ impl<'a> Interp<'a> {
                 if key.is_none() {
                     if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
                         if tpd.ty.is_some() && tpd.default.is_none() {
-                            return self.fail(PhpError::uncaught(
-                                "Error",
-                                format!(
-                                    "Typed property {}::${} must not be accessed before initialization",
-                                    tdcls.name(),
-                                    pn
-                                ),
-                                0,
-                            ));
+                            let nullable = tpd
+                                .ty
+                                .as_ref()
+                                .map(|t| t.iter().any(|m| m.eq_ignore_ascii_case("null")))
+                                .unwrap_or(false);
+                            if !nullable {
+                                // `=&` on an uninit typed prop routes to
+                                // `&__get` when it exists — the bound
+                                // ref sees __get's cell (073).
+                                let cls = o.borrow().class.clone();
+                                let get_by_ref = cls
+                                    .find_method("__get")
+                                    .map(|m| m.decl.by_ref)
+                                    .unwrap_or(false);
+                                if get_by_ref {
+                                    self.last_ret_cell = None;
+                                    let rv = self.method_invoke(
+                                        o.clone(),
+                                        "__get",
+                                        CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
+                                    )?;
+                                    let got = self.last_ret_cell.take().unwrap_or_else(|| cell(rv));
+                                    // Zend materializes the real prop
+                                    // slot from __get's value (typed →
+                                    // coerced): the bound ref decouples
+                                    // from __get's storage (073).
+                                    let tys = tpd.ty.clone().unwrap_or_default();
+                                    let cv = self.prop_typed_write_check(
+                                        &tpd,
+                                        &tdcls,
+                                        got.borrow().clone(),
+                                    )?;
+                                    let key =
+                                        self.obj_prop_key(&o, &pn).unwrap_or_else(|| pn.clone());
+                                    let slot = cell(cv);
+                                    {
+                                        let mut ob = o.borrow_mut();
+                                        if !ob.prop_order.contains(&key) {
+                                            ob.prop_order.push(key.clone());
+                                        }
+                                        ob.props.insert(key.clone(), slot.clone());
+                                    }
+                                    let p = Rc::as_ptr(&slot) as usize;
+                                    self.typed_slots.insert(
+                                        p,
+                                        (slot.clone(), tys, tdcls.name().to_string(), pn.clone()),
+                                    );
+                                    self.slot_anchor
+                                        .insert(p, SlotAnchor::Obj(Rc::downgrade(&o), key.clone()));
+                                    return Ok(slot);
+                                }
+                                return self.fail(PhpError::uncaught(
+                                    "Error",
+                                    format!(
+                                        "Cannot access uninitialized non-nullable property {}::${} by reference",
+                                        tdcls.name(),
+                                        pn
+                                    ),
+                                    0,
+                                ));
+                            }
+                            // Nullable uninit slots byref-init to null.
+                            let nc = cell(Value::Null);
+                            self.last_fresh_cell = Some(Rc::as_ptr(&nc) as usize);
+                            o.borrow_mut().props.insert(pn.clone(), nc);
                         }
                     }
                 }
@@ -10665,9 +16941,29 @@ impl<'a> Interp<'a> {
                     if !ob.prop_order.contains(&key) {
                         ob.prop_order.push(key.clone());
                     }
-                    ob.props.insert(key.clone(), cell(Value::Null));
+                    let nc = cell(Value::Null);
+                    self.last_fresh_cell = Some(Rc::as_ptr(&nc) as usize);
+                    ob.props.insert(key.clone(), nc);
                 }
-                Ok(ob.props.get(&key).unwrap().clone())
+                let slot = ob.props.get(&key).unwrap().clone();
+                drop(ob);
+                if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
+                    if let Some(tys) = &pd.ty {
+                        let p = Rc::as_ptr(&slot) as usize;
+                        self.typed_slots.insert(
+                            p,
+                            (
+                                slot.clone(),
+                                tys.clone(),
+                                dcls.name().to_string(),
+                                pn.clone(),
+                            ),
+                        );
+                        self.slot_anchor
+                            .insert(p, SlotAnchor::Obj(Rc::downgrade(&o), key.clone()));
+                    }
+                }
+                Ok(slot)
             }
             _ => self.fail(PhpError::fatal(
                 format!("Attempt to assign property \"{}\" on non-object", pn),
@@ -10720,7 +17016,52 @@ impl<'a> Interp<'a> {
                 }
                 let cls = o.borrow().class.clone();
                 if let Some(k) = self.obj_prop_key(&o, &pn) {
-                    o.borrow_mut().props.remove(&k);
+                    let mut ob = o.borrow_mut();
+                    let prune = if let Some(c) = ob.props.remove(&k) {
+                        // unset() severs the typed slot: refs bound to it
+                        // become plain variables again (typed_properties_090).
+                        let ptr = Rc::as_ptr(&c) as usize;
+                        if let Some(os) = self.slot_owners.get_mut(&ptr) {
+                            os.retain(|(_, _, op, _)| op != &pn);
+                            if os.is_empty() {
+                                self.slot_owners.remove(&ptr);
+                            }
+                        }
+                        if self
+                            .typed_slots
+                            .get(&ptr)
+                            .map(|(_, _, _, sp)| sp == &pn)
+                            .unwrap_or(false)
+                        {
+                            self.typed_slots.remove(&ptr);
+                            self.slot_anchor.remove(&ptr);
+                        }
+                        Some(ptr)
+                    } else {
+                        None
+                    };
+                    ob.unset_props.insert(k);
+                    drop(ob);
+                    if let Some(ptr) = prune {
+                        self.prune_typed_slot(ptr);
+                    }
+                } else if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
+                    // unset() on an uninitialized declared prop still
+                    // marks it unset — reads then route to __get
+                    // (typed_properties_009/040).
+                    let k = if pd.visibility == crate::ast::Visibility::Private {
+                        format!("\0{}\0{}", dcls.name(), pd.name)
+                    } else {
+                        pd.name.clone()
+                    };
+                    o.borrow_mut().unset_props.insert(k);
+                    if cls.find_method("__unset").is_some() {
+                        self.method_invoke(
+                            o.clone(),
+                            "__unset",
+                            CallArgs::positional(vec![cell(Value::str(pn))]),
+                        )?;
+                    }
                 } else if cls.find_method("__unset").is_some() {
                     self.method_invoke(
                         o.clone(),
@@ -10751,7 +17092,7 @@ impl<'a> Interp<'a> {
                     .unwrap_or_default();
                 let argvals = self.arg_cells(args, &params, &format!("{}()", mn))?;
                 // method_invoke handles builtin (Throwable), __call, undefined.
-                self.method_invoke(o.clone(), &mn, argvals)
+                self.method_invoke_vis(o.clone(), &mn, argvals)
             }
             Value::Null => {
                 if nullsafe {
@@ -10785,6 +17126,10 @@ impl<'a> Interp<'a> {
                     .unwrap_or(Value::Null);
                 if let Value::Object(t) = newthis {
                     let mut nc = (*c).clone();
+                    // ->call also rebinds the lexical scope to the
+                    // object's class, so private slots resolve
+                    // (typed_properties_048).
+                    nc.scope_class = Some(t.borrow().class.clone());
                     nc.this_obj = Some(t);
                     ca.cells.remove(0);
                     return self.call_value(&Value::Callable(Rc::new(nc)), ca);
@@ -10830,6 +17175,221 @@ impl<'a> Interp<'a> {
         self.pending_decl_class = None;
         self.pending_called_class = None;
         r
+    }
+
+    /// Dispatch `$obj->name($args)` through `__call(name, args)`.
+    fn call_via_magic(
+        &mut self,
+        obj: Rc<RefCell<PhpObject>>,
+        m: &Rc<MethodDecl>,
+        dc: Rc<PhpClass>,
+        name: &str,
+        args: CallArgs,
+    ) -> Result<Value, PhpError> {
+        let mut arr = PhpArray::new();
+        for a in &args.cells {
+            arr.push(a.borrow().clone());
+        }
+        for (n, a, ..) in &args.named {
+            arr.set(ArrKey::Str(Rc::from(n.as_str())), a.borrow().clone());
+        }
+        self.invoke_method(
+            obj,
+            m,
+            CallArgs::positional(vec![
+                cell(Value::str(name)),
+                cell(Value::Array(Rc::new(RefCell::new(arr)))),
+            ]),
+            dc,
+        )
+    }
+
+    /// A private method owned by the calling scope binds statically:
+    /// `$this->m()` inside `S::x` always resolves to `S::m`, bypassing
+    /// the object's override (zend private methods are not virtual).
+    fn scope_private_method(&mut self, name: &str) -> Option<(Rc<MethodDecl>, Rc<PhpClass>)> {
+        let scope = self
+            .stack
+            .last()
+            .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()).cloned())
+            .or_else(|| self.const_self.clone())?;
+        let m = scope.decl.find_method(&name.to_lowercase())?;
+        (m.visibility == crate::ast::Visibility::Private).then_some((m, scope))
+    }
+
+    /// Userland `Cls::name()` dispatch: gate visibility at the call
+    /// site, routing inaccessible methods through __callStatic.
+    fn static_invoke_vis(
+        &mut self,
+        cls: Rc<PhpClass>,
+        name: &str,
+        args: CallArgs,
+        called_class: Option<Rc<PhpClass>>,
+    ) -> Result<Value, PhpError> {
+        if let Some((m, sc)) = self.scope_private_method(name) {
+            let this_obj = if m.is_static {
+                None
+            } else {
+                self.stack
+                    .last()
+                    .and_then(|f| f.this_obj.clone())
+                    .filter(|o| {
+                        let cname = o.borrow().class.name().to_string();
+                        self.is_a_str(&cname, cls.name())
+                    })
+            };
+            self.pending_decl_class = Some(sc.clone());
+            self.pending_called_class = Some(called_class.unwrap_or(cls.clone()));
+            let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(sc));
+            self.pending_decl_class = None;
+            self.pending_called_class = None;
+            return r;
+        }
+        if let Some((m, dc)) = self.find_method_in(&cls, name) {
+            if !self.method_access_ok(&m, &dc) {
+                if let Some((cm, cdc)) = self.find_method_in(&cls, "__callstatic") {
+                    let mut arr = PhpArray::new();
+                    for a in &args.cells {
+                        arr.push(a.borrow().clone());
+                    }
+                    for (n, a, ..) in &args.named {
+                        arr.set(ArrKey::Str(Rc::from(n.as_str())), a.borrow().clone());
+                    }
+                    self.pending_decl_class = Some(cdc.clone());
+                    self.pending_called_class = Some(called_class.unwrap_or(cls.clone()));
+                    let r = self.invoke_fn(
+                        &Rc::new(cm.decl.clone()),
+                        CallArgs::positional(vec![
+                            cell(Value::str(name)),
+                            cell(Value::Array(Rc::new(RefCell::new(arr)))),
+                        ]),
+                        None,
+                        Some(cdc),
+                    );
+                    self.pending_decl_class = None;
+                    self.pending_called_class = None;
+                    return r;
+                }
+                let e = self.method_vis_error(&m, &dc);
+                return self.fail(e);
+            }
+        }
+        self.static_invoke(cls, name, args, called_class)
+    }
+
+    /// Userland `$obj->name()` dispatch: gate visibility at the call
+    /// site. Internal invocations (FCC bound scope, engine magic calls)
+    /// go through `method_invoke` unchecked.
+    fn method_invoke_vis(
+        &mut self,
+        obj: Rc<RefCell<PhpObject>>,
+        name: &str,
+        args: CallArgs,
+    ) -> Result<Value, PhpError> {
+        let cls = obj.borrow().class.clone();
+        // Scope-private binding takes precedence over the object's own
+        // method table (private methods are not virtual).
+        if let Some((m, sc)) = self.scope_private_method(name) {
+            if m.is_abstract {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    format!("Cannot call abstract method {}::{}()", sc.name(), name),
+                    0,
+                ));
+            }
+            return self.invoke_method(obj, &m, args, sc);
+        }
+        if let Some((m, dc)) = self.find_method_in(&cls, name) {
+            if !self.method_access_ok(&m, &dc) {
+                // Inaccessible method routes through __call when
+                // defined (zend_std_get_method fallback).
+                if let Some((cm, cdc)) = self.find_method_in(&cls, "__call") {
+                    return self.call_via_magic(obj, &cm, cdc, name, args);
+                }
+                let e = self.method_vis_error(&m, &dc);
+                return self.fail(e);
+            }
+        }
+        self.method_invoke(obj, name, args)
+    }
+
+    /// Method-call visibility against the current calling scope.
+    fn method_access_ok(&mut self, m: &MethodDecl, dc: &Rc<PhpClass>) -> bool {
+        let scope = self
+            .stack
+            .last()
+            .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()).cloned())
+            .or_else(|| self.const_self.clone());
+        match m.visibility {
+            crate::ast::Visibility::Public => true,
+            crate::ast::Visibility::Private => scope
+                .as_ref()
+                .map(|s| s.name() == dc.name())
+                .unwrap_or(false),
+            crate::ast::Visibility::Protected => scope
+                .as_ref()
+                .map(|s| {
+                    let proto = self.method_prototype(dc, &m.decl.name.to_lowercase());
+                    self.is_a_str(s.name(), dc.name())
+                        || self.is_a_str(dc.name(), s.name())
+                        // Sibling access: protected `B::m()` callable from
+                        // scope A when A is a descendant of the method's
+                        // PROTOTYPE owner (the ancestor that first
+                        // declared it — gh14009: A and B both extend P,
+                        // P first declared `common`).
+                        || self.is_a_str(s.name(), &proto)
+                })
+                .unwrap_or(false),
+        }
+    }
+
+    /// The ancestor class that first declared `lname` (non-private) —
+    /// the prototype owner for protected-member access rules.
+    fn method_prototype(&mut self, cls: &Rc<PhpClass>, lname: &str) -> String {
+        let mut owner = cls.name().to_string();
+        let mut cur = cls.decl.parent.clone();
+        while let Some(p) = cur {
+            let Some(pc) = self.classes.get(&p.to_lowercase()).cloned() else {
+                break;
+            };
+            if pc.decl.methods.iter().any(|m| {
+                m.decl.name.to_lowercase() == lname
+                    && !matches!(m.visibility, crate::ast::Visibility::Private)
+            }) {
+                owner = pc.decl.name.clone();
+            }
+            cur = pc.decl.parent.clone();
+        }
+        owner
+    }
+
+    /// `Call to private/protected method X::m() from scope Y` — catchable.
+    fn method_vis_error(&mut self, m: &MethodDecl, dc: &Rc<PhpClass>) -> PhpError {
+        let vis = match m.visibility {
+            crate::ast::Visibility::Public => "public",
+            crate::ast::Visibility::Protected => "protected",
+            crate::ast::Visibility::Private => "private",
+        };
+        let scope = self
+            .stack
+            .last()
+            .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()).cloned())
+            .or_else(|| self.const_self.clone());
+        let from = match &scope {
+            Some(s) => format!("scope {}", s.name()),
+            None => "global scope".to_string(),
+        };
+        PhpError::uncaught(
+            "Error",
+            format!(
+                "Call to {} method {}::{}() from {}",
+                vis,
+                dc.name(),
+                m.decl.name,
+                from
+            ),
+            0,
+        )
     }
 
     /// Calls a method by name through an object cell (magic methods, __call).
@@ -10897,6 +17457,21 @@ impl<'a> Interp<'a> {
                 return Ok(v);
             }
         }
+        // Generator: same pattern — native iteration state.
+        if cls.name().eq_ignore_ascii_case("generator") {
+            if let Some(v) = self.generator_method(&obj, name, &args)? {
+                return Ok(v);
+            }
+        }
+        // SplFileInfo / DirectoryIterator: SPL filesystem objects.
+        if matches!(
+            cls.name().to_lowercase().as_str(),
+            "splfileinfo" | "directoryiterator" | "filesystemiterator"
+        ) {
+            if let Some(v) = self.spl_method(&obj, name, &args)? {
+                return Ok(v);
+            }
+        }
         // PDO / PDOStatement: sqlite-backed storage surface (#15 spike).
         if cls.name().eq_ignore_ascii_case("pdo") {
             if let Some(v) = crate::pdo::pdo_method(self, &obj, name, &args)? {
@@ -10921,22 +17496,7 @@ impl<'a> Interp<'a> {
             }
             None => {
                 if let Some((m, dc)) = self.find_method_in(&cls, "__call") {
-                    let mut arr = PhpArray::new();
-                    for a in &args.cells {
-                        arr.push(a.borrow().clone());
-                    }
-                    for (n, a, ..) in &args.named {
-                        arr.set(ArrKey::Str(Rc::from(n.as_str())), a.borrow().clone());
-                    }
-                    return self.invoke_method(
-                        obj,
-                        &m,
-                        CallArgs::positional(vec![
-                            cell(Value::str(name)),
-                            cell(Value::Array(Rc::new(RefCell::new(arr)))),
-                        ]),
-                        dc,
-                    );
+                    return self.call_via_magic(obj, &m, dc, name, args);
                 }
                 self.fail(PhpError::uncaught(
                     "Error",
@@ -11079,18 +17639,66 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `X::` member access where X may be a trait: traits resolve to a
+    /// synthesized class holding their statics; direct trait member
+    /// access is deprecated (direct_static_member_access). Returns the
+    /// resolved class plus the trait's display name when it is one.
+    fn member_class_of(
+        &mut self,
+        class: &Expr,
+    ) -> Result<(Rc<PhpClass>, Option<String>), PhpError> {
+        let name = self.class_name_of(class)?;
+        if let Some(td) = self.traits.get(&name.to_lowercase()).cloned() {
+            let key = td.name.to_lowercase();
+            let cls = self
+                .trait_statics
+                .entry(key)
+                .or_insert_with(|| {
+                    Rc::new(PhpClass {
+                        decl: td.clone(),
+                        statics: RefCell::new(HashMap::new()),
+                        statics_init: RefCell::new(false),
+                    })
+                })
+                .clone();
+            return Ok((cls, Some(td.name.clone())));
+        }
+        Ok((self.class_of(class)?, None))
+    }
+
     fn static_prop_read(&mut self, class: &Expr, name: &PropName) -> Result<Value, PhpError> {
         let name = self.prop_name(name)?;
-        let cls = self.class_of(class)?;
+        let (cls, tname) = self.member_class_of(class)?;
+        if let Some(t) = tname {
+            self.deprecated(&format!(
+                "Accessing static trait property {}::${} is deprecated, it should only be accessed on a class using the trait",
+                t, name
+            ))?;
+        }
         self.statics_init(&cls);
         let v = cls.statics.borrow().get(&name).map(|c| c.borrow().clone());
         match v {
             Some(v) => Ok(v),
-            None => self.fail(PhpError::uncaught(
-                "Error",
-                format!("Undefined static property {}::${}", cls.name(), name),
-                0,
-            )),
+            None => {
+                if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &name) {
+                    if pd.ty.is_some() {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Typed static property {}::${} must not be accessed before initialization",
+                                dcls.name(),
+                                name
+                            ),
+                            0,
+                        ));
+                    }
+                }
+                self.fail(PhpError::uncaught(
+                    "Error",
+                    format!("Undefined static property {}::${}", cls.name(), name),
+                    0,
+                ))
+            }
         }
     }
 
@@ -11100,16 +17708,68 @@ impl<'a> Interp<'a> {
     }
 
     fn static_prop_named(&mut self, class: &Expr, name: &str) -> Result<Cell, PhpError> {
-        let cls = self.class_of(class)?;
+        let (cls, tname) = self.member_class_of(class)?;
+        if let Some(t) = tname {
+            self.deprecated(&format!(
+                "Accessing static trait property {}::${} is deprecated, it should only be accessed on a class using the trait",
+                t, name
+            ))?;
+        }
         self.statics_init(&cls);
         let found = cls.statics.borrow().get(name).cloned();
         match found {
-            Some(c) => Ok(c),
-            None => self.fail(PhpError::uncaught(
-                "Error",
-                format!("Undefined static property {}::${}", cls.name(), name),
-                0,
-            )),
+            Some(c) => {
+                if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
+                    if let Some(tys) = &pd.ty {
+                        let p = Rc::as_ptr(&c) as usize;
+                        self.typed_slots.insert(
+                            p,
+                            (
+                                c.clone(),
+                                tys.clone(),
+                                dcls.name().to_string(),
+                                name.to_string(),
+                            ),
+                        );
+                        self.slot_anchor.insert(
+                            p,
+                            SlotAnchor::Statics(dcls.name().to_string(), name.to_string()),
+                        );
+                    }
+                }
+                Ok(c)
+            }
+            None => {
+                // Write/cell path materializes a declared static; an
+                // undeclared one is an Error.
+                if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
+                    let c = cell(Value::Null);
+                    cls.statics.borrow_mut().insert(name.to_string(), c.clone());
+                    if let Some(tys) = &pd.ty {
+                        self.last_fresh_cell = Some(Rc::as_ptr(&c) as usize);
+                        let p = Rc::as_ptr(&c) as usize;
+                        self.typed_slots.insert(
+                            p,
+                            (
+                                c.clone(),
+                                tys.clone(),
+                                dcls.name().to_string(),
+                                name.to_string(),
+                            ),
+                        );
+                        self.slot_anchor.insert(
+                            p,
+                            SlotAnchor::Statics(dcls.name().to_string(), name.to_string()),
+                        );
+                    }
+                    return Ok(c);
+                }
+                self.fail(PhpError::uncaught(
+                    "Error",
+                    format!("Undefined static property {}::${}", cls.name(), name),
+                    0,
+                ))
+            }
         }
     }
 
@@ -11119,11 +17779,25 @@ impl<'a> Interp<'a> {
             return;
         }
         *cls.statics_init.borrow_mut() = true;
+        // Inherited statics: PHP snapshots the parent's static-prop
+        // values into the child's table at link time, so `static::$p`
+        // on the child resolves parent defaults.
+        if let Some(pname) = &cls.decl.parent {
+            if let Some(p) = self.classes.get(&pname.to_lowercase()).cloned() {
+                self.statics_init(&p);
+                for (k, v) in p.statics.borrow().iter() {
+                    cls.statics
+                        .borrow_mut()
+                        .entry(k.clone())
+                        .or_insert_with(|| cell(v.borrow().clone()));
+                }
+            }
+        }
         for p in &cls.decl.props {
             if !p.is_static {
                 continue;
             }
-            let default = match &p.default {
+            let mut default = match &p.default {
                 Some(d) => {
                     let old = self.const_self.replace(cls.clone());
                     self.class_const_ctx += 1;
@@ -11136,6 +17810,16 @@ impl<'a> Interp<'a> {
                 }
                 None => Value::Null,
             };
+            if p.ty.is_some() {
+                if let Ok(d) = self.prop_typed_write_check(p, cls, default.clone()) {
+                    default = d;
+                }
+            }
+            // A typed static without a default stays *uninitialized*:
+            // reads raise the uninit Error until first assignment.
+            if p.ty.is_some() && p.default.is_none() {
+                continue;
+            }
             cls.statics
                 .borrow_mut()
                 .insert(p.name.clone(), cell(default));
@@ -11143,13 +17827,38 @@ impl<'a> Interp<'a> {
     }
 
     fn static_call(&mut self, class: &Expr, name: &str, args: &[Expr]) -> Result<Value, PhpError> {
-        let cls = self.class_of(class)?;
+        let (cls, tname) = self.member_class_of(class)?;
+        if let Some(t) = tname {
+            self.deprecated(&format!(
+                "Calling static trait method {}::{} is deprecated, it should only be called on a class using the trait",
+                t, name
+            ))?;
+        }
         let params = self
             .find_method_in(&cls, name)
             .map(|m| m.0.decl.params.clone())
             .unwrap_or_default();
         let argvals = self.arg_cells(args, &params, &format!("{}()", name))?;
-        self.static_invoke(cls, name, argvals)
+        // Forwarding calls (self::/parent::/static::) preserve the
+        // current late-static-binding class instead of resetting it to
+        // the resolved target: `parent::__construct()` on a subclass
+        // still sees the subclass via `static::` inside the parent ctor.
+        let called = match class {
+            Expr::Const(n) | Expr::Str(n)
+                if matches!(
+                    n.trim_start_matches('\\').to_lowercase().as_str(),
+                    "self" | "parent" | "static"
+                ) =>
+            {
+                self.stack.last().and_then(|f| {
+                    f.called_class
+                        .clone()
+                        .or_else(|| f.this_obj.as_ref().map(|o| o.borrow().class.clone()))
+                })
+            }
+            _ => None,
+        };
+        self.static_invoke_vis(cls, name, argvals, called)
     }
 
     fn static_invoke(
@@ -11157,6 +17866,7 @@ impl<'a> Interp<'a> {
         cls: Rc<PhpClass>,
         name: &str,
         args: CallArgs,
+        called_class: Option<Rc<PhpClass>>,
     ) -> Result<Value, PhpError> {
         // Closure::{bind,fromCallable}: native callable rebinding.
         if cls.name().eq_ignore_ascii_case("closure") {
@@ -11227,7 +17937,7 @@ impl<'a> Interp<'a> {
                         })
                 };
                 self.pending_decl_class = Some(dc.clone());
-                self.pending_called_class = Some(cls.clone());
+                self.pending_called_class = Some(called_class.clone().unwrap_or(cls.clone()));
                 let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(dc));
                 self.pending_decl_class = None;
                 self.pending_called_class = None;
@@ -11243,7 +17953,7 @@ impl<'a> Interp<'a> {
                         arr.set(ArrKey::Str(Rc::from(n.as_str())), a.borrow().clone());
                     }
                     self.pending_decl_class = Some(dc.clone());
-                    self.pending_called_class = Some(cls.clone());
+                    self.pending_called_class = Some(called_class.clone().unwrap_or(cls.clone()));
                     let r = self.invoke_fn(
                         &Rc::new(m.decl.clone()),
                         CallArgs::positional(vec![
@@ -11319,11 +18029,202 @@ impl<'a> Interp<'a> {
 
     /// Declared class/interface/trait names for get_declared_*().
     pub fn declared_names(&self, kind: crate::ast::ClassKind) -> Vec<String> {
-        self.classes
-            .values()
-            .filter(|c| c.decl.kind == kind)
-            .map(|c| c.name().to_string())
-            .collect()
+        let mut out = Vec::new();
+        for n in &self.decl_order {
+            let name = match kind {
+                crate::ast::ClassKind::Trait => self.traits.get(n).map(|d| d.name.clone()),
+                crate::ast::ClassKind::Interface => self.interfaces.get(n).map(|d| d.name.clone()),
+                _ => self
+                    .classes
+                    .get(n)
+                    .filter(|c| c.decl.kind == kind)
+                    .map(|c| c.name().to_string()),
+            };
+            if let Some(nm) = name {
+                out.push(nm);
+            }
+        }
+        for (k, a) in &self.decl_aliases {
+            if *k == kind {
+                out.push(a.clone());
+            }
+        }
+        out
+    }
+
+    /// class_alias($name, $alias): alias entries resolve like the
+    /// original (classes, interfaces and traits alike).
+    pub fn class_alias(&mut self, name: &str, alias: &str) -> Result<bool, PhpError> {
+        // `class_alias($cls, 'int')` — the alias may not be a reserved
+        // scalar type name (scalar_reserved*_class_alias).
+        let short = alias
+            .trim_start_matches('\\')
+            .rsplit('\\')
+            .next()
+            .unwrap_or(alias)
+            .to_lowercase();
+        const RESERVED_ALS: &[&str] = &[
+            "int", "float", "string", "bool", "void", "iterable", "object", "mixed", "never",
+            "null", "false", "true",
+        ];
+        if RESERVED_ALS.contains(&short.as_str()) {
+            return Err(PhpError::fatal(
+                format!(
+                    "Cannot use \"{}\" as a class alias as it is reserved",
+                    short
+                ),
+                self.cur_line,
+            ));
+        }
+        let alias_l = alias.trim_start_matches('\\').to_lowercase();
+        let key = name.trim_start_matches('\\').to_lowercase();
+        if let Some(c) = self.classes.get(&key).cloned() {
+            self.classes.insert(alias_l.clone(), c);
+            self.decl_aliases
+                .push((crate::ast::ClassKind::Class, alias_l));
+            return Ok(true);
+        }
+        if let Some(i) = self.interfaces.get(&key).cloned() {
+            self.interfaces.insert(alias_l.clone(), i);
+            self.decl_aliases
+                .push((crate::ast::ClassKind::Interface, alias_l));
+            return Ok(true);
+        }
+        if let Some(t) = self.traits.get(&key).cloned() {
+            self.traits.insert(alias_l.clone(), t);
+            self.decl_aliases
+                .push((crate::ast::ClassKind::Trait, alias_l));
+            return Ok(true);
+        }
+        self.warn(&format!("Class \"{}\" not found", name))?;
+        Ok(false)
+    }
+
+    /// Does this object's class implement `iname` (transitively)?
+    /// Used by serialize() for the Serializable C:-format branch.
+    pub fn obj_implements(&mut self, o: &Rc<RefCell<PhpObject>>, iname: &str) -> bool {
+        self.is_a(&o.borrow().class, iname)
+    }
+
+    /// Does `d` (a class decl) implement interface `iname`, directly or
+    /// through the implements chain of interfaces it names?
+    fn implements_iface(&self, d: &ClassDecl, iname: &str) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<String> = d.implements.clone();
+        while let Some(i) = stack.pop() {
+            let l = i.trim_start_matches('\\').to_lowercase();
+            if l == iname {
+                return true;
+            }
+            if !seen.insert(l.clone()) {
+                continue;
+            }
+            if let Some(id) = self.interfaces.get(&l) {
+                stack.extend(id.implements.iter().cloned());
+            }
+        }
+        false
+    }
+
+    /// Locate a class/interface/trait const decl by name — walks the
+    /// class chain, used traits' merged consts and implemented
+    /// interfaces (reflection APIs see trait consts on both sides).
+    fn find_const_decl(
+        &mut self,
+        cname: &str,
+        name: &str,
+    ) -> Option<(crate::ast::ConstDecl, String)> {
+        let key = cname.trim_start_matches('\\').to_lowercase();
+        if let Some(td) = self.traits.get(&key) {
+            for cd in &td.consts {
+                if cd.name == name {
+                    return Some((cd.clone(), td.file.clone()));
+                }
+            }
+            return None;
+        }
+        if let Some(id) = self.interfaces.get(&key) {
+            for cd in &id.consts {
+                if cd.name == name {
+                    return Some((cd.clone(), id.file.clone()));
+                }
+            }
+            return None;
+        }
+        let mut cur = self.classes.get(&key).cloned();
+        let mut ifaces: Vec<String> = Vec::new();
+        while let Some(c) = cur {
+            for cd in &c.decl.consts {
+                if cd.name == name {
+                    return Some((cd.clone(), c.decl.file.clone()));
+                }
+            }
+            ifaces.extend(c.decl.implements.iter().cloned());
+            cur = c
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        for iname in ifaces {
+            if let Some(id) = self.interfaces.get(&iname.to_lowercase()) {
+                for cd in &id.consts {
+                    if cd.name == name {
+                        return Some((cd.clone(), id.file.clone()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// All (name, (decl, file)) consts visible on `cname` — class chain
+    /// + interfaces; trait members appear via the class's merged decl.
+    fn all_const_decls(&mut self, cname: &str) -> Vec<(String, (crate::ast::ConstDecl, String))> {
+        let mut out: Vec<(String, (crate::ast::ConstDecl, String))> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let key = cname.trim_start_matches('\\').to_lowercase();
+        if let Some(td) = self.traits.get(&key).cloned() {
+            for cd in &td.consts {
+                if seen.insert(cd.name.clone()) {
+                    out.push((cd.name.clone(), (cd.clone(), td.file.clone())));
+                }
+            }
+            return out;
+        }
+        if let Some(id) = self.interfaces.get(&key).cloned() {
+            for cd in &id.consts {
+                if seen.insert(cd.name.clone()) {
+                    out.push((cd.name.clone(), (cd.clone(), id.file.clone())));
+                }
+            }
+            return out;
+        }
+        let mut cur = self.classes.get(&key).cloned();
+        let mut ifaces: Vec<String> = Vec::new();
+        while let Some(c) = cur {
+            for cd in &c.decl.consts {
+                if seen.insert(cd.name.clone()) {
+                    out.push((cd.name.clone(), (cd.clone(), c.decl.file.clone())));
+                }
+            }
+            ifaces.extend(c.decl.implements.iter().cloned());
+            cur = c
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        for iname in ifaces {
+            if let Some(id) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+                for cd in &id.consts {
+                    if seen.insert(cd.name.clone()) {
+                        out.push((cd.name.clone(), (cd.clone(), id.file.clone())));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Zend backtrace text for debug_print_backtrace(): innermost-first
@@ -11351,10 +18252,69 @@ impl<'a> Interp<'a> {
 
     /// is-a check between two class-name strings.
     fn is_a_str(&mut self, a: &str, b: &str) -> bool {
+        // Type-member checks during signature verification autoload the
+        // compared classes — Zend verifies covariance with the real
+        // hierarchy, so `C::m(): D` inside an autoloaded class sees `D`
+        // even when it is declared later (abstract_method_9).
+        if !self.classes.contains_key(&a.to_lowercase()) && self.run_autoload(a).is_err() {
+            // An autoload failure is a compile-time fatal everywhere
+            // else; inside a signature check a missing class just means
+            // "not a subtype".
+            self.pending_exception = None;
+        }
+        // Aliases canonicalize through the class table: `Bar` (an
+        // alias of Foo) compares as `Foo` (typed_properties_084).
+        let canon_b = self
+            .classes
+            .get(&b.trim_start_matches('\\').to_lowercase())
+            .map(|c| c.name().to_string());
+        let b = canon_b.as_deref().unwrap_or(b);
         match self.classes.get(&a.to_lowercase()).cloned() {
             Some(c) => self.is_a(&c, b),
-            None => a.eq_ignore_ascii_case(b),
+            None => self.is_a_unresolved(a, b, 0),
         }
+    }
+
+    /// Ancestry check by NAME for a class not (yet) in `self.classes`:
+    /// walks parent/implements names through `classes` and `linking`.
+    fn is_a_unresolved(&mut self, a: &str, b: &str, depth: u8) -> bool {
+        if a.trim_start_matches('\\').eq_ignore_ascii_case(b) {
+            return true;
+        }
+        if depth > 16 {
+            return false;
+        }
+        let d = self
+            .classes
+            .get(&a.to_lowercase())
+            .map(|c| c.decl.clone())
+            .or_else(|| {
+                self.linking
+                    .iter()
+                    .rev()
+                    .find(|d| d.name.eq_ignore_ascii_case(a))
+                    .cloned()
+            })
+            .or_else(|| {
+                self.interfaces
+                    .get(&a.to_lowercase())
+                    .cloned()
+                    .or_else(|| self.traits.get(&a.to_lowercase()).cloned())
+            });
+        let Some(d) = d else {
+            return false;
+        };
+        if let Some(p) = &d.parent {
+            if self.is_a_unresolved(p, b, depth + 1) {
+                return true;
+            }
+        }
+        for i in &d.implements {
+            if self.is_a_unresolved(i, b, depth + 1) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn find_method_in(
@@ -11380,7 +18340,7 @@ impl<'a> Interp<'a> {
     fn class_of(&mut self, e: &Expr) -> Result<Rc<PhpClass>, PhpError> {
         let name = self.class_name_of(e)?;
         if !self.classes.contains_key(&name.to_lowercase()) {
-            self.run_autoload(&name);
+            self.run_autoload(&name)?;
         }
         match self.classes.get(&name.to_lowercase()) {
             Some(c) => Ok(c.clone()),
@@ -11394,10 +18354,92 @@ impl<'a> Interp<'a> {
 
     fn class_const(&mut self, class: &Expr, name: &str) -> Result<Value, PhpError> {
         let cname = self.class_name_of(class)?;
+        self.class_const_named(&cname, name)
+    }
+
+    /// is_callable(['Cls'|$obj, 'm']): 'parent'/'self'/'static' names
+    /// resolve against the caller's scope; "parent"/"self" string
+    /// callables are deprecated once they resolve (bug76773-deprecated).
+    pub fn is_callable_arr(&mut self, first: &Value, mname: &str) -> bool {
+        let cls = match first {
+            Value::Object(o) => Some(o.borrow().class.clone()),
+            Value::Str(n) => {
+                let n = crate::value::lossy(n);
+                let ln = n.trim_start_matches('\\').to_lowercase();
+                match ln.as_str() {
+                    "parent" | "self" | "static" => {
+                        let Some(scope) = self.caller_scope_name() else {
+                            return false;
+                        };
+                        let Some(sc) = self.classes.get(&scope.to_lowercase()).cloned() else {
+                            return false;
+                        };
+                        let target = match ln.as_str() {
+                            "parent" => sc
+                                .decl
+                                .parent
+                                .as_ref()
+                                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned()),
+                            "static" => self
+                                .stack
+                                .last()
+                                .and_then(|f| f.called_class.clone())
+                                .or(Some(sc)),
+                            _ => Some(sc),
+                        };
+                        if let Some(c) = &target {
+                            if self.find_method_in(c, mname).is_some() {
+                                self.deprecated(&format!(
+                                    "Use of \"{}\" in callables is deprecated",
+                                    ln
+                                ))
+                                .ok();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                    _ => {
+                        if !self.classes.contains_key(&ln) {
+                            let _ = self.run_autoload(&n);
+                            self.pending_exception = None;
+                        }
+                        self.classes.get(&ln).cloned()
+                    }
+                }
+            }
+            _ => None,
+        };
+        match cls {
+            Some(c) => self.find_method_in(&c, mname).is_some(),
+            None => false,
+        }
+    }
+
+    /// `Cls::CONST` lookup by plain class-name string (shared with the
+    /// constant() builtin so `constant('T::X')` honours the trait-const
+    /// rule — constant_018).
+    pub fn class_const_named(&mut self, cname: &str, name: &str) -> Result<Value, PhpError> {
+        let cname = cname.to_string();
         if name == "class" {
             return Ok(Value::str(cname));
         }
-        let ckey = cname.to_lowercase();
+        // `X::CONST` on an unloaded class runs the autoloaders (real
+        // psr-4 code hits this constantly — e.g. `Language::ENGLISH`).
+        let ckey = self
+            .resolve_class(&cname)
+            .unwrap_or_else(|| cname.clone())
+            .to_lowercase();
+        if let Some(td) = self.traits.get(&ckey).cloned() {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!(
+                    "Cannot access trait constant {}::{} directly",
+                    td.name, name
+                ),
+                0,
+            ));
+        }
         if let Some(iface) = self.interfaces.get(&ckey).cloned() {
             // Const on an interface (e.g. `FastRoute\Dispatcher::FOUND`):
             // walk it and its extended interfaces.
@@ -11407,12 +18449,15 @@ impl<'a> Interp<'a> {
                 if !seen.insert(c.name.to_lowercase()) {
                     continue;
                 }
-                for (n, e) in &c.consts {
-                    if n == name {
+                for cd in &c.consts {
+                    if cd.name == name {
                         self.class_const_ctx += 1;
-                        let r = self.eval_decl_const(e, &c.file);
+                        let r = self.eval_decl_const(&cd.value, &c.file);
                         self.class_const_ctx -= 1;
-                        return r;
+                        return match r {
+                            Ok(v) => self.const_apply_ty(cd, &c.name, v),
+                            Err(e) => Err(e),
+                        };
                     }
                 }
                 for i in &c.implements {
@@ -11447,14 +18492,20 @@ impl<'a> Interp<'a> {
         let mut cur = Some(cls.clone());
         let mut ifaces: Vec<String> = Vec::new();
         while let Some(c) = cur {
-            for (n, e) in &c.decl.consts {
-                if n == name {
+            for cd in &c.decl.consts {
+                if cd.name == name {
+                    if cd.enum_case {
+                        return self.enum_case_value(&c.decl.name, &cd.name, cd);
+                    }
                     let old = self.const_self.replace(c.clone());
                     self.class_const_ctx += 1;
-                    let r = self.eval_decl_const(e, &c.decl.file);
+                    let r = self.eval_decl_const(&cd.value, &c.decl.file);
                     self.class_const_ctx -= 1;
                     self.const_self = old;
-                    return r;
+                    return match r {
+                        Ok(v) => self.const_apply_ty(cd, &c.decl.name, v),
+                        Err(e) => Err(e),
+                    };
                 }
             }
             ifaces.extend(c.decl.implements.iter().cloned());
@@ -11471,11 +18522,13 @@ impl<'a> Interp<'a> {
                 continue;
             }
             if let Some(c) = self.interfaces.get(&iname.to_lowercase()).cloned() {
-                for (n, e) in &c.consts {
-                    if n == name {
+                for cd in &c.consts {
+                    if cd.name == name {
                         let old = self.const_self.replace(cls.clone());
                         self.class_const_ctx += 1;
-                        let r = self.eval_decl_const(e, &c.file);
+                        let r = self
+                            .eval_decl_const(&cd.value, &c.file)
+                            .and_then(|v| self.const_apply_ty(cd, &c.name, v));
                         self.class_const_ctx -= 1;
                         self.const_self = old;
                         return r;
@@ -11933,6 +18986,31 @@ impl<'a> Interp<'a> {
             .get(&name.trim_start_matches('\\').to_lowercase())
             .cloned()
     }
+    /// get_called_class(): late-static-binding class of the current
+    /// frame, `false` outside a called-class context (static_get_called_class).
+    pub fn called_class_name(&mut self) -> Value {
+        match self.stack.last().and_then(|f| f.called_class.clone()) {
+            Some(c) => Value::str(c.name().to_string()),
+            None => Value::Bool(false),
+        }
+    }
+
+    /// property_exists(): instance prop declared on the class or any
+    /// ancestor (property002).
+    pub fn class_has_prop(&self, c: &Rc<PhpClass>, name: &str) -> bool {
+        let mut cur = Some(c.clone());
+        while let Some(k) = cur {
+            if k.decl.props.iter().any(|p| p.name == name) {
+                return true;
+            }
+            cur = k
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        false
+    }
     pub fn instantiate_class(&mut self, name: &str, args: Vec<Cell>) -> Result<Value, PhpError> {
         self.new_instance(name, CallArgs::positional(args))
     }
@@ -12179,7 +19257,15 @@ fn weak_ty_coerce(tys: &[String], v: &Value) -> Option<Value> {
                 };
                 base.map(Value::Int)
             }
-            ("int", Value::Float(f)) => Some(Value::Int(*f as i64)),
+            ("int", Value::Float(f)) => {
+                // Zend refuses out-of-range float->int coercions
+                // (NaN/Inf/|f| >= 2^63 → TypeError, no saturation).
+                if f.is_finite() && *f < 9.223372036854776e18 && *f >= -9.223372036854776e18 {
+                    Some(Value::Int(*f as i64))
+                } else {
+                    None
+                }
+            }
             ("int", Value::Bool(b)) => Some(Value::Int(*b as i64)),
             ("string", Value::Int(i)) => Some(Value::str(i.to_string())),
             ("string", Value::Float(f)) => Some(Value::str(format_float_repr(*f))),
@@ -12199,4 +19285,150 @@ fn weak_ty_coerce(tys: &[String], v: &Value) -> Option<Value> {
         }
     }
     None
+}
+
+/// Render a parsed type member list the way Zend prints it — a union
+/// containing `null` displays as `?T`.
+fn ty_disp(ty: &[String]) -> String {
+    let mut nullable = false;
+    let mut rest: Vec<String> = Vec::new();
+    for m in ty {
+        if m.eq_ignore_ascii_case("null") {
+            nullable = true;
+        } else {
+            rest.push(
+                m.split('&')
+                    .map(|p| {
+                        let p = p.trim_start_matches('\\');
+                        if let Some(pos) = p.find("@anonymous$") {
+                            format!("{}@anonymous", &p[..pos])
+                        } else {
+                            p.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("&"),
+            );
+        }
+    }
+    let joined = if rest.len() > 1 || nullable {
+        rest.iter()
+            .map(|m| {
+                if m.contains('&') {
+                    format!("({m})")
+                } else {
+                    m.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    } else {
+        rest.join("|")
+    };
+    if nullable && rest.is_empty() {
+        "null".to_string()
+    } else if nullable && rest.len() == 1 && !rest[0].contains('&') {
+        format!("?{}", joined)
+    } else if nullable {
+        // `(X&Y)|null` — intersections can't take the ? shortcut.
+        format!("{}|null", joined)
+    } else {
+        joined
+    }
+}
+
+/// Typed-const compat in trait composition: same member list
+/// (case-insensitive; both `None` is compatible).
+fn ty_list_eq(a: &Option<Vec<String>>, b: &Option<Vec<String>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|(m, n)| m.eq_ignore_ascii_case(n))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a const initializer is a pure compile-time expression
+/// (literals and operators over them — no fetches, calls, `new`).
+/// Only these get Zend's eager "Cannot use ... as value" fatal at
+/// class registration; everything else type-checks lazily at access.
+fn is_compile_const(e: &Expr) -> bool {
+    match e {
+        Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::Str(_) => true,
+        Expr::Interp(parts) => parts
+            .iter()
+            .all(|p| matches!(p, crate::lexer::StringPart::Lit(_))),
+        Expr::ArrayLit(items) => items.iter().all(|(_, v)| is_compile_const(v)),
+        Expr::Unary { e, .. } => is_compile_const(e),
+        Expr::Binary { l, r, .. } => is_compile_const(l) && is_compile_const(r),
+        Expr::Cast { e, .. } => is_compile_const(e),
+        Expr::Ternary { c, t, f } => {
+            is_compile_const(c)
+                && t.as_ref().map(|x| is_compile_const(x)).unwrap_or(true)
+                && is_compile_const(f)
+        }
+        _ => false,
+    }
+}
+
+/// Zend's normalized union display for redundancy errors: iterable
+/// expands to its members, class names first (written order), then
+/// `object`, then `array`, then remaining builtins, `null` last.
+fn ty_norm_disp(ty: &[String]) -> String {
+    let mut classes: Vec<String> = Vec::new();
+    let mut scalars: Vec<String> = Vec::new();
+    let mut obj = false;
+    let mut arr = false;
+    let mut nul = false;
+    for m in ty {
+        let mut members: Vec<String> = if m.eq_ignore_ascii_case("iterable") {
+            vec!["Traversable".into(), "array".into()]
+        } else {
+            vec![m.clone()]
+        };
+        for e in members.drain(..) {
+            let el = e.to_lowercase();
+            match el.as_str() {
+                "null" => nul = true,
+                "object" => obj = true,
+                "array" => arr = true,
+                "self" | "static" | "parent" => {
+                    if !classes.iter().any(|c| c.eq_ignore_ascii_case(&e)) {
+                        classes.push(e);
+                    }
+                }
+                "int" | "float" | "string" | "bool" | "callable" | "iterable" | "mixed"
+                | "void" | "never" | "false" | "true" => {
+                    if !scalars.iter().any(|c| c == &el) {
+                        scalars.push(el);
+                    }
+                }
+                _ => {
+                    if !classes.iter().any(|c| c.eq_ignore_ascii_case(&e)) {
+                        if e.contains('&') {
+                            classes.push(format!("({})", e));
+                        } else {
+                            classes.push(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = classes;
+    if obj {
+        out.push("object".into());
+    }
+    if arr {
+        out.push("array".into());
+    }
+    out.extend(scalars);
+    if nul {
+        out.push("null".into());
+    }
+    out.join("|")
 }
