@@ -5169,7 +5169,8 @@ impl<'a> Interp<'a> {
                     return Ok(newv);
                 }
                 {
-                    let nv = self.typed_slot_store(&base, newv.clone())?;
+                    // Index writes mutate INSIDE the container — a typed
+                    // `array` prop keeps its type, no gate on the value.
                     let mut b = base.borrow_mut();
                     if matches!(*b, Value::Null) {
                         *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
@@ -5177,10 +5178,10 @@ impl<'a> Interp<'a> {
                     if let Value::Array(rc) = &mut *b {
                         let mut arr = rc.borrow_mut();
                         if append {
-                            arr.push(nv.clone());
+                            arr.push(newv.clone());
                         } else {
-                            let key = key.map(|k| to_key(&k)).unwrap_or(to_key(&nv));
-                            arr.set(key, nv.clone());
+                            let key = key.map(|k| to_key(&k)).unwrap_or(to_key(&newv));
+                            arr.set(key, newv.clone());
                         }
                     }
                 }
