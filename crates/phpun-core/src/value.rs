@@ -890,6 +890,8 @@ pub enum PhpResource {
         pos: u64,
         eof: bool,
     },
+    /// STDIN/STDOUT/STDERR — php:// and the CLI-SAPI constants.
+    Stdio { id: u64, which: u8 },
     /// curl/db handles etc. — opaque placeholder.
     Other { id: u64, kind: &'static str },
 }
@@ -898,6 +900,7 @@ impl PhpResource {
     pub fn id(&self) -> u64 {
         match self {
             PhpResource::File { id, .. } => *id,
+            PhpResource::Stdio { id, .. } => *id,
             PhpResource::Other { id, .. } => *id,
         }
     }

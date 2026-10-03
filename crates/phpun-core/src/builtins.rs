@@ -2606,22 +2606,32 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "fopen" => {
             let path = arg_str(it, args, 0);
             let mode = arg_str(it, args, 1);
-            match fopen(&path, &mode) {
-                Ok(f) => {
-                    let id = it.next_res_id();
-                    let (r, w) = mode_flags(&mode);
-                    Value::Resource(Rc::new(RefCell::new(PhpResource::File {
-                        id,
-                        file: f,
-                        read: r,
-                        write: w,
-                        pos: 0,
-                        eof: false,
-                    })))
-                }
-                Err(e) => {
-                    it.warn_pub(&format!("fopen({}): Failed to open stream: {}", path, e))?;
-                    Value::Bool(false)
+            if let Some(which) = match path.as_str() {
+                "php://stdin" => Some(0u8),
+                "php://stdout" => Some(1u8),
+                "php://stderr" => Some(2u8),
+                _ => None,
+            } {
+                let id = it.next_res_id();
+                Value::Resource(Rc::new(RefCell::new(PhpResource::Stdio { id, which })))
+            } else {
+                match fopen(&path, &mode) {
+                    Ok(f) => {
+                        let id = it.next_res_id();
+                        let (r, w) = mode_flags(&mode);
+                        Value::Resource(Rc::new(RefCell::new(PhpResource::File {
+                            id,
+                            file: f,
+                            read: r,
+                            write: w,
+                            pos: 0,
+                            eof: false,
+                        })))
+                    }
+                    Err(e) => {
+                        it.warn_pub(&format!("fopen({}): Failed to open stream: {}", path, e))?;
+                        Value::Bool(false)
+                    }
                 }
             }
         }
@@ -5730,12 +5740,23 @@ fn fopen(path: &str, mode: &str) -> std::io::Result<std::fs::File> {
     o.open(path)
 }
 
-fn write_resource(_it: &mut Interp, c: Option<&Cell>, data: &str) -> Result<(), PhpError> {
+fn write_resource(it: &mut Interp, c: Option<&Cell>, data: &str) -> Result<(), PhpError> {
     use std::io::{Seek, Write};
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
             let mut rb = r.borrow_mut();
             match &mut *rb {
+                PhpResource::Stdio { which, .. } => match *which {
+                    1 => {
+                        it.out.push_str(data);
+                        Ok(())
+                    }
+                    2 => {
+                        it.err_buf.push_str(data);
+                        Ok(())
+                    }
+                    _ => Err(PhpError::fatal("not writable", 0)),
+                },
                 PhpResource::File {
                     file, pos, write, ..
                 } => {
@@ -5761,6 +5782,7 @@ fn read_resource(c: Option<&Cell>, n: usize) -> Result<Vec<u8>, PhpError> {
         Some(Value::Resource(r)) => {
             let mut rb = r.borrow_mut();
             match &mut *rb {
+                PhpResource::Stdio { .. } => Ok(Vec::new()),
                 PhpResource::File {
                     file,
                     pos,
@@ -5798,6 +5820,7 @@ fn read_line_resource(c: Option<&Cell>) -> Result<Vec<u8>, PhpError> {
         Some(Value::Resource(r)) => {
             let mut rb = r.borrow_mut();
             match &mut *rb {
+                PhpResource::Stdio { .. } => Ok(Vec::new()),
                 PhpResource::File {
                     file,
                     pos,

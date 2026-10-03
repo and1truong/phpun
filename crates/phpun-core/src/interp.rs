@@ -285,6 +285,15 @@ impl<'a> Interp<'a> {
         constants.insert("PHP_OS".into(), Value::str("Linux"));
         constants.insert("PHP_OS_FAMILY".into(), Value::str("Linux"));
         constants.insert("PHP_SAPI".into(), Value::str("cli"));
+        for (name, which) in [("STDIN", 0u8), ("STDOUT", 1u8), ("STDERR", 2u8)] {
+            constants.insert(
+                name.into(),
+                Value::Resource(Rc::new(RefCell::new(crate::value::PhpResource::Stdio {
+                    id: which as u64 + 1,
+                    which,
+                }))),
+            );
+        }
         constants.insert("DIRECTORY_SEPARATOR".into(), Value::str("/"));
         constants.insert("INI_USER".into(), Value::Int(1));
         constants.insert("INI_PERDIR".into(), Value::Int(2));
