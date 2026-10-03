@@ -161,6 +161,8 @@ pub struct Interp<'a> {
     pub resp_code: i64,
     /// Set by json_encode/json_decode for json_last_error().
     pub last_json_error: i64,
+    /// Set by the preg_* builtins for preg_last_error().
+    pub last_preg_error: i64,
     /// Raw request body for php://input — serve mode fills it.
     pub php_input: std::rc::Rc<Vec<u8>>,
     /// Real upload tmp paths created this request — is_uploaded_file()
@@ -358,6 +360,14 @@ impl<'a> Interp<'a> {
         constants.insert("PREG_SPLIT_DELIM_CAPTURE".into(), Value::Int(2));
         constants.insert("PREG_SPLIT_OFFSET_CAPTURE".into(), Value::Int(4));
         constants.insert("PREG_GREP_INVERT".into(), Value::Int(1));
+        constants.insert("PREG_NO_ERROR".into(), Value::Int(0));
+        constants.insert("PREG_INTERNAL_ERROR".into(), Value::Int(1));
+        constants.insert("PREG_BACKTRACK_LIMIT_ERROR".into(), Value::Int(2));
+        constants.insert("PREG_RECURSION_LIMIT_ERROR".into(), Value::Int(3));
+        constants.insert("PREG_BAD_UTF8_ERROR".into(), Value::Int(4));
+        constants.insert("PREG_BAD_UTF8_OFFSET_ERROR".into(), Value::Int(5));
+        constants.insert("PREG_JIT_STACKLIMIT_ERROR".into(), Value::Int(6));
+        constants.insert("PREG_BAD_MODE_LIMIT_ERROR".into(), Value::Int(7));
         // ext/filter.
         constants.insert("FILTER_VALIDATE_INT".into(), Value::Int(257));
         constants.insert("FILTER_VALIDATE_BOOL".into(), Value::Int(258));
@@ -435,6 +445,7 @@ impl<'a> Interp<'a> {
             out_headers: Vec::new(),
             resp_code: 200,
             last_json_error: 0,
+            last_preg_error: 0,
             php_input: std::rc::Rc::new(Vec::new()),
             uploads: Vec::new(),
             ob_stack: Vec::new(),
@@ -6168,12 +6179,14 @@ impl<'a> Interp<'a> {
         // by-ref slots emit "Only variables should be passed by reference"
         // (passByReference_012, array_shift(array_shift($a))).
         let builtin_params: Vec<Param> = if decl.is_none() {
+            let sig = crate::builtins::builtin_sig(&lname).unwrap_or_default();
             builtin_byref(&lname)
                 .map(|flags| {
                     flags
                         .iter()
-                        .map(|by_ref| Param {
-                            name: String::new(),
+                        .enumerate()
+                        .map(|(i, by_ref)| Param {
+                            name: sig.get(i).map(|(n, _)| n.clone()).unwrap_or_default(),
                             default: None,
                             by_ref: *by_ref,
                             variadic: false,
@@ -10915,14 +10928,11 @@ impl<'a> Interp<'a> {
                 let mut ob = obj.borrow_mut();
                 let msg = _args
                     .first()
-                    .map(|c| c.borrow().clone())
-                    .unwrap_or(Value::str(""));
-                let code = _args
-                    .get(1)
-                    .map(|c| c.borrow().clone())
-                    .unwrap_or(Value::Int(0));
-                ob.props.insert("message".into(), cell(msg));
-                ob.props.insert("code".into(), cell(code));
+                    .map(|c| c.borrow().to_php_string())
+                    .unwrap_or_default();
+                let code = _args.get(1).map(|c| c.borrow().to_int()).unwrap_or(0);
+                ob.props.insert("message".into(), cell(Value::str(msg)));
+                ob.props.insert("code".into(), cell(Value::Int(code)));
                 if !ob.prop_order.contains(&"message".into()) {
                     ob.prop_order.push("message".into());
                     ob.prop_order.push("code".into());
@@ -11994,14 +12004,15 @@ fn builtin_byref(name: &str) -> Option<&'static [bool]> {
         "preg_match" | "preg_match_all" => &[false, false, true],
         "preg_replace"
         | "preg_replace_callback"
-        | "preg_replace_callback_array"
+        | "preg_filter"
         | "str_replace"
-        | "str_ireplace" => &[false, false, false, true],
+        | "str_ireplace" => &[false, false, false, false, true],
+        "preg_replace_callback_array" => &[false, false, false, true],
         "parse_str" => &[false, true],
         "sscanf" | "fscanf" => &[false, false],
         "exec" => &[false, true, true],
         "passthru" | "system" => &[false, true],
-        "preg_filter" | "preg_grep" => &[false],
+        "preg_grep" => &[false],
         _ => return None,
     })
 }

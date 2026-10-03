@@ -24,6 +24,8 @@ pub struct PcreRe {
     code: *mut pcre2_code_8,
     /// group index -> name (index 0 = whole match, never named)
     names: Vec<Option<String>>,
+    /// compiled with PCRE2_UTF — matches must stay on char boundaries
+    utf8: bool,
 }
 
 impl Drop for PcreRe {
@@ -41,28 +43,37 @@ impl PcreRe {
         self.names.get(g).cloned().flatten()
     }
 
-    /// All leftmost matches, PHP `preg_match_all` order.
-    pub fn match_all(&self, subject: &[u8]) -> Vec<PcreMatch> {
+    /// All leftmost matches, PHP `preg_match_all` order. Returns the
+    /// matches plus 0, or the negative PCRE2 error code (backtrack /
+    /// depth limit, bad UTF-8, ...) that ended the scan.
+    pub fn match_all(
+        &self,
+        subject: &[u8],
+        match_limit: u32,
+        depth_limit: u32,
+    ) -> (Vec<PcreMatch>, i32) {
         unsafe {
             let md = pcre2_match_data_create_from_pattern_8(self.code, ptr::null_mut());
             if md.is_null() {
-                return Vec::new();
+                return (Vec::new(), 0);
+            }
+            let mctx = pcre2_match_context_create_8(ptr::null_mut());
+            if !mctx.is_null() {
+                pcre2_set_match_limit_8(mctx, match_limit);
+                pcre2_set_depth_limit_8(mctx, depth_limit);
             }
             let ovc = pcre2_get_ovector_count_8(md) as usize;
             let mut out = Vec::new();
+            let mut err = 0i32;
             let mut offset = 0usize;
             let len = subject.len();
             while offset <= len {
-                let rc = pcre2_match_8(
-                    self.code,
-                    subject.as_ptr(),
-                    len,
-                    offset,
-                    0,
-                    md,
-                    ptr::null_mut(),
-                );
-                if rc <= 0 {
+                let rc = pcre2_match_8(self.code, subject.as_ptr(), len, offset, 0, md, mctx);
+                if rc == 0 || rc == PCRE2_ERROR_NOMATCH {
+                    break;
+                }
+                if rc < 0 {
+                    err = rc;
                     break;
                 }
                 let ov = pcre2_get_ovector_pointer_8(md);
@@ -86,34 +97,87 @@ impl PcreRe {
                     }
                 };
                 let (s0, e0) = spans.first().copied().flatten().unwrap_or((offset, offset));
+                if e0 > s0 {
+                    out.push(PcreMatch { spans, mark });
+                    offset = e0;
+                    continue;
+                }
+                // Empty match — PHP's global-scan rule: record it, then
+                // retry anchored+notempty at the same offset; on no match
+                // move past one character (UTF-8-aware under /u).
                 out.push(PcreMatch { spans, mark });
-                // Empty match: advance past the current position like
-                // pcre2demo (keeps progress, keeps UTF-8 alignment for
-                // /u patterns since PCRE2 offsets stay on boundaries).
-                offset = if e0 > s0 { e0 } else { e0 + 1 };
+                let rc2 = pcre2_match_8(
+                    self.code,
+                    subject.as_ptr(),
+                    len,
+                    offset,
+                    PCRE2_NOTEMPTY_ATSTART | PCRE2_ANCHORED,
+                    md,
+                    mctx,
+                );
+                if rc2 > 0 {
+                    let ov = pcre2_get_ovector_pointer_8(md);
+                    let (a1, b1) = (*ov, *ov.add(1));
+                    offset = if a1 != usize::MAX { b1 } else { e0 + 1 };
+                } else if rc2 == 0 || rc2 == PCRE2_ERROR_NOMATCH {
+                    offset = e0
+                        + if self.utf8 && e0 < len {
+                            let mut n = 1usize;
+                            while e0 + n < len && (subject[e0 + n] & 0xC0) == 0x80 {
+                                n += 1;
+                            }
+                            n
+                        } else {
+                            1
+                        };
+                } else {
+                    err = rc2;
+                    break;
+                }
+            }
+            if !mctx.is_null() {
+                pcre2_match_context_free_8(mctx);
             }
             pcre2_match_data_free_8(md);
-            out
+            (out, err)
         }
     }
 }
 
 /// Compile a PCRE2 pattern (without delimiters — options already
-/// inlined as `(?imsx)` by the caller). Returns None on compile error.
-pub fn compile(src: &str) -> Option<PcreRe> {
+/// inlined as `(?imsx)` or passed in `options` by the caller).
+/// Err is the engine's message plus the byte offset, PHP style.
+pub fn compile(src: &str, options: u32, extra_options: u32) -> Result<PcreRe, String> {
     unsafe {
         let mut errcode: std::os::raw::c_int = 0;
         let mut erroff: usize = 0;
+        let cctx = if extra_options != 0 {
+            let c = pcre2_compile_context_create_8(ptr::null_mut());
+            pcre2_set_compile_extra_options_8(c, extra_options);
+            c
+        } else {
+            ptr::null_mut()
+        };
         let code = pcre2_compile_8(
             src.as_ptr(),
             src.len(),
-            0,
+            options,
             &mut errcode,
             &mut erroff,
-            ptr::null_mut(),
+            cctx,
         );
+        if !cctx.is_null() {
+            pcre2_compile_context_free_8(cctx);
+        }
         if code.is_null() {
-            return None;
+            let mut buf = [0u8; 256];
+            let n = pcre2_get_error_message_8(errcode, buf.as_mut_ptr().cast(), buf.len());
+            let msg = if n > 0 {
+                String::from_utf8_lossy(&buf[..n as usize]).into_owned()
+            } else {
+                format!("error {}", errcode)
+            };
+            return Err(format!("{} at offset {}", msg, erroff));
         }
         let mut ncap: u32 = 0;
         pcre2_pattern_info_8(
@@ -144,7 +208,7 @@ pub fn compile(src: &str) -> Option<PcreRe> {
             for i in 0..ntable_count as usize {
                 let entry = table.add(i * esize as usize);
                 // first two bytes = group number, then NUL-terminated name
-                let num = u16::from_ne_bytes([*entry, *entry.add(1)]) as usize;
+                let num = u16::from_be_bytes([*entry, *entry.add(1)]) as usize;
                 let name_ptr = entry.add(2).cast::<std::os::raw::c_char>();
                 let name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
                 if num < names.len() {
@@ -152,6 +216,10 @@ pub fn compile(src: &str) -> Option<PcreRe> {
                 }
             }
         }
-        Some(PcreRe { code, names })
+        Ok(PcreRe {
+            code,
+            names,
+            utf8: options & PCRE2_UTF != 0,
+        })
     }
 }
