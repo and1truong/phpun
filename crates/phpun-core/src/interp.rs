@@ -160,6 +160,26 @@ pub struct Interp<'a> {
     /// no-ops instead of recursing forever (autoload(D) → `D extends C`
     /// → autoload(C) while C's own autoload is still in flight).
     autoloading: std::collections::HashSet<String>,
+    /// Class lnames whose inheritance signature check deferred on a
+    /// compared type that was still loading — Zend's delayed variance
+    /// obligations, re-verified after each class finishes linking
+    /// (class_order_autoload*).
+    variance_obligations: Vec<String>,
+    /// Reentrancy guard: a class registering while the deferred pass
+    /// itself runs does not spawn a nested pass (error9 ordering — the
+    /// autoloaded class's own code runs before the recheck resumes).
+    in_variance_pass: bool,
+    /// Fatal raised inside an autoload a signature probe triggered —
+    /// the probe reports it to the checking context instead of
+    /// degrading to "could not check" (cascading variance failures
+    /// must surface the original fatal once).
+    sig_fatal: Option<PhpError>,
+    /// Decls currently mid-registration (register_class entered, the
+    /// decl not yet on `linking`/`classes`) — type probes resolve
+    /// them as class-likes so a check sees `C extends B` by name
+    /// while C's own dependencies still autoload
+    /// (class_order_autoload1; infinite_recursion).
+    declaring: Vec<Rc<ClassDecl>>,
     /// (class, method) pairs of internal methods whose declared return
     /// type is *tentative* — incompatible overrides get a Deprecated
     /// notice, not a fatal (internal_parent/*).
@@ -571,6 +591,10 @@ impl<'a> Interp<'a> {
             trait_statics: HashMap::new(),
             linking: Vec::new(),
             autoloading: std::collections::HashSet::new(),
+            variance_obligations: Vec::new(),
+            in_variance_pass: false,
+            sig_fatal: None,
+            declaring: Vec::new(),
             tentative: {
                 let mut t = HashSet::new();
                 t.insert(("datetimezone".into(), "listidentifiers".into()));
@@ -3027,6 +3051,61 @@ impl<'a> Interp<'a> {
                 Ok(v) => Ok(Some(v)),
                 Err(e) => self.fail(e),
             };
+        }
+        // strict_types applies to internal-function calls too: scalar
+        // args must already be the declared ZPP type (int->float still
+        // widens), else a catchable TypeError — the short form, no
+        // `called in ... and defined in` suffix (that's userland-only).
+        // `callable` params are validated eagerly even in weak mode
+        // (Zend's `f` ZPP flag) with the callback-specific messages.
+        if args.named.is_empty() {
+            if let Some(sig) = builtins::strict_sig(name) {
+                let strict = self.caller_file_strict();
+                for (i, (pname, pty)) in sig.iter().enumerate() {
+                    if i >= args.cells.len() {
+                        break;
+                    }
+                    let v = args.cells[i].borrow().clone();
+                    let has_cb = pty
+                        .trim_start_matches('?')
+                        .split('|')
+                        .any(|t| t == "callable");
+                    if has_cb {
+                        let ok = (pty.starts_with('?') && matches!(v, Value::Null))
+                            || self.is_callable_value(&v);
+                        if !ok {
+                            let null = if pty.starts_with('?') { " or null" } else { "" };
+                            let msg = format!(
+                                "{}(): Argument #{} (${}) must be a valid callback{}, {}",
+                                name,
+                                i + 1,
+                                pname,
+                                null,
+                                self.zpp_callback_detail(&v),
+                            );
+                            let e = self.exception("TypeError", &msg);
+                            let te = self.throw(e);
+                            let r = self.fail(te);
+                            self.call_trace.pop();
+                            return r;
+                        }
+                    } else if strict && !self.zpp_strict_ok(pty, &v) {
+                        let msg = format!(
+                            "{}(): Argument #{} (${}) must be of type {}, {} given",
+                            name,
+                            i + 1,
+                            pname,
+                            pty,
+                            self.zval_type_name(&v),
+                        );
+                        let e = self.exception("TypeError", &msg);
+                        let te = self.throw(e);
+                        let r = self.fail(te);
+                        self.call_trace.pop();
+                        return r;
+                    }
+                }
+            }
         }
         match builtins::builtin_params(name) {
             // Internal fns with a known signature get Zend's named-arg
@@ -8980,6 +9059,56 @@ impl<'a> Interp<'a> {
             }
         }
         self.autoloading.remove(&key);
+        // A throwable escaping an autoloader while variance obligations
+        // are pending leaves the in-progress class half-linked — Zend
+        // falls back to a fatal naming the class being inherited
+        // (variance/loading_exception*).
+        if let Err(e) = &res {
+            if e.kind == crate::error::ErrorKind::Throw && !self.variance_obligations.is_empty() {
+                if let Some(Value::Object(o)) = &self.pending_exception {
+                    let (cls, msg, file, line, tr) = {
+                        let ob = o.borrow();
+                        let msg = ob
+                            .props
+                            .get("message")
+                            .map(|v| v.borrow().to_php_string())
+                            .unwrap_or_default();
+                        let (file, line, tr) = match &ob.internal {
+                            Some(ObjectInternal::Exception {
+                                file,
+                                line,
+                                trace,
+                                frames,
+                                ..
+                            }) => (
+                                file.clone(),
+                                *line as usize,
+                                if !trace.is_empty() {
+                                    trace.clone()
+                                } else {
+                                    crate::value::format_trace(frames)
+                                },
+                            ),
+                            _ => (self.diag_file(), e.line, "#0 {main}".to_string()),
+                        };
+                        (ob.class.name().to_string(), msg, file, line, tr)
+                    };
+                    self.pending_exception = None;
+                    let outer = self
+                        .declaring
+                        .last()
+                        .map(|d| d.name.clone())
+                        .unwrap_or_default();
+                    return Err(PhpError::fatal(
+                        format!(
+                            "During inheritance of {outer} with variance dependencies: Uncaught {cls}: {msg} in {file}:{line}\nStack trace:\n{}",
+                            tr.trim_end()
+                        ),
+                        self.cur_line,
+                    ));
+                }
+            }
+        }
         res
     }
     /// Params binding + body run for a pushed frame context (closures).
@@ -9215,14 +9344,15 @@ impl<'a> Interp<'a> {
                     let lit_ok = disp
                         .iter()
                         .all(|m| builtins.contains(&m.to_lowercase().as_str()))
-                        && match kind {
-                            "int" => disp.iter().any(|m| {
-                                m.eq_ignore_ascii_case("int") || m.eq_ignore_ascii_case("float")
-                            }),
-                            "float" => disp.iter().any(|m| m.eq_ignore_ascii_case("float")),
-                            "string" => disp.iter().any(|m| m.eq_ignore_ascii_case("string")),
-                            _ => disp.iter().any(|m| m.eq_ignore_ascii_case("bool")),
-                        };
+                        && (disp.iter().any(|m| m.eq_ignore_ascii_case("mixed"))
+                            || match kind {
+                                "int" => disp.iter().any(|m| {
+                                    m.eq_ignore_ascii_case("int") || m.eq_ignore_ascii_case("float")
+                                }),
+                                "float" => disp.iter().any(|m| m.eq_ignore_ascii_case("float")),
+                                "string" => disp.iter().any(|m| m.eq_ignore_ascii_case("string")),
+                                _ => disp.iter().any(|m| m.eq_ignore_ascii_case("bool")),
+                            });
                     if !lit_ok {
                         self.cur_line = saved;
                         return Err(PhpError::fatal(
@@ -9353,27 +9483,10 @@ impl<'a> Interp<'a> {
         ty: &[String],
         cls: &Option<(&str, Option<String>)>,
     ) -> Result<(), PhpError> {
-        for m in ty {
-            if m.contains('\\') || m.contains('&') {
-                continue;
-            }
-            let msg = match m.to_lowercase().as_str() {
-                "integer" => format!(
-                    "\"{m}\" will be interpreted as a class name. Did you mean \"int\"? Write \"\\{m}\" to suppress this warning"
-                ),
-                "double" => format!(
-                    "\"{m}\" will be interpreted as a class name. Did you mean \"float\"? Write \"\\{m}\" to suppress this warning"
-                ),
-                "boolean" => format!(
-                    "\"{m}\" will be interpreted as a class name. Did you mean \"bool\"? Write \"\\{m}\" to suppress this warning"
-                ),
-                "resource" => format!(
-                    "\"{m}\" is not a supported builtin type and will be interpreted as a class name. Write \"\\{m}\" to suppress this warning"
-                ),
-                _ => continue,
-            };
-            self.warn(&msg)?;
-        }
+        // Confusable-type warnings (`integer`/`double`/`boolean`/
+        // `resource` as class names) are a compile-time diagnostic
+        // emitted by the parser — it owns the written-vs-resolved
+        // distinction and the use-import table (confusable_type_warning).
         // Intersection conjuncts may only be class-like names — any
         // builtin scalar/compound member is a compile error
         // (invalid_types/*).
@@ -9416,8 +9529,21 @@ impl<'a> Interp<'a> {
             return Ok(());
         }
         let builtins = [
-            "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed",
-            "void", "never", "false", "true", "null",
+            "int",
+            "float",
+            "string",
+            "bool",
+            "array",
+            "object",
+            "callable",
+            "iterable",
+            "mixed",
+            "void",
+            "never",
+            "false",
+            "true",
+            "null",
+            "traversable",
         ];
         // `T|object` — a class member (incl. an intersection of
         // classes) alongside `object` is redundant
@@ -9472,7 +9598,22 @@ impl<'a> Interp<'a> {
         let mut seen: Vec<(String, String)> = Vec::new();
         let mut seen_true = false;
         let mut seen_false = false;
-        for m in ty {
+        // Zend dedupes builtin scalars before class names: for
+        // `iterable|iterable` the reported dup is `array`, not
+        // `Traversable` (iterable_alias_redundancy_iterable).
+        const DEDUP_BUILTINS: &[&str] = &[
+            "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed",
+            "void", "never", "false", "true", "null",
+        ];
+        let ordered: Vec<&String> = ty
+            .iter()
+            .filter(|m| DEDUP_BUILTINS.contains(&m.to_lowercase().as_str()))
+            .chain(
+                ty.iter()
+                    .filter(|m| !DEDUP_BUILTINS.contains(&m.to_lowercase().as_str())),
+            )
+            .collect();
+        for m in ordered {
             let l = m.to_lowercase();
             let exps: Vec<String> = if l == "iterable" {
                 vec!["array".into(), "Traversable".into()]
@@ -9906,6 +10047,80 @@ impl<'a> Interp<'a> {
             Value::Object(o) => o.borrow().class.name().to_string(),
             Value::Callable(_) => "Closure".into(),
             Value::Resource(_) => "resource".into(),
+        }
+    }
+
+    /// Strict-mode ZPP arg check for internal functions: `?` = nullable,
+    /// `|` = union; int widens to float, everything else must match
+    /// exactly (no scalar coercion, no __toString).
+    fn zpp_strict_ok(&mut self, pty: &str, v: &Value) -> bool {
+        let (pty, nullable) = match pty.strip_prefix('?') {
+            Some(t) => (t, true),
+            None => (pty, false),
+        };
+        if nullable && matches!(v, Value::Null) {
+            return true;
+        }
+        pty.split('|').any(|t| match t {
+            "string" => matches!(v, Value::Str(_)),
+            "int" => matches!(v, Value::Int(_)),
+            "float" => matches!(v, Value::Float(_) | Value::Int(_)),
+            "bool" => matches!(v, Value::Bool(_)),
+            "array" => matches!(v, Value::Array(_)),
+            "object" => matches!(v, Value::Object(_) | Value::Callable(_)),
+            "callable" => self.is_callable_value(v),
+            "iterable" => {
+                matches!(v, Value::Array(_))
+                    || matches!(v, Value::Object(o) if {
+                        let n = o.borrow().class.name().to_string();
+                        self.is_a_str(&n, "traversable")
+                    })
+            }
+            "resource" => matches!(v, Value::Resource(_)),
+            _ => true, // mixed and unknown tags accept everything
+        })
+    }
+
+    /// Zend's callback-validation error detail for internal functions
+    /// (the part after `must be a valid callback`/`or null,`).
+    fn zpp_callback_detail(&mut self, v: &Value) -> String {
+        match v {
+            Value::Array(a) => {
+                let a = a.borrow();
+                let mut it = a.entries.iter();
+                match it.next() {
+                    None => "first array member is not a valid class name or object".into(),
+                    Some((_, c0)) => {
+                        if !matches!(&*c0.borrow(), Value::Str(_) | Value::Object(_)) {
+                            return "first array member is not a valid class name or object".into();
+                        }
+                        let c0 = c0.borrow().clone();
+                        let second = it.next().map(|(_, c)| c.borrow().clone());
+                        let Some(Value::Str(m)) = second else {
+                            return "second array member is not a valid method".into();
+                        };
+                        let m = String::from_utf8_lossy(&m).to_string();
+                        match c0 {
+                            Value::Str(cn) => format!(
+                                "class {} does not have a method \"{}\"",
+                                String::from_utf8_lossy(&cn),
+                                m
+                            ),
+                            Value::Object(o) => format!(
+                                "class {} does not have a method \"{}\"",
+                                o.borrow().class.name(),
+                                m
+                            ),
+                            _ => "first array member is not a valid class name or object".into(),
+                        }
+                    }
+                }
+            }
+            Value::Str(s) => format!(
+                "function \"{}\" not found or invalid function name",
+                String::from_utf8_lossy(s)
+            ),
+            _ => "no array or string given".into(),
         }
     }
 
@@ -11195,6 +11410,17 @@ impl<'a> Interp<'a> {
     // ----- classes -----
 
     fn register_class(&mut self, decl: Rc<ClassDecl>) -> Result<(), PhpError> {
+        // The name is "in progress" from the moment registration is
+        // entered: type probes treat it as resolvable so a check can
+        // defer on it instead of autoloading recursively
+        // (infinite_recursion: `class C extends Z implements C`).
+        self.declaring.push(decl.clone());
+        let res = self.register_class_inner(decl);
+        self.declaring.pop();
+        res
+    }
+
+    fn register_class_inner(&mut self, decl: Rc<ClassDecl>) -> Result<(), PhpError> {
         // Reserved scalar names can't name a class/interface/trait/enum
         // (scalar_reserved*): `class int {}` is a compile fatal.
         let short = decl.name.rsplit('\\').next().unwrap_or(&decl.name);
@@ -11487,6 +11713,91 @@ impl<'a> Interp<'a> {
                 );
                 self.decl_order.push(lname);
             }
+        }
+        // Delayed variance obligations re-verify once the types they
+        // waited on link — a registration re-checks only its own
+        // ancestors' obligations, and never nests a pass inside a
+        // running pass (class_order_autoload*).
+        if !self.in_variance_pass && !self.variance_obligations.is_empty() {
+            self.in_variance_pass = true;
+            let res = self.process_variance_obligations(&decl);
+            self.in_variance_pass = false;
+            res?;
+        }
+        Ok(())
+    }
+
+    /// The class currently linking owes a signature re-check whenever
+    /// one of its probes autoloads a type — record it before the
+    /// autoloader runs so nested registrations can re-verify it.
+    fn note_variance_obligation(&mut self) {
+        if let Some(d) = self.linking.last() {
+            let l = d.name.to_lowercase();
+            if !self.variance_obligations.contains(&l) {
+                self.variance_obligations.push(l);
+            }
+        }
+    }
+
+    /// Re-run the deferred signature checks for obligated ancestors
+    /// of the just-linked class — a subclass can't link against a
+    /// parent whose own variance is still unverified, so linking it
+    /// forces the parent's obligations first (class_order_autoload*).
+    /// Obligations on unrelated classes stay pending (error8).
+    fn process_variance_obligations(&mut self, decl: &Rc<ClassDecl>) -> Result<(), PhpError> {
+        let mut anc: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut work: Vec<String> = decl
+            .parent
+            .iter()
+            .chain(decl.implements.iter())
+            .map(|n| n.trim_start_matches('\\').to_lowercase())
+            .collect();
+        while let Some(n) = work.pop() {
+            if !anc.insert(n.clone()) {
+                continue;
+            }
+            let d = self
+                .classes
+                .get(&n)
+                .map(|c| c.decl.clone())
+                .or_else(|| self.interfaces.get(&n).cloned())
+                .or_else(|| self.traits.get(&n).cloned())
+                .or_else(|| {
+                    self.linking
+                        .iter()
+                        .find(|c| c.name.to_lowercase() == n)
+                        .cloned()
+                });
+            if let Some(d) = d {
+                work.extend(
+                    d.parent
+                        .iter()
+                        .chain(d.implements.iter())
+                        .map(|x| x.trim_start_matches('\\').to_lowercase()),
+                );
+            }
+        }
+        let obls = std::mem::take(&mut self.variance_obligations);
+        for lname in obls {
+            if !anc.contains(&lname) {
+                // Not an ancestor of what just linked — stays pending.
+                self.variance_obligations.push(lname);
+                continue;
+            }
+            let decl = self
+                .classes
+                .get(&lname)
+                .map(|c| c.decl.clone())
+                .or_else(|| self.interfaces.get(&lname).cloned())
+                .or_else(|| {
+                    self.linking
+                        .iter()
+                        .find(|c| c.name.to_lowercase() == lname)
+                        .cloned()
+                });
+            let Some(d) = decl else { continue };
+            self.check_interface_sigs(&d)?;
+            self.check_override_sigs(&d)?;
         }
         Ok(())
     }
@@ -12361,6 +12672,12 @@ impl<'a> Interp<'a> {
                 }
             };
         }
+        // A fatal raised inside an autoload the probes triggered
+        // aborts the whole check — the original error wins over any
+        // synthesized compatibility message (error3 cascade).
+        if let Some(e) = self.sig_fatal.take() {
+            return Some(e);
+        }
         if ok && both_abs {
             // Requirements must agree in BOTH directions (bug60217c).
             return self.trait_sig_error(abs_m, impl_m, abs_disp, impl_disp, false);
@@ -12372,6 +12689,12 @@ impl<'a> Interp<'a> {
         // rather than incompatible — Zend reports which class it
         // couldn't load (variance/trait_error, abstract_constructor).
         if let Some(cn) = miss {
+            if self.autoloading.contains(&cn.to_lowercase()) {
+                // The compared type's own autoload is still in flight —
+                // Zend defers the verdict; the obligation re-runs when
+                // the type links (class_order_autoload1).
+                return None;
+            }
             let mut e = PhpError::fatal(
                 format!(
                     "Could not check compatibility between {}::{}{} and {}::{}{}, because class {} is not available",
@@ -13206,13 +13529,19 @@ impl<'a> Interp<'a> {
                     || self.classes.contains_key(&ml)
                     || self.interfaces.contains_key(&ml)
                     || self
+                        .declaring
+                        .iter()
+                        .any(|d| d.name.eq_ignore_ascii_case(&ml))
+                    || self
                         .linking
                         .iter()
                         .any(|c| c.name.eq_ignore_ascii_case(&ml))
                 {
                     return false;
                 }
-                if self.run_autoload(m.trim_start_matches('\\')).is_err() {
+                self.note_variance_obligation();
+                if let Err(e) = self.run_autoload(m.trim_start_matches('\\')) {
+                    self.sig_fatal.get_or_insert(e);
                     self.pending_exception = None;
                 }
                 !self.classes.contains_key(&ml) && !self.interfaces.contains_key(&ml)
@@ -13264,15 +13593,23 @@ impl<'a> Interp<'a> {
         if self.classes.contains_key(&cl)
             || self.interfaces.contains_key(&cl)
             || self.traits.contains_key(&cl)
+            || self
+                .declaring
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(&cl))
             || self.linking.iter().any(|d| d.name.to_lowercase() == cl)
         {
             return true;
         }
         // Autoload errors must not surface here — resolvability is a
         // yes/no probe (invalid4 "could not check" is raised by the
-        // caller). Preserve any pre-existing pending exception.
+        // caller). Preserve any pre-existing pending exception; a fatal
+        // still propagates through sig_fatal.
+        self.note_variance_obligation();
         let prior = self.pending_exception.take();
-        let _ = self.run_autoload(c);
+        if let Err(e) = self.run_autoload(c) {
+            self.sig_fatal.get_or_insert(e);
+        }
         self.pending_exception = prior;
         self.classes.contains_key(&cl)
             || self.interfaces.contains_key(&cl)
@@ -13293,6 +13630,18 @@ impl<'a> Interp<'a> {
     }
 
     fn ty_member_is_a_impl(&mut self, t: &str, s: &str, strict: bool) -> bool {
+        let tl0 = t.to_lowercase();
+        let sl0 = s.to_lowercase();
+        // `never` is the bottom type (subtype of everything). `void`
+        // and `never` match only themselves — `void` is NOT a subtype
+        // of `mixed` (mixed_return_inheritance_error1), and nothing
+        // but `never` is a subtype of `never`.
+        if tl0 == "never" {
+            return true;
+        }
+        if tl0 == "void" || sl0 == "void" || sl0 == "never" {
+            return tl0 == sl0;
+        }
         if s.eq_ignore_ascii_case(t) || s.eq_ignore_ascii_case("mixed") {
             return true;
         }
@@ -13346,7 +13695,10 @@ impl<'a> Interp<'a> {
                 "null", "false", "true", "resource", "numeric",
             ];
             if !SCALARS.contains(&tl.as_str()) {
-                return true;
+                // A non-scalar member covers `object` only when it
+                // actually resolves to a class-like — Zend autoloads
+                // it to verify (enum_forward_compat).
+                return self.ty_conj_resolvable(t);
             }
         }
         if sl == "bool" && (tl == "true" || tl == "false") {
@@ -18644,12 +18996,32 @@ impl<'a> Interp<'a> {
         // Type-member checks during signature verification autoload the
         // compared classes — Zend verifies covariance with the real
         // hierarchy, so `C::m(): D` inside an autoloaded class sees `D`
-        // even when it is declared later (abstract_method_9).
-        if !self.classes.contains_key(&a.to_lowercase()) && self.run_autoload(a).is_err() {
-            // An autoload failure is a compile-time fatal everywhere
-            // else; inside a signature check a missing class just means
-            // "not a subtype".
-            self.pending_exception = None;
+        // even when it is declared later (abstract_method_9). A name
+        // mid-link counts as resolvable without loading
+        // (infinite_recursion — `class C extends Z implements C`).
+        if !self.classes.contains_key(&a.to_lowercase())
+            && !self.linking.iter().any(|c| c.name.eq_ignore_ascii_case(a))
+        {
+            // The check creates a delayed variance dependency either
+            // way; a name mid-registration is still unlinked — the
+            // decl answers it by name, but the obligation is recorded
+            // so the check re-verifies after it links
+            // (variance/loading_exception*).
+            self.note_variance_obligation();
+            if !self
+                .declaring
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(a))
+            {
+                if let Err(e) = self.run_autoload(a) {
+                    // An autoload failure is a compile-time fatal everywhere
+                    // else; inside a signature check a missing class just
+                    // means "not a subtype" — but the fatal itself must
+                    // still reach the checking context (error3 cascade).
+                    self.sig_fatal.get_or_insert(e);
+                    self.pending_exception = None;
+                }
+            }
         }
         // Aliases canonicalize through the class table: `Bar` (an
         // alias of Foo) compares as `Foo` (typed_properties_084).
@@ -18679,6 +19051,13 @@ impl<'a> Interp<'a> {
             .map(|c| c.decl.clone())
             .or_else(|| {
                 self.linking
+                    .iter()
+                    .rev()
+                    .find(|d| d.name.eq_ignore_ascii_case(a))
+                    .cloned()
+            })
+            .or_else(|| {
+                self.declaring
                     .iter()
                     .rev()
                     .find(|d| d.name.eq_ignore_ascii_case(a))

@@ -16,6 +16,9 @@ pub struct Parser<'a> {
     /// Compile-time deprecation diagnostics (msg, line) — PHP emits them
     /// before execution; `parse_with` prepends them as `Stmt::Deprecated`.
     deprecations: Vec<(String, usize)>,
+    /// Compile-time warnings (msg, line) — confusable type names
+    /// (confusable_type_warning). Drained into `Stmt::Diag`.
+    compile_warnings: Vec<(String, usize)>,
     /// Enclosing class name while parsing members (hook error text).
     cur_class: String,
     /// (prop name, is_get) while inside a hook body — gates
@@ -119,6 +122,7 @@ fn parse_toks(toks: Vec<Lexed>) -> Result<Vec<Stmt>, PhpError> {
         toks: &toks,
         pos: 0,
         deprecations: Vec::new(),
+        compile_warnings: Vec::new(),
         cur_class: String::new(),
         hook_ctx: None,
         pending_class_attrs: Vec::new(),
@@ -140,6 +144,11 @@ fn parse_toks(toks: Vec<Lexed>) -> Result<Vec<Stmt>, PhpError> {
         std::mem::take(&mut p.deprecations)
             .into_iter()
             .map(|(msg, line)| (msg, "Deprecated", line)),
+    );
+    diags.extend(
+        std::mem::take(&mut p.compile_warnings)
+            .into_iter()
+            .map(|(msg, line)| (msg, "Warning", line)),
     );
     diags.sort_by_key(|(_, _, line)| *line);
     for (i, (msg, level, line)) in diags.into_iter().enumerate() {
@@ -218,6 +227,7 @@ pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
         toks: &toks,
         pos: 0,
         deprecations: Vec::new(),
+        compile_warnings: Vec::new(),
         cur_class: String::new(),
         hook_ctx: None,
         pending_class_attrs: Vec::new(),
@@ -294,7 +304,10 @@ impl<'a> Parser<'a> {
         } else {
             // Zend reports a lone unexpected `\` name separator without an
             // "expecting" clause (namespaced_name_whitespace).
-            let msg = if op == ";" && matches!(self.peek(), Some(Token::Op("\\"))) {
+            // Zend never appends an "expecting" clause for `;`
+            // (mixed_cast_error); other expected tokens keep it
+            // (oct_whitespace's `expecting ")"`).
+            let msg = if op == ";" {
                 format!("syntax error, unexpected {}", self.describe())
             } else {
                 format!(
@@ -312,7 +325,7 @@ impl<'a> Parser<'a> {
             None => "end of file".to_string(),
             Some(Token::Ident(s)) => format!("identifier \"{}\"", s),
             Some(Token::Variable(s)) => format!("variable \"${}\"", s),
-            Some(Token::Int(v)) => format!("integer {}", v),
+            Some(Token::Int(v)) => format!("integer \"{}\"", v),
             Some(Token::Float(v)) => format!("float {}", v),
             Some(Token::Op(o)) => format!("token \"{}\"", o),
             Some(_) => "token".to_string(),
@@ -2921,6 +2934,31 @@ impl<'a> Parser<'a> {
                             .map(|p| {
                                 let t = p.trim_start_matches('\\');
                                 let tl = t.to_lowercase();
+                                // Confusable builtin-ish class names warn
+                                // at compile time — only when the written
+                                // name is unqualified AND not imported
+                                // (`use integer` suppresses it).
+                                // (confusable_type_warning)
+                                if !p.contains('\\') && !self.use_map.contains_key(&tl) {
+                                    let suppress = if self.cur_ns.is_empty() {
+                                        format!("Write \"\\{p}\" to suppress this warning")
+                                    } else {
+                                        format!(
+                                            "Write \"\\{}\\{p}\" or import the class with \"use\" to suppress this warning",
+                                            self.cur_ns
+                                        )
+                                    };
+                                    let w = match tl.as_str() {
+                                        "integer" => Some(format!("\"{p}\" will be interpreted as a class name. Did you mean \"int\"? {suppress}")),
+                                        "double" => Some(format!("\"{p}\" will be interpreted as a class name. Did you mean \"float\"? {suppress}")),
+                                        "boolean" => Some(format!("\"{p}\" will be interpreted as a class name. Did you mean \"bool\"? {suppress}")),
+                                        "resource" => Some(format!("\"{p}\" is not a supported builtin type and will be interpreted as a class name. {suppress}")),
+                                        _ => None,
+                                    };
+                                    if let Some(m) = w {
+                                        self.compile_warnings.push((m, self.line()));
+                                    }
+                                }
                                 // `self`/`static`/`parent` need an
                                 // active class scope (self_*/parent_*/
                                 // static_*_global_function).
@@ -2937,7 +2975,8 @@ impl<'a> Parser<'a> {
                                         ));
                                     }
                                     "parent"
-                                        if !self.class_ctx.last().map(|c| c.1).unwrap_or(false)
+                                        if !self.in_closure
+                                            && !self.class_ctx.last().map(|c| c.1).unwrap_or(false)
                                             && !self
                                                 .class_ctx
                                                 .last()
@@ -4313,7 +4352,7 @@ fn desc_t(t: Option<&Token>) -> String {
         Some(Token::Ident(s)) => format!("identifier \"{}\"", s),
         Some(Token::Variable(s)) => format!("variable \"${}\"", s),
         Some(Token::Op(o)) => format!("token \"{}\"", o),
-        Some(Token::Int(v)) => format!("integer {}", v),
+        Some(Token::Int(v)) => format!("integer \"{}\"", v),
         Some(Token::Float(v)) => format!("float {}", v),
         _ => "token".to_string(),
     }

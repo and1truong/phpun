@@ -4266,7 +4266,14 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "get_called_class" => it.called_class_name(),
         "spl_autoload_register" => {
             if let Some(v) = args.first() {
-                it.autoload_fns.push(v.borrow().clone());
+                // ($callback, $throw, $prepend) — a truthy 3rd arg
+                // prepends the loader (variance/loading_exception*).
+                let prepend = args.get(2).map(|v| v.borrow().is_truthy()).unwrap_or(false);
+                if prepend {
+                    it.autoload_fns.insert(0, v.borrow().clone());
+                } else {
+                    it.autoload_fns.push(v.borrow().clone());
+                }
             }
             Value::Bool(true)
         }
@@ -5076,7 +5083,14 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                 Some(crate::value::ObjectInternal::Generator(st)) => {
                     let st = st.borrow();
                     let fname = match &st.setup {
-                        crate::value::GenSetup::Invoke { decl, .. } => decl.name.clone(),
+                        // Methods dump as `C::test` (generator_return_
+                        // containing_extra_types).
+                        crate::value::GenSetup::Invoke {
+                            decl, decl_class, ..
+                        } => match decl_class {
+                            Some(c) => format!("{}::{}", c.decl.name, decl.name),
+                            None => decl.name.clone(),
+                        },
                     };
                     vec![("\"function\"".to_string(), Value::str(&fname))]
                 }
@@ -8683,4 +8697,169 @@ fn valid_email(s: &str) -> bool {
         && !local.starts_with('.')
         && !local.ends_with('.')
         && !local.contains("..")
+}
+
+/// Zend arginfo parameter types for the internal functions whose
+/// `strict_types` argument checks phpun models. Each entry is
+/// `(param_name, zpp_type)` where zpp_type is a `|`-joined union of
+/// `string`, `int`, `float`, `bool`, `array`, `object`, `callable`,
+/// `iterable`, `mixed` with an optional leading `?` for nullable.
+/// Under strict mode scalar coercion is disabled (int->float widening
+/// is still allowed); a mismatch throws TypeError.
+pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
+    let str_p = ("string", "string");
+    let ps: &[(&str, &str)] = match name {
+        "strlen" | "strrev" | "strtoupper" | "strtolower" | "ucfirst" | "lcfirst" | "md5"
+        | "sha1" | "str_rot13" | "nl2br" | "quotemeta" | "soundex" => &[str_p],
+        "ord" => &[("character", "string")],
+        "chr" => &[("codepoint", "int")],
+        "str_repeat" | "wordwrap" => &[("string", "string"), ("times", "int")],
+        "substr" => &[("string", "string"), ("offset", "int"), ("length", "?int")],
+        "strpos" | "stripos" | "strrpos" | "strripos" => &[
+            ("haystack", "string"),
+            ("needle", "string"),
+            ("offset", "int"),
+        ],
+        "str_contains" | "str_starts_with" | "str_ends_with" => {
+            &[("haystack", "string"), ("needle", "string")]
+        }
+        "strcmp" | "strcasecmp" | "strnatcmp" | "strnatcasecmp" => {
+            &[("string1", "string"), ("string2", "string")]
+        }
+        "strncmp" | "strncasecmp" => &[
+            ("string1", "string"),
+            ("string2", "string"),
+            ("length", "int"),
+        ],
+        "str_pad" => &[
+            ("string", "string"),
+            ("length", "int"),
+            ("pad_string", "string"),
+            ("pad_type", "int"),
+        ],
+        "trim" | "ltrim" | "rtrim" => &[("string", "string"), ("characters", "string")],
+        "str_split" => &[("string", "string"), ("length", "int")],
+        "str_replace" | "str_ireplace" => &[
+            ("search", "string|array"),
+            ("replace", "string|array"),
+            ("subject", "string|array"),
+        ],
+        "explode" => &[
+            ("separator", "string"),
+            ("string", "string"),
+            ("limit", "int"),
+        ],
+        "implode" | "join" => &[("separator", "?string"), ("array", "?array")],
+        "array_map" => &[("callback", "?callable"), ("array", "array")],
+        "array_filter" => &[("array", "array"), ("callback", "?callable")],
+        "array_reduce" => &[
+            ("array", "array"),
+            ("callback", "callable"),
+            ("initial", "mixed"),
+        ],
+        "array_walk" | "array_walk_recursive" => {
+            &[("array", "array|object"), ("callback", "callable")]
+        }
+        "usort" | "uasort" | "uksort" => &[("array", "array"), ("callback", "callable")],
+        "count" | "sizeof" => &[("value", "array|object"), ("mode", "int")],
+        "in_array" => &[
+            ("needle", "mixed"),
+            ("haystack", "array"),
+            ("strict", "bool"),
+        ],
+        "array_key_exists" | "key_exists" => &[
+            ("key", "string|int|float|bool|resource"),
+            ("array", "array"),
+        ],
+        "array_search" => &[
+            ("needle", "mixed"),
+            ("haystack", "array"),
+            ("strict", "bool"),
+        ],
+        "intdiv" => &[("num1", "int"), ("num2", "int")],
+        "abs" => &[("num", "int|float")],
+        "array_sum" | "array_product" => &[("array", "array")],
+        "range" => &[("start", "mixed"), ("end", "mixed"), ("step", "int|float")],
+        "array_slice" => &[
+            ("array", "array"),
+            ("offset", "int"),
+            ("length", "?int"),
+            ("preserve_keys", "bool"),
+        ],
+        "array_splice" => &[
+            ("array", "array"),
+            ("offset", "int"),
+            ("length", "?int"),
+            ("replacement", "mixed"),
+        ],
+        "array_merge" | "array_replace" | "array_merge_recursive" => {
+            &[("array", "array"), ("arrays", "array")]
+        }
+        "array_reverse" => &[("array", "array"), ("preserve_keys", "bool")],
+        "array_fill" => &[("start_index", "int"), ("count", "int"), ("value", "mixed")],
+        "array_fill_keys" => &[("keys", "array"), ("value", "mixed")],
+        "array_keys" | "array_values" => &[("array", "array")],
+        "array_flip" | "array_unique" | "array_rand" => &[("array", "array")],
+        "str_word_count" | "similar_text" => &[("string", "string")],
+        "ucwords" | "lcwords" => &[("string", "string"), ("separators", "string")],
+        "sprintf" | "printf" | "vsprintf" | "vprintf" => &[("format", "string")],
+        "number_format" => &[("num", "float"), ("decimals", "int")],
+        "preg_match" | "preg_match_all" => &[("pattern", "string"), ("subject", "string")],
+        "preg_replace" | "preg_filter" | "preg_replace_callback" => &[
+            ("pattern", "string|array"),
+            ("replacement", "string|array|callable"),
+            ("subject", "string|array"),
+            ("limit", "int"),
+        ],
+        "preg_split" => &[
+            ("pattern", "string"),
+            ("subject", "string"),
+            ("limit", "int"),
+        ],
+        "preg_quote" => &[("str", "string"), ("delimiter", "?string")],
+        "preg_grep" => &[("pattern", "string"), ("array", "array"), ("flags", "int")],
+        "json_encode" => &[("value", "mixed"), ("flags", "int"), ("depth", "int")],
+        "json_decode" => &[
+            ("json", "string"),
+            ("associative", "?bool"),
+            ("depth", "int"),
+            ("flags", "int"),
+        ],
+        "serialize" => &[("value", "mixed")],
+        "unserialize" => &[("data", "string")],
+        "mb_strlen" | "mb_strtoupper" | "mb_strtolower" => {
+            &[("string", "string"), ("encoding", "?string")]
+        }
+        "mb_substr" => &[
+            ("string", "string"),
+            ("start", "int"),
+            ("length", "?int"),
+            ("encoding", "?string"),
+        ],
+        "mb_strpos" | "mb_strrpos" => &[
+            ("haystack", "string"),
+            ("needle", "string"),
+            ("offset", "int"),
+            ("encoding", "?string"),
+        ],
+        "hexdec" => &[("hex_string", "string")],
+        "dechex" | "decoct" | "decbin" => &[("num", "int")],
+        "base64_encode" => &[("string", "string")],
+        "base64_decode" => &[("string", "string"), ("strict", "bool")],
+        "bin2hex" => &[("string", "string")],
+        "hex2bin" => &[("string", "string")],
+        "urlencode" | "urldecode" | "rawurlencode" | "rawurldecode" => &[("string", "string")],
+        "strtolower_ascii" => &[("string", "string")],
+        "ctype_digit" | "ctype_alpha" | "ctype_alnum" | "ctype_space" | "ctype_upper"
+        | "ctype_lower" | "ctype_punct" | "ctype_xdigit" => &[("text", "mixed")],
+        "is_string" | "is_int" | "is_float" | "is_bool" | "is_array" | "is_object" | "is_null"
+        | "is_scalar" | "is_numeric" => &[("value", "mixed")],
+        "strtolower_mb" => &[("string", "string")],
+        _ => return None,
+    };
+    Some(
+        ps.iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect(),
+    )
 }
