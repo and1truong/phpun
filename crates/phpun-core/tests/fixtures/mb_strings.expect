@@ -1,0 +1,21 @@
+int(2)
+int(3)
+int(1)
+string(4) ",llo"
+string(2) ",c"
+int(2)
+string(8) "Héllo W"
+string(3) "éx"
+string(5) "UTF-8"
+bool(false)
+string(10) "ISO-8859-1"
+int(233)
+string(2) "é"
+string(5) "Éllo"
+string(6) "--é--"
+string(4) "hél"
+string(4) "68e9"
+string(6) "a|b|cd"
+string(7) "neutral"
+int(63)
+string(6) "héllo"

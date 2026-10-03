@@ -311,6 +311,18 @@ impl<'a> Interp<'a> {
         constants.insert("STR_PAD_RIGHT".into(), Value::Int(1));
         constants.insert("STR_PAD_LEFT".into(), Value::Int(0));
         constants.insert("STR_PAD_BOTH".into(), Value::Int(2));
+        constants.insert("MB_CASE_UPPER".into(), Value::Int(0));
+        constants.insert("MB_CASE_LOWER".into(), Value::Int(1));
+        constants.insert("MB_CASE_TITLE".into(), Value::Int(2));
+        constants.insert("MB_CASE_FOLD".into(), Value::Int(3));
+        constants.insert("MB_CASE_UPPER_SIMPLE".into(), Value::Int(4));
+        constants.insert("MB_CASE_LOWER_SIMPLE".into(), Value::Int(5));
+        constants.insert("MB_CASE_TITLE_SIMPLE".into(), Value::Int(6));
+        constants.insert("MB_CASE_FOLD_SIMPLE".into(), Value::Int(7));
+        constants.insert("MB_OVERLOAD_MAIL".into(), Value::Int(1));
+        constants.insert("MB_OVERLOAD_STRING".into(), Value::Int(2));
+        constants.insert("MB_OVERLOAD_REGEX".into(), Value::Int(4));
+        constants.insert("MB_ONIGURUMA_VERSION".into(), Value::str("6.9.10"));
         constants.insert("PHP_INT_MAX".into(), Value::Int(i64::MAX));
         constants.insert("PHP_INT_MIN".into(), Value::Int(i64::MIN));
         constants.insert("PHP_INT_SIZE".into(), Value::Int(8));
