@@ -1,0 +1,6 @@
+{
+    "name": "phpun/symfony-console-demo",
+    "require": {
+        "symfony/console": "^6.4"
+    }
+}
