@@ -3,8 +3,11 @@
 
 use crate::error::PhpError;
 use crate::interp::Interp;
-use crate::value::{compare, numeric, to_key, ArrKey, Cell, Numeric, PhpArray, PhpResource, Value};
+use crate::value::{
+    compare, numeric, to_key, ArrKey, Cell, Numeric, PhpArray, PhpObject, PhpResource, Value,
+};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 fn cell(v: Value) -> Cell {
@@ -1655,13 +1658,49 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             },
             _ => Value::Bool(false),
         },
-        "get_object_vars" => match arg(args, 0) {
+        "get_object_vars" | "get_mangled_object_vars" => match arg(args, 0) {
             Value::Object(o) => {
                 let mut a = PhpArray::new();
-                let ob = o.borrow();
-                for n in &ob.prop_order {
-                    if let Some(c) = ob.props.get(n) {
-                        a.set(ArrKey::Str(n.clone().into()), c.borrow().clone());
+                if name == "get_mangled_object_vars" {
+                    // Raw slots with mangled keys — no hooks
+                    // (property_hooks/dump).
+                    let ob = o.borrow();
+                    for n in &ob.prop_order {
+                        if let Some(c) = ob.props.get(n) {
+                            a.set(ArrKey::Str(n.clone().into()), c.borrow().clone());
+                        }
+                    }
+                } else {
+                    // Scope-visible decl entries; hooked props run `get`,
+                    // write-only and uninitialized props are skipped.
+                    let scope = it.caller_scope_name();
+                    let entries = it.object_serial_entries(&o);
+                    for (out, slot, decl) in entries {
+                        let ok = match &decl {
+                            None => true, // dynamic props are public
+                            Some((p, dcls)) => match p.visibility {
+                                crate::ast::Visibility::Public => true,
+                                crate::ast::Visibility::Protected => {
+                                    let oc = o.borrow().class.name().to_string();
+                                    scope.as_ref().is_some_and(|sc| {
+                                        it.obj_is_a_str(sc, &oc) || it.obj_is_a_str(&oc, sc)
+                                    })
+                                }
+                                crate::ast::Visibility::Private => {
+                                    scope.as_ref() == Some(&dcls.name().to_string())
+                                }
+                            },
+                        };
+                        if !ok {
+                            continue;
+                        }
+                        let v = match &decl {
+                            Some((p, dcls)) => it.serial_entry_value(&o, p, dcls, &slot),
+                            None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
+                        };
+                        if let Some(v) = v {
+                            a.set(ArrKey::Str(out.into()), v);
+                        }
                     }
                 }
                 Value::Array(Rc::new(RefCell::new(a)))
@@ -1688,7 +1727,23 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             },
             _ => Value::Null,
         },
-        "get_class_vars" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+        "get_class_vars" => {
+            let cls = match arg(args, 0) {
+                Value::Object(o) => Some(o.borrow().class.clone()),
+                Value::Str(cn) => it.lookup_class(&cn),
+                _ => None,
+            };
+            match cls {
+                Some(c) => {
+                    let mut a = PhpArray::new();
+                    for (n, v) in it.class_default_props(&c) {
+                        a.set(ArrKey::Str(n.into()), v);
+                    }
+                    Value::Array(Rc::new(RefCell::new(a)))
+                }
+                None => Value::Bool(false),
+            }
+        }
         "get_declared_classes" => {
             let mut a = PhpArray::new();
             for n in it.declared_names(crate::ast::ClassKind::Class) {
@@ -1966,7 +2021,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "unserialize" => {
             let s = arg_str(it, args, 0);
             let mut pos = 0;
-            match unserialize(&s, &mut pos) {
+            match unserialize(it, &s, &mut pos) {
                 Ok(v) => v,
                 Err(_) => Value::Bool(false),
             }
@@ -1981,12 +2036,15 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "json_decode" => {
             let s = arg_str(it, args, 0);
             let assoc = arg(args, 1).is_truthy();
-            match json_decode(&s, assoc) {
+            match json_decode(it, &s, assoc) {
                 Ok(v) => v,
                 Err(_) => Value::Null,
             }
         }
-        "json_validate" => Value::Bool(json_decode(&arg_str(it, args, 0), true).is_ok()),
+        "json_validate" => {
+            let s = arg_str(it, args, 0);
+            Value::Bool(json_decode(it, &s, true).is_ok())
+        }
 
         // ----- hashing -----
         "md5" => Value::str(md5_hex(arg_str(it, args, 0).as_bytes())),
@@ -2965,6 +3023,38 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                 live
             ));
             for n in &ob.prop_order {
+                // Reserved-but-cellless slots are uninitialized typed
+                // props — zend prints `uninitialized(T)` (recursion).
+                if !ob.props.contains_key(n) {
+                    if let Some(pd) = it.decl_for_slot(o, n) {
+                        if let Some(tys) = &pd.ty {
+                            let ty = if tys.len() == 2 && tys.iter().any(|t| t == "null") {
+                                format!("?{}", tys.iter().find(|t| *t != "null").unwrap())
+                            } else {
+                                tys.join("|")
+                            };
+                            let (vis, dcls) = it.prop_visibility(&ob.class, n);
+                            let disp = n
+                                .strip_prefix('\0')
+                                .and_then(|r| r.split('\0').nth(1))
+                                .unwrap_or(n.as_str());
+                            let key = match vis {
+                                crate::ast::Visibility::Private => {
+                                    format!("\"{}\":\"{}\":private", disp, dcls)
+                                }
+                                crate::ast::Visibility::Protected => {
+                                    format!("\"{}\":protected", disp)
+                                }
+                                crate::ast::Visibility::Public => {
+                                    format!("\"{}\"", disp)
+                                }
+                            };
+                            it.emit(&format!("{}  [{}]=>\n", pad, key));
+                            it.emit(&format!("{}  uninitialized({})\n", pad, ty));
+                        }
+                    }
+                    continue;
+                }
                 if let Some(c) = ob.props.get(n) {
                     let (vis, dcls) = it.prop_visibility(&ob.class, n);
                     // Mangled private keys "\0Cls\0name" display only `name`.
@@ -3081,12 +3171,17 @@ fn var_export(it: &mut Interp, v: &Value) -> String {
             s
         }
         Value::Object(o) => {
-            let ob = o.borrow();
-            let mut s = format!("\\{}::__set_state(array(\n", ob.class.name());
-            for n in &ob.prop_order {
-                if let Some(c) = ob.props.get(n) {
-                    s.push_str(&format!("   '{}' => ", n));
-                    s.push_str(&var_export(it, &c.borrow()));
+            // All decl entries (both private `changed`s), hooked props
+            // via `get`, plain emitted names (property_hooks/dump).
+            let mut s = format!("\\{}::__set_state(array(\n", o.borrow().class.name());
+            for (out, slot, decl) in it.object_serial_entries(o) {
+                let v = match &decl {
+                    Some((p, dcls)) => it.serial_entry_value(o, p, dcls, &slot),
+                    None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
+                };
+                if let Some(v) = v {
+                    s.push_str(&format!("   '{}' => ", out));
+                    s.push_str(&var_export(it, &v));
                     s.push_str(",\n");
                 }
             }
@@ -3753,27 +3848,28 @@ fn serialize(v: &Value) -> String {
         }
         Value::Object(o) => {
             let ob = o.borrow();
-            let n = ob.prop_order.len();
-            let mut s = format!(
-                "O:{}:\"{}\":{}:{{",
-                ob.class.name().len(),
-                ob.class.name(),
-                n
-            );
+            let mut body = String::new();
+            let mut n = 0;
             for name in &ob.prop_order {
                 if let Some(c) = ob.props.get(name) {
-                    s.push_str(&serialize(&Value::str(name.clone())));
-                    s.push_str(&serialize(&c.borrow()));
+                    body.push_str(&serialize(&Value::str(name.clone())));
+                    body.push_str(&serialize(&c.borrow()));
+                    n += 1;
                 }
             }
-            s.push('}');
-            s
+            format!(
+                "O:{}:\"{}\":{}:{{{}}}",
+                ob.class.name().len(),
+                ob.class.name(),
+                n,
+                body
+            )
         }
         _ => "N;".into(),
     }
 }
 
-fn unserialize(s: &str, pos: &mut usize) -> Result<Value, ()> {
+fn unserialize(it: &mut Interp, s: &str, pos: &mut usize) -> Result<Value, ()> {
     let b = s.as_bytes();
     let take_until = |pos: &mut usize, ch: u8| -> Result<String, ()> {
         let start = *pos;
@@ -3826,12 +3922,63 @@ fn unserialize(s: &str, pos: &mut usize) -> Result<Value, ()> {
             *pos += 1; // {
             let mut arr = PhpArray::new();
             for _ in 0..n {
-                let k = unserialize(s, pos)?;
-                let v = unserialize(s, pos)?;
+                let k = unserialize(it, s, pos)?;
+                let v = unserialize(it, s, pos)?;
                 arr.set(to_key(&k), v);
             }
             *pos += 1; // }
             Ok(Value::Array(Rc::new(RefCell::new(arr))))
+        }
+        Some(b'O') => {
+            // O:<clen>:"<class>":<n>:{<pairs>}
+            *pos += 2;
+            let clen: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
+            *pos += 1; // opening quote
+            if *pos + clen > b.len() {
+                return Err(());
+            }
+            let cname = String::from_utf8_lossy(&b[*pos..*pos + clen]).into_owned();
+            *pos += clen;
+            *pos += 1; // closing quote
+            *pos += 1; // :
+            let n: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
+            *pos += 1; // {
+            let obj = match it.instantiate(&cname.to_lowercase(), &[]) {
+                Value::Object(o) => o,
+                _ => return Err(()),
+            };
+            for _ in 0..n {
+                let k = unserialize(it, s, pos)?;
+                let Value::Str(ks) = k else { return Err(()) };
+                let plain = ks
+                    .strip_prefix('\0')
+                    .and_then(|r| r.split('\0').nth(1))
+                    .unwrap_or(ks.as_ref());
+                // Virtual hooked props have no backing to fill — zend
+                // aborts the whole unserialize, reporting the offset
+                // right after the property name (unserialize.phpt).
+                if it.unserial_prop_virtual(&obj, plain) {
+                    let _ = it.warn_pub(&format!(
+                        "unserialize(): Cannot unserialize value for virtual property {}::${}",
+                        cname, plain
+                    ));
+                    let _ = it.warn_pub(&format!(
+                        "unserialize(): Error at offset {} of {} bytes",
+                        pos,
+                        s.len()
+                    ));
+                    return Err(());
+                }
+                let v = unserialize(it, s, pos)?;
+                let mut ob = obj.borrow_mut();
+                let key = ks.to_string();
+                if !ob.prop_order.contains(&key) {
+                    ob.prop_order.push(key.clone());
+                }
+                ob.props.insert(key, cell(v));
+            }
+            *pos += 1; // }
+            Ok(Value::Object(obj))
         }
         _ => Err(()),
     }
@@ -3880,20 +4027,41 @@ fn json_encode(_it: &mut Interp, v: &Value) -> Result<String, ()> {
             }
         }
         Value::Object(o) => {
-            let ob = o.borrow();
-            let parts: Vec<String> = ob
-                .prop_order
-                .iter()
-                .filter_map(|n| {
-                    ob.props.get(n).map(|c| {
-                        format!(
-                            "{}:{}",
-                            json_str(n),
-                            json_encode(_it, &c.borrow()).unwrap_or("null".into())
-                        )
-                    })
-                })
-                .collect();
+            // JsonSerializable::jsonSerialize() wins over the raw
+            // public-property view (gh16725).
+            if _it
+                .find_method_in(&o.borrow().class, "jsonserialize")
+                .is_some()
+            {
+                let v = _it
+                    .method_invoke(o.clone(), "jsonSerialize", Vec::new())
+                    .unwrap_or(Value::Null);
+                return json_encode(_it, &v);
+            }
+            // Public props only; hooked props serialize their `get`
+            // value (property_hooks/dump, oss-fuzz-382922236).
+            let entries = _it.object_serial_entries(o);
+            let mut parts: Vec<String> = Vec::new();
+            for (out, slot, decl) in entries {
+                let public = decl
+                    .as_ref()
+                    .map(|(p, _)| p.visibility == crate::ast::Visibility::Public)
+                    .unwrap_or(true);
+                if !public {
+                    continue;
+                }
+                let v = match &decl {
+                    Some((p, dcls)) => _it.serial_entry_value(o, p, dcls, &slot),
+                    None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
+                };
+                if let Some(v) = v {
+                    parts.push(format!(
+                        "{}:{}",
+                        json_str(&out),
+                        json_encode(_it, &v).unwrap_or("null".into())
+                    ));
+                }
+            }
             format!("{{{}}}", parts.join(","))
         }
         _ => "null".into(),
@@ -3917,10 +4085,10 @@ fn json_str(s: &str) -> String {
     out
 }
 
-fn json_decode(s: &str, assoc: bool) -> Result<Value, ()> {
+fn json_decode(it: &mut Interp, s: &str, assoc: bool) -> Result<Value, ()> {
     let b = s.as_bytes();
     let mut pos = 0;
-    let v = json_value(b, &mut pos, assoc)?;
+    let v = json_value(it, b, &mut pos, assoc)?;
     Ok(v)
 }
 
@@ -3930,7 +4098,7 @@ fn json_ws(b: &[u8], pos: &mut usize) {
     }
 }
 
-fn json_value(b: &[u8], pos: &mut usize, assoc: bool) -> Result<Value, ()> {
+fn json_value(it: &mut Interp, b: &[u8], pos: &mut usize, assoc: bool) -> Result<Value, ()> {
     json_ws(b, pos);
     match b.get(*pos) {
         Some(b'n') => {
@@ -3985,7 +4153,7 @@ fn json_value(b: &[u8], pos: &mut usize, assoc: bool) -> Result<Value, ()> {
                 return Ok(Value::Array(Rc::new(RefCell::new(a))));
             }
             loop {
-                let v = json_value(b, pos, assoc)?;
+                let v = json_value(it, b, pos, assoc)?;
                 a.push(v);
                 json_ws(b, pos);
                 match b.get(*pos) {
@@ -4010,12 +4178,21 @@ fn json_value(b: &[u8], pos: &mut usize, assoc: bool) -> Result<Value, ()> {
                 return Ok(if assoc {
                     Value::Array(Rc::new(RefCell::new(a)))
                 } else {
-                    empty_object()
+                    let Some(cls) = it.lookup_class("stdclass") else {
+                        return Ok(Value::Null);
+                    };
+                    Value::Object(it.alloc_obj(PhpObject {
+                        class: cls,
+                        props: HashMap::new(),
+                        prop_order: Vec::new(),
+                        id: 0,
+                        internal: None,
+                    }))
                 });
             }
             loop {
                 json_ws(b, pos);
-                let k = match json_value(b, pos, true)? {
+                let k = match json_value(it, b, pos, true)? {
                     Value::Str(s) => s.to_string(),
                     _ => return Err(()),
                 };
@@ -4024,7 +4201,7 @@ fn json_value(b: &[u8], pos: &mut usize, assoc: bool) -> Result<Value, ()> {
                     return Err(());
                 }
                 *pos += 1;
-                let v = json_value(b, pos, assoc)?;
+                let v = json_value(it, b, pos, assoc)?;
                 a.set(ArrKey::Str(k.into()), v);
                 json_ws(b, pos);
                 match b.get(*pos) {
@@ -4041,8 +4218,28 @@ fn json_value(b: &[u8], pos: &mut usize, assoc: bool) -> Result<Value, ()> {
             Ok(if assoc {
                 Value::Array(Rc::new(RefCell::new(a)))
             } else {
-                // non-assoc → stdClass-ish object (approximate with array)
-                Value::Array(Rc::new(RefCell::new(a)))
+                // non-assoc decodes to stdClass
+                let mut props = HashMap::new();
+                let mut order = Vec::new();
+                for (k, c) in a.iter() {
+                    let ks = match k {
+                        ArrKey::Str(st) => st.to_string(),
+                        ArrKey::Int(i) => i.to_string(),
+                        ArrKey::Tomb => continue,
+                    };
+                    order.push(ks.clone());
+                    props.insert(ks, c.clone());
+                }
+                let Some(cls) = it.lookup_class("stdclass") else {
+                    return Ok(Value::Null);
+                };
+                Value::Object(it.alloc_obj(PhpObject {
+                    class: cls,
+                    props,
+                    prop_order: order,
+                    id: 0,
+                    internal: None,
+                }))
             })
         }
         Some(&c) if c == b'-' || c.is_ascii_digit() => {
@@ -4073,10 +4270,6 @@ fn utf8_len(b: u8) -> usize {
     } else {
         4
     }
-}
-
-fn empty_object() -> Value {
-    Value::Null // placeholder until stdClass lands
 }
 
 // ---------- hashing ----------

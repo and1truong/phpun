@@ -1991,59 +1991,155 @@ impl<'a> Interp<'a> {
                 }
                 if self.obj_is_a(&o, "Iterator") {
                     if matches!(val, ForeachTarget::ByRef(_)) {
-                        return self.err_flow(PhpError::uncaught(
+                        let v = self.exception(
                             "Error",
                             "An iterator cannot be used with foreach by reference",
-                            self.cur_line,
-                        ));
+                        );
+                        let e = self.throw(v);
+                        return self.err_flow(e);
                     }
                     return self.exec_foreach_iter(o.clone(), key, val, body);
                 }
-                // Plain object: iterate the live property table by
-                // position — unset() during the loop tombstones a slot
+                // Plain object: iterate the property table in
+                // declaration order — backed slots plus *virtual* hooked
+                // props (which have no slot but still yield their get
+                // value), with dynamic props appended (property_hooks/
+                // foreach). unset() during the loop tombstones a slot
                 // (foreachLoopObjects.004/.005).
                 let cls = o.borrow().class.clone();
+                let (spec, decl_names) = self.object_foreach_spec(&o);
                 let mut pos = 0usize;
+                let mut dyn_pos = 0usize;
                 loop {
-                    let next = {
-                        let ob = o.borrow();
-                        if pos >= ob.prop_order.len() {
-                            None
-                        } else {
-                            let n = ob.prop_order[pos].clone();
-                            ob.props.get(&n).map(|c| (n, c.clone()))
+                    // After the declared spec runs out, scan prop_order
+                    // live for dynamic props — ones added during the
+                    // loop are seen (foreach_002); declared names hide
+                    // same-named dynamics entirely.
+                    let (ent, resolved_decl) = if pos < spec.len() {
+                        (spec[pos].clone(), true)
+                    } else {
+                        let mut found = None;
+                        loop {
+                            let k = {
+                                let ob = o.borrow();
+                                ob.prop_order.get(dyn_pos).cloned()
+                            };
+                            let Some(k) = k else { break };
+                            dyn_pos += 1;
+                            let plain = k
+                                .strip_prefix('\0')
+                                .and_then(|r| r.split('\0').nth(1))
+                                .unwrap_or(k.as_str());
+                            if decl_names.contains(plain) {
+                                continue;
+                            }
+                            if !spec.iter().any(|(_, sk, _)| sk == &k) {
+                                found = Some((k.clone(), k.clone(), k.clone()));
+                                break;
+                            }
+                        }
+                        match found {
+                            Some(e) => (e, false),
+                            None => break,
                         }
                     };
-                    if next.is_none() {
-                        // Tombstoned or past the end: keep scanning while
-                        // positions remain, else done.
-                        let more = {
-                            let ob = o.borrow();
-                            pos + 1 < ob.prop_order.len()
-                        };
-                        if !more {
-                            break;
-                        }
-                        pos += 1;
-                        continue;
-                    }
-                    let (n, c) = next.unwrap();
                     pos += 1;
-                    if !self.prop_visible(&cls, &n) {
+                    let (n, slot_key, dname) = ent;
+                    // Spec entries are already scope-resolved; dynamics
+                    // are runtime slots checked against the caller.
+                    if !resolved_decl && !self.prop_visible(&cls, &dname) {
                         continue;
                     }
-                    let plain = n
-                        .strip_prefix('\0')
-                        .and_then(|r| r.split('\0').nth(1))
-                        .map(|s| s.to_string())
-                        .unwrap_or(n);
+                    // Resolve this entry: hooked props (backed or
+                    // virtual) read/write through their hooks; plain
+                    // props read the live slot (unset() tombstones).
+                    let mut writeback: Option<(PropDecl, MergedHooks, Value)> = None;
+                    let c: Cell = if let Some((pd, hs)) = self.hooked_prop(&o, &dname) {
+                        // Write-only hooked props aren't in the readable
+                        // property table — foreach skips them
+                        // (virtualSetOnly in property_hooks/foreach).
+                        if !hs.iter().any(|(h, _)| h.is_get && h.body.is_some()) {
+                            continue;
+                        }
+                        if matches!(val, ForeachTarget::ByRef(_)) {
+                            // By-ref binds a managed reference: virtual
+                            // props read via get and write back through
+                            // set; a backed prop is only bindable when a
+                            // `&get` hands back its real backing cell —
+                            // otherwise the reference can't be created
+                            // (foreach_val_to_ref, foreach_002).
+                            let backed = self.backed_for(&o, &dname, &hs);
+                            let by_ref_get = hs
+                                .iter()
+                                .find(|(h, _)| h.is_get && h.by_ref && h.body.is_some());
+                            if backed && by_ref_get.is_none() {
+                                let dc = self
+                                    .decl_prop(&o, &dname)
+                                    .map(|(_, c)| c.name().to_string())
+                                    .unwrap_or_else(|| cls.name().to_string());
+                                let v = self.exception(
+                                    "Error",
+                                    &format!(
+                                        "Cannot create reference to property {}::${}",
+                                        dc, dname
+                                    ),
+                                );
+                                let e = self.throw(v);
+                                return self.err_flow(e);
+                            }
+                            if let Some((h, hc)) = by_ref_get.filter(|_| {
+                                backed || !hs.iter().any(|(h2, _)| !h2.is_get && h2.body.is_some())
+                            }) {
+                                self.last_ret_cell = None;
+                                match self.run_hook(&o, hc, &dname, h, None) {
+                                    Ok(_) => self
+                                        .last_ret_cell
+                                        .take()
+                                        .unwrap_or_else(|| cell(Value::Null)),
+                                    Err(e) => return self.err_flow(e),
+                                }
+                            } else if hs.iter().any(|(h, _)| !h.is_get && h.body.is_some()) {
+                                let v = match self.hook_read(&o, &pd, &hs) {
+                                    Ok(v) => v,
+                                    Err(e) => return self.err_flow(e),
+                                };
+                                writeback = Some((pd, hs, v.clone()));
+                                cell(v)
+                            } else {
+                                let dc = self
+                                    .decl_prop(&o, &dname)
+                                    .map(|(_, c)| c.name().to_string())
+                                    .unwrap_or_else(|| cls.name().to_string());
+                                let v = self.exception(
+                                    "Error",
+                                    &format!(
+                                        "Cannot create reference to property {}::${}",
+                                        dc, dname
+                                    ),
+                                );
+                                let e = self.throw(v);
+                                return self.err_flow(e);
+                            }
+                        } else {
+                            match self.hook_read(&o, &pd, &hs) {
+                                Ok(v) => cell(v),
+                                Err(e) => return self.err_flow(e),
+                            }
+                        }
+                    } else {
+                        let live = { o.borrow().props.get(&slot_key).cloned() };
+                        match live {
+                            Some(c) => c,
+                            None => continue, // tombstoned by unset()
+                        }
+                    };
                     if let Some(ForeachKey::Var(kn)) = key {
-                        self.var_set(kn, Value::str(plain));
+                        self.var_set(kn, Value::str(n.clone()));
                     }
                     match val {
                         ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
                         ForeachTarget::ByRef(n) => {
-                            self.cur().vars.insert(n.clone(), c);
+                            self.cur().vars.insert(n.clone(), c.clone());
                         }
                         ForeachTarget::Lvalue(e) => {
                             let _ = self.store(e, c.borrow().clone());
@@ -2055,10 +2151,19 @@ impl<'a> Interp<'a> {
                     match self.exec_block(body) {
                         Flow::Break(0) | Flow::Break(1) => break,
                         Flow::Break(n) => return Flow::Break(n - 1),
-                        Flow::Continue(0) | Flow::Continue(1) => continue,
+                        Flow::Normal | Flow::Continue(0) | Flow::Continue(1) => {}
                         Flow::Continue(n) => return Flow::Continue(n - 1),
-                        Flow::Normal => {}
                         f => return f,
+                    }
+                    // Managed reference: a changed bound value dispatches
+                    // to the set hook (property_hooks/foreach).
+                    if let Some((pd, hs, old)) = writeback.take() {
+                        let nv = c.borrow().clone();
+                        if !crate::value::identical(&nv, &old) {
+                            if let Err(e) = self.hook_write(&o, &pd, &hs, nv) {
+                                return self.err_flow(e);
+                            }
+                        }
                     }
                 }
                 Flow::Normal
@@ -3079,7 +3184,51 @@ impl<'a> Interp<'a> {
                     _ => self.fail(PhpError::fatal("Cannot create reference to expression", 0)),
                 }
             }
-            Expr::Prop { .. } | Expr::VarVar(..) => {
+            Expr::Prop { obj, name, .. } => {
+                // `=&` on a hooked prop without `&get` — the engine
+                // reports the overloaded-object error, not the
+                // indirect-modification one (get_by_ref_auto).
+                if let Ok(Value::Object(o)) = self.eval(obj) {
+                    if let Ok(pn) = self.prop_name(name) {
+                        if let Some((_pd, hs)) = self.hooked_prop(&o, &pn) {
+                            let has_ref_get = hs
+                                .iter()
+                                .any(|(h, _)| h.is_get && h.by_ref && h.body.is_some());
+                            if !has_ref_get {
+                                let v = self.exception(
+                                    "Error",
+                                    "Cannot assign by reference to overloaded object",
+                                );
+                                let e = self.throw(v);
+                                return self.fail(e);
+                            }
+                        }
+                    }
+                }
+                let ov = self.eval(obj)?;
+                if let Value::Object(o) = &ov {
+                    if let Ok(pn) = self.prop_name(name) {
+                        // `=&` installs the source cell as the prop's
+                        // slot itself — later writes through either name
+                        // hit the same storage; a missing dynamic prop
+                        // materializes a real slot (oss-fuzz-382922236).
+                        if let Value::Array(rc) = &*src.borrow() {
+                            rc.borrow_mut().is_ref = true;
+                        }
+                        let key = self.obj_prop_key(o, &pn).unwrap_or_else(|| pn.clone());
+                        let mut ob = o.borrow_mut();
+                        if !ob.prop_order.contains(&key) {
+                            ob.prop_order.push(key.clone());
+                        }
+                        ob.props.insert(key, src);
+                        return Ok(());
+                    }
+                }
+                let c = self.eval_cell(target)?;
+                *c.borrow_mut() = src.borrow().clone();
+                Ok(())
+            }
+            Expr::VarVar(..) => {
                 let c = self.eval_cell(target)?;
                 *c.borrow_mut() = src.borrow().clone();
                 Ok(())
@@ -3157,7 +3306,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Write `$ov->$pn = v` — private-slot, `__set` or dynamic-prop rules.
-    fn store_prop(&mut self, ov: Value, pn: &str, v: Value) -> Result<(), PhpError> {
+    fn store_prop(&mut self, ov: Value, pn: &str, mut v: Value) -> Result<(), PhpError> {
         match ov {
             Value::Object(o) => {
                 if !self.in_own_hook(&o, pn) {
@@ -3172,9 +3321,62 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
+                if let Some((pd, dcls)) = self.decl_prop(&o, pn) {
+                    if pd.readonly {
+                        // readonly implies protected(set): one-time init
+                        // from the declaring scope only; later writes
+                        // always fail (readonly_property tests).
+                        let key = self.obj_prop_key(&o, pn).unwrap_or_else(|| pn.to_string());
+                        if o.borrow().props.contains_key(&key) {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Cannot modify readonly property {}::${}",
+                                    dcls.name(),
+                                    pd.name
+                                ),
+                                0,
+                            ));
+                        }
+                        let scope = self.caller_scope_name();
+                        if scope.as_deref() != Some(dcls.name()) {
+                            let from = scope
+                                .map(|s| format!("scope {}", s))
+                                .unwrap_or_else(|| "global scope".to_string());
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Cannot modify protected(set) readonly property {}::${} from {}",
+                                    dcls.name(),
+                                    pd.name,
+                                    from
+                                ),
+                                0,
+                            ));
+                        }
+                    }
+                    v = self.prop_typed_write_check(&pd, &dcls, v)?;
+                }
+                // Declared-prop slot resolution: private decls write
+                // their mangled `\0C\0p` slot even on first write (the
+                // promoted-ctor write reaches here); undeclared names
+                // fall through to __set/dynamic.
+                let k = self.obj_prop_key(&o, pn).or_else(|| {
+                    self.decl_prop(&o, pn).map(|(pd, dcls)| {
+                        if pd.visibility == crate::ast::Visibility::Private {
+                            format!("\0{}\0{}", dcls.name(), pd.name)
+                        } else {
+                            pd.name.clone()
+                        }
+                    })
+                });
                 let cls = o.borrow().class.clone();
-                if let Some(k) = self.obj_prop_key(&o, pn) {
-                    o.borrow_mut().props.insert(k, cell(v));
+                if let Some(k) = k {
+                    let mut ob = o.borrow_mut();
+                    if !ob.prop_order.contains(&k) {
+                        ob.prop_order.push(k.clone());
+                    }
+                    ob.props.insert(k, cell(v));
                     Ok(())
                 } else if cls.find_method("__set").is_some() {
                     self.method_invoke(
@@ -4183,6 +4385,18 @@ impl<'a> Interp<'a> {
             CastKind::Array => match v {
                 Value::Array(_) => v,
                 Value::Null => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+                // `(array) $obj` exposes raw slots under their (possibly
+                // mangled) keys — hooks are not run (dump.phpt).
+                Value::Object(o) => {
+                    let mut a = PhpArray::new();
+                    let ob = o.borrow();
+                    for n in &ob.prop_order {
+                        if let Some(c) = ob.props.get(n) {
+                            a.set(ArrKey::Str(n.clone().into()), c.borrow().clone());
+                        }
+                    }
+                    Value::Array(Rc::new(RefCell::new(a)))
+                }
                 other => {
                     let mut a = PhpArray::new();
                     a.push(other);
@@ -4966,13 +5180,51 @@ impl<'a> Interp<'a> {
                                 }
                             }
                             for p in &td.props {
-                                if !d.props.iter().any(|x| x.name == p.name) {
-                                    let mut np = p.clone();
-                                    // Trait origin survives the merge —
-                                    // `__METHOD__` prints `T::$p::get`.
-                                    np.decl_in = Some(t.clone());
-                                    d.props.push(np);
+                                if let Some(ex) = d.props.iter().find(|x| x.name == p.name) {
+                                    // "hooked" means either side —
+                                    // a plain decl can't override a
+                                    // hooked trait prop either.
+                                    if ex.hooks.is_some() || p.hooks.is_some() {
+                                        // Hooked props cannot be
+                                        // conflict-resolved — zend
+                                        // fatals at composition
+                                        // (traits_conflict).
+                                        let ex_src =
+                                            ex.decl_in.clone().unwrap_or_else(|| d.name.clone());
+                                        return Err(PhpError::fatal(
+                                            format!(
+                                                "{} and {} define the same hooked property (${}) in the composition of {}. Conflict resolution between hooked properties is currently not supported. Class was composed",
+                                                ex_src, t, p.name, d.name
+                                            ),
+                                            self.cur_line,
+                                        ));
+                                    }
+                                    // Identical plain-prop defs merge
+                                    // silently; differing ones fatal.
+                                    let compat = ex.visibility == p.visibility
+                                        && ex.is_static == p.is_static
+                                        && ex.readonly == p.readonly
+                                        && ex.ty == p.ty
+                                        && format!("{:?}", ex.default)
+                                            == format!("{:?}", p.default);
+                                    if !compat {
+                                        let ex_src =
+                                            ex.decl_in.clone().unwrap_or_else(|| d.name.clone());
+                                        return Err(PhpError::fatal(
+                                            format!(
+                                                "{} and {} define the same property (${}) in the composition of {}. However, the definition differs and is considered incompatible. Class was composed",
+                                                ex_src, t, p.name, d.name
+                                            ),
+                                            self.cur_line,
+                                        ));
+                                    }
+                                    continue;
                                 }
+                                let mut np = p.clone();
+                                // Trait origin survives the merge —
+                                // `__METHOD__` prints `T::$p::get`.
+                                np.decl_in = Some(t.clone());
+                                d.props.push(np);
                             }
                         }
                     }
@@ -5012,6 +5264,34 @@ impl<'a> Interp<'a> {
                         self.cur_line,
                     ));
                 }
+                // Property types are invariant across inheritance
+                // only for *backed* props — a virtual hook pair
+                // follows per-kind signature variance instead
+                // (backed_invariant vs override_add_get_contravariant).
+                let backed = ap.hooks.is_none()
+                    || Self::prop_is_backed(ap)
+                    || cp.hooks.is_none()
+                    || Self::prop_is_backed(cp);
+                let norm = |t: &Option<Vec<String>>| {
+                    let mut v = t.clone().unwrap_or_default();
+                    v.sort();
+                    v.dedup();
+                    v
+                };
+                if backed && norm(&cp.ty) != norm(&ap.ty) {
+                    let aty = ap
+                        .ty
+                        .as_ref()
+                        .map(|m| m.join("|"))
+                        .unwrap_or_else(|| "mixed".into());
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Type of {}::${} must be {} (as in class {})",
+                            d.name, cp.name, aty, pc.decl.name
+                        ),
+                        cp.line,
+                    ));
+                }
                 if let (Some(chs), Some(ahs)) = (&cp.hooks, &ap.hooks) {
                     for ch in chs {
                         if ahs.iter().any(|ah| ah.is_get == ch.is_get && ah.is_final) {
@@ -5036,6 +5316,19 @@ impl<'a> Interp<'a> {
                                 .unwrap_or_else(|| "mixed".into())
                         };
                         if ch.is_get {
+                            // A parent `&get` requires the child's get to
+                            // return by reference too; a child `&get`
+                            // under a plain parent get is fine
+                            // (interface_get_value_as_ref).
+                            if ah.by_ref && !ch.by_ref {
+                                return Err(PhpError::fatal(
+                                    format!(
+                                        "Declaration of {}::${}::get() must be compatible with & {}::${}::get()",
+                                        d.name, cp.name, pc.decl.name, cp.name
+                                    ),
+                                    cp.line,
+                                ));
+                            }
                             let (cty, aty) = (fmt(&cp.ty), fmt(&ap.ty));
                             let cm = cp.ty.clone().unwrap_or_else(|| vec!["mixed".into()]);
                             let am = ap.ty.clone().unwrap_or_else(|| vec!["mixed".into()]);
@@ -5083,6 +5376,36 @@ impl<'a> Interp<'a> {
                 }
             }
             an = pc.decl.parent.clone();
+        }
+        // Interface prop hooks also constrain the implementation's
+        // signatures (get_by_ref_implemented_by_val: `&get;` in the
+        // interface requires `&get` in the class).
+        for iname in &d.implements {
+            let Some(iface) = self.interfaces.get(&iname.to_lowercase()).cloned() else {
+                continue;
+            };
+            for cp in &d.props {
+                let Some(ap) = iface.props.iter().find(|x| x.name == cp.name) else {
+                    continue;
+                };
+                let (Some(chs), Some(ahs)) = (&cp.hooks, &ap.hooks) else {
+                    continue;
+                };
+                for ch in chs {
+                    let Some(ah) = ahs.iter().find(|ah| ah.is_get == ch.is_get) else {
+                        continue;
+                    };
+                    if ch.is_get && ah.by_ref && !ch.by_ref {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Declaration of {}::${}::get() must be compatible with & {}::${}::get()",
+                                d.name, cp.name, iface.name, cp.name
+                            ),
+                            cp.line,
+                        ));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -5243,9 +5566,30 @@ impl<'a> Interp<'a> {
                     self.cur_line,
                 ));
             }
-            // `&get` is legal only without a set hook (Zend hardcodes
-            // "backed property" in the message even for virtual ones).
-            if hs.iter().any(|h| !h.is_get) && hs.iter().any(|h| h.is_get && h.by_ref) {
+            // `&get` alongside `set` is legal only on a *virtual* prop —
+            // when the hooks (or a plain ancestor decl) back the property
+            // the engine can't reconcile the returned reference with set
+            // writes (get_by_ref_virtual vs get_by_ref_backed).
+            let backed = Self::prop_is_backed(p) || {
+                let mut par = d.parent.clone();
+                let mut found = false;
+                while let Some(pname) = par {
+                    let Some(pc) = self.classes.get(&pname.to_lowercase()) else {
+                        break;
+                    };
+                    if pc.decl.props.iter().any(|p2| {
+                        p2.name == p.name
+                            && p2.hooks.is_none()
+                            && p2.visibility != crate::ast::Visibility::Private
+                    }) {
+                        found = true;
+                        break;
+                    }
+                    par = pc.decl.parent.clone();
+                }
+                found
+            };
+            if backed && hs.iter().any(|h| !h.is_get) && hs.iter().any(|h| h.is_get && h.by_ref) {
                 return Err(PhpError::fatal(
                     format!(
                         "Get hook of backed property {}::{} with set hook may not return by reference",
@@ -5273,9 +5617,7 @@ impl<'a> Interp<'a> {
                     let compat = match (&p.ty, &sp.ty) {
                         (None, None) => true,
                         (pty, Some(sty)) => {
-                            let pty = pty
-                                .clone()
-                                .unwrap_or_else(|| vec!["mixed".to_string()]);
+                            let pty = pty.clone().unwrap_or_else(|| vec!["mixed".to_string()]);
                             self.ty_sup(sty, &pty)
                         }
                         (Some(_), None) => false,
@@ -5535,8 +5877,9 @@ impl<'a> Interp<'a> {
             ));
         }
         let obj = self.instantiate(&lname, &[]);
-        // __construct (native for builtins via method_invoke's interception)
-        if cls.decl.find_method("__construct").is_some() {
+        // __construct (native for builtins via method_invoke's
+        // interception); the ctor may be inherited (property_hooks/foreach).
+        if self.find_method_in(&cls, "__construct").is_some() {
             if let Value::Object(o) = &obj {
                 self.method_invoke(o.clone(), "__construct", args)?;
             }
@@ -5622,9 +5965,18 @@ impl<'a> Interp<'a> {
                     continue;
                 }
                 // A typed prop without a default starts *uninitialized* —
-                // no slot at all, so reads raise the "must not be accessed"
-                // Error instead of returning null.
+                // no cell, but Zend still reserves its table position, so
+                // a later write lands in declaration order
+                // (property_hooks/foreach's backedUninitialized).
                 if p.ty.is_some() && p.default.is_none() {
+                    let key = if is_priv {
+                        format!("\0{}\0{}", c.decl.name, p.name)
+                    } else {
+                        p.name.clone()
+                    };
+                    if !prop_order.contains(&key) {
+                        prop_order.push(key);
+                    }
                     continue;
                 }
                 let default = match &p.default {
@@ -5716,7 +6068,7 @@ impl<'a> Interp<'a> {
 
     /// Name of the class whose scope the current frame runs in —
     /// private props are only visible to their own declaring class.
-    fn caller_scope_name(&self) -> Option<String> {
+    pub fn caller_scope_name(&self) -> Option<String> {
         self.stack.last().and_then(|f| {
             f.decl_class
                 .as_ref()
@@ -5759,11 +6111,7 @@ impl<'a> Interp<'a> {
     /// child redecl still inherits parent hooks; per-hook origin class
     /// drives `__METHOD__` and decl_class). Private props of other
     /// scopes are skipped — they are different properties entirely.
-    fn hooked_prop(
-        &self,
-        o: &Rc<RefCell<PhpObject>>,
-        pn: &str,
-    ) -> Option<(PropDecl, MergedHooks)> {
+    fn hooked_prop(&self, o: &Rc<RefCell<PhpObject>>, pn: &str) -> Option<(PropDecl, MergedHooks)> {
         if let Some((p, c)) = self.scope_private_prop(o, pn) {
             return p.hooks.as_ref().map(|hs| {
                 (
@@ -5802,6 +6150,307 @@ impl<'a> Interp<'a> {
             return None;
         }
         Some((pd, hooks))
+    }
+
+    /// Foreach iteration spec for a plain object: `(emitted key, slot
+    /// key, decl name)` entries for declared props in first-declaration
+    /// order — parent props first, a child redecl keeps the first decl's
+    /// slot position, private props keep per-class mangled keys, virtual
+    /// hooked props appear (no slot) at their decl position. Dynamic
+    /// props are NOT included — the loop scans prop_order live so props
+    /// added mid-iteration still appear (foreach_002). Returns the spec
+    /// plus the declared-name set used to hide shadowed dynamics.
+    fn object_foreach_spec(
+        &mut self,
+        o: &Rc<RefCell<PhpObject>>,
+    ) -> (
+        Vec<(String, String, String)>,
+        std::collections::HashSet<String>,
+    ) {
+        let mut spec: Vec<(String, String, String)> = Vec::new();
+        let mut decl_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cur = Some(o.borrow().class.clone());
+        let mut chain = Vec::new();
+        while let Some(c) = cur {
+            let par = c.decl.parent.clone();
+            chain.push(c.clone());
+            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        chain.reverse();
+        let scope = self.stack.last().and_then(|f| {
+            f.decl_class
+                .as_ref()
+                .or(f.scope_class.as_ref())
+                .map(|c| c.name().to_string())
+        });
+        for c in &chain {
+            for p in &c.decl.props {
+                if p.is_static {
+                    continue;
+                }
+                decl_names.insert(p.name.clone());
+            }
+        }
+        // One entry per prop NAME: each name resolves to a single decl
+        // through scope-private-first — a private decl wins only for its
+        // own declaring scope, else the first non-private decl. The
+        // entry emits at the RESOLVED decl's position (a child's private
+        // redecl iterates at the end, after inherited protecteds), and
+        // only when that resolved decl is visible — an invisible
+        // resolution suppresses the name entirely (C::e skipped under
+        // an E scope, but emitted under C).
+        let mut emitted: Vec<(usize, usize, String, String)> = Vec::new();
+        let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for c in &chain {
+            for p in &c.decl.props {
+                if p.is_static || done.contains(&p.name) {
+                    continue;
+                }
+                done.insert(p.name.clone());
+                // Resolve: first private decl matching the caller scope,
+                // else the first non-private decl.
+                let mut pick: Option<(usize, usize)> = None;
+                for (ci, cc) in chain.iter().enumerate() {
+                    for (pi, p2) in cc.decl.props.iter().enumerate() {
+                        if p2.name != p.name || p2.is_static {
+                            continue;
+                        }
+                        if p2.visibility == crate::ast::Visibility::Private {
+                            if scope.as_ref().is_some_and(|sc| sc == &cc.decl.name) {
+                                pick = Some((ci, pi));
+                                break;
+                            }
+                        } else if pick.is_none() {
+                            pick = Some((ci, pi));
+                        }
+                    }
+                    if pick.as_ref().is_some_and(|&(ci, pi)| {
+                        chain[ci].decl.props[pi].visibility == crate::ast::Visibility::Private
+                    }) {
+                        break;
+                    }
+                }
+                let Some((ci, pi)) = pick else { continue };
+                let decl = &chain[ci].decl.props[pi];
+                let dcls = &chain[ci];
+                let visible = match decl.visibility {
+                    crate::ast::Visibility::Public => true,
+                    crate::ast::Visibility::Private => {
+                        scope.as_ref().is_some_and(|sc| sc == &dcls.decl.name)
+                    }
+                    crate::ast::Visibility::Protected => scope.as_ref().is_some_and(|sc| {
+                        self.is_a_str(sc, &dcls.decl.name) || self.is_a_str(&dcls.decl.name, sc)
+                    }),
+                };
+                if !visible {
+                    continue;
+                }
+                // Position: a private decl emits at its own decl position;
+                // a non-private prop shares the first declaration's slot.
+                let (pci, ppi) = if decl.visibility == crate::ast::Visibility::Private {
+                    (ci, pi)
+                } else {
+                    chain
+                        .iter()
+                        .enumerate()
+                        .find_map(|(i, cc)| {
+                            cc.decl
+                                .props
+                                .iter()
+                                .enumerate()
+                                .find(|(_, p3)| p3.name == decl.name && !p3.is_static)
+                                .map(|(j, _)| (i, j))
+                        })
+                        .unwrap_or((ci, pi))
+                };
+                let slot_key = if decl.visibility == crate::ast::Visibility::Private {
+                    format!("\0{}\0{}", dcls.decl.name, decl.name)
+                } else {
+                    decl.name.clone()
+                };
+                emitted.push((pci, ppi, decl.name.clone(), slot_key));
+            }
+        }
+        emitted.sort_by_key(|(a, b, _, _)| (*a, *b));
+        for (_, _, n, k) in emitted {
+            spec.push((n.clone(), k, n));
+        }
+        (spec, decl_names)
+    }
+
+    /// Serialization view for get_object_vars/json_encode/var_export:
+    /// per-DECL entries in parent-first order — non-private decls
+    /// dedupe by name at their first position while private decls emit
+    /// one entry per declaring class (both `changed`s in dump.phpt).
+    /// Returns `(emitted key, slot key, decl+decl class)` entries;
+    /// dynamic props appended live in insertion order carry `None` —
+    /// the caller filters by visibility and resolves values.
+    pub fn object_serial_entries(&self, o: &Rc<RefCell<PhpObject>>) -> Vec<SerialEntry> {
+        let mut entries = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cur = Some(o.borrow().class.clone());
+        let mut chain = Vec::new();
+        while let Some(c) = cur {
+            let par = c.decl.parent.clone();
+            chain.push(c.clone());
+            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        chain.reverse();
+        for c in &chain {
+            for p in &c.decl.props {
+                if p.is_static {
+                    continue;
+                }
+                if p.visibility == crate::ast::Visibility::Private {
+                    entries.push((
+                        p.name.clone(),
+                        format!("\0{}\0{}", c.decl.name, p.name),
+                        Some((p.clone(), c.clone())),
+                    ));
+                } else if seen.insert(p.name.clone()) {
+                    entries.push((p.name.clone(), p.name.clone(), Some((p.clone(), c.clone()))));
+                }
+            }
+        }
+        // Dynamic props follow the declared entries in insertion order
+        // (gh20479's g/h, oss-fuzz-382922236's b); mangled keys are
+        // declared-private slots emitted by their own entries already.
+        let emitted: std::collections::HashSet<String> =
+            entries.iter().map(|(_, s, _)| s.clone()).collect();
+        for k in &o.borrow().prop_order {
+            if emitted.contains(k) || k.starts_with('\0') {
+                continue;
+            }
+            entries.push((k.clone(), k.clone(), None));
+        }
+        entries
+    }
+
+    /// Resolve one serial entry's value: a hooked prop runs its `get`
+    /// (write-only props are skipped); a plain prop yields the live
+    /// slot (uninitialized slots are skipped).
+    pub fn serial_entry_value(
+        &mut self,
+        o: &Rc<RefCell<PhpObject>>,
+        p: &PropDecl,
+        dcls: &Rc<PhpClass>,
+        slot: &str,
+    ) -> Option<Value> {
+        let hs: MergedHooks = if p.visibility == crate::ast::Visibility::Private {
+            p.hooks
+                .as_ref()
+                .map(|hs| hs.iter().cloned().map(|h| (h, dcls.clone())).collect())
+                .unwrap_or_default()
+        } else {
+            match self.hooked_prop(o, &p.name) {
+                Some((_, hs)) => hs,
+                None => Vec::new(),
+            }
+        };
+        if !hs.is_empty() {
+            if let Some((h, c)) = hs.iter().find(|(h, _)| h.is_get && h.body.is_some()) {
+                // Serialization bypasses the caller's visibility — a
+                // private hook runs in its own declaring scope (dump).
+                let v = self.run_hook(o, c, &p.name, h, None).ok()?;
+                return self.hook_get_typecheck(p, c, v).ok();
+            }
+            // A set-only hooked prop still backs a slot — serialization
+            // reads it raw, like a plain prop (gh17988).
+        }
+        o.borrow().props.get(slot).map(|c| c.borrow().clone())
+    }
+
+    /// get_class_vars(): declared prop defaults in parent-first decl
+    /// order, filtered by caller visibility — hooked props keep their
+    /// raw default (no `get` run), virtual props and private props
+    /// outside scope are omitted (gh15456).
+    pub fn class_default_props(&mut self, cls: &Rc<PhpClass>) -> Vec<(String, Value)> {
+        let mut chain = Vec::new();
+        let mut cur = Some(cls.clone());
+        while let Some(c) = cur {
+            let par = c.decl.parent.clone();
+            chain.push(c.clone());
+            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        chain.reverse();
+        let scope = self.caller_scope_name();
+        let mut out: Vec<(String, Value)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (ci, c) in chain.iter().enumerate() {
+            for p in &c.decl.props {
+                let visible = match p.visibility {
+                    crate::ast::Visibility::Public => true,
+                    crate::ast::Visibility::Private => {
+                        scope.as_ref().is_some_and(|sc| sc == &c.decl.name)
+                    }
+                    crate::ast::Visibility::Protected => scope.as_ref().is_some_and(|sc| {
+                        self.is_a_str(sc, &c.decl.name) || self.is_a_str(&c.decl.name, sc)
+                    }),
+                };
+                if !visible {
+                    continue;
+                }
+                if p.visibility != crate::ast::Visibility::Private && !seen.insert(p.name.clone()) {
+                    continue;
+                }
+                // Virtual hooked props have no storage — not in vars.
+                if p.hooks.is_some()
+                    && !Self::prop_is_backed(p)
+                    && !chain[..=ci].iter().any(|c2| {
+                        c2.decl.props.iter().any(|p2| {
+                            p2.name == p.name
+                                && p2.hooks.is_none()
+                                && p2.visibility != crate::ast::Visibility::Private
+                        })
+                    })
+                {
+                    continue;
+                }
+                let v = match &p.default {
+                    Some(d) => self.eval(d).unwrap_or(Value::Null),
+                    None => Value::Null,
+                };
+                out.push((p.name.clone(), v));
+            }
+        }
+        out
+    }
+
+    /// The PropDecl owning a prop_order slot key — mangled `\0Cls\0p`
+    /// private keys resolve to that class's decl, plain keys to the
+    /// nearest non-private decl (var_dump's `uninitialized(T)`).
+    pub fn decl_for_slot(&self, o: &Rc<RefCell<PhpObject>>, key: &str) -> Option<PropDecl> {
+        let mut chain = Vec::new();
+        let mut cur = Some(o.borrow().class.clone());
+        while let Some(c) = cur {
+            let par = c.decl.parent.clone();
+            chain.push(c.clone());
+            cur = par.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        if let Some(r) = key.strip_prefix('\0') {
+            let mut it = r.split('\0');
+            let cn = it.next()?;
+            let pn = it.next()?;
+            for c in &chain {
+                if c.decl.name == cn {
+                    return c
+                        .decl
+                        .props
+                        .iter()
+                        .find(|p| p.name == pn && !p.is_static)
+                        .cloned();
+                }
+            }
+            return None;
+        }
+        for c in &chain {
+            if let Some(p) = c.decl.props.iter().find(|p| {
+                p.name == key && !p.is_static && p.visibility != crate::ast::Visibility::Private
+            }) {
+                return Some(p.clone());
+            }
+        }
+        None
     }
 
     /// The nearest PropDecl for `pn` along the chain, honoring the same
@@ -6071,11 +6720,7 @@ impl<'a> Interp<'a> {
     /// ancestor in the object's chain declaring it (GH-19044: the check
     /// uses the prototype's scope, so sibling subclasses descending
     /// from that ancestor can access each other's instances).
-    fn prop_scope_class(
-        &self,
-        o: &Rc<RefCell<PhpObject>>,
-        pn: &str,
-    ) -> Option<Rc<PhpClass>> {
+    fn prop_scope_class(&self, o: &Rc<RefCell<PhpObject>>, pn: &str) -> Option<Rc<PhpClass>> {
         let mut found = None;
         let mut cur = Some(o.borrow().class.clone());
         while let Some(c) = cur {
@@ -6109,9 +6754,7 @@ impl<'a> Interp<'a> {
             (crate::ast::Visibility::Public, _) => true,
             (crate::ast::Visibility::Private, Some(s)) => s == dcls.name(),
             (crate::ast::Visibility::Protected, Some(s)) => {
-                let pcls = self
-                    .prop_scope_class(o, pn)
-                    .unwrap_or_else(|| dcls.clone());
+                let pcls = self.prop_scope_class(o, pn).unwrap_or_else(|| dcls.clone());
                 self.is_a_str(&s, pcls.name()) || self.is_a_str(pcls.name(), &s)
             }
             _ => false,
@@ -6230,6 +6873,42 @@ impl<'a> Interp<'a> {
         ))
     }
 
+    /// Strict type membership for the type-check-then-weakly-coerce
+    /// pattern (unlike `param_type_match`, scalars don't loosely pass).
+    fn ty_exact(&mut self, tys: &[String], v: &Value) -> bool {
+        tys.iter().any(|t| {
+            let l = t.to_lowercase();
+            match l.as_str() {
+                "null" => matches!(v, Value::Null),
+                "int" => matches!(v, Value::Int(_)),
+                "float" => matches!(v, Value::Float(_) | Value::Int(_)),
+                "string" => matches!(v, Value::Str(_)),
+                "bool" => matches!(v, Value::Bool(_)),
+                _ => self.param_type_match(t, v),
+            }
+        })
+    }
+
+    /// Zend's "Implicit conversion from float X to int loses precision"
+    /// Deprecated on a lossy float->int weak coercion.
+    fn deprecate_lossy_int(&mut self, tys: &[String], v: &Value, c: &Value) {
+        if !matches!(c, Value::Int(_)) || !tys.iter().any(|t| t.eq_ignore_ascii_case("int")) {
+            return;
+        }
+        if let Value::Float(f) = v {
+            if f.fract() != 0.0 {
+                let _ = self.emit_diag(
+                    "Deprecated",
+                    8192,
+                    &format!(
+                        "Implicit conversion from float {} to int loses precision",
+                        format_float_repr(*f)
+                    ),
+                );
+            }
+        }
+    }
+
     /// A `get` hook's return is coerced to the property's declared type
     /// in weak mode ("C::$p::get(): Return value must be of type int,
     /// string returned" TypeError otherwise).
@@ -6240,42 +6919,13 @@ impl<'a> Interp<'a> {
         v: Value,
     ) -> Result<Value, PhpError> {
         let Some(tys) = &p.ty else { return Ok(v) };
-        let ok = tys
-            .iter()
-            .any(|t| t == "mixed" || self.param_type_match(t, &v));
-        if ok {
+        if self.ty_exact(tys, &v) {
             return Ok(v);
         }
         // weak-mode coercion for scalar targets
-        for t in tys {
-            let coerced = match (t.as_str(), &v) {
-                ("int", Value::Str(s)) => {
-                    let tr = s.trim();
-                    let base = if let Some(h) = tr.strip_prefix("0x") {
-                        i64::from_str_radix(h, 16).ok()
-                    } else if let Some(o) = tr.strip_prefix("0o") {
-                        i64::from_str_radix(o, 8).ok()
-                    } else if let Some(b) = tr.strip_prefix("0b") {
-                        i64::from_str_radix(b, 2).ok()
-                    } else {
-                        tr.parse::<i64>().ok()
-                    };
-                    base.map(Value::Int)
-                }
-                ("int", Value::Float(f)) => Some(Value::Int(*f as i64)),
-                ("int", Value::Bool(b)) => Some(Value::Int(*b as i64)),
-                ("string", Value::Int(i)) => Some(Value::str(i.to_string())),
-                ("string", Value::Float(f)) => Some(Value::str(format_float_repr(*f))),
-                ("string", Value::Bool(b)) => Some(Value::str(if *b { "1" } else { "" })),
-                ("float", Value::Int(i)) => Some(Value::Float(*i as f64)),
-                ("float", Value::Str(s)) => s.trim().parse::<f64>().ok().map(Value::Float),
-                ("float", Value::Bool(b)) => Some(Value::Float(if *b { 1.0 } else { 0.0 })),
-                ("bool", _) => Some(Value::Bool(v.is_truthy())),
-                _ => None,
-            };
-            if let Some(c) = coerced {
-                return Ok(c);
-            }
+        if let Some(c) = weak_ty_coerce(tys, &v) {
+            self.deprecate_lossy_int(tys, &v, &c);
+            return Ok(c);
         }
         let want = tys.join("|");
         let got = self.zval_type_name(&v);
@@ -6292,6 +6942,72 @@ impl<'a> Interp<'a> {
         ))
     }
 
+    /// Typed-property write check (plain and backing writes): the
+    /// assigned value is coerced in weak mode, else a catchable
+    /// `Cannot assign T to property C::$p of type U` TypeError.
+    fn prop_typed_write_check(
+        &mut self,
+        p: &PropDecl,
+        dcls: &Rc<PhpClass>,
+        v: Value,
+    ) -> Result<Value, PhpError> {
+        let Some(tys) = &p.ty else { return Ok(v) };
+        if self.ty_exact(tys, &v) {
+            return Ok(v);
+        }
+        if let Some(c) = weak_ty_coerce(tys, &v) {
+            self.deprecate_lossy_int(tys, &v, &c);
+            return Ok(c);
+        }
+        let mut e = PhpError::uncaught(
+            "TypeError",
+            format!(
+                "Cannot assign {} to property {}::${} of type {}",
+                self.zval_type_name(&v),
+                dcls.name(),
+                p.name,
+                tys.join("|")
+            ),
+            0,
+        );
+        e.thrown_line = Some(self.cur_line);
+        self.fail(e)
+    }
+
+    /// The value passed to a `set` hook is checked against the hook's
+    /// `$value` parameter type — the declared prop type for the `set =>
+    /// expr` shorthand — under weak coercion (gh17988's `string(2) "42"`).
+    fn hook_set_arg_check(
+        &mut self,
+        p: &PropDecl,
+        dcls: &Rc<PhpClass>,
+        tys: Vec<String>,
+        v: Value,
+    ) -> Result<Value, PhpError> {
+        if self.ty_exact(&tys, &v) {
+            return Ok(v);
+        }
+        if let Some(c) = weak_ty_coerce(&tys, &v) {
+            self.deprecate_lossy_int(&tys, &v, &c);
+            return Ok(c);
+        }
+        let mut e = PhpError::uncaught(
+            "TypeError",
+            format!(
+                "{}::${}::set(): Argument #1 ($value) must be of type {}, {} given, called in {} on line {}",
+                dcls.name(),
+                p.name,
+                tys.join("|"),
+                self.zval_type_name(&v),
+                self.file,
+                self.cur_line
+            ),
+            0,
+        );
+        e.thrown_line = Some(p.line);
+        self.fail(e)
+    }
+
     /// Write through a hooked prop: `set` hook, backing slot, or the
     /// read-only error. `private(set)` narrows the write side.
     fn hook_write(
@@ -6299,7 +7015,7 @@ impl<'a> Interp<'a> {
         o: &Rc<RefCell<PhpObject>>,
         p: &PropDecl,
         hs: &[(crate::ast::PropHook, Rc<PhpClass>)],
-        v: Value,
+        mut v: Value,
     ) -> Result<(), PhpError> {
         let set = hs.iter().find(|(h, _)| !h.is_get && h.body.is_some());
         let dcls = &set
@@ -6315,10 +7031,19 @@ impl<'a> Interp<'a> {
             return self.hook_visibility_error(dcls, &p.name, vis);
         }
         if let Some((h, c)) = set {
+            let arg_tys = h
+                .params
+                .first()
+                .and_then(|pp| pp.ty.clone())
+                .or_else(|| p.ty.clone());
+            if let Some(tys) = arg_tys {
+                v = self.hook_set_arg_check(p, dcls, tys, v)?;
+            }
             self.run_hook(o, c, &p.name, h, Some(cell(v)))?;
             return Ok(());
         }
         if self.backed_for(o, &p.name, hs) {
+            v = self.prop_typed_write_check(p, dcls, v)?;
             let mut ob = o.borrow_mut();
             if !ob.prop_order.contains(&p.name) {
                 ob.prop_order.push(p.name.clone());
@@ -6331,6 +7056,15 @@ impl<'a> Interp<'a> {
             format!("Property {}::${} is read-only", dcls.name(), p.name),
             0,
         ))
+    }
+
+    /// unserialize(): writing into a *virtual* hooked prop aborts the
+    /// whole unserialize with warnings (property_hooks/unserialize).
+    pub fn unserial_prop_virtual(&mut self, o: &Rc<RefCell<PhpObject>>, pn: &str) -> bool {
+        match self.hooked_prop(o, pn) {
+            Some((_, hs)) => !self.backed_for(o, pn, &hs),
+            None => false,
+        }
     }
 
     /// `parent::$prop::get()/set()` inside a hook — runs the parent
@@ -7227,7 +7961,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn find_method_in(
+    pub fn find_method_in(
         &mut self,
         cls: &Rc<PhpClass>,
         name: &str,
@@ -7794,6 +8528,9 @@ fn decl_owner(dcls: &Rc<PhpClass>, pname: &str) -> String {
 
 /// Hooks merged along a chain (hook, declaring class), nearest first.
 type MergedHooks = Vec<(PropHook, Rc<PhpClass>)>;
+/// `(emitted key, slot key, decl+decl class)` — `None` decl means a
+/// dynamic property (property-hooks serialization views).
+type SerialEntry = (String, String, Option<(PropDecl, Rc<PhpClass>)>);
 
 fn cell(v: Value) -> Cell {
     Rc::new(RefCell::new(v))
@@ -7944,4 +8681,40 @@ fn builtin_byref(name: &str) -> Option<&'static [bool]> {
         "preg_filter" | "preg_grep" => &[false],
         _ => return None,
     })
+}
+
+/// Weak-mode scalar coercion used by typed-property writes and hook
+/// type checks ("C::$p: Return value must be of type int" family).
+fn weak_ty_coerce(tys: &[String], v: &Value) -> Option<Value> {
+    for t in tys {
+        let coerced = match (t.as_str(), v) {
+            ("int", Value::Str(s)) => {
+                let tr = s.trim();
+                let base = if let Some(h) = tr.strip_prefix("0x") {
+                    i64::from_str_radix(h, 16).ok()
+                } else if let Some(o) = tr.strip_prefix("0o") {
+                    i64::from_str_radix(o, 8).ok()
+                } else if let Some(b) = tr.strip_prefix("0b") {
+                    i64::from_str_radix(b, 2).ok()
+                } else {
+                    tr.parse::<i64>().ok()
+                };
+                base.map(Value::Int)
+            }
+            ("int", Value::Float(f)) => Some(Value::Int(*f as i64)),
+            ("int", Value::Bool(b)) => Some(Value::Int(*b as i64)),
+            ("string", Value::Int(i)) => Some(Value::str(i.to_string())),
+            ("string", Value::Float(f)) => Some(Value::str(format_float_repr(*f))),
+            ("string", Value::Bool(b)) => Some(Value::str(if *b { "1" } else { "" })),
+            ("float", Value::Int(i)) => Some(Value::Float(*i as f64)),
+            ("float", Value::Str(s)) => s.trim().parse::<f64>().ok().map(Value::Float),
+            ("float", Value::Bool(b)) => Some(Value::Float(if *b { 1.0 } else { 0.0 })),
+            ("bool", _) => Some(Value::Bool(v.is_truthy())),
+            _ => None,
+        };
+        if let Some(c) = coerced {
+            return Some(c);
+        }
+    }
+    None
 }
