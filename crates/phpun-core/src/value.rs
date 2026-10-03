@@ -218,23 +218,7 @@ pub fn format_backtrace_frames(frames: &[TraceFrame]) -> String {
         if trace_frame_hidden(fr) {
             continue;
         }
-        let site = if fr.file == "[internal function]" {
-            fr.file.clone()
-        } else {
-            format!("{}({})", fr.file, fr.line)
-        };
-        let callee = match &fr.class {
-            Some(c) => format!("{}{}{}", c, fr.ty, fr.function),
-            None => fr.function.clone(),
-        };
-        // Internal callees render their args too (PHP 8 shows
-        // `strlen('a', 'b')`); named args render `name: value`.
-        let mut arg_strs: Vec<String> = fr.args.iter().map(|c| trace_arg(&c.borrow())).collect();
-        for (n, c) in &fr.named_args {
-            arg_strs.push(format!("{}: {}", n, trace_arg(&c.borrow())));
-        }
-        let args = arg_strs.join(", ");
-        t.push_str(&format!("#{} {}: {}({})\n", i, site, callee, args));
+        t.push_str(&format!("#{} {}\n", i, trace_frame_str(fr)));
         i += 1;
     }
     t
@@ -255,8 +239,35 @@ pub fn trace_arg(v: &Value) -> String {
         Value::Null => "NULL".into(),
         Value::Callable(_) => "Object(Closure)".into(),
         Value::Resource(_) => "Resource id #1".into(),
+        Value::Float(f) => {
+            if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e16 {
+                format!("{f:.1}")
+            } else {
+                format_float_repr(*f)
+            }
+        }
         other => other.to_php_string(),
     }
+}
+
+/// `#N`-less frame body `file(line): Fn(args)` used by both
+/// `format_backtrace_frames` and synthetic exception traces (arg-type
+/// TypeErrors carry real callee frames below the call site).
+pub fn trace_frame_str(fr: &TraceFrame) -> String {
+    let site = if fr.file == "[internal function]" {
+        fr.file.clone()
+    } else {
+        format!("{}({})", fr.file, fr.line)
+    };
+    let callee = match &fr.class {
+        Some(c) => format!("{}{}{}", c, fr.ty, fr.function),
+        None => fr.function.clone(),
+    };
+    let mut arg_strs: Vec<String> = fr.args.iter().map(|c| trace_arg(&c.borrow())).collect();
+    for (n, c) in &fr.named_args {
+        arg_strs.push(format!("{}: {}", n, trace_arg(&c.borrow())));
+    }
+    format!("{}: {}({})", site, callee, arg_strs.join(", "))
 }
 
 /// Lossy UTF-8 view of a byte string — for APIs/names that are

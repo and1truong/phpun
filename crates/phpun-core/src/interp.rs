@@ -98,6 +98,9 @@ pub struct Frame {
     /// Class the running method was declared in — PHP's private
     /// property slot is keyed by the declaring class (`\0Cls\0prop`).
     decl_class: Option<Rc<PhpClass>>,
+    /// Declaration line — closures render in traces as
+    /// `{closure:FILE:LINE}` (typed_properties_055).
+    fn_line: usize,
     /// File this frame's code was declared in (include resolution base).
     file: String,
     /// Namespace the running code was declared in — unqualified
@@ -125,6 +128,7 @@ impl Frame {
             scope_class: None,
             called_class: None,
             decl_class: None,
+            fn_line: 0,
             file: String::new(),
             ns: String::new(),
             ret_by_ref: false,
@@ -288,6 +292,14 @@ pub struct Interp<'a> {
     /// (typed_properties_045). The stored clone keeps the slot alive so
     /// the pointer key stays unique.
     typed_slots: std::collections::HashMap<usize, (Cell, Vec<String>, String, String)>,
+    /// Interfaces registered by the builtin-class table — their method
+    /// signatures carry *tentative* return types: implementations may
+    /// declare any return type (typed_properties_065).
+    builtin_ifaces: std::collections::HashSet<String>,
+    /// Implicit-nullable deprecations already emitted (function
+    /// declarations evaluate at both collect and `Stmt::Function`
+    /// time — Zend compiles once, so each param warns once).
+    dep_seen: std::collections::HashSet<String>,
     /// File the last `fail()` was raised in (uncaught-print attribution
     /// for engine errors — `self.file` is always the entry script).
     last_err_file: String,
@@ -558,6 +570,8 @@ impl<'a> Interp<'a> {
             cur_file: file.to_string(),
             strict_files: std::collections::HashSet::new(),
             typed_slots: std::collections::HashMap::new(),
+            builtin_ifaces: std::collections::HashSet::new(),
+            dep_seen: std::collections::HashSet::new(),
             last_err_file: String::new(),
             assert_src: String::new(),
             mem_used: 0,
@@ -621,6 +635,7 @@ impl<'a> Interp<'a> {
             );
             it.globals.vars.insert("argc".into(), cell(Value::Int(1)));
         }
+        it.globals.file = file.to_string();
         it.register_builtin_classes();
         it
     }
@@ -723,6 +738,7 @@ impl<'a> Interp<'a> {
                 statics_init: RefCell::new(true),
             });
             if is_iface {
+                self.builtin_ifaces.insert(c.decl.name.to_lowercase());
                 self.interfaces
                     .insert(c.name().to_lowercase(), c.decl.clone());
             } else {
@@ -5440,7 +5456,13 @@ impl<'a> Interp<'a> {
                     // Write into the existing slot — a `&`-bound
                     // reference must see the update (typed_properties_010).
                     if let Some(existing) = ob.props.get(&k) {
-                        *existing.borrow_mut() = v;
+                        let existing = existing.clone();
+                        drop(ob);
+                        // The slot may be shared with a DIFFERENT typed
+                        // prop via `=&` — that prop's type still gates
+                        // the write (typed_properties_062).
+                        let nv = self.typed_slot_store(&existing, v)?;
+                        *existing.borrow_mut() = nv;
                     } else {
                         if !ob.prop_order.contains(&k) {
                             ob.prop_order.push(k.clone());
@@ -7235,6 +7257,8 @@ impl<'a> Interp<'a> {
                     CallableKind::Closure(decl) => {
                         let mut frame_args = Vec::new();
                         let mut frame = Frame::new("{closure}".into());
+                        frame.fn_line = decl.line;
+                        frame.file = decl.file.clone();
                         frame.ret_by_ref = decl.by_ref;
                         for (n, cap) in &c.captures {
                             frame.vars.insert(n.clone(), cap.clone());
@@ -8020,7 +8044,11 @@ impl<'a> Interp<'a> {
             .stack
             .last()
             .map(|f| TraceFrame {
-                function: f.fn_name.clone(),
+                function: if f.fn_name == "{closure}" {
+                    format!("{{closure:{}:{}}}", f.file, f.fn_line)
+                } else {
+                    f.fn_name.clone()
+                },
                 class: f.scope_class.as_ref().map(|c| c.name().to_string()),
                 ty: if f.this_obj.is_some() {
                     "->"
@@ -8086,7 +8114,11 @@ impl<'a> Interp<'a> {
             };
             match &p.default {
                 _ if null_default => {
-                    if !nullable {
+                    if !nullable
+                        && self
+                            .dep_seen
+                            .insert(format!("{}\0{}\0{}", decl.file, decl.line, p.name))
+                    {
                         self.deprecated(&format!(
                             "{}(): Implicitly marking parameter ${} as nullable is deprecated, the explicit nullable type must be used instead",
                             fname, p.name
@@ -8146,6 +8178,48 @@ impl<'a> Interp<'a> {
         ty: &[String],
         cls: &Option<(&str, Option<String>)>,
     ) -> Result<(), PhpError> {
+        for m in ty {
+            if m.contains('\\') || m.contains('&') {
+                continue;
+            }
+            let msg = match m.to_lowercase().as_str() {
+                "integer" => format!(
+                    "\"{m}\" will be interpreted as a class name. Did you mean \"int\"? Write \"\\{m}\" to suppress this warning"
+                ),
+                "double" => format!(
+                    "\"{m}\" will be interpreted as a class name. Did you mean \"float\"? Write \"\\{m}\" to suppress this warning"
+                ),
+                "boolean" => format!(
+                    "\"{m}\" will be interpreted as a class name. Did you mean \"bool\"? Write \"\\{m}\" to suppress this warning"
+                ),
+                "resource" => format!(
+                    "\"{m}\" is not a supported builtin type and will be interpreted as a class name. Write \"\\{m}\" to suppress this warning"
+                ),
+                _ => continue,
+            };
+            self.warn(&msg)?;
+        }
+        // Intersection conjuncts may only be class-like names — any
+        // builtin scalar/compound member is a compile error
+        // (invalid_types/*).
+        const NON_CLASS: &[&str] = &[
+            "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed",
+            "void", "never", "false", "true", "null", "numeric", "resource",
+        ];
+        for m in ty {
+            if !m.contains('&') {
+                continue;
+            }
+            for part in m.split('&') {
+                let p = part.trim_start_matches('\\');
+                if NON_CLASS.contains(&p.to_lowercase().as_str()) {
+                    return Err(PhpError::fatal(
+                        format!("Type {p} cannot be part of an intersection type"),
+                        self.cur_line,
+                    ));
+                }
+            }
+        }
         if ty.len() < 2 {
             return Ok(());
         }
@@ -8270,10 +8344,7 @@ impl<'a> Interp<'a> {
                 matches!(v, Value::Array(_))
                     || matches!(v, Value::Object(o) if self.obj_is_a(o, "Traversable"))
             }
-            "callable" => matches!(
-                v,
-                Value::Callable(_) | Value::Str(_) | Value::Object(_) | Value::Array(_)
-            ),
+            "callable" => self.is_callable_value(v),
             "object" => matches!(v, Value::Object(_)),
             // Named class/interface — instanceof check. `Closure` is
             // our Callable value's class (constexpr/default_args).
@@ -8342,10 +8413,64 @@ impl<'a> Interp<'a> {
     /// the call site — the frame just below the callee's own.
     fn caller_file_strict(&self) -> bool {
         if self.stack.len() < 2 {
-            return self.exec_file_strict();
+            // Top-level call site: `self.globals` lives off `self.stack`,
+            // so the caller is the top-level file currently executing
+            // (`cur_file` swaps for includes mid-eval).
+            return self.strict_files.contains(&self.cur_file);
         }
         self.strict_files
             .contains(&self.stack[self.stack.len() - 2].file)
+    }
+
+    /// `callable` accepts an actual callable: a Closure/FCC value, a
+    /// function-name string, a `"Class::method"` string, a `[cls|obj, m]`
+    /// pair, or an object with `__invoke` (callable_001).
+    fn is_callable_value(&mut self, v: &Value) -> bool {
+        match v {
+            Value::Callable(_) => true,
+            Value::Str(s) => {
+                let s = String::from_utf8_lossy(s).to_string();
+                if self.functions.contains_key(&s.to_lowercase()) {
+                    return true;
+                }
+                let Some((cn, mn)) = s.split_once("::") else {
+                    return false;
+                };
+                let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() else {
+                    return false;
+                };
+                self.find_method_in(&c, mn).is_some()
+            }
+            Value::Object(o) => {
+                let cn = o.borrow().class.decl.name.clone();
+                let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() else {
+                    return false;
+                };
+                self.find_method_in(&c, "__invoke").is_some()
+            }
+            Value::Array(a) => {
+                let arr = a.borrow();
+                let first = arr.get(&crate::value::ArrKey::Int(0));
+                let second = arr.get(&crate::value::ArrKey::Int(1));
+                let (Some(first), Some(second)) = (first, second) else {
+                    return false;
+                };
+                let Value::Str(mn) = &second else {
+                    return false;
+                };
+                let mn = String::from_utf8_lossy(mn).to_string();
+                let cn = match &first {
+                    Value::Str(cn) => String::from_utf8_lossy(cn).to_string(),
+                    Value::Object(o) => o.borrow().class.decl.name.clone(),
+                    _ => return false,
+                };
+                let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() else {
+                    return false;
+                };
+                self.find_method_in(&c, &mn).is_some()
+            }
+            _ => false,
+        }
     }
 
     /// PHP's "given" type word in TypeError messages.
@@ -8524,12 +8649,31 @@ impl<'a> Interp<'a> {
                     argdesc
                 );
                 let call_line = self.cur_line;
+                // Frames below the call site (include/require and
+                // outer calls) join the synthetic #0 — the callee's
+                // own trace frame is the top of call_trace.
+                let mut frs = vec![frame];
+                for fr in self.call_trace.iter().rev().skip(1) {
+                    if crate::value::trace_frame_hidden(fr) {
+                        continue;
+                    }
+                    frs.push(crate::value::trace_frame_str(fr));
+                }
                 self.stack.pop();
                 let mut e = PhpError::uncaught("TypeError", msg, call_line);
-                e.trace = Some(vec![frame]);
+                e.trace = Some(frs);
                 e.thrown_line = Some(decl.line);
                 e.display_msg = Some(display);
-                return self.fail(e);
+                let r = self.fail(e);
+                if let Some(Value::Object(o)) = &self.pending_exception {
+                    if let Some(crate::value::ObjectInternal::Exception { file, .. }) =
+                        &mut o.borrow_mut().internal
+                    {
+                        *file = decl.file.clone();
+                    }
+                }
+                self.last_err_file = decl.file.clone();
+                return r;
             }
         }
         {
@@ -8802,6 +8946,8 @@ impl<'a> Interp<'a> {
         called_class: Option<Rc<PhpClass>>,
     ) -> Result<Value, PhpError> {
         let mut frame = Frame::new(decl.name.clone());
+        frame.fn_line = decl.line;
+        frame.file = decl.file.clone();
         frame.ns = decl.ns.clone();
         frame.ret_by_ref = decl.by_ref;
         if let Some(obj) = &this_obj {
@@ -10473,8 +10619,10 @@ impl<'a> Interp<'a> {
                             impl_m.decl.line,
                         ));
                     }
-                    if let Some(e) = self.trait_sig_error(&impl_m, im, &d.name, &cite, false) {
-                        return Err(e);
+                    if !self.builtin_ifaces.contains(&f.name.to_lowercase()) {
+                        if let Some(e) = self.trait_sig_error(&impl_m, im, &d.name, &cite, false) {
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -11114,6 +11262,14 @@ impl<'a> Interp<'a> {
         if s.eq_ignore_ascii_case(t) || s.eq_ignore_ascii_case("mixed") {
             return true;
         }
+        if s.contains('&') {
+            // `t ⊆ S1&S2&…` iff every conjunct of s is covered by some
+            // conjunct of t (`A&B&C` is a subtype of `A&B`).
+            let tparts: Vec<&str> = t.split('&').collect();
+            return s
+                .split('&')
+                .all(|sc| tparts.iter().any(|tc| self.ty_member_is_a(tc, sc)));
+        }
         if t.contains('&') {
             return t.split('&').any(|sm| self.ty_member_is_a(sm, s));
         }
@@ -11210,7 +11366,12 @@ impl<'a> Interp<'a> {
                     let l = m.to_lowercase();
                     if ["callable", "void", "never"].contains(&l.as_str()) {
                         return Err(PhpError::fatal(
-                            format!("Property {}::${} cannot have type {}", d.name, pd.name, m),
+                            format!(
+                                "Property {}::${} cannot have type {}",
+                                d.name,
+                                pd.name,
+                                ty_disp(ty)
+                            ),
                             pd.line,
                         ));
                     }
@@ -11950,15 +12111,11 @@ impl<'a> Interp<'a> {
                     }
                     None => Value::Null,
                 };
-                // Literal `= 2` on a `float` prop stores 2.0
-                // (typed_properties_016).
-                if p.ty
-                    .as_ref()
-                    .is_some_and(|t| t.iter().any(|m| m.eq_ignore_ascii_case("float")))
-                {
-                    if let Value::Int(i) = default {
-                        default = Value::Float(i as f64);
-                    }
+                // Runtime defaults (define()'d consts etc.) go through
+                // the same write check as assignments — strict files
+                // TypeError here (typed_properties_058).
+                if p.ty.is_some() {
+                    default = self.prop_typed_write_check(p, c, default)?;
                 }
                 // Private props live in a per-declaring-class slot
                 // ("\0Cls\0name"), so C::$e and E::$e are distinct.
@@ -14265,9 +14422,13 @@ impl<'a> Interp<'a> {
                             .iter()
                             .any(|k| k.ends_with(&format!("\0{}", pn)))
                 };
-                if !was_unset {
+                // Without __get, an unset() declared prop still reads
+                // as uninitialized; with __get it routes to magic
+                // (typed_properties_047 vs _009).
+                let has_get = cls.find_method("__get").is_some();
+                if !was_unset || !has_get {
                     if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
-                        if tpd.ty.is_some() && tpd.default.is_none() {
+                        if tpd.ty.is_some() {
                             return self.fail(PhpError::uncaught(
                                 "Error",
                                 format!(
@@ -14281,7 +14442,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 // __get magic
-                if cls.find_method("__get").is_some() {
+                if has_get {
                     let rv = self.method_invoke(
                         o.clone(),
                         "__get",
@@ -14585,6 +14746,10 @@ impl<'a> Interp<'a> {
                     .unwrap_or(Value::Null);
                 if let Value::Object(t) = newthis {
                     let mut nc = (*c).clone();
+                    // ->call also rebinds the lexical scope to the
+                    // object's class, so private slots resolve
+                    // (typed_properties_048).
+                    nc.scope_class = Some(t.borrow().class.clone());
                     nc.this_obj = Some(t);
                     ca.cells.remove(0);
                     return self.call_value(&Value::Callable(Rc::new(nc)), ca);
@@ -15219,12 +15384,9 @@ impl<'a> Interp<'a> {
                 }
                 None => Value::Null,
             };
-            if p.ty
-                .as_ref()
-                .is_some_and(|t| t.iter().any(|m| m.eq_ignore_ascii_case("float")))
-            {
-                if let Value::Int(i) = default {
-                    default = Value::Float(i as f64);
+            if p.ty.is_some() {
+                if let Ok(d) = self.prop_typed_write_check(p, cls, default.clone()) {
+                    default = d;
                 }
             }
             cls.statics
@@ -16675,7 +16837,20 @@ fn ty_disp(ty: &[String]) -> String {
             );
         }
     }
-    let joined = rest.join("|");
+    let joined = if rest.len() > 1 || nullable {
+        rest.iter()
+            .map(|m| {
+                if m.contains('&') {
+                    format!("({m})")
+                } else {
+                    m.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    } else {
+        rest.join("|")
+    };
     if nullable && rest.len() == 1 {
         format!("?{}", joined)
     } else if nullable {

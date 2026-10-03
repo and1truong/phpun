@@ -1682,8 +1682,10 @@ impl<'a> Parser<'a> {
             }
             // Typed or untyped property: [type] $name [= default], ...;
             let pline = self.line();
-            let pty = if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
-                && !matches!(self.peek2(), Some(Token::Op("(")))
+            let pty = if matches!(
+                self.peek(),
+                Some(Token::Ident(_)) | Some(Token::Op("?")) | Some(Token::Op("\\"))
+            ) && !matches!(self.peek2(), Some(Token::Op("(")))
             {
                 self.take_type()
             } else {
