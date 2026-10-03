@@ -1198,6 +1198,13 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             Value::bytes(trim_set(&s, &chars, true, false))
         }
         "rtrim" | "chop" => {
+            if matches!(arg(args, 0), Value::Null) {
+                // Non-nullable internal param receiving null (bug43201).
+                it.deprecated_pub(&format!(
+                    "{}(): Passing null to parameter #1 ($string) of type string is deprecated",
+                    name
+                ))?;
+            }
             let s = arg_bs(it, args, 0);
             let chars = if args.len() > 1 {
                 arg_bs(it, args, 1)

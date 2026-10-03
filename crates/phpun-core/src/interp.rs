@@ -5412,8 +5412,13 @@ impl<'a> Interp<'a> {
                                 .iter()
                                 .any(|k| k.ends_with(&format!("\0{}", pn)))
                     };
-                    let declared_live = self.decl_prop(o, &pn).is_some() && !was_unset;
-                    let missing = self.obj_prop_key(o, &pn).is_none() && !declared_live;
+                    let declared_live = self.decl_prop(o, &pn).is_some()
+                        && !was_unset
+                        && self.prop_visible(&cls, &pn);
+                    let missing = match self.obj_prop_key(o, &pn) {
+                        Some(_) => !self.prop_visible(&cls, &pn),
+                        None => true,
+                    } && !declared_live;
                     if missing {
                         if cls.find_method("__isset").is_some() {
                             let gkey = (Rc::as_ptr(o) as usize, 2u8, pn.clone());
@@ -5916,6 +5921,18 @@ impl<'a> Interp<'a> {
                 {
                     let mut b = base.borrow_mut();
                     if let Value::Array(rc) = &mut *b {
+                        // Shared zend_array: CoW-separate before the
+                        // write — an overloaded prop's fetched temp
+                        // must not write through into the getter's
+                        // backing store (bug32660).
+                        if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
+                            let fresh = rc.borrow().clone();
+                            *b = Value::Array(Rc::new(RefCell::new(fresh)));
+                        }
+                        let rc = match &*b {
+                            Value::Array(rc) => rc.clone(),
+                            _ => unreachable!(),
+                        };
                         let mut arr = rc.borrow_mut();
                         if append {
                             arr.push(newv.clone());
@@ -6010,11 +6027,6 @@ impl<'a> Interp<'a> {
         self.ref_cells.insert(Rc::as_ptr(&src) as usize);
         match target {
             Expr::Var(n) => {
-                // Binding an array by `=&` marks it referenced: later writes
-                // through copies go through, not CoW-split (Zend is_ref).
-                if let Value::Array(rc) = &*src.borrow() {
-                    rc.borrow_mut().is_ref = true;
-                }
                 self.cur().vars.insert(n.clone(), src);
                 Ok(())
             }
@@ -6083,13 +6095,60 @@ impl<'a> Interp<'a> {
                 let ov = self.eval(obj)?;
                 if let Value::Object(o) = &ov {
                     if let Ok(pn) = self.prop_name(name) {
+                        // `=&` into an overloaded prop (missing slot +
+                        // __get) still fetches through __get — then the
+                        // indirect-modification notice and the
+                        // cannot-assign-by-reference Error (bug32660).
+                        {
+                            let was_unset = {
+                                let ob = o.borrow();
+                                ob.unset_props.contains(&pn)
+                                    || ob
+                                        .unset_props
+                                        .iter()
+                                        .any(|k| k.ends_with(&format!("\0{}", pn)))
+                            };
+                            let cls = o.borrow().class.clone();
+                            let declared_live = self.decl_prop(o, &pn).is_some()
+                                && !was_unset
+                                && self.prop_visible(&cls, &pn);
+                            let inaccessible = match self.obj_prop_key(o, &pn) {
+                                Some(_) => !self.prop_visible(&cls, &pn),
+                                None => true,
+                            };
+                            if inaccessible && !declared_live && cls.find_method("__get").is_some()
+                            {
+                                let gkey = (Rc::as_ptr(o) as usize, 0u8, pn.clone());
+                                if self.magic_guards.insert(gkey.clone()) {
+                                    let res = self.method_invoke(
+                                        o.clone(),
+                                        "__get",
+                                        CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
+                                    );
+                                    self.magic_guards.remove(&gkey);
+                                    res?;
+                                }
+                                self.notice(&format!(
+                                    "Indirect modification of overloaded property {}::${} has no effect",
+                                    cls.name(),
+                                    pn
+                                ))?;
+                                let v = self.exception(
+                                    "Error",
+                                    "Cannot assign by reference to overloaded object",
+                                );
+                                let e = self.throw(v);
+                                return self.fail(e);
+                            }
+                        }
                         // `=&` installs the source cell as the prop's
                         // slot itself — later writes through either name
                         // hit the same storage; a missing dynamic prop
                         // materializes a real slot (oss-fuzz-382922236).
-                        if let Value::Array(rc) = &*src.borrow() {
-                            rc.borrow_mut().is_ref = true;
-                        }
+                        // The array itself stays unmarked — zend's ref
+                        // is a property of the zval, not the array; a
+                        // later value-copy still CoW-separates
+                        // (bug39775).
                         // Binding a ref into a TYPED prop validates the
                         // source (076/068 conflict); the shared cell
                         // then stays gated through typed_slots (071).
@@ -6868,6 +6927,9 @@ impl<'a> Interp<'a> {
             *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
         }
         if let Value::Array(rc) = &mut *b {
+            // Deliberately-shared arrays ($GLOBALS, &-bound storage)
+            // are exempted from CoW via is_ref; an ordinary shared
+            // zend_array still separates on write (bug32660).
             if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
                 let fresh = rc.borrow().clone();
                 *b = Value::Array(Rc::new(RefCell::new(fresh)));
@@ -17988,7 +18050,11 @@ impl<'a> Interp<'a> {
                     }
                 }
                 if let Some(k) = self.obj_prop_key(&o, pn) {
-                    return Ok(o.borrow().props.get(&k).unwrap().borrow().clone());
+                    // Declared but not visible from this scope →
+                    // __get territory (bug37667).
+                    if self.prop_visible(&cls, pn) {
+                        return Ok(o.borrow().props.get(&k).unwrap().borrow().clone());
+                    }
                 }
                 // Typed prop whose slot was never initialized → Error
                 // (not __get, not a warning): parent_get_plain_typed_uninitialized.
@@ -18158,6 +18224,14 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let key = self.obj_prop_key(&o, &pn);
+                // A slot that exists but isn't visible from this scope
+                // is *inaccessible*: cell ops route to __get like a
+                // missing prop, and the write dies in the temp
+                // (bug37667 — appends to a protected prop).
+                let key = match key {
+                    Some(k) if self.prop_visible(&o.borrow().class.clone(), &pn) => Some(k),
+                    _ => None,
+                };
                 if key.is_none() {
                     if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
                         if tpd.ty.is_some() && tpd.default.is_none() {
@@ -18225,6 +18299,38 @@ impl<'a> Interp<'a> {
                             self.last_fresh_cell = Some(Rc::as_ptr(&nc) as usize);
                             o.borrow_mut().props.insert(pn.clone(), nc);
                         }
+                    }
+                }
+                if key.is_none() {
+                    // A missing prop on a class with __get is
+                    // *overloaded*: cell ops (`[]`, `=&`, `++`) fetch
+                    // through __get. `&__get` returns a real cell the
+                    // write binds; a plain __get yields a temp — the
+                    // write dies with an "Indirect modification"
+                    // notice (bug32660, bug37667, bug43201).
+                    let cls = o.borrow().class.clone();
+                    if let Some(gm) = cls.find_method("__get") {
+                        let gkey = (Rc::as_ptr(&o) as usize, 0u8, pn.clone());
+                        if self.magic_guards.insert(gkey.clone()) {
+                            self.last_ret_cell = None;
+                            let res = self.method_invoke(
+                                o.clone(),
+                                "__get",
+                                CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
+                            );
+                            self.magic_guards.remove(&gkey);
+                            let rv = res?;
+                            if gm.decl.by_ref {
+                                return Ok(self.last_ret_cell.take().unwrap_or_else(|| cell(rv)));
+                            }
+                            self.notice(&format!(
+                                "Indirect modification of overloaded property {}::${} has no effect",
+                                cls.name(),
+                                pn
+                            ))?;
+                            return Ok(cell(rv));
+                        }
+                        return Ok(cell(Value::Null));
                     }
                 }
                 let key = key.unwrap_or_else(|| pn.clone());
@@ -20438,6 +20544,10 @@ impl<'a> Interp<'a> {
     }
     pub fn warn_pub(&mut self, msg: &str) -> Result<(), PhpError> {
         self.warn(msg)
+    }
+
+    pub fn deprecated_pub(&mut self, msg: &str) -> Result<(), PhpError> {
+        self.deprecated(msg)
     }
 
     /// Diagnostic at a caller-selected E_USER_* level (trigger_error).
