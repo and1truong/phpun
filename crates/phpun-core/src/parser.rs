@@ -817,10 +817,21 @@ impl<'a> Parser<'a> {
             self.skip_type()?;
         }
         let mut parent = None;
-        if self.eat_ident("extends") {
-            parent = self.name_path();
-        }
         let mut implements = Vec::new();
+        if self.eat_ident("extends") {
+            if kind == ClassKind::Interface {
+                // `interface Y extends X, Z` — multiple interface parents
+                // recorded in `implements` (what instanceof/iface walks use).
+                while let Some(n) = self.name_path() {
+                    implements.push(n);
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+            } else {
+                parent = self.name_path();
+            }
+        }
         if self.eat_ident("implements") {
             while let Some(n) = self.name_path() {
                 implements.push(n);
@@ -941,6 +952,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             // Typed or untyped property: [type] $name [= default], ...;
+            let pline = self.line();
             let pty = if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
                 && !matches!(self.peek2(), Some(Token::Op("(")))
             {
@@ -978,6 +990,7 @@ impl<'a> Parser<'a> {
                     set_vis: m_set_vis,
                     decl_in: None,
                     hooks: None,
+                    line: pline,
                 });
                 if !self.eat_op(",") {
                     break;
@@ -1622,6 +1635,7 @@ impl<'a> Parser<'a> {
                     self.expect_op(";")?;
                     continue;
                 }
+                let pline = self.line();
                 let pty = if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
                     && !matches!(self.peek2(), Some(Token::Op("(")))
                 {
@@ -1659,6 +1673,7 @@ impl<'a> Parser<'a> {
                         set_vis: m_set_vis,
                         decl_in: None,
                         hooks: None,
+                        line: pline,
                     });
                     if !self.eat_op(",") {
                         break;

@@ -362,6 +362,7 @@ impl<'a> Interp<'a> {
                         set_vis: None,
                         decl_in: None,
                         hooks: None,
+                        line: 0,
                     })
                     .collect(),
                 consts: vec![],
@@ -4935,6 +4936,7 @@ impl<'a> Interp<'a> {
                             set_vis: p.set_vis,
                             decl_in: None,
                             hooks: p.hooks.clone(),
+                            line: 0,
                         });
                     }
                 }
@@ -4991,10 +4993,10 @@ impl<'a> Interp<'a> {
     }
 
     /// `final` props/hooks may not be overridden by a subclass.
-    fn check_final_override(&self, d: &ClassDecl) -> Result<(), PhpError> {
+    fn check_final_override(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
         let mut an = d.parent.clone();
         while let Some(pname) = an {
-            let Some(pc) = self.classes.get(&pname.to_lowercase()) else {
+            let Some(pc) = self.classes.get(&pname.to_lowercase()).cloned() else {
                 break;
             };
             for cp in &d.props {
@@ -5022,6 +5024,61 @@ impl<'a> Interp<'a> {
                                 self.cur_line,
                             ));
                         }
+                        let Some(ah) = ahs.iter().find(|ah| ah.is_get == ch.is_get) else {
+                            continue;
+                        };
+                        // Hook signature variance: a get's return type (the
+                        // prop type) is covariant; a set's $value parameter
+                        // is contravariant (type_compatibility*).
+                        let fmt = |t: &Option<Vec<String>>| {
+                            t.as_ref()
+                                .map(|m| m.join("|"))
+                                .unwrap_or_else(|| "mixed".into())
+                        };
+                        if ch.is_get {
+                            let (cty, aty) = (fmt(&cp.ty), fmt(&ap.ty));
+                            let cm = cp.ty.clone().unwrap_or_else(|| vec!["mixed".into()]);
+                            let am = ap.ty.clone().unwrap_or_else(|| vec!["mixed".into()]);
+                            if !self.ty_sup(&am, &cm) {
+                                return Err(PhpError::fatal(
+                                    format!(
+                                        "Declaration of {}::${}::get(): {} must be compatible with {}::${}::get(): {}",
+                                        d.name, cp.name, cty, pc.decl.name, cp.name, aty
+                                    ),
+                                    cp.line,
+                                ));
+                            }
+                        } else {
+                            let eff = |pd: &crate::ast::PropDecl, h: &crate::ast::PropHook| {
+                                h.params
+                                    .first()
+                                    .and_then(|sp| sp.ty.clone())
+                                    .or_else(|| pd.ty.clone())
+                                    .unwrap_or_else(|| vec!["mixed".into()])
+                            };
+                            let cm = eff(cp, ch);
+                            let am = eff(ap, ah);
+                            let cn = ch
+                                .params
+                                .first()
+                                .map(|sp| sp.name.clone())
+                                .unwrap_or_else(|| "value".into());
+                            let an = ah
+                                .params
+                                .first()
+                                .map(|sp| sp.name.clone())
+                                .unwrap_or_else(|| "value".into());
+                            if !self.ty_sup(&cm, &am) {
+                                return Err(PhpError::fatal(
+                                    format!(
+                                        "Declaration of {}::${}::set({} ${}): void must be compatible with {}::${}::set({} ${}): void",
+                                        d.name, cp.name, cm.join("|"), cn,
+                                        pc.decl.name, cp.name, am.join("|"), an
+                                    ),
+                                    cp.line,
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -5034,7 +5091,7 @@ impl<'a> Interp<'a> {
     /// are forbidden on static/readonly props; a default requires a
     /// *backed* prop; `set(T)` must be type-compatible; `final`/`abstract`
     /// and interface restrictions produce link-time fatals.
-    fn check_hooked_props(&self, d: &ClassDecl) -> Result<(), PhpError> {
+    fn check_hooked_props(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
         let in_iface = d.kind == ClassKind::Interface;
         for p in &d.props {
             if in_iface && p.is_abstract {
@@ -5206,24 +5263,71 @@ impl<'a> Interp<'a> {
                     self.cur_line,
                 ));
             }
-            if let (Some(pty), Some(set)) = (&p.ty, hs.iter().find(|h| !h.is_get)) {
+            if let Some(set) = hs.iter().find(|h| !h.is_get) {
                 if let Some(sp) = set.params.first() {
-                    if let Some(sty) = &sp.ty {
-                        let compat = sty.iter().all(|m| pty.iter().any(|t| t == m));
-                        if !compat {
-                            return Err(PhpError::fatal(
-                                format!(
-                                    "Type of parameter ${} of hook {}::${}::set must be compatible with property type",
-                                    sp.name, d.name, p.name
-                                ),
-                                0,
-                            ));
+                    // The set $value parameter must accept every value the
+                    // property type admits (param type ⊇ prop type); an
+                    // untyped prop is mixed, and an untyped parameter is
+                    // only legal on an untyped prop
+                    // (set_value_parameter_type_variance_005).
+                    let compat = match (&p.ty, &sp.ty) {
+                        (None, None) => true,
+                        (pty, Some(sty)) => {
+                            let pty = pty
+                                .clone()
+                                .unwrap_or_else(|| vec!["mixed".to_string()]);
+                            self.ty_sup(sty, &pty)
                         }
+                        (Some(_), None) => false,
+                    };
+                    if !compat {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Type of parameter ${} of hook {}::${}::set must be compatible with property type",
+                                sp.name, d.name, p.name
+                            ),
+                            0,
+                        ));
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    /// `sup` is a supertype of `sub` when every `sub` member is admitted
+    /// by some `sup` member — equal names, `mixed`, or a class/interface
+    /// the member is-a (set_value_parameter_type_variance_006).
+    fn ty_sup(&mut self, sup: &[String], sub: &[String]) -> bool {
+        sub.iter()
+            .all(|t| sup.iter().any(|s| self.ty_member_is_a(t, s)))
+    }
+
+    /// Type-member acceptance: `t` is admitted by `s` when they match by
+    /// name, `s` is `mixed`, or `t`'s class/interface ancestry includes
+    /// `s` (interfaces live in `self.interfaces`, not `self.classes`).
+    fn ty_member_is_a(&mut self, t: &str, s: &str) -> bool {
+        if s.eq_ignore_ascii_case(t) || s.eq_ignore_ascii_case("mixed") {
+            return true;
+        }
+        if t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("mixed") {
+            return false;
+        }
+        if let Some(iface) = self.interfaces.get(&t.to_lowercase()).cloned() {
+            let mut stack = vec![iface];
+            while let Some(f) = stack.pop() {
+                for p in &f.implements {
+                    if p.eq_ignore_ascii_case(s) {
+                        return true;
+                    }
+                    if let Some(ff) = self.interfaces.get(&p.to_lowercase()).cloned() {
+                        stack.push(ff);
+                    }
+                }
+            }
+            return false;
+        }
+        self.is_a_str(t, s)
     }
 
     /// An abstract hook (`get;`/`set;` in an interface or `abstract`
