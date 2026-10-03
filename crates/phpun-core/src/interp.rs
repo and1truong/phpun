@@ -1269,6 +1269,66 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Like run_source but also returns the script's top-level `return`
+    /// value — the boot phase of `phpun serve --worker` reads the app
+    /// handler this way.
+    pub fn run_source_ret(&mut self, src: &str) -> (RunResult, Option<Value>) {
+        match parser::parse_source(src, self.ini_on("short_open_tag")) {
+            Ok(stmts) => {
+                self.hoist_funcs(&stmts);
+                let flow = self.exec_block(&stmts);
+                let rv = match &flow {
+                    Flow::Return(v) => Some(v.clone()),
+                    _ => None,
+                };
+                let res = self.finish(flow);
+                self.run_shutdown();
+                (res, rv)
+            }
+            Err(e) => {
+                match e.kind {
+                    ErrorKind::Parse => self.print_parse(&e),
+                    _ => self.print_fatal(&e),
+                }
+                (
+                    RunResult {
+                        exit_code: 255,
+                        fatal: Some(e),
+                    },
+                    None,
+                )
+            }
+        }
+    }
+
+    /// Worker mode: clear per-request state while keeping the warm world
+    /// (classes, functions, global vars, objects) alive.
+    pub fn reset_request(&mut self) {
+        self.out.clear();
+        self.err_buf.clear();
+        self.out_headers.clear();
+        self.resp_code = 200;
+        self.uploads.clear();
+        self.ob_stack.clear();
+        self.silence = 0;
+        self.pending_exception = None;
+        self.call_trace.clear();
+        self.deadline = None;
+    }
+
+    /// Worker mode: objects created during boot are application state and
+    /// must not be destructed at request end. Call once after the boot
+    /// phase so per-request shutdown only sweeps request objects.
+    pub fn seal_boot_objects(&mut self) {
+        self.obj_handles.clear();
+    }
+
+    /// Worker-mode request end: registered shutdown functions and
+    /// destructors for request-created objects.
+    pub fn end_request(&mut self) {
+        self.run_shutdown();
+    }
+
     fn cur(&mut self) -> &mut Frame {
         self.stack.last_mut().unwrap_or(&mut self.globals)
     }

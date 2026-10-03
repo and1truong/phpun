@@ -15,12 +15,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const HEADER_CAP: usize = 64 * 1024;
 const BODY_CAP: usize = 16 * 1024 * 1024;
 
-/// `phpun serve <file> --host H --port N [--docroot DIR]`. Blocks until the
-/// process dies. `docroot` enables front-controller mode: existing files
-/// under it are served directly (`.php` ones run as scripts, the rest as
-/// static content); everything else routes to `file`. Default docroot is
+/// `phpun serve <file> --host H --port N [--docroot DIR] [--worker]`. Blocks
+/// until the process dies. `docroot` enables front-controller mode: existing
+/// files under it are served directly (`.php` ones run as scripts, the rest
+/// as static content); everything else routes to `file`. Default docroot is
 /// the front script's directory.
-pub fn serve(file: &str, host: &str, port: u16, docroot: Option<&str>) -> i32 {
+///
+/// `workers` > 0 switches to persistent-worker mode: each worker boots the
+/// script ONCE on its own warm interpreter; the script's top-level `return`
+/// must be a callable invoked per request as `handler(array $req)`. Worker
+/// state is per-worker — a global incremented in the handler persists
+/// across requests on that worker only. `workers == 0` keeps the classic
+/// fresh-interp-per-request model.
+pub fn serve(file: &str, host: &str, port: u16, docroot: Option<&str>, workers: usize) -> i32 {
     let canon = std::fs::canonicalize(file)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| file.to_string());
@@ -40,13 +47,38 @@ pub fn serve(file: &str, host: &str, port: u16, docroot: Option<&str>) -> i32 {
             return 1;
         }
     };
-    eprintln!("phpun serve: http://{host}:{port} → {canon} (docroot {dr})");
+    let mode = if workers > 0 {
+        format!("{} worker(s)", workers)
+    } else {
+        "fresh-interp".to_string()
+    };
+    eprintln!("phpun serve: http://{host}:{port} → {canon} (docroot {dr}, {mode})");
     let cfg = std::sync::Arc::new(Cfg {
         front: canon,
         docroot: dr,
         host: host.to_string(),
         port,
     });
+    if workers > 0 {
+        let mut senders = Vec::new();
+        for w in 0..workers {
+            let (tx, rx) = std::sync::mpsc::channel::<TcpStream>();
+            let c = cfg.clone();
+            std::thread::spawn(move || worker_loop(w, rx, c));
+            senders.push(tx);
+        }
+        let mut n = 0usize;
+        for conn in listener.incoming() {
+            match conn {
+                Ok(stream) => {
+                    let _ = senders[n % senders.len()].send(stream);
+                    n = n.wrapping_add(1);
+                }
+                Err(e) => eprintln!("phpun serve: accept: {e}"),
+            }
+        }
+        return 0;
+    }
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
@@ -57,6 +89,191 @@ pub fn serve(file: &str, host: &str, port: u16, docroot: Option<&str>) -> i32 {
         }
     }
     0
+}
+
+/// One warm interpreter per worker. The script boots once; its top-level
+/// `return`ed callable handles every request this worker receives.
+fn worker_loop(id: usize, rx: std::sync::mpsc::Receiver<TcpStream>, cfg: std::sync::Arc<Cfg>) {
+    let src = match std::fs::read_to_string(&cfg.front) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("phpun serve: worker {id}: cannot read {}: {e}", cfg.front);
+            return;
+        }
+    };
+    let mut it = Interp::new(&cfg.front);
+    let (res, ret) = it.run_source_ret(&src);
+    if !it.out.is_empty() {
+        eprint!("{}", it.out);
+    }
+    if !it.err_buf.is_empty() {
+        eprint!("{}", it.err_buf);
+    }
+    if res.fatal.is_some() {
+        eprintln!("phpun serve: worker {id}: boot failed — exiting");
+        return;
+    }
+    let handler = match ret {
+        Some(Value::Callable(_)) | Some(Value::Str(_)) => ret.unwrap(),
+        _ => {
+            eprintln!(
+                "phpun serve: worker {id}: {} did not return a callable; \
+                 running requests on fresh interps",
+                cfg.front
+            );
+            for stream in rx {
+                handle(stream, cfg.clone());
+            }
+            return;
+        }
+    };
+    it.seal_boot_objects();
+    for stream in rx {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+        let remote = stream
+            .peer_addr()
+            .map(|a| (a.ip().to_string(), a.port()))
+            .unwrap_or_else(|_| (String::new(), 0));
+        let mut stream = stream;
+        match read_request(&mut stream, remote) {
+            Ok(Some(req)) => respond_worker(stream, &cfg, &req, &mut it, &handler),
+            Ok(None) => {}
+            Err(()) => {
+                let body = "400 Bad Request\n";
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+    }
+}
+
+/// Warm-worker request: reset per-request state, repopulate globals, then
+/// invoke the boot-time handler with a request array
+/// {method, uri, path, query, headers, body}.
+fn respond_worker(mut stream: TcpStream, cfg: &Cfg, req: &Req, it: &mut Interp, handler: &Value) {
+    // Static files and docroot .php scripts bypass the handler, same as
+    // classic mode.
+    match resolve_script(cfg, req) {
+        Resolved::Static(p) => {
+            let body = std::fs::read(&p).unwrap_or_default();
+            let head = req.method == "HEAD";
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    mime_of(&p),
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            if !head {
+                let _ = stream.write_all(&body);
+            }
+            return;
+        }
+        Resolved::Script(s) => {
+            // A docroot .php runs on a throwaway interp — its state must
+            // not leak into the warm world.
+            respond(stream, cfg, req);
+            let _ = s;
+            return;
+        }
+        _ => {}
+    }
+    it.reset_request();
+    populate(it, req, &cfg.front, cfg);
+
+    let mut rarr = PhpArray::new();
+    rarr.set(ArrKey::Str("method".into()), Value::str(req.method.clone()));
+    rarr.set(ArrKey::Str("uri".into()), Value::str(req.uri.clone()));
+    rarr.set(ArrKey::Str("path".into()), Value::str(req.path.clone()));
+    rarr.set(ArrKey::Str("query".into()), Value::str(req.query.clone()));
+    rarr.set(
+        ArrKey::Str("body".into()),
+        Value::str(String::from_utf8_lossy(&req.body).into_owned()),
+    );
+    let mut hdrs = PhpArray::new();
+    for (k, v) in &req.headers {
+        hdrs.set(ArrKey::Str(k.clone().into()), Value::str(v.clone()));
+    }
+    rarr.set(
+        ArrKey::Str("headers".into()),
+        Value::Array(std::rc::Rc::new(std::cell::RefCell::new(hdrs))),
+    );
+
+    let args =
+        crate::interp::CallArgs::positional(vec![std::rc::Rc::new(std::cell::RefCell::new(
+            Value::Array(std::rc::Rc::new(std::cell::RefCell::new(rarr))),
+        ))]);
+    let ret = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        it.call_value(handler, args)
+    }))
+    .unwrap_or_else(|_| Err(crate::error::PhpError::fatal("handler panicked", 0)));
+    it.end_request();
+
+    let mut code = it.resp_code;
+    let mut lines: Vec<String> = it.out_headers.clone();
+    let mut body = it.out.clone();
+    if !it.err_buf.is_empty() {
+        eprint!("{}", it.err_buf);
+    }
+    match ret {
+        Ok(Value::Array(a)) => {
+            let a = a.borrow();
+            for (k, c) in a.iter() {
+                let ArrKey::Str(name) = k else { continue };
+                let v = c.borrow().clone();
+                match name.as_ref() {
+                    "status" => code = v.to_int(),
+                    "headers" => {
+                        if let Value::Array(h) = &v {
+                            for (_, hc) in h.borrow().iter() {
+                                lines.push(hc.borrow().to_php_string());
+                            }
+                        }
+                    }
+                    "body" => body.push_str(&v.to_php_string()),
+                    _ => {}
+                }
+            }
+        }
+        Ok(Value::Str(s)) => body.push_str(&s),
+        Ok(_) => {}
+        Err(e) => {
+            if code == 200 {
+                code = 500;
+            }
+            body.push_str(&format!("\n{}", e.message));
+        }
+    }
+    if !lines
+        .iter()
+        .any(|h| h.to_lowercase().starts_with("content-type:"))
+    {
+        lines.push("Content-Type: text/html; charset=UTF-8".to_string());
+    }
+    let head_req = req.method == "HEAD";
+    let mut resp = format!("HTTP/1.1 {} {}\r\n", code, reason(code));
+    for h in &lines {
+        resp.push_str(h);
+        resp.push_str("\r\n");
+    }
+    resp.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    ));
+    if !head_req {
+        resp.push_str(&body);
+    }
+    let _ = stream.write_all(resp.as_bytes());
 }
 
 struct Cfg {
