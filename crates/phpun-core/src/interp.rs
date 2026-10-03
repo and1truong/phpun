@@ -4793,7 +4793,7 @@ impl<'a> Interp<'a> {
                 self.silence += 1;
                 let mut ok = true;
                 for a in args {
-                    match self.isset_val(a) {
+                    match self.isset_val_mode(a, 0) {
                         Ok(Some(_)) => {}
                         Ok(None) => {
                             ok = false;
@@ -4810,7 +4810,7 @@ impl<'a> Interp<'a> {
             }
             Expr::Empty(e) => {
                 self.silence += 1;
-                let v = self.isset_val(e);
+                let v = self.isset_val_mode(e, 1);
                 self.silence -= 1;
                 match v {
                     Ok(Some(v)) => Ok(Value::Bool(!v.is_truthy())),
@@ -5290,7 +5290,17 @@ impl<'a> Interp<'a> {
     /// `isset()` semantics returning the read value — `Some(v)` when the
     /// operand exists and isn't null. `??`/`empty` consume the value
     /// directly so calls and prop-getters evaluate exactly once.
-    fn isset_val(&mut self, e: &Expr) -> Result<Option<Value>, PhpError> {
+    /// isset/empty/?? property semantics (mode):
+    ///  0 = isset()  — last segment's __isset answers directly, no
+    ///                 fetch; absent prop without __isset is just not
+    ///                 set — __get never fires (bug44899).
+    ///  1 = empty()  — __isset gates; truthy result then reads via
+    ///                 __get for the falsy check; absent prop without
+    ///                 __isset is empty, still no __get.
+    ///  2 = ?? / intermediate segment — __isset gates then __get
+    ///                 fetches; without __isset the read runs __get
+    ///                 directly (bug71359).
+    fn isset_val_mode(&mut self, e: &Expr, mode: u8) -> Result<Option<Value>, PhpError> {
         match e {
             Expr::Var(n) => Ok(match self.var_cell_opt(n) {
                 Some(c) => match &*c.borrow() {
@@ -5301,12 +5311,15 @@ impl<'a> Interp<'a> {
             }),
             Expr::Index { e, i } => {
                 // `isset($this->uninitTyped['k'])` and `$x ?? y` must not
-                // throw on uninitialized typed properties.
+                // throw on uninitialized typed properties. The base
+                // chains through isset semantics — absent segments
+                // short-circuit without __get (bug71359).
                 self.silence += 1;
-                let base = self.prop_read_loose(e);
+                let base = self.isset_val_mode(e, 2);
                 self.silence -= 1;
                 let base = match base {
-                    Ok(b) => b,
+                    Ok(Some(b)) => b,
+                    Ok(None) => return Ok(None),
                     Err(err) if matches!(err.kind, ErrorKind::Throw) => {
                         if err
                             .message
@@ -5369,12 +5382,23 @@ impl<'a> Interp<'a> {
                     _ => Ok(None),
                 }
             }
-            Expr::Prop { obj, name, .. } => {
+            Expr::Prop {
+                obj,
+                name,
+                nullsafe,
+            } => {
                 // Missing/inaccessible props consult __isset first
                 // (bug63462, bug44899); a re-entrant isset inside
-                // __isset hits real storage only.
+                // __isset hits real storage only. The base evaluates
+                // through isset semantics too: each segment of a chain
+                // tests via __isset, then fetches via __get only when
+                // set — never triggering __get on an absent segment
+                // (bug71359).
                 let pn = self.prop_name(name)?;
-                let ov = self.eval(obj)?;
+                let ov = match self.isset_val_mode(obj, 2)? {
+                    Some(v) => v,
+                    None => return Ok(None),
+                };
                 if let Value::Object(o) = &ov {
                     let cls = o.borrow().class.clone();
                     // A declared prop checks its real slot unless it
@@ -5389,52 +5413,62 @@ impl<'a> Interp<'a> {
                                 .any(|k| k.ends_with(&format!("\0{}", pn)))
                     };
                     let declared_live = self.decl_prop(o, &pn).is_some() && !was_unset;
-                    if self.obj_prop_key(o, &pn).is_none()
-                        && !declared_live
-                        && cls.find_method("__isset").is_some()
-                    {
-                        let gkey = (Rc::as_ptr(o) as usize, 2u8, pn.clone());
-                        if self.magic_guards.insert(gkey.clone()) {
-                            let res = self.method_invoke(
-                                o.clone(),
-                                "__isset",
-                                CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
-                            );
-                            self.magic_guards.remove(&gkey);
-                            if !res?.is_truthy() {
+                    let missing = self.obj_prop_key(o, &pn).is_none() && !declared_live;
+                    if missing {
+                        if cls.find_method("__isset").is_some() {
+                            let gkey = (Rc::as_ptr(o) as usize, 2u8, pn.clone());
+                            if self.magic_guards.insert(gkey.clone()) {
+                                let res = self.method_invoke(
+                                    o.clone(),
+                                    "__isset",
+                                    CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
+                                );
+                                self.magic_guards.remove(&gkey);
+                                if !res?.is_truthy() {
+                                    return Ok(None);
+                                }
+                                // isset() takes __isset's answer — no
+                                // fetch (bug44899). empty()/?? then
+                                // read through __get with the SAME
+                                // bound name (bug75420).
+                                if mode == 0 {
+                                    return Ok(Some(Value::Bool(true)));
+                                }
+                                self.silence += 1;
+                                let v = self.prop_read_value(ov.clone(), &pn, false);
+                                self.silence -= 1;
+                                return match v {
+                                    Ok(v) => Ok(if matches!(v, Value::Null) {
+                                        None
+                                    } else {
+                                        Some(v)
+                                    }),
+                                    Err(e)
+                                        if matches!(e.kind, ErrorKind::Throw)
+                                            && e.message.ends_with(
+                                                "must not be accessed before initialization",
+                                            ) =>
+                                    {
+                                        Ok(None)
+                                    }
+                                    Err(e) if matches!(e.kind, ErrorKind::Throw) => Err(e),
+                                    Err(_) => Ok(None),
+                                };
+                            } else {
                                 return Ok(None);
                             }
-                            // __isset passed — zend fetches the value
-                            // through __get with the SAME bound name
-                            // (bug75420).
-                            self.silence += 1;
-                            let v = self.prop_read_value(ov.clone(), &pn, false);
-                            self.silence -= 1;
-                            return match v {
-                                Ok(v) => Ok(if matches!(v, Value::Null) {
-                                    None
-                                } else {
-                                    Some(v)
-                                }),
-                                Err(e)
-                                    if matches!(e.kind, ErrorKind::Throw)
-                                        && e.message.ends_with(
-                                            "must not be accessed before initialization",
-                                        ) =>
-                                {
-                                    Ok(None)
-                                }
-                                Err(e) if matches!(e.kind, ErrorKind::Throw) => Err(e),
-                                Err(_) => Ok(None),
-                            };
-                        } else {
+                        }
+                        // No __isset: isset()/empty() see an absent
+                        // prop — __get stays quiet; ?? still reads it
+                        // (bug71359).
+                        if mode != 2 {
                             return Ok(None);
                         }
                     }
                 }
                 self.check_prop_name(&pn)?;
                 self.silence += 1;
-                let v = self.prop_read_loose(e);
+                let v = self.prop_read_value(ov.clone(), &pn, *nullsafe);
                 self.silence -= 1;
                 match v {
                     Ok(v) => Ok(if matches!(v, Value::Null) {
@@ -7737,7 +7771,7 @@ impl<'a> Interp<'a> {
                 // uninitialized typed props fall through to the right.
                 // isset_val returns the read value so calls and getters
                 // evaluate exactly once.
-                match self.isset_val(l)? {
+                match self.isset_val_mode(l, 2)? {
                     Some(v) => Ok(v),
                     None => self.eval(r),
                 }
