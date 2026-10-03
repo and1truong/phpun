@@ -1775,6 +1775,11 @@ impl<'a> Interp<'a> {
                     mk_method("getName", vec![]),
                     mk_method("getAttributes", vec![]),
                     mk_method("getParameters", vec![]),
+                    mk_method("isClosure", vec![]),
+                    mk_method("getClosure", vec![]),
+                    mk_method("getClosureScopeClass", vec![]),
+                    mk_method("getClosureCalledClass", vec![]),
+                    mk_method("getClosureThis", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -1815,6 +1820,10 @@ impl<'a> Interp<'a> {
                     mk_method("isProtected", vec![]),
                     mk_method("isPrivate", vec![]),
                     mk_method("getParameters", vec![]),
+                    mk_method("getClosure", vec![any_param("object", false)]),
+                    mk_method("getClosureScopeClass", vec![]),
+                    mk_method("getClosureCalledClass", vec![]),
+                    mk_method("getClosureThis", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -5107,12 +5116,22 @@ impl<'a> Interp<'a> {
                         captures.push((n.clone(), cap));
                     }
                 }
+                // `static function` never binds $this; `static::`
+                // keeps the creating frame's late-bound class
+                // (closure_049-052).
+                let is_static = c.is_static;
                 Ok(Value::Callable(self.new_callable(PhpCallable {
                     id: std::cell::Cell::new(0),
                     kind: CallableKind::Closure(Rc::new(decl)),
                     captures,
-                    this_obj: self.stack.last().and_then(|f| f.this_obj.clone()),
+                    this_obj: if is_static {
+                        None
+                    } else {
+                        self.stack.last().and_then(|f| f.this_obj.clone())
+                    },
                     scope_class: self.stack.last().and_then(|f| f.scope_class.clone()),
+                    called_class: self.stack.last().and_then(|f| f.called_class.clone()),
+                    is_static,
                 })))
             }
             Expr::New { class, args } => {
@@ -5613,6 +5632,45 @@ impl<'a> Interp<'a> {
                         }
                     }
                     Err(_) => Ok(None),
+                }
+            }
+            Expr::StaticProp { class, name } => {
+                // Scoped isset — `isset(A::$priv)` is false when the
+                // static exists but is invisible to the current scope
+                // (closure_041-046, disallows_*).
+                let pn = match self.prop_name(name) {
+                    Ok(pn) => pn,
+                    Err(_) => return Ok(None),
+                };
+                let cls = match self.class_of(class) {
+                    Ok(c) => c,
+                    Err(_) => return Ok(None),
+                };
+                self.statics_init(&cls);
+                let v = cls.statics.borrow().get(&pn).map(|c| c.borrow().clone());
+                let ok = match self.find_static_prop_decl(&cls, &pn) {
+                    Some((pd, dcls)) => match pd.visibility {
+                        crate::ast::Visibility::Public => true,
+                        _ => {
+                            let scope = self
+                                .stack
+                                .last()
+                                .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()))
+                                .map(|s| s.name().to_string());
+                            match (pd.visibility, scope) {
+                                (crate::ast::Visibility::Private, Some(s)) => s == dcls.name(),
+                                (crate::ast::Visibility::Protected, Some(s)) => {
+                                    self.is_a_str(&s, dcls.name()) || self.is_a_str(dcls.name(), &s)
+                                }
+                                _ => false,
+                            }
+                        }
+                    },
+                    None => true,
+                };
+                match (v, ok) {
+                    (Some(v), true) if !matches!(v, Value::Null) => Ok(Some(v)),
+                    _ => Ok(None),
                 }
             }
             _ => {
@@ -8928,7 +8986,7 @@ impl<'a> Interp<'a> {
                                 c.this_obj.clone(),
                                 c.scope_class.clone(),
                                 None,
-                                None,
+                                c.called_class.clone(),
                                 c.captures.clone(),
                             )));
                         }
@@ -8942,6 +9000,7 @@ impl<'a> Interp<'a> {
                         }
                         frame.this_obj = c.this_obj.clone();
                         frame.scope_class = c.scope_class.clone();
+                        frame.called_class = c.called_class.clone();
                         // $this binds like a normal method frame —
                         // closures defined in an object context auto-capture it.
                         if let Some(o) = &c.this_obj {
@@ -9189,6 +9248,8 @@ impl<'a> Interp<'a> {
                 captures: Vec::new(),
                 this_obj: None,
                 scope_class: None,
+                called_class: None,
+                is_static: false,
             }))),
             None => self.fail(PhpError::uncaught(
                 "Error",
@@ -9198,12 +9259,112 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Shared `Closure::bind`/`bindTo`/`call` rebinding model
+    /// (closure_036-044, zend_closures):
+    /// - binding an instance to a static closure warns → NULL
+    /// - unbinding $this from a closure that has one warns → NULL
+    /// - explicit scope arg: null → unscoped ("dummy"), object → its
+    ///   class, string → resolved class; omitted or 'static' keeps
+    ///   the previous scope — an unscoped closure stays unscoped
+    ///   ("dummy scope", closure_046)
+    ///
+    /// Returns Ok(None) after emitting a warning → caller returns NULL.
+    fn rebind_closure(
+        &mut self,
+        c: &PhpCallable,
+        new_this: Option<Rc<RefCell<PhpObject>>>,
+        scope_arg: Option<Value>,
+    ) -> Result<Option<PhpCallable>, PhpError> {
+        let uses_this = c.this_obj.is_some();
+        if new_this.is_some() && c.is_static {
+            self.warn(
+                "Cannot bind an instance to a static closure, this will be an error in PHP 9",
+            )?;
+            return Ok(None);
+        }
+        if new_this.is_none() && uses_this && !c.is_static {
+            self.warn(
+                "Cannot unbind $this of closure using $this, this will be an error in PHP 9",
+            )?;
+            return Ok(None);
+        }
+        // A method callable's new instance must be instanceof the
+        // method's class (closure_from_callable_rebinding).
+        if let (
+            Some(t),
+            CallableKind::Method {
+                obj: Some(o),
+                name: mname,
+                ..
+            },
+        ) = (&new_this, &c.kind)
+        {
+            let mcls = o.borrow().class.clone();
+            let tc = t.borrow().class.clone();
+            if !self.is_a(&tc, mcls.name()) {
+                self.warn(&format!(
+                    "Cannot bind method {}::{}() to object of class {}, this will be an error in PHP 9",
+                    mcls.name(),
+                    mname,
+                    tc.name()
+                ))?;
+                return Ok(None);
+            }
+        }
+        let scope: Option<Rc<PhpClass>> = match &scope_arg {
+            Some(Value::Null) => None,
+            Some(Value::Object(o)) => Some(o.borrow().class.clone()),
+            Some(Value::Str(s)) => {
+                let sn = crate::value::lossy(s).to_string();
+                if sn.eq_ignore_ascii_case("static") {
+                    // 'static' keeps the previous scope verbatim —
+                    // same as omitting the argument (zend's default
+                    // IS "static", closure_046).
+                    c.scope_class.clone()
+                } else {
+                    match self
+                        .resolve_class(&sn)
+                        .and_then(|c| self.classes.get(&c.to_lowercase()).cloned())
+                    {
+                        Some(c) => Some(c),
+                        None => {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                format!("Class \"{}\" not found", sn),
+                                0,
+                            ))
+                        }
+                    }
+                }
+            }
+            // Omitted — keep the previous scope; an unscoped closure
+            // stays on the "dummy scope" (isset() on foreign privates
+            // is still false, closure_046).
+            None => c.scope_class.clone(),
+            // Other arg types were rejected by the caller's TypeError.
+            Some(_) => None,
+        };
+        let mut nc = (*c).clone();
+        nc.this_obj = new_this;
+        nc.scope_class = scope.clone();
+        nc.called_class = scope.clone();
+        // Method-kind callables rebind the invocation target too.
+        if let CallableKind::Method { obj, name, .. } = &mut nc.kind {
+            if nc.this_obj.is_some() {
+                *obj = nc.this_obj.clone();
+            } else {
+                let _ = name;
+            }
+        }
+        Ok(Some(nc))
+    }
+
     /// `Closure::fromCallable($v)` — like fcc_val but: failures throw
     /// TypeError (caller wraps), and the scope keywords
     /// `self`/`parent`/`static` are deprecated yet still resolve
     /// non-static methods against the current `$this`
     /// (closure_from_callable_basic).
-    fn from_callable(&mut self, v: &Value) -> Result<Value, PhpError> {
+    fn callable_to_closure(&mut self, v: &Value) -> Result<Value, PhpError> {
         type Spec = Option<(String, String, Option<Rc<RefCell<PhpObject>>>)>;
         let spec: Spec = match v {
             Value::Str(s) => crate::value::lossy(s)
@@ -9285,7 +9446,9 @@ impl<'a> Interp<'a> {
                 },
                 captures: Vec::new(),
                 this_obj: bound_obj.clone(),
-                scope_class: Some(dc),
+                scope_class: Some(dc.clone()),
+                called_class: Some(dc),
+                is_static: false,
             })));
         }
         // Scope-keyword callable to a non-static method binds the
@@ -9310,7 +9473,9 @@ impl<'a> Interp<'a> {
             },
             captures: Vec::new(),
             this_obj: Some(this),
-            scope_class: Some(dc),
+            scope_class: Some(dc.clone()),
+            called_class: Some(dc),
+            is_static: false,
         })))
     }
 
@@ -9343,6 +9508,8 @@ impl<'a> Interp<'a> {
                         captures: Vec::new(),
                         this_obj: None,
                         scope_class: None,
+                        called_class: None,
+                        is_static: false,
                     })))
                 } else {
                     self.fail(PhpError::uncaught(
@@ -9365,6 +9532,8 @@ impl<'a> Interp<'a> {
                         captures: Vec::new(),
                         this_obj: Some(o.clone()),
                         scope_class: Some(o.borrow().class.clone()),
+                        called_class: Some(o.borrow().class.clone()),
+                        is_static: false,
                     })))
                 } else {
                     self.fail(PhpError::uncaught(
@@ -9473,7 +9642,9 @@ impl<'a> Interp<'a> {
                     },
                     captures: Vec::new(),
                     this_obj: Some(o),
-                    scope_class: Some(dc),
+                    scope_class: Some(dc.clone()),
+                    called_class: Some(dc),
+                    is_static: false,
                 })))
             }
             None => {
@@ -9489,7 +9660,9 @@ impl<'a> Interp<'a> {
                         },
                         captures: Vec::new(),
                         this_obj: Some(o),
-                        scope_class: Some(cls),
+                        scope_class: Some(cls.clone()),
+                        called_class: Some(cls),
+                        is_static: false,
                     })))
                 } else {
                     self.fail(PhpError::uncaught(
@@ -9549,6 +9722,8 @@ impl<'a> Interp<'a> {
                     captures: Vec::new(),
                     this_obj: None,
                     scope_class: Some(dc),
+                    called_class: Some(cls),
+                    is_static: true,
                 })))
             }
             None => {
@@ -9569,7 +9744,9 @@ impl<'a> Interp<'a> {
                         },
                         captures: Vec::new(),
                         this_obj: None,
-                        scope_class: Some(cls),
+                        scope_class: Some(cls.clone()),
+                        called_class: Some(cls),
+                        is_static: true,
                     })))
                 } else {
                     self.fail(PhpError::uncaught(
@@ -9922,7 +10099,20 @@ impl<'a> Interp<'a> {
                 } else {
                     f.fn_name.clone()
                 },
-                class: f.scope_class.as_ref().map(|c| c.name().to_string()),
+                // A closure bound to $this without a real scope runs
+                // on the "dummy scope" — traces show `Closure->`
+                // (closure_038).
+                class: f
+                    .scope_class
+                    .as_ref()
+                    .map(|c| c.name().to_string())
+                    .or_else(|| {
+                        if f.fn_name == "{closure}" && f.this_obj.is_some() {
+                            Some("Closure".to_string())
+                        } else {
+                            None
+                        }
+                    }),
                 ty: if f.this_obj.is_some() {
                     "->"
                 } else if f.scope_class.is_some() {
@@ -17668,6 +17858,135 @@ impl<'a> Interp<'a> {
                     Ok(Some(self.call_value(&cb, ca)?))
                 }
             }
+            // ReflectionFunctionAbstract closure accessors
+            // (closure_031/042). A function reflector keeps the
+            // callable under \0rc\0class; a method reflector keeps
+            // {class-name, method-name} — resolve it for scope.
+            "isclosure"
+            | "getclosure"
+            | "getclosurescopeclass"
+            | "getclosurecalledclass"
+            | "getclosurethis" => {
+                let stored = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let is_method = obj
+                    .borrow()
+                    .class
+                    .name()
+                    .eq_ignore_ascii_case("reflectionmethod");
+                let cb = match &stored {
+                    Value::Callable(c) => Some(c.clone()),
+                    _ => None,
+                };
+                if lname == "isclosure" {
+                    return Ok(Some(Value::Bool(matches!(
+                        cb.as_ref().map(|c| &c.kind),
+                        Some(CallableKind::Closure(_))
+                    ))));
+                }
+                if lname == "getclosure" {
+                    if cb.is_some() {
+                        return Ok(Some(stored));
+                    }
+                    if is_method {
+                        let cn = self.conv_str(&stored)?.to_string();
+                        let mn = obj
+                            .borrow()
+                            .props
+                            .get("\0rc\0prop")
+                            .map(|c| c.borrow().clone())
+                            .unwrap_or(Value::Null);
+                        let mn = self.conv_str(&mn)?.to_string();
+                        let target = args
+                            .first()
+                            .map(|c| c.borrow().clone())
+                            .unwrap_or(Value::Null);
+                        let (mc, tc) = match target {
+                            Value::Object(o) => (o.borrow().class.clone(), Some(o.clone())),
+                            _ => (
+                                self.classes
+                                    .get(&cn.to_lowercase())
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        PhpError::uncaught(
+                                            "ReflectionException",
+                                            format!("Class {} does not exist", cn),
+                                            0,
+                                        )
+                                    })?,
+                                None,
+                            ),
+                        };
+                        return Ok(Some(Value::Callable(self.new_callable(PhpCallable {
+                            id: std::cell::Cell::new(0),
+                            kind: CallableKind::Method {
+                                obj: tc,
+                                class: Some(mc.clone()),
+                                name: mn,
+                            },
+                            captures: Vec::new(),
+                            this_obj: None,
+                            scope_class: Some(mc.clone()),
+                            called_class: Some(mc),
+                            is_static: false,
+                        }))));
+                    }
+                    return Ok(Some(Value::Null));
+                }
+                // Scope/this accessors.
+                let (scope, called, this) = match &cb {
+                    Some(c) => (
+                        c.scope_class.clone(),
+                        c.called_class.clone(),
+                        c.this_obj.clone(),
+                    ),
+                    None if is_method => {
+                        let cn = self.conv_str(&stored)?.to_string();
+                        let mc = self.classes.get(&cn.to_lowercase()).cloned();
+                        (mc.clone(), mc, None)
+                    }
+                    None => (None, None, None),
+                };
+                match lname.as_str() {
+                    "getclosurethis" => Ok(Some(match this {
+                        Some(o) => Value::Object(o),
+                        None => Value::Null,
+                    })),
+                    _ => {
+                        let rc = if lname == "getclosurescopeclass" {
+                            scope
+                        } else {
+                            called
+                        };
+                        // Dummy scope: a closure bound to $this with
+                        // no real scope reflects class Closure
+                        // (closure_042).
+                        let nm = rc.map(|c| c.name().to_string()).or_else(|| {
+                            if lname == "getclosurescopeclass" && this.is_some() {
+                                Some("Closure".to_string())
+                            } else {
+                                None
+                            }
+                        });
+                        match nm {
+                            Some(n) => {
+                                let r = self.instantiate("reflectionclass", &[])?;
+                                if let Value::Object(o) = &r {
+                                    let mut ob = o.borrow_mut();
+                                    ob.props.insert("name".into(), cell(Value::str(&n)));
+                                    ob.props.insert("\0rc\0class".into(), cell(Value::str(&n)));
+                                }
+                                Ok(Some(r))
+                            }
+                            None => Ok(Some(Value::Null)),
+                        }
+                    }
+                }
+            }
             // ReflectionClass::getProperty($name) -> ReflectionProperty
             // carrying {\0rc\0class, \0rc\0prop} (typed_properties_018).
             "getproperty" => {
@@ -19108,8 +19427,9 @@ impl<'a> Interp<'a> {
                 self.call_value(&Value::Callable(c), argvals)
             }
             Value::Callable(c) if mn.eq_ignore_ascii_case("call") => {
-                // `$fn->call($newThis, ...$args)`: invoke rebound to
-                // $newThis (skipped for static closures).
+                // `$fn->call($newThis, ...$args)`: bind with an omitted
+                // scope then invoke — previous scope preserved when the
+                // new instance is compatible (closure_036/038).
                 let argvals = self.arg_cells(args, &[], &format!("{}()", mn), false)?;
                 let mut ca = argvals;
                 let newthis = ca
@@ -19118,68 +19438,55 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 if let Value::Object(t) = newthis {
-                    let mut nc = (*c).clone();
-                    // Rebinding a method callable to an unrelated class
-                    // warns (an error in PHP 9)
-                    // (closure_from_callable_rebinding).
-                    if let CallableKind::Method {
-                        obj: mo,
-                        class: mc,
-                        name: mname,
-                    } = &nc.kind
-                    {
-                        let mcls = mo
-                            .as_ref()
-                            .map(|o| o.borrow().class.clone())
-                            .or_else(|| mc.clone());
-                        let tc = t.borrow().class.clone();
-                        if let Some(mcls) = mcls {
-                            if !self.is_a(&tc, mcls.name()) {
-                                self.warn(&format!(
-                                    "Cannot bind method {}::{}() to object of class {}, this will be an error in PHP 9",
-                                    mcls.name(),
-                                    mname,
-                                    tc.name()
-                                ))?;
-                                // Zend skips the invocation entirely.
-                                return Ok(Value::Null);
-                            }
+                    // call() scopes to the new instance's class
+                    // (unlike bindTo's default 'static' scope).
+                    match self.rebind_closure(&c, Some(t.clone()), Some(Value::Object(t)))? {
+                        Some(nc) => {
+                            ca.cells.remove(0);
+                            return self.call_value(&Value::Callable(Rc::new(nc)), ca);
                         }
+                        // A failed bind (warned) skips the invocation
+                        // (closure_from_callable_rebinding).
+                        None => return Ok(Value::Null),
                     }
-                    // ->call also rebinds the lexical scope to the
-                    // object's class, so private slots resolve
-                    // (typed_properties_048).
-                    nc.scope_class = Some(t.borrow().class.clone());
-                    nc.this_obj = Some(t);
-                    ca.cells.remove(0);
-                    return self.call_value(&Value::Callable(Rc::new(nc)), ca);
                 }
                 self.call_value(&Value::Callable(c), ca)
             }
             Value::Callable(c) if mn.eq_ignore_ascii_case("bindto") => {
                 let argvals = self.arg_cells(args, &[], &format!("{}()", mn), false)?;
-                match argvals.cells.first().map(|c| c.borrow().clone()) {
-                    Some(Value::Object(t)) => {
-                        let mut nc = (*c).clone();
-                        nc.scope_class = match argvals.cells.get(1).map(|c| c.borrow().clone()) {
-                            // `bindTo($o)` defaults scope to "static" —
-                            // the bound object's class (static_type_return).
-                            Some(Value::Str(s)) => {
-                                let sn = crate::value::lossy(&s);
-                                if sn.eq_ignore_ascii_case("static") {
-                                    Some(t.borrow().class.clone())
-                                } else {
-                                    self.classes.get(&sn.to_lowercase()).cloned()
-                                }
-                            }
-                            Some(Value::Object(o)) => Some(o.borrow().class.clone()),
-                            Some(Value::Null) | None => Some(t.borrow().class.clone()),
-                            _ => None,
-                        };
-                        nc.this_obj = Some(t);
-                        Ok(Value::Callable(Rc::new(nc)))
+                let this = argvals.cells.first().map(|c| c.borrow().clone());
+                let scope = argvals.cells.get(1).map(|c| c.borrow().clone());
+                let new_this = match &this {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Object(o)) => Some(o.clone()),
+                    Some(v) => {
+                        let e = self.exception(
+                            "TypeError",
+                            &format!(
+                                "Closure::bindTo(): Argument #1 ($newThis) must be of type ?object, {} given",
+                                v.gettype()
+                            ),
+                        );
+                        return Err(self.throw(e));
                     }
-                    _ => Ok(Value::Null),
+                };
+                let scope_arg = match &scope {
+                    None => None,
+                    Some(v @ (Value::Null | Value::Object(_) | Value::Str(_))) => Some(v.clone()),
+                    Some(v) => {
+                        let e = self.exception(
+                            "TypeError",
+                            &format!(
+                                "Closure::bindTo(): Argument #2 ($newScope) must be of type object|string|null, {} given",
+                                v.gettype()
+                            ),
+                        );
+                        return Err(self.throw(e));
+                    }
+                };
+                match self.rebind_closure(&c, new_this, scope_arg)? {
+                    Some(nc) => Ok(Value::Callable(Rc::new(nc))),
+                    None => Ok(Value::Null),
                 }
             }
             other => self.fail(PhpError::uncaught(
@@ -19957,26 +20264,47 @@ impl<'a> Interp<'a> {
             let lname = name.to_lowercase();
             match lname.as_str() {
                 "bind" | "bindto" => {
+                    // `Closure::bind($closure, $newThis, $newScope = ?)`.
                     let c = args.cells.first().map(|c| c.borrow().clone());
                     let this = args.cells.get(1).map(|c| c.borrow().clone());
                     let scope = args.cells.get(2).map(|c| c.borrow().clone());
-                    if let Some(Value::Callable(cb)) = c {
-                        let mut nc = (*cb).clone();
-                        nc.this_obj = match &this {
-                            Some(Value::Object(o)) => Some(o.clone()),
-                            _ => None,
-                        };
-                        nc.scope_class = match &scope {
-                            Some(Value::Object(o)) => Some(o.borrow().class.clone()),
-                            Some(Value::Str(s)) => self
-                                .classes
-                                .get(&crate::value::lossy(&s).to_lowercase())
-                                .cloned(),
-                            _ => None,
-                        };
-                        return Ok(Value::Callable(Rc::new(nc)));
+                    let Value::Callable(cb) = c.unwrap_or(Value::Null) else {
+                        return Ok(Value::Null);
+                    };
+                    let new_this = match &this {
+                        None | Some(Value::Null) => None,
+                        Some(Value::Object(o)) => Some(o.clone()),
+                        Some(v) => {
+                            let e = self.exception(
+                                "TypeError",
+                                &format!(
+                                    "Closure::bind(): Argument #2 ($newThis) must be of type ?object, {} given",
+                                    v.gettype()
+                                ),
+                            );
+                            return Err(self.throw(e));
+                        }
+                    };
+                    let scope_arg = match &scope {
+                        None => None,
+                        Some(v @ (Value::Null | Value::Object(_) | Value::Str(_))) => {
+                            Some(v.clone())
+                        }
+                        Some(v) => {
+                            let e = self.exception(
+                                "TypeError",
+                                &format!(
+                                    "Closure::bind(): Argument #3 ($newScope) must be of type object|string|null, {} given",
+                                    v.gettype()
+                                ),
+                            );
+                            return Err(self.throw(e));
+                        }
+                    };
+                    match self.rebind_closure(&cb, new_this, scope_arg)? {
+                        Some(nc) => return Ok(Value::Callable(Rc::new(nc))),
+                        None => return Ok(Value::Null),
                     }
-                    return Ok(Value::Null);
                 }
                 "fromcallable" => {
                     let v = args
@@ -19984,7 +20312,7 @@ impl<'a> Interp<'a> {
                         .first()
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
-                    match self.from_callable(&v) {
+                    match self.callable_to_closure(&v) {
                         Ok(c) => return Ok(c),
                         Err(fail) => {
                             // Zend appends the reason:

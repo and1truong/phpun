@@ -2335,7 +2335,9 @@ impl<'a> Parser<'a> {
         let line = self.line();
         let mut arrow = false;
         let mut uses = Vec::new();
+        let mut is_static = false;
         if self.ident_is("static") {
+            is_static = true;
             self.pos += 1;
         }
         if self.eat_ident("fn") {
@@ -2427,6 +2429,7 @@ impl<'a> Parser<'a> {
             },
             uses,
             arrow,
+            is_static,
         }))
     }
 

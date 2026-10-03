@@ -521,6 +521,8 @@ pub struct ClosureExpr {
     pub uses: Vec<(String, bool)>,
     /// Arrow fn `fn(...) => expr`: captures whole parent scope by value.
     pub arrow: bool,
+    /// `static function` — never binds $this.
+    pub is_static: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

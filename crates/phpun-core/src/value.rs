@@ -1027,6 +1027,12 @@ pub struct PhpCallable {
     pub this_obj: Option<Rc<RefCell<PhpObject>>>,
     /// Declared class context for `self::`/`static::` inside the body.
     pub scope_class: Option<Rc<PhpClass>>,
+    /// Late-static-binding class captured at creation — `static::`
+    /// inside the body resolves to it (closure_049-052, bug66622).
+    pub called_class: Option<Rc<PhpClass>>,
+    /// `static function`/static-method callables can never bind $this
+    /// (closure_041/043, disallows_*).
+    pub is_static: bool,
 }
 
 #[derive(Debug, Clone)]
