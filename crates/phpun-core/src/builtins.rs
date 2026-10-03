@@ -3504,12 +3504,10 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
             let pad3 = format!("{}    ", pad);
             let mut keys: Vec<(String, String)> = Vec::new();
             let mut this_obj = None;
-            let params: Option<Vec<(String, bool)>>;
-            match &c.kind {
+            let params: Option<Vec<(String, bool)>> = match &c.kind {
                 crate::value::CallableKind::Named(n) => {
                     keys.push(("function".into(), n.clone()));
-                    params = it
-                        .functions
+                    it.functions
                         .get(&n.to_lowercase())
                         .map(|d| {
                             d.params
@@ -3517,7 +3515,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                                 .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
                                 .collect()
                         })
-                        .or_else(|| builtin_sig(&n.to_lowercase()));
+                        .or_else(|| builtin_sig(&n.to_lowercase()))
                 }
                 crate::value::CallableKind::Method { obj, class, name } => {
                     let cn = c
@@ -3538,7 +3536,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                         .as_ref()
                         .map(|o| o.borrow().class.clone())
                         .or_else(|| class.clone());
-                    params = cls.and_then(|cl| {
+                    cls.and_then(|cl| {
                         it.find_method_in(&cl, name).map(|(m, _)| {
                             m.decl
                                 .params
@@ -3546,20 +3544,20 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                                 .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
                                 .collect()
                         })
-                    });
+                    })
                 }
                 crate::value::CallableKind::Closure(d) => {
                     keys.push(("name".into(), format!("{{closure:{}:{}}}", d.file, d.line)));
                     keys.push(("file".into(), d.file.clone()));
                     keys.push(("line".into(), String::new())); // int below
-                    params = Some(
+                    Some(
                         d.params
                             .iter()
                             .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
                             .collect(),
-                    );
+                    )
                 }
-            }
+            };
             let has_params = params.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
             let nfields = keys.len() + this_obj.is_some() as usize + has_params as usize;
             it.emit(&format!(
