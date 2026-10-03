@@ -11027,12 +11027,8 @@ impl<'a> Interp<'a> {
                 self.class_const_ctx += 1;
                 let r = self.eval_decl_const(&cd.value, &file);
                 self.class_const_ctx -= 1;
-                match r {
-                    Ok(v) => {
-                        self.const_apply_ty(cd, &c.decl.name, v)?;
-                    }
-                    Err(e) => return Err(e),
-                }
+                let v = r?;
+                self.const_apply_ty(cd, &c.decl.name, v)?;
             }
         }
         Ok(())
