@@ -5494,10 +5494,11 @@ impl<'a> Interp<'a> {
                 if !is_priv {
                     // The NEAREST redecl is authoritative — defaults are
                     // never inherited (default_value_inheritance): a later
-                    // decl replaces any slot a grandparent already made.
+                    // decl replaces any slot a grandparent already made,
+                    // but keeps the first declaration's slot position
+                    // (foreachLoopObjects.002).
                     if !seen.insert(p.name.clone()) {
                         props.remove(&p.name);
-                        prop_order.retain(|k| k != &p.name);
                     }
                 }
                 let backed = if p.hooks.is_some() {
