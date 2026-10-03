@@ -51,6 +51,33 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
 /// `parse` honoring `short_open_tag` (INI `short_open_tag=On`).
 pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
     let toks = lex_with(src, short_open)?;
+    parse_toks(toks)
+}
+
+/// phpun source mode: PHP code from byte 0, no `<?php` required (a
+/// leading tag falls back to classic tag mode for legacy sources).
+/// If pure-source parsing fails and the source contains a `<?` tag
+/// anywhere, the legacy tag-mode parse is tried so HTML-embedded PHP
+/// keeps working; the pure-mode error is preferred if both fail.
+pub fn parse_source(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
+    parse_pure(src, short_open).or_else(|e| {
+        if src.contains("<?") {
+            if let Ok(stmts) = parse_with(src, short_open) {
+                return Ok(stmts);
+            }
+        }
+        Err(e)
+    })
+}
+
+/// Strict pure-source parse — no tag-mode detection or retry. Used for
+/// eval()'d code, which in PHP is always tag-free source.
+pub fn parse_pure(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
+    let toks = crate::lexer::lex_php_source(src, short_open)?;
+    parse_toks(toks)
+}
+
+fn parse_toks(toks: Vec<Lexed>) -> Result<Vec<Stmt>, PhpError> {
     // Compile-time diagnostics ride the token stream; drain them and
     // emit before execution (Zend emits compile warnings upfront).
     let mut lex_diags: Vec<(String, &'static str, usize)> = Vec::new();

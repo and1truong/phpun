@@ -124,33 +124,66 @@ pub fn lex(src: &str) -> Result<Vec<Lexed>, PhpError> {
 
 /// `lex` with `short_open_tag` — when on, `<?` opens PHP like `<?php`.
 pub fn lex_with(src: &str, short_open: bool) -> Result<Vec<Lexed>, PhpError> {
+    let (src, shebang) = strip_shebang(src);
+    let mut out = Vec::new();
+    // The shebang occupies line 1; real numbering starts at line 2.
+    let mut line = if shebang { 2 } else { 1 };
+    scan_html(src, 0, &mut line, &mut out, short_open)?;
+    Ok(out)
+}
+
+fn strip_shebang(src: &str) -> (&str, bool) {
     // CLI PHP skips a leading `#!...` shebang line (tests/lang/bug23584).
-    let (src, shebang) = match src.strip_prefix("#!") {
+    match src.strip_prefix("#!") {
         Some(rest) => match rest.find('\n') {
             Some(nl) => (&rest[nl + 1..], true),
             None => ("", true),
         },
         None => (src, false),
-    };
-    let mut out = Vec::new();
-    let bytes = src.as_bytes();
-    let mut pos = 0usize;
-    // The shebang occupies line 1; real numbering starts at line 2.
-    let mut line = if shebang { 2 } else { 1 };
+    }
+}
 
+/// phpun source mode: the file is PHP code from byte 0 — no `<?php` tag
+/// required. A leading `<?php` tag opts back into legacy tag mode so
+/// mixed/HTML-embedded sources (and the PHPT corpus) keep working; `?>`
+/// mid-file still drops to inline output like classic PHP.
+pub fn lex_php_source(src: &str, short_open: bool) -> Result<Vec<Lexed>, PhpError> {
+    let (body, shebang) = strip_shebang(src);
+    if body.len() >= 5 && body[..5].eq_ignore_ascii_case("<?php") && boundary(body, 5) {
+        return lex_with(src, short_open);
+    }
+    let src = body;
+    let mut out = Vec::new();
+    let mut line = if shebang { 2 } else { 1 };
+    let pos = lex_php(src, 0, &mut line, &mut out)?;
+    if pos < src.len() {
+        scan_html(src, pos, &mut line, &mut out, short_open)?;
+    }
+    Ok(out)
+}
+
+/// Inline-HTML scanning: everything outside `<?php`/`<?=`/`<?` is echoed.
+fn scan_html(
+    src: &str,
+    mut pos: usize,
+    line: &mut usize,
+    out: &mut Vec<Lexed>,
+    short_open: bool,
+) -> Result<(), PhpError> {
+    let bytes = src.as_bytes();
     while pos < bytes.len() {
         // Inline HTML until an open tag.
         let rest = &src[pos..];
         match rest.find("<?") {
             None => {
-                push(&mut out, Token::Inline(rest.to_string()), line);
+                push(out, Token::Inline(rest.to_string()), *line);
                 pos = bytes.len();
             }
             Some(off) => {
                 if off > 0 {
                     let html = &rest[..off];
-                    line += html.matches('\n').count();
-                    push(&mut out, Token::Inline(html.to_string()), line);
+                    *line += html.matches('\n').count();
+                    push(out, Token::Inline(html.to_string()), *line);
                 }
                 let tag_at = pos + off;
                 let after = &src[tag_at..];
@@ -159,12 +192,12 @@ pub fn lex_with(src: &str, short_open: bool) -> Result<Vec<Lexed>, PhpError> {
                     && boundary(after, 5)
                 {
                     pos = tag_at + 5;
-                    pos += skip_ws_and_newline(&src[pos..], &mut line);
-                    pos = lex_php(src, pos, &mut line, &mut out)?;
+                    pos += skip_ws_and_newline(&src[pos..], line);
+                    pos = lex_php(src, pos, line, out)?;
                 } else if after.starts_with("<?=") {
                     pos = tag_at + 3;
-                    push(&mut out, Token::Echo, line);
-                    pos = lex_php(src, pos, &mut line, &mut out)?;
+                    push(out, Token::Echo, *line);
+                    pos = lex_php(src, pos, line, out)?;
                 } else if short_open
                     && (rest[off..].starts_with("<?\n")
                         || rest[off..].starts_with("<?\r")
@@ -173,16 +206,16 @@ pub fn lex_with(src: &str, short_open: bool) -> Result<Vec<Lexed>, PhpError> {
                 {
                     // `<?` with short_open_tag=on opens PHP mode.
                     pos = tag_at + 2;
-                    pos += skip_ws_and_newline(&src[pos..], &mut line);
-                    pos = lex_php(src, pos, &mut line, &mut out)?;
+                    pos += skip_ws_and_newline(&src[pos..], line);
+                    pos = lex_php(src, pos, line, out)?;
                 } else {
-                    push(&mut out, Token::Inline("<?".to_string()), line);
+                    push(out, Token::Inline("<?".to_string()), *line);
                     pos = tag_at + 2;
                 }
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn boundary(s: &str, n: usize) -> bool {

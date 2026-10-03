@@ -882,7 +882,7 @@ impl<'a> Interp<'a> {
     }
 
     pub fn run_source(&mut self, src: &str) -> RunResult {
-        match parser::parse_with(src, self.ini_on("short_open_tag")) {
+        match parser::parse_source(src, self.ini_on("short_open_tag")) {
             Ok(stmts) => self.run(&stmts),
             Err(e) => {
                 // Compile-time semantic errors (hook decl checks, `parent::`
@@ -9403,7 +9403,7 @@ impl<'a> Interp<'a> {
             }
         };
         let fname = canon.display().to_string();
-        let stmts = match parser::parse(&src) {
+        let stmts = match parser::parse_source(&src, self.ini_on("short_open_tag")) {
             Ok(s) => s,
             Err(e) => {
                 match e.kind {
@@ -9461,9 +9461,8 @@ impl<'a> Interp<'a> {
 
     fn eval_code(&mut self, code: &str) -> Result<Value, PhpError> {
         // eval'd code has no <?php tag; strip a leading one defensively.
-        let src = code.strip_prefix("<?php").map(|s| s.to_string());
-        let src = src.unwrap_or_else(|| format!("<?php\n{}", code));
-        match parser::parse(&src) {
+        let src = code.strip_prefix("<?php").unwrap_or(code).to_string();
+        match parser::parse_pure(&src, self.ini_on("short_open_tag")) {
             Ok(stmts) => {
                 let flow = self.exec_block(&stmts);
                 match flow {
@@ -9492,16 +9491,13 @@ impl<'a> Interp<'a> {
                 }
             }
             Err(e) => {
-                // ` on line N` inside bracket messages is padded-file
-                // relative — unshift it (syntax_errors).
-                let msg = Self::unshift_line_ref(&e.message);
+                let msg = e.message.clone();
                 let v = self.exception("ParseError", &msg);
                 if let Value::Object(o) = &v {
                     if let Some(ObjectInternal::Exception { eval_ctx, .. }) =
                         &mut o.borrow_mut().internal
                     {
-                        // `<?php\n` prepend shifts inner lines by one.
-                        *eval_ctx = e.line.saturating_sub(1) as u32;
+                        *eval_ctx = e.line as u32;
                     }
                 }
                 self.pending_exception = Some(v);
@@ -9515,29 +9511,6 @@ impl<'a> Interp<'a> {
                 })
             }
         }
-    }
-
-    /// Rewrites ` on line N` inside an error message to N-1 — eval'd
-    /// code is parsed behind a `<?php\n` pad that shifts every line.
-    fn unshift_line_ref(msg: &str) -> String {
-        let Some(p) = msg.find(" on line ") else {
-            return msg.to_string();
-        };
-        let tail = &msg[p + 9..];
-        let digits: usize = tail
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .map(|c| c.len_utf8())
-            .sum();
-        let Ok(n) = tail[..digits].parse::<usize>() else {
-            return msg.to_string();
-        };
-        format!(
-            "{}{}{}",
-            &msg[..p + 9],
-            n.saturating_sub(1),
-            &tail[digits..]
-        )
     }
 
     /// Flush all output buffers at script end, innermost first so each
