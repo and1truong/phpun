@@ -8242,7 +8242,7 @@ impl<'a> Interp<'a> {
                         Some(Expr::Str(_)) => "string",
                         _ => "bool",
                     };
-                    let mut disp = ty.clone();
+                    let mut disp = Self::zpp_ty_disp(ty);
                     disp.retain(|m| !m.eq_ignore_ascii_case("null"));
                     let tn = disp.join("|");
                     if disp
@@ -8273,9 +8273,100 @@ impl<'a> Interp<'a> {
                 self.cur_line = saved;
                 return Err(e);
             }
+            // `return;` (or any `return` under `never`) is a compile
+            // error in typed functions — generators are exempt
+            // (typed_return_without_value, never).
+            if !Self::decl_contains_yield(&decl.body) {
+                let never = ty.iter().any(|m| m.eq_ignore_ascii_case("never"));
+                let void = ty.iter().all(|m| m.eq_ignore_ascii_case("void"));
+                if never {
+                    if let Some(l) = Self::first_return_line(&decl.body, decl.line, false) {
+                        self.cur_line = saved;
+                        return Err(PhpError::compile_fatal(
+                            "A never-returning function must not return",
+                            l,
+                        ));
+                    }
+                } else if !void {
+                    if let Some(l) = Self::first_return_line(&decl.body, decl.line, true) {
+                        self.cur_line = saved;
+                        let hint = if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) {
+                            " (did you mean \"return null;\" instead of \"return;\"?)"
+                        } else {
+                            ""
+                        };
+                        return Err(PhpError::compile_fatal(
+                            format!("A function with return type must return a value{hint}"),
+                            l,
+                        ));
+                    }
+                }
+            }
         }
         self.cur_line = saved;
         Ok(())
+    }
+
+    /// First `return`'s line within a body — `bare_only` restricts to
+    /// value-less `return;`. Nested function/closure/class bodies are
+    /// their own scope and skipped (typed_return_without_value).
+    fn first_return_line(stmts: &[Stmt], mut cur: usize, bare_only: bool) -> Option<usize> {
+        for s in stmts {
+            match s {
+                Stmt::Line(l) => cur = *l,
+                Stmt::Return(e) if e.is_none() || !bare_only => return Some(cur),
+                Stmt::Return(_) => {}
+                Stmt::Block(b) => {
+                    if let Some(l) = Self::first_return_line(b, cur, bare_only) {
+                        return Some(l);
+                    }
+                }
+                Stmt::If { then, else_, .. } => {
+                    if let Some(l) = Self::first_return_line(then, cur, bare_only)
+                        .or_else(|| Self::first_return_line(else_, cur, bare_only))
+                    {
+                        return Some(l);
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::Foreach { body, .. } => {
+                    if let Some(l) = Self::first_return_line(body, cur, bare_only) {
+                        return Some(l);
+                    }
+                }
+                Stmt::Switch { cases, .. } => {
+                    for (_, b) in cases {
+                        if let Some(l) = Self::first_return_line(b, cur, bare_only) {
+                            return Some(l);
+                        }
+                    }
+                }
+                Stmt::Try {
+                    body,
+                    catches,
+                    finally,
+                } => {
+                    if let Some(l) = Self::first_return_line(body, cur, bare_only)
+                        .or_else(|| {
+                            catches
+                                .iter()
+                                .find_map(|c| Self::first_return_line(&c.body, cur, bare_only))
+                        })
+                        .or_else(|| {
+                            finally
+                                .as_ref()
+                                .and_then(|b| Self::first_return_line(b, cur, bare_only))
+                        })
+                    {
+                        return Some(l);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Union-type redundancy rules at decl time (PHP 8.x compile
@@ -8424,6 +8515,12 @@ impl<'a> Interp<'a> {
     /// Scalar literal default check context ends; whether `v` satisfies a
     /// type member — scalar builtins pass (weak-mode coercion territory).
     fn param_type_match(&mut self, m: &str, v: &Value) -> bool {
+        // Intersection member `A&B`: every part must match
+        // (intersection_types/variance).
+        if m.contains('&') && !m.starts_with('(') {
+            let parts: Vec<String> = m.split('&').map(|p| p.to_string()).collect();
+            return parts.iter().all(|p| self.param_type_match(p, v));
+        }
         let l = m.to_lowercase();
         match l.as_str() {
             "null" => matches!(v, Value::Null),
@@ -8586,7 +8683,7 @@ impl<'a> Interp<'a> {
     fn zval_type_name(&self, v: &Value) -> String {
         match v {
             Value::Null => "null".into(),
-            Value::Bool(_) => "bool".into(),
+            Value::Bool(b) => if *b { "true" } else { "false" }.into(),
             Value::Int(_) => "int".into(),
             Value::Float(_) => "float".into(),
             Value::Str(_) => "string".into(),
@@ -8595,6 +8692,20 @@ impl<'a> Interp<'a> {
             Value::Callable(_) => "Closure".into(),
             Value::Resource(_) => "resource".into(),
         }
+    }
+
+    /// ZPP-style type display: `iterable` expands to `Traversable|array`
+    /// in param/return TypeErrors and default-value fatals (iterable_*).
+    fn zpp_ty_disp(ty: &[String]) -> Vec<String> {
+        ty.iter()
+            .flat_map(|m| {
+                if m.eq_ignore_ascii_case("iterable") {
+                    vec!["Traversable".to_string(), "array".to_string()]
+                } else {
+                    vec![m.clone()]
+                }
+            })
+            .collect()
     }
 
     /// Display name for a decl in diagnostics — closures are named
@@ -8706,11 +8817,8 @@ impl<'a> Interp<'a> {
             }
             if !ok {
                 let fname = self.decl_fname(decl);
-                let mut disp: Vec<String> = ty
-                    .iter()
-                    .filter(|m| !m.eq_ignore_ascii_case("null"))
-                    .cloned()
-                    .collect();
+                let mut disp: Vec<String> = Self::zpp_ty_disp(ty);
+                disp.retain(|m| !m.eq_ignore_ascii_case("null"));
                 if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) || implicit_null {
                     if disp.len() == 1 {
                         disp[0] = format!("?{}", disp[0]);
@@ -8934,6 +9042,13 @@ impl<'a> Interp<'a> {
         self.stack.pop();
         match flow {
             Flow::Return(v) => {
+                // In a generator body `return v` is the iterator's
+                // getReturn() payload — the declared return type binds
+                // the produced Generator object, not this value
+                // (generator_return_return_type).
+                if decl.ret.is_some() && Self::decl_contains_yield(&decl.body) {
+                    return Ok(v);
+                }
                 if let Some(ty) = &decl.ret {
                     let ret_strict = self.strict_files.contains(&decl.file);
                     let ok = ty
@@ -8946,11 +9061,8 @@ impl<'a> Interp<'a> {
                             None => Ok(v),
                         }
                     } else {
-                        let disp: Vec<String> = ty
-                            .iter()
-                            .filter(|m| !m.eq_ignore_ascii_case("null"))
-                            .cloned()
-                            .collect();
+                        let mut disp: Vec<String> = Self::zpp_ty_disp(ty);
+                        disp.retain(|m| !m.eq_ignore_ascii_case("null"));
                         let given = self.zval_type_name(&v);
                         let msg = format!(
                             "{}(): Return value must be of type {}, {} returned",
@@ -8992,7 +9104,42 @@ impl<'a> Interp<'a> {
                 "'break' or 'continue' outside of loop or switch context",
                 0,
             )),
-            Flow::Normal => Ok(Value::Null),
+            Flow::Normal => {
+                // Falling off the end of a typed function still checks
+                // the return type: `none returned` TypeError for real
+                // types, `must not implicitly return` for `never`
+                // (typed_return*_without_value). Generators are exempt —
+                // their declared type describes the produced object.
+                if decl.ret.is_some() && Self::decl_contains_yield(&decl.body) {
+                    return Ok(Value::Null);
+                }
+                if let Some(ty) = &decl.ret {
+                    let never = ty.iter().any(|m| m.eq_ignore_ascii_case("never"));
+                    let void = ty.iter().all(|m| m.eq_ignore_ascii_case("void"));
+                    if never {
+                        let msg = format!(
+                            "{}: never-returning function must not implicitly return",
+                            ret_fname
+                        );
+                        let mut e = PhpError::uncaught("TypeError", msg, self.cur_line);
+                        e.thrown_line = Some(decl.line);
+                        return self.fail(e);
+                    }
+                    if !void {
+                        let mut disp_v = Self::zpp_ty_disp(ty);
+                        disp_v.retain(|m| !m.eq_ignore_ascii_case("null"));
+                        let disp = disp_v.join("|");
+                        let msg = format!(
+                            "{}(): Return value must be of type {}, none returned",
+                            ret_fname, disp
+                        );
+                        let mut e = PhpError::uncaught("TypeError", msg, self.cur_line);
+                        e.thrown_line = Some(decl.line);
+                        return self.fail(e);
+                    }
+                }
+                Ok(Value::Null)
+            }
         }
     }
 

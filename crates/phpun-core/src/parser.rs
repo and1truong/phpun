@@ -1533,7 +1533,7 @@ impl<'a> Parser<'a> {
                             Some(Token::Op(o)) if *o == "="
                         )
                     {
-                        self.take_type()
+                        self.take_type()?
                     } else {
                         None
                     }
@@ -1687,7 +1687,7 @@ impl<'a> Parser<'a> {
                 Some(Token::Ident(_)) | Some(Token::Op("?")) | Some(Token::Op("\\"))
             ) && !matches!(self.peek2(), Some(Token::Op("(")))
             {
-                self.take_type()
+                self.take_type()?
             } else {
                 None
             };
@@ -1772,7 +1772,7 @@ impl<'a> Parser<'a> {
         let prev_hook = self.hook_ctx.take();
         let params = self.params()?;
         let ret = if self.eat_op(":") {
-            self.take_type()
+            self.take_type()?
         } else {
             None
         };
@@ -1999,13 +1999,21 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
+            // `static` is never a legal param modifier/type
+            // (static_type_param).
+            if self.ident_is("static") {
+                return Err(PhpError::fatal(
+                    "Cannot use the static modifier on a parameter",
+                    self.line(),
+                ));
+            }
             // skip type declaration before the variable
             let ty = if matches!(
                 self.peek(),
                 Some(Token::Ident(_)) | Some(Token::Op("?")) | Some(Token::Op("\\"))
             ) && !matches!(self.peek2(), Some(Token::Op(",")) | Some(Token::Op(")")))
             {
-                self.take_type()
+                self.take_type()?
             } else {
                 None
             };
@@ -2158,7 +2166,7 @@ impl<'a> Parser<'a> {
         let params = self.params()?;
         // Return type declarations (: int).
         let ret = if self.eat_op(":") {
-            self.take_type()
+            self.take_type()?
         } else {
             None
         };
@@ -2219,24 +2227,24 @@ impl<'a> Parser<'a> {
             }
             self.expect_op(")")?;
         }
+        // `: ret` after `(` — return types apply to closures too
+        // (scalar_strict uses `{closure:...}(): Return value ...` TypeErrors).
+        let cret = if self.eat_op(":") {
+            self.take_type()?
+        } else {
+            None
+        };
         let body = if arrow {
-            // `fn (p): ret => e` — arrow fns take a return type too.
-            if self.eat_op(":") {
-                self.skip_type()?;
-            }
             self.expect_op("=>")?;
             let e = self.expr()?;
             vec![Stmt::Return(Some(e))]
         } else {
-            if self.eat_op(":") {
-                self.skip_type()?;
-            }
             self.body()?
         };
         self.hook_ctx = prev_hook;
         Ok(Expr::Closure(ClosureExpr {
             decl: FunctionDecl {
-                ret: None,
+                ret: cret,
                 name: String::new(),
                 params,
                 body,
@@ -2414,7 +2422,7 @@ impl<'a> Parser<'a> {
                 let pty = if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
                     && !matches!(self.peek2(), Some(Token::Op("(")))
                 {
-                    self.take_type()
+                    self.take_type()?
                 } else {
                     None
                 };
@@ -2606,13 +2614,13 @@ impl<'a> Parser<'a> {
 
     /// Skip a type declaration (names, |, &, ?, parenthesized DNF).
     fn skip_type(&mut self) -> Result<(), PhpError> {
-        let _ = self.take_type();
+        let _ = self.take_type()?;
         Ok(())
     }
 
     /// Consume a type expression, returning its member names in source
     /// order. `?T`/`T|null` append a "null" member; parentheses flatten.
-    fn take_type(&mut self) -> Option<Vec<String>> {
+    fn take_type(&mut self) -> Result<Option<Vec<String>>, PhpError> {
         let mut members: Vec<String> = Vec::new();
         let mut nullable = false;
         let mut depth = 0i32;
@@ -2671,12 +2679,29 @@ impl<'a> Parser<'a> {
         if nullable {
             members.push("null".into());
         }
-        if members.is_empty() {
+        let members = if members.is_empty() {
             None
         } else {
+            // `mixed` already covers every type incl. null: `?mixed` and
+            // `mixed|x` are compile errors (mixed_* tests).
+            if members.iter().any(|m| m.eq_ignore_ascii_case("mixed")) {
+                let line = self.line();
+                if nullable {
+                    return Err(PhpError::compile_fatal(
+                        "Type mixed cannot be marked as nullable since mixed already includes null",
+                        line,
+                    ));
+                }
+                if members.len() > 1 {
+                    return Err(PhpError::compile_fatal(
+                        "Type mixed can only be used as a standalone type",
+                        line,
+                    ));
+                }
+            }
             // Class-type members resolve against the current namespace /
             // use-aliases at compile time; builtin scalar types do not
-            // (namespaces/ns_055).
+            // (namespaces/ns_055). `&`-intersections resolve each part.
             const BUILTIN_TYS: &[&str] = &[
                 "int", "float", "string", "bool", "array", "callable", "iterable", "object",
                 "mixed", "void", "never", "null", "false", "true", "numeric", "resource", "self",
@@ -2686,15 +2711,30 @@ impl<'a> Parser<'a> {
                 members
                     .into_iter()
                     .map(|m| {
-                        if m.is_empty() || BUILTIN_TYS.contains(&m.to_lowercase().as_str()) {
-                            m
+                        let (pre, inner, post) = if m.starts_with('(') && m.ends_with(')') {
+                            ("(", &m[1..m.len() - 1], ")")
                         } else {
-                            self.ns_resolve(&m, NsKind::Class)
-                        }
+                            ("", m.as_str(), "")
+                        };
+                        let resolved = inner
+                            .split('&')
+                            .map(|p| {
+                                let p = p.trim_start_matches('\\');
+                                if p.is_empty() || BUILTIN_TYS.contains(&p.to_lowercase().as_str())
+                                {
+                                    p.to_string()
+                                } else {
+                                    self.ns_resolve(p, NsKind::Class)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("&");
+                        format!("{pre}{resolved}{post}")
                     })
                     .collect(),
             )
-        }
+        };
+        Ok(members)
     }
 
     fn expr_list(&mut self) -> Result<Vec<Expr>, PhpError> {
