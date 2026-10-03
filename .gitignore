@@ -1,3 +1,6 @@
 vendor/
 target/
 !examples/fastroute/vendor/
+!examples/composer/vendor/
+!examples/http-foundation/vendor/
+!crates/phpun-core/tests/fixtures/composer_autoload/vendor/

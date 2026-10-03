@@ -27,7 +27,9 @@ pub enum Token {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StringPart {
-    Lit(String),
+    /// Literal bytes — escapes decode to raw bytes (PHP strings are
+    /// byte arrays; `\xNN` is a byte, not a codepoint).
+    Lit(Vec<u8>),
     /// `$name`
     Var(String),
     /// `{$expr_source}` — re-lexed lazily by the parser.
@@ -621,7 +623,7 @@ fn interp_scan(
     let b = src.as_bytes();
     let mut n = n0;
     let mut parts: Vec<StringPart> = Vec::new();
-    let mut lit = String::new();
+    let mut lit: Vec<u8> = Vec::new();
     macro_rules! flush {
         () => {
             if !lit.is_empty() {
@@ -644,16 +646,16 @@ fn interp_scan(
             }
             Some(&b'\\') => {
                 let e = b.get(pos + n + 1).copied();
-                let (ch, adv) = match e {
-                    Some(b'n') => ('\n', 2),
-                    Some(b't') => ('\t', 2),
-                    Some(b'r') => ('\r', 2),
-                    Some(b'v') => ('\x0b', 2),
-                    Some(b'e') => ('\x1b', 2),
-                    Some(b'f') => ('\x0c', 2),
-                    Some(b'\\') => ('\\', 2),
-                    Some(b'$') => ('$', 2),
-                    Some(b'"') => ('"', 2),
+                let (ebytes, adv): (Vec<u8>, usize) = match e {
+                    Some(b'n') => (b"\n".to_vec(), 2),
+                    Some(b't') => (b"\t".to_vec(), 2),
+                    Some(b'r') => (b"\r".to_vec(), 2),
+                    Some(b'v') => (b"\x0b".to_vec(), 2),
+                    Some(b'e') => (b"\x1b".to_vec(), 2),
+                    Some(b'f') => (b"\x0c".to_vec(), 2),
+                    Some(b'\\') => (b"\\".to_vec(), 2),
+                    Some(b'$') => (b"$".to_vec(), 2),
+                    Some(b'"') => (b"\"".to_vec(), 2),
                     Some(b'0'..=b'7') => {
                         let mut v = 0u32;
                         let mut k = 1;
@@ -680,9 +682,10 @@ fn interp_scan(
                                 line: line + s_matches(&src[pos..pos + n]),
                                 ws_adj: 0,
                             });
-                            (char::from_u32(v & 0xff).unwrap_or('\u{fffd}'), k)
+                            (vec![(v & 0xff) as u8], k)
                         } else {
-                            (char::from_u32(v).unwrap_or('\u{fffd}'), k)
+                            // \NNN is a raw byte, not a codepoint.
+                            (vec![v as u8], k)
                         }
                     }
                     Some(b'x') => {
@@ -698,9 +701,10 @@ fn interp_scan(
                             }
                         }
                         if k == 2 {
-                            ('\\', 1)
+                            (b"\\".to_vec(), 1)
                         } else {
-                            (char::from_u32(v).unwrap_or('\u{fffd}'), k)
+                            // \xNN is a raw byte, not a codepoint.
+                            (vec![v as u8], k)
                         }
                     }
                     Some(b'u') if b.get(pos + n + 2) == Some(&b'{') => {
@@ -745,13 +749,28 @@ fn interp_scan(
                                 line,
                             ));
                         }
-                        // PHP emits raw UTF-8 even for surrogate halves
-                        // (CESU-8); our UTF-8 String can't hold them.
-                        (char::from_u32(v).unwrap_or('\u{fffd}'), k)
+                        // PHP emits CESU-8 for surrogate halves — a
+                        // Rust char can't hold them, encode the 3-byte
+                        // form by hand (unicode_escape_surrogates.phpt).
+                        match char::from_u32(v) {
+                            Some(c) => {
+                                let mut tmp = [0u8; 4];
+                                (c.encode_utf8(&mut tmp).as_bytes().to_vec(), k)
+                            }
+                            None if (0xD800..=0xDFFF).contains(&v) => (
+                                vec![
+                                    0xED,
+                                    0xA0 + ((v - 0xD800) >> 6) as u8,
+                                    0x80 + ((v - 0xD800) & 0x3f) as u8,
+                                ],
+                                k,
+                            ),
+                            None => (b"\xef\xbf\xbd".to_vec(), k),
+                        }
                     }
-                    _ => ('\\', 1),
+                    _ => (b"\\".to_vec(), 1),
                 };
-                lit.push(ch);
+                lit.extend_from_slice(&ebytes);
                 n += adv;
             }
             Some(&b'{') if b.get(pos + n + 1) == Some(&b'$') => {
@@ -847,7 +866,7 @@ fn interp_scan(
                 } else {
                     let (name, len) = ident(src, pos + n + 1);
                     if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
-                        lit.push('$');
+                        lit.push(b'$');
                         n += 1;
                     } else {
                         flush!();
@@ -901,7 +920,8 @@ fn interp_scan(
             }
             Some(_) => {
                 let ch = src[pos + n..].chars().next().unwrap();
-                lit.push(ch);
+                let mut tmp = [0u8; 4];
+                lit.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
                 n += ch.len_utf8();
             }
         }
