@@ -1839,6 +1839,7 @@ impl<'a> Interp<'a> {
                 methods: vec![
                     mk_method("isCallable", vec![]),
                     mk_method("isVariadic", vec![]),
+                    mk_method("hasType", vec![]),
                     mk_method("getType", vec![]),
                     mk_method("getName", vec![]),
                 ],
@@ -8467,6 +8468,14 @@ impl<'a> Interp<'a> {
                         let vals = self.arg_cells(args, &params, "", false)?;
                         return self.call_value(&v, vals);
                     }
+                    Value::Array(_) => {
+                        // `[obj,'m']` / `[$closure,'__invoke']` array
+                        // callables (bug78689).
+                        let c = self.fcc_val(&v)?;
+                        let params = self.callable_params(&c);
+                        let vals = self.arg_cells(args, &params, "", false)?;
+                        return self.call_value(&c, vals);
+                    }
                     _ => self.conv_str(&v).unwrap_or_default(),
                 }
             }
@@ -8497,6 +8506,12 @@ impl<'a> Interp<'a> {
                         let params = self.callable_params(&v);
                         let vals = self.arg_cells(args, &params, "", false)?;
                         return self.call_value(&v, vals);
+                    }
+                    Value::Array(_) => {
+                        let c = self.fcc_val(&v)?;
+                        let params = self.callable_params(&c);
+                        let vals = self.arg_cells(args, &params, "", false)?;
+                        return self.call_value(&c, vals);
                     }
                     _ => self.conv_str(&v).unwrap_or_default(),
                 }
@@ -9183,6 +9198,122 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `Closure::fromCallable($v)` — like fcc_val but: failures throw
+    /// TypeError (caller wraps), and the scope keywords
+    /// `self`/`parent`/`static` are deprecated yet still resolve
+    /// non-static methods against the current `$this`
+    /// (closure_from_callable_basic).
+    fn from_callable(&mut self, v: &Value) -> Result<Value, PhpError> {
+        type Spec = Option<(String, String, Option<Rc<RefCell<PhpObject>>>)>;
+        let spec: Spec = match v {
+            Value::Str(s) => crate::value::lossy(s)
+                .split_once("::")
+                .map(|(cn, mn)| (cn.to_string(), mn.to_string(), None)),
+            Value::Array(a) => {
+                let a = a.borrow();
+                let t = a.get(&ArrKey::Int(0));
+                let m = a.get(&ArrKey::Int(1));
+                match (t, m) {
+                    (Some(Value::Str(cn)), Some(mv)) => Some((
+                        crate::value::lossy(&cn).to_string(),
+                        mv.to_php_string(),
+                        None,
+                    )),
+                    (Some(Value::Object(o)), Some(mv)) => {
+                        Some((String::new(), mv.to_php_string(), Some(o.clone())))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((cn, mn, bound_obj)) = spec else {
+            return self.fcc_val(v);
+        };
+        let kw = cn.to_ascii_lowercase();
+        let is_scope_kw = matches!(kw.as_str(), "self" | "parent" | "static");
+        if bound_obj.is_none() && is_scope_kw {
+            self.deprecated(&format!("Use of \"{}\" in callables is deprecated", kw))?;
+        }
+        let cls: Option<Rc<PhpClass>> = if let Some(o) = &bound_obj {
+            Some(o.borrow().class.clone())
+        } else if is_scope_kw {
+            let f = self.stack.last();
+            let scope = f.and_then(|f| f.decl_class.clone().or(f.scope_class.clone()));
+            match kw.as_str() {
+                "self" => scope,
+                "parent" => scope.and_then(|s| {
+                    s.decl
+                        .parent
+                        .as_ref()
+                        .and_then(|p| self.classes.get(&p.to_lowercase()).cloned())
+                }),
+                "static" => f.and_then(|f| f.called_class.clone()).or(scope),
+                _ => None,
+            }
+        } else {
+            self.resolve_class(&cn)
+                .and_then(|c| self.classes.get(&c.to_lowercase()).cloned())
+        };
+        let Some(cls) = cls else {
+            return self.fcc_val(v);
+        };
+        let Some((m, dc)) = self.find_method_in(&cls, &mn) else {
+            if bound_obj.is_none() {
+                return self.fcc_static(cls, &mn);
+            }
+            return self.fcc_method(&Value::Object(bound_obj.unwrap()), &mn);
+        };
+        if m.is_abstract {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!("Cannot call abstract method {}::{}()", dc.name(), mn),
+                0,
+            ));
+        }
+        self.fcc_vis_check(&m, &dc)?;
+        if m.is_static || bound_obj.is_some() {
+            if bound_obj.is_none() {
+                return self.fcc_static(cls, &mn);
+            }
+            return Ok(Value::Callable(self.new_callable(PhpCallable {
+                id: std::cell::Cell::new(0),
+                kind: CallableKind::Method {
+                    obj: bound_obj.clone(),
+                    class: None,
+                    name: mn.to_string(),
+                },
+                captures: Vec::new(),
+                this_obj: bound_obj.clone(),
+                scope_class: Some(dc),
+            })));
+        }
+        // Scope-keyword callable to a non-static method binds the
+        // current `$this` when it's an instance of the class.
+        let this = self
+            .stack
+            .last()
+            .and_then(|f| f.this_obj.clone())
+            .filter(|o| {
+                let cname = o.borrow().class.name().to_string();
+                self.is_a_str(&cname, cls.name())
+            });
+        let Some(this) = this else {
+            return self.fcc_static(cls, &mn);
+        };
+        Ok(Value::Callable(self.new_callable(PhpCallable {
+            id: std::cell::Cell::new(0),
+            kind: CallableKind::Method {
+                obj: Some(this.clone()),
+                class: None,
+                name: mn.to_string(),
+            },
+            captures: Vec::new(),
+            this_obj: Some(this),
+            scope_class: Some(dc),
+        })))
+    }
+
     /// Any value → callable coercion for FCC (`$fn(...)`, `($c)(...)`,
     /// `[$o,'m'](...)`). Non-callables throw `Error` (Zend "not callable").
     fn fcc_val(&mut self, v: &Value) -> Result<Value, PhpError> {
@@ -9251,6 +9382,20 @@ impl<'a> Interp<'a> {
                     (Some(Value::Object(o)), Some(mv)) => {
                         let mn = mv.to_php_string();
                         self.fcc_method(&Value::Object(o.clone()), &mn)
+                    }
+                    // `[$closure, '__invoke']` — a closure is callable
+                    // (bug78689).
+                    (Some(Value::Callable(c)), Some(mv)) => {
+                        let mn = mv.to_php_string();
+                        if mn.eq_ignore_ascii_case("__invoke") {
+                            Ok(Value::Callable(c.clone()))
+                        } else {
+                            self.fail(PhpError::uncaught(
+                                "Error",
+                                "Value of type array is not callable",
+                                0,
+                            ))
+                        }
                     }
                     (Some(Value::Str(cn)), Some(mv)) => {
                         let mn = mv.to_php_string();
@@ -17858,6 +18003,21 @@ impl<'a> Interp<'a> {
                     .get("\0rp\0variadic")
                     .is_some_and(|c| c.borrow().is_truthy()),
             ))),
+            "hastype" => {
+                // ReflectionParameter::hasType() — \0rp\0ty members
+                // populated by getParameters().
+                let has = obj
+                    .borrow()
+                    .props
+                    .get("\0rp\0ty")
+                    .map(|c| c.borrow().clone())
+                    .and_then(|v| match v {
+                        Value::Array(a) => Some(!a.borrow().entries.is_empty()),
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+                Ok(Some(Value::Bool(has)))
+            }
             "iscallable" => {
                 self.deprecated(
                     "Method ReflectionParameter::isCallable() is deprecated since 8.0, use ReflectionParameter::getType() instead",
@@ -18959,6 +19119,33 @@ impl<'a> Interp<'a> {
                     .unwrap_or(Value::Null);
                 if let Value::Object(t) = newthis {
                     let mut nc = (*c).clone();
+                    // Rebinding a method callable to an unrelated class
+                    // warns (an error in PHP 9)
+                    // (closure_from_callable_rebinding).
+                    if let CallableKind::Method {
+                        obj: mo,
+                        class: mc,
+                        name: mname,
+                    } = &nc.kind
+                    {
+                        let mcls = mo
+                            .as_ref()
+                            .map(|o| o.borrow().class.clone())
+                            .or_else(|| mc.clone());
+                        let tc = t.borrow().class.clone();
+                        if let Some(mcls) = mcls {
+                            if !self.is_a(&tc, mcls.name()) {
+                                self.warn(&format!(
+                                    "Cannot bind method {}::{}() to object of class {}, this will be an error in PHP 9",
+                                    mcls.name(),
+                                    mname,
+                                    tc.name()
+                                ))?;
+                                // Zend skips the invocation entirely.
+                                return Ok(Value::Null);
+                            }
+                        }
+                    }
                     // ->call also rebinds the lexical scope to the
                     // object's class, so private slots resolve
                     // (typed_properties_048).
@@ -19792,13 +19979,49 @@ impl<'a> Interp<'a> {
                     return Ok(Value::Null);
                 }
                 "fromcallable" => {
-                    if let Some(c) = args.cells.first() {
-                        let v = c.borrow().clone();
-                        if let Value::Callable(_) = v {
-                            return Ok(v);
+                    let v = args
+                        .cells
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    match self.from_callable(&v) {
+                        Ok(c) => return Ok(c),
+                        Err(fail) => {
+                            // Zend appends the reason:
+                            // "Failed to create closure from callable:
+                            // non-static method A::m() cannot be called
+                            // statically" (from_callable_non_static).
+                            let reason = if !fail.message.is_empty() {
+                                fail.message
+                                    .replacen("Non-static method", "non-static method", 1)
+                            } else {
+                                self.pending_exception
+                                    .as_ref()
+                                    .and_then(|e| match e {
+                                        Value::Object(o) => o
+                                            .borrow()
+                                            .props
+                                            .get("message")
+                                            .map(|c| c.borrow().to_php_string()),
+                                        _ => None,
+                                    })
+                                    .unwrap_or_default()
+                            };
+                            let e = self.exception(
+                                "TypeError",
+                                &format!("Failed to create closure from callable: {}", reason),
+                            );
+                            self.pending_exception = Some(e);
+                            return Err(PhpError {
+                                trace: None,
+                                thrown_line: None,
+                                display_msg: None,
+                                kind: ErrorKind::Throw,
+                                message: "fromCallable".into(),
+                                line: 0,
+                            });
                         }
                     }
-                    return Ok(Value::Null);
                 }
                 _ => {
                     return self.fail(PhpError::uncaught(
