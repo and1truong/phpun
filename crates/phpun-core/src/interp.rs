@@ -1666,6 +1666,7 @@ impl<'a> Interp<'a> {
                     mk_method("invokeArgs", vec![any_param("args", false)]),
                     mk_method("getName", vec![]),
                     mk_method("getAttributes", vec![]),
+                    mk_method("getParameters", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -1705,6 +1706,31 @@ impl<'a> Interp<'a> {
                     mk_method("isPublic", vec![]),
                     mk_method("isProtected", vec![]),
                     mk_method("isPrivate", vec![]),
+                    mk_method("getParameters", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        // ReflectionParameter — produced by getParameters();
+        // per-param data lives under \0rp\0* props.
+        reg(
+            ClassDecl {
+                name: "ReflectionParameter".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method("isCallable", vec![]),
+                    mk_method("getName", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -6481,6 +6507,9 @@ impl<'a> Interp<'a> {
         for (tys, _, _) in &owners {
             results.push(self.slot_write_one(tys, &v)?);
         }
+        // A value an owner rejects outright reports that owner; only
+        // all-accepted-but-divergent coercions are "inconsistent"
+        // (typed_reference).
         let consistent = results.iter().all(|r| r.is_some())
             && results
                 .iter()
@@ -6488,6 +6517,22 @@ impl<'a> Interp<'a> {
                 .all(|rv| Self::value_identical(&rv, results[0].as_ref().unwrap()));
         if consistent {
             return Ok(results.into_iter().next().unwrap().unwrap());
+        }
+        if let Some(bad) = results.iter().position(|r| r.is_none()) {
+            let (tys, cn, pn) = &owners[bad];
+            let mut e = PhpError::uncaught(
+                "TypeError",
+                format!(
+                    "Cannot assign {} to reference held by property {}::${} of type {}",
+                    self.zval_type_name(&v),
+                    cn,
+                    pn,
+                    ty_disp(tys)
+                ),
+                0,
+            );
+            e.thrown_line = Some(self.cur_line);
+            return self.fail(e);
         }
         let mut e = if owners.len() == 1 {
             let (tys, cn, pn) = &owners[0];
@@ -8735,6 +8780,23 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        // Conjunct-level dedupe inside an intersection member:
+        // `A&A` (or `A&B` where B aliases A via `use`) is redundant.
+        for m in ty {
+            if !m.contains('&') {
+                continue;
+            }
+            let mut conj: Vec<String> = Vec::new();
+            for c in m.split('&') {
+                if conj.iter().any(|x| x.eq_ignore_ascii_case(c)) {
+                    return Err(PhpError::fatal(
+                        format!("Duplicate type {} is redundant", c),
+                        self.cur_line,
+                    ));
+                }
+                conj.push(c.to_string());
+            }
+        }
         if ty.len() < 2 {
             return Ok(());
         }
@@ -8742,11 +8804,13 @@ impl<'a> Interp<'a> {
             "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed",
             "void", "never", "false", "true", "null",
         ];
-        // `T|object` — a class member alongside `object` is redundant.
+        // `T|object` — a class member (incl. an intersection of
+        // classes) alongside `object` is redundant
+        // (dnf_types/redundant_types/object_and_dnf_type).
         if ty.iter().any(|m| m.eq_ignore_ascii_case("object"))
             && ty
                 .iter()
-                .any(|m| !m.contains('&') && !builtins.contains(&m.to_lowercase().as_str()))
+                .any(|m| !builtins.contains(&m.to_lowercase().as_str()))
         {
             return Err(PhpError::fatal(
                 format!(
@@ -8755,6 +8819,40 @@ impl<'a> Interp<'a> {
                 ),
                 self.cur_line,
             ));
+        }
+        // `A&B|A` / `(A&B&C)|(A&B)` — an intersection member is
+        // redundant when another member already covers it by name
+        // (less_restrive_type_constraint_already_present*).
+        for (i, m) in ty.iter().enumerate() {
+            if !m.contains('&') {
+                continue;
+            }
+            let conj: Vec<&str> = m.split('&').collect();
+            for (j, s) in ty.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                // Identical members are the seen-loop's "redundant
+                // with" case, not the restrictive one.
+                if m.eq_ignore_ascii_case(s) {
+                    continue;
+                }
+                let covers = if s.contains('&') {
+                    s.split('&')
+                        .all(|sc| conj.iter().any(|c| c.eq_ignore_ascii_case(sc)))
+                } else {
+                    conj.iter().any(|c| c.eq_ignore_ascii_case(s))
+                };
+                if covers {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Type {} is redundant as it is more restrictive than type {}",
+                            m, s
+                        ),
+                        self.cur_line,
+                    ));
+                }
+            }
         }
         let mut seen: Vec<(String, String)> = Vec::new();
         let mut seen_true = false;
@@ -8785,6 +8883,19 @@ impl<'a> Interp<'a> {
                         || cmp.eq_ignore_ascii_case("closure") && s.eq_ignore_ascii_case("callable")
                 });
                 if dup {
+                    // Identical intersection members report differently
+                    // from plain dups (duplicate_class_alias_type).
+                    if cmp.contains('&') {
+                        let other = seen
+                            .iter()
+                            .find(|(s, _)| s.eq_ignore_ascii_case(&cmp))
+                            .map(|(_, w)| w.clone())
+                            .unwrap_or_else(|| e.clone());
+                        return Err(PhpError::fatal(
+                            format!("Type {} is redundant with type {}", e, other),
+                            self.cur_line,
+                        ));
+                    }
                     if cmp.eq_ignore_ascii_case("null") {
                         return Err(PhpError::fatal(
                             "null cannot be marked as nullable".to_string(),
@@ -9019,11 +9130,14 @@ impl<'a> Interp<'a> {
                 "object" => matches!(v, Value::Object(_)),
                 "callable" => self.is_callable_value(v),
                 "mixed" | "void" | "never" | "self" | "static" | "parent" => true,
-                _ if m.contains('&') => m
-                    .trim_start_matches('(')
-                    .trim_end_matches(')')
-                    .split('&')
-                    .all(|p| self.ty_weak_exact(&[p.to_string()], v)),
+                _ if m.contains('&') => {
+                    let ok = m
+                        .trim_start_matches('(')
+                        .trim_end_matches(')')
+                        .split('&')
+                        .all(|p| self.ty_weak_exact(&[p.to_string()], v));
+                    ok
+                }
                 _ => match v {
                     Value::Callable(_) => m.eq_ignore_ascii_case("closure"),
                     Value::Object(o) => self.obj_is_a(o, m),
@@ -9063,7 +9177,10 @@ impl<'a> Interp<'a> {
             Value::Callable(_) => true,
             Value::Str(s) => {
                 let s = String::from_utf8_lossy(s).to_string();
-                if self.functions.contains_key(&s.to_lowercase()) {
+                if self.functions.contains_key(&s.to_lowercase())
+                    || builtins::is_builtin(&s.to_lowercase())
+                    || builtins::builtin_params(&s.to_lowercase()).is_some()
+                {
                     return true;
                 }
                 let Some((cn, mn)) = s.split_once("::") else {
@@ -9072,7 +9189,11 @@ impl<'a> Interp<'a> {
                 let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() else {
                     return false;
                 };
-                self.find_method_in(&c, mn).is_some()
+                // "Class::method" strings only call statics
+                // (callable_001).
+                self.find_method_in(&c, mn)
+                    .map(|(mm, _)| mm.is_static)
+                    .unwrap_or(false)
             }
             Value::Object(o) => {
                 let cn = o.borrow().class.decl.name.clone();
@@ -9092,15 +9213,19 @@ impl<'a> Interp<'a> {
                     return false;
                 };
                 let mn = String::from_utf8_lossy(mn).to_string();
-                let cn = match &first {
-                    Value::Str(cn) => String::from_utf8_lossy(cn).to_string(),
-                    Value::Object(o) => o.borrow().class.decl.name.clone(),
+                let (cn, need_static) = match &first {
+                    Value::Str(cn) => (String::from_utf8_lossy(cn).to_string(), true),
+                    Value::Object(o) => (o.borrow().class.decl.name.clone(), false),
                     _ => return false,
                 };
                 let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() else {
                     return false;
                 };
-                self.find_method_in(&c, &mn).is_some()
+                // [class-string, method] only calls statics; [obj, m]
+                // calls any (callable_001).
+                self.find_method_in(&c, &mn)
+                    .map(|(mm, _)| mm.is_static || !need_static)
+                    .unwrap_or(false)
             }
             _ => false,
         }
@@ -9130,6 +9255,10 @@ impl<'a> Interp<'a> {
                     vec!["Traversable".to_string(), "array".to_string()]
                 } else if m.starts_with("class@anonymous$") {
                     vec!["class@anonymous".to_string()]
+                } else if m.contains('&') && ty.len() > 1 {
+                    // Intersection members parenthesize inside a union
+                    // ((X&Y)|(W&Z) — dnf_2_intersection).
+                    vec![format!("({m})")]
                 } else {
                     vec![m.clone()]
                 }
@@ -9279,10 +9408,20 @@ impl<'a> Interp<'a> {
                 if fname.starts_with("class@anonymous::") {
                     fname = "class@anonymous".into();
                 }
-                let mut disp: Vec<String> = Self::zpp_ty_disp(ty);
+                // Implicit-nullable needs the phantom `null` member so
+                // an intersection renders `(X&Y)|null`
+                // (implicit_nullable_intersection_type_error).
+                let tyv: Vec<String> = if implicit_null {
+                    let mut t = ty.to_vec();
+                    t.push("null".into());
+                    t
+                } else {
+                    ty.to_vec()
+                };
+                let mut disp: Vec<String> = Self::zpp_ty_disp(&tyv);
                 disp.retain(|m| !m.eq_ignore_ascii_case("null"));
                 if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) || implicit_null {
-                    if disp.len() == 1 {
+                    if disp.len() == 1 && !disp[0].contains('&') {
                         disp[0] = format!("?{}", disp[0]);
                     } else {
                         disp.push("null".into());
@@ -9470,10 +9609,17 @@ impl<'a> Interp<'a> {
                             || ty.iter().any(|m| self.param_type_match(m, &dv));
                         if !ok {
                             self.stack.pop();
-                            let mut disp: Vec<String> = Self::zpp_ty_disp(ty);
+                            let tyv: Vec<String> = if implicit_null {
+                                let mut t = ty.to_vec();
+                                t.push("null".into());
+                                t
+                            } else {
+                                ty.to_vec()
+                            };
+                            let mut disp: Vec<String> = Self::zpp_ty_disp(&tyv);
                             disp.retain(|m| !m.eq_ignore_ascii_case("null"));
                             if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) || implicit_null {
-                                if disp.len() == 1 {
+                                if disp.len() == 1 && !disp[0].contains('&') {
                                     disp[0] = format!("?{}", disp[0]);
                                 } else {
                                     disp.push("null".into());
@@ -10468,6 +10614,12 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 Self::resolve_scope_tys(&mut d);
+                // `interface B extends A` — B's methods must stay
+                // compatible with A's (invalid_covariance_*).
+                self.linking.push(Rc::new(d.clone()));
+                let checks_res = self.check_interface_sigs(&d);
+                self.linking.pop();
+                checks_res?;
                 self.interfaces.insert(lname.clone(), Rc::new(d));
                 self.decl_order.push(lname);
             }
@@ -11274,7 +11426,7 @@ impl<'a> Interp<'a> {
         // `X|null` renders as `?X` in Zend signatures (internal_parent).
         if ty.len() == 2 {
             if let Some(other) = ty.iter().find(|t| !t.eq_ignore_ascii_case("null")) {
-                if ty.iter().any(|t| t.eq_ignore_ascii_case("null")) {
+                if ty.iter().any(|t| t.eq_ignore_ascii_case("null")) && !other.contains('&') {
                     return format!(
                         "?{}",
                         if other.eq_ignore_ascii_case("self") {
@@ -11290,6 +11442,12 @@ impl<'a> Interp<'a> {
             .map(|t| {
                 if t.eq_ignore_ascii_case("self") {
                     ctx.to_string()
+                } else if t.eq_ignore_ascii_case("iterable") {
+                    // Compatibility messages render the normalized
+                    // form (invalid5).
+                    "Traversable|array".to_string()
+                } else if t.contains('&') && ty.len() > 1 {
+                    format!("({t})")
                 } else {
                     t.clone()
                 }
@@ -11814,15 +11972,19 @@ impl<'a> Interp<'a> {
         if bl == sl {
             return true;
         }
+        let b_inner = big.trim_start_matches('(').trim_end_matches(')');
         let s_inner = small.trim_start_matches('(').trim_end_matches(')');
+        if b_inner.contains('&') {
+            // `small ⊆ B1&B2` iff every conjunct of big is covered by
+            // some conjunct of small (`B&A` ⊆ `A&B` — commutative).
+            let sparts: Vec<&str> = s_inner.split('&').collect();
+            return b_inner
+                .split('&')
+                .all(|b| sparts.iter().any(|p| self.ty_covers(b, p)));
+        }
         if s_inner.contains('&') {
             // `A&B` ⊆ anything covering one of its parts.
             return s_inner.split('&').any(|p| self.ty_covers(big, p));
-        }
-        let b_inner = big.trim_start_matches('(').trim_end_matches(')');
-        if b_inner.contains('&') {
-            // `X` ⊆ `A&B` iff X ⊆ A and X ⊆ B.
-            return b_inner.split('&').all(|p| self.ty_covers(p, small));
         }
         const SCALARS: &[&str] = &[
             "int", "float", "string", "bool", "array", "callable", "object", "mixed", "void",
@@ -11942,7 +12104,18 @@ impl<'a> Interp<'a> {
                     let aty = ap
                         .ty
                         .as_ref()
-                        .map(|m| m.join("|"))
+                        .map(|m| {
+                            m.iter()
+                                .map(|t| {
+                                    if t.contains('&') && m.len() > 1 {
+                                        format!("({})", t)
+                                    } else {
+                                        t.clone()
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("|")
+                        })
                         .unwrap_or_else(|| "mixed".into());
                     return Err(PhpError::fatal(
                         format!(
@@ -12345,6 +12518,57 @@ impl<'a> Interp<'a> {
             .all(|t| sup.iter().any(|s| self.ty_member_is_a(t, s)))
     }
 
+    /// Whether a single type conjunct resolves to a registered (or
+    /// mid-linking / autoloadable) class-like name or builtin. Used
+    /// to gate `&`-member coverage of `object`/`iterable`/`callable`.
+    fn ty_conj_resolvable(&mut self, c: &str) -> bool {
+        let cl = c.to_lowercase();
+        const BUILTIN: &[&str] = &[
+            "int",
+            "float",
+            "string",
+            "bool",
+            "array",
+            "object",
+            "callable",
+            "iterable",
+            "mixed",
+            "void",
+            "never",
+            "false",
+            "true",
+            "null",
+            "numeric",
+            "resource",
+            "self",
+            "static",
+            "parent",
+            "closure",
+            "traversable",
+            "iterator",
+            "generator",
+        ];
+        if BUILTIN.contains(&cl.as_str()) {
+            return true;
+        }
+        if self.classes.contains_key(&cl)
+            || self.interfaces.contains_key(&cl)
+            || self.traits.contains_key(&cl)
+            || self.linking.iter().any(|d| d.name.to_lowercase() == cl)
+        {
+            return true;
+        }
+        // Autoload errors must not surface here — resolvability is a
+        // yes/no probe (invalid4 "could not check" is raised by the
+        // caller). Preserve any pre-existing pending exception.
+        let prior = self.pending_exception.take();
+        let _ = self.run_autoload(c);
+        self.pending_exception = prior;
+        self.classes.contains_key(&cl)
+            || self.interfaces.contains_key(&cl)
+            || self.traits.contains_key(&cl)
+    }
+
     /// Type-member acceptance: `t` is admitted by `s` when they match by
     /// name, `s` is `mixed`, or `t`'s class/interface ancestry includes
     /// `s` (interfaces live in `self.interfaces`, not `self.classes`).
@@ -12361,7 +12585,18 @@ impl<'a> Interp<'a> {
                 .all(|sc| tparts.iter().any(|tc| self.ty_member_is_a(tc, sc)));
         }
         if t.contains('&') {
-            return t.split('&').any(|sm| self.ty_member_is_a(sm, s));
+            // `C1&C2 ⊆ s` when some conjunct already is-a `s` — but a
+            // conjunct covering `object`/`iterable`/`callable` must be
+            // a resolvable class-like name; an unloadable conjunct
+            // can't prove the member is object-like (invalid4).
+            return t.split('&').any(|sm| {
+                let atomish =
+                    ["object", "iterable", "callable"].contains(&s.to_lowercase().as_str());
+                if atomish && !self.ty_conj_resolvable(sm) {
+                    return false;
+                }
+                self.ty_member_is_a(sm, s)
+            });
         }
         if t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("mixed") {
             return false;
@@ -12369,7 +12604,8 @@ impl<'a> Interp<'a> {
         let tl = t.to_lowercase();
         let sl = s.to_lowercase();
         if sl == "iterable"
-            && ["array", "traversable", "iterator", "generator"].contains(&tl.as_str())
+            && (["array", "traversable", "iterator", "generator"].contains(&tl.as_str())
+                || self.is_a_str(&tl, "traversable"))
         {
             return true;
         }
@@ -12492,6 +12728,21 @@ impl<'a> Interp<'a> {
                             if matches!(v, Value::Null)
                                 && !ty.iter().any(|m| m.eq_ignore_ascii_case("null"))
                             {
+                                // Implicit nullable is only hinted for
+                                // single non-`&` types — unions and
+                                // intersections report the plain
+                                // "Cannot use null" (bug81268).
+                                if ty.len() > 1 || ty.iter().any(|m| m.contains('&')) {
+                                    return Err(PhpError::fatal(
+                                        format!(
+                                            "Cannot use null as default value for property {}::${} of type {}",
+                                            d.name,
+                                            pd.name,
+                                            ty_disp(ty)
+                                        ),
+                                        pd.line,
+                                    ));
+                                }
                                 let hint = if ty.len() == 1 {
                                     format!("?{}", ty_disp(ty))
                                 } else {
@@ -14339,7 +14590,60 @@ impl<'a> Interp<'a> {
             return Some(a.to_string());
         }
         if al.contains('&') || bl.contains('&') {
-            return None;
+            // `(X&Y) ∩ (X&Z)` = `X&Y&Z` — conjunct sets merge
+            // (typed_reference). A scalar builtin can't coexist with
+            // class conjuncts; `object`/`mixed` absorb; two unrelated
+            // concrete classes can't both hold.
+            let scalarish = |c: &str| {
+                matches!(
+                    c.to_lowercase().as_str(),
+                    "int"
+                        | "float"
+                        | "string"
+                        | "bool"
+                        | "array"
+                        | "null"
+                        | "false"
+                        | "true"
+                        | "void"
+                        | "never"
+                        | "resource"
+                        | "numeric"
+                )
+            };
+            let mut conj: Vec<String> = Vec::new();
+            for c in a.split('&').chain(b.split('&')) {
+                let cl = c.to_lowercase();
+                if cl == "object" || cl == "mixed" {
+                    continue;
+                }
+                if conj.iter().any(|x| x.eq_ignore_ascii_case(c)) {
+                    continue;
+                }
+                conj.push(c.to_string());
+            }
+            if conj.is_empty() {
+                return Some("object".to_string());
+            }
+            if conj.iter().any(|c| scalarish(c)) && conj.iter().any(|c| !scalarish(c)) {
+                return None;
+            }
+            for i in 0..conj.len() {
+                for j in (i + 1)..conj.len() {
+                    let (x, y) = (conj[i].to_lowercase(), conj[j].to_lowercase());
+                    if self.interfaces.contains_key(&x) || self.interfaces.contains_key(&y) {
+                        continue;
+                    }
+                    if self.classes.contains_key(&x)
+                        && self.classes.contains_key(&y)
+                        && !self.ty_member_is_a(&x, &y)
+                        && !self.ty_member_is_a(&y, &x)
+                    {
+                        return None;
+                    }
+                }
+            }
+            return Some(conj.join("&"));
         }
         const ATOMS: &[&str] = &[
             "int", "float", "string", "bool", "array", "null", "false", "true", "void", "never",
@@ -15190,6 +15494,113 @@ impl<'a> Interp<'a> {
                     let ca = self.args_from_array(&arr);
                     Ok(Some(self.call_value(&cb, ca)?))
                 }
+            }
+            "getparameters" => {
+                // Each param becomes a ReflectionParameter carrying its
+                // declared type members under \0rp\0ty (callable_002).
+                let is_method = obj
+                    .borrow()
+                    .class
+                    .name()
+                    .eq_ignore_ascii_case("reflectionmethod");
+                let decl: Option<Rc<crate::ast::FunctionDecl>> = if is_method {
+                    let cn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let cn = self.conv_str(&cn)?.to_string();
+                    let mn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0prop")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let mn = self.conv_str(&mn)?.to_string();
+                    let c = self.classes.get(&cn.to_lowercase()).cloned();
+                    match c {
+                        Some(c) => self
+                            .find_method_in(&c, &mn)
+                            .map(|(m, _)| Rc::new(m.decl.clone())),
+                        None => None,
+                    }
+                } else {
+                    let cb = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    match &cb {
+                        Value::Str(s) => self
+                            .functions
+                            .get(&String::from_utf8_lossy(s).to_lowercase())
+                            .cloned(),
+                        Value::Callable(c) => match &c.kind {
+                            crate::value::CallableKind::Closure(d) => Some(d.clone()),
+                            crate::value::CallableKind::Named(n) => {
+                                self.functions.get(&n.to_lowercase()).cloned()
+                            }
+                            crate::value::CallableKind::Method { name, obj, class } => {
+                                let c = class
+                                    .clone()
+                                    .or_else(|| obj.as_ref().map(|o| o.borrow().class.clone()));
+                                match c {
+                                    Some(c) => self
+                                        .find_method_in(&c, name)
+                                        .map(|(m, _)| Rc::new(m.decl.clone())),
+                                    None => None,
+                                }
+                            }
+                        },
+                        _ => None,
+                    }
+                };
+                let mut arr = PhpArray::default();
+                if let Some(d) = decl {
+                    for p in &d.params {
+                        let rp = self.instantiate("reflectionparameter", &[])?;
+                        if let Value::Object(o) = &rp {
+                            o.borrow_mut()
+                                .props
+                                .insert("\0rp\0name".into(), cell(Value::str(&p.name)));
+                            let mut ta = PhpArray::default();
+                            if let Some(ty) = &p.ty {
+                                for m in ty {
+                                    ta.push(Value::str(m));
+                                }
+                            }
+                            o.borrow_mut().props.insert(
+                                "\0rp\0ty".into(),
+                                cell(Value::Array(Rc::new(RefCell::new(ta)))),
+                            );
+                        }
+                        arr.push(rp);
+                    }
+                }
+                Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
+            }
+            "iscallable" => {
+                self.deprecated(
+                    "Method ReflectionParameter::isCallable() is deprecated since 8.0, use ReflectionParameter::getType() instead",
+                )?;
+                let has = obj
+                    .borrow()
+                    .props
+                    .get("\0rp\0ty")
+                    .map(|c| c.borrow().clone())
+                    .and_then(|v| match v {
+                        Value::Array(a) => Some(a),
+                        _ => None,
+                    })
+                    .map(|a| {
+                        a.borrow().entries.iter().any(|(_, c)| {
+                            matches!(&*c.borrow(), Value::Str(s) if s.eq_ignore_ascii_case(b"callable"))
+                        })
+                    })
+                    .unwrap_or(false);
+                Ok(Some(Value::Bool(has)))
             }
             "getattributes" => {
                 let is_fn = obj
@@ -18282,9 +18693,10 @@ fn ty_disp(ty: &[String]) -> String {
     };
     if nullable && rest.is_empty() {
         "null".to_string()
-    } else if nullable && rest.len() == 1 {
+    } else if nullable && rest.len() == 1 && !rest[0].contains('&') {
         format!("?{}", joined)
     } else if nullable {
+        // `(X&Y)|null` — intersections can't take the ? shortcut.
         format!("{}|null", joined)
     } else {
         joined
@@ -18363,7 +18775,11 @@ fn ty_norm_disp(ty: &[String]) -> String {
                 }
                 _ => {
                     if !classes.iter().any(|c| c.eq_ignore_ascii_case(&e)) {
-                        classes.push(e);
+                        if e.contains('&') {
+                            classes.push(format!("({})", e));
+                        } else {
+                            classes.push(e);
+                        }
                     }
                 }
             }

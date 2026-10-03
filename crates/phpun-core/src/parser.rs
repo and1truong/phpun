@@ -1755,7 +1755,10 @@ impl<'a> Parser<'a> {
             let pline = self.line();
             let pty = if matches!(
                 self.peek(),
-                Some(Token::Ident(_)) | Some(Token::Op("?")) | Some(Token::Op("\\"))
+                Some(Token::Ident(_))
+                    | Some(Token::Op("?"))
+                    | Some(Token::Op("\\"))
+                    | Some(Token::Op("("))
             ) && !matches!(self.peek2(), Some(Token::Op("(")))
             {
                 self.take_type()?
@@ -2083,7 +2086,10 @@ impl<'a> Parser<'a> {
             // skip type declaration before the variable
             let ty = if matches!(
                 self.peek(),
-                Some(Token::Ident(_)) | Some(Token::Op("?")) | Some(Token::Op("\\"))
+                Some(Token::Ident(_))
+                    | Some(Token::Op("?"))
+                    | Some(Token::Op("\\"))
+                    | Some(Token::Op("("))
             ) && !matches!(self.peek2(), Some(Token::Op(",")) | Some(Token::Op(")")))
             {
                 self.take_type()?
@@ -2494,8 +2500,13 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 let pline = self.line();
-                let pty = if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
-                    && !matches!(self.peek2(), Some(Token::Op("(")))
+                let pty = if matches!(
+                    self.peek(),
+                    Some(Token::Ident(_))
+                        | Some(Token::Op("?"))
+                        | Some(Token::Op("\\"))
+                        | Some(Token::Op("("))
+                ) && !matches!(self.peek2(), Some(Token::Op("(")))
                 {
                     self.take_type()?
                 } else {
@@ -2705,7 +2716,9 @@ impl<'a> Parser<'a> {
         loop {
             match self.peek() {
                 Some(Token::Ident(n)) => {
-                    if !name.is_empty() && !name.ends_with('\\') {
+                    // `A&B` continues the intersection conjunct, not a
+                    // namespaced path — no `\` separator after `&`.
+                    if !name.is_empty() && !name.ends_with('\\') && !name.ends_with('&') {
                         name.push('\\');
                     }
                     name.push_str(n);
@@ -2720,6 +2733,14 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                 }
                 Some(Token::Op("|")) => {
+                    // `?` may only prefix a single name — `?X|Y` is a
+                    // parse error like `?X&Y` (invalid_nullable_type).
+                    if nullable && !name.is_empty() && depth == 0 {
+                        return Err(PhpError::parse(
+                            "syntax error, unexpected token \"|\", expecting \"{\"",
+                            self.line(),
+                        ));
+                    }
                     if !name.is_empty() {
                         members.push(std::mem::take(&mut name));
                     }
@@ -2734,7 +2755,27 @@ impl<'a> Parser<'a> {
                         Some(Token::Ident(_)) | Some(Token::Op("\\")) | Some(Token::Op("("))
                     );
                     if !next_is_name {
+                        // `X& #[Attr]` — the attribute token is the
+                        // syntax error, not the `&`
+                        // (parsing_attribute).
+                        if matches!(
+                            self.toks.get(self.pos + 1).map(|l| &l.token),
+                            Some(Token::Op("#["))
+                        ) {
+                            return Err(PhpError::parse(
+                                "syntax error, unexpected token \"#[\"",
+                                self.line(),
+                            ));
+                        }
                         break;
+                    }
+                    // `?` may only prefix a single name — `?X&Y`
+                    // (invalid_nullable_type).
+                    if nullable && !name.is_empty() && depth == 0 {
+                        return Err(PhpError::parse(
+                            "syntax error, unexpected token \"&\", expecting \"{\"",
+                            self.line(),
+                        ));
                     }
                     name.push('&');
                     self.pos += 1;
@@ -2849,6 +2890,33 @@ impl<'a> Parser<'a> {
                                     _ => {}
                                 }
                                 if t.is_empty() || BUILTIN_TYS.contains(&tl.as_str()) {
+                                    // `self`/`parent` conjuncts must be
+                                    // resolvable at compile time — inside
+                                    // a trait neither is (relative_*).
+                                    if in_intersection
+                                        && (tl == "self"
+                                            && self
+                                                .class_ctx
+                                                .last()
+                                                .map(|c| c.1)
+                                                .unwrap_or(true)
+                                            || tl == "parent"
+                                                && self
+                                                    .class_ctx
+                                                    .last()
+                                                    .map(|c| c.1 || !c.0)
+                                                    .unwrap_or(true))
+                                    {
+                                        // Zend echoes the written case
+                                        // (SELF/PARENT, relative_*2).
+                                        return Err(PhpError::compile_fatal(
+                                            format!(
+                                                "Type {} cannot be part of an intersection type",
+                                                t
+                                            ),
+                                            self.line(),
+                                        ));
+                                    }
                                     // Intersections accept class types
                                     // only — builtin members error
                                     // (invalid_iterable/static_type).

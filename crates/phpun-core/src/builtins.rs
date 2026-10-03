@@ -2772,7 +2772,9 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "function_exists" => {
             let n = arg_str(it, args, 0).trim_start_matches('\\').to_lowercase();
-            Value::Bool(it.functions.contains_key(&n) || is_builtin(&n))
+            Value::Bool(
+                it.functions.contains_key(&n) || is_builtin(&n) || builtin_params(&n).is_some(),
+            )
         }
         "class_exists" => {
             let n = arg_str(it, args, 0);
