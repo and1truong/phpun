@@ -12070,16 +12070,9 @@ impl<'a> Interp<'a> {
                         d.name
                     ))?;
                 }
-                self.linking.push(Rc::new(d.clone()));
-                let checks_res = self
-                    .check_interface_sigs(&d)
-                    .and_then(|_| self.check_abstract_hooks(&d))
-                    .and_then(|_| self.check_abstract_methods(&d))
-                    .and_then(|_| self.check_final_override(&d))
-                    .and_then(|_| self.check_override_sigs(&d))
-                    .and_then(|_| self.check_const_types(&d));
-                self.linking.pop();
-                checks_res?;
+                // Magic-method declaration diagnostics are compile-time
+                // in zend — they precede every link-time inheritance
+                // fatal (magic_methods_008).
                 // A private+final method (declared outright or produced
                 // by `m as final` / `m as private` adaptations) warns
                 // once per class (gh12854).
@@ -12091,6 +12084,16 @@ impl<'a> Interp<'a> {
                     self.warn("Private methods cannot be final as they are never overridden by other classes")?;
                 }
                 self.magic_method_checks(&d)?;
+                self.linking.push(Rc::new(d.clone()));
+                let checks_res = self
+                    .check_interface_sigs(&d)
+                    .and_then(|_| self.check_abstract_hooks(&d))
+                    .and_then(|_| self.check_abstract_methods(&d))
+                    .and_then(|_| self.check_final_override(&d))
+                    .and_then(|_| self.check_override_sigs(&d))
+                    .and_then(|_| self.check_const_types(&d));
+                self.linking.pop();
+                checks_res?;
                 // Declaring __toString (incl. via a trait) implicitly
                 // implements Stringable — added post-checks like zend,
                 // so no sig-compat check runs against it
@@ -14648,11 +14651,6 @@ impl<'a> Interp<'a> {
             crate::ast::Visibility::Private => 0,
         };
         for m in &d.methods {
-            if m.decl.name.eq_ignore_ascii_case("__construct")
-                || matches!(m.visibility, crate::ast::Visibility::Private)
-            {
-                continue;
-            }
             let lname = m.decl.name.to_lowercase();
             let Some((aname, am)) = chain.iter().find_map(|(pn, pc)| {
                 pc.methods
@@ -14663,6 +14661,31 @@ impl<'a> Interp<'a> {
             }) else {
                 continue;
             };
+            // An abstract declaration's contract propagates through
+            // intermediate concrete impls — the fatal cites the
+            // abstract declarer, not the nearest impl (bug61970_2).
+            let (aname, am) = chain
+                .iter()
+                .find_map(|(pn, pc)| {
+                    pc.methods
+                        .iter()
+                        .find(|x| {
+                            x.decl.name.to_lowercase() == lname
+                                && x.is_abstract
+                                && !matches!(x.visibility, crate::ast::Visibility::Private)
+                        })
+                        .map(|x| (pn.clone(), x.clone()))
+                })
+                .unwrap_or((aname, am));
+            // `__construct` and private impls escape LSP visibility —
+            // except when an ancestor declares the contract abstractly,
+            // which the impl must satisfy (bug61970, magic_methods_008).
+            if (m.decl.name.eq_ignore_ascii_case("__construct")
+                || matches!(m.visibility, crate::ast::Visibility::Private))
+                && !am.is_abstract
+            {
+                continue;
+            }
             if rank(&m.visibility) < rank(&am.visibility) {
                 let want = match am.visibility {
                     crate::ast::Visibility::Public => {
@@ -19498,6 +19521,13 @@ impl<'a> Interp<'a> {
         while let Some(c) = cur {
             for p in &c.decl.props {
                 if p.name == name && !p.is_static {
+                    // A private decl's real slot is the mangled
+                    // `\0C\0name` key — it can never own a PLAIN-name
+                    // slot, which is then a dynamic prop instead
+                    // (bug60536_001).
+                    if p.visibility == crate::ast::Visibility::Private {
+                        continue;
+                    }
                     return (p.visibility, c.name().to_string());
                 }
             }
