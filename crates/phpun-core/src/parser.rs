@@ -54,6 +54,11 @@ pub struct Parser<'a> {
     /// True only while the literal first statement is a
     /// `declare` — the only place `strict_types` is legal.
     strict_slot: bool,
+    /// Inside a closure decl — `self`/`static`/`parent` type members
+    /// resolve lazily at call time (bindTo can supply the scope), so
+    /// the no-class-scope compile fatal doesn't apply
+    /// (static_type_return's unbound `{closure:...}(): static`).
+    in_closure: bool,
 }
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
@@ -127,6 +132,7 @@ fn parse_toks(toks: Vec<Lexed>) -> Result<Vec<Stmt>, PhpError> {
         class_ctx: Vec::new(),
         first_stmt_slot: false,
         strict_slot: false,
+        in_closure: false,
     };
     let mut stmts = p.program()?;
     let mut diags: Vec<(String, &'static str, usize)> = lex_diags;
@@ -225,6 +231,7 @@ pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
         class_ctx: Vec::new(),
         first_stmt_slot: false,
         strict_slot: false,
+        in_closure: false,
     };
     let e = p.expr()?;
     Ok((e, diags))
@@ -256,6 +263,16 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         t
+    }
+
+    /// Line of the token just consumed — the `}` closing a body
+    /// (FunctionDecl::end_line).
+    fn prev_line(&self) -> usize {
+        self.pos
+            .checked_sub(1)
+            .and_then(|i| self.toks.get(i))
+            .map(|t| t.line)
+            .unwrap_or_else(|| self.line())
     }
 
     fn at_op(&self, op: &str) -> bool {
@@ -1765,6 +1782,7 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            self.check_prop_ty(&pty, pline)?;
             loop {
                 let pname = match self.next() {
                     Some(Token::Variable(n)) => n,
@@ -1852,10 +1870,12 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let body = if self.eat_op(";") {
-            Vec::new()
+        let (body, end_line) = if self.eat_op(";") {
+            (Vec::new(), line)
         } else {
-            self.body()?
+            let b = self.body()?;
+            let e = self.prev_line();
+            (b, e)
         };
         self.hook_ctx = prev_hook;
         Ok(MethodDecl {
@@ -1867,6 +1887,7 @@ impl<'a> Parser<'a> {
                 attrs: vec![],
                 by_ref,
                 line,
+                end_line,
                 file: String::new(),
                 ns: self.cur_ns.clone(),
                 decl_in: None,
@@ -1877,6 +1898,25 @@ impl<'a> Parser<'a> {
             visibility: vis,
             trait_alias_of: None,
         })
+    }
+
+    /// `static` is never a legal property type — Zend reports it as
+    /// `unexpected token "static"` (static_type_property).
+    fn check_prop_ty(&self, ty: &Option<Vec<String>>, line: usize) -> Result<(), PhpError> {
+        if let Some(ms) = ty {
+            for m in ms {
+                if m.trim_matches(|c| c == '(' || c == ')')
+                    .split('&')
+                    .any(|p| p.trim_start_matches('\\').eq_ignore_ascii_case("static"))
+                {
+                    return Err(PhpError::parse(
+                        "syntax error, unexpected token \"static\"",
+                        line,
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `{ get => e; set { .. }; set(T $v) { .. }; get; }` — PHP 8.4
@@ -2250,6 +2290,7 @@ impl<'a> Parser<'a> {
             None
         };
         let body = self.body()?;
+        let end_line = self.prev_line();
         self.hook_ctx = prev_hook;
         let name = self.ns_qualify(&name);
         Ok(Stmt::Function(FunctionDecl {
@@ -2260,6 +2301,7 @@ impl<'a> Parser<'a> {
             attrs: std::mem::take(&mut self.pending_class_attrs),
             by_ref,
             line,
+            end_line,
             file: String::new(),
             ns: self.cur_ns.clone(),
             decl_in: None,
@@ -2269,6 +2311,14 @@ impl<'a> Parser<'a> {
     /// `function (&$a) use ($x, &$y) { }`, `static function () {}`,
     /// `fn($x) => $x + 1`.
     fn closure_expr(&mut self) -> Result<Expr, PhpError> {
+        let prev_in_closure = self.in_closure;
+        self.in_closure = true;
+        let r = self.closure_inner();
+        self.in_closure = prev_in_closure;
+        r
+    }
+
+    fn closure_inner(&mut self) -> Result<Expr, PhpError> {
         let line = self.line();
         let mut arrow = false;
         let mut uses = Vec::new();
@@ -2313,12 +2363,15 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let body = if arrow {
+        let (body, end_line) = if arrow {
             self.expect_op("=>")?;
             let e = self.expr()?;
-            vec![Stmt::Return(Some(e))]
+            let el = self.prev_line();
+            (vec![Stmt::Return(Some(e))], el)
         } else {
-            self.body()?
+            let b = self.body()?;
+            let el = self.prev_line();
+            (b, el)
         };
         self.hook_ctx = prev_hook;
         Ok(Expr::Closure(ClosureExpr {
@@ -2330,6 +2383,7 @@ impl<'a> Parser<'a> {
                 attrs: vec![],
                 by_ref,
                 line,
+                end_line,
                 file: String::new(),
                 ns: self.cur_ns.clone(),
                 decl_in: None,
@@ -2512,6 +2566,7 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
+                self.check_prop_ty(&pty, pline)?;
                 loop {
                     let pname = match self.next() {
                         Some(Token::Variable(n)) => n,
@@ -2871,7 +2926,7 @@ impl<'a> Parser<'a> {
                                 // static_*_global_function).
                                 match tl.as_str() {
                                     "self" | "static" | "parent"
-                                        if self.class_ctx.is_empty() =>
+                                        if self.class_ctx.is_empty() && !self.in_closure =>
                                     {
                                         return Err(PhpError::compile_fatal(
                                             format!(
@@ -2984,6 +3039,19 @@ impl<'a> Parser<'a> {
         // order drives both message display and weak coercion
         // preference (union_types/type_checking_*).
         if let Some(ms) = &mut members {
+            // `iterable` is the union Traversable|array — Zend expands
+            // it in place before sorting (iterable_alias_redundancy_*).
+            let expanded: Vec<String> = ms
+                .drain(..)
+                .flat_map(|m| {
+                    if m.eq_ignore_ascii_case("iterable") {
+                        vec!["Traversable".to_string(), "array".to_string()]
+                    } else {
+                        vec![m]
+                    }
+                })
+                .collect();
+            *ms = expanded;
             const SCALARS: &[&str] = &[
                 "int", "float", "string", "bool", "array", "callable", "iterable", "object",
                 "mixed", "void", "never", "null", "false", "true", "numeric", "resource",

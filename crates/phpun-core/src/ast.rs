@@ -308,6 +308,9 @@ pub struct FunctionDecl {
     /// Source line of the `function` keyword (for TypeError "defined in"
     /// and compile-time deprecation diagnostics).
     pub line: usize,
+    /// Line of the closing `}` — Zend attributes "none returned"
+    /// TypeErrors to the function's last line.
+    pub end_line: usize,
     /// File the decl was registered from — PHP resolves includes relative
     /// to the file containing the call site (include_variation2).
     pub file: String,

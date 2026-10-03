@@ -312,6 +312,10 @@ pub struct Interp<'a> {
     /// by property"; plain prop slots say "property"
     /// (typed_properties_034 first vs second foo() call).
     pub ref_cells: std::collections::HashSet<usize>,
+    /// Prop cells bound into an ArrayIterator whose decl is readonly —
+    /// acquiring a `&` on one is "Cannot acquire reference to readonly
+    /// property C::$p" (typed_properties_115). Value = (class, prop).
+    pub readonly_cells: std::collections::HashMap<usize, (String, String)>,
     /// Ptr of a typed prop slot eval_cell materialized to `null` just
     /// now — a rejected array auto-init must leave the prop
     /// uninitialized again (typed_properties_083).
@@ -331,6 +335,10 @@ pub struct Interp<'a> {
     /// AssertionError message shows `assert(<args>)` as written
     /// (named_params/assert's `assert(assertion: false)`).
     pub(crate) assert_src: String,
+    /// Closure captures staged for the next invoke_fn_run — a
+    /// yield-bearing closure's `use` vars bind when its generator body
+    /// finally starts (iterable_003).
+    pending_gen_captures: Vec<(String, Cell)>,
     /// Bytes emitted so far — memory_limit bookkeeping.
     pub mem_used: u64,
     /// Size of the last emit — the 'tried to allocate' figure.
@@ -601,6 +609,7 @@ impl<'a> Interp<'a> {
             in_handler: false,
             cur_line: 1,
             gen_sink: None,
+            pending_gen_captures: Vec::new(),
             gen_sends: std::collections::VecDeque::new(),
             gen_auto: 0,
             pending_decl_class: None,
@@ -621,6 +630,7 @@ impl<'a> Interp<'a> {
             slot_merged: std::collections::HashMap::new(),
             slot_anchor: std::collections::HashMap::new(),
             ref_cells: std::collections::HashSet::new(),
+            readonly_cells: std::collections::HashMap::new(),
             last_fresh_cell: None,
             builtin_ifaces: std::collections::HashSet::new(),
             dep_seen: std::collections::HashSet::new(),
@@ -773,6 +783,7 @@ impl<'a> Interp<'a> {
                     attrs: vec![],
                     by_ref: false,
                     line: 0,
+                    end_line: 0,
                     file: String::new(),
                     ns: String::new(),
                     decl_in: None,
@@ -822,6 +833,7 @@ impl<'a> Interp<'a> {
                             attrs: vec![],
                             by_ref: false,
                             line: 0,
+                            end_line: 0,
                             file: String::new(),
                             ns: String::new(),
                             decl_in: None,
@@ -940,6 +952,7 @@ impl<'a> Interp<'a> {
                     attrs: vec![],
                     by_ref: false,
                     line: 0,
+                    end_line: 0,
                     file: String::new(),
                     ns: String::new(),
                     decl_in: None,
@@ -1454,6 +1467,7 @@ impl<'a> Interp<'a> {
                             attrs: vec![],
                             by_ref: false,
                             line: 0,
+                            end_line: 0,
                             file: String::new(),
                             ns: String::new(),
                             decl_in: None,
@@ -1513,6 +1527,7 @@ impl<'a> Interp<'a> {
                             attrs: vec![],
                             by_ref: false,
                             line: 0,
+                            end_line: 0,
                             file: String::new(),
                             ns: String::new(),
                             decl_in: None,
@@ -1580,6 +1595,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         by_ref: false,
                         line: 0,
+                        end_line: 0,
                         file: String::new(),
                         ns: String::new(),
                         decl_in: None,
@@ -1619,6 +1635,7 @@ impl<'a> Interp<'a> {
                     attrs: vec![],
                     by_ref: false,
                     line: 0,
+                    end_line: 0,
                     file: String::new(),
                     ns: String::new(),
                     decl_in: None,
@@ -1682,6 +1699,7 @@ impl<'a> Interp<'a> {
                     mk_method("getTraitAliases", vec![]),
                     mk_method("getProperty", vec![str_param("name")]),
                     mk_method("hasProperty", vec![str_param("name")]),
+                    mk_method("getDefaultProperties", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -2463,6 +2481,26 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Write through an existing var cell honoring typed-slot gates —
+    /// a `&`-bound typed prop cell rejects bad values with TypeError
+    /// (typed_properties_108 catch binding). `strict` applies
+    /// catch-bind semantics: no coercion.
+    fn var_set_gated(&mut self, name: &str, v: Value, strict: bool) -> Result<(), PhpError> {
+        match self.var_cell_opt(name) {
+            Some(c) => {
+                let nv = self.typed_slot_store_mode(&c, v, strict)?;
+                *c.borrow_mut() = nv;
+                Ok(())
+            }
+            None => {
+                self.cur()
+                    .vars
+                    .insert(name.to_string(), Rc::new(RefCell::new(v)));
+                Ok(())
+            }
+        }
+    }
+
     fn fn_statics_key(&self) -> String {
         self.stack
             .last()
@@ -2718,10 +2756,11 @@ impl<'a> Interp<'a> {
                 } else {
                     self.last_err_file.clone()
                 };
+                let dmsg = e.display_msg.clone().unwrap_or_else(|| e.message.clone());
                 self.emit(&format!(
                     "\nFatal error: Uncaught {}: {} in {}:{}\nStack trace:\n{}  thrown in {} on line {}\n",
                     class,
-                    e.message,
+                    dmsg,
                     ef,
                     e.line,
                     t,
@@ -2735,7 +2774,7 @@ impl<'a> Interp<'a> {
                     self.err_buf.push_str(&format!(
                         "PHP Fatal error:  Uncaught {}: {} in {}:{}\nStack trace:\n{}  thrown in {} on line {}\n",
                         class,
-                        e.message,
+                        dmsg,
                         ef,
                         e.line,
                         t,
@@ -3725,9 +3764,18 @@ impl<'a> Interp<'a> {
                         for c in catches {
                             if self.catch_matches(&v, &c.types) {
                                 if let Some(var) = &c.var {
-                                    self.var_set(var, v.clone());
+                                    // Binding the catch var is a normal
+                                    // assign — a `&`-bound typed ref
+                                    // gates it and the TypeError
+                                    // propagates out of the try
+                                    // (typed_properties_108).
+                                    match self.var_set_gated(var, v.clone(), true) {
+                                        Ok(_) => result = self.exec_block(&c.body),
+                                        Err(e) => result = self.err_flow(e),
+                                    }
+                                } else {
+                                    result = self.exec_block(&c.body);
                                 }
-                                result = self.exec_block(&c.body);
                                 break;
                             }
                         }
@@ -3978,6 +4026,9 @@ impl<'a> Interp<'a> {
                         match val {
                             ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
                             ForeachTarget::ByRef(n) => {
+                                if let Some(f) = self.readonly_ref_error(&c) {
+                                    return f;
+                                }
                                 self.cur().vars.insert(n.clone(), c);
                             }
                             ForeachTarget::Lvalue(e) => {
@@ -4018,6 +4069,9 @@ impl<'a> Interp<'a> {
                     match val {
                         ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
                         ForeachTarget::ByRef(n) => {
+                            if let Some(f) = self.readonly_ref_error(&c) {
+                                return f;
+                            }
                             self.cur().vars.insert(n.clone(), c);
                         }
                         ForeachTarget::Lvalue(e) => {
@@ -4075,9 +4129,11 @@ impl<'a> Interp<'a> {
                 if self.obj_is_a(&o, "Iterator") {
                     // `function &gen()` generators DO support
                     // `foreach .. as &$v` — their yields are cells
-                    // (typed_properties_033/034).
+                    // (typed_properties_033/034). An ArrayIterator's
+                    // entries are already cells too (113/115).
                     let gen_byref = match &o.borrow().internal {
                         Some(ObjectInternal::Generator(st)) => st.borrow().by_ref,
+                        Some(ObjectInternal::ArrayIter { .. }) => true,
                         _ => false,
                     };
                     if matches!(val, ForeachTarget::ByRef(_)) && !gen_byref {
@@ -4340,7 +4396,10 @@ impl<'a> Interp<'a> {
                 ForeachTarget::Var(n) => self.var_set(n, v),
                 ForeachTarget::ByRef(n) => {
                     // A by-ref generator's current() is the yielded
-                    // cell itself — bind to it directly.
+                    // cell itself — bind to it directly. An
+                    // ArrayIterator binds the backing entry cell —
+                    // prop cells write through the typed gate
+                    // (typed_properties_113/114).
                     let c = match &it.borrow().internal {
                         Some(ObjectInternal::Generator(st)) => {
                             let st = st.borrow();
@@ -4349,8 +4408,17 @@ impl<'a> Interp<'a> {
                                 .map(|(_, c)| c.clone())
                                 .unwrap_or_else(|| cell(v.clone()))
                         }
+                        Some(ObjectInternal::ArrayIter { arr, pos, .. }) => arr
+                            .borrow()
+                            .entries
+                            .get(*pos)
+                            .map(|(_, c)| c.clone())
+                            .unwrap_or_else(|| cell(v.clone())),
                         _ => cell(v),
                     };
+                    if let Some(f) = self.readonly_ref_error(&c) {
+                        return f;
+                    }
                     self.ref_cells.insert(Rc::as_ptr(&c) as usize);
                     self.cur().vars.insert(n.clone(), c);
                 }
@@ -4453,6 +4521,7 @@ impl<'a> Interp<'a> {
                     // `&$x` elements bind the source cell, not a copy.
                     if let Expr::ByRef(e) = v {
                         let c = self.eval_cell(e)?;
+                        self.ref_cells.insert(Rc::as_ptr(&c) as usize);
                         arr.is_ref = true;
                         match k {
                             Some(ke) => {
@@ -4684,7 +4753,19 @@ impl<'a> Interp<'a> {
                 } else {
                     c.decl.file.clone()
                 };
-                let fname = format!("{{closure:{}:{}}}", cfile, c.decl.line);
+                // PHP 8.5 names a closure after its enclosing scope:
+                // `{closure:fn():L}` inside a function/method,
+                // `{closure:FILE:L}` at top level (iterable_003).
+                let enclosing = self
+                    .stack
+                    .last()
+                    .map(|f| f.fn_name.clone())
+                    .unwrap_or_default();
+                let fname = if enclosing.is_empty() || enclosing == "{main}" {
+                    format!("{{closure:{}:{}}}", cfile, c.decl.line)
+                } else {
+                    format!("{{closure:{}():{}}}", enclosing, c.decl.line)
+                };
                 // The closure's decl.file = the file currently executing
                 // — __FILE__/__DIR__ inside it must resolve to where it
                 // was defined, not where it is later invoked (autoloaders).
@@ -4692,6 +4773,7 @@ impl<'a> Interp<'a> {
                 if decl.file.is_empty() {
                     decl.file = cfile;
                 }
+                decl.name = fname.clone();
                 self.decl_type_checks(&fname, &decl, None)?;
                 let mut captures = Vec::new();
                 if c.arrow {
@@ -4785,7 +4867,14 @@ impl<'a> Interp<'a> {
                     Value::Object(o) => {
                         let ob = o.borrow();
                         let mut props = HashMap::new();
+                        // References survive clone — the clone's prop
+                        // shares the same zval and keeps the typed gate
+                        // (typed_properties_081).
+                        let mut shared: Vec<(String, Cell)> = Vec::new();
                         for (k, c) in ob.props.iter() {
+                            if self.ref_cells.contains(&(Rc::as_ptr(c) as usize)) {
+                                shared.push((k.clone(), c.clone()));
+                            }
                             props.insert(k.clone(), cell(c.borrow().clone()));
                         }
                         let new_obj = PhpObject {
@@ -4813,11 +4902,42 @@ impl<'a> Interp<'a> {
                                 }),
                                 _ => None,
                             },
-                            unset_props: std::collections::HashSet::new(),
+                            unset_props: ob.unset_props.clone(),
                         };
                         drop(ob);
                         let nv = Value::Object(self.alloc_obj(new_obj));
-                        // __clone magic
+                        // Rebind shared cells into the clone and give it
+                        // its own slot owner so type checks keep
+                        // resolving against the clone's prop.
+                        if let Value::Object(no) = &nv {
+                            for (k, c) in shared {
+                                let ptr = Rc::as_ptr(&c) as usize;
+                                no.borrow_mut().props.insert(k.clone(), c);
+                                if let Some(a) = self.slot_anchor.get_mut(&ptr) {
+                                    if let SlotAnchor::Obj(w, sk) = a {
+                                        if sk == &k
+                                            && w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, &o))
+                                        {
+                                            *a = SlotAnchor::Obj(Rc::downgrade(no), k.clone());
+                                        }
+                                    }
+                                }
+                                if let Some(owners) = self.slot_owners.get_mut(&ptr) {
+                                    for (_, _, _, a) in owners.iter_mut() {
+                                        // Repoint owners that anchored
+                                        // the SOURCE object's prop to
+                                        // the clone's slot.
+                                        if let SlotAnchor::Obj(w, sk) = a {
+                                            if sk == &k
+                                                && w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, &o))
+                                            {
+                                                *a = SlotAnchor::Obj(Rc::downgrade(no), k.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if let Value::Object(no) = &nv {
                             if no.borrow().class.find_method("__clone").is_some() {
                                 self.method_invoke(no.clone(), "__clone", CallArgs::empty())?;
@@ -5389,9 +5509,17 @@ impl<'a> Interp<'a> {
             match &target_cell {
                 Some(c) => c.borrow().clone(),
                 None => {
-                    self.silence += 1;
+                    // `??=` reads with isset() semantics (no undefined
+                    // warnings); every other compound op warns
+                    // (typed_properties_103).
+                    let quiet = op == "??=";
+                    if quiet {
+                        self.silence += 1;
+                    }
                     let c = self.eval(target);
-                    self.silence -= 1;
+                    if quiet {
+                        self.silence -= 1;
+                    }
                     c.unwrap_or(Value::Null)
                 }
             }
@@ -5981,6 +6109,21 @@ impl<'a> Interp<'a> {
                         *existing.borrow_mut() = nv.clone();
                         v = nv;
                     } else {
+                        // A declared prop that was unset() is
+                        // inaccessible — writes go through __set
+                        // (typed_properties_magic_set).
+                        if ob.unset_props.contains(&k) && cls.find_method("__set").is_some() {
+                            drop(ob);
+                            self.method_invoke(
+                                o.clone(),
+                                "__set",
+                                CallArgs::positional(vec![
+                                    cell(Value::str(pn.to_string())),
+                                    cell(v.clone()),
+                                ]),
+                            )?;
+                            return Ok(v);
+                        }
                         if !ob.prop_order.contains(&k) {
                             ob.prop_order.push(k.clone());
                         }
@@ -6660,6 +6803,21 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Catch-bind checking: strict member fit only — no __toString or
+    /// scalar coercion (int still widens to float)
+    /// (typed_properties_108).
+    fn slot_write_strict(&mut self, tys: &[String], v: &Value) -> Option<Value> {
+        if self.ty_exact(tys, v) {
+            if tys.iter().any(|t| t.eq_ignore_ascii_case("float")) {
+                if let Value::Int(i) = v {
+                    return Some(Value::Float(*i as f64));
+                }
+            }
+            return Some(v.clone());
+        }
+        None
+    }
+
     /// The write result one typed-slot owner would produce — exact
     /// match widens `int` into a `float` member, weak files coerce;
     /// `None` when the type can't be satisfied (union_types/prop_ref_assign).
@@ -6774,7 +6932,32 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// By-ref foreach bind onto a readonly prop cell shared through an
+    /// ArrayIterator — Error "Cannot acquire reference to readonly
+    /// property C::$p" (typed_properties_115).
+    fn readonly_ref_error(&mut self, c: &Cell) -> Option<Flow> {
+        let (cn, pn) = self.readonly_cells.get(&(Rc::as_ptr(c) as usize))?;
+        let v = self.exception(
+            "Error",
+            &format!("Cannot acquire reference to readonly property {cn}::${pn}"),
+        );
+        let e = self.throw(v);
+        Some(self.err_flow(e))
+    }
+
     fn typed_slot_store(&mut self, c: &Cell, v: Value) -> Result<Value, PhpError> {
+        self.typed_slot_store_mode(c, v, false)
+    }
+
+    /// `strict` = catch-binding semantics: no __toString/scalar
+    /// coercion — the value must fit the declared type as-is
+    /// (typed_properties_108).
+    fn typed_slot_store_mode(
+        &mut self,
+        c: &Cell,
+        v: Value,
+        strict: bool,
+    ) -> Result<Value, PhpError> {
         let ptr = Rc::as_ptr(c) as usize;
         self.prune_typed_slot(ptr);
         let owners: Vec<(Vec<String>, String, String)> =
@@ -6794,7 +6977,11 @@ impl<'a> Interp<'a> {
             };
         let mut results: Vec<Option<Value>> = Vec::with_capacity(owners.len());
         for (tys, _, _) in &owners {
-            results.push(self.slot_write_one(tys, &v)?);
+            results.push(if strict {
+                self.slot_write_strict(tys, &v)
+            } else {
+                self.slot_write_one(tys, &v)?
+            });
         }
         // A value an owner rejects outright reports that owner; only
         // all-accepted-but-divergent coercions are "inconsistent"
@@ -8080,6 +8267,21 @@ impl<'a> Interp<'a> {
             Value::Callable(c) => {
                 match &c.kind {
                     CallableKind::Closure(decl) => {
+                        // A `yield`-bearing closure body makes the call
+                        // a Generator factory — `function() { yield }`
+                        // returns a Generator like any other function
+                        // (iterable_003).
+                        if Self::decl_contains_yield(&decl.body) {
+                            return Ok(Value::Object(self.make_generator(
+                                decl.clone(),
+                                args,
+                                c.this_obj.clone(),
+                                c.scope_class.clone(),
+                                None,
+                                None,
+                                c.captures.clone(),
+                            )));
+                        }
                         let mut frame_args = Vec::new();
                         let mut frame = Frame::new("{closure}".into());
                         frame.fn_line = decl.line;
@@ -9353,6 +9555,34 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// `static` members resolve to the called class for checks and
+    /// messages; unbound (unscoped closure) stays literal `static`
+    /// (static_type_return).
+    fn resolve_static(&self, ty: &[String]) -> Vec<String> {
+        if !ty.iter().any(|m| m.eq_ignore_ascii_case("static")) {
+            return ty.to_vec();
+        }
+        let cn = self
+            .stack
+            .last()
+            .and_then(|f| {
+                f.called_class
+                    .as_ref()
+                    .or(f.scope_class.as_ref())
+                    .or(f.decl_class.as_ref())
+            })
+            .map(|c| c.name().to_string());
+        ty.iter()
+            .map(|m| {
+                if m.eq_ignore_ascii_case("static") {
+                    cn.clone().unwrap_or_else(|| m.clone())
+                } else {
+                    m.clone()
+                }
+            })
+            .collect()
+    }
+
     /// Scalar literal default check context ends; whether `v` satisfies a
     /// type member — scalar builtins pass (weak-mode coercion territory).
     fn param_type_match(&mut self, m: &str, v: &Value) -> bool {
@@ -9365,7 +9595,27 @@ impl<'a> Interp<'a> {
         let l = m.to_lowercase();
         match l.as_str() {
             "null" => matches!(v, Value::Null),
-            "mixed" | "void" | "never" | "self" | "parent" | "static" => true,
+            "mixed" | "void" | "never" | "self" | "parent" => true,
+            // `static` = instance of the called class (late static);
+            // unresolved (unbound closure) it can match nothing —
+            // displayed literally (static_type_return).
+            "static" => match v {
+                Value::Object(o) => {
+                    let cn = self
+                        .stack
+                        .last()
+                        .and_then(|f| {
+                            f.called_class
+                                .as_ref()
+                                .or(f.scope_class.as_ref())
+                                .or(f.decl_class.as_ref())
+                        })
+                        .map(|c| c.name().to_string())
+                        .unwrap_or_else(|| "\u{1}static".to_string());
+                    self.obj_is_a(o, &cn)
+                }
+                _ => false,
+            },
             "false" => matches!(v, Value::Bool(false)),
             "true" => matches!(v, Value::Bool(true)),
             // Weak-mode scalar params accept what coercion can convert:
@@ -9831,7 +10081,7 @@ impl<'a> Interp<'a> {
                 } else {
                     ty.to_vec()
                 };
-                let mut disp: Vec<String> = Self::zpp_ty_disp(&tyv);
+                let mut disp: Vec<String> = Self::zpp_ty_disp(&self.resolve_static(&tyv));
                 disp.retain(|m| !m.eq_ignore_ascii_case("null"));
                 if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) || implicit_null {
                     if disp.len() == 1 && !disp[0].contains('&') {
@@ -9853,7 +10103,7 @@ impl<'a> Interp<'a> {
                     self.diag_file(),
                     self.cur_line
                 );
-                let display = format!("{} and defined in {}:{}", msg, self.diag_file(), decl.line);
+                let display = format!("{} and defined", msg);
                 let argdesc = args
                     .iter()
                     .map(|a| trace_arg(&a.borrow()))
@@ -9965,6 +10215,11 @@ impl<'a> Interp<'a> {
                                 p.name
                             ))?;
                         }
+                        // The callee's var becomes a Zend IS_REFERENCE
+                        // over the caller's cell — write-through errors
+                        // say "reference held by property"
+                        // (typed_properties_055/108).
+                        self.ref_cells.insert(Rc::as_ptr(v) as usize);
                         binds.push((p.name.clone(), v.clone()));
                     } else {
                         binds.push((p.name.clone(), cell(v.borrow().clone())));
@@ -10029,7 +10284,8 @@ impl<'a> Interp<'a> {
                             } else {
                                 ty.to_vec()
                             };
-                            let mut disp: Vec<String> = Self::zpp_ty_disp(&tyv);
+                            let mut disp: Vec<String> =
+                                Self::zpp_ty_disp(&self.resolve_static(&tyv));
                             disp.retain(|m| !m.eq_ignore_ascii_case("null"));
                             if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) || implicit_null {
                                 if disp.len() == 1 && !disp[0].contains('&') {
@@ -10049,7 +10305,12 @@ impl<'a> Interp<'a> {
                                 self.diag_file(),
                                 self.cur_line
                             );
-                            return self.fail(PhpError::uncaught("TypeError", msg, self.cur_line));
+                            let display = format!("{} and defined", msg);
+                            let mut e = PhpError::uncaught("TypeError", msg, self.cur_line);
+                            e.display_msg = Some(display);
+                            e.thrown_line = Some(decl.line);
+                            self.stack.pop();
+                            return self.fail(e);
                         }
                         if !self.caller_file_strict() && !self.ty_weak_exact(ty, &dv) {
                             if let Some(cv) = self.coerce_scalar(ty, &dv) {
@@ -10116,6 +10377,9 @@ impl<'a> Interp<'a> {
         }
         let flow = self.exec_block(&decl.body);
         let ret_fname = self.decl_fname(decl);
+        // `static` resolves against THIS frame's called class — after
+        // the pop, `stack.last()` is the caller (static_type_return).
+        let resolved_ret = decl.ret.as_ref().map(|ty| self.resolve_static(ty));
         self.stack.pop();
         match flow {
             Flow::Return(v) => {
@@ -10126,7 +10390,7 @@ impl<'a> Interp<'a> {
                 if decl.ret.is_some() && Self::decl_contains_yield(&decl.body) {
                     return Ok(v);
                 }
-                if let Some(ty) = &decl.ret {
+                if let Some(ty) = &resolved_ret {
                     let ret_strict = self.strict_files.contains(&decl.file);
                     let ok = ty
                         .iter()
@@ -10148,8 +10412,15 @@ impl<'a> Interp<'a> {
                             Ok(v)
                         }
                     } else {
-                        let mut disp: Vec<String> = Self::zpp_ty_disp(ty);
+                        let mut disp: Vec<String> = Self::zpp_ty_disp(&self.resolve_static(ty));
                         disp.retain(|m| !m.eq_ignore_ascii_case("null"));
+                        if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) {
+                            if disp.len() == 1 && !disp[0].contains('&') {
+                                disp[0] = format!("?{}", disp[0]);
+                            } else {
+                                disp.push("null".into());
+                            }
+                        }
                         let given = self.zval_type_name(&v);
                         let msg = format!(
                             "{}(): Return value must be of type {}, {} returned",
@@ -10157,12 +10428,7 @@ impl<'a> Interp<'a> {
                             disp.join("|"),
                             given
                         );
-                        let display =
-                            format!("{} and defined in {}:{}", msg, self.diag_file(), decl.line);
-                        let mut e = PhpError::uncaught("TypeError", msg, self.cur_line);
-                        e.display_msg = Some(display);
-                        e.thrown_line = Some(decl.line);
-                        self.fail(e)
+                        self.fail(PhpError::uncaught("TypeError", msg, self.cur_line))
                     }
                 } else {
                     Ok(v)
@@ -10200,7 +10466,7 @@ impl<'a> Interp<'a> {
                 if decl.ret.is_some() && Self::decl_contains_yield(&decl.body) {
                     return Ok(Value::Null);
                 }
-                if let Some(ty) = &decl.ret {
+                if let Some(ty) = &resolved_ret {
                     let never = ty.iter().any(|m| m.eq_ignore_ascii_case("never"));
                     let void = ty.iter().all(|m| m.eq_ignore_ascii_case("void"));
                     if never {
@@ -10213,15 +10479,22 @@ impl<'a> Interp<'a> {
                         return self.fail(e);
                     }
                     if !void {
-                        let mut disp_v = Self::zpp_ty_disp(ty);
+                        let mut disp_v = Self::zpp_ty_disp(&self.resolve_static(ty));
                         disp_v.retain(|m| !m.eq_ignore_ascii_case("null"));
+                        if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) {
+                            if disp_v.len() == 1 && !disp_v[0].contains('&') {
+                                disp_v[0] = format!("?{}", disp_v[0]);
+                            } else {
+                                disp_v.push("null".into());
+                            }
+                        }
                         let disp = disp_v.join("|");
                         let msg = format!(
                             "{}(): Return value must be of type {}, none returned",
                             ret_fname, disp
                         );
                         let mut e = PhpError::uncaught("TypeError", msg, self.cur_line);
-                        e.thrown_line = Some(decl.line);
+                        e.thrown_line = Some(decl.end_line);
                         return self.fail(e);
                     }
                 }
@@ -10270,6 +10543,7 @@ impl<'a> Interp<'a> {
                 scope_class,
                 dc,
                 cc,
+                Vec::new(),
             )));
         }
         let dc = self.pending_decl_class.take();
@@ -10309,7 +10583,13 @@ impl<'a> Interp<'a> {
         } else {
             decl.file.clone()
         };
+        let pending_caps = std::mem::take(&mut self.pending_gen_captures);
         self.stack.push(frame);
+        if let Some(top) = self.stack.last_mut() {
+            for (n, c) in pending_caps {
+                top.vars.insert(n, c);
+            }
+        }
         self.bind_and_run(decl, args, Vec::new())
     }
 
@@ -10470,6 +10750,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Build the deferred Generator object for a yielding call.
+    #[allow(clippy::too_many_arguments)]
     fn make_generator(
         &mut self,
         decl: Rc<FunctionDecl>,
@@ -10478,6 +10759,7 @@ impl<'a> Interp<'a> {
         scope_class: Option<Rc<PhpClass>>,
         decl_class: Option<Rc<PhpClass>>,
         called_class: Option<Rc<PhpClass>>,
+        captures: Vec<(String, Cell)>,
     ) -> Rc<RefCell<PhpObject>> {
         let by_ref = decl.by_ref;
         let state = Rc::new(RefCell::new(GenState {
@@ -10488,6 +10770,7 @@ impl<'a> Interp<'a> {
                 scope_class,
                 decl_class,
                 called_class,
+                captures,
             },
             items: Vec::new(),
             pos: 0,
@@ -10531,6 +10814,7 @@ impl<'a> Interp<'a> {
                     scope_class,
                     decl_class,
                     called_class,
+                    captures,
                     ..
                 } => (
                     decl.clone(),
@@ -10538,11 +10822,12 @@ impl<'a> Interp<'a> {
                     scope_class.clone(),
                     decl_class.clone(),
                     called_class.clone(),
+                    captures.clone(),
                 ),
             };
             (setup, st.sends.clone())
         };
-        let (decl, this_obj, scope_class, decl_class, called_class) = setup;
+        let (decl, this_obj, scope_class, decl_class, called_class, captures) = setup;
         // Re-evaluating stored arg cells is unnecessary — bind_and_run
         // consumes the cells captured at call time.
         let args = {
@@ -10555,6 +10840,10 @@ impl<'a> Interp<'a> {
         let saved_sink = self.gen_sink.replace(items.clone());
         let saved_sends = std::mem::replace(&mut self.gen_sends, sends.into_iter().collect());
         let saved_auto = std::mem::replace(&mut self.gen_auto, 0);
+        // Closure-generator captures bind as extra frame vars.
+        if !captures.is_empty() {
+            self.pending_gen_captures = captures;
+        }
         let r = self.invoke_fn_run(&decl, args, this_obj, scope_class, decl_class, called_class);
         self.gen_sink = saved_sink;
         self.gen_sends = saved_sends;
@@ -13159,7 +13448,10 @@ impl<'a> Interp<'a> {
                             // `= null` on a non-nullable prop needs `?T`
                             // (typed_properties_015).
                             if matches!(v, Value::Null)
-                                && !ty.iter().any(|m| m.eq_ignore_ascii_case("null"))
+                                && !ty.iter().any(|m| {
+                                    m.eq_ignore_ascii_case("null")
+                                        || m.eq_ignore_ascii_case("mixed")
+                                })
                             {
                                 // Implicit nullable is only hinted for
                                 // single non-`&` types — unions and
@@ -14841,6 +15133,7 @@ impl<'a> Interp<'a> {
             attrs: vec![],
             by_ref: hook.by_ref,
             line: self.cur_line,
+            end_line: self.cur_line,
             file: self.cur_file.clone(),
             ns: String::new(),
             decl_in: None,
@@ -15647,11 +15940,57 @@ impl<'a> Interp<'a> {
                         }
                         Rc::new(RefCell::new(copy))
                     }
-                    // Objects iterate their public props (Zend casts).
+                    // Objects iterate their prop cells BY REFERENCE —
+                    // writes through $v update the prop (typed gate
+                    // still applies); deprecated since 8.5
+                    // (typed_properties_113/114/115).
                     Some(Value::Object(o)) => {
+                        drop(ob);
+                        self.deprecated(
+                            "ArrayIterator::__construct(): Using an object as a backing array for ArrayIterator is deprecated, as it allows violating class constraints and invariants",
+                        )?;
+                        ob = obj.borrow_mut();
                         let mut copy = PhpArray::new();
-                        for (k, c) in &o.borrow().props {
-                            copy.set(ArrKey::Str(Rc::from(k.as_str())), c.borrow().clone());
+                        copy.is_ref = true;
+                        let pairs: Vec<(String, Cell)> = o
+                            .borrow()
+                            .props
+                            .iter()
+                            .map(|(k, c)| (k.clone(), c.clone()))
+                            .collect();
+                        for (k, c) in pairs {
+                            let pn = k.rsplit('\0').next().unwrap_or(&k).to_string();
+                            if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
+                                let p = Rc::as_ptr(&c) as usize;
+                                if let Some(tys) = &pd.ty {
+                                    // Writes through the shared cell
+                                    // still hit the typed gate.
+                                    self.typed_slots.insert(
+                                        p,
+                                        (
+                                            c.clone(),
+                                            tys.clone(),
+                                            dcls.name().to_string(),
+                                            pn.clone(),
+                                        ),
+                                    );
+                                    self.slot_anchor
+                                        .insert(p, SlotAnchor::Obj(Rc::downgrade(&o), k.clone()));
+                                    self.slot_owners.entry(p).or_default().push((
+                                        tys.clone(),
+                                        dcls.name().to_string(),
+                                        pn.clone(),
+                                        SlotAnchor::Obj(Rc::downgrade(&o), k.clone()),
+                                    ));
+                                }
+                                // Remember readonly cells — by-ref
+                                // acquisition must fail (115).
+                                if pd.readonly {
+                                    self.readonly_cells
+                                        .insert(p, (dcls.name().to_string(), pn.clone()));
+                                }
+                            }
+                            copy.bind_cell(ArrKey::Str(Rc::from(k.as_str())), c);
                         }
                         Rc::new(RefCell::new(copy))
                     }
@@ -16085,6 +16424,54 @@ impl<'a> Interp<'a> {
                 } else {
                     Ok(Some(Value::Null))
                 }
+            }
+            // ReflectionClass::getDefaultProperties(): prop defaults
+            // keyed by prop name; typed props without defaults are
+            // absent (bug #77673 — typed_properties_105).
+            "getdefaultproperties" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let mut arr = PhpArray::default();
+                if let Some(cls) = self.classes.get(&cn.to_lowercase()).cloned() {
+                    let mut chain: Vec<Rc<PhpClass>> = Vec::new();
+                    let mut cur = Some(cls);
+                    while let Some(c) = cur {
+                        chain.push(c.clone());
+                        cur = c
+                            .decl
+                            .parent
+                            .as_ref()
+                            .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                    }
+                    for c in chain.iter().rev() {
+                        for p in &c.decl.props {
+                            if p.ty.is_some() && p.default.is_none() {
+                                continue;
+                            }
+                            let dv = match &p.default {
+                                Some(d) => {
+                                    let old = self.const_self.replace(c.clone());
+                                    self.class_const_ctx += 1;
+                                    let r = self.eval_decl_const(d, &c.decl.file);
+                                    self.class_const_ctx -= 1;
+                                    self.const_self = old;
+                                    match r {
+                                        Ok(v) => v,
+                                        Err(_) => continue,
+                                    }
+                                }
+                                None => Value::Null,
+                            };
+                            arr.set(ArrKey::Str(p.name.clone().into()), dv);
+                        }
+                    }
+                }
+                Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
             }
             "getparameters" => {
                 // Each param becomes a ReflectionParameter carrying its
@@ -16889,34 +17276,18 @@ impl<'a> Interp<'a> {
                                         CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
                                     )?;
                                     let got = self.last_ret_cell.take().unwrap_or_else(|| cell(rv));
-                                    // Zend materializes the real prop
-                                    // slot from __get's value (typed →
-                                    // coerced): the bound ref decouples
-                                    // from __get's storage (073).
-                                    let tys = tpd.ty.clone().unwrap_or_default();
+                                    // The bound ref IS __get's cell —
+                                    // its value is cast to the declared
+                                    // type in place and the prop itself
+                                    // stays uninitialized (073).
                                     let cv = self.prop_typed_write_check(
                                         &tpd,
                                         &tdcls,
                                         got.borrow().clone(),
                                     )?;
-                                    let key =
-                                        self.obj_prop_key(&o, &pn).unwrap_or_else(|| pn.clone());
-                                    let slot = cell(cv);
-                                    {
-                                        let mut ob = o.borrow_mut();
-                                        if !ob.prop_order.contains(&key) {
-                                            ob.prop_order.push(key.clone());
-                                        }
-                                        ob.props.insert(key.clone(), slot.clone());
-                                    }
-                                    let p = Rc::as_ptr(&slot) as usize;
-                                    self.typed_slots.insert(
-                                        p,
-                                        (slot.clone(), tys, tdcls.name().to_string(), pn.clone()),
-                                    );
-                                    self.slot_anchor
-                                        .insert(p, SlotAnchor::Obj(Rc::downgrade(&o), key.clone()));
-                                    return Ok(slot);
+                                    *got.borrow_mut() = cv;
+                                    self.ref_cells.insert(Rc::as_ptr(&got) as usize);
+                                    return Ok(got);
                                 }
                                 return self.fail(PhpError::uncaught(
                                     "Error",
@@ -17055,13 +17426,9 @@ impl<'a> Interp<'a> {
                         pd.name.clone()
                     };
                     o.borrow_mut().unset_props.insert(k);
-                    if cls.find_method("__unset").is_some() {
-                        self.method_invoke(
-                            o.clone(),
-                            "__unset",
-                            CallArgs::positional(vec![cell(Value::str(pn))]),
-                        )?;
-                    }
+                    // __unset only fires for UNDECLARED props — a
+                    // declared one is simply marked uninitialized
+                    // (typed_properties_magic_set).
                 } else if cls.find_method("__unset").is_some() {
                     self.method_invoke(
                         o.clone(),
@@ -17141,6 +17508,21 @@ impl<'a> Interp<'a> {
                 match argvals.cells.first().map(|c| c.borrow().clone()) {
                     Some(Value::Object(t)) => {
                         let mut nc = (*c).clone();
+                        nc.scope_class = match argvals.cells.get(1).map(|c| c.borrow().clone()) {
+                            // `bindTo($o)` defaults scope to "static" —
+                            // the bound object's class (static_type_return).
+                            Some(Value::Str(s)) => {
+                                let sn = crate::value::lossy(&s);
+                                if sn.eq_ignore_ascii_case("static") {
+                                    Some(t.borrow().class.clone())
+                                } else {
+                                    self.classes.get(&sn.to_lowercase()).cloned()
+                                }
+                            }
+                            Some(Value::Object(o)) => Some(o.borrow().class.clone()),
+                            Some(Value::Null) | None => Some(t.borrow().class.clone()),
+                            _ => None,
+                        };
                         nc.this_obj = Some(t);
                         Ok(Value::Callable(Rc::new(nc)))
                     }
@@ -17590,12 +17972,13 @@ impl<'a> Interp<'a> {
                     .get("message")
                     .map(|c| c.borrow().to_php_string())
                     .unwrap_or_default();
-                let (file, line, trace) = match &ob.internal {
+                let (file, line, trace, full) = match &ob.internal {
                     Some(ObjectInternal::Exception {
                         file,
                         line,
                         trace,
                         frames,
+                        full_msg,
                         ..
                     }) => {
                         let t = if !trace.is_empty() {
@@ -17605,10 +17988,16 @@ impl<'a> Interp<'a> {
                         } else {
                             "#0 {main}".into()
                         };
-                        (file.clone(), *line, t)
+                        (file.clone(), *line, t, full_msg.clone())
                     }
-                    _ => (self.diag_file(), self.cur_line as u32, "#0 {main}".into()),
+                    _ => (
+                        self.diag_file(),
+                        self.cur_line as u32,
+                        "#0 {main}".into(),
+                        String::new(),
+                    ),
                 };
+                let msg = if full.is_empty() { msg } else { full };
                 Some(Value::str(format!(
                     "{}: {} in {}:{}\nStack trace:\n{}",
                     ob.class.name(),

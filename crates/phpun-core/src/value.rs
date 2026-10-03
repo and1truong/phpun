@@ -976,6 +976,8 @@ pub enum GenSetup {
         scope_class: Option<Rc<PhpClass>>,
         decl_class: Option<Rc<PhpClass>>,
         called_class: Option<Rc<PhpClass>>,
+        /// `use ($a, &$b)` cells for closure-generators.
+        captures: Vec<(String, Cell)>,
     },
 }
 

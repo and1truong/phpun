@@ -4991,32 +4991,43 @@ fn key_str(k: &ArrKey) -> String {
 /// var_dump one zval; `is_ref` prints PHP's `&` prefix for reference cells.
 fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool) {
     let pad = "  ".repeat(indent);
-    let _ = zval;
+    // debug_zval_dump appends `refcount(N)` to every line/header.
+    let rc = |n: usize| -> String {
+        if zval {
+            format!(" refcount({})", n)
+        } else {
+            String::new()
+        }
+    };
     let r = if is_ref { "&" } else { "" };
     match v {
-        Value::Null => it.emit(&format!("{}{}NULL\n", pad, r)),
-        Value::Bool(b) => it.emit(&format!("{}{}bool({})\n", pad, r, b)),
-        Value::Int(i) => it.emit(&format!("{}{}int({})\n", pad, r, i)),
+        Value::Null => it.emit(&format!("{}{}NULL{}\n", pad, r, rc(1))),
+        Value::Bool(b) => it.emit(&format!("{}{}bool({}){}\n", pad, r, b, rc(1))),
+        Value::Int(i) => it.emit(&format!("{}{}int({}){}\n", pad, r, i, rc(1))),
         Value::Float(f) => {
             let prec = it.ini_int("serialize_precision", -1);
             it.emit(&format!(
-                "{}{}float({})\n",
+                "{}{}float({}){}\n",
                 pad,
                 r,
-                crate::value::format_float_prec(*f, prec)
+                crate::value::format_float_prec(*f, prec),
+                rc(1)
             ))
         }
         Value::Str(s) => it.emit_bytes(
             &[
                 format!("{}{}string({}) \"", pad, r, s.len()).into_bytes(),
                 s.to_vec(),
-                b"\"\n".to_vec(),
+                format!("\"{}\n", rc(1)).into_bytes(),
             ]
             .concat(),
         ),
         Value::Array(a) => {
+            let rcn = Rc::strong_count(a);
             let a = a.borrow();
-            it.emit(&format!("{}{}array({}) {{\n", pad, r, a.len()));
+            // zval: `array(2) refcount(1){` — plain: `array(2) {`.
+            let tail = if zval { rc(rcn) } else { " ".to_string() };
+            it.emit(&format!("{}{}array({}){}{{\n", pad, r, a.len(), tail));
             for (k, c) in a.iter() {
                 match k {
                     ArrKey::Int(i) => it.emit(&format!("{}  [{}]=>\n", pad, i)),
@@ -5053,17 +5064,43 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                 }
             }
             // Count live props only — unset() tombstones prop_order slots.
-            let live = ob
+            let mut live = ob
                 .prop_order
                 .iter()
                 .filter(|n| ob.props.contains_key(*n))
                 .count();
+            // Internal engine state Zend exposes in var_dump:
+            // Generator's creating function and ArrayIterator's
+            // private storage (iterable_001).
+            let internal_props: Vec<(String, Value)> = match &ob.internal {
+                Some(crate::value::ObjectInternal::Generator(st)) => {
+                    let st = st.borrow();
+                    let fname = match &st.setup {
+                        crate::value::GenSetup::Invoke { decl, .. } => decl.name.clone(),
+                    };
+                    vec![("\"function\"".to_string(), Value::str(&fname))]
+                }
+                Some(crate::value::ObjectInternal::ArrayIter { arr, .. }) => {
+                    vec![(
+                        "\"storage\":\"ArrayIterator\":private".to_string(),
+                        Value::Array(arr.clone()),
+                    )]
+                }
+                _ => Vec::new(),
+            };
+            live += internal_props.len();
+            let tail = if zval {
+                rc(Rc::strong_count(o))
+            } else {
+                " ".to_string()
+            };
             it.emit(&format!(
-                "{}object({})#{} ({}) {{\n",
+                "{}object({})#{} ({}){}{{\n",
                 pad,
                 ob.class.name(),
                 ob.id,
-                live
+                live,
+                tail
             ));
             for n in &ob.prop_order {
                 // Reserved-but-cellless slots are uninitialized typed
@@ -5126,6 +5163,10 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                             > 1 + it.typed_slots.contains_key(&(Rc::as_ptr(c) as usize)) as usize,
                     );
                 }
+            }
+            for (k, v) in &internal_props {
+                it.emit(&format!("{}  [{}]=>\n", pad, k));
+                var_dump(it, v, indent + 1, zval, false);
             }
             it.emit(&format!("{}}}\n", pad));
         }
