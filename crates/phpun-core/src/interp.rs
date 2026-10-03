@@ -159,6 +159,11 @@ pub struct Interp<'a> {
     /// Response status code set via http_response_code() or the third
     /// arg of header() — serve mode reads it (200 default).
     pub resp_code: i64,
+    /// Raw request body for php://input — serve mode fills it.
+    pub php_input: std::rc::Rc<Vec<u8>>,
+    /// Real upload tmp paths created this request — is_uploaded_file()
+    /// and move_uploaded_file() check membership.
+    pub uploads: Vec<std::path::PathBuf>,
     /// Output buffer stack for ob_*().
     ob_stack: Vec<ObLevel>,
     /// While >0, warnings are suppressed (implements `??`, `isset`,
@@ -383,6 +388,8 @@ impl<'a> Interp<'a> {
             decl_file_ctx: None,
             out_headers: Vec::new(),
             resp_code: 200,
+            php_input: std::rc::Rc::new(Vec::new()),
+            uploads: Vec::new(),
             ob_stack: Vec::new(),
             silence: 0,
             statics: HashMap::new(),

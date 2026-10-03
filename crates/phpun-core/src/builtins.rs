@@ -2327,14 +2327,18 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "file_get_contents" => {
             let path = arg_str(it, args, 0);
-            match read_stream(&path) {
-                Ok(b) => Value::str(String::from_utf8_lossy(&b).into_owned()),
-                Err(e) => {
-                    it.warn_pub(&format!(
-                        "file_get_contents({}): Failed to open stream: {}",
-                        path, e
-                    ))?;
-                    Value::Bool(false)
+            if path == "php://input" {
+                Value::str(String::from_utf8_lossy(&it.php_input).into_owned())
+            } else {
+                match read_stream(&path) {
+                    Ok(b) => Value::str(String::from_utf8_lossy(&b).into_owned()),
+                    Err(e) => {
+                        it.warn_pub(&format!(
+                            "file_get_contents({}): Failed to open stream: {}",
+                            path, e
+                        ))?;
+                        Value::Bool(false)
+                    }
                 }
             }
         }
@@ -2602,11 +2606,51 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             }
             Value::Array(Rc::new(RefCell::new(out)))
         }
+        "is_uploaded_file" => {
+            let p = arg_str(it, args, 0);
+            Value::Bool(it.uploads.iter().any(|u| u.display().to_string() == p))
+        }
+        "move_uploaded_file" => {
+            let from = arg_str(it, args, 0);
+            let to = arg_str(it, args, 1);
+            if !it.uploads.iter().any(|u| u.display().to_string() == from) {
+                it.warn_pub(&format!(
+                    "move_uploaded_file({}): Unable to move: not an uploaded file",
+                    from
+                ))?;
+                Value::Bool(false)
+            } else {
+                match std::fs::rename(&from, &to).or_else(|_| {
+                    std::fs::copy(&from, &to)
+                        .map(|_| ())
+                        .and_then(|_| std::fs::remove_file(&from))
+                }) {
+                    Ok(_) => {
+                        it.uploads.retain(|u| u.display().to_string() != from);
+                        Value::Bool(true)
+                    }
+                    Err(e) => {
+                        it.warn_pub(&format!(
+                            "move_uploaded_file(): Unable to move '{}' to '{}': {}",
+                            from, to, e
+                        ))?;
+                        Value::Bool(false)
+                    }
+                }
+            }
+        }
         "opendir" | "readdir" | "closedir" | "rewinddir" => Value::Null,
         "fopen" => {
             let path = arg_str(it, args, 0);
             let mode = arg_str(it, args, 1);
-            if let Some(which) = match path.as_str() {
+            if path == "php://input" {
+                let id = it.next_res_id();
+                Value::Resource(Rc::new(RefCell::new(PhpResource::Input {
+                    id,
+                    body: it.php_input.clone(),
+                    pos: 0,
+                })))
+            } else if let Some(which) = match path.as_str() {
                 "php://stdin" => Some(0u8),
                 "php://stdout" => Some(1u8),
                 "php://stderr" => Some(2u8),
@@ -2747,15 +2791,21 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "readfile" => {
             let path = arg_str(it, args, 0);
-            match std::fs::read(&path) {
-                Ok(b) => {
-                    let s = String::from_utf8_lossy(&b);
-                    it.emit(&s);
-                    Value::Int(b.len() as i64)
-                }
-                Err(_) => {
-                    it.warn_pub(&format!("readfile({}): Failed to open stream", path))?;
-                    Value::Bool(false)
+            if path == "php://input" {
+                let body = it.php_input.clone();
+                it.emit(&String::from_utf8_lossy(&body));
+                Value::Int(body.len() as i64)
+            } else {
+                match std::fs::read(&path) {
+                    Ok(b) => {
+                        let s = String::from_utf8_lossy(&b);
+                        it.emit(&s);
+                        Value::Int(b.len() as i64)
+                    }
+                    Err(_) => {
+                        it.warn_pub(&format!("readfile({}): Failed to open stream", path))?;
+                        Value::Bool(false)
+                    }
                 }
             }
         }
@@ -5783,6 +5833,13 @@ fn read_resource(c: Option<&Cell>, n: usize) -> Result<Vec<u8>, PhpError> {
             let mut rb = r.borrow_mut();
             match &mut *rb {
                 PhpResource::Stdio { .. } => Ok(Vec::new()),
+                PhpResource::Input { body, pos, .. } => {
+                    let avail = body.len().saturating_sub(*pos as usize);
+                    let take = avail.min(n);
+                    let out = body[*pos as usize..*pos as usize + take].to_vec();
+                    *pos += take as u64;
+                    Ok(out)
+                }
                 PhpResource::File {
                     file,
                     pos,
@@ -5821,6 +5878,21 @@ fn read_line_resource(c: Option<&Cell>) -> Result<Vec<u8>, PhpError> {
             let mut rb = r.borrow_mut();
             match &mut *rb {
                 PhpResource::Stdio { .. } => Ok(Vec::new()),
+                PhpResource::Input { body, pos, .. } => {
+                    let start = *pos as usize;
+                    if start >= body.len() {
+                        Ok(Vec::new())
+                    } else {
+                        let nl = body[start..]
+                            .iter()
+                            .position(|b| *b == b'\n')
+                            .map(|o| start + o + 1)
+                            .unwrap_or(body.len());
+                        let out = body[start..nl].to_vec();
+                        *pos = nl as u64;
+                        Ok(out)
+                    }
+                }
                 PhpResource::File {
                     file,
                     pos,

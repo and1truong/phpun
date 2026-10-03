@@ -892,6 +892,12 @@ pub enum PhpResource {
     },
     /// STDIN/STDOUT/STDERR — php:// and the CLI-SAPI constants.
     Stdio { id: u64, which: u8 },
+    /// php://input — the request body, readable like a file.
+    Input {
+        id: u64,
+        body: std::rc::Rc<Vec<u8>>,
+        pos: u64,
+    },
     /// curl/db handles etc. — opaque placeholder.
     Other { id: u64, kind: &'static str },
 }
@@ -901,6 +907,7 @@ impl PhpResource {
         match self {
             PhpResource::File { id, .. } => *id,
             PhpResource::Stdio { id, .. } => *id,
+            PhpResource::Input { id, .. } => *id,
             PhpResource::Other { id, .. } => *id,
         }
     }

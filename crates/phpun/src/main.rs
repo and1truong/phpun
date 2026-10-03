@@ -98,6 +98,7 @@ fn serve(args: &[String]) -> ExitCode {
     let mut file: Option<&str> = None;
     let mut host = "127.0.0.1".to_string();
     let mut port = 8000u16;
+    let mut docroot: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -106,6 +107,16 @@ fn serve(args: &[String]) -> ExitCode {
                     host = args[i + 1].clone();
                 }
                 i += 2;
+            }
+            "--docroot" | "-t" => {
+                if i + 1 < args.len() {
+                    docroot = Some(args[i + 1].clone());
+                }
+                i += 2;
+            }
+            s if s.starts_with("--docroot=") => {
+                docroot = Some(s[10..].to_string());
+                i += 1;
             }
             "--port" | "-p" => {
                 if i + 1 < args.len() {
@@ -128,13 +139,13 @@ fn serve(args: &[String]) -> ExitCode {
         }
     }
     let Some(file) = file else {
-        eprintln!("usage: phpun serve <file.php> [--host H] [--port N]");
+        eprintln!("usage: phpun serve <file.php> [--host H] [--port N] [--docroot DIR]");
         return ExitCode::FAILURE;
     };
     let abs = std::fs::canonicalize(file)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| file.to_string());
-    ExitCode::from(phpun_core::serve::serve(&abs, &host, port) as u8)
+    ExitCode::from(phpun_core::serve::serve(&abs, &host, port, docroot.as_deref()) as u8)
 }
 
 /// `phpun test [path] [--bootstrap file] [--filter substr]`
