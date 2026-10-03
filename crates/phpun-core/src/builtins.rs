@@ -4250,6 +4250,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     // overwrite; false → append.
                     let preserve = args.get(1).map(|c| c.borrow().is_truthy()).unwrap_or(true);
                     for (k, v) in items {
+                        let v = v.borrow().clone();
                         if preserve {
                             out.set(crate::value::to_key(&k), v);
                         } else {
