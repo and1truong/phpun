@@ -288,6 +288,10 @@ pub struct Interp<'a> {
     fcc_fn_cache: HashMap<(String, String, String), Option<String>>,
     /// Object ptrs whose __destruct already ran (shutdown pass).
     destructed: HashSet<usize>,
+    /// `new` temporaries of the running expression statement — swept
+    /// at statement end so unowned objects destruct promptly
+    /// (bug29368_2/_3).
+    expr_temps: Vec<Rc<RefCell<PhpObject>>>,
     /// Nonzero while a callable is invoked from inside a builtin's
     /// internals (ob handlers) — marks its trace site internal-function.
     internal_cb: u32,
@@ -652,6 +656,7 @@ impl<'a> Interp<'a> {
             obj_handles: Vec::new(),
             fcc_fn_cache: HashMap::new(),
             destructed: HashSet::new(),
+            expr_temps: Vec::new(),
             internal_cb: 0,
             cur_file: file.to_string(),
             strict_files: std::collections::HashSet::new(),
@@ -1731,6 +1736,8 @@ impl<'a> Interp<'a> {
                     mk_method("getProperty", vec![str_param("name")]),
                     mk_method("hasProperty", vec![str_param("name")]),
                     mk_method("getDefaultProperties", vec![]),
+                    mk_method("getInterfaceNames", vec![]),
+                    mk_method("getInterfaces", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -2228,9 +2235,44 @@ impl<'a> Interp<'a> {
         }
         // Zend calls __destruct on live objects after shutdown functions
         // and before output buffers flush — destructors still see their
-        // buffers' contents (bug30578, bug24908).
-        for h in std::mem::take(&mut self.obj_handles) {
-            let ObjHandle::Obj(w) = h else { continue };
+        // buffers' contents (bug30578, bug24908). Two phases:
+        //  1) CV teardown — the global symbol table frees in reverse
+        //     declaration order; objects whose last ref is a global var
+        //     die newest-created first (bug36759).
+        //  2) object store pass — remaining live objects in creation
+        //     order; objects a dtor spawns get visited too (bug74053).
+        let mut cv_objs: Vec<(u64, Rc<RefCell<PhpObject>>)> = Vec::new();
+        for c in self.globals.vars.values() {
+            if let Value::Object(o) = &*c.borrow() {
+                cv_objs.push((o.borrow().id, o.clone()));
+            }
+        }
+        cv_objs.sort_by_key(|(id, _)| *id);
+        for (_, o) in cv_objs.into_iter().rev() {
+            // strong_count 2 = the var's cell + our clone.
+            if Rc::strong_count(&o) != 2 {
+                continue;
+            }
+            let key = Rc::as_ptr(&o) as usize;
+            if self
+                .find_method_in(&o.borrow().class, "__destruct")
+                .is_some()
+                && self.destructed.insert(key)
+            {
+                let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+            }
+        }
+        self.globals.vars.clear();
+        let mut i = 0;
+        while i < self.obj_handles.len() {
+            let w = match &self.obj_handles[i] {
+                ObjHandle::Obj(w) => w.clone(),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            i += 1;
             let Some(o) = w.upgrade() else { continue };
             let key = Rc::as_ptr(&o) as usize;
             if self.destructed.contains(&key) {
@@ -2247,6 +2289,33 @@ impl<'a> Interp<'a> {
         if !self.mem_exceeded {
             self.flush_ob_all();
         }
+    }
+
+    /// Free the expression statement's temporaries: an object with no
+    /// remaining owner destructs now, first-created first — matching
+    /// Zend freeing the VM temp slots at statement end. `base` scopes
+    /// the sweep to temporaries created during *this* statement — a
+    /// nested statement's unwind must not free an outer statement's
+    /// live temps (bug29368_3).
+    fn sweep_expr_temps(&mut self, base: usize) -> Result<(), PhpError> {
+        let temps = self.expr_temps.split_off(base);
+        for o in temps {
+            if Rc::strong_count(&o) != 1 {
+                continue;
+            }
+            let key = Rc::as_ptr(&o) as usize;
+            if self.destructed.contains(&key) {
+                continue;
+            }
+            if self
+                .find_method_in(&o.borrow().class, "__destruct")
+                .is_some()
+            {
+                self.destructed.insert(key);
+                self.method_invoke(o.clone(), "__destruct", CallArgs::empty())?;
+            }
+        }
+        Ok(())
     }
 
     /// Convenience: parse+run a source string (used by tests and the CLI).
@@ -3479,29 +3548,52 @@ impl<'a> Interp<'a> {
                 // A lone `$x;` compiles to a dead FREE op in Zend — no
                 // undefined-variable warning (first_class_callable_dynamic).
                 Expr::Var(n) if self.var_lookup(n).is_none() => Flow::Normal,
-                _ => match self.eval(e) {
-                    // A discarded temporary object reaches refcount 0
-                    // here — Zend runs its __destruct immediately
-                    // (methods_003 `new bar;`).
-                    Ok(Value::Object(o)) if Rc::strong_count(&o) == 1 => {
-                        if self
-                            .find_method_in(&o.borrow().class, "__destruct")
-                            .is_some()
-                        {
-                            let oid = Rc::as_ptr(&o) as usize;
-                            if self.destructed.insert(oid) {
-                                match self.method_invoke(o.clone(), "__destruct", CallArgs::empty())
+                _ => {
+                    let base = self.expr_temps.len();
+                    let r = self.eval(e);
+                    match r {
+                        Ok(v) => {
+                            // A discarded temporary object reaches
+                            // refcount 0 here — Zend runs its
+                            // __destruct immediately (methods_003
+                            // `new bar;`). strong_count 2 = the
+                            // statement value + its expr_temps slot.
+                            if let Value::Object(o) = &v {
+                                if Rc::strong_count(o) == 2
+                                    && self
+                                        .find_method_in(&o.borrow().class, "__destruct")
+                                        .is_some()
                                 {
-                                    Ok(_) => {}
-                                    Err(e) => return self.err_flow(e),
+                                    let oid = Rc::as_ptr(o) as usize;
+                                    if self.destructed.insert(oid) {
+                                        if let Err(e) = self.method_invoke(
+                                            o.clone(),
+                                            "__destruct",
+                                            CallArgs::empty(),
+                                        ) {
+                                            self.expr_temps.truncate(base);
+                                            return self.err_flow(e);
+                                        }
+                                    }
                                 }
                             }
+                            // Statement end frees expression
+                            // temporaries; a dtor exception propagates
+                            // through the statement (bug29368_2).
+                            match self.sweep_expr_temps(base) {
+                                Ok(()) => Flow::Normal,
+                                Err(e) => self.err_flow(e),
+                            }
                         }
-                        Flow::Normal
+                        // On unwind the live temporaries die in order
+                        // before the exception propagates
+                        // (bug29368_3).
+                        Err(e) => {
+                            let _ = self.sweep_expr_temps(base);
+                            self.err_flow(e)
+                        }
                     }
-                    Ok(_) => Flow::Normal,
-                    Err(e) => self.err_flow(e),
-                },
+                }
             },
             Stmt::Block(b) => self.exec_block(b),
             Stmt::If { cond, then, else_ } => match self.eval(cond) {
@@ -4457,6 +4549,35 @@ impl<'a> Interp<'a> {
         val: &ForeachTarget,
         body: &[Stmt],
     ) -> Flow {
+        let f = self.exec_foreach_iter_loop(it.clone(), key, val, body);
+        // The iterator's temp dies with the foreach — a `new` captured
+        // only by the iteration frees here, not at statement end
+        // (typed_properties_115: its prop cells must unalias before a
+        // later var_dump counts holders).
+        if Rc::strong_count(&it) == 2 && self.expr_temps.iter().any(|o| Rc::ptr_eq(o, &it)) {
+            self.expr_temps.retain(|o| !Rc::ptr_eq(o, &it));
+            let key = Rc::as_ptr(&it) as usize;
+            if !self.destructed.contains(&key)
+                && self
+                    .find_method_in(&it.borrow().class, "__destruct")
+                    .is_some()
+            {
+                self.destructed.insert(key);
+                if let Err(e) = self.method_invoke(it.clone(), "__destruct", CallArgs::empty()) {
+                    return self.err_flow(e);
+                }
+            }
+        }
+        f
+    }
+
+    fn exec_foreach_iter_loop(
+        &mut self,
+        it: Rc<RefCell<PhpObject>>,
+        key: &Option<ForeachKey>,
+        val: &ForeachTarget,
+        body: &[Stmt],
+    ) -> Flow {
         if let Err(e) = self.method_invoke(it.clone(), "rewind", CallArgs::empty()) {
             return self.err_flow(e);
         }
@@ -4940,12 +5061,24 @@ impl<'a> Interp<'a> {
             }
             Expr::StaticCallDyn { class, name, args } => {
                 // `C::$var(...)`: class resolves first, then the name.
+                // Non-string names are a catchable Error
+                // (call_static_004).
                 let cls = self.class_of(class)?;
                 let nv = self.eval(name)?;
-                let n = self.conv_str(&nv)?;
+                let n = match nv {
+                    Value::Str(s) => crate::value::lossy(&s).into_owned(),
+                    _ => {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            "Method name must be a string",
+                            0,
+                        ))
+                    }
+                };
+                let fwd = matches!(&**class, Expr::Const(_) | Expr::Str(_) | Expr::AnonClass(_));
                 let argvals =
                     self.arg_cells(args, &[], &format!("{}::{{closure}}()", cls.name()), false)?;
-                self.static_invoke_vis(cls, &n, argvals, None)
+                self.static_invoke_vis(cls, &n, argvals, None, fwd)
             }
             Expr::ClassConst { class, name } => self.class_const(class, name),
             Expr::Clone(e) => {
@@ -8044,7 +8177,8 @@ impl<'a> Interp<'a> {
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
                 let vals = self.arg_cells(args, &params, &format!("{}()", mn), false)?;
-                return self.static_invoke_vis(cls, &mn, vals, None);
+                let fwd = matches!(&**class, Expr::Const(_) | Expr::Str(_) | Expr::AnonClass(_));
+                return self.static_invoke_vis(cls, &mn, vals, None, fwd);
             }
             Expr::Prop { .. } | Expr::MethodCall { .. } | Expr::Index { .. } => {
                 let v = self.eval(name)?;
@@ -8528,7 +8662,7 @@ impl<'a> Interp<'a> {
                     CallableKind::Method { obj, class, name } => match obj {
                         Some(o) => self.method_invoke(o.clone(), name, args),
                         None => match class {
-                            Some(cls) => self.static_invoke(cls.clone(), name, args, None),
+                            Some(cls) => self.static_invoke(cls.clone(), name, args, None, true),
                             None => self.fail(PhpError::fatal("bad callable", 0)),
                         },
                     },
@@ -8543,7 +8677,7 @@ impl<'a> Interp<'a> {
                     if let Some(c) = self.resolve_class(cls) {
                         let cls = self.classes.get(&c.to_lowercase()).cloned();
                         if let Some(cls) = cls {
-                            return self.static_invoke_vis(cls, m, args, None);
+                            return self.static_invoke_vis(cls, m, args, None, true);
                         }
                     }
                 }
@@ -8577,7 +8711,9 @@ impl<'a> Interp<'a> {
                                     .resolve_class(&crate::value::lossy(&cn))
                                     .and_then(|c| self.classes.get(&c.to_lowercase()).cloned());
                                 match cls {
-                                    Some(cls) => self.static_invoke_vis(cls, &mname, args, None),
+                                    Some(cls) => {
+                                        self.static_invoke_vis(cls, &mname, args, None, true)
+                                    }
                                     None => self.fail(PhpError::uncaught(
                                         "Error",
                                         format!("Class \"{}\" not found", crate::value::lossy(&cn)),
@@ -8629,7 +8765,16 @@ impl<'a> Interp<'a> {
             Expr::StaticCallDyn { class, name, .. } => {
                 let cls = self.fcc_class_of(class)?;
                 let nv = self.eval(name)?;
-                let mn = self.conv_str(&nv)?;
+                let mn = match nv {
+                    Value::Str(s) => crate::value::lossy(&s).into_owned(),
+                    _ => {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            "Method name must be a string",
+                            0,
+                        ))
+                    }
+                };
                 self.fcc_static(cls, &mn)
             }
             other => {
@@ -11676,6 +11821,19 @@ impl<'a> Interp<'a> {
                 self.linking.pop();
                 checks_res?;
                 self.magic_method_checks(&d)?;
+                // An interface declaring __toString implicitly extends
+                // Stringable (interface_with_tostring).
+                let mut d = d;
+                if d.methods
+                    .iter()
+                    .any(|m| m.decl.name.eq_ignore_ascii_case("__tostring"))
+                    && !d
+                        .implements
+                        .iter()
+                        .any(|i| i.eq_ignore_ascii_case("stringable"))
+                {
+                    d.implements.push("Stringable".to_string());
+                }
                 self.interfaces.insert(lname.clone(), Rc::new(d));
                 self.decl_order.push(lname);
             }
@@ -11825,6 +11983,20 @@ impl<'a> Interp<'a> {
                     self.warn("Private methods cannot be final as they are never overridden by other classes")?;
                 }
                 self.magic_method_checks(&d)?;
+                // Declaring __toString (incl. via a trait) implicitly
+                // implements Stringable — added post-checks like zend,
+                // so no sig-compat check runs against it
+                // (stringable_automatic_implementation).
+                if d.methods
+                    .iter()
+                    .any(|m| m.decl.name.eq_ignore_ascii_case("__tostring"))
+                    && !d
+                        .implements
+                        .iter()
+                        .any(|i| i.eq_ignore_ascii_case("stringable"))
+                {
+                    d.implements.push("Stringable".to_string());
+                }
                 self.classes.insert(
                     lname.clone(),
                     Rc::new(PhpClass {
@@ -14737,8 +14909,16 @@ impl<'a> Interp<'a> {
         // interception); the ctor may be inherited (property_hooks/foreach).
         if has_ctor {
             if let Value::Object(o) = &obj {
-                self.method_invoke_vis(o.clone(), "__construct", args)?;
+                if let Err(e) = self.method_invoke_vis(o.clone(), "__construct", args) {
+                    // A ctor that throws leaves a half-built object;
+                    // zend never runs its __destruct (bug29368_1/_3).
+                    self.destructed.insert(Rc::as_ptr(o) as usize);
+                    return Err(e);
+                }
             }
+        }
+        if let Value::Object(o) = &obj {
+            self.expr_temps.push(o.clone());
         }
         Ok(obj)
     }
@@ -16812,6 +16992,13 @@ impl<'a> Interp<'a> {
                     .first()
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
+                // Zend reflectors keep the class NAME, not the object —
+                // `new ReflectionClass(new T)` drops the arg temp so
+                // its __destruct runs at statement end (bug29368_2).
+                let cls = match &cls {
+                    Value::Object(o) => Value::str(o.borrow().class.name()),
+                    _ => cls,
+                };
                 let prop = args
                     .get(1)
                     .map(|c| c.borrow().clone())
@@ -17571,6 +17758,42 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
             }
+            // ReflectionClass::getInterfaceNames() — declared-case
+            // interface names; getInterfaces() returns the reflectors.
+            "getinterfacenames" | "getinterfaces" => {
+                let cv = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = match &cv {
+                    Value::Object(o) => o.borrow().class.name().to_string(),
+                    _ => self.conv_str(&cv)?.to_string(),
+                };
+                let l = self
+                    .resolve_class(&cn)
+                    .unwrap_or_else(|| cn.clone())
+                    .to_lowercase();
+                let decl = self
+                    .classes
+                    .get(&l)
+                    .map(|c| c.decl.clone())
+                    .or_else(|| self.interfaces.get(&l).cloned())
+                    .or_else(|| self.traits.get(&l).cloned());
+                let mut arr = PhpArray::default();
+                if let Some(d) = decl {
+                    for i in &d.implements {
+                        if lname == "getinterfaces" {
+                            let r = self.instantiate("reflectionclass", &[Value::str(i)])?;
+                            arr.set(ArrKey::Str(i.as_str().into()), r);
+                        } else {
+                            arr.push(Value::str(i.clone()));
+                        }
+                    }
+                }
+                Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
+            }
             "getconstant" | "getconstants" => {
                 let cn = obj
                     .borrow()
@@ -18282,6 +18505,7 @@ impl<'a> Interp<'a> {
         name: &str,
         args: CallArgs,
         called_class: Option<Rc<PhpClass>>,
+        fwd: bool,
     ) -> Result<Value, PhpError> {
         if let Some((m, sc)) = self.scope_private_method(name) {
             let this_obj = if m.is_static {
@@ -18295,6 +18519,17 @@ impl<'a> Interp<'a> {
                         self.is_a_str(&cname, cls.name())
                     })
             };
+            if !m.is_static && this_obj.is_none() {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    format!(
+                        "Non-static method {}::{}() cannot be called statically",
+                        sc.name(),
+                        m.decl.name
+                    ),
+                    0,
+                ));
+            }
             self.pending_decl_class = Some(sc.clone());
             self.pending_called_class = Some(called_class.unwrap_or(cls.clone()));
             let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(sc));
@@ -18304,6 +18539,22 @@ impl<'a> Interp<'a> {
         }
         if let Some((m, dc)) = self.find_method_in(&cls, name) {
             if !self.method_access_ok(&m, &dc) {
+                // Inaccessible found-method: same magic preference as
+                // the missing path — __call first in object context,
+                // else __callStatic (bug53826, bug48533).
+                let this_obj = self
+                    .stack
+                    .last()
+                    .and_then(|f| f.this_obj.clone())
+                    .filter(|o| {
+                        let cname = o.borrow().class.name().to_string();
+                        self.is_a_str(&cname, cls.name())
+                    });
+                if let Some(o) = this_obj {
+                    if let Some((cm, cdc)) = self.find_method_in(&cls, "__call") {
+                        return self.call_via_magic(o, &cm, cdc, name, args);
+                    }
+                }
                 if let Some((cm, cdc)) = self.find_method_in(&cls, "__callstatic") {
                     let mut arr = PhpArray::new();
                     for a in &args.cells {
@@ -18331,7 +18582,7 @@ impl<'a> Interp<'a> {
                 return self.fail(e);
             }
         }
-        self.static_invoke(cls, name, args, called_class)
+        self.static_invoke(cls, name, args, called_class, fwd)
     }
 
     /// Userland `$obj->name()` dispatch: gate visibility at the call
@@ -18903,6 +19154,9 @@ impl<'a> Interp<'a> {
             .map(|m| m.0.decl.params.clone())
             .unwrap_or_default();
         let argvals = self.arg_cells(args, &params, &format!("{}()", name), false)?;
+        // Only a syntactic class ref (self/parent/static/Foo) is a
+        // forwarding call; `$x::m()` is not (bug48533).
+        let fwd = matches!(class, Expr::Const(_) | Expr::Str(_) | Expr::AnonClass(_));
         // Forwarding calls (self::/parent::/static::) preserve the
         // current late-static-binding class instead of resetting it to
         // the resolved target: `parent::__construct()` on a subclass
@@ -18922,7 +19176,7 @@ impl<'a> Interp<'a> {
             }
             _ => None,
         };
-        self.static_invoke_vis(cls, name, argvals, called)
+        self.static_invoke_vis(cls, name, argvals, called, fwd)
     }
 
     fn static_invoke(
@@ -18931,6 +19185,7 @@ impl<'a> Interp<'a> {
         name: &str,
         args: CallArgs,
         called_class: Option<Rc<PhpClass>>,
+        fwd: bool,
     ) -> Result<Value, PhpError> {
         // Closure::{bind,fromCallable}: native callable rebinding.
         if cls.name().eq_ignore_ascii_case("closure") {
@@ -18986,10 +19241,12 @@ impl<'a> Interp<'a> {
                         0,
                     ));
                 }
-                // Forwarding call: a non-static method invoked statically
-                // still receives $this when the caller's $this is an
-                // instance of the callee's class (bug21961).
-                let this_obj = if m.is_static {
+                // Forwarding call: a non-static method invoked
+                // statically still receives $this when the caller's
+                // $this is an instance of the callee's class
+                // (bug21961) — but only via a syntactic class ref;
+                // `$obj::m()` is not a forwarding call (bug48533).
+                let this_obj = if m.is_static || !fwd {
                     None
                 } else {
                     self.stack
@@ -19000,6 +19257,17 @@ impl<'a> Interp<'a> {
                             self.is_a_str(&cname, cls.name())
                         })
                 };
+                if !m.is_static && this_obj.is_none() {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!(
+                            "Non-static method {}::{}() cannot be called statically",
+                            dc.name(),
+                            m.decl.name
+                        ),
+                        0,
+                    ));
+                }
                 self.pending_decl_class = Some(dc.clone());
                 self.pending_called_class = Some(called_class.clone().unwrap_or(cls.clone()));
                 let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(dc));
@@ -19008,25 +19276,44 @@ impl<'a> Interp<'a> {
                 r
             }
             None => {
+                // A missing __construct never reaches magic —
+                // `Foo::__construct()` is "Cannot call constructor"
+                // (call_static_006). __destruct etc. dispatch normally.
+                if name.eq_ignore_ascii_case("__construct") {
+                    return self.fail(PhpError::uncaught("Error", "Cannot call constructor", 0));
+                }
+                let mut arr = PhpArray::new();
+                for a in &args.cells {
+                    arr.push(a.borrow().clone());
+                }
+                for (n, a, ..) in &args.named {
+                    arr.set(ArrKey::Str(Rc::from(n.as_str())), a.borrow().clone());
+                }
+                let magic_args = CallArgs::positional(vec![
+                    cell(Value::str(name)),
+                    cell(Value::Array(Rc::new(RefCell::new(arr)))),
+                ]);
+                // Object context prefers __call over __callStatic when
+                // the caller's $this is an instance of the callee —
+                // `self::x()` inside a method acts as an instance call
+                // (call_static_003/007, bug45186).
+                let this_obj = self
+                    .stack
+                    .last()
+                    .and_then(|f| f.this_obj.clone())
+                    .filter(|o| {
+                        let cname = o.borrow().class.name().to_string();
+                        self.is_a_str(&cname, cls.name())
+                    });
+                if let Some(o) = this_obj {
+                    if self.find_method_in(&cls, "__call").is_some() {
+                        return self.method_invoke(o, "__call", magic_args);
+                    }
+                }
                 if let Some((m, dc)) = self.find_method_in(&cls, "__callstatic") {
-                    let mut arr = PhpArray::new();
-                    for a in &args.cells {
-                        arr.push(a.borrow().clone());
-                    }
-                    for (n, a, ..) in &args.named {
-                        arr.set(ArrKey::Str(Rc::from(n.as_str())), a.borrow().clone());
-                    }
                     self.pending_decl_class = Some(dc.clone());
                     self.pending_called_class = Some(called_class.clone().unwrap_or(cls.clone()));
-                    let r = self.invoke_fn(
-                        &Rc::new(m.decl.clone()),
-                        CallArgs::positional(vec![
-                            cell(Value::str(name)),
-                            cell(Value::Array(Rc::new(RefCell::new(arr)))),
-                        ]),
-                        None,
-                        Some(dc),
-                    );
+                    let r = self.invoke_fn(&Rc::new(m.decl.clone()), magic_args, None, Some(dc));
                     self.pending_decl_class = None;
                     self.pending_called_class = None;
                     return r;
