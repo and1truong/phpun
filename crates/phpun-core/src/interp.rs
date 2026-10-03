@@ -83,6 +83,9 @@ pub struct Interp<'a> {
     /// Traits by name — their methods are copied into using classes.
     traits: HashMap<String, Rc<ClassDecl>>,
     interfaces: HashMap<String, Rc<ClassDecl>>,
+    /// Top-level parentless classes registered by hoisting (early
+    /// binding); their decl stmt then no-ops (namespaces/ns_060).
+    early_bound_classes: HashSet<String>,
     constants: HashMap<String, Value>,
     /// Accumulated program output (display_errors prints to stdout under
     /// CLI, and the PHPT harness merges streams via 2>&1).
@@ -245,6 +248,7 @@ impl<'a> Interp<'a> {
             classes: HashMap::new(),
             traits: HashMap::new(),
             interfaces: HashMap::new(),
+            early_bound_classes: HashSet::new(),
             constants,
             out: String::new(),
             ob_stack: Vec::new(),
@@ -677,12 +681,33 @@ impl<'a> Interp<'a> {
                     d.file = self.cur_file.clone();
                     self.functions.insert(d.name.to_lowercase(), Rc::new(d));
                 }
-                // Top-level `const` binds early like functions
-                // (namespaces/ns_041).
-                Stmt::ConstDecl(defs) => {
-                    for (n, e) in defs {
-                        if let Ok(v) = self.eval(e) {
-                            self.define_const(n, v);
+                // `namespace X { stmts }` parses as
+                // Block[Namespace, Block[stmts]] — decls inside are still
+                // unconditional top-level for early binding (ns_085).
+                Stmt::Block(v) if matches!(v.first(), Some(Stmt::Namespace(_))) => {
+                    for s in &v[1..] {
+                        if let Stmt::Block(inner) = s {
+                            self.hoist_funcs(inner);
+                        }
+                    }
+                }
+                // Early binding: unconditional top-level classes with no
+                // parent/interfaces/traits register before execution
+                // (namespaces/ns_060).
+                Stmt::Class(d)
+                    if d.parent.is_none() && d.implements.is_empty() && d.traits.is_empty() =>
+                {
+                    let key = d.name.to_lowercase();
+                    if !self.classes.contains_key(&key) && !self.early_bound_classes.contains(&key)
+                    {
+                        let mut d = (**d).clone();
+                        for m in &mut d.methods {
+                            let mut mm = (**m).clone();
+                            mm.decl.file = self.cur_file.clone();
+                            *m = Rc::new(mm);
+                        }
+                        if self.register_class(Rc::new(d)).is_ok() {
+                            self.early_bound_classes.insert(key);
                         }
                     }
                 }
@@ -1547,6 +1572,9 @@ impl<'a> Interp<'a> {
                     mm.decl.file = self.cur_file.clone();
                     *m = Rc::new(mm);
                 }
+                if self.early_bound_classes.contains(&d.name.to_lowercase()) {
+                    return Flow::Normal;
+                }
                 if let Err(e) = self.register_class(Rc::new(d)) {
                     return self.err_flow(e);
                 }
@@ -1792,6 +1820,15 @@ impl<'a> Interp<'a> {
             }
             Stmt::ConstDecl(defs) => {
                 for (n, e) in defs {
+                    // TRUE/FALSE/NULL are reserved — `const NULL` is a
+                    // compile-time fatal (namespaces/ns_075).
+                    let short = n.rsplit('\\').next().unwrap_or(n);
+                    if matches!(short.to_uppercase().as_str(), "TRUE" | "FALSE" | "NULL") {
+                        return self.err_flow(PhpError::fatal(
+                            format!("Cannot redeclare constant '{}'", short),
+                            self.cur_line,
+                        ));
+                    }
                     match self.eval(e) {
                         Ok(v) => self.define_const(n, v),
                         Err(e) => return self.err_flow(e),
@@ -2389,13 +2426,18 @@ impl<'a> Interp<'a> {
                         }
                         continue;
                     }
-                    let val = self.eval(v)?;
+                    // Zend evaluates the key expression before the value
+                    // (namespaces/ns_077_3).
                     match k {
                         Some(ke) => {
                             let kv = self.eval(ke)?;
+                            let val = self.eval(v)?;
                             arr.set(to_key(&kv), val);
                         }
-                        None => arr.push(val),
+                        None => {
+                            let val = self.eval(v)?;
+                            arr.push(val);
+                        }
                     }
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(arr))))
@@ -2546,6 +2588,16 @@ impl<'a> Interp<'a> {
                 }
             }
             Expr::Closure(c) => {
+                // Compile-time param checks for the closure's decl —
+                // `{closure:FILE:LINE}():` names it (namespaces/ns_073).
+                let cfile = if c.decl.file.is_empty() {
+                    self.file.to_string()
+                } else {
+                    c.decl.file.clone()
+                };
+                let fname = format!("{{closure:{}:{}}}", cfile, c.decl.line);
+                let decl = c.decl.clone();
+                self.decl_type_checks(&fname, &decl)?;
                 let mut captures = Vec::new();
                 if c.arrow {
                     // `fn` captures whole scope by value.
@@ -2907,12 +2959,16 @@ impl<'a> Interp<'a> {
             _ => {}
         }
         let key = name.trim_start_matches('\\');
+        // Error names the ns-qualified candidate for an unqualified
+        // const inside a namespace (namespaces/ns_041).
+        let mut miss_name = name.trim_start_matches('\\').to_string();
         if !name.contains('\\') {
             // Unqualified constant inside a namespace: `ns\NAME` first,
             // then the global constant (Zend/tests/namespaces).
             let ns = self.caller_ns();
             if !ns.is_empty() {
-                if let Some(v) = self.constants.get(&format!("{}\\{}", ns, key)) {
+                miss_name = format!("{}\\{}", ns, key);
+                if let Some(v) = self.constants.get(&miss_name) {
                     return Ok(v.clone());
                 }
             }
@@ -2923,10 +2979,7 @@ impl<'a> Interp<'a> {
         if let Some(v) = self.constants.get(name) {
             return Ok(v.clone());
         }
-        let v = self.exception(
-            "Error",
-            &format!("Undefined constant \"{}\"", name.trim_start_matches('\\')),
-        );
+        let v = self.exception("Error", &format!("Undefined constant \"{}\"", miss_name));
         self.pending_exception = Some(v);
         Err(PhpError {
             trace: None,
@@ -4780,6 +4833,17 @@ impl<'a> Interp<'a> {
             Some(n) => (true, n.to_lowercase()),
             None => (false, fname.trim_start_matches('\\').to_lowercase()),
         };
+        // `__HALT_COMPILER()` stops execution of the file (ns_080).
+        if lname == "__halt_compiler" {
+            return Err(PhpError {
+                trace: None,
+                thrown_line: None,
+                display_msg: None,
+                kind: ErrorKind::Fatal,
+                message: "\u{1}exit:0".to_string(),
+                line: 0,
+            });
+        }
         let mut decl = self.functions.get(&lname).cloned();
         // A namespaced user function outranks the global/builtin one for
         // unqualified calls (namespaces/ns_013).
@@ -4895,7 +4959,9 @@ impl<'a> Interp<'a> {
                 }
             }
             Value::Str(s) => {
-                let name = s.to_string();
+                // Fully-qualified dynamic names carry a leading `\`
+                // (namespaces/ns_032).
+                let name = s.trim_start_matches('\\').to_string();
                 // "Class::method" string callables
                 if let Some((cls, m)) = name.split_once("::") {
                     if let Some(c) = self.resolve_class(cls) {
@@ -5196,7 +5262,20 @@ impl<'a> Interp<'a> {
                     .map(|a| trace_arg(&a.borrow()))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let frame = format!("{}({}): {}({})", self.file, self.cur_line, fname, argdesc);
+                // Trace frames render `->` for instance calls while the
+                // message keeps `::` (namespaces/ns_071).
+                let arrow = if self
+                    .stack
+                    .last()
+                    .and_then(|f| f.this_obj.as_ref())
+                    .is_some()
+                {
+                    "->"
+                } else {
+                    "::"
+                };
+                let tname = fname.replacen("::", arrow, 1);
+                let frame = format!("{}({}): {}({})", self.file, self.cur_line, tname, argdesc);
                 let call_line = self.cur_line;
                 self.stack.pop();
                 let mut e = PhpError::uncaught("TypeError", msg, call_line);
@@ -5227,7 +5306,16 @@ impl<'a> Interp<'a> {
                         binds.push((p.name.clone(), cell(v.borrow().clone())));
                     }
                 } else if let Some(d) = &p.default {
-                    let dv = self.eval(d).unwrap_or(Value::Null);
+                    // Default exprs are evaluated at call time; an error
+                    // (e.g. an undefined constant) propagates as the
+                    // call's failure (namespaces/ns_077).
+                    let dv = match self.eval(d) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.stack.pop();
+                            return self.fail(e);
+                        }
+                    };
                     binds.push((p.name.clone(), cell(dv)));
                 } else {
                     binds.push((p.name.clone(), cell(Value::Null)));
@@ -8484,12 +8572,16 @@ impl<'a> Interp<'a> {
                 return Ok(Value::Bool(false));
             }
         };
-        // Include executes in the current scope (PHP semantics).
+        // Include executes in the current scope (PHP semantics); the
+        // included file's namespace starts global regardless of the
+        // includer's (namespaces/ns_069).
         let saved_file = std::mem::replace(&mut self.cur_file, canon.display().to_string());
+        let saved_ns = std::mem::take(&mut self.globals.ns);
         self.hoist_funcs(&stmts);
         let flow = self.exec_block(&stmts);
         inc_pop(self);
         self.cur_file = saved_file;
+        self.globals.ns = saved_ns;
         match flow {
             Flow::Return(v) => Ok(v),
             Flow::Normal => Ok(Value::Int(1)),

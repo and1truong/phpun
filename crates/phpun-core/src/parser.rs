@@ -35,6 +35,13 @@ pub struct Parser<'a> {
     /// declared in this file — a `use` alias colliding with one is a
     /// compile-time fatal (namespaces/ns_030).
     declared_types: std::collections::HashSet<String>,
+    /// Inside a `namespace X { ... }` body — nested `namespace`
+    /// declarations are a compile error (namespaces/ns_079).
+    in_braced_ns: bool,
+    /// Braced vs unbraced namespace declarations in this file —
+    /// 0 none, 1 unbraced, 2 braced (mixing is a compile fatal,
+    /// namespaces/ns_081/ns_084).
+    ns_style: u8,
 }
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
@@ -57,6 +64,8 @@ pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
         use_fn_map: std::collections::HashMap::new(),
         use_const_map: std::collections::HashMap::new(),
         declared_types: std::collections::HashSet::new(),
+        in_braced_ns: false,
+        ns_style: 0,
     };
     let mut stmts = p.program()?;
     for (i, (msg, line)) in std::mem::take(&mut p.deprecations).into_iter().enumerate() {
@@ -125,6 +134,8 @@ pub fn parse_expr_src(src: &str) -> Result<Expr, PhpError> {
         use_fn_map: std::collections::HashMap::new(),
         use_const_map: std::collections::HashMap::new(),
         declared_types: std::collections::HashSet::new(),
+        in_braced_ns: false,
+        ns_style: 0,
     };
     let e = p.expr()?;
     Ok(e)
@@ -219,9 +230,44 @@ impl<'a> Parser<'a> {
 
     pub fn program(&mut self) -> Result<Vec<Stmt>, PhpError> {
         let mut stmts = Vec::new();
+        let mut saw_code = false;
+        let mut saw_ns = false;
         while self.peek().is_some() {
             stmts.push(Stmt::Line(self.line()));
-            stmts.push(self.stmt()?);
+            let s = self.stmt()?;
+            let is_ns = matches!(&s, Stmt::Namespace(_))
+                || matches!(&s, Stmt::Block(v) if matches!(v.first(), Some(Stmt::Namespace(_))));
+            // The first `namespace` declaration must precede all code
+            // (only `declare` may come earlier); later `namespace`
+            // declarations may follow code (namespaces/ns_068).
+            if is_ns && !saw_ns && saw_code {
+                return Err(PhpError::fatal(
+                    "Namespace declaration statement has to be the very first statement or after any declare call in the script".to_string(),
+                    self.line(),
+                ));
+            }
+            // Once a braced `namespace {}` is used, every later stmt
+            // must itself be inside a namespace block (ns_087).
+            if !is_ns
+                && self.ns_style == 2
+                && !matches!(&s, Stmt::Declare { .. })
+                && !matches!(&s, Stmt::Expr(Expr::Null))
+            {
+                return Err(PhpError::fatal(
+                    "No code may exist outside of namespace {}".to_string(),
+                    self.line(),
+                ));
+            }
+            saw_ns = saw_ns || is_ns;
+            // A lone `;` (Stmt::Expr(Expr::Null)) is not "code" either
+            // (namespaces/namespace_first_stmt_nop).
+            if !is_ns
+                && !matches!(&s, Stmt::Declare { .. })
+                && !matches!(&s, Stmt::Expr(Expr::Null))
+            {
+                saw_code = true;
+            }
+            stmts.push(s);
         }
         Ok(stmts)
     }
@@ -414,11 +460,32 @@ impl<'a> Parser<'a> {
                     self.use_map.clear();
                     self.use_fn_map.clear();
                     self.use_const_map.clear();
+                    self.declared_types.clear();
+                    let braced = self.at_op("{");
+                    if self.in_braced_ns {
+                        return Err(PhpError::fatal(
+                            if braced {
+                                "Namespace declarations cannot be nested".to_string()
+                            } else {
+                                "Cannot mix bracketed namespace declarations with unbracketed namespace declarations".to_string()
+                            },
+                            self.line(),
+                        ));
+                    }
+                    let style = if braced { 2 } else { 1 };
+                    if self.ns_style != 0 && self.ns_style != style {
+                        return Err(PhpError::fatal(
+                            "Cannot mix bracketed namespace declarations with unbracketed namespace declarations".to_string(),
+                            self.line(),
+                        ));
+                    }
+                    self.ns_style = style;
                     if self.eat_op("{") {
                         // `namespace Foo { ... }` — body parsed inline
                         // while cur_ns is set, then the enclosing scope
                         // is restored.
                         let mut v = Vec::new();
+                        self.in_braced_ns = true;
                         while !self.eat_op("}") {
                             if self.peek().is_none() {
                                 return Err(PhpError::parse(
@@ -428,10 +495,12 @@ impl<'a> Parser<'a> {
                             }
                             v.push(self.stmt()?);
                         }
+                        self.in_braced_ns = false;
                         self.cur_ns.clear();
                         self.use_map.clear();
                         self.use_fn_map.clear();
                         self.use_const_map.clear();
+                        self.declared_types.clear();
                         return Ok(Stmt::Block(vec![Stmt::Namespace(name), Stmt::Block(v)]));
                     }
                     self.expect_op(";")?;
@@ -830,6 +899,14 @@ impl<'a> Parser<'a> {
                     if self.eat_op("}") {
                         break;
                     }
+                    // `use A\{B\{C}}` — nested group use is a syntax
+                    // error naming `}` (namespaces/ns_088).
+                    if self.at_op("{") {
+                        return Err(PhpError::parse(
+                            "syntax error, unexpected token \"{\", expecting \"}\"",
+                            self.line(),
+                        ));
+                    }
                     self.expect_op(",")?;
                 }
             } else {
@@ -856,6 +933,12 @@ impl<'a> Parser<'a> {
     /// A `use` with no `function`/`const` prefix imports the alias for
     /// every symbol kind (Zend/tests/namespaces/ns_012).
     fn insert_use_alias(&mut self, kind: NsKind, alias: &str, fq: &str) -> Result<(), PhpError> {
+        // Re-importing the same alias to the same target is a no-op
+        // (namespaces/ns_078).
+        if kind == NsKind::Class && self.use_map.get(&alias.to_lowercase()) == Some(&fq.to_string())
+        {
+            return Ok(());
+        }
         if kind == NsKind::Class && self.declared_types.contains(&alias.to_lowercase()) {
             return Err(PhpError::fatal(
                 format!(
@@ -938,11 +1021,7 @@ impl<'a> Parser<'a> {
         if segs.is_empty() {
             return self.cur_ns.clone();
         }
-        // Already-resolved names (the `X::` postfix re-runs resolution on
-        // the ident branch's output) must not double-prepend.
-        if !self.cur_ns.is_empty() && raw.starts_with(&format!("{}\\", self.cur_ns)) {
-            return raw.to_string();
-        }
+
         let map = match kind {
             NsKind::Class => &self.use_map,
             NsKind::Func => &self.use_fn_map,
@@ -2115,7 +2194,7 @@ impl<'a> Parser<'a> {
         loop {
             match self.peek() {
                 Some(Token::Ident(n)) => {
-                    if !name.is_empty() {
+                    if !name.is_empty() && !name.ends_with('\\') {
                         name.push('\\');
                     }
                     name.push_str(n);
@@ -2155,7 +2234,26 @@ impl<'a> Parser<'a> {
         if members.is_empty() {
             None
         } else {
-            Some(members)
+            // Class-type members resolve against the current namespace /
+            // use-aliases at compile time; builtin scalar types do not
+            // (namespaces/ns_055).
+            const BUILTIN_TYS: &[&str] = &[
+                "int", "float", "string", "bool", "array", "callable", "iterable", "object",
+                "mixed", "void", "never", "null", "false", "true", "numeric", "resource", "self",
+                "static", "parent",
+            ];
+            Some(
+                members
+                    .into_iter()
+                    .map(|m| {
+                        if m.is_empty() || BUILTIN_TYS.contains(&m.to_lowercase().as_str()) {
+                            m
+                        } else {
+                            self.ns_resolve(&m, NsKind::Class)
+                        }
+                    })
+                    .collect(),
+            )
         }
     }
 
@@ -3108,7 +3206,10 @@ impl<'a> Parser<'a> {
                     Ok(Expr::MagicConst(MagicConst::Class))
                 } else if self.ident_is("__namespace__") {
                     self.pos += 1;
-                    Ok(Expr::MagicConst(MagicConst::Namespace))
+                    // __NAMESPACE__ is compile-time per the file the
+                    // literal sits in — an include's top level is global
+                    // even inside a namespaced caller (ns_069).
+                    Ok(Expr::Str(self.cur_ns.clone()))
                 } else if self.ident_is("__property__") {
                     self.pos += 1;
                     Ok(Expr::MagicConst(MagicConst::Property))
@@ -3146,13 +3247,13 @@ impl<'a> Parser<'a> {
                         // `X::…` — a class name in every form.
                         Ok(Expr::Const(self.ns_resolve(&name, NsKind::Class)))
                     } else {
-                        // Constant read: fully qualified `\A` stays
-                        // `\`-marked so const_read skips the namespace
-                        // fallback; qualified `A\B` resolves now.
-                        if name.contains('\\') && !name.starts_with('\\') {
-                            Ok(Expr::Const(self.ns_resolve(&name, NsKind::Const)))
-                        } else {
+                        // Constant read: resolve now so a `use` alias
+                        // applies; an unqualified miss keeps the bare
+                        // name for the runtime ns\name -> name fallback.
+                        if name.starts_with('\\') {
                             Ok(Expr::Const(name))
+                        } else {
+                            Ok(Expr::Const(self.ns_resolve(&name, NsKind::Const)))
                         }
                     }
                 }
