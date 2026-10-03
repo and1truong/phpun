@@ -2368,6 +2368,30 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_op(")")?;
+            // Zend compile checks on the use list (closure_use_*).
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (n, _) in &uses {
+                if n == "GLOBALS" {
+                    return Err(PhpError::fatal(
+                        "Cannot use auto-global as lexical variable",
+                        self.prev_line(),
+                    ));
+                }
+                if !seen.insert(n.as_str()) {
+                    return Err(PhpError::fatal(
+                        format!("Cannot use variable ${} twice", n),
+                        self.prev_line(),
+                    ));
+                }
+            }
+            for (n, _) in &uses {
+                if params.iter().any(|p| p.name == *n) {
+                    return Err(PhpError::fatal(
+                        format!("Cannot use lexical variable ${} as a parameter name", n),
+                        self.prev_line(),
+                    ));
+                }
+            }
         }
         // `: ret` after `(` — return types apply to closures too
         // (scalar_strict uses `{closure:...}(): Return value ...` TypeErrors).

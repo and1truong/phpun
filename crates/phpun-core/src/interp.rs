@@ -298,6 +298,9 @@ pub struct Interp<'a> {
     /// `bind_and_run` wrapper which runs its deferred __destruct
     /// pass after the call-trace pop (bug52361).
     last_popped_frame: Option<Frame>,
+    /// Container addresses currently being var_dumped — a re-entrant
+    /// dump prints `*RECURSION*` (closure_034/035).
+    pub dump_stack: std::collections::HashSet<usize>,
     /// Nonzero while a callable is invoked from inside a builtin's
     /// internals (ob handlers) — marks its trace site internal-function.
     internal_cb: u32,
@@ -664,6 +667,7 @@ impl<'a> Interp<'a> {
             destructed: HashMap::new(),
             expr_temps: Vec::new(),
             last_popped_frame: None,
+            dump_stack: std::collections::HashSet::new(),
             internal_cb: 0,
             cur_file: file.to_string(),
             strict_files: std::collections::HashSet::new(),
@@ -2038,6 +2042,29 @@ impl<'a> Interp<'a> {
                     mk_method("getType", vec![]),
                     mk_method("getValue", vec![str_param("object")]),
                     mk_method("setValue", vec![str_param("object"), str_param("value")]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        // ReflectionObject — minimal stub (bug50146).
+        reg(
+            ClassDecl {
+                name: "ReflectionObject".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method("__construct", vec![str_param("object")]),
+                    mk_method("hasProperty", vec![str_param("name")]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -4807,6 +4834,7 @@ impl<'a> Interp<'a> {
                         match k {
                             Some(ke) => {
                                 let kv = self.eval(ke)?;
+                                self.check_offset_key(&kv)?;
                                 arr.bind_cell(to_key(&kv), c);
                             }
                             None => {
@@ -4821,6 +4849,7 @@ impl<'a> Interp<'a> {
                     match k {
                         Some(ke) => {
                             let kv = self.eval(ke)?;
+                            self.check_offset_key(&kv)?;
                             let val = self.eval(v)?;
                             arr.set(to_key(&kv), val);
                         }
@@ -5240,6 +5269,13 @@ impl<'a> Interp<'a> {
                         }
                         Ok(nv)
                     }
+                    Value::Callable(c) => {
+                        // `clone $closure` — fresh handle id; captured
+                        // cells stay shared so by-ref uses still alias
+                        // the outer var (closure_024).
+                        let nc = self.new_callable((*c).clone());
+                        Ok(Value::Callable(nc))
+                    }
                     _ => {
                         let e = self.exception("Error", "Cannot clone non-object");
                         self.pending_exception = Some(e);
@@ -5410,6 +5446,7 @@ impl<'a> Interp<'a> {
                     Some(k) => self.eval(k)?,
                     None => return Ok(None),
                 };
+                self.check_offset_key(&key)?;
                 match base {
                     Value::Array(a) => Ok(match a.borrow().get(&to_key(&key)) {
                         Some(v) => match v {
@@ -6678,6 +6715,17 @@ impl<'a> Interp<'a> {
                     Ok(v)
                 }
             }
+            Value::Callable(_) => {
+                // Closures have no prop storage — writes are a
+                // catchable Error, not a dynamic-prop create
+                // (closure_022, closure_write_prop).
+                let e = PhpError::uncaught(
+                    "Error",
+                    format!("Cannot create dynamic property Closure::${}", pn),
+                    0,
+                );
+                self.fail(e)
+            }
             _ => {
                 self.warn(&format!(
                     "Attempt to assign property \"{}\" on {}",
@@ -6715,6 +6763,12 @@ impl<'a> Interp<'a> {
         let mut c = self.eval_cell(e)?;
         let last = keys.len() - 1;
         for (n, k) in keys.iter().enumerate() {
+            // Illegal offset types must not fall into the string-offset
+            // fallback — the key Error propagates
+            // (closure_array_offset_error).
+            if let Some(kv) = k {
+                self.check_offset_key(kv)?;
+            }
             // Auto-init gate: writing through a typed slot that is
             // null (or a just-materialized uninit slot) must produce
             // `Cannot auto-initialize an array inside property ...`
@@ -6828,8 +6882,29 @@ impl<'a> Interp<'a> {
         Ok(v)
     }
 
+    /// `$a[$k]` keys: object/closure keys are a catchable Error
+    /// naming the class (closure_array_key_error/offset_error).
+    fn check_offset_key(&mut self, v: &Value) -> Result<(), PhpError> {
+        let cn = match v {
+            Value::Object(o) => Some(o.borrow().class.name().to_string()),
+            Value::Callable(_) => Some("Closure".to_string()),
+            _ => None,
+        };
+        if let Some(cn) = cn {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!("Cannot access offset of type {} on array", cn),
+                0,
+            ));
+        }
+        Ok(())
+    }
+
     /// `set_index` with an already-evaluated key.
     fn set_index_val(&mut self, e: &Expr, key: Option<Value>, v: Value) -> Result<(), PhpError> {
+        if let Some(k) = &key {
+            self.check_offset_key(k)?;
+        }
         match e {
             Expr::Var(name) => {
                 let arr_cell = self.var_cell(name);
@@ -7018,6 +7093,9 @@ impl<'a> Interp<'a> {
 
     /// Index into `c`'s array value, taking a cell for `key`/`[]`.
     fn index_into_key(&mut self, c: Cell, key: Option<Value>) -> Result<Cell, PhpError> {
+        if let Some(k) = &key {
+            self.check_offset_key(k)?;
+        }
         let mut b = c.borrow_mut();
         if matches!(*b, Value::Null) {
             *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
@@ -7130,6 +7208,7 @@ impl<'a> Interp<'a> {
     }
 
     fn index_read_base(&mut self, base: Value, key: Value) -> Result<Value, PhpError> {
+        self.check_offset_key(&key)?;
         match base {
             Value::Array(rc) => {
                 let k = to_key(&key);
@@ -17483,18 +17562,32 @@ impl<'a> Interp<'a> {
                 }
             }
             "hasproperty" => {
-                let cn = obj
-                    .borrow()
-                    .props
-                    .get("\0rc\0class")
-                    .map(|c| c.borrow().clone())
-                    .unwrap_or(Value::Null);
-                let cn = self.conv_str(&cn)?.to_string();
                 let pn = args
                     .first()
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let pn = self.conv_str(&pn)?.to_string();
+                let target = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                // ReflectionObject wraps the object itself; check its
+                // live + declared props (bug50146). Closures never have
+                // props.
+                match &target {
+                    Value::Object(t) => {
+                        let has =
+                            t.borrow().props.contains_key(&pn) || self.decl_prop(t, &pn).is_some();
+                        return Ok(Some(Value::Bool(has)));
+                    }
+                    Value::Callable(_) | Value::Null => {
+                        return Ok(Some(Value::Bool(false)));
+                    }
+                    _ => {}
+                }
+                let cn = self.conv_str(&target)?.to_string();
                 let has = self
                     .classes
                     .get(&cn.to_lowercase())
@@ -18460,6 +18553,12 @@ impl<'a> Interp<'a> {
                         }
                     }
                     return Ok(rv);
+                }
+                // A declared prop this scope can't see raises
+                // `Cannot access private/protected property`, not the
+                // undefined-property warning (closure_020).
+                if let Some(e) = self.hidden_decl_error(&o, pn) {
+                    return self.fail(e);
                 }
                 self.check_prop_name(pn)?;
                 self.warn(&format!("Undefined property: {}::${}", cls.name(), pn))?;

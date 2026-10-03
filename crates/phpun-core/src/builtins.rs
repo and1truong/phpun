@@ -1871,16 +1871,41 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 }
                 arr.entries = head.to_vec();
                 if let Some(repl) = args.get(3) {
-                    if let Value::Array(r) = &*repl.borrow() {
-                        for (_, c) in r.borrow().iter() {
-                            arr.push(c.borrow().clone());
+                    let rv = repl.borrow().clone();
+                    match &rv {
+                        Value::Array(r) => {
+                            for (_, c) in r.borrow().iter() {
+                                arr.push(c.borrow().clone());
+                            }
                         }
+                        // Non-array replacement is `(array)`-cast — an
+                        // object yields its prop values, everything else
+                        // becomes `[0 => $v]` (bug52193).
+                        Value::Object(o) => {
+                            let ob = o.borrow();
+                            for n in &ob.prop_order {
+                                if let Some(c) = ob.props.get(n) {
+                                    arr.push(c.borrow().clone());
+                                }
+                            }
+                        }
+                        Value::Null => {}
+                        _ => arr.push(rv.clone()),
                     }
                 }
                 for (k, c) in tail2 {
                     let _ = k;
                     arr.push(c.borrow().clone());
                 }
+                // Splice renumbers integer keys (bug52193).
+                let mut i = 0i64;
+                for (k, _) in arr.entries.iter_mut() {
+                    if matches!(k, ArrKey::Int(_)) {
+                        *k = ArrKey::Int(i);
+                        i += 1;
+                    }
+                }
+                arr.next = i;
             }
             Value::Array(Rc::new(RefCell::new(removed)))
         }
@@ -3001,6 +3026,10 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             Value::Object(o) => {
                 let n = arg_str(it, args, 1);
                 Value::Bool(it.obj_is_a(&o, &n))
+            }
+            Value::Callable(_) => {
+                let n = arg_str(it, args, 1);
+                Value::Bool(n.eq_ignore_ascii_case("closure"))
             }
             _ => Value::Bool(false),
         },
@@ -5037,6 +5066,11 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
             .concat(),
         ),
         Value::Array(a) => {
+            let aptr = Rc::as_ptr(a) as usize;
+            if !it.dump_stack.insert(aptr) {
+                it.emit(&format!("{}*RECURSION*\n", pad));
+                return;
+            }
             let rcn = Rc::strong_count(a);
             let a = a.borrow();
             // zval: `array(2) refcount(1){` — plain: `array(2) {`.
@@ -5060,8 +5094,14 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                 );
             }
             it.emit(&format!("{}}}\n", pad));
+            it.dump_stack.remove(&aptr);
         }
         Value::Object(o) => {
+            let optr = Rc::as_ptr(o) as usize;
+            if !it.dump_stack.insert(optr) {
+                it.emit(&format!("{}*RECURSION*\n", pad));
+                return;
+            }
             let ob = o.borrow();
             // Enum cases print `enum(E::Case1)` (single line).
             if ob.class.decl.kind == crate::ast::ClassKind::Enum {
@@ -5073,6 +5113,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                             ob.class.name(),
                             crate::value::lossy(case)
                         ));
+                        it.dump_stack.remove(&optr);
                         return;
                     }
                 }
@@ -5190,8 +5231,14 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                 var_dump(it, v, indent + 1, zval, false);
             }
             it.emit(&format!("{}}}\n", pad));
+            it.dump_stack.remove(&optr);
         }
         Value::Callable(c) => {
+            let cptr = Rc::as_ptr(c) as usize;
+            if !it.dump_stack.insert(cptr) {
+                it.emit(&format!("{}*RECURSION*\n", pad));
+                return;
+            }
             // Closure debug info (zend_closures.c): function/name key +
             // bound $this + file/line for literals + parameter map.
             let pad2 = format!("{}  ", pad);
@@ -5252,8 +5299,17 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                     )
                 }
             };
+            // Bound `$this` shows for closure kinds that keep it on the
+            // callable itself (closure_020).
+            if this_obj.is_none() {
+                this_obj = c.this_obj.clone();
+            }
             let has_params = params.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
-            let nfields = keys.len() + this_obj.is_some() as usize + has_params as usize;
+            let has_static = !c.captures.is_empty();
+            let nfields = keys.len()
+                + this_obj.is_some() as usize
+                + has_static as usize
+                + has_params as usize;
             it.emit(&format!(
                 "{}object(Closure)#{} ({}) {{\n",
                 pad,
@@ -5280,6 +5336,23 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                         v
                     ));
                 }
+            }
+            if has_static {
+                // The use-capture map renders as the closure's `static`
+                // member — by-ref captures alias their cells so `&`
+                // markers appear naturally (bug52193).
+                it.emit(&format!("{}[\"static\"]=>\n", pad2));
+                let mut sa = PhpArray::new();
+                for (n, cap) in &c.captures {
+                    sa.set_cell(ArrKey::Str(n.clone().into()), cap.clone());
+                }
+                var_dump(
+                    it,
+                    &Value::Array(Rc::new(RefCell::new(sa))),
+                    indent + 1,
+                    zval,
+                    false,
+                );
             }
             if let Some(o) = &this_obj {
                 it.emit(&format!("{}[\"this\"]=>\n", pad2));
@@ -5308,6 +5381,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                 }
             }
             it.emit(&format!("{}}}\n", pad));
+            it.dump_stack.remove(&cptr);
         }
         Value::Resource(r) => it.emit(&format!(
             "{}resource({}) of type (stream)\n",
