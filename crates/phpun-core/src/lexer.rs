@@ -34,6 +34,10 @@ pub enum StringPart {
 pub struct Lexed {
     pub token: Token,
     pub line: usize,
+    /// For `\` name separators: bit 1 = whitespace on the left in source,
+    /// bit 2 = whitespace on the right. Qualified names forbid whitespace
+    /// inside them (namespaced_name_whitespace).
+    pub ws_adj: u8,
 }
 
 const KEYWORDS: &[&str] = &[
@@ -198,7 +202,11 @@ fn skip_ws_and_newline(s: &str, line: &mut usize) -> usize {
 }
 
 fn push(out: &mut Vec<Lexed>, token: Token, line: usize) {
-    out.push(Lexed { token, line });
+    out.push(Lexed {
+        token,
+        line,
+        ws_adj: 0,
+    });
 }
 
 /// Lex PHP code mode starting at `pos`; returns the offset where PHP mode
@@ -284,6 +292,7 @@ fn lex_php(
             b'0'..=b'9' => {
                 let (tok, n) = number(src, pos, *line)?;
                 out.push(Lexed {
+                    ws_adj: 0,
                     token: tok,
                     line: *line,
                 });
@@ -292,6 +301,7 @@ fn lex_php(
             b'.' if matches!(b.get(pos + 1), Some(&x) if x.is_ascii_digit()) => {
                 let (tok, n) = number(src, pos, *line)?;
                 out.push(Lexed {
+                    ws_adj: 0,
                     token: tok,
                     line: *line,
                 });
@@ -332,6 +342,15 @@ fn lex_php(
                         PhpError::parse(msg, *line)
                     })?;
                     push(out, Token::Op(op), *line);
+                    if op == "\\" {
+                        let lt = out.last_mut().unwrap();
+                        if pos > 0 && b[pos - 1].is_ascii_whitespace() {
+                            lt.ws_adj |= 1;
+                        }
+                        if b.get(pos + n).is_some_and(|c| c.is_ascii_whitespace()) {
+                            lt.ws_adj |= 2;
+                        }
+                    }
                     pos += n;
                 }
             }

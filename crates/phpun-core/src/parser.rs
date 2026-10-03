@@ -182,14 +182,18 @@ impl<'a> Parser<'a> {
         if self.eat_op(op) {
             Ok(())
         } else {
-            Err(PhpError::parse(
+            // Zend reports a lone unexpected `\` name separator without an
+            // "expecting" clause (namespaced_name_whitespace).
+            let msg = if op == ";" && matches!(self.peek(), Some(Token::Op("\\"))) {
+                format!("syntax error, unexpected {}", self.describe())
+            } else {
                 format!(
                     "syntax error, unexpected {}, expecting \"{}\"",
                     self.describe(),
                     op
-                ),
-                self.line(),
-            ))
+                )
+            };
+            Err(PhpError::parse(msg, self.line()))
         }
     }
 
@@ -232,14 +236,21 @@ impl<'a> Parser<'a> {
         let mut stmts = Vec::new();
         let mut saw_code = false;
         let mut saw_ns = false;
+        // Everything after `__HALT_COMPILER()` is ignored entirely —
+        // the lexer stops there (namespaces/ns_080).
+        let mut halted = false;
         while self.peek().is_some() {
-            stmts.push(Stmt::Line(self.line()));
+            let stmt_line = self.line();
+            stmts.push(Stmt::Line(stmt_line));
             let s = self.stmt()?;
             let is_ns = matches!(&s, Stmt::Namespace(_))
                 || matches!(&s, Stmt::Block(v) if matches!(v.first(), Some(Stmt::Namespace(_))));
             // The first `namespace` declaration must precede all code
             // (only `declare` may come earlier); later `namespace`
             // declarations may follow code (namespaces/ns_068).
+            if halted {
+                // unreachable (guarded above); keeps the flow explicit.
+            }
             if is_ns && !saw_ns && saw_code {
                 return Err(PhpError::fatal(
                     "Namespace declaration statement has to be the very first statement or after any declare call in the script".to_string(),
@@ -248,14 +259,27 @@ impl<'a> Parser<'a> {
             }
             // Once a braced `namespace {}` is used, every later stmt
             // must itself be inside a namespace block (ns_087).
+            // `__HALT_COMPILER()` is allowed outside even in braced-ns
+            // files (namespaces/ns_080).
+            let is_halt = matches!(&s,
+                Stmt::Expr(Expr::Call { name, .. })
+                    if matches!(&**name, Expr::Str(n) if n.trim_start_matches('\u{1}').eq_ignore_ascii_case("__halt_compiler")));
+            if halted {
+                stmts.push(s);
+                continue;
+            }
+            if is_halt {
+                halted = true;
+            }
             if !is_ns
                 && self.ns_style == 2
+                && !is_halt
                 && !matches!(&s, Stmt::Declare { .. })
                 && !matches!(&s, Stmt::Expr(Expr::Null))
             {
                 return Err(PhpError::fatal(
                     "No code may exist outside of namespace {}".to_string(),
-                    self.line(),
+                    stmt_line,
                 ));
             }
             saw_ns = saw_ns || is_ns;
@@ -456,6 +480,29 @@ impl<'a> Parser<'a> {
                         .unwrap_or_default()
                         .trim_start_matches('\\')
                         .to_string();
+                    // `namespace` is reserved as a name: bare
+                    // `namespace namespace;` is a fatal, while
+                    // `namespace namespace\x` reads as a stray
+                    // ns-relative name (namespace_name_namespace*).
+                    if name
+                        .split('\\')
+                        .next()
+                        .is_some_and(|seg| seg.eq_ignore_ascii_case("namespace"))
+                    {
+                        if name.contains('\\') {
+                            return Err(PhpError::parse(
+                                format!(
+                                    "syntax error, unexpected namespace-relative name \"{}\", expecting \"{{\"",
+                                    name
+                                ),
+                                self.line(),
+                            ));
+                        }
+                        return Err(PhpError::fatal(
+                            format!("Cannot use '{}' as namespace name", name),
+                            self.line(),
+                        ));
+                    }
                     self.cur_ns = name.clone();
                     self.use_map.clear();
                     self.use_fn_map.clear();
@@ -493,6 +540,7 @@ impl<'a> Parser<'a> {
                                     self.line(),
                                 ));
                             }
+                            v.push(Stmt::Line(self.line()));
                             v.push(self.stmt()?);
                         }
                         self.in_braced_ns = false;
@@ -877,12 +925,40 @@ impl<'a> Parser<'a> {
                 // every entry and does not itself warn.
                 loop {
                     let mut ekind = kind;
-                    if self.ident_is("function") {
+                    if self.ident_is("function") || self.ident_is("const") {
+                        // A typed `use const|function` outer forbids
+                        // re-typing items inside the braces (ns_094).
+                        if kind != NsKind::Class {
+                            let kw = if self.ident_is("function") {
+                                "function"
+                            } else {
+                                "const"
+                            };
+                            return Err(PhpError::parse(
+                                format!(
+                                    "syntax error, unexpected token \"{}\", expecting \"}}\"",
+                                    kw
+                                ),
+                                self.line(),
+                            ));
+                        }
+                        ekind = if self.ident_is("function") {
+                            NsKind::Func
+                        } else {
+                            NsKind::Const
+                        };
                         self.pos += 1;
-                        ekind = NsKind::Func;
-                    } else if self.ident_is("const") {
-                        self.pos += 1;
-                        ekind = NsKind::Const;
+                    }
+                    // `use A\{\B}` — leading separator illegal (ns_096).
+                    if self.at_op("\\") {
+                        let lead = self.name_path().unwrap_or_default();
+                        return Err(PhpError::parse(
+                            format!(
+                                "syntax error, unexpected fully qualified name \"{}\", expecting identifier or namespaced name or \"function\" or \"const\"",
+                                lead
+                            ),
+                            self.line(),
+                        ));
                     }
                     if let Some(sub) = self.name_path() {
                         let sub = sub.trim_start_matches('\\');
@@ -965,13 +1041,34 @@ impl<'a> Parser<'a> {
     }
 
     /// `Foo\Bar\Baz` — backslash-joined qualified name.
+    /// `\` inside or before a qualified name must have no surrounding
+    /// whitespace in source (namespaced_name_whitespace). A leading `\`
+    /// may have whitespace before it (`= \foo()`), mid-name may not.
+    fn backslash_adj_ok(&self) -> bool {
+        matches!(self.toks.get(self.pos), Some(t) if t.ws_adj & 2 == 0)
+    }
+
+    /// Mid-name `\`: continues the path only when tight on the left and
+    /// directly followed by an identifier (`Foo\Bar`); also serves as a
+    /// group-use terminator before `{` (`use A\B\{C}` — ns_093).
+    fn eat_mid_name_sep(&mut self) -> bool {
+        let ok = match (self.toks.get(self.pos), self.peek2()) {
+            // Group-use terminator `A\B\{C}` / `A\B \ { C }` — spacing
+            // around the final separator is free (ns_093).
+            (Some(_), Some(Token::Op("{"))) => true,
+            (Some(t), Some(Token::Ident(_))) => t.ws_adj == 0,
+            _ => false,
+        };
+        ok && self.eat_op("\\")
+    }
+
     fn name_path(&mut self) -> Option<String> {
         let mut parts = Vec::new();
         // leading \ for FQ names
-        let lead = self.eat_op("\\");
+        let lead = self.at_op("\\") && self.backslash_adj_ok() && self.eat_op("\\");
         while matches!(self.peek(), Some(Token::Ident(_))) {
             parts.push(self.ident().unwrap());
-            if !self.eat_op("\\") {
+            if !self.eat_mid_name_sep() {
                 break;
             }
         }
@@ -3128,8 +3225,10 @@ impl<'a> Parser<'a> {
                     || (self.ident_is("static")
                         && matches!(self.peek2(), Some(Token::Ident(f)) if f.eq_ignore_ascii_case("function")
                             || f.eq_ignore_ascii_case("fn")))
-                    || self.ident_is("fn")
+                    || (self.ident_is("fn") && !matches!(self.peek2(), Some(Token::Op("\\"))))
                 {
+                    // `fn` is soft-reserved: `fn\test()` is a namespaced
+                    // call, not an arrow fn (ns_name_reserved_keywords).
                     self.closure_expr()
                 } else if self.ident_is("new") {
                     self.pos += 1;

@@ -1648,15 +1648,27 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             }
         }
         "function_exists" => {
-            let n = arg_str(it, args, 0).to_lowercase();
+            let n = arg_str(it, args, 0).trim_start_matches('\\').to_lowercase();
             Value::Bool(it.functions.contains_key(&n) || is_builtin(&n))
         }
         "class_exists" => {
             let n = arg_str(it, args, 0);
             Value::Bool(it.lookup_class(&n).is_some())
         }
-        "interface_exists" => Value::Bool(false),
-        "trait_exists" => Value::Bool(false),
+        "interface_exists" => {
+            let n = arg_str(it, args, 0);
+            Value::Bool(
+                it.interfaces
+                    .contains_key(&n.trim_start_matches('\\').to_lowercase()),
+            )
+        }
+        "trait_exists" => {
+            let n = arg_str(it, args, 0);
+            Value::Bool(
+                it.traits
+                    .contains_key(&n.trim_start_matches('\\').to_lowercase()),
+            )
+        }
         "enum_exists" => Value::Bool(false),
         "method_exists" => match arg(args, 0) {
             Value::Object(o) => {

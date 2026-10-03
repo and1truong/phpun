@@ -81,8 +81,8 @@ pub struct Interp<'a> {
     pub functions: HashMap<String, Rc<FunctionDecl>>,
     classes: HashMap<String, Rc<PhpClass>>,
     /// Traits by name — their methods are copied into using classes.
-    traits: HashMap<String, Rc<ClassDecl>>,
-    interfaces: HashMap<String, Rc<ClassDecl>>,
+    pub traits: HashMap<String, Rc<ClassDecl>>,
+    pub interfaces: HashMap<String, Rc<ClassDecl>>,
     /// Top-level parentless classes registered by hoisting (early
     /// binding); their decl stmt then no-ops (namespaces/ns_060).
     early_bound_classes: HashSet<String>,
@@ -490,6 +490,33 @@ impl<'a> Interp<'a> {
                 methods: vec![],
                 props: vec![],
                 consts: vec![],
+            },
+            false,
+        );
+        // ArrayObject — SPL stub carrying its flags as class constants;
+        // the ns tests only need `ArrayObject::STD_PROP_LIST` to resolve
+        // (namespaces/ns_035, ns_036, bug42819).
+        reg(
+            ClassDecl {
+                name: "ArrayObject".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![
+                    "IteratorAggregate".into(),
+                    "ArrayAccess".into(),
+                    "Countable".into(),
+                ],
+                attrs: vec![],
+                traits: vec![],
+                methods: vec![],
+                props: vec![],
+                consts: vec![
+                    ("STD_PROP_LIST".into(), Expr::Int(1)),
+                    ("ARRAY_AS_PROPS".into(), Expr::Int(2)),
+                ],
             },
             false,
         );
@@ -4848,12 +4875,18 @@ impl<'a> Interp<'a> {
         // A namespaced user function outranks the global/builtin one for
         // unqualified calls (namespaces/ns_013).
         let mut ns_resolved = false;
+        // When the ns\name fallback misses too, the undefined-function
+        // error names the ns-qualified candidate (bugs/77376).
+        let mut miss_name = fname.trim_start_matches('\u{1}').to_string();
         if decl.is_none() && unqualified {
             let ns = self.caller_ns();
             if !ns.is_empty() {
                 let cand = format!("{}\\{}", ns.to_lowercase(), lname);
                 decl = self.functions.get(&cand).cloned();
                 ns_resolved = decl.is_some();
+                if !ns_resolved {
+                    miss_name = format!("{}\\{}", ns, fname.trim_start_matches('\u{1}'));
+                }
             }
         }
         // Synthetic params carrying builtin by-ref flags so call results in
@@ -4900,10 +4933,7 @@ impl<'a> Interp<'a> {
             None => {
                 return self.fail(PhpError::uncaught(
                     "Error",
-                    format!(
-                        "Call to undefined function {}()",
-                        fname.trim_start_matches('\u{1}')
-                    ),
+                    format!("Call to undefined function {}()", miss_name),
                     0,
                 ))
             }
