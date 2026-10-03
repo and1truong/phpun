@@ -5179,53 +5179,107 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                 }
             };
             let all = name == "preg_match_all";
+            let flags = arg(args, 3).to_int();
+            let offset = arg(args, 4).to_int().max(0) as usize;
+            let hay = subj.get(offset..).unwrap_or("");
             let mut matches_arr = PhpArray::new();
             let mut count = 0i64;
-            // PHP duplicates a named capture under its string key
-            // immediately BEFORE the group's int key.
-            let group_name = |re: &regex::Regex, g: usize| {
-                re.capture_names().nth(g).flatten().map(|n| n.to_string())
+            let caps = re.caps(hay);
+            // A capture group -> PHP value honoring OFFSET_CAPTURE and
+            // UNMATCHED_AS_NULL; offsets are absolute on the subject.
+            let entry = |span: Option<(usize, usize)>| -> Value {
+                match span {
+                    Some((a, b)) if flags & 256 != 0 => {
+                        let mut pair = PhpArray::new();
+                        pair.push(hay.get(a..b).map(Value::str).unwrap_or(Value::str("")));
+                        pair.push(Value::Int((a + offset) as i64));
+                        Value::Array(Rc::new(RefCell::new(pair)))
+                    }
+                    Some((a, b)) => hay.get(a..b).map(Value::str).unwrap_or(Value::str("")),
+                    None if flags & 512 != 0 => Value::Null,
+                    None => Value::str(""),
+                }
             };
             if all {
-                // group by capture index
                 let ngroups = re.captures_len();
-                let mut groups: Vec<PhpArray> = (0..ngroups).map(|_| PhpArray::new()).collect();
-                for cap in re.captures_iter(&subj) {
-                    count += 1;
-                    for (g, grp) in groups.iter_mut().enumerate().take(ngroups) {
-                        let m = cap
-                            .get(g)
-                            .map(|m| m.as_str().to_string())
-                            .unwrap_or_default();
-                        grp.push(Value::str(m));
+                if flags & 2 != 0 {
+                    // PREG_SET_ORDER: one row per match.
+                    for cap in &caps {
+                        count += 1;
+                        let mut row = PhpArray::new();
+                        for g in 0..cap.spans.len().max(ngroups) {
+                            let span = cap.spans.get(g).copied().flatten();
+                            // PHP omits unmatched groups entirely unless
+                            // PREG_UNMATCHED_AS_NULL asked for nulls.
+                            if span.is_none() && flags & 512 == 0 {
+                                continue;
+                            }
+                            let v = entry(span);
+                            if let Some(n) = re.group_name(g) {
+                                row.set(ArrKey::Str(n.into()), v.clone());
+                            }
+                            row.set(ArrKey::Int(g as i64), v);
+                        }
+                        if let Some(m) = &cap.mark {
+                            row.set(ArrKey::Str("MARK".into()), Value::str(m.clone()));
+                        }
+                        matches_arr.push(Value::Array(Rc::new(RefCell::new(row))));
                     }
-                }
-                for (g, grp) in groups.into_iter().enumerate() {
-                    if let Some(n) = group_name(&re, g) {
+                } else {
+                    // PREG_PATTERN_ORDER (default): one column per group.
+                    let mut groups: Vec<PhpArray> = (0..ngroups).map(|_| PhpArray::new()).collect();
+                    for cap in &caps {
+                        count += 1;
+                        for (g, grp) in groups.iter_mut().enumerate().take(ngroups) {
+                            grp.push(entry(cap.spans.get(g).copied().flatten()));
+                        }
+                    }
+                    for (g, grp) in groups.into_iter().enumerate() {
+                        if let Some(n) = re.group_name(g) {
+                            matches_arr.set(
+                                ArrKey::Str(n.into()),
+                                Value::Array(Rc::new(RefCell::new(grp.clone()))),
+                            );
+                        }
+                        matches_arr.push(Value::Array(Rc::new(RefCell::new(grp))));
+                    }
+                    if caps.iter().any(|c| c.mark.is_some()) {
+                        let mut marks = PhpArray::new();
+                        for c in &caps {
+                            marks.push(
+                                c.mark
+                                    .as_ref()
+                                    .map(|m| Value::str(m.clone()))
+                                    .unwrap_or(Value::Bool(false)),
+                            );
+                        }
                         matches_arr.set(
-                            ArrKey::Str(n.into()),
-                            Value::Array(Rc::new(RefCell::new(grp.clone()))),
+                            ArrKey::Str("MARK".into()),
+                            Value::Array(Rc::new(RefCell::new(marks))),
                         );
                     }
-                    matches_arr.push(Value::Array(Rc::new(RefCell::new(grp))));
                 }
-            } else if let Some(cap) = re.captures(&subj) {
+            } else if let Some(cap) = caps.into_iter().next() {
                 count = 1;
-                for g in 0..cap.len() {
-                    let v = cap
-                        .get(g)
-                        .map(|m| Value::str(m.as_str()))
-                        .unwrap_or(Value::str(""));
-                    if let Some(n) = group_name(&re, g) {
+                for g in 0..cap.spans.len() {
+                    let span = cap.spans.get(g).copied().flatten();
+                    if span.is_none() && flags & 512 == 0 {
+                        continue;
+                    }
+                    let v = entry(span);
+                    if let Some(n) = re.group_name(g) {
                         matches_arr.set(ArrKey::Str(n.into()), v.clone());
                     }
-                    matches_arr.push(v);
+                    matches_arr.set(ArrKey::Int(g as i64), v);
+                }
+                if let Some(m) = &cap.mark {
+                    matches_arr.set(ArrKey::Str("MARK".into()), Value::str(m.clone()));
                 }
             }
             if let Some(c) = args.get(2) {
                 *c.borrow_mut() = Value::Array(Rc::new(RefCell::new(matches_arr)));
             }
-            Ok(Value::Int(count.min(1)))
+            Ok(Value::Int(count))
         }
         "preg_replace" | "preg_replace_callback" => {
             let pat = arg(args, 0);
@@ -5250,18 +5304,24 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                     let cb = arg(args, 1);
                     let mut out = String::new();
                     let mut last = 0;
-                    for (n, cap) in re.captures_iter(&result).enumerate() {
+                    for (n, cap) in re.caps(&result).into_iter().enumerate() {
                         let n = n as i64;
                         if limit > 0 && n >= limit {
                             break;
                         }
-                        let m = cap.get(0).unwrap();
-                        out.push_str(&result[last..m.start()]);
+                        let Some(Some((ms, me))) = cap.spans.first() else {
+                            continue;
+                        };
+                        out.push_str(result.get(last..*ms).unwrap_or(""));
                         let mut group_arr = PhpArray::new();
-                        for g in 0..cap.len() {
+                        for g in 0..cap.spans.len() {
                             group_arr.push(
-                                cap.get(g)
-                                    .map(|m| Value::str(m.as_str()))
+                                cap.spans
+                                    .get(g)
+                                    .copied()
+                                    .flatten()
+                                    .and_then(|(a, b)| result.get(a..b))
+                                    .map(Value::str)
                                     .unwrap_or(Value::str("")),
                             );
                         }
@@ -5270,23 +5330,28 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                             vec![cell(Value::Array(Rc::new(RefCell::new(group_arr))))],
                         )?;
                         out.push_str(&r.to_php_string());
-                        last = m.end();
+                        last = *me;
                         let _ = n;
                     }
                     out.push_str(&result[last..]);
                     out
                 } else {
                     let repl = arg(args, 1).to_php_string();
-                    let r = re.replace_all(&result, |caps: &regex::Captures| {
+                    re.replace_all(&result, &mut |caps: &PhpCap| {
                         let mut out = repl.clone();
-                        for g in (0..caps.len()).rev() {
-                            let m = caps.get(g).map(|m| m.as_str()).unwrap_or("");
+                        for g in (0..caps.spans.len()).rev() {
+                            let m = caps
+                                .spans
+                                .get(g)
+                                .copied()
+                                .flatten()
+                                .and_then(|(a, b)| result.get(a..b))
+                                .unwrap_or("");
                             out = out.replace(&format!("${}", g), m);
                             out = out.replace(&format!("\\{}", g), m);
                         }
                         out
-                    });
-                    r.to_string()
+                    })
                 };
             }
             Ok(Value::str(result))
@@ -5294,18 +5359,67 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
         "preg_split" => {
             let pat = arg_str(it, args, 0);
             let subj = arg_str(it, args, 1);
+            let flags = arg(args, 3).to_int();
+            let limit = arg(args, 2).to_int();
             let re = match php_regex(&pat) {
                 Some(r) => r,
                 None => return Ok(Value::Bool(false)),
             };
             let mut out = PhpArray::new();
-            for part in re.split(&subj) {
-                out.push(Value::str(part));
+            let mut last = 0usize;
+            for cap in re.caps(&subj) {
+                let Some(Some((a, b))) = cap.spans.first() else {
+                    continue;
+                };
+                // limit reached: emit the rest as one piece and stop
+                if limit > 0 && out.entries.len() as i64 >= limit - 1 {
+                    out.push(Value::str(subj.get(last..).unwrap_or("")));
+                    return Ok(Value::Array(Rc::new(RefCell::new(out))));
+                }
+                let piece = subj.get(last..*a).unwrap_or("");
+                if flags & 1 == 0 || !piece.is_empty() {
+                    if flags & 4 != 0 {
+                        let mut pair = PhpArray::new();
+                        pair.push(Value::str(piece));
+                        pair.push(Value::Int(last as i64));
+                        out.push(Value::Array(Rc::new(RefCell::new(pair))));
+                    } else {
+                        out.push(Value::str(piece));
+                    }
+                }
+                if flags & 2 != 0 {
+                    for (ga, gb) in cap.spans.iter().skip(1).flatten() {
+                        if flags & 1 == 0 || ga != gb {
+                            let g = subj.get(*ga..*gb).unwrap_or("");
+                            if flags & 4 != 0 {
+                                let mut pair = PhpArray::new();
+                                pair.push(Value::str(g));
+                                pair.push(Value::Int(*ga as i64));
+                                out.push(Value::Array(Rc::new(RefCell::new(pair))));
+                            } else {
+                                out.push(Value::str(g));
+                            }
+                        }
+                    }
+                }
+                last = *b;
+            }
+            let tail = subj.get(last..).unwrap_or("");
+            if flags & 1 == 0 || !tail.is_empty() {
+                if flags & 4 != 0 {
+                    let mut pair = PhpArray::new();
+                    pair.push(Value::str(tail));
+                    pair.push(Value::Int(last as i64));
+                    out.push(Value::Array(Rc::new(RefCell::new(pair))));
+                } else {
+                    out.push(Value::str(tail));
+                }
             }
             Ok(Value::Array(Rc::new(RefCell::new(out))))
         }
         "preg_grep" => {
             let pat = arg_str(it, args, 0);
+            let flags = arg(args, 2).to_int();
             let re = match php_regex(&pat) {
                 Some(r) => r,
                 None => return Ok(Value::Bool(false)),
@@ -5314,7 +5428,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
             if let Value::Array(a) = arg(args, 1) {
                 for (k, c) in a.borrow().iter() {
                     let v = c.borrow().to_php_string();
-                    if re.is_match(&v) {
+                    if re.is_match(&v) != (flags & 1 != 0) {
                         out.set(k.clone(), Value::str(v));
                     }
                 }
@@ -5325,8 +5439,80 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
     }
 }
 
-/// Translate a PHP `/pat/flags` regex to a `regex::Regex`.
-fn php_regex(pat: &str) -> Option<regex::Regex> {
+/// Match-group byte spans; `spans[0]` is the whole match. `mark` is
+/// the `(*MARK:x)` verb payload when one fired (PCRE2 only).
+struct PhpCap {
+    spans: Vec<Option<(usize, usize)>>,
+    mark: Option<String>,
+}
+
+/// A PHP pattern compiled for one of the two engines we carry: `regex`
+/// (pure Rust) for the common syntax subset, or PCRE2 — PHP's own
+/// engine — for anything it can't express (backtracking verbs like
+/// `(*SKIP)(*F)`, recursion `(?-n)`, lookbehind, etc.).
+enum PhpRe {
+    Re(regex::Regex),
+    Pcre(crate::pcre::PcreRe),
+}
+
+impl PhpRe {
+    fn captures_len(&self) -> usize {
+        match self {
+            PhpRe::Re(r) => r.captures_len(),
+            PhpRe::Pcre(r) => r.captures_len(),
+        }
+    }
+    fn group_name(&self, g: usize) -> Option<String> {
+        match self {
+            PhpRe::Re(r) => r.capture_names().nth(g).flatten().map(|s| s.to_string()),
+            PhpRe::Pcre(r) => r.group_name(g),
+        }
+    }
+    /// All matches in order, normalized to group byte spans.
+    fn caps(&self, s: &str) -> Vec<PhpCap> {
+        match self {
+            PhpRe::Re(r) => r
+                .captures_iter(s)
+                .map(|c| PhpCap {
+                    spans: (0..c.len())
+                        .map(|g| c.get(g).map(|m| (m.start(), m.end())))
+                        .collect(),
+                    mark: None,
+                })
+                .collect(),
+            PhpRe::Pcre(r) => r
+                .match_all(s.as_bytes())
+                .into_iter()
+                .map(|m| PhpCap {
+                    spans: m.spans,
+                    mark: m.mark,
+                })
+                .collect(),
+        }
+    }
+    fn is_match(&self, s: &str) -> bool {
+        match self {
+            PhpRe::Re(r) => r.is_match(s),
+            PhpRe::Pcre(r) => !r.match_all(s.as_bytes()).is_empty(),
+        }
+    }
+    fn replace_all(&self, s: &str, repl: &mut dyn FnMut(&PhpCap) -> String) -> String {
+        let mut out = String::new();
+        let mut last = 0usize;
+        for c in self.caps(s) {
+            if let Some(Some((a, b))) = c.spans.first() {
+                out.push_str(s.get(last..*a).unwrap_or(""));
+                out.push_str(&repl(&c));
+                last = *b;
+            }
+        }
+        out.push_str(&s[last..]);
+        out
+    }
+}
+
+/// Translate a PHP `/pat/flags` regex to a `PhpRe`.
+fn php_regex(pat: &str) -> Option<PhpRe> {
     let b = pat.as_bytes();
     if b.len() < 2 {
         return None;
@@ -5349,8 +5535,28 @@ fn php_regex(pat: &str) -> Option<regex::Regex> {
             _ => {}
         }
     }
+    // PHP compiles patterns with PCRE2; use it for anything the `regex`
+    // crate can't express rather than trying to emulate backtracking.
+    let pcre_only = [
+        "(*", "\\K", "\\G", "(?<", "(?R", "(?-", "(?+", "(?|", "(?'", "(?P>", "(?#",
+    ];
+    let mut has_backref = false;
+    let bb = body.as_bytes();
+    for i in 0..bb.len().saturating_sub(1) {
+        if bb[i] == b'\\' && bb[i + 1].is_ascii_digit() {
+            has_backref = true;
+            break;
+        }
+    }
+    if has_backref || pcre_only.iter().any(|t| body.contains(t)) {
+        let src = format!("{}{}", wrapped, body);
+        return crate::pcre::compile(&src).map(PhpRe::Pcre);
+    }
     wrapped.push_str(body);
-    regex::Regex::new(&wrapped).ok()
+    regex::Regex::new(&wrapped)
+        .ok()
+        .map(PhpRe::Re)
+        .or_else(|| crate::pcre::compile(&wrapped).map(PhpRe::Pcre))
 }
 
 // ---------- filesystem ----------
