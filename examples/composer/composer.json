@@ -1,0 +1,9 @@
+{
+    "name": "demo/autoload",
+    "autoload": {
+        "psr-4": { "Demo\\": "src/" },
+        "psr-0": { "Legacy_": "lib/" },
+        "classmap": ["src/Legacy/"],
+        "files": ["src/bootstrap.php"]
+    }
+}

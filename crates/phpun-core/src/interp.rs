@@ -149,6 +149,10 @@ pub struct Interp<'a> {
     /// PHP CLI logs every diagnostic to stderr as `PHP <Level>: msg` when
     /// log_errors is on (default); the harness merges stderr after stdout.
     pub err_buf: String,
+    /// File a const-expr lexically belongs to while it's being evaluated
+    /// (prop/const/param defaults, attr args): __FILE__/__DIR__ bind to
+    /// the declaring file, not the accessing file.
+    decl_file_ctx: Option<String>,
     /// Headers queued by header()/setcookie() — `phpun serve` emits them
     /// into the HTTP response; CLI ignores them (like php-cli).
     pub out_headers: Vec<String>,
@@ -275,6 +279,9 @@ impl<'a> Interp<'a> {
         constants.insert("PHP_VERSION".into(), Value::str("8.5.11-phpun"));
         constants.insert("PHP_MAJOR_VERSION".into(), Value::Int(8));
         constants.insert("PHP_MINOR_VERSION".into(), Value::Int(5));
+        constants.insert("PHP_RELEASE_VERSION".into(), Value::Int(11));
+        constants.insert("PHP_EXTRA_VERSION".into(), Value::str(""));
+        constants.insert("PHP_VERSION_ID".into(), Value::Int(80511));
         constants.insert("PHP_OS".into(), Value::str("Linux"));
         constants.insert("PHP_OS_FAMILY".into(), Value::str("Linux"));
         constants.insert("PHP_SAPI".into(), Value::str("cli"));
@@ -364,6 +371,7 @@ impl<'a> Interp<'a> {
             constants,
             out: String::new(),
             err_buf: String::new(),
+            decl_file_ctx: None,
             out_headers: Vec::new(),
             resp_code: 200,
             ob_stack: Vec::new(),
@@ -503,6 +511,7 @@ impl<'a> Interp<'a> {
                     })
                     .collect(),
                 consts: vec![],
+                file: String::new(),
             }
         }
         fn method(name: &str, _params: &[&str]) -> Rc<MethodDecl> {
@@ -570,6 +579,7 @@ impl<'a> Interp<'a> {
                 .collect(),
             props: vec![],
             consts: vec![],
+            file: String::new(),
         };
         reg(iface("Throwable", &[], &[]), true);
         reg(iface("Stringable", &[], &["__toString"]), true);
@@ -662,6 +672,7 @@ impl<'a> Interp<'a> {
                 ],
                 props: vec![],
                 consts: vec![],
+                file: String::new(),
             },
             false,
         );
@@ -693,6 +704,7 @@ impl<'a> Interp<'a> {
                 methods: vec![],
                 props: vec![],
                 consts: vec![],
+                file: String::new(),
             },
             false,
         );
@@ -720,6 +732,7 @@ impl<'a> Interp<'a> {
                     ("STD_PROP_LIST".into(), Expr::Int(1)),
                     ("ARRAY_AS_PROPS".into(), Expr::Int(2)),
                 ],
+                file: String::new(),
             },
             false,
         );
@@ -767,6 +780,7 @@ impl<'a> Interp<'a> {
                 })],
                 props: vec![],
                 consts: vec![],
+                file: String::new(),
             },
             false,
         );
@@ -839,6 +853,7 @@ impl<'a> Interp<'a> {
                 ],
                 props: vec![],
                 consts: vec![],
+                file: String::new(),
             },
             false,
         );
@@ -862,6 +877,7 @@ impl<'a> Interp<'a> {
                 ],
                 props: vec![],
                 consts: vec![],
+                file: String::new(),
             },
             false,
         );
@@ -893,6 +909,7 @@ impl<'a> Interp<'a> {
                 ],
                 props: vec![],
                 consts: vec![],
+                file: String::new(),
             },
             false,
         );
@@ -916,6 +933,7 @@ impl<'a> Interp<'a> {
                 ],
                 props: vec![],
                 consts: vec![],
+                file: String::new(),
             },
             false,
         );
@@ -943,6 +961,7 @@ impl<'a> Interp<'a> {
                     ("TARGET_ALL".into(), Expr::Int(63)),
                     ("IS_REPEATABLE".into(), Expr::Int(64)),
                 ],
+                file: String::new(),
             },
             false,
         );
@@ -981,6 +1000,7 @@ impl<'a> Interp<'a> {
                 ],
                 props: vec![],
                 consts: vec![],
+                file: String::new(),
             },
             false,
         );
@@ -990,6 +1010,28 @@ impl<'a> Interp<'a> {
         );
         reg(
             throwable_class("Error", None, &["message", "code", "file", "line"]),
+            false,
+        );
+        // Closure — name must resolve for `\Closure::bind()` /
+        // `\Closure::fromCallable()` (composer's ClassLoader uses bind to
+        // scope-isolate `include`). Methods dispatch natively in
+        // static_invoke / the Value::Callable method arm.
+        reg(
+            ClassDecl {
+                name: "Closure".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: true,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                methods: vec![],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
             false,
         );
         for (name, parent) in [
@@ -1020,6 +1062,18 @@ impl<'a> Interp<'a> {
                 false,
             );
         }
+    }
+
+    /// eval_const for a decl-attached expr (prop/const/param default):
+    /// __FILE__/__DIR__ inside resolve to the declaring file.
+    fn eval_decl_const(&mut self, e: &Expr, decl_file: &str) -> Result<Value, PhpError> {
+        if decl_file.is_empty() {
+            return self.eval_const(e);
+        }
+        let old = self.decl_file_ctx.replace(decl_file.to_string());
+        let r = self.eval_const(e);
+        self.decl_file_ctx = old;
+        r
     }
 
     /// PHP binds a compilation unit's unconditional top-level function
@@ -3582,10 +3636,14 @@ impl<'a> Interp<'a> {
         // sees that file's dir even when invoked from elsewhere
         // (composer-style PSR-4 autoloaders depend on this).
         let decl_file = self
-            .stack
-            .last()
-            .map(|f| f.file.clone())
-            .filter(|s| !s.is_empty())
+            .decl_file_ctx
+            .clone()
+            .or_else(|| {
+                self.stack
+                    .last()
+                    .map(|f| f.file.clone())
+                    .filter(|s| !s.is_empty())
+            })
             .unwrap_or_else(|| self.cur_file.clone());
         match m {
             MagicConst::Line => Value::Int(self.cur_line as i64),
@@ -7147,7 +7205,7 @@ impl<'a> Interp<'a> {
                         Some(c) => self.const_self.replace(c),
                         None => self.const_self.take(),
                     };
-                    let r = self.eval_const(d);
+                    let r = self.eval_decl_const(d, &decl.file);
                     self.const_self = old;
                     self.cur_line = prev_line;
                     let dv = match r {
@@ -7320,6 +7378,11 @@ impl<'a> Interp<'a> {
             }
         }
         let mut d = (*decl).clone();
+        // Declaring file — prop/const default exprs bind __FILE__/__DIR__
+        // to it (composer's generated `__DIR__ . '/../..' . ...` paths).
+        if d.file.is_empty() {
+            d.file = self.cur_file.clone();
+        }
         // Synthesize PropDecls from promoted constructor params
         // (`__construct(public readonly int $x)`) — they behave as
         // declared props for visibility/type/readonly and hooks.
@@ -7353,7 +7416,7 @@ impl<'a> Interp<'a> {
         let lname = decl.name.to_lowercase();
         match decl.kind {
             ClassKind::Interface => {
-                self.interfaces.insert(lname, decl);
+                self.interfaces.insert(lname, Rc::new(d));
             }
             ClassKind::Trait => {
                 self.traits.insert(lname, Rc::new(d));
@@ -8180,6 +8243,7 @@ impl<'a> Interp<'a> {
                             methods: vec![],
                             props: vec![],
                             consts: vec![],
+                            file: String::new(),
                         }),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(true),
@@ -8257,7 +8321,7 @@ impl<'a> Interp<'a> {
                     Some(d) => {
                         let old = self.const_self.replace(c.clone());
                         self.class_const_ctx += 1;
-                        let r = self.eval_const(d);
+                        let r = self.eval_decl_const(d, &c.decl.file);
                         self.class_const_ctx -= 1;
                         self.const_self = old;
                         r?
@@ -10775,7 +10839,9 @@ impl<'a> Interp<'a> {
                 Some(d) => {
                     let old = self.const_self.replace(cls.clone());
                     self.class_const_ctx += 1;
-                    let v = self.eval_const(d).unwrap_or(Value::Null);
+                    let v = self
+                        .eval_decl_const(d, &cls.decl.file)
+                        .unwrap_or(Value::Null);
                     self.class_const_ctx -= 1;
                     self.const_self = old;
                     v
@@ -10804,6 +10870,47 @@ impl<'a> Interp<'a> {
         name: &str,
         args: CallArgs,
     ) -> Result<Value, PhpError> {
+        // Closure::{bind,fromCallable}: native callable rebinding.
+        if cls.name().eq_ignore_ascii_case("closure") {
+            let lname = name.to_lowercase();
+            match lname.as_str() {
+                "bind" | "bindto" => {
+                    let c = args.cells.first().map(|c| c.borrow().clone());
+                    let this = args.cells.get(1).map(|c| c.borrow().clone());
+                    let scope = args.cells.get(2).map(|c| c.borrow().clone());
+                    if let Some(Value::Callable(cb)) = c {
+                        let mut nc = (*cb).clone();
+                        nc.this_obj = match &this {
+                            Some(Value::Object(o)) => Some(o.clone()),
+                            _ => None,
+                        };
+                        nc.scope_class = match &scope {
+                            Some(Value::Object(o)) => Some(o.borrow().class.clone()),
+                            Some(Value::Str(s)) => self.classes.get(&s.to_lowercase()).cloned(),
+                            _ => None,
+                        };
+                        return Ok(Value::Callable(Rc::new(nc)));
+                    }
+                    return Ok(Value::Null);
+                }
+                "fromcallable" => {
+                    if let Some(c) = args.cells.first() {
+                        let v = c.borrow().clone();
+                        if let Value::Callable(_) = v {
+                            return Ok(v);
+                        }
+                    }
+                    return Ok(Value::Null);
+                }
+                _ => {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Call to undefined method Closure::{}()", name),
+                        0,
+                    ));
+                }
+            }
+        }
         // Throwable methods are instance-only; look up incl. parents.
         match self.find_method_in(&cls, name) {
             Some((m, dc)) => {
@@ -11012,7 +11119,7 @@ impl<'a> Interp<'a> {
                 for (n, e) in &c.consts {
                     if n == name {
                         self.class_const_ctx += 1;
-                        let r = self.eval_const(e);
+                        let r = self.eval_decl_const(e, &c.file);
                         self.class_const_ctx -= 1;
                         return r;
                     }
@@ -11053,7 +11160,7 @@ impl<'a> Interp<'a> {
                 if n == name {
                     let old = self.const_self.replace(c.clone());
                     self.class_const_ctx += 1;
-                    let r = self.eval_const(e);
+                    let r = self.eval_decl_const(e, &c.decl.file);
                     self.class_const_ctx -= 1;
                     self.const_self = old;
                     return r;
@@ -11077,7 +11184,7 @@ impl<'a> Interp<'a> {
                     if n == name {
                         let old = self.const_self.replace(cls.clone());
                         self.class_const_ctx += 1;
-                        let r = self.eval_const(e);
+                        let r = self.eval_decl_const(e, &c.file);
                         self.class_const_ctx -= 1;
                         self.const_self = old;
                         return r;
@@ -11245,13 +11352,24 @@ impl<'a> Interp<'a> {
         };
         // Include executes in the current scope (PHP semantics); the
         // included file's namespace starts global regardless of the
-        // includer's (namespaces/ns_069).
+        // includer's (namespaces/ns_069). __FILE__/__DIR__ and diag
+        // attribution inside its top-level code bind to the included
+        // file, so the executing frame's file swaps with it.
         let saved_file = std::mem::replace(&mut self.cur_file, canon.display().to_string());
+        let saved_frame_file = self
+            .stack
+            .last_mut()
+            .map(|f| std::mem::replace(&mut f.file, self.cur_file.clone()));
         let saved_ns = std::mem::take(&mut self.globals.ns);
         self.hoist_funcs(&stmts);
         let flow = self.exec_block(&stmts);
         inc_pop(self);
         self.cur_file = saved_file;
+        if let Some(old) = saved_frame_file {
+            if let Some(f) = self.stack.last_mut() {
+                f.file = old;
+            }
+        }
         self.globals.ns = saved_ns;
         match flow {
             Flow::Return(v) => Ok(v),

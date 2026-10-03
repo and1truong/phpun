@@ -1590,6 +1590,7 @@ impl<'a> Parser<'a> {
             methods,
             props,
             consts,
+            file: String::new(),
         })))
     }
 
@@ -2281,6 +2282,7 @@ impl<'a> Parser<'a> {
                     methods,
                     props,
                     consts,
+                    file: String::new(),
                 })),
                 ctor_args,
             ));

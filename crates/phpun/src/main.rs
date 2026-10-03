@@ -73,7 +73,11 @@ fn run_script(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut it = Interp::new(file);
+    // __FILE__/__DIR__ are always absolute in PHP.
+    let abs = std::fs::canonicalize(file)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| file.to_string());
+    let mut it = Interp::new(&abs);
     for kv in ini {
         if let Some((k, v)) = kv.split_once('=') {
             it.ini.insert(k.trim().to_string(), v.trim().to_string());
@@ -125,5 +129,8 @@ fn serve(args: &[String]) -> ExitCode {
         eprintln!("usage: phpun serve <file.php> [--host H] [--port N]");
         return ExitCode::FAILURE;
     };
-    ExitCode::from(phpun_core::serve::serve(file, &host, port) as u8)
+    let abs = std::fs::canonicalize(file)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| file.to_string());
+    ExitCode::from(phpun_core::serve::serve(&abs, &host, port) as u8)
 }

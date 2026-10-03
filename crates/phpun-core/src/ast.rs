@@ -107,6 +107,9 @@ pub struct ClassDecl {
     /// (name, default value expr, flags)
     pub props: Vec<PropDecl>,
     pub consts: Vec<(String, Expr)>,
+    /// Declaring file — filled at registration; const-exprs inside
+    /// (prop/const defaults) bind __FILE__/__DIR__ to it.
+    pub file: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
