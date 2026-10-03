@@ -1075,8 +1075,10 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Use(names))
     }
 
-    /// A `use` with no `function`/`const` prefix imports the alias for
-    /// every symbol kind (Zend/tests/namespaces/ns_012).
+    /// A plain `use` imports a class alias only — unqualified function
+    /// and const names keep their namespace->global runtime fallback
+    /// (Zend/tests/namespaces/ns_012); `use function`/`use const` fill
+    /// their own tables.
     fn insert_use_alias(&mut self, kind: NsKind, alias: &str, fq: &str) -> Result<(), PhpError> {
         // Re-importing the same alias to the same target is a no-op
         // (namespaces/ns_078).
@@ -1096,8 +1098,6 @@ impl<'a> Parser<'a> {
         match kind {
             NsKind::Class => {
                 self.use_map.insert(alias.to_lowercase(), fq.to_string());
-                self.use_fn_map.insert(alias.to_lowercase(), fq.to_string());
-                self.use_const_map.insert(alias.to_string(), fq.to_string());
             }
             NsKind::Func => {
                 self.use_fn_map.insert(alias.to_lowercase(), fq.to_string());
@@ -1188,14 +1188,24 @@ impl<'a> Parser<'a> {
             return self.cur_ns.clone();
         }
 
-        let map = match kind {
-            NsKind::Class => &self.use_map,
-            NsKind::Func => &self.use_fn_map,
-            NsKind::Const => &self.use_const_map,
+        // Qualified names resolve their first segment through the CLASS
+        // alias table regardless of symbol kind (`use A\C; C\X` ->
+        // `A\C\X` even as a const read). Only unqualified names use the
+        // kind-specific tables (`use function`, `use const`).
+        let map = if segs.len() > 1 {
+            &self.use_map
+        } else {
+            match kind {
+                NsKind::Class => &self.use_map,
+                NsKind::Func => &self.use_fn_map,
+                NsKind::Const => &self.use_const_map,
+            }
         };
-        let key = if kind == NsKind::Const {
+        let key = if kind == NsKind::Const && segs.len() == 1 {
+            // Unqualified const: the const alias table is case-sensitive.
             segs[0].to_string()
         } else {
+            // Class-alias lookups (and `use function`) are insensitive.
             segs[0].to_lowercase()
         };
         if !from_ns {
@@ -1270,6 +1280,10 @@ impl<'a> Parser<'a> {
                         self.line(),
                     )
                 })?;
+                // Attribute names resolve through the file's use-map at
+                // compile time — `#[AsCommand]` under
+                // `use X\Y\AsCommand` instantiates X\Y\AsCommand.
+                let name = self.ns_resolve(&name, NsKind::Class);
                 let mut args = Vec::new();
                 if self.at_op("(") {
                     // `(` followed by `...` is FCC syntax — a compile-time
@@ -2051,6 +2065,10 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
         }
         let body = if arrow {
+            // `fn (p): ret => e` — arrow fns take a return type too.
+            if self.eat_op(":") {
+                self.skip_type()?;
+            }
             self.expect_op("=>")?;
             let e = self.expr()?;
             vec![Stmt::Return(Some(e))]
@@ -2507,6 +2525,13 @@ impl<'a> Parser<'a> {
     }
 
     fn assign(&mut self) -> Result<Expr, PhpError> {
+        // PHP 8 throw-expression: legal wherever an expression is —
+        // `?? throw`, ternary arms, match arms, arrow-fn bodies.
+        if self.ident_is("throw") {
+            self.pos += 1;
+            let e = self.assign()?;
+            return Ok(Expr::Throw(Box::new(e)));
+        }
         let e = self.ternary()?;
 
         if let Some(Token::Op(op)) = self.peek() {

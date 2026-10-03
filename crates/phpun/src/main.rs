@@ -80,6 +80,15 @@ fn run_script(args: &[String]) -> ExitCode {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| file.to_string());
     let mut it = Interp::new(&abs);
+    // CLI PHP sets the script-path SERVER vars to the path AS INVOKED
+    // (`php console.php` shows "console.php"), unlike __FILE__ which is
+    // always canonical.
+    for k in ["SCRIPT_FILENAME", "PHP_SELF", "SCRIPT_NAME"] {
+        it.set_server_var(k, file);
+    }
+    // Args after the script path become $argv[1..] like reference php;
+    // argv[0] keeps the as-invoked path too.
+    it.set_script_args(file, &args[(i + 1).min(args.len())..]);
     for kv in ini {
         if let Some((k, v)) = kv.split_once('=') {
             it.ini.insert(k.trim().to_string(), v.trim().to_string());

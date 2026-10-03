@@ -305,6 +305,57 @@ fn html_entity(cp: u32) -> Option<&'static str> {
         .map(|i| HTML_ENTITIES[i].1)
 }
 
+/// Decode `s` from `from` into codepoints and re-encode as `to`.
+/// Only the latin-1 family, ASCII, and UTF-8 are real encodings; every
+/// other name is treated as UTF-8.
+fn mb_recode(s: &[u8], to: &str, from: &str) -> Vec<u8> {
+    let to = to.to_ascii_uppercase();
+    let from = from.to_ascii_uppercase();
+    let is_latin = |e: &str| matches!(e, "ISO-8859-1" | "ISO8859-1" | "LATIN1" | "WINDOWS-1252");
+    let cps: Vec<u32> = if is_latin(&from) {
+        s.iter().map(|b| *b as u32).collect()
+    } else {
+        String::from_utf8_lossy(s)
+            .chars()
+            .map(|c| c as u32)
+            .collect()
+    };
+    let mut out: Vec<u8> = Vec::new();
+    if is_latin(&to) {
+        for cp in cps {
+            out.push(if cp <= 0xFF { cp as u8 } else { b'?' });
+        }
+    } else if to == "ASCII" || to == "US-ASCII" {
+        for cp in cps {
+            out.push(if cp < 0x80 { cp as u8 } else { b'?' });
+        }
+    } else {
+        for cp in cps {
+            let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out
+}
+
+/// mb_convert_variables' per-var conversion: strings recode, arrays
+/// recurse, everything else passes through.
+fn mb_cv(v: &Value, to: &str, from: &str) -> Value {
+    match v {
+        Value::Str(s) => Value::bytes(mb_recode(s, to, from)),
+        Value::Array(a) => {
+            let mut out = PhpArray::new();
+            for (k, c) in a.borrow().iter() {
+                let nv = mb_cv(&c.borrow(), to, from);
+                out.set(k.clone(), nv);
+            }
+            Value::Array(Rc::new(RefCell::new(out)))
+        }
+        _ => v.clone(),
+    }
+}
+
 fn bfind(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() || from > hay.len() {
         return None;
@@ -878,40 +929,34 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 );
             }
             let s = arg_bs(it, args, 0);
-            let to = arg(args, 1).to_php_string().to_ascii_uppercase();
+            let to = arg(args, 1).to_php_string();
             let from = if args.len() > 2 {
-                arg(args, 2).to_php_string().to_ascii_uppercase()
+                arg(args, 2).to_php_string()
             } else {
                 "UTF-8".to_string()
             };
-            let is_latin =
-                |e: &str| matches!(e, "ISO-8859-1" | "ISO8859-1" | "LATIN1" | "WINDOWS-1252");
-            // Decode `from` to codepoints, then re-encode to `to`.
-            let cps: Vec<u32> = if is_latin(&from) {
-                s.iter().map(|b| *b as u32).collect()
-            } else {
-                String::from_utf8_lossy(&s)
-                    .chars()
-                    .map(|c| c as u32)
-                    .collect()
+            Value::bytes(mb_recode(&s, &to, &from))
+        }
+        "mb_convert_variables" => {
+            // mb_convert_variables($to, $from, &$var, ...) — converts
+            // each var in place (nested arrays too), returns the source
+            // encoding it detected.
+            let to = arg(args, 0).to_php_string();
+            let from_v = arg(args, 1);
+            let from = match &from_v {
+                Value::Array(a) => a
+                    .borrow()
+                    .iter()
+                    .map(|(_, c)| c.borrow().to_php_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                _ => from_v.to_php_string(),
             };
-            let mut out: Vec<u8> = Vec::new();
-            if is_latin(&to) {
-                for cp in cps {
-                    out.push(if cp <= 0xFF { cp as u8 } else { b'?' });
-                }
-            } else if to == "ASCII" {
-                for cp in cps {
-                    out.push(if cp < 0x80 { cp as u8 } else { b'?' });
-                }
-            } else {
-                for cp in cps {
-                    let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
-                    let mut buf = [0u8; 4];
-                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-                }
+            for c in args.iter().skip(2) {
+                let nv = mb_cv(&c.borrow(), &to, &from);
+                *c.borrow_mut() = nv;
             }
-            Value::bytes(out)
+            Value::str(from)
         }
         "mb_split" => {
             let pat = arg_bs(it, args, 0);
@@ -1083,6 +1128,42 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 std::cmp::Ordering::Equal => 0,
                 std::cmp::Ordering::Greater => 1,
             })
+        }
+        "strspn" | "strcspn" => {
+            // Byte-based: subject slice is (offset, length) of $str;
+            // count the leading run of mask-present (strspn) or
+            // mask-absent (strcspn) bytes.
+            let s = arg_bs(it, args, 0);
+            let mask = arg_bs(it, args, 1);
+            let len = s.len() as i64;
+            let off = arg(args, 2).to_int();
+            let start = if off < 0 {
+                (len + off).max(0)
+            } else {
+                off.min(len)
+            } as usize;
+            let mut end = len as usize;
+            if let Some(l) = args.get(3) {
+                let l = l.borrow().to_int();
+                end = if l < 0 {
+                    (len + l).max(start as i64) as usize
+                } else {
+                    (start + l as usize).min(end)
+                };
+            }
+            let mut member = [false; 256];
+            for &b in &mask {
+                member[b as usize] = true;
+            }
+            let want = name == "strspn";
+            let mut n = 0usize;
+            for &b in &s[start..end.max(start)] {
+                if member[b as usize] != want {
+                    break;
+                }
+                n += 1;
+            }
+            Value::Int(n as i64)
         }
         "str_starts_with" => {
             let hay = arg_bs(it, args, 0);
@@ -1751,7 +1832,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_splice" => {
             // array_splice(&$a, $off, $len, $repl)
             let mut removed = PhpArray::new();
-            if let Value::Array(rc) = &mut *args[0].borrow_mut() {
+            if let Some(rc) = it.arr_mut(&args[0]) {
                 let mut arr = rc.borrow_mut();
                 let n = arr.entries.len() as i64;
                 let off = arg(args, 1).to_int();
@@ -1793,7 +1874,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             Value::Array(Rc::new(RefCell::new(removed)))
         }
         "array_push" => {
-            if let Value::Array(rc) = &mut *args[0].borrow_mut() {
+            if let Some(rc) = it.arr_mut(&args[0]) {
                 let mut arr = rc.borrow_mut();
                 for a in &args[1..] {
                     arr.push(a.borrow().clone());
@@ -1804,7 +1885,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             Value::Null
         }
         "array_pop" => {
-            if let Value::Array(rc) = &mut *args[0].borrow_mut() {
+            if let Some(rc) = it.arr_mut(&args[0]) {
                 let mut arr = rc.borrow_mut();
                 // Tombstone the last live bucket — a live foreach anchored
                 // on it still finds it and ends instead of restarting
@@ -1825,7 +1906,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             Value::Null
         }
         "array_shift" => {
-            if let Value::Array(rc) = &mut *args[0].borrow_mut() {
+            if let Some(rc) = it.arr_mut(&args[0]) {
                 let mut arr = rc.borrow_mut();
                 // Shift the first LIVE element: tombstone its bucket (a live
                 // foreach keeps positions — foreachLoop.013) and renumber
@@ -1854,7 +1935,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             Value::Null
         }
         "array_unshift" => {
-            if let Value::Array(rc) = &mut *args[0].borrow_mut() {
+            if let Some(rc) = it.arr_mut(&args[0]) {
                 let mut arr = rc.borrow_mut();
                 // Renumber existing int keys up by arg count.
                 let add = args.len() - 1;
@@ -2175,7 +2256,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     return Ok(Some(Value::Bool(true)));
                 }
             }
-            if let Value::Array(rc) = &mut *args[0].borrow_mut() {
+            if let Some(rc) = it.arr_mut(&args[0]) {
                 let cells: Vec<(ArrKey, Cell)> = rc.borrow().iter().cloned().collect();
                 for (k, c) in cells {
                     it.call_value(
@@ -2338,7 +2419,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "sort" | "rsort" | "asort" | "arsort" | "ksort" | "krsort" | "usort" | "uasort"
         | "uksort" | "natsort" | "natcasesort" | "shuffle" => {
-            if let Value::Array(rc) = &mut *args[0].borrow_mut() {
+            if let Some(rc) = it.arr_mut(&args[0]) {
                 let mut arr = rc.borrow_mut();
                 sort_array(it, &mut arr, name, args.get(1))?;
             }
@@ -4157,7 +4238,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "spl_autoload_call" => {
             let n = arg_str(it, args, 0);
-            it.run_autoload(&n);
+            it.run_autoload(&n)?;
             Value::Bool(true)
         }
         "array_key_exists_slow" => Value::Null,
@@ -7104,6 +7185,13 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                             let rb = r.as_slice();
                             let mut i = 0;
                             while i < rb.len() {
+                                // `\\` in a replacement is ONE literal
+                                // backslash (PHP's escape), not two.
+                                if rb[i] == b'\\' && rb.get(i + 1) == Some(&b'\\') {
+                                    cleaned.push(b'\\');
+                                    i += 2;
+                                    continue;
+                                }
                                 if rb[i] == b'$' || rb[i] == b'\\' {
                                     let (digits_len, end) = if rb[i] == b'$'
                                         && i + 1 < rb.len()
@@ -7955,6 +8043,14 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         "strcmp" | "strcasecmp" => bp!(("string1", Req), ("string2", Req)),
         "strncmp" | "strncasecmp" => {
             bp!(("string1", Req), ("string2", Req), ("length", Req))
+        }
+        "strspn" | "strcspn" => {
+            bp!(
+                ("string", Req),
+                ("characters", Req),
+                ("offset", Int(0)),
+                ("length", Null)
+            )
         }
         "str_replace" | "str_ireplace" => bp!(
             ("search", Req),

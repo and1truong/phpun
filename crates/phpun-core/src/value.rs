@@ -913,6 +913,8 @@ pub enum ObjectInternal {
     /// object; the body runs on the first Iterator method and every
     /// yielded (key, value) lands in `items`.
     Generator(Rc<RefCell<GenState>>),
+    /// DirectoryIterator state: the dir's entry paths + cursor.
+    DirIter { entries: Vec<String>, pos: usize },
     /// DateTime, closures-as-objects, etc. — opaque marker.
     None,
 }
@@ -961,6 +963,7 @@ impl std::fmt::Debug for ObjectInternal {
             ObjectInternal::ArrayIter { .. } => f.write_str("ArrayIter"),
             ObjectInternal::ReflectionAttribute { .. } => f.write_str("ReflectionAttribute"),
             ObjectInternal::Generator { .. } => f.write_str("Generator"),
+            ObjectInternal::DirIter { .. } => f.write_str("DirIter"),
             ObjectInternal::Sqlite { .. } => f.write_str("Sqlite"),
             ObjectInternal::SqliteStmt { .. } => f.write_str("SqliteStmt"),
             ObjectInternal::None => f.write_str("None"),

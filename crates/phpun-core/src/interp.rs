@@ -312,6 +312,9 @@ impl<'a> Interp<'a> {
             );
         }
         constants.insert("DIRECTORY_SEPARATOR".into(), Value::str("/"));
+        // Reported as the engine's target PCRE2 level — feature checks
+        // like symfony's `>= 10.39` gate on this, not the vendored lib.
+        constants.insert("PCRE_VERSION".into(), Value::str("10.49 2026-09-28"));
         constants.insert("INI_USER".into(), Value::Int(1));
         constants.insert("INI_PERDIR".into(), Value::Int(2));
         constants.insert("INI_SYSTEM".into(), Value::Int(4));
@@ -388,6 +391,16 @@ impl<'a> Interp<'a> {
         constants.insert("PREG_BAD_UTF8_OFFSET_ERROR".into(), Value::Int(5));
         constants.insert("PREG_JIT_STACKLIMIT_ERROR".into(), Value::Int(6));
         constants.insert("PREG_BAD_MODE_LIMIT_ERROR".into(), Value::Int(7));
+        // ext/standard sort flags (used by sort-family builtins and
+        // symfony console's command sorting).
+        constants.insert("SORT_REGULAR".into(), Value::Int(0));
+        constants.insert("SORT_NUMERIC".into(), Value::Int(1));
+        constants.insert("SORT_STRING".into(), Value::Int(2));
+        constants.insert("SORT_DESC".into(), Value::Int(3));
+        constants.insert("SORT_ASC".into(), Value::Int(4));
+        constants.insert("SORT_LOCALE_STRING".into(), Value::Int(5));
+        constants.insert("SORT_NATURAL".into(), Value::Int(6));
+        constants.insert("SORT_FLAG_CASE".into(), Value::Int(8));
         // ext/filter.
         constants.insert("FILTER_VALIDATE_INT".into(), Value::Int(257));
         constants.insert("FILTER_VALIDATE_BOOL".into(), Value::Int(258));
@@ -564,6 +577,30 @@ impl<'a> Interp<'a> {
         }
         it.register_builtin_classes();
         it
+    }
+
+    /// `phpun file.php a b c` — CLI args after the script name land in
+    /// `$argv`/`$argc`/`$_SERVER['argv']` like reference php.
+    pub fn set_script_args(&mut self, script: &str, args: &[String]) {
+        let mut argv = PhpArray::new();
+        argv.push(Value::str(script));
+        for a in args {
+            argv.push(Value::str(a));
+        }
+        let argc = argv.len() as i64;
+        let argv_v = Value::Array(Rc::new(RefCell::new(argv)));
+        if let Some(c) = self.globals.vars.get("_SERVER") {
+            if let Value::Array(srv) = &*c.borrow() {
+                srv.borrow_mut()
+                    .set(ArrKey::Str("argv".into()), argv_v.clone());
+                srv.borrow_mut()
+                    .set(ArrKey::Str("argc".into()), Value::Int(argc));
+            }
+        }
+        self.globals.vars.insert("argv".into(), cell(argv_v));
+        self.globals
+            .vars
+            .insert("argc".into(), cell(Value::Int(argc)));
     }
 
     /// Builtin exception classes + interfaces needed by try/catch.
@@ -814,6 +851,69 @@ impl<'a> Interp<'a> {
                     stub_method("send", &["value"]),
                     stub_method("throw", &["exception"]),
                     stub_method("getReturn", &[]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        // SplFileInfo / DirectoryIterator — SPL filesystem surface;
+        // methods native-dispatch on \0fi\0path / DirIter internals.
+        reg(
+            ClassDecl {
+                name: "SplFileInfo".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                methods: vec![
+                    stub_method("__construct", &["filename"]),
+                    stub_method("getFilename", &[]),
+                    stub_method("getBasename", &[]),
+                    stub_method("getPathname", &[]),
+                    stub_method("getPath", &[]),
+                    stub_method("getExtension", &[]),
+                    stub_method("getRealPath", &[]),
+                    stub_method("isFile", &[]),
+                    stub_method("isDir", &[]),
+                    stub_method("isLink", &[]),
+                    stub_method("isReadable", &[]),
+                    stub_method("isWritable", &[]),
+                    stub_method("isExecutable", &[]),
+                    stub_method("getSize", &[]),
+                    stub_method("getMTime", &[]),
+                    stub_method("getType", &[]),
+                    stub_method("__toString", &[]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        reg(
+            ClassDecl {
+                name: "DirectoryIterator".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: Some("SplFileInfo".into()),
+                implements: vec!["Iterator".into()],
+                attrs: vec![],
+                traits: vec![],
+                methods: vec![
+                    stub_method("rewind", &[]),
+                    stub_method("valid", &[]),
+                    stub_method("current", &[]),
+                    stub_method("key", &[]),
+                    stub_method("next", &[]),
+                    stub_method("isDot", &[]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -1567,8 +1667,6 @@ impl<'a> Interp<'a> {
                 | "_REQUEST"
                 | "_SESSION"
                 | "GLOBALS"
-                | "argc"
-                | "argv"
         )
     }
 
@@ -3169,8 +3267,9 @@ impl<'a> Interp<'a> {
                 let snapshot: Vec<(ArrKey, Cell)> = if by_ref {
                     rc.borrow().iter().cloned().collect()
                 } else {
+                    // .iter() skips tombstoned buckets — a value-foreach
+                    // never sees shifted/unset elements.
                     rc.borrow()
-                        .entries
                         .iter()
                         .map(|(k, c)| (k.clone(), cell(c.borrow().clone())))
                         .collect()
@@ -3892,7 +3991,7 @@ impl<'a> Interp<'a> {
                 let n = self.conv_str(&nv)?;
                 let argvals =
                     self.arg_cells(args, &[], &format!("{}::{{closure}}()", cls.name()))?;
-                self.static_invoke(cls, &n, argvals)
+                self.static_invoke(cls, &n, argvals, None)
             }
             Expr::ClassConst { class, name } => self.class_const(class, name),
             Expr::Clone(e) => {
@@ -3966,6 +4065,8 @@ impl<'a> Interp<'a> {
                         let cls = o.borrow().class.clone();
                         Ok(Value::Bool(self.is_a(&cls, &cname)))
                     }
+                    // A closure literal IS a Closure object.
+                    Value::Callable(_) => Ok(Value::Bool(cname.eq_ignore_ascii_case("closure"))),
                     _ => Ok(Value::Bool(false)),
                 }
             }
@@ -4195,7 +4296,10 @@ impl<'a> Interp<'a> {
             }
             Value::Object(o) => {
                 let class = o.borrow().class.clone();
-                if class.find_method("__tostring").is_some() {
+                // __toString may be inherited — walk the chain, not just
+                // the leaf decl (AbstractString defines it for
+                // UnicodeString).
+                if self.find_method_in(&class, "__tostring").is_some() {
                     let r = self.method_invoke(o.clone(), "__tostring", CallArgs::empty())?;
                     Ok(r.to_php_string())
                 } else {
@@ -4367,23 +4471,14 @@ impl<'a> Interp<'a> {
                 }
             }
             Expr::Index { e, i } if has_prop(e) => {
-                // Prop-chain index: container resolved early; a dynamic index
-                // expr runs for side effects and its effective key is replaced
-                // by the RHS (register quirk), a literal keeps its value.
+                // Prop-chain index: the container resolves early; the dim
+                // expr's own value is always the key — `$o->a[${f()}]` is a
+                // variable-variable, not a register quirk
+                // (engine_assignExecutionOrder_001 reads $name that way).
                 match self.eval_cell(e) {
                     Ok(c) => {
-                        // The register quirk only hits call-result dims
-                        // (engine_assignExecutionOrder_001): literals, plain
-                        // vars and binary-op dims keep their evaluated value.
-                        let clobber = matches!(
-                            i.as_deref(),
-                            Some(Expr::Call { .. })
-                                | Some(Expr::MethodCall { .. })
-                                | Some(Expr::StaticCall { .. })
-                                | Some(Expr::New { .. })
-                        );
                         let key = match i.as_deref() {
-                            Some(ie) => self.eval(ie).ok().filter(|_| !clobber),
+                            Some(ie) => self.eval(ie).ok(),
                             None => None,
                         };
                         late = Late::Index {
@@ -5189,6 +5284,25 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Writable array handle for by-ref builtin args: PHP COW-separates
+    /// a shared array at the callee boundary, so a builtin mutating
+    /// `&$array` replaces the caller's slot with a private copy while
+    /// other variables keep the old contents. is_ref arrays (true `=&`
+    /// bindings) write through to every alias instead.
+    pub fn arr_mut(&self, c: &Cell) -> Option<Rc<RefCell<PhpArray>>> {
+        let mut b = c.borrow_mut();
+        if let Value::Array(rc) = &mut *b {
+            if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
+                let fresh = rc.borrow().clone();
+                *b = Value::Array(Rc::new(RefCell::new(fresh)));
+            }
+            if let Value::Array(rc) = &*b {
+                return Some(rc.clone());
+            }
+        }
+        None
+    }
+
     /// Index into `c`'s array value, taking a cell for `key`/`[]`.
     fn index_into_key(&mut self, c: Cell, key: Option<Value>) -> Result<Cell, PhpError> {
         let mut b = c.borrow_mut();
@@ -5428,8 +5542,19 @@ impl<'a> Interp<'a> {
                 if let Some(c) = self.var_cell_opt(name) {
                     let mut b = c.borrow_mut();
                     if let Value::Array(rc) = &mut *b {
-                        if let Some(k) = key {
-                            rc.borrow_mut().unset(&to_key(&k));
+                        // `unset($copy[$k])` must cow-separate a shared
+                        // array like a write does — PHP copies `$a = $b`
+                        // lazily; mutating the shared table would corrupt
+                        // the source (InputDefinition::parseArgument
+                        // unsets on its own copy of getArguments()).
+                        if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
+                            let fresh = rc.borrow().clone();
+                            *b = Value::Array(Rc::new(RefCell::new(fresh)));
+                        }
+                        if let Value::Array(rc) = &*b {
+                            if let Some(k) = key {
+                                rc.borrow_mut().unset(&to_key(&k));
+                            }
                         }
                     }
                 }
@@ -5452,8 +5577,14 @@ impl<'a> Interp<'a> {
                 if let Ok(c) = self.index_cell(inner, ii.as_deref()) {
                     let mut b = c.borrow_mut();
                     if let Value::Array(rc) = &mut *b {
-                        if let Some(k) = key {
-                            rc.borrow_mut().unset(&to_key(&k));
+                        if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
+                            let fresh = rc.borrow().clone();
+                            *b = Value::Array(Rc::new(RefCell::new(fresh)));
+                        }
+                        if let Value::Array(rc) = &*b {
+                            if let Some(k) = key {
+                                rc.borrow_mut().unset(&to_key(&k));
+                            }
                         }
                     }
                 }
@@ -6085,7 +6216,7 @@ impl<'a> Interp<'a> {
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
                 let vals = self.arg_cells(args, &params, &format!("{}()", mn))?;
-                return self.static_invoke(cls, &mn, vals);
+                return self.static_invoke(cls, &mn, vals, None);
             }
             Expr::Prop { .. } | Expr::MethodCall { .. } | Expr::Index { .. } => {
                 let v = self.eval(name)?;
@@ -6498,6 +6629,13 @@ impl<'a> Interp<'a> {
                         }
                         frame.this_obj = c.this_obj.clone();
                         frame.scope_class = c.scope_class.clone();
+                        // $this binds like a normal method frame —
+                        // closures defined in an object context auto-capture it.
+                        if let Some(o) = &c.this_obj {
+                            frame
+                                .vars
+                                .insert("this".to_string(), cell(Value::Object(o.clone())));
+                        }
                         frame.file = if decl.file.is_empty() {
                             self.cur_file.clone()
                         } else {
@@ -6529,7 +6667,7 @@ impl<'a> Interp<'a> {
                     CallableKind::Method { obj, class, name } => match obj {
                         Some(o) => self.method_invoke(o.clone(), name, args),
                         None => match class {
-                            Some(cls) => self.static_invoke(cls.clone(), name, args),
+                            Some(cls) => self.static_invoke(cls.clone(), name, args, None),
                             None => self.fail(PhpError::fatal("bad callable", 0)),
                         },
                     },
@@ -6544,7 +6682,7 @@ impl<'a> Interp<'a> {
                     if let Some(c) = self.resolve_class(cls) {
                         let cls = self.classes.get(&c.to_lowercase()).cloned();
                         if let Some(cls) = cls {
-                            return self.static_invoke(cls, m, args);
+                            return self.static_invoke(cls, m, args, None);
                         }
                     }
                 }
@@ -6578,7 +6716,7 @@ impl<'a> Interp<'a> {
                                     .resolve_class(&crate::value::lossy(&cn))
                                     .and_then(|c| self.classes.get(&c.to_lowercase()).cloned());
                                 match cls {
-                                    Some(cls) => self.static_invoke(cls, &mname, args),
+                                    Some(cls) => self.static_invoke(cls, &mname, args, None),
                                     None => self.fail(PhpError::uncaught(
                                         "Error",
                                         format!("Class \"{}\" not found", crate::value::lossy(&cn)),
@@ -7154,14 +7292,17 @@ impl<'a> Interp<'a> {
 
     /// spl_autoload: invoke each registered loader until `name`
     /// resolves (resolve_class/class_of retry on miss).
-    pub fn run_autoload(&mut self, name: &str) {
+    /// An exception thrown by an autoloader propagates to the code that
+    /// triggered the load (PHP stops the chain on throw).
+    pub fn run_autoload(&mut self, name: &str) -> Result<(), PhpError> {
         let fns = self.autoload_fns.clone();
         for f in fns {
-            let _ = self.call_value(&f, CallArgs::positional(vec![cell(Value::str(name))]));
+            self.call_value(&f, CallArgs::positional(vec![cell(Value::str(name))]))?;
             if self.classes.contains_key(&name.to_lowercase()) {
-                return;
+                return Ok(());
             }
         }
+        Ok(())
     }
     /// Params binding + body run for a pushed frame context (closures).
     fn bind_and_run(
@@ -7301,7 +7442,11 @@ impl<'a> Interp<'a> {
         for p in &decl.params {
             let Some(ty) = &p.ty else { continue };
             self.cur_line = decl.line;
-            let nullable = ty.iter().any(|m| m.eq_ignore_ascii_case("null"));
+            // `mixed` already spans null (and `?mixed` is a parse error),
+            // so `mixed $x = null` is never the implicit-nullable case.
+            let nullable = ty
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case("null") || m.eq_ignore_ascii_case("mixed"));
             let null_default = match &p.default {
                 Some(Expr::Null) => true,
                 Some(Expr::Const(c)) => c.eq_ignore_ascii_case("null"),
@@ -8049,6 +8194,177 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// SplFileInfo / DirectoryIterator native methods. SplFileInfo
+    /// state is a `\0fi\0path` prop; DirectoryIterator additionally
+    /// carries a DirIter internal (sorted dir entries + cursor).
+    fn spl_method(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        name: &str,
+        args: &CallArgs,
+    ) -> Result<Option<Value>, PhpError> {
+        let lname = name.to_lowercase();
+        match lname.as_str() {
+            "__construct" => {
+                let path_v = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let path = self.conv_str(&path_v)?.to_string();
+                let is_iter = matches!(
+                    obj.borrow().class.name().to_lowercase().as_str(),
+                    "directoryiterator" | "filesystemiterator"
+                );
+                if is_iter {
+                    let mut entries: Vec<String> = Vec::new();
+                    match std::fs::read_dir(&path) {
+                        Ok(rd) => {
+                            for e in rd.flatten() {
+                                let n = e.file_name().to_string_lossy().to_string();
+                                if n == "." || n == ".." {
+                                    continue;
+                                }
+                                entries.push(format!("{}/{}", path.trim_end_matches('/'), n));
+                            }
+                            entries.sort();
+                        }
+                        Err(_) => {
+                            return self.fail::<Option<Value>>(PhpError::uncaught(
+                                "UnexpectedValueException",
+                                format!(
+                                    "DirectoryIterator::__construct({}): failed to open dir",
+                                    path
+                                ),
+                                0,
+                            ));
+                        }
+                    }
+                    let mut ob = obj.borrow_mut();
+                    ob.props
+                        .insert("\0fi\0path".into(), cell(Value::str(&path)));
+                    ob.internal = Some(ObjectInternal::DirIter { entries, pos: 0 });
+                } else {
+                    obj.borrow_mut()
+                        .props
+                        .insert("\0fi\0path".into(), cell(Value::str(&path)));
+                }
+                Ok(Some(Value::Null))
+            }
+            "rewind" => {
+                if let Some(ObjectInternal::DirIter { pos, .. }) = &mut obj.borrow_mut().internal {
+                    *pos = 0;
+                }
+                Ok(Some(Value::Null))
+            }
+            "valid" => Ok(Some(Value::Bool(match &obj.borrow().internal {
+                Some(ObjectInternal::DirIter { entries, pos }) => *pos < entries.len(),
+                _ => false,
+            }))),
+            "current" => {
+                // PHP yields SplFileInfo instances for each entry.
+                let path = match &obj.borrow().internal {
+                    Some(ObjectInternal::DirIter { entries, pos }) if *pos < entries.len() => {
+                        Some(entries[*pos].clone())
+                    }
+                    _ => None,
+                };
+                match path {
+                    Some(p) => {
+                        let v = self.instantiate("splfileinfo", &[])?;
+                        if let Value::Object(o) = &v {
+                            o.borrow_mut()
+                                .props
+                                .insert("\0fi\0path".into(), cell(Value::str(&p)));
+                        }
+                        Ok(Some(v))
+                    }
+                    None => Ok(Some(Value::Null)),
+                }
+            }
+            "key" => Ok(Some(match &obj.borrow().internal {
+                Some(ObjectInternal::DirIter { pos, .. }) => Value::Int(*pos as i64),
+                _ => Value::Null,
+            })),
+            "next" => {
+                if let Some(ObjectInternal::DirIter { pos, .. }) = &mut obj.borrow_mut().internal {
+                    *pos += 1;
+                }
+                Ok(Some(Value::Null))
+            }
+            // Dots are filtered out at construct time, so the current
+            // entry is never `.`/`..`.
+            "isdot" => Ok(Some(Value::Bool(false))),
+            _ => {
+                let path_v = obj
+                    .borrow()
+                    .props
+                    .get("\0fi\0path")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let path = self.conv_str(&path_v)?.to_string();
+                let base = path.rsplit('/').next().unwrap_or(&path).to_string();
+                let md = std::fs::metadata(&path).ok();
+                let v = match lname.as_str() {
+                    "getfilename" => Value::str(&base),
+                    "getbasename" => {
+                        let suffix = args
+                            .first()
+                            .map(|c| c.borrow().clone())
+                            .map(|v| self.conv_str(&v).map(|s| s.to_string()))
+                            .transpose()?
+                            .unwrap_or_default();
+                        Value::str(
+                            base.strip_suffix(&suffix)
+                                .filter(|_| !suffix.is_empty())
+                                .unwrap_or(&base),
+                        )
+                    }
+                    "getpathname" => Value::str(&path),
+                    "getpath" => Value::str(match path.rfind('/') {
+                        Some(i) => &path[..i],
+                        None => "",
+                    }),
+                    "getextension" => Value::str(
+                        base.rsplit_once('.')
+                            .filter(|(h, _)| !h.is_empty())
+                            .map(|(_, e)| e)
+                            .unwrap_or(""),
+                    ),
+                    "getrealpath" => match std::fs::canonicalize(&path) {
+                        Ok(p) => Value::str(p.display().to_string()),
+                        Err(_) => Value::Bool(false),
+                    },
+                    "isfile" => Value::Bool(md.as_ref().is_some_and(|m| m.is_file())),
+                    "isdir" => Value::Bool(md.as_ref().is_some_and(|m| m.is_dir())),
+                    "islink" => Value::Bool(
+                        std::fs::symlink_metadata(&path)
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false),
+                    ),
+                    "isreadable" | "iswritable" | "isexecutable" => Value::Bool(md.is_some()),
+                    "getsize" => md
+                        .as_ref()
+                        .map(|m| Value::Int(m.len() as i64))
+                        .unwrap_or(Value::Bool(false)),
+                    "getmtime" => md
+                        .as_ref()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| Value::Int(d.as_secs() as i64))
+                        .unwrap_or(Value::Bool(false)),
+                    "gettype" => Value::str(if md.as_ref().is_some_and(|m| m.is_dir()) {
+                        "dir"
+                    } else {
+                        "file"
+                    }),
+                    "__tostring" => Value::str(&path),
+                    _ => return Ok(None),
+                };
+                Ok(Some(v))
+            }
+        }
+    }
+
     /// Native dispatch for the `Generator` class (Iterator + send/throw/
     /// getReturn). `obj` must carry a Generator internal.
     fn generator_method(
@@ -8213,19 +8529,19 @@ impl<'a> Interp<'a> {
         // RegexBasedAbstract and the DataGenerator interface here).
         if let Some(p) = &decl.parent {
             if !self.classes.contains_key(&p.to_lowercase()) {
-                self.run_autoload(p.trim_start_matches('\\'));
+                self.run_autoload(p.trim_start_matches('\\'))?;
             }
         }
         for i in &decl.implements {
             if !self.interfaces.contains_key(&i.to_lowercase())
                 && !self.classes.contains_key(&i.to_lowercase())
             {
-                self.run_autoload(i.trim_start_matches('\\'));
+                self.run_autoload(i.trim_start_matches('\\'))?;
             }
         }
         for t in &decl.traits {
             if !self.traits.contains_key(&t.to_lowercase()) {
-                self.run_autoload(t.trim_start_matches('\\'));
+                self.run_autoload(t.trim_start_matches('\\'))?;
             }
         }
         let mut d = (*decl).clone();
@@ -8971,7 +9287,10 @@ impl<'a> Interp<'a> {
         if !self.classes.contains_key(&n.to_lowercase())
             && !self.interfaces.contains_key(&n.to_lowercase())
         {
-            self.run_autoload(n);
+            // Option-typed: a throwing autoloader can't surface here —
+            // PHP propagates it, but callers of resolve_class (e.g.
+            // class_exists) mostly can't throw either; keep the swallow.
+            let _ = self.run_autoload(n);
         }
         if self.classes.contains_key(&n.to_lowercase())
             || self.interfaces.contains_key(&n.to_lowercase())
@@ -9030,7 +9349,7 @@ impl<'a> Interp<'a> {
     fn new_instance(&mut self, name: &str, args: CallArgs) -> Result<Value, PhpError> {
         let lname = name.to_lowercase();
         if !self.classes.contains_key(&lname) {
-            self.run_autoload(name.trim_start_matches('\\'));
+            self.run_autoload(name.trim_start_matches('\\'))?;
         }
         let cls = match self.classes.get(&lname) {
             Some(c) => c.clone(),
@@ -10747,8 +11066,34 @@ impl<'a> Interp<'a> {
                     .get(1)
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
-                ob.props.insert("\0rc\0class".into(), cell(cls));
-                ob.props.insert("\0rc\0prop".into(), cell(prop));
+                ob.props.insert("\0rc\0class".into(), cell(cls.clone()));
+                ob.props.insert("\0rc\0prop".into(), cell(prop.clone()));
+                // Public metadata props the real reflectors expose:
+                // ReflectionProperty::{class,name}, ReflectionMethod::
+                // {class,name}, ReflectionClass/Function::name. `class`
+                // keeps the canonical (declared-case) class name.
+                let cname = match &cls {
+                    Value::Object(o) => o.borrow().class.name().to_string(),
+                    Value::Str(s) => {
+                        let raw = String::from_utf8_lossy(s).to_string();
+                        let resolved = self.resolve_class(&raw).unwrap_or_else(|| raw.clone());
+                        self.classes
+                            .get(&resolved.to_lowercase())
+                            .map(|c| c.decl.name.clone())
+                            .unwrap_or(resolved)
+                    }
+                    _ => String::new(),
+                };
+                match ob.class.name().to_lowercase().as_str() {
+                    "reflectionproperty" | "reflectionmethod" => {
+                        ob.props.insert("name".into(), cell(prop));
+                        ob.props.insert("class".into(), cell(Value::str(&cname)));
+                    }
+                    "reflectionclass" | "reflectionfunction" => {
+                        ob.props.insert("name".into(), cell(cls));
+                    }
+                    _ => {}
+                }
                 Ok(Some(Value::Null))
             }
             // ReflectionFunction::invoke(...$args) and
@@ -10879,8 +11224,18 @@ impl<'a> Interp<'a> {
                         1,
                     )
                 };
+                // Optional class-name filter arg.
+                let fname = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .map(|v| self.conv_str(&v).map(|s| s.to_string()))
+                    .transpose()?
+                    .unwrap_or_default();
                 let mut arr = PhpArray::default();
                 for a in decls {
+                    if !fname.is_empty() && !a.name.eq_ignore_ascii_case(&fname) {
+                        continue;
+                    }
                     let v = self.instantiate("reflectionattribute", &[])?;
                     if let Value::Object(o) = &v {
                         o.borrow_mut().internal = Some(ObjectInternal::ReflectionAttribute {
@@ -10923,13 +11278,23 @@ impl<'a> Interp<'a> {
                     let cls = match self.classes.get(&lname).cloned() {
                         Some(c) => c,
                         None => {
-                            return self
-                                .fail::<Option<Value>>(PhpError::uncaught(
-                                    "Error",
-                                    format!("Class \"{}\" not found", name),
-                                    0,
-                                ))
-                                .map(|_| None);
+                            // `new ReflectionClass` may not have loaded
+                            // the attribute class yet — trigger autoload.
+                            let resolved = self
+                                .resolve_class(name.trim_start_matches('\\'))
+                                .unwrap_or_else(|| name.clone());
+                            match self.classes.get(&resolved.to_lowercase()).cloned() {
+                                Some(c) => c,
+                                None => {
+                                    return self
+                                        .fail::<Option<Value>>(PhpError::uncaught(
+                                            "Error",
+                                            format!("Class \"{}\" not found", name),
+                                            0,
+                                        ))
+                                        .map(|_| None);
+                                }
+                            }
                         }
                     };
                     let short = |n: &str| n.rsplit('\\').next().unwrap_or(n).to_string();
@@ -11478,6 +11843,15 @@ impl<'a> Interp<'a> {
                 return Ok(v);
             }
         }
+        // SplFileInfo / DirectoryIterator: SPL filesystem objects.
+        if matches!(
+            cls.name().to_lowercase().as_str(),
+            "splfileinfo" | "directoryiterator" | "filesystemiterator"
+        ) {
+            if let Some(v) = self.spl_method(&obj, name, &args)? {
+                return Ok(v);
+            }
+        }
         // PDO / PDOStatement: sqlite-backed storage surface (#15 spike).
         if cls.name().eq_ignore_ascii_case("pdo") {
             if let Some(v) = crate::pdo::pdo_method(self, &obj, name, &args)? {
@@ -11700,6 +12074,20 @@ impl<'a> Interp<'a> {
             return;
         }
         *cls.statics_init.borrow_mut() = true;
+        // Inherited statics: PHP snapshots the parent's static-prop
+        // values into the child's table at link time, so `static::$p`
+        // on the child resolves parent defaults.
+        if let Some(pname) = &cls.decl.parent {
+            if let Some(p) = self.classes.get(&pname.to_lowercase()).cloned() {
+                self.statics_init(&p);
+                for (k, v) in p.statics.borrow().iter() {
+                    cls.statics
+                        .borrow_mut()
+                        .entry(k.clone())
+                        .or_insert_with(|| cell(v.borrow().clone()));
+                }
+            }
+        }
         for p in &cls.decl.props {
             if !p.is_static {
                 continue;
@@ -11730,7 +12118,26 @@ impl<'a> Interp<'a> {
             .map(|m| m.0.decl.params.clone())
             .unwrap_or_default();
         let argvals = self.arg_cells(args, &params, &format!("{}()", name))?;
-        self.static_invoke(cls, name, argvals)
+        // Forwarding calls (self::/parent::/static::) preserve the
+        // current late-static-binding class instead of resetting it to
+        // the resolved target: `parent::__construct()` on a subclass
+        // still sees the subclass via `static::` inside the parent ctor.
+        let called = match class {
+            Expr::Const(n) | Expr::Str(n)
+                if matches!(
+                    n.trim_start_matches('\\').to_lowercase().as_str(),
+                    "self" | "parent" | "static"
+                ) =>
+            {
+                self.stack.last().and_then(|f| {
+                    f.called_class
+                        .clone()
+                        .or_else(|| f.this_obj.as_ref().map(|o| o.borrow().class.clone()))
+                })
+            }
+            _ => None,
+        };
+        self.static_invoke(cls, name, argvals, called)
     }
 
     fn static_invoke(
@@ -11738,6 +12145,7 @@ impl<'a> Interp<'a> {
         cls: Rc<PhpClass>,
         name: &str,
         args: CallArgs,
+        called_class: Option<Rc<PhpClass>>,
     ) -> Result<Value, PhpError> {
         // Closure::{bind,fromCallable}: native callable rebinding.
         if cls.name().eq_ignore_ascii_case("closure") {
@@ -11808,7 +12216,7 @@ impl<'a> Interp<'a> {
                         })
                 };
                 self.pending_decl_class = Some(dc.clone());
-                self.pending_called_class = Some(cls.clone());
+                self.pending_called_class = Some(called_class.clone().unwrap_or(cls.clone()));
                 let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(dc));
                 self.pending_decl_class = None;
                 self.pending_called_class = None;
@@ -11824,7 +12232,7 @@ impl<'a> Interp<'a> {
                         arr.set(ArrKey::Str(Rc::from(n.as_str())), a.borrow().clone());
                     }
                     self.pending_decl_class = Some(dc.clone());
-                    self.pending_called_class = Some(cls.clone());
+                    self.pending_called_class = Some(called_class.clone().unwrap_or(cls.clone()));
                     let r = self.invoke_fn(
                         &Rc::new(m.decl.clone()),
                         CallArgs::positional(vec![
@@ -11961,7 +12369,7 @@ impl<'a> Interp<'a> {
     fn class_of(&mut self, e: &Expr) -> Result<Rc<PhpClass>, PhpError> {
         let name = self.class_name_of(e)?;
         if !self.classes.contains_key(&name.to_lowercase()) {
-            self.run_autoload(&name);
+            self.run_autoload(&name)?;
         }
         match self.classes.get(&name.to_lowercase()) {
             Some(c) => Ok(c.clone()),
