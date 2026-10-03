@@ -2639,6 +2639,16 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                 }
                 Some(Token::Op("&")) => {
+                    // `&` is an intersection operator only when a type
+                    // name follows; a `&` before `$var` is by-ref
+                    // (`int &$p` — typed_properties_010).
+                    let next_is_name = matches!(
+                        self.toks.get(self.pos + 1).map(|l| &l.token),
+                        Some(Token::Ident(_)) | Some(Token::Op("\\")) | Some(Token::Op("("))
+                    );
+                    if !next_is_name {
+                        break;
+                    }
                     name.push('&');
                     self.pos += 1;
                 }

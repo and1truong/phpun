@@ -280,6 +280,14 @@ pub struct Interp<'a> {
     /// File currently executing — include resolution uses its directory
     /// (PHP checks include_path, then the calling file's dir, then cwd).
     cur_file: String,
+    /// Files that ran `declare(strict_types=1)` — scalar arg/prop/return
+    /// coercion is off for code executing inside them.
+    strict_files: std::collections::HashSet<String>,
+    /// Cells backing declared-typed props, keyed by their Rc pointer —
+    /// writes *through a reference* to a typed slot stay checked
+    /// (typed_properties_045). The stored clone keeps the slot alive so
+    /// the pointer key stays unique.
+    typed_slots: std::collections::HashMap<usize, (Cell, Vec<String>, String, String)>,
     /// File the last `fail()` was raised in (uncaught-print attribution
     /// for engine errors — `self.file` is always the entry script).
     last_err_file: String,
@@ -548,6 +556,8 @@ impl<'a> Interp<'a> {
             destructed: HashSet::new(),
             internal_cb: 0,
             cur_file: file.to_string(),
+            strict_files: std::collections::HashSet::new(),
+            typed_slots: std::collections::HashMap::new(),
             last_err_file: String::new(),
             assert_src: String::new(),
             mem_used: 0,
@@ -3513,7 +3523,14 @@ impl<'a> Interp<'a> {
                 }
                 Flow::Normal
             }
-            Stmt::Declare { .. } => Flow::Normal,
+            Stmt::Declare { name, value } => {
+                if name.eq_ignore_ascii_case("strict_types")
+                    && matches!(self.eval(value), Ok(Value::Int(1)))
+                {
+                    self.strict_files.insert(self.cur_file.clone());
+                }
+                Flow::Normal
+            }
         }
     }
 
@@ -4487,6 +4504,7 @@ impl<'a> Interp<'a> {
                                 }),
                                 _ => None,
                             },
+                            unset_props: std::collections::HashSet::new(),
                         };
                         drop(ob);
                         let nv = Value::Object(self.alloc_obj(new_obj));
@@ -5104,6 +5122,13 @@ impl<'a> Interp<'a> {
             }
             Late::Static { class, pn } => {
                 let c = self.static_prop_named(&class, &pn)?;
+                // Static prop writes coerce to the declared type like
+                // instance props (typed_properties_023).
+                if let Ok((cls, _)) = self.member_class_of(&class) {
+                    if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pn) {
+                        newv = self.prop_typed_write_check(&pd, &dcls, newv)?;
+                    }
+                }
                 *c.borrow_mut() = newv.clone();
             }
             Late::Keyed { e, keys } => {
@@ -5111,7 +5136,8 @@ impl<'a> Interp<'a> {
             }
             Late::None => match target_cell {
                 Some(c) => {
-                    *c.borrow_mut() = newv.clone();
+                    let nv = self.typed_slot_store(&c, newv.clone())?;
+                    *c.borrow_mut() = nv;
                 }
                 None => self.store(target, newv.clone())?,
             },
@@ -5287,7 +5313,14 @@ impl<'a> Interp<'a> {
             Expr::Index { e, i } => self.set_index(e, i.as_deref(), v),
             Expr::StaticProp { class, name } => {
                 let c = self.static_prop_cell(class, name)?;
-                *c.borrow_mut() = v;
+                let (cls, _) = self.member_class_of(class)?;
+                let pname = self.prop_name(name)?;
+                if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pname) {
+                    let v2 = self.prop_typed_write_check(&pd, &dcls, v)?;
+                    *c.borrow_mut() = v2;
+                } else {
+                    *c.borrow_mut() = v;
+                }
                 Ok(())
             }
             Expr::List(items) => {
@@ -5404,10 +5437,16 @@ impl<'a> Interp<'a> {
                 let cls = o.borrow().class.clone();
                 if let Some(k) = k {
                     let mut ob = o.borrow_mut();
-                    if !ob.prop_order.contains(&k) {
-                        ob.prop_order.push(k.clone());
+                    // Write into the existing slot — a `&`-bound
+                    // reference must see the update (typed_properties_010).
+                    if let Some(existing) = ob.props.get(&k) {
+                        *existing.borrow_mut() = v;
+                    } else {
+                        if !ob.prop_order.contains(&k) {
+                            ob.prop_order.push(k.clone());
+                        }
+                        ob.props.insert(k, cell(v));
                     }
-                    ob.props.insert(k, cell(v));
                     Ok(())
                 } else if cls.find_method("__set").is_some() {
                     self.method_invoke(
@@ -6068,6 +6107,46 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// A write reaching a cell that backs a declared-typed prop must
+    /// satisfy the declared type — Zend reports it as a write "to
+    /// reference held by property" (typed_properties_033/045).
+    fn typed_slot_store(&mut self, c: &Cell, v: Value) -> Result<Value, PhpError> {
+        let Some((_, tys, cn, pn)) = self
+            .typed_slots
+            .get(&(Rc::as_ptr(c) as usize))
+            .map(|(cc, t, n, p)| (cc.clone(), t.clone(), n.clone(), p.clone()))
+        else {
+            return Ok(v);
+        };
+        if self.ty_exact(&tys, &v) {
+            if tys.iter().any(|t| t.eq_ignore_ascii_case("float")) {
+                if let Value::Int(i) = v {
+                    return Ok(Value::Float(i as f64));
+                }
+            }
+            return Ok(v);
+        }
+        if !self.exec_file_strict() {
+            if let Some(cv) = weak_ty_coerce(&tys, &v) {
+                self.deprecate_lossy_int(&tys, &v, &cv);
+                return Ok(cv);
+            }
+        }
+        let mut e = PhpError::uncaught(
+            "TypeError",
+            format!(
+                "Cannot assign {} to reference held by property {}::${} of type {}",
+                self.zval_type_name(&v),
+                cn,
+                pn,
+                ty_disp(&tys)
+            ),
+            0,
+        );
+        e.thrown_line = Some(self.cur_line);
+        self.fail(e)
+    }
+
     fn incdec(&mut self, target: &Expr, delta: i64, post: bool) -> Result<Value, PhpError> {
         // PHP warns on undefined vars/props/keys during ++/-- (bug25547).
         let old = match target {
@@ -6089,6 +6168,64 @@ impl<'a> Interp<'a> {
                 ))
             }
         };
+        // Typed `int` prop can't overflow to float — a dedicated Error
+        // instead of the generic assign TypeError (typed_properties_019).
+        if matches!(old, Value::Int(i) if i.checked_add(delta).is_none()) {
+            // Through a bound reference the wording differs: "a
+            // reference held by property" (typed_properties_044).
+            if let Expr::Var(vn) = target {
+                if let Some(c) = self.var_cell_opt(vn) {
+                    if let Some((_, tys, cn, pn)) = self
+                        .typed_slots
+                        .get(&(Rc::as_ptr(&c) as usize))
+                        .map(|(cc, t, n, p)| (cc.clone(), t.clone(), n.clone(), p.clone()))
+                    {
+                        if tys.iter().any(|m| m.eq_ignore_ascii_case("int"))
+                            && !tys.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                        {
+                            let dir = if delta > 0 { "increment" } else { "decrement" };
+                            let bound = if delta > 0 { "maximal" } else { "minimal" };
+                            let mut e = PhpError::uncaught(
+                                "TypeError",
+                                format!(
+                                    "Cannot {} a reference held by property {}::${} of type {} past its {} value",
+                                    dir, cn, pn, ty_disp(&tys), bound
+                                ),
+                                0,
+                            );
+                            e.thrown_line = Some(self.cur_line);
+                            return self.fail(e);
+                        }
+                    }
+                }
+            }
+            if let Expr::Prop { obj, name, .. } = target {
+                if let Ok(pn) = self.prop_name(name) {
+                    if let Value::Object(o) = self.eval(obj)? {
+                        if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
+                            if let Some(tys) = &pd.ty {
+                                if tys.iter().any(|m| m.eq_ignore_ascii_case("int"))
+                                    && !tys.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                                {
+                                    let dir = if delta > 0 { "increment" } else { "decrement" };
+                                    let bound = if delta > 0 { "maximal" } else { "minimal" };
+                                    let mut e = PhpError::uncaught(
+                                        "TypeError",
+                                        format!(
+                                            "Cannot {} property {}::${} of type int past its {} value",
+                                            dir, dcls.name(), pn, bound
+                                        ),
+                                        0,
+                                    );
+                                    e.thrown_line = Some(self.cur_line);
+                                    return self.fail(e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let new = self.incdec_value(&old, delta)?;
         self.store(target, new.clone())?;
         Ok(if post { old } else { new })
@@ -6631,6 +6768,7 @@ impl<'a> Interp<'a> {
                         prop_order: order,
                         id: 0,
                         internal: None,
+                        unset_props: std::collections::HashSet::new(),
                     }))
                 }
             },
@@ -8191,6 +8329,25 @@ impl<'a> Interp<'a> {
         None
     }
 
+    /// Is the currently-executing code inside a `strict_types=1` file?
+    /// (prop writes, const writes, incdec — Zend uses the writer's file.)
+    fn exec_file_strict(&self) -> bool {
+        self.stack
+            .last()
+            .map(|f| self.strict_files.contains(&f.file))
+            .unwrap_or_else(|| self.strict_files.contains(&self.cur_file))
+    }
+
+    /// Strictness for argument checks is determined by the file holding
+    /// the call site — the frame just below the callee's own.
+    fn caller_file_strict(&self) -> bool {
+        if self.stack.len() < 2 {
+            return self.exec_file_strict();
+        }
+        self.strict_files
+            .contains(&self.stack[self.stack.len() - 2].file)
+    }
+
     /// PHP's "given" type word in TypeError messages.
     fn zval_type_name(&self, v: &Value) -> String {
         match v {
@@ -8282,6 +8439,11 @@ impl<'a> Interp<'a> {
             ) else {
                 continue;
             };
+            if p.by_ref {
+                // By-ref params bind cells, not values — the contained
+                // value isn't checked at the boundary (typed_properties_010).
+                continue;
+            }
             let v = a.borrow().clone();
             let implicit_null = !ty.iter().any(|m| m.eq_ignore_ascii_case("null"))
                 && match &p.default {
@@ -8290,10 +8452,22 @@ impl<'a> Interp<'a> {
                     _ => false,
                 };
             let ok = (implicit_null && matches!(v, Value::Null))
-                || ty.iter().any(|m| self.param_type_match(m, &v));
-            if ok {
+                || if self.caller_file_strict() {
+                    self.ty_exact(ty, &v)
+                } else {
+                    ty.iter().any(|m| self.param_type_match(m, &v))
+                };
+            let caller_strict = self.caller_file_strict();
+            if ok && !caller_strict {
                 if let Some(cv) = self.coerce_scalar(ty, &v) {
                     *a.borrow_mut() = cv;
+                }
+            }
+            // strict mode still allows the int->float widening stored
+            // back for visibility in the callee.
+            if ok && caller_strict && ty.iter().any(|m| m.eq_ignore_ascii_case("float")) {
+                if let Value::Int(i) = v {
+                    *a.borrow_mut() = Value::Float(i as f64);
                 }
             }
             if !ok {
@@ -8508,10 +8682,12 @@ impl<'a> Interp<'a> {
         match flow {
             Flow::Return(v) => {
                 if let Some(ty) = &decl.ret {
+                    let ret_strict = self.strict_files.contains(&decl.file);
                     let ok = ty
                         .iter()
-                        .any(|m| self.param_type_match(m, &v) || m.eq_ignore_ascii_case("void"));
-                    if ok {
+                        .any(|m| self.param_type_match(m, &v) || m.eq_ignore_ascii_case("void"))
+                        && (!ret_strict || self.ty_exact(ty, &v));
+                    if ok && !ret_strict {
                         match self.coerce_scalar(ty, &v) {
                             Some(cv) => Ok(cv),
                             None => Ok(v),
@@ -8842,6 +9018,7 @@ impl<'a> Interp<'a> {
             prop_order: Vec::new(),
             id: 0,
             internal: Some(ObjectInternal::Generator(state)),
+            unset_props: std::collections::HashSet::new(),
         })
     }
 
@@ -10514,7 +10691,11 @@ impl<'a> Interp<'a> {
                 }
             }
             for cp in &d.props {
-                let Some(ap) = pc.decl.props.iter().find(|x| x.name == cp.name) else {
+                let Some(ap) =
+                    pc.decl.props.iter().find(|x| {
+                        x.name == cp.name && x.visibility != crate::ast::Visibility::Private
+                    })
+                else {
                     continue;
                 };
                 if ap.is_final {
@@ -10541,6 +10722,17 @@ impl<'a> Interp<'a> {
                     v
                 };
                 if backed && norm(&cp.ty) != norm(&ap.ty) {
+                    // Child re-types an untyped parent prop → "must be
+                    // omitted"; typed-vs-typed mismatch → "must be T".
+                    if ap.ty.is_none() && cp.ty.is_some() {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Type of {}::${} must be omitted to match the parent definition in class {}",
+                                d.name, cp.name, pc.decl.name
+                            ),
+                            self.cur_line,
+                        ));
+                    }
                     let aty = ap
                         .ty
                         .as_ref()
@@ -10551,7 +10743,7 @@ impl<'a> Interp<'a> {
                             "Type of {}::${} must be {} (as in class {})",
                             d.name, cp.name, aty, pc.decl.name
                         ),
-                        cp.line,
+                        self.cur_line,
                     ));
                 }
                 if let (Some(chs), Some(ahs)) = (&cp.hooks, &ap.hooks) {
@@ -11014,8 +11206,58 @@ impl<'a> Interp<'a> {
         }
         for pd in &d.props {
             if let Some(ty) = &pd.ty {
+                for m in ty {
+                    let l = m.to_lowercase();
+                    if ["callable", "void", "never"].contains(&l.as_str()) {
+                        return Err(PhpError::fatal(
+                            format!("Property {}::${} cannot have type {}", d.name, pd.name, m),
+                            pd.line,
+                        ));
+                    }
+                }
                 let ctx = Some((d.name.as_str(), d.parent.clone()));
                 self.check_ty_redundant(ty, &ctx)?;
+                if let Some(def) = &pd.default {
+                    if is_compile_const(def) {
+                        if let Ok(v) = self.eval_decl_const(def, &d.file) {
+                            // `= null` on a non-nullable prop needs `?T`
+                            // (typed_properties_015).
+                            if matches!(v, Value::Null)
+                                && !ty.iter().any(|m| m.eq_ignore_ascii_case("null"))
+                            {
+                                let hint = if ty.len() == 1 {
+                                    format!("?{}", ty_disp(ty))
+                                } else {
+                                    format!("{}|null", ty_disp(ty))
+                                };
+                                return Err(PhpError::fatal(
+                                    format!(
+                                        "Default value for property of type {} may not be null. Use the nullable type {} to allow null default value",
+                                        ty_disp(ty),
+                                        hint
+                                    ),
+                                    pd.line,
+                                ));
+                            }
+                            // int→float is the only allowed widening.
+                            if !(self.const_ty_accepts(ty, &v, &d.name)
+                                || (matches!(v, Value::Int(_))
+                                    && ty.iter().any(|m| m.eq_ignore_ascii_case("float"))))
+                            {
+                                return Err(PhpError::fatal(
+                                    format!(
+                                        "Cannot use {} as default value for property {}::${} of type {}",
+                                        self.zval_type_name(&v),
+                                        d.name,
+                                        pd.name,
+                                        ty_disp(ty)
+                                    ),
+                                    pd.line,
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
         // Inheritance variance — parent classes and implemented
@@ -11631,6 +11873,7 @@ impl<'a> Interp<'a> {
                     prop_order: vec![],
                     id: 0,
                     internal: None,
+                    unset_props: std::collections::HashSet::new(),
                 }))))
             }
         };
@@ -11696,7 +11939,7 @@ impl<'a> Interp<'a> {
                     }
                     continue;
                 }
-                let default = match &p.default {
+                let mut default = match &p.default {
                     Some(d) => {
                         let old = self.const_self.replace(c.clone());
                         self.class_const_ctx += 1;
@@ -11707,6 +11950,16 @@ impl<'a> Interp<'a> {
                     }
                     None => Value::Null,
                 };
+                // Literal `= 2` on a `float` prop stores 2.0
+                // (typed_properties_016).
+                if p.ty
+                    .as_ref()
+                    .is_some_and(|t| t.iter().any(|m| m.eq_ignore_ascii_case("float")))
+                {
+                    if let Value::Int(i) = default {
+                        default = Value::Float(i as f64);
+                    }
+                }
                 // Private props live in a per-declaring-class slot
                 // ("\0Cls\0name"), so C::$e and E::$e are distinct.
                 let key = if is_priv {
@@ -11739,6 +11992,7 @@ impl<'a> Interp<'a> {
             prop_order,
             id: 0,
             internal,
+            unset_props: std::collections::HashSet::new(),
         })))
     }
 
@@ -12196,6 +12450,32 @@ impl<'a> Interp<'a> {
 
     /// The nearest PropDecl for `pn` along the chain, honoring the same
     /// private-scope rules as `hooked_prop` (hooked or plain).
+    /// Declared *static* prop lookup across the class chain
+    /// (`Foo::$i = v` write checks).
+    fn find_static_prop_decl(
+        &self,
+        cls: &Rc<PhpClass>,
+        pn: &str,
+    ) -> Option<(PropDecl, Rc<PhpClass>)> {
+        let mut cur = Some(cls.clone());
+        while let Some(c) = cur {
+            let priv_ok = std::rc::Rc::ptr_eq(&c, cls);
+            if let Some(pd) = c.decl.props.iter().find(|p| {
+                p.name == pn
+                    && p.is_static
+                    && (priv_ok || p.visibility != crate::ast::Visibility::Private)
+            }) {
+                return Some((pd.clone(), c.clone()));
+            }
+            cur = c
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        None
+    }
+
     fn decl_prop(&self, o: &Rc<RefCell<PhpObject>>, pn: &str) -> Option<(PropDecl, Rc<PhpClass>)> {
         if let Some(x) = self.scope_private_prop(o, pn) {
             return Some(x);
@@ -12676,6 +12956,34 @@ impl<'a> Interp<'a> {
         v: Value,
     ) -> Result<Value, PhpError> {
         let Some(tys) = &p.ty else { return Ok(v) };
+        // self/parent/static in a prop type resolve against the
+        // DECLARING class (typed_properties_043); keep the literal
+        // members for error display.
+        let resolved: Vec<String> = tys
+            .iter()
+            .map(|m| {
+                let l = m.to_lowercase();
+                match l.as_str() {
+                    "self" | "static" => dcls.name().to_string(),
+                    "parent" => dcls.decl.parent.clone().unwrap_or_else(|| m.clone()),
+                    _ => m.clone(),
+                }
+            })
+            .collect();
+        // Object with __toString coerces into a `string` prop weakly
+        // (typed_properties_051).
+        if let Value::Object(o) = &v {
+            if tys.iter().any(|t| t.eq_ignore_ascii_case("string")) {
+                let tostr = o.borrow().class.find_method("__tostring").is_some()
+                    || o.borrow().class.find_method("__toString").is_some();
+                if tostr {
+                    let sv =
+                        self.method_invoke(o.clone(), "__toString", CallArgs::positional(vec![]))?;
+                    return Ok(sv);
+                }
+            }
+        }
+        let tys = &resolved;
         if self.ty_exact(tys, &v) {
             return Ok(v);
         }
@@ -12709,12 +13017,49 @@ impl<'a> Interp<'a> {
         v: Value,
     ) -> Result<Value, PhpError> {
         let Some(tys) = &p.ty else { return Ok(v) };
+        // self/parent/static in a prop type resolve against the
+        // DECLARING class (typed_properties_043); keep the literal
+        // members for error display.
+        let resolved: Vec<String> = tys
+            .iter()
+            .map(|m| {
+                let l = m.to_lowercase();
+                match l.as_str() {
+                    "self" | "static" => dcls.name().to_string(),
+                    "parent" => dcls.decl.parent.clone().unwrap_or_else(|| m.clone()),
+                    _ => m.clone(),
+                }
+            })
+            .collect();
+        // Object with __toString coerces into a `string` prop weakly
+        // (typed_properties_051).
+        if let Value::Object(o) = &v {
+            if tys.iter().any(|t| t.eq_ignore_ascii_case("string")) {
+                let tostr = o.borrow().class.find_method("__tostring").is_some()
+                    || o.borrow().class.find_method("__toString").is_some();
+                if tostr {
+                    let sv =
+                        self.method_invoke(o.clone(), "__toString", CallArgs::positional(vec![]))?;
+                    return Ok(sv);
+                }
+            }
+        }
+        let tys = &resolved;
         if self.ty_exact(tys, &v) {
+            // int stored into a `float` prop widens to a float even in
+            // strict mode (typed_properties_031).
+            if tys.iter().any(|t| t.eq_ignore_ascii_case("float")) {
+                if let Value::Int(i) = v {
+                    return Ok(Value::Float(i as f64));
+                }
+            }
             return Ok(v);
         }
-        if let Some(c) = weak_ty_coerce(tys, &v) {
-            self.deprecate_lossy_int(tys, &v, &c);
-            return Ok(c);
+        if !self.exec_file_strict() {
+            if let Some(c) = weak_ty_coerce(tys, &v) {
+                self.deprecate_lossy_int(tys, &v, &c);
+                return Ok(c);
+            }
         }
         let mut e = PhpError::uncaught(
             "TypeError",
@@ -12723,7 +13068,7 @@ impl<'a> Interp<'a> {
                 self.zval_type_name(&v),
                 dcls.name(),
                 p.name,
-                tys.join("|")
+                ty_disp(p.ty.as_deref().unwrap_or(&[]))
             ),
             0,
         );
@@ -13910,26 +14255,66 @@ impl<'a> Interp<'a> {
                 }
                 // Typed prop whose slot was never initialized → Error
                 // (not __get, not a warning): parent_get_plain_typed_uninitialized.
-                if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
-                    if tpd.ty.is_some() && tpd.default.is_none() {
-                        return self.fail(PhpError::uncaught(
-                            "Error",
-                            format!(
-                                "Typed property {}::${} must not be accessed before initialization",
-                                tdcls.name(),
-                                pn
-                            ),
-                            0,
-                        ));
+                // One that was unset() routes to __get like an
+                // undefined property (typed_properties_009).
+                let was_unset = {
+                    let ob = o.borrow();
+                    ob.unset_props.contains(&pn)
+                        || ob
+                            .unset_props
+                            .iter()
+                            .any(|k| k.ends_with(&format!("\0{}", pn)))
+                };
+                if !was_unset {
+                    if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
+                        if tpd.ty.is_some() && tpd.default.is_none() {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Typed property {}::${} must not be accessed before initialization",
+                                    tdcls.name(),
+                                    pn
+                                ),
+                                0,
+                            ));
+                        }
                     }
                 }
                 // __get magic
                 if cls.find_method("__get").is_some() {
-                    return self.method_invoke(
+                    let rv = self.method_invoke(
                         o.clone(),
                         "__get",
-                        CallArgs::positional(vec![cell(Value::str(pn))]),
-                    );
+                        CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
+                    )?;
+                    // A __get result for an unset() declared-typed prop
+                    // must satisfy the declared type
+                    // (typed_properties_030).
+                    if was_unset {
+                        if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
+                            if let Some(tys) = &tpd.ty {
+                                let ok =
+                                    self.ty_exact(tys, &rv) || weak_ty_coerce(tys, &rv).is_some();
+                                if !ok {
+                                    let mut e = PhpError::uncaught(
+                                        "TypeError",
+                                        format!(
+                                            "Value of type {} returned from {}::__get() must be compatible with unset property {}::${} of type {}",
+                                            self.zval_type_name(&rv),
+                                            tdcls.name(),
+                                            tdcls.name(),
+                                            pn,
+                                            ty_disp(tys)
+                                        ),
+                                        0,
+                                    );
+                                    e.thrown_line = Some(self.cur_line);
+                                    return self.fail(e);
+                                }
+                            }
+                        }
+                    }
+                    return Ok(rv);
                 }
                 self.warn(&format!("Undefined property: {}::${}", cls.name(), pn))?;
                 Ok(Value::Null)
@@ -14019,15 +14404,24 @@ impl<'a> Interp<'a> {
                 if key.is_none() {
                     if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
                         if tpd.ty.is_some() && tpd.default.is_none() {
-                            return self.fail(PhpError::uncaught(
-                                "Error",
-                                format!(
-                                    "Typed property {}::${} must not be accessed before initialization",
-                                    tdcls.name(),
-                                    pn
-                                ),
-                                0,
-                            ));
+                            let nullable = tpd
+                                .ty
+                                .as_ref()
+                                .map(|t| t.iter().any(|m| m.eq_ignore_ascii_case("null")))
+                                .unwrap_or(false);
+                            if !nullable {
+                                return self.fail(PhpError::uncaught(
+                                    "Error",
+                                    format!(
+                                        "Cannot access uninitialized non-nullable property {}::${} by reference",
+                                        tdcls.name(),
+                                        pn
+                                    ),
+                                    0,
+                                ));
+                            }
+                            // Nullable uninit slots byref-init to null.
+                            o.borrow_mut().props.insert(pn.clone(), cell(Value::Null));
                         }
                     }
                 }
@@ -14039,7 +14433,22 @@ impl<'a> Interp<'a> {
                     }
                     ob.props.insert(key.clone(), cell(Value::Null));
                 }
-                Ok(ob.props.get(&key).unwrap().clone())
+                let slot = ob.props.get(&key).unwrap().clone();
+                drop(ob);
+                if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
+                    if let Some(tys) = &pd.ty {
+                        self.typed_slots.insert(
+                            Rc::as_ptr(&slot) as usize,
+                            (
+                                slot.clone(),
+                                tys.clone(),
+                                dcls.name().to_string(),
+                                pn.clone(),
+                            ),
+                        );
+                    }
+                }
+                Ok(slot)
             }
             _ => self.fail(PhpError::fatal(
                 format!("Attempt to assign property \"{}\" on non-object", pn),
@@ -14092,7 +14501,26 @@ impl<'a> Interp<'a> {
                 }
                 let cls = o.borrow().class.clone();
                 if let Some(k) = self.obj_prop_key(&o, &pn) {
-                    o.borrow_mut().props.remove(&k);
+                    let mut ob = o.borrow_mut();
+                    ob.props.remove(&k);
+                    ob.unset_props.insert(k);
+                } else if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
+                    // unset() on an uninitialized declared prop still
+                    // marks it unset — reads then route to __get
+                    // (typed_properties_009/040).
+                    let k = if pd.visibility == crate::ast::Visibility::Private {
+                        format!("\0{}\0{}", dcls.name(), pd.name)
+                    } else {
+                        pd.name.clone()
+                    };
+                    o.borrow_mut().unset_props.insert(k);
+                    if cls.find_method("__unset").is_some() {
+                        self.method_invoke(
+                            o.clone(),
+                            "__unset",
+                            CallArgs::positional(vec![cell(Value::str(pn))]),
+                        )?;
+                    }
                 } else if cls.find_method("__unset").is_some() {
                     self.method_invoke(
                         o.clone(),
@@ -14730,7 +15158,22 @@ impl<'a> Interp<'a> {
         self.statics_init(&cls);
         let found = cls.statics.borrow().get(name).cloned();
         match found {
-            Some(c) => Ok(c),
+            Some(c) => {
+                if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
+                    if let Some(tys) = &pd.ty {
+                        self.typed_slots.insert(
+                            Rc::as_ptr(&c) as usize,
+                            (
+                                c.clone(),
+                                tys.clone(),
+                                dcls.name().to_string(),
+                                name.to_string(),
+                            ),
+                        );
+                    }
+                }
+                Ok(c)
+            }
             None => self.fail(PhpError::uncaught(
                 "Error",
                 format!("Undefined static property {}::${}", cls.name(), name),
@@ -14763,7 +15206,7 @@ impl<'a> Interp<'a> {
             if !p.is_static {
                 continue;
             }
-            let default = match &p.default {
+            let mut default = match &p.default {
                 Some(d) => {
                     let old = self.const_self.replace(cls.clone());
                     self.class_const_ctx += 1;
@@ -14776,6 +15219,14 @@ impl<'a> Interp<'a> {
                 }
                 None => Value::Null,
             };
+            if p.ty
+                .as_ref()
+                .is_some_and(|t| t.iter().any(|m| m.eq_ignore_ascii_case("float")))
+            {
+                if let Value::Int(i) = default {
+                    default = Value::Float(i as f64);
+                }
+            }
             cls.statics
                 .borrow_mut()
                 .insert(p.name.clone(), cell(default));

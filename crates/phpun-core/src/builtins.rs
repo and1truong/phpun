@@ -6434,6 +6434,7 @@ fn json_value(it: &mut Interp, b: &[u8], pos: &mut usize, assoc: bool) -> Result
                         prop_order: Vec::new(),
                         id: 0,
                         internal: None,
+                        unset_props: std::collections::HashSet::new(),
                     }))
                 });
             }
@@ -6486,6 +6487,7 @@ fn json_value(it: &mut Interp, b: &[u8], pos: &mut usize, assoc: bool) -> Result
                     prop_order: order,
                     id: 0,
                     internal: None,
+                    unset_props: std::collections::HashSet::new(),
                 }))
             })
         }

@@ -812,7 +812,13 @@ pub struct PhpClass {
 
 impl PhpClass {
     pub fn name(&self) -> &str {
-        &self.decl.name
+        // Anonymous classes carry a `$LINE` uniquifier internally;
+        // Zend's public name is just `class@anonymous`.
+        if self.decl.name.starts_with("class@anonymous") {
+            "class@anonymous"
+        } else {
+            &self.decl.name
+        }
     }
 
     /// Method lookup walking the parent chain.
@@ -833,6 +839,9 @@ pub struct PhpObject {
     pub id: u64,
     /// Internal payload for builtin classes (e.g. Exception fields).
     pub internal: Option<ObjectInternal>,
+    /// Typed props that were `unset()` — reads route to `__get` like
+    /// undefined props instead of the uninitialized-typed Error.
+    pub unset_props: std::collections::HashSet<String>,
 }
 
 /// One recorded call for exception backtraces (getTrace()).
