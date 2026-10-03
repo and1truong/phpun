@@ -291,7 +291,7 @@ pub struct Interp<'a> {
     /// writes *through a reference* to a typed slot stay checked
     /// (typed_properties_045). The stored clone keeps the slot alive so
     /// the pointer key stays unique.
-    typed_slots: std::collections::HashMap<usize, (Cell, Vec<String>, String, String)>,
+    pub typed_slots: std::collections::HashMap<usize, (Cell, Vec<String>, String, String)>,
     /// Interfaces registered by the builtin-class table — their method
     /// signatures carry *tentative* return types: implementations may
     /// declare any return type (typed_properties_065).
@@ -3984,6 +3984,23 @@ impl<'a> Interp<'a> {
                             None => continue, // tombstoned by unset()
                         }
                     };
+                    // `&$val` binds the prop cell — register it so
+                    // writes stay type-gated (typed_properties_045).
+                    if matches!(val, ForeachTarget::ByRef(_) | ForeachTarget::Lvalue(_)) {
+                        if let Some((pd, dcls)) = self.decl_prop(&o, &dname) {
+                            if let Some(tys) = &pd.ty {
+                                self.typed_slots.insert(
+                                    Rc::as_ptr(&c) as usize,
+                                    (
+                                        c.clone(),
+                                        tys.clone(),
+                                        dcls.name().to_string(),
+                                        dname.clone(),
+                                    ),
+                                );
+                            }
+                        }
+                    }
                     if let Some(ForeachKey::Var(kn)) = key {
                         self.var_set(kn, Value::str(n.clone()));
                     }
@@ -4911,7 +4928,37 @@ impl<'a> Interp<'a> {
                     }
                     c
                 }
-                _ => self.eval_cell(value)?,
+                _ => {
+                    let c = self.eval_cell(value)?;
+                    // A `=&` source that is itself a typed-prop slot
+                    // carries that prop's declared type into the
+                    // conflict check (typed_properties_068/076).
+                    let decl = match value {
+                        Expr::Prop { obj, name, .. } => {
+                            let ov = self.eval(obj)?;
+                            match (&ov, self.prop_name(name)) {
+                                (Value::Object(o), Ok(pn)) => self
+                                    .decl_prop(o, &pn)
+                                    .map(|(pd, dc)| (pd.ty.clone(), dc.name().to_string(), pn)),
+                                _ => None,
+                            }
+                        }
+                        Expr::StaticProp { class, name } => {
+                            match (self.member_class_of(class), self.prop_name(name)) {
+                                (Ok((cls, _)), Ok(pn)) => self
+                                    .find_static_prop_decl(&cls, &pn)
+                                    .map(|(pd, dc)| (pd.ty.clone(), dc.name().to_string(), pn)),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((Some(tys), dcn, dpn)) = decl {
+                        self.typed_slots
+                            .insert(Rc::as_ptr(&c) as usize, (c.clone(), tys, dcn, dpn));
+                    }
+                    c
+                }
             };
             self.bind_cell(target, src.clone())?;
             return Ok(src.borrow().clone());
@@ -5093,10 +5140,10 @@ impl<'a> Interp<'a> {
                     Some(n) => self.prop_name(&n)?,
                     None => self.conv_str(&newv)?,
                 };
-                self.store_prop(ov, &pn, newv.clone())?;
+                newv = self.store_prop(ov, &pn, newv.clone())?;
             }
             Late::PropStr { ov, pn } => {
-                self.store_prop(ov, &pn, newv.clone())?;
+                newv = self.store_prop(ov, &pn, newv.clone())?;
             }
             Late::Index { base, key, append } => {
                 // A clobbered (call-result) dim falls back to the RHS
@@ -5121,20 +5168,22 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(newv);
                 }
-                let mut b = base.borrow_mut();
-                if matches!(*b, Value::Null) {
-                    *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
-                }
-                if let Value::Array(rc) = &mut *b {
-                    let mut arr = rc.borrow_mut();
-                    if append {
-                        arr.push(newv.clone());
-                    } else {
-                        let key = key.map(|k| to_key(&k)).unwrap_or(to_key(&newv));
-                        arr.set(key, newv.clone());
+                {
+                    let nv = self.typed_slot_store(&base, newv.clone())?;
+                    let mut b = base.borrow_mut();
+                    if matches!(*b, Value::Null) {
+                        *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+                    }
+                    if let Value::Array(rc) = &mut *b {
+                        let mut arr = rc.borrow_mut();
+                        if append {
+                            arr.push(nv.clone());
+                        } else {
+                            let key = key.map(|k| to_key(&k)).unwrap_or(to_key(&nv));
+                            arr.set(key, nv.clone());
+                        }
                     }
                 }
-                drop(b);
             }
             Late::Static { class, pn } => {
                 let c = self.static_prop_named(&class, &pn)?;
@@ -5145,7 +5194,8 @@ impl<'a> Interp<'a> {
                         newv = self.prop_typed_write_check(&pd, &dcls, newv)?;
                     }
                 }
-                *c.borrow_mut() = newv.clone();
+                let nv = self.typed_slot_store(&c, newv.clone())?;
+                *c.borrow_mut() = nv;
             }
             Late::Keyed { e, keys } => {
                 newv = self.assign_index_path(&e, &keys, newv)?;
@@ -5288,17 +5338,56 @@ impl<'a> Interp<'a> {
                         if let Value::Array(rc) = &*src.borrow() {
                             rc.borrow_mut().is_ref = true;
                         }
+                        // Binding a ref into a TYPED prop validates the
+                        // source (076/068 conflict); the shared cell
+                        // then stays gated through typed_slots (071).
+                        let mut merged: Option<Vec<String>> = None;
+                        if let Some((pd, dcls)) = self.decl_prop(o, &pn) {
+                            if pd.ty.is_some() {
+                                merged = Some(self.bind_typed_check(&pd, &dcls, &src)?);
+                            }
+                        }
                         let key = self.obj_prop_key(o, &pn).unwrap_or_else(|| pn.clone());
                         let mut ob = o.borrow_mut();
                         if !ob.prop_order.contains(&key) {
                             ob.prop_order.push(key.clone());
                         }
-                        ob.props.insert(key, src);
+                        ob.props.insert(key, src.clone());
+                        drop(ob);
+                        if let (Some(m), Some((_, dcls))) = (merged, self.decl_prop(o, &pn)) {
+                            self.typed_slots.insert(
+                                Rc::as_ptr(&src) as usize,
+                                (src, m, dcls.name().to_string(), pn.clone()),
+                            );
+                        }
                         return Ok(());
                     }
                 }
                 let c = self.eval_cell(target)?;
                 *c.borrow_mut() = src.borrow().clone();
+                Ok(())
+            }
+            Expr::StaticProp { class, name } => {
+                let pn = self.prop_name(name)?;
+                let (cls, _t) = self.member_class_of(class)?;
+                self.statics_init(&cls);
+                let mut merged: Option<Vec<String>> = None;
+                if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pn) {
+                    if pd.ty.is_some() {
+                        // Binding a ref to a typed static validates the
+                        // source (catchable TypeError — 068/069); the
+                        // cell then stays gated via typed_slots.
+                        merged = Some(self.bind_typed_check(&pd, &dcls, &src)?);
+                    }
+                }
+                cls.statics.borrow_mut().insert(pn.clone(), src.clone());
+                if let (Some(m), Some((_, dcls))) = (merged, self.find_static_prop_decl(&cls, &pn))
+                {
+                    self.typed_slots.insert(
+                        Rc::as_ptr(&src) as usize,
+                        (src.clone(), m, dcls.name().to_string(), pn),
+                    );
+                }
                 Ok(())
             }
             Expr::VarVar(..) => {
@@ -5331,11 +5420,16 @@ impl<'a> Interp<'a> {
                 let c = self.static_prop_cell(class, name)?;
                 let (cls, _) = self.member_class_of(class)?;
                 let pname = self.prop_name(name)?;
+                // The stored cell may be a `=&`-bound cell shared with a
+                // DIFFERENT typed prop — typed_slots gates that write
+                // (typed_properties_107).
                 if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pname) {
                     let v2 = self.prop_typed_write_check(&pd, &dcls, v)?;
-                    *c.borrow_mut() = v2;
+                    let nv = self.typed_slot_store(&c, v2)?;
+                    *c.borrow_mut() = nv;
                 } else {
-                    *c.borrow_mut() = v;
+                    let nv = self.typed_slot_store(&c, v)?;
+                    *c.borrow_mut() = nv;
                 }
                 Ok(())
             }
@@ -5379,19 +5473,24 @@ impl<'a> Interp<'a> {
             } => {
                 let pn = self.prop_name(name)?;
                 let ov = self.eval(obj)?;
-                self.store_prop(ov, &pn, v)
+                self.store_prop(ov, &pn, v).map(|_| ())
             }
             _ => self.fail(PhpError::fatal("Cannot assign to this expression", 0)),
         }
     }
 
     /// Write `$ov->$pn = v` — private-slot, `__set` or dynamic-prop rules.
-    fn store_prop(&mut self, ov: Value, pn: &str, mut v: Value) -> Result<(), PhpError> {
+    /// Write `$ov->$pn = v`; returns the STORED value (typed props
+    /// coerce — the assign expr yields the coerced result, 077).
+    fn store_prop(&mut self, ov: Value, pn: &str, mut v: Value) -> Result<Value, PhpError> {
         match ov {
             Value::Object(o) => {
                 if !self.in_own_hook(&o, pn) {
                     if let Some((pd, hs)) = self.hooked_prop(&o, pn) {
-                        return self.hook_write(&o, &pd, &hs, v);
+                        {
+                            self.hook_write(&o, &pd, &hs, v.clone())?;
+                            return Ok(v);
+                        }
                     }
                     if let Some((pd, dcls)) = self.decl_prop(&o, pn) {
                         if let Some(sv) = pd.set_vis {
@@ -5462,21 +5561,25 @@ impl<'a> Interp<'a> {
                         // prop via `=&` — that prop's type still gates
                         // the write (typed_properties_062).
                         let nv = self.typed_slot_store(&existing, v)?;
-                        *existing.borrow_mut() = nv;
+                        *existing.borrow_mut() = nv.clone();
+                        v = nv;
                     } else {
                         if !ob.prop_order.contains(&k) {
                             ob.prop_order.push(k.clone());
                         }
-                        ob.props.insert(k, cell(v));
+                        ob.props.insert(k, cell(v.clone()));
                     }
-                    Ok(())
+                    Ok(v)
                 } else if cls.find_method("__set").is_some() {
                     self.method_invoke(
                         o.clone(),
                         "__set",
-                        CallArgs::positional(vec![cell(Value::str(pn.to_string())), cell(v)]),
+                        CallArgs::positional(vec![
+                            cell(Value::str(pn.to_string())),
+                            cell(v.clone()),
+                        ]),
                     )?;
-                    Ok(())
+                    Ok(v)
                 } else {
                     // E_DEPRECATED on first write to an undeclared prop
                     // (PHP 8.2+; stdClass is exempt).
@@ -5507,8 +5610,8 @@ impl<'a> Interp<'a> {
                     if !ob.prop_order.contains(&pn) {
                         ob.prop_order.push(pn.clone());
                     }
-                    ob.props.insert(pn, cell(v));
-                    Ok(())
+                    ob.props.insert(pn, cell(v.clone()));
+                    Ok(v)
                 }
             }
             _ => {
@@ -5517,7 +5620,7 @@ impl<'a> Interp<'a> {
                     pn,
                     ov.gettype()
                 ))?;
-                Ok(())
+                Ok(Value::Null)
             }
         }
     }
@@ -5583,7 +5686,10 @@ impl<'a> Interp<'a> {
             match self.index_into_key(c.clone(), k.clone()) {
                 Ok(nc) => {
                     if n == last {
-                        *nc.borrow_mut() = v.clone();
+                        // `$ref[k] = v` where the element cell is bound to
+                        // a typed prop stays type-gated (064).
+                        let nv = self.typed_slot_store(&nc, v.clone())?;
+                        *nc.borrow_mut() = nv;
                         return Ok(v);
                     }
                     c = nc;
@@ -6149,6 +6255,22 @@ impl<'a> Interp<'a> {
             return Ok(v);
         }
         if !self.exec_file_strict() {
+            // Object with __toString coerces into a `string` slot (107).
+            if let Value::Object(o) = &v {
+                if tys.iter().any(|t| t.eq_ignore_ascii_case("string"))
+                    && (self
+                        .find_method_in(&o.borrow().class, "__tostring")
+                        .is_some()
+                        || self
+                            .find_method_in(&o.borrow().class, "__toString")
+                            .is_some())
+                {
+                    let sv =
+                        self.method_invoke(o.clone(), "__toString", CallArgs::positional(vec![]))?;
+                    let svs = self.conv_str(&sv)?;
+                    return Ok(Value::str(svs));
+                }
+            }
             if let Some(cv) = weak_ty_coerce(&tys, &v) {
                 self.deprecate_lossy_int(&tys, &v, &cv);
                 return Ok(cv);
@@ -6192,59 +6314,45 @@ impl<'a> Interp<'a> {
         };
         // Typed `int` prop can't overflow to float — a dedicated Error
         // instead of the generic assign TypeError (typed_properties_019).
+        // The target's storage cell carries the owning prop's type —
+        // "property" when the target IS that prop, "a reference held
+        // by property" when reached through an alias/bound ref.
         if matches!(old, Value::Int(i) if i.checked_add(delta).is_none()) {
-            // Through a bound reference the wording differs: "a
-            // reference held by property" (typed_properties_044).
-            if let Expr::Var(vn) = target {
-                if let Some(c) = self.var_cell_opt(vn) {
-                    if let Some((_, tys, cn, pn)) = self
-                        .typed_slots
-                        .get(&(Rc::as_ptr(&c) as usize))
-                        .map(|(cc, t, n, p)| (cc.clone(), t.clone(), n.clone(), p.clone()))
-                    {
-                        if tys.iter().any(|m| m.eq_ignore_ascii_case("int"))
-                            && !tys.iter().any(|m| m.eq_ignore_ascii_case("float"))
-                        {
-                            let dir = if delta > 0 { "increment" } else { "decrement" };
-                            let bound = if delta > 0 { "maximal" } else { "minimal" };
-                            let mut e = PhpError::uncaught(
-                                "TypeError",
-                                format!(
-                                    "Cannot {} a reference held by property {}::${} of type {} past its {} value",
-                                    dir, cn, pn, ty_disp(&tys), bound
-                                ),
-                                0,
-                            );
-                            e.thrown_line = Some(self.cur_line);
-                            return self.fail(e);
+            let ent = self.eval_cell(target).ok().and_then(|c| {
+                self.typed_slots
+                    .get(&(Rc::as_ptr(&c) as usize))
+                    .map(|(cc, t, n, p)| (cc.clone(), t.clone(), n.clone(), p.clone()))
+            });
+            if let Some((_, tys, cn, cpn)) = ent {
+                if tys.iter().any(|m| m.eq_ignore_ascii_case("int"))
+                    && !tys.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                {
+                    let dir = if delta > 0 { "increment" } else { "decrement" };
+                    let bound = if delta > 0 { "maximal" } else { "minimal" };
+                    let own = match target {
+                        Expr::Prop { name, .. } | Expr::StaticProp { name, .. } => {
+                            self.prop_name(name).map(|pn| pn == cpn).unwrap_or(false)
                         }
-                    }
-                }
-            }
-            if let Expr::Prop { obj, name, .. } = target {
-                if let Ok(pn) = self.prop_name(name) {
-                    if let Value::Object(o) = self.eval(obj)? {
-                        if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
-                            if let Some(tys) = &pd.ty {
-                                if tys.iter().any(|m| m.eq_ignore_ascii_case("int"))
-                                    && !tys.iter().any(|m| m.eq_ignore_ascii_case("float"))
-                                {
-                                    let dir = if delta > 0 { "increment" } else { "decrement" };
-                                    let bound = if delta > 0 { "maximal" } else { "minimal" };
-                                    let mut e = PhpError::uncaught(
-                                        "TypeError",
-                                        format!(
-                                            "Cannot {} property {}::${} of type int past its {} value",
-                                            dir, dcls.name(), pn, bound
-                                        ),
-                                        0,
-                                    );
-                                    e.thrown_line = Some(self.cur_line);
-                                    return self.fail(e);
-                                }
-                            }
-                        }
-                    }
+                        _ => false,
+                    };
+                    let msg = if own {
+                        format!(
+                            "Cannot {} property {}::${} of type int past its {} value",
+                            dir, cn, cpn, bound
+                        )
+                    } else {
+                        format!(
+                            "Cannot {} a reference held by property {}::${} of type {} past its {} value",
+                            dir,
+                            cn,
+                            cpn,
+                            ty_disp(&tys),
+                            bound
+                        )
+                    };
+                    let mut e = PhpError::uncaught("TypeError", msg, 0);
+                    e.thrown_line = Some(self.cur_line);
+                    return self.fail(e);
                 }
             }
         }
@@ -8817,7 +8925,7 @@ impl<'a> Interp<'a> {
             for (obj, pname, v) in promoted_writes {
                 // Promoted assignment goes through prop write semantics —
                 // hooked promoted props run their set hook (gh15438_1).
-                self.store_prop(Value::Object(obj), &pname, v)?;
+                let _ = self.store_prop(Value::Object(obj), &pname, v)?;
             }
         }
         let flow = self.exec_block(&decl.body);
@@ -13116,17 +13224,7 @@ impl<'a> Interp<'a> {
         // self/parent/static in a prop type resolve against the
         // DECLARING class (typed_properties_043); keep the literal
         // members for error display.
-        let resolved: Vec<String> = tys
-            .iter()
-            .map(|m| {
-                let l = m.to_lowercase();
-                match l.as_str() {
-                    "self" | "static" => dcls.name().to_string(),
-                    "parent" => dcls.decl.parent.clone().unwrap_or_else(|| m.clone()),
-                    _ => m.clone(),
-                }
-            })
-            .collect();
+        let resolved = self.resolved_ty(tys, dcls.as_ref());
         // Object with __toString coerces into a `string` prop weakly
         // (typed_properties_051).
         if let Value::Object(o) = &v {
@@ -13164,6 +13262,161 @@ impl<'a> Interp<'a> {
         ))
     }
 
+    /// Resolve `self`/`parent`/`static` members of a declared type to
+    /// concrete class names for the declaring class.
+    fn resolved_ty(&self, tys: &[String], dcls: &PhpClass) -> Vec<String> {
+        tys.iter()
+            .map(|m| {
+                let l = m.to_lowercase();
+                match l.as_str() {
+                    "self" | "static" => dcls.name().to_string(),
+                    "parent" => dcls
+                        .decl
+                        .parent
+                        .clone()
+                        .unwrap_or_else(|| "\\0parent".to_string()),
+                    _ => m.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Intersect two single type members for `=&` slot-compat: same
+    /// name → itself; class types narrow by hierarchy; `object` accepts
+    /// any class; `iterable` accepts array/Traversable. Disjoint atoms
+    /// (`int` ∩ `float`) return None (typed_properties_076).
+    fn ty_member_intersect(&mut self, a: &str, b: &str) -> Option<String> {
+        let al = a.to_lowercase();
+        let bl = b.to_lowercase();
+        if al == bl {
+            return Some(a.to_string());
+        }
+        if al == "mixed" {
+            return Some(b.to_string());
+        }
+        if bl == "mixed" {
+            return Some(a.to_string());
+        }
+        if al.contains('&') || bl.contains('&') {
+            return None;
+        }
+        const ATOMS: &[&str] = &[
+            "int", "float", "string", "bool", "array", "null", "false", "true", "void", "never",
+            "resource", "callable", "iterable", "object",
+        ];
+        let a_atom = ATOMS.contains(&al.as_str());
+        let b_atom = ATOMS.contains(&bl.as_str());
+        if !a_atom && !b_atom {
+            // Both class-like: compatible when one is a subtype of the
+            // other — the narrower type wins (A&B refs, 076).
+            return if self.ty_member_is_a(&al, &bl) {
+                Some(a.to_string())
+            } else if self.ty_member_is_a(&bl, &al) {
+                Some(b.to_string())
+            } else {
+                None
+            };
+        }
+        if a_atom && b_atom {
+            return match (al.as_str(), bl.as_str()) {
+                ("iterable", "array") | ("array", "iterable") => Some("array".to_string()),
+                ("iterable", "object") | ("object", "iterable") => Some("Traversable".to_string()),
+                _ => None,
+            };
+        }
+        // Exactly one side is a class-like name.
+        let (cls, atom) = if a_atom { (b, a) } else { (a, b) };
+        let cl = cls.to_lowercase();
+        match atom.to_lowercase().as_str() {
+            "object" => Some(cls.to_string()),
+            "iterable" => {
+                if self.ty_member_is_a(&cl, "Traversable") || self.ty_member_is_a(&cl, "iterable") {
+                    Some(cls.to_string())
+                } else {
+                    None
+                }
+            }
+            "callable" => {
+                if self.ty_member_is_a(&cl, "Closure") {
+                    Some(cls.to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Non-empty member-wise type intersection of two declared types —
+    /// returns the intersected member list, or None when disjoint
+    /// (typed_properties_068/076 `=&` conflict check).
+    fn ty_bind_merge(&mut self, a: &[String], b: &[String]) -> Option<Vec<String>> {
+        let mut inter: Vec<String> = Vec::new();
+        for am in a {
+            for bm in b {
+                if let Some(m) = self.ty_member_intersect(am, bm) {
+                    if !inter.iter().any(|x| x.eq_ignore_ascii_case(&m)) {
+                        inter.push(m);
+                    }
+                }
+            }
+        }
+        if inter.is_empty() {
+            None
+        } else {
+            Some(inter)
+        }
+    }
+
+    /// Binding `src` into a typed prop (`$p =& $src`): when src is
+    /// another typed prop's slot, the two declared types must
+    /// intersect ("Reference ... not compatible", 068/076); the
+    /// current value is weak-checked like a normal write ("Cannot
+    /// assign X to property"). Returns the merged member list.
+    fn bind_typed_check(
+        &mut self,
+        pd: &PropDecl,
+        dcls: &Rc<PhpClass>,
+        src: &Cell,
+    ) -> Result<Vec<String>, PhpError> {
+        let tys = pd.ty.clone().unwrap_or_default();
+        let mut merged = tys.clone();
+        if let Some((_, otys, ocn, opn)) = self
+            .typed_slots
+            .get(&(Rc::as_ptr(src) as usize))
+            .map(|(c, t, n, p)| (c.clone(), t.clone(), n.clone(), p.clone()))
+        {
+            let ta = self.resolved_ty(&otys, dcls.as_ref());
+            let tb = self.resolved_ty(&tys, dcls.as_ref());
+            match self.ty_bind_merge(&ta, &tb) {
+                Some(m) => merged = m,
+                None => {
+                    let sv = src.borrow().clone();
+                    let mut e = PhpError::uncaught(
+                        "TypeError",
+                        format!(
+                            "Reference with value of type {} held by property {}::${} of type {} is not compatible with property {}::${} of type {}",
+                            self.zval_type_name(&sv),
+                            ocn,
+                            opn,
+                            ty_disp(&otys),
+                            dcls.name(),
+                            pd.name,
+                            ty_disp(&tys)
+                        ),
+                        0,
+                    );
+                    e.thrown_line = Some(self.cur_line);
+                    return self.fail(e);
+                }
+            }
+        }
+        let v = src.borrow().clone();
+        let nv = self.prop_typed_write_check(pd, dcls, v)?;
+        *src.borrow_mut() = nv;
+        Ok(merged)
+    }
+
     /// Typed-property write check (plain and backing writes): the
     /// assigned value is coerced in weak mode, else a catchable
     /// `Cannot assign T to property C::$p of type U` TypeError.
@@ -13177,17 +13430,7 @@ impl<'a> Interp<'a> {
         // self/parent/static in a prop type resolve against the
         // DECLARING class (typed_properties_043); keep the literal
         // members for error display.
-        let resolved: Vec<String> = tys
-            .iter()
-            .map(|m| {
-                let l = m.to_lowercase();
-                match l.as_str() {
-                    "self" | "static" => dcls.name().to_string(),
-                    "parent" => dcls.decl.parent.clone().unwrap_or_else(|| m.clone()),
-                    _ => m.clone(),
-                }
-            })
-            .collect();
+        let resolved = self.resolved_ty(tys, dcls.as_ref());
         // Object with __toString coerces into a `string` prop weakly
         // (typed_properties_051).
         if let Value::Object(o) = &v {
@@ -14454,6 +14697,11 @@ impl<'a> Interp<'a> {
                     if was_unset {
                         if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
                             if let Some(tys) = &tpd.ty {
+                                if !self.ty_exact(tys, &rv) {
+                                    if let Some(cv) = weak_ty_coerce(tys, &rv) {
+                                        return Ok(cv);
+                                    }
+                                }
                                 let ok =
                                     self.ty_exact(tys, &rv) || weak_ty_coerce(tys, &rv).is_some();
                                 if !ok {
@@ -14571,6 +14819,48 @@ impl<'a> Interp<'a> {
                                 .map(|t| t.iter().any(|m| m.eq_ignore_ascii_case("null")))
                                 .unwrap_or(false);
                             if !nullable {
+                                // `=&` on an uninit typed prop routes to
+                                // `&__get` when it exists — the bound
+                                // ref sees __get's cell (073).
+                                let cls = o.borrow().class.clone();
+                                let get_by_ref = cls
+                                    .find_method("__get")
+                                    .map(|m| m.decl.by_ref)
+                                    .unwrap_or(false);
+                                if get_by_ref {
+                                    self.last_ret_cell = None;
+                                    let rv = self.method_invoke(
+                                        o.clone(),
+                                        "__get",
+                                        CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
+                                    )?;
+                                    let got = self.last_ret_cell.take().unwrap_or_else(|| cell(rv));
+                                    // Zend materializes the real prop
+                                    // slot from __get's value (typed →
+                                    // coerced): the bound ref decouples
+                                    // from __get's storage (073).
+                                    let tys = tpd.ty.clone().unwrap_or_default();
+                                    let cv = self.prop_typed_write_check(
+                                        &tpd,
+                                        &tdcls,
+                                        got.borrow().clone(),
+                                    )?;
+                                    let key =
+                                        self.obj_prop_key(&o, &pn).unwrap_or_else(|| pn.clone());
+                                    let slot = cell(cv);
+                                    {
+                                        let mut ob = o.borrow_mut();
+                                        if !ob.prop_order.contains(&key) {
+                                            ob.prop_order.push(key.clone());
+                                        }
+                                        ob.props.insert(key, slot.clone());
+                                    }
+                                    self.typed_slots.insert(
+                                        Rc::as_ptr(&slot) as usize,
+                                        (slot.clone(), tys, tdcls.name().to_string(), pn.clone()),
+                                    );
+                                    return Ok(slot);
+                                }
                                 return self.fail(PhpError::uncaught(
                                     "Error",
                                     format!(
@@ -14663,7 +14953,11 @@ impl<'a> Interp<'a> {
                 let cls = o.borrow().class.clone();
                 if let Some(k) = self.obj_prop_key(&o, &pn) {
                     let mut ob = o.borrow_mut();
-                    ob.props.remove(&k);
+                    if let Some(c) = ob.props.remove(&k) {
+                        // unset() severs the typed slot: refs bound to it
+                        // become plain variables again (typed_properties_090).
+                        self.typed_slots.remove(&(Rc::as_ptr(&c) as usize));
+                    }
                     ob.unset_props.insert(k);
                 } else if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
                     // unset() on an uninitialized declared prop still
@@ -15299,11 +15593,26 @@ impl<'a> Interp<'a> {
         let v = cls.statics.borrow().get(&name).map(|c| c.borrow().clone());
         match v {
             Some(v) => Ok(v),
-            None => self.fail(PhpError::uncaught(
-                "Error",
-                format!("Undefined static property {}::${}", cls.name(), name),
-                0,
-            )),
+            None => {
+                if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &name) {
+                    if pd.ty.is_some() {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Typed static property {}::${} must not be accessed before initialization",
+                                dcls.name(),
+                                name
+                            ),
+                            0,
+                        ));
+                    }
+                }
+                self.fail(PhpError::uncaught(
+                    "Error",
+                    format!("Undefined static property {}::${}", cls.name(), name),
+                    0,
+                ))
+            }
         }
     }
 
@@ -15339,11 +15648,31 @@ impl<'a> Interp<'a> {
                 }
                 Ok(c)
             }
-            None => self.fail(PhpError::uncaught(
-                "Error",
-                format!("Undefined static property {}::${}", cls.name(), name),
-                0,
-            )),
+            None => {
+                // Write/cell path materializes a declared static; an
+                // undeclared one is an Error.
+                if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
+                    let c = cell(Value::Null);
+                    cls.statics.borrow_mut().insert(name.to_string(), c.clone());
+                    if let Some(tys) = &pd.ty {
+                        self.typed_slots.insert(
+                            Rc::as_ptr(&c) as usize,
+                            (
+                                c.clone(),
+                                tys.clone(),
+                                dcls.name().to_string(),
+                                name.to_string(),
+                            ),
+                        );
+                    }
+                    return Ok(c);
+                }
+                self.fail(PhpError::uncaught(
+                    "Error",
+                    format!("Undefined static property {}::${}", cls.name(), name),
+                    0,
+                ))
+            }
         }
     }
 
@@ -15388,6 +15717,11 @@ impl<'a> Interp<'a> {
                 if let Ok(d) = self.prop_typed_write_check(p, cls, default.clone()) {
                     default = d;
                 }
+            }
+            // A typed static without a default stays *uninitialized*:
+            // reads raise the uninit Error until first assignment.
+            if p.ty.is_some() && p.default.is_none() {
+                continue;
             }
             cls.statics
                 .borrow_mut()
@@ -16798,7 +17132,15 @@ fn weak_ty_coerce(tys: &[String], v: &Value) -> Option<Value> {
                 };
                 base.map(Value::Int)
             }
-            ("int", Value::Float(f)) => Some(Value::Int(*f as i64)),
+            ("int", Value::Float(f)) => {
+                // Zend refuses out-of-range float->int coercions
+                // (NaN/Inf/|f| >= 2^63 → TypeError, no saturation).
+                if f.is_finite() && *f < 9.223372036854776e18 && *f >= -9.223372036854776e18 {
+                    Some(Value::Int(*f as i64))
+                } else {
+                    None
+                }
+            }
             ("int", Value::Bool(b)) => Some(Value::Int(*b as i64)),
             ("string", Value::Int(i)) => Some(Value::str(i.to_string())),
             ("string", Value::Float(f)) => Some(Value::str(format_float_repr(*f))),
@@ -16851,7 +17193,9 @@ fn ty_disp(ty: &[String]) -> String {
     } else {
         rest.join("|")
     };
-    if nullable && rest.len() == 1 {
+    if nullable && rest.is_empty() {
+        "null".to_string()
+    } else if nullable && rest.len() == 1 {
         format!("?{}", joined)
     } else if nullable {
         format!("{}|null", joined)

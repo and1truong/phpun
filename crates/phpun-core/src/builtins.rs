@@ -5007,7 +5007,16 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                     ArrKey::Str(s) => it.emit(&format!("{}  [\"{}\"]=>\n", pad, s)),
                     ArrKey::Tomb => continue,
                 }
-                var_dump(it, &c.borrow(), indent + 1, zval, Rc::strong_count(c) > 1);
+                var_dump(
+                    it,
+                    &c.borrow(),
+                    indent + 1,
+                    zval,
+                    // typed_slots pins a clone of bound cells — exclude it
+                    // from the &-marker count (typed_properties_038).
+                    Rc::strong_count(c)
+                        > 1 + it.typed_slots.contains_key(&(Rc::as_ptr(c) as usize)) as usize,
+                );
             }
             it.emit(&format!("{}}}\n", pad));
         }
@@ -5090,7 +5099,16 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                         crate::ast::Visibility::Public => format!("\"{}\"", disp),
                     };
                     it.emit(&format!("{}  [{}]=>\n", pad, key));
-                    var_dump(it, &c.borrow(), indent + 1, zval, Rc::strong_count(c) > 1);
+                    var_dump(
+                        it,
+                        &c.borrow(),
+                        indent + 1,
+                        zval,
+                        // typed_slots pins a clone of bound cells — exclude it
+                        // from the &-marker count (typed_properties_038).
+                        Rc::strong_count(c)
+                            > 1 + it.typed_slots.contains_key(&(Rc::as_ptr(c) as usize)) as usize,
+                    );
                 }
             }
             it.emit(&format!("{}}}\n", pad));
