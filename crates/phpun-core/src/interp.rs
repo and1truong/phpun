@@ -8245,10 +8245,21 @@ impl<'a> Interp<'a> {
                     let mut disp = Self::zpp_ty_disp(ty);
                     disp.retain(|m| !m.eq_ignore_ascii_case("null"));
                     let tn = disp.join("|");
-                    if disp
+                    // A literal default must satisfy a member EXACTLY —
+                    // the only widening is int -> float
+                    // (scalar_float_with_invalid_default).
+                    let lit_ok = disp
                         .iter()
-                        .any(|m| !builtins.contains(&m.to_lowercase().as_str()))
-                    {
+                        .all(|m| builtins.contains(&m.to_lowercase().as_str()))
+                        && match kind {
+                            "int" => disp.iter().any(|m| {
+                                m.eq_ignore_ascii_case("int") || m.eq_ignore_ascii_case("float")
+                            }),
+                            "float" => disp.iter().any(|m| m.eq_ignore_ascii_case("float")),
+                            "string" => disp.iter().any(|m| m.eq_ignore_ascii_case("string")),
+                            _ => disp.iter().any(|m| m.eq_ignore_ascii_case("bool")),
+                        };
+                    if !lit_ok {
                         self.cur_line = saved;
                         return Err(PhpError::fatal(
                             format!(
@@ -8529,18 +8540,30 @@ impl<'a> Interp<'a> {
             "true" => matches!(v, Value::Bool(true)),
             // Weak-mode scalar params accept what coercion can convert:
             // non-numeric strings are a TypeError, not silent (trait_type_errors).
-            "int" | "float" => match v {
-                Value::Int(_) | Value::Float(_) | Value::Bool(_) => true,
-                Value::Str(b) => matches!(
-                    numeric(b),
-                    Numeric::Int(_) | Numeric::Float(_) | Numeric::Leading(..)
-                ),
+            "int" => match v {
+                Value::Int(_) | Value::Bool(_) => true,
+                // Out-of-range/NaN floats can't coerce -> TypeError
+                // (scalar_return_basic_64bit).
+                Value::Float(f) => {
+                    f.is_finite() && *f < 9.223372036854776e18 && *f >= -9.223372036854776e18
+                }
+                // Only well-formed numeric strings pass — `"1a"` and
+                // `"0x1A"` are a TypeError in PHP 8 weak mode.
+                Value::Str(b) => matches!(numeric(b), Numeric::Int(_) | Numeric::Float(_)),
                 _ => false,
             },
-            "string" => matches!(
-                v,
-                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Object(_)
-            ),
+            "float" => match v {
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) => true,
+                Value::Str(b) => matches!(numeric(b), Numeric::Int(_) | Numeric::Float(_)),
+                _ => false,
+            },
+            "string" => match v {
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) => true,
+                // Objects coerce via __toString only — a stdClass is a
+                // TypeError, not "" (scalar_return_basic_64bit).
+                Value::Object(o) => o.borrow().class.find_method("__tostring").is_some(),
+                _ => false,
+            },
             "bool" => matches!(
                 v,
                 Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_)
@@ -8580,7 +8603,13 @@ impl<'a> Interp<'a> {
             match l.as_str() {
                 "int" => match v {
                     Value::Int(_) => return Some(v.clone()),
-                    Value::Float(f) => return Some(Value::Int(*f as i64)),
+                    Value::Float(f)
+                        if f.is_finite()
+                            && *f < 9.223372036854776e18
+                            && *f >= -9.223372036854776e18 =>
+                    {
+                        return Some(Value::Int(*f as i64));
+                    }
                     Value::Bool(b) => return Some(Value::Int(*b as i64)),
                     Value::Str(b) => match numeric(b) {
                         Numeric::Int(i) => return Some(Value::Int(i)),
@@ -8603,11 +8632,31 @@ impl<'a> Interp<'a> {
                     _ => {}
                 },
                 "string" => {
+                    if let Value::Float(f) = v {
+                        if f.is_nan() {
+                            let _ = self.emit_diag(
+                                "Warning",
+                                2,
+                                "unexpected NAN value was coerced to string",
+                            );
+                        }
+                    }
                     if let Ok(b) = self.conv_bytes(v) {
                         return Some(Value::Str(b.into()));
                     }
                 }
-                "bool" => return Some(Value::Bool(v.is_truthy())),
+                "bool" => {
+                    if let Value::Float(f) = v {
+                        if f.is_nan() {
+                            let _ = self.emit_diag(
+                                "Warning",
+                                2,
+                                "unexpected NAN value was coerced to bool",
+                            );
+                        }
+                    }
+                    return Some(Value::Bool(v.is_truthy()));
+                }
                 "null" if matches!(v, Value::Null) => return Some(Value::Null),
                 _ => {}
             }
@@ -8750,7 +8799,15 @@ impl<'a> Interp<'a> {
             self.stack.pop();
             return self.fail(PhpError::uncaught(
                 "ArgumentCountError",
-                format!("Too few arguments to function, {} passed", args.len()),
+                format!(
+                    "Too few arguments to function {}(), {} passed in {} on line {} and {} {} expected",
+                    self.decl_fname(decl),
+                    args.len(),
+                    self.diag_file(),
+                    self.cur_line,
+                    if required == decl.params.len() { "exactly" } else { "at least" },
+                    required
+                ),
                 0,
             ));
         }
@@ -8822,6 +8879,12 @@ impl<'a> Interp<'a> {
             let caller_strict = self.caller_file_strict();
             if ok && !caller_strict {
                 if let Some(cv) = self.coerce_scalar(ty, &v) {
+                    // Arg-coercion deprecations attribute to the
+                    // callee's declaration line (scalar_basic).
+                    let pl = self.cur_line;
+                    self.cur_line = decl.line;
+                    self.deprecate_lossy_int(ty, &v, &cv);
+                    self.cur_line = pl;
                     *a.borrow_mut() = cv;
                 }
             }
@@ -9011,6 +9074,47 @@ impl<'a> Interp<'a> {
                                 dv = Value::Float(*i as f64);
                             }
                         }
+                        // A non-literal default (const, expr) is checked
+                        // like a passed arg — `int $a = NULL_CONST`
+                        // TypeErrors when the default binds
+                        // (scalar_constant_defaults).
+                        let implicit_null = !ty.iter().any(|m| m.eq_ignore_ascii_case("null"))
+                            && match &p.default {
+                                Some(Expr::Null) => true,
+                                Some(Expr::Const(c)) => c.eq_ignore_ascii_case("null"),
+                                _ => false,
+                            };
+                        let ok = (implicit_null && matches!(dv, Value::Null))
+                            || ty.iter().any(|m| self.param_type_match(m, &dv));
+                        if !ok {
+                            self.stack.pop();
+                            let mut disp: Vec<String> = Self::zpp_ty_disp(ty);
+                            disp.retain(|m| !m.eq_ignore_ascii_case("null"));
+                            if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) || implicit_null {
+                                if disp.len() == 1 {
+                                    disp[0] = format!("?{}", disp[0]);
+                                } else {
+                                    disp.push("null".into());
+                                }
+                            }
+                            let fname = self.decl_fname(decl);
+                            let msg = format!(
+                                "{}(): Argument #{} (${}) must be of type {}, {} given, called in {} on line {}",
+                                fname,
+                                i + 1,
+                                p.name,
+                                disp.join("|"),
+                                self.zval_type_name(&dv),
+                                self.diag_file(),
+                                self.cur_line
+                            );
+                            return self.fail(PhpError::uncaught("TypeError", msg, self.cur_line));
+                        }
+                        if !self.caller_file_strict() {
+                            if let Some(cv) = self.coerce_scalar(ty, &dv) {
+                                dv = cv;
+                            }
+                        }
                     }
                     binds.push((p.name.clone(), cell(dv)));
                 } else {
@@ -9087,10 +9191,20 @@ impl<'a> Interp<'a> {
                         .iter()
                         .any(|m| self.param_type_match(m, &v) || m.eq_ignore_ascii_case("void"))
                         && (!ret_strict || self.ty_exact(ty, &v));
-                    if ok && !ret_strict {
-                        match self.coerce_scalar(ty, &v) {
-                            Some(cv) => Ok(cv),
-                            None => Ok(v),
+                    if ok {
+                        if !ret_strict {
+                            match self.coerce_scalar(ty, &v) {
+                                Some(cv) => {
+                                    let pl = self.cur_line;
+                                    self.cur_line = decl.line;
+                                    self.deprecate_lossy_int(ty, &v, &cv);
+                                    self.cur_line = pl;
+                                    Ok(cv)
+                                }
+                                None => Ok(v),
+                            }
+                        } else {
+                            Ok(v)
                         }
                     } else {
                         let mut disp: Vec<String> = Self::zpp_ty_disp(ty);
@@ -9192,7 +9306,7 @@ impl<'a> Interp<'a> {
                 "ArgumentCountError",
                 format!(
                     "Too few arguments to function {}(), {} passed in {} on line {} and {} {} expected",
-                    decl.name,
+                    self.decl_fname(decl),
                     args.len(),
                     self.diag_file(),
                     self.cur_line,
@@ -13399,8 +13513,8 @@ impl<'a> Interp<'a> {
         if !matches!(c, Value::Int(_)) || !tys.iter().any(|t| t.eq_ignore_ascii_case("int")) {
             return;
         }
-        if let Value::Float(f) = v {
-            if f.fract() != 0.0 {
+        match v {
+            Value::Float(f) if f.fract() != 0.0 => {
                 let _ = self.emit_diag(
                     "Deprecated",
                     8192,
@@ -13410,6 +13524,23 @@ impl<'a> Interp<'a> {
                     ),
                 );
             }
+            // Float-strings name the value `float-string "1.5"`
+            // (scalar_return_basic_64bit).
+            Value::Str(b) => {
+                if let Numeric::Float(f) = numeric(b) {
+                    if f.fract() != 0.0 {
+                        let _ = self.emit_diag(
+                            "Deprecated",
+                            8192,
+                            &format!(
+                                "Implicit conversion from float-string \"{}\" to int loses precision",
+                                String::from_utf8_lossy(b)
+                            ),
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
     }
 

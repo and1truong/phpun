@@ -3722,6 +3722,15 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     body: it.php_input.clone(),
                     pos: 0,
                 })))
+            } else if let Some(body) = parse_data_uri(&path) {
+                // `data:[mediatype][;base64],payload` — a memory stream
+                // (scalar_* tests fopen a data: URL for test values).
+                let id = it.next_res_id();
+                Value::Resource(Rc::new(RefCell::new(PhpResource::Input {
+                    id,
+                    body: Rc::new(body),
+                    pos: 0,
+                })))
             } else if let Some(which) = match path.as_str() {
                 "php://stdin" => Some(0u8),
                 "php://stdout" => Some(1u8),
@@ -7666,6 +7675,43 @@ fn read_stream(path: &str) -> Result<Vec<u8>, std::io::Error> {
         return Ok(Vec::new());
     }
     std::fs::read(path)
+}
+
+/// `data:[mediatype][;base64],payload` wrapper — returns the decoded
+/// payload bytes, or None when the path isn't a data: URI.
+/// `data:` and `data://` forms both work (scalar_* tests).
+fn parse_data_uri(path: &str) -> Option<Vec<u8>> {
+    let rest = path
+        .strip_prefix("data:")
+        .or_else(|| path.strip_prefix("data://"))?;
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let comma = rest.find(',')?;
+    let (meta, payload) = (&rest[..comma], &rest[comma + 1..]);
+    if meta.split(';').any(|m| m.eq_ignore_ascii_case("base64")) {
+        base64_decode(payload)
+    } else {
+        Some(percent_decode(payload.as_bytes()))
+    }
+}
+
+/// URL percent-decoding for data: URIs (`%41` -> 'A', '+' stays literal).
+fn percent_decode(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let h = (b[i + 1] as char).to_digit(16);
+            let l = (b[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (h, l) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
 }
 
 fn mode_flags(mode: &str) -> (bool, bool) {

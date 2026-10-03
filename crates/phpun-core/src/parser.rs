@@ -42,6 +42,18 @@ pub struct Parser<'a> {
     /// 0 none, 1 unbraced, 2 braced (mixing is a compile fatal,
     /// namespaces/ns_081/ns_084).
     ns_style: u8,
+    /// Enclosing class-like declarations as (has_parent, is_trait) —
+    /// `self`/`static`/`parent` type members are compile errors
+    /// outside class scope (static_type_outside_class).
+    class_ctx: Vec<(bool, bool)>,
+    /// Set by `program()` while the FIRST top-level statement is being
+    /// parsed; `stmt()` moves it into `strict_slot` so a nested
+    /// `declare(strict_types=1)` can't claim the slot
+    /// (scalar_strict_declaration_placement_*, strict_nested).
+    first_stmt_slot: bool,
+    /// True only while the literal first statement is a
+    /// `declare` — the only place `strict_types` is legal.
+    strict_slot: bool,
 }
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
@@ -112,6 +124,9 @@ fn parse_toks(toks: Vec<Lexed>) -> Result<Vec<Stmt>, PhpError> {
         declared_types: std::collections::HashSet::new(),
         in_braced_ns: false,
         ns_style: 0,
+        class_ctx: Vec::new(),
+        first_stmt_slot: false,
+        strict_slot: false,
     };
     let mut stmts = p.program()?;
     let mut diags: Vec<(String, &'static str, usize)> = lex_diags;
@@ -207,6 +222,9 @@ pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
         declared_types: std::collections::HashSet::new(),
         in_braced_ns: false,
         ns_style: 0,
+        class_ctx: Vec::new(),
+        first_stmt_slot: false,
+        strict_slot: false,
     };
     let e = p.expr()?;
     Ok((e, diags))
@@ -321,15 +339,8 @@ impl<'a> Parser<'a> {
         while self.peek().is_some() {
             let stmt_line = self.line();
             stmts.push(Stmt::Line(stmt_line));
+            self.first_stmt_slot = !saw_any;
             let s = self.stmt()?;
-            if let Stmt::Declare { name, .. } = &s {
-                if name.eq_ignore_ascii_case("strict_types") && saw_any {
-                    return Err(PhpError::fatal(
-                        "strict_types declaration must be the very first statement in the script",
-                        stmt_line,
-                    ));
-                }
-            }
             saw_any = true;
             let is_ns = matches!(&s, Stmt::Namespace(_))
                 || matches!(&s, Stmt::Block(v) if matches!(v.first(), Some(Stmt::Namespace(_))));
@@ -438,6 +449,10 @@ impl<'a> Parser<'a> {
     }
 
     fn stmt(&mut self) -> Result<Stmt, PhpError> {
+        // The first-statement slot is consumed by whichever stmt
+        // parses it — a nested `declare` can't reach it (strict_nested).
+        self.strict_slot = self.first_stmt_slot;
+        self.first_stmt_slot = false;
         // `#[Attr]` may precede any declaration statement.
         if self.at_op("#[") {
             self.pending_class_attrs = self.parse_attrs()?;
@@ -980,11 +995,28 @@ impl<'a> Parser<'a> {
         self.expect_op("=")?;
         let value = self.expr()?;
         self.expect_op(")")?;
+        let is_strict = name.eq_ignore_ascii_case("strict_types");
+        // `declare(strict_types=1)` is legal only as the very first
+        // top-level statement — nowhere nested, nothing before it
+        // (scalar_strict_declaration_placement_*, strict_nested).
+        if is_strict && !self.strict_slot {
+            return Err(PhpError::fatal(
+                "strict_types declaration must be the very first statement in the script",
+                self.line(),
+            ));
+        }
         let decl = Stmt::Declare { name, value };
         if self.eat_op(";") {
             Ok(decl)
         } else {
-            // `declare(...) { }` / `declare(...):` block forms.
+            // `declare(...) { }` / `declare(...):` block forms —
+            // strict_types forbids block mode entirely (placement_008).
+            if is_strict {
+                return Err(PhpError::fatal(
+                    "strict_types declaration must not use block mode",
+                    self.line(),
+                ));
+            }
             let body = self.body_any("enddeclare")?;
             Ok(Stmt::Block(vec![decl, Stmt::Block(body)]))
         }
@@ -1476,6 +1508,10 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op("{")?;
+        self.class_ctx.push((
+            parent.is_some() || !implements.is_empty(),
+            kind == ClassKind::Trait,
+        ));
         let mut methods = Vec::new();
         let mut props = Vec::new();
         let mut consts = Vec::new();
@@ -1775,6 +1811,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op("}")?;
+        self.class_ctx.pop();
         Ok(Stmt::Class(Rc::new(ClassDecl {
             name,
             attrs,
@@ -2734,6 +2771,16 @@ impl<'a> Parser<'a> {
                     ));
                 }
             }
+            // `void` is likewise standalone-only: `?void`, `void|x`
+            // (nullable_void).
+            if members.iter().any(|m| m.eq_ignore_ascii_case("void"))
+                && (members.len() > 1 || nullable)
+            {
+                return Err(PhpError::compile_fatal(
+                    "Void can only be used as a standalone type",
+                    self.line(),
+                ));
+            }
             // Class-type members resolve against the current namespace /
             // use-aliases at compile time; builtin scalar types do not
             // (namespaces/ns_055). `&`-intersections resolve each part.
@@ -2751,12 +2798,60 @@ impl<'a> Parser<'a> {
                         } else {
                             ("", m.as_str(), "")
                         };
+                        let in_intersection = inner.contains('&');
                         let resolved = inner
                             .split('&')
                             .map(|p| {
                                 let t = p.trim_start_matches('\\');
-                                if t.is_empty() || BUILTIN_TYS.contains(&t.to_lowercase().as_str())
-                                {
+                                let tl = t.to_lowercase();
+                                // `self`/`static`/`parent` need an
+                                // active class scope (self_*/parent_*/
+                                // static_*_global_function).
+                                match tl.as_str() {
+                                    "self" | "static" | "parent"
+                                        if self.class_ctx.is_empty() =>
+                                    {
+                                        return Err(PhpError::compile_fatal(
+                                            format!(
+                                                "Cannot use \"{}\" when no class scope is active",
+                                                tl
+                                            ),
+                                            self.line(),
+                                        ));
+                                    }
+                                    "parent"
+                                        if !self.class_ctx.last().map(|c| c.1).unwrap_or(false)
+                                            && !self
+                                                .class_ctx
+                                                .last()
+                                                .map(|c| c.0)
+                                                .unwrap_or(false) =>
+                                    {
+                                        return Err(PhpError::compile_fatal(
+                                            "Cannot use \"parent\" when current class scope has no parent",
+                                            self.line(),
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                                if t.is_empty() || BUILTIN_TYS.contains(&tl.as_str()) {
+                                    // Intersections accept class types
+                                    // only — builtin members error
+                                    // (invalid_iterable/static_type).
+                                    if in_intersection && tl != "self" && tl != "parent" {
+                                        let disp = if tl == "iterable" {
+                                            "Traversable|array"
+                                        } else {
+                                            tl.as_str()
+                                        };
+                                        return Err(PhpError::compile_fatal(
+                                            format!(
+                                                "Type {} cannot be part of an intersection type",
+                                                disp
+                                            ),
+                                            self.line(),
+                                        ));
+                                    }
                                     Ok(t.to_string())
                                 } else {
                                     // Resolve the RAW part — a leading `\`
