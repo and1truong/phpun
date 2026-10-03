@@ -191,6 +191,9 @@ pub struct Interp<'a> {
     /// File currently executing — include resolution uses its directory
     /// (PHP checks include_path, then the calling file's dir, then cwd).
     cur_file: String,
+    /// File the last `fail()` was raised in (uncaught-print attribution
+    /// for engine errors — `self.file` is always the entry script).
+    last_err_file: String,
     /// Bytes emitted so far — memory_limit bookkeeping.
     pub mem_used: u64,
     /// Size of the last emit — the 'tried to allocate' figure.
@@ -344,6 +347,7 @@ impl<'a> Interp<'a> {
             destructed: HashSet::new(),
             internal_cb: 0,
             cur_file: file.to_string(),
+            last_err_file: String::new(),
             mem_used: 0,
             mem_last: 0,
             mem_exceeded: false,
@@ -1153,7 +1157,7 @@ impl<'a> Interp<'a> {
             let args: Vec<Cell> = vec![
                 cell(Value::Int(errno)),
                 cell(Value::str(msg)),
-                cell(Value::str(self.file)),
+                cell(Value::str(self.diag_file())),
                 cell(Value::Int(self.cur_line as i64)),
             ];
             self.in_handler = true;
@@ -1208,12 +1212,18 @@ impl<'a> Interp<'a> {
             let msg = self.docref(msg);
             self.emit(&format!(
                 "<br />\n<b>{}</b>:  {} in <b>{}</b> on line <b>{}</b><br />\n",
-                level, msg, self.file, self.cur_line
+                level,
+                msg,
+                self.diag_file(),
+                self.cur_line
             ));
         } else {
             self.emit(&format!(
                 "\n{}: {} in {} on line {}\n",
-                level, msg, self.file, self.cur_line
+                level,
+                msg,
+                self.diag_file(),
+                self.cur_line
             ));
         }
     }
@@ -1294,22 +1304,32 @@ impl<'a> Interp<'a> {
                     t.push_str(&format!("#{} {}\n", i, fr));
                 }
                 t.push_str(&format!("#{} {{main}}\n", frames.len()));
+                let ef = if self.last_err_file.is_empty() {
+                    self.file
+                } else {
+                    &self.last_err_file
+                };
                 self.emit(&format!(
                     "\nFatal error: Uncaught {}: {} in {}:{}\nStack trace:\n{}  thrown in {} on line {}\n",
                     class,
                     e.message,
-                    self.file,
+                    ef,
                     e.line,
                     t,
-                    self.file,
+                    ef,
                     e.thrown_line.unwrap_or(e.line)
                 ));
             }
             // Plain fatals (compile errors, E_ERROR) print no trace.
             _ => {
+                let ef = if self.last_err_file.is_empty() {
+                    self.file
+                } else {
+                    &self.last_err_file
+                };
                 let s = format!(
                     "\nFatal error: {} in {} on line {}\n",
-                    e.message, self.file, e.line
+                    e.message, ef, e.line
                 );
                 if self.mem_exceeded {
                     // Memory-exhausted: buffers are dropped, so the
@@ -1363,7 +1383,7 @@ impl<'a> Interp<'a> {
                     *eval_ctx,
                 ),
                 _ => (
-                    self.file.to_string(),
+                    self.diag_file(),
                     self.cur_line as u32,
                     self.cur_line as u32,
                     "#0 {main}".to_string(),
@@ -1426,7 +1446,7 @@ impl<'a> Interp<'a> {
             o.props.insert("message".into(), cell(Value::str(msg)));
             o.props.insert("code".into(), cell(Value::Int(0)));
             o.internal = Some(ObjectInternal::Exception {
-                file: self.file.to_string(),
+                file: self.diag_file(),
                 line: self.cur_line as u32,
                 trace: String::new(),
                 thrown: self.cur_line as u32,
@@ -1461,7 +1481,7 @@ impl<'a> Interp<'a> {
             function: name.to_string(),
             class: None,
             ty: String::new(),
-            file: self.file.to_string(),
+            file: self.diag_file(),
             line: self.cur_line as u32,
             args: args.to_vec(),
             internal: true,
@@ -1475,12 +1495,17 @@ impl<'a> Interp<'a> {
     }
 
     fn fail<T>(&mut self, e: PhpError) -> Result<T, PhpError> {
+        self.last_err_file = self.diag_file();
         if let ErrorKind::Uncaught { class } = e.kind {
             // Errors raised mid-const-expr get a pseudo-frame for the
             // constant expression itself (property_initializer_scope_002:
             // `#0 %s(%d): [constant expression]()`).
             let e = if self.class_const_ctx > 0 {
-                let fr = format!("{}({}): [constant expression]()", self.file, self.cur_line);
+                let fr = format!(
+                    "{}({}): [constant expression]()",
+                    self.diag_file(),
+                    self.cur_line
+                );
                 let mut frames = e.trace.clone().unwrap_or_default();
                 frames.insert(0, fr);
                 PhpError {
@@ -2051,6 +2076,17 @@ impl<'a> Interp<'a> {
             cur = nxt;
         }
         false
+    }
+
+    /// File diagnostics attribute to: the executing frame's declaring
+    /// file, else the file currently being included/run (warnings inside
+    /// autoloaded/library code report the library file, not the caller).
+    fn diag_file(&self) -> String {
+        self.stack
+            .last()
+            .map(|f| f.file.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.cur_file.clone())
     }
 
     fn exec_while(&mut self, cond: &Expr, body: &[Stmt], do_first: bool) -> Flow {
@@ -5851,7 +5887,18 @@ impl<'a> Interp<'a> {
         let (site_file, site_line) = if from_builtin {
             ("[internal function]".to_string(), 0)
         } else {
-            (self.file.to_string(), saved_line as u32)
+            // Call-site file = the frame below the callee (the caller's
+            // executing file); top-level calls report the file currently
+            // being run.
+            let sf = self
+                .stack
+                .iter()
+                .rev()
+                .nth(1)
+                .map(|f| f.file.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| self.cur_file.clone());
+            (sf, saved_line as u32)
         };
         let fr = self
             .stack
@@ -6056,10 +6103,10 @@ impl<'a> Interp<'a> {
                     p.name,
                     disp.join("|"),
                     given,
-                    self.file,
+                    self.diag_file(),
                     self.cur_line
                 );
-                let display = format!("{} and defined in {}:{}", msg, self.file, decl.line);
+                let display = format!("{} and defined in {}:{}", msg, self.diag_file(), decl.line);
                 let argdesc = args
                     .iter()
                     .map(|a| trace_arg(&a.borrow()))
@@ -6078,7 +6125,13 @@ impl<'a> Interp<'a> {
                     "::"
                 };
                 let tname = fname.replacen("::", arrow, 1);
-                let frame = format!("{}({}): {}({})", self.file, self.cur_line, tname, argdesc);
+                let frame = format!(
+                    "{}({}): {}({})",
+                    self.diag_file(),
+                    self.cur_line,
+                    tname,
+                    argdesc
+                );
                 let call_line = self.cur_line;
                 self.stack.pop();
                 let mut e = PhpError::uncaught("TypeError", msg, call_line);
@@ -6220,7 +6273,7 @@ impl<'a> Interp<'a> {
                     "Too few arguments to function {}(), {} passed in {} on line {} and {} {} expected",
                     decl.name,
                     args.len(),
-                    self.file,
+                    self.diag_file(),
                     self.cur_line,
                     if required == decl.params.len() { "exactly" } else { "at least" },
                     required
@@ -7225,7 +7278,7 @@ impl<'a> Interp<'a> {
         }
         let internal = if self.is_throwable_name(&cls.decl.name) {
             Some(ObjectInternal::Exception {
-                file: self.file.to_string(),
+                file: self.diag_file(),
                 line: self.cur_line as u32,
                 trace: String::new(),
                 thrown: self.cur_line as u32,
@@ -8251,7 +8304,7 @@ impl<'a> Interp<'a> {
                 p.name,
                 tys.join("|"),
                 self.zval_type_name(&v),
-                self.file,
+                self.diag_file(),
                 self.cur_line
             ),
             0,
@@ -8979,7 +9032,7 @@ impl<'a> Interp<'a> {
             ),
             "getfile" => match &ob.internal {
                 Some(ObjectInternal::Exception { file, .. }) => Some(Value::str(file.clone())),
-                _ => Some(Value::str(self.file)),
+                _ => Some(Value::str(self.diag_file())),
             },
             "getline" => match &ob.internal {
                 Some(ObjectInternal::Exception { line, .. }) => Some(Value::Int(*line as i64)),
@@ -9037,7 +9090,7 @@ impl<'a> Interp<'a> {
                     .unwrap_or_default();
                 let (file, line) = match &ob.internal {
                     Some(ObjectInternal::Exception { file, line, .. }) => (file.clone(), *line),
-                    _ => (self.file.to_string(), self.cur_line as u32),
+                    _ => (self.diag_file(), self.cur_line as u32),
                 };
                 Some(Value::str(format!(
                     "{}: {} in {}:{}\nStack trace:\n#0 {{main}}",
@@ -9455,7 +9508,7 @@ impl<'a> Interp<'a> {
             .to_string(),
             class: None,
             ty: String::new(),
-            file: self.file.to_string(),
+            file: self.diag_file(),
             line: self.cur_line as u32,
             args: vec![cell(pathv.clone())],
             internal: true,
