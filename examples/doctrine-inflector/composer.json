@@ -1,0 +1,10 @@
+{
+    "name": "phpun/demo-inflector",
+    "description": "phpun e2e demo: doctrine/inflector on the vendored autoloader",
+    "require": {
+        "doctrine/inflector": "^2.0"
+    },
+    "autoload": {
+        "psr-4": { "Doctrine\\Inflector\\": "vendor/doctrine/inflector/lib/Doctrine/Inflector" }
+    }
+}

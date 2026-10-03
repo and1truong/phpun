@@ -3440,6 +3440,44 @@ impl<'a> Parser<'a> {
                     let e = self.expr()?;
                     self.expect_op(")")?;
                     Ok(Expr::Empty(Box::new(e)))
+                } else if self.ident_is("yield") {
+                    self.pos += 1;
+                    // `yield from <it>` splices another iterable's items.
+                    if self.ident_is("from") {
+                        self.pos += 1;
+                        let e = self.assign()?;
+                        return Ok(Expr::YieldFrom(Box::new(e)));
+                    }
+                    // Operand is optional: `yield;` / `(yield)` / `f(yield)`
+                    // / `yield ,` in list contexts push a null value.
+                    let operand_end = matches!(
+                        self.peek(),
+                        None | Some(Token::Op(";"))
+                            | Some(Token::Op(")"))
+                            | Some(Token::Op("]"))
+                            | Some(Token::Op(","))
+                            | Some(Token::Op(":"))
+                    );
+                    if operand_end {
+                        return Ok(Expr::Yield {
+                            key: None,
+                            val: None,
+                        });
+                    }
+                    let first = self.assign()?;
+                    // `yield k => v`
+                    if self.at_op("=>") {
+                        self.pos += 1;
+                        let v = self.assign()?;
+                        return Ok(Expr::Yield {
+                            key: Some(Box::new(first)),
+                            val: Some(Box::new(v)),
+                        });
+                    }
+                    Ok(Expr::Yield {
+                        key: None,
+                        val: Some(Box::new(first)),
+                    })
                 } else if self.ident_is("print") {
                     self.pos += 1;
                     let e = self.expr()?;

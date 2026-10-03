@@ -909,8 +909,49 @@ pub enum ObjectInternal {
         /// named binds (':' stripped)
         named: HashMap<String, Value>,
     },
+    /// `yield`-function deferred execution: the call returns a Generator
+    /// object; the body runs on the first Iterator method and every
+    /// yielded (key, value) lands in `items`.
+    Generator(Rc<RefCell<GenState>>),
     /// DateTime, closures-as-objects, etc. — opaque marker.
     None,
+}
+
+/// One yielded pair.
+pub type GenItem = (Value, Value);
+
+/// Generator internal state (object internal behind the `Generator`
+/// class, which implements `Iterator`).
+pub struct GenState {
+    /// Everything needed to re-enter the function frame later.
+    pub setup: GenSetup,
+    /// Materialized (key, value) pairs after the body ran.
+    pub items: Vec<GenItem>,
+    /// Iteration cursor.
+    pub pos: usize,
+    /// Body has been started (ran eagerly on first use).
+    pub started: bool,
+    /// Body completed (items final).
+    pub finished: bool,
+    /// `return` value — read by getReturn().
+    pub return_val: Value,
+    /// Auto keys for keyless `yield $v` (0, 1, 2…).
+    pub auto_key: i64,
+    /// Every send() value ever passed, in call order — the k-th send
+    /// feeds the k-th yield expression when the body (re)runs.
+    pub sends: Vec<Value>,
+}
+
+pub enum GenSetup {
+    /// invoke_fn capture: decl + evaluated args + call context.
+    Invoke {
+        decl: Rc<crate::ast::FunctionDecl>,
+        args: crate::interp::CallArgs,
+        this_obj: Option<Rc<RefCell<PhpObject>>>,
+        scope_class: Option<Rc<PhpClass>>,
+        decl_class: Option<Rc<PhpClass>>,
+        called_class: Option<Rc<PhpClass>>,
+    },
 }
 
 impl std::fmt::Debug for ObjectInternal {
@@ -919,6 +960,7 @@ impl std::fmt::Debug for ObjectInternal {
             ObjectInternal::Exception { .. } => f.write_str("Exception"),
             ObjectInternal::ArrayIter { .. } => f.write_str("ArrayIter"),
             ObjectInternal::ReflectionAttribute { .. } => f.write_str("ReflectionAttribute"),
+            ObjectInternal::Generator { .. } => f.write_str("Generator"),
             ObjectInternal::Sqlite { .. } => f.write_str("Sqlite"),
             ObjectInternal::SqliteStmt { .. } => f.write_str("SqliteStmt"),
             ObjectInternal::None => f.write_str("None"),

@@ -531,14 +531,22 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             Value::bytes(s)
         }
         "ucwords" => {
+            // ucwords(string, separators = " \t\r\n\f\v") — cap after
+            // any byte in the separator set (PHP 8 signature).
             let mut s = arg_bs(it, args, 0);
+            let seps = args
+                .get(1)
+                .map(|c| arg_bs(it, std::slice::from_ref(c), 0))
+                .unwrap_or_else(|| b" \t\r\n\x0B\x0C".to_vec());
             let mut cap = true;
             for ch in s.iter_mut() {
-                if cap && ch.is_ascii_alphabetic() {
+                if seps.contains(ch) {
+                    cap = true;
+                } else if cap && ch.is_ascii_alphabetic() {
                     ch.make_ascii_uppercase();
                     cap = false;
-                } else {
-                    cap = *ch == b' ';
+                } else if cap {
+                    cap = false;
                 }
             }
             Value::bytes(s)
@@ -4090,16 +4098,39 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
 
         // ----- misc -----
-        "iterator_to_array" | "iterator_count" | "iterator_apply" => match arg(args, 0) {
-            Value::Array(a) => {
-                let mut out = PhpArray::new();
-                for (k, c) in a.borrow().iter() {
-                    out.set(k.clone(), c.borrow().clone());
+        "iterator_to_array" | "iterator_count" | "iterator_apply" => {
+            let name_l = name.to_lowercase();
+            match arg(args, 0) {
+                Value::Array(a) => {
+                    let mut out = PhpArray::new();
+                    for (k, c) in a.borrow().iter() {
+                        out.set(k.clone(), c.borrow().clone());
+                    }
+                    Value::Array(Rc::new(RefCell::new(out)))
                 }
-                Value::Array(Rc::new(RefCell::new(out)))
+                Value::Object(o) => {
+                    // Materialize via the Iterator protocol (Generator,
+                    // IteratorAggregate, plain Iterator).
+                    let items = it.yield_from_collect(&Value::Object(o))?;
+                    if name_l == "iterator_count" {
+                        return Ok(Some(Value::Int(items.len() as i64)));
+                    }
+                    let mut out = PhpArray::new();
+                    // $preserve_keys (default true): duplicate int keys
+                    // overwrite; false → append.
+                    let preserve = args.get(1).map(|c| c.borrow().is_truthy()).unwrap_or(true);
+                    for (k, v) in items {
+                        if preserve {
+                            out.set(crate::value::to_key(&k), v);
+                        } else {
+                            out.push(v);
+                        }
+                    }
+                    Value::Array(Rc::new(RefCell::new(out)))
+                }
+                _ => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
             }
-            _ => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
-        },
+        }
         "closure_from_callable" | "closure::fromcallable" => arg(args, 0),
         "get_called_class" => Value::str(""),
         "spl_autoload_register" => {

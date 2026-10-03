@@ -11,8 +11,8 @@ use crate::lexer::StringPart;
 use crate::parser;
 use crate::value::{
     compare, format_backtrace_frames, format_float_repr, format_trace, identical, numeric, to_key,
-    trace_arg, ArrKey, CallableKind, Cell, Numeric, ObjectInternal, PhpArray, PhpCallable,
-    PhpClass, PhpObject, PhpResource, TraceFrame, Value,
+    trace_arg, ArrKey, CallableKind, Cell, GenSetup, GenState, Numeric, ObjectInternal, PhpArray,
+    PhpCallable, PhpClass, PhpObject, PhpResource, TraceFrame, Value,
 };
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -206,6 +206,14 @@ pub struct Interp<'a> {
     in_handler: bool,
     /// Current line estimate for error messages (best-effort).
     pub cur_line: usize,
+    /// Active generator body's yield collector — `Expr::Yield` pushes
+    /// (key, value) here while a generator function's body runs.
+    gen_sink: Option<Rc<RefCell<Vec<crate::value::GenItem>>>>,
+    /// send() queue feeding `yield`-expr results in the running body.
+    gen_sends: std::collections::VecDeque<Value>,
+    /// Auto-key counter for keyless `yield $v` — counts keyless yields
+    /// only (explicit keys and `yield from` items don't advance it).
+    gen_auto: i64,
     /// Declaring class of the method about to be invoked (set by
     /// invoke_method, consumed by invoke_fn to fill Frame::decl_class).
     pending_decl_class: Option<Rc<PhpClass>>,
@@ -476,6 +484,9 @@ impl<'a> Interp<'a> {
             exception_handler: None,
             in_handler: false,
             cur_line: 1,
+            gen_sink: None,
+            gen_sends: std::collections::VecDeque::new(),
+            gen_auto: 0,
             pending_decl_class: None,
             pending_called_class: None,
             pending_hook_prop: None,
@@ -774,6 +785,35 @@ impl<'a> Interp<'a> {
                     stub_method("ksort", &["flags"]),
                     stub_method("natcasesort", &[]),
                     stub_method("natsort", &[]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        // Generator — engine iterator produced by `yield` functions;
+        // methods native-dispatch on the Generator internal.
+        reg(
+            ClassDecl {
+                name: "Generator".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: true,
+                readonly: false,
+                parent: None,
+                implements: vec!["Iterator".into()],
+                attrs: vec![],
+                traits: vec![],
+                methods: vec![
+                    stub_method("rewind", &[]),
+                    stub_method("valid", &[]),
+                    stub_method("current", &[]),
+                    stub_method("key", &[]),
+                    stub_method("next", &[]),
+                    stub_method("send", &["value"]),
+                    stub_method("throw", &["exception"]),
+                    stub_method("getReturn", &[]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -3408,7 +3448,9 @@ impl<'a> Interp<'a> {
         val: &ForeachTarget,
         body: &[Stmt],
     ) -> Flow {
-        let _ = self.method_invoke(it.clone(), "rewind", CallArgs::empty());
+        if let Err(e) = self.method_invoke(it.clone(), "rewind", CallArgs::empty()) {
+            return self.err_flow(e);
+        }
         loop {
             let ok = self
                 .method_invoke(it.clone(), "valid", CallArgs::empty())
@@ -3448,7 +3490,9 @@ impl<'a> Interp<'a> {
                 Flow::Normal => {}
                 f => return f,
             }
-            let _ = self.method_invoke(it.clone(), "next", CallArgs::empty());
+            if let Err(e) = self.method_invoke(it.clone(), "next", CallArgs::empty()) {
+                return self.err_flow(e);
+            }
         }
         Flow::Normal
     }
@@ -3594,9 +3638,9 @@ impl<'a> Interp<'a> {
                 self.silence += 1;
                 let mut ok = true;
                 for a in args {
-                    match self.isset_eval(a) {
-                        Ok(true) => {}
-                        Ok(false) => {
+                    match self.isset_val(a) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
                             ok = false;
                             break;
                         }
@@ -3611,19 +3655,11 @@ impl<'a> Interp<'a> {
             }
             Expr::Empty(e) => {
                 self.silence += 1;
-                let v = self.isset_eval(e);
+                let v = self.isset_val(e);
                 self.silence -= 1;
                 match v {
-                    Ok(true) => {
-                        self.silence += 1;
-                        let v = self.eval(e);
-                        self.silence -= 1;
-                        match v {
-                            Ok(v) => Ok(Value::Bool(!v.is_truthy())),
-                            Err(e) => Err(e),
-                        }
-                    }
-                    Ok(false) => Ok(Value::Bool(true)),
+                    Ok(Some(v)) => Ok(Value::Bool(!v.is_truthy())),
+                    Ok(None) => Ok(Value::Bool(true)),
                     Err(e) => Err(e),
                 }
             }
@@ -3632,6 +3668,54 @@ impl<'a> Interp<'a> {
                 let s = self.conv_str(&v)?;
                 self.emit(&s);
                 Ok(Value::Int(1))
+            }
+            Expr::Yield { key, val } => {
+                let v = match val {
+                    Some(e) => self.eval(e)?,
+                    None => Value::Null,
+                };
+                let k = match key {
+                    Some(e) => self.eval(e)?,
+                    None => {
+                        if self.gen_sink.is_none() {
+                            return self.fail(PhpError::fatal(
+                                "The \"yield\" expression can only be used inside a function",
+                                self.cur_line,
+                            ));
+                        }
+                        let i = self.gen_auto;
+                        self.gen_auto += 1;
+                        Value::Int(i)
+                    }
+                };
+                match &self.gen_sink {
+                    Some(sink) => {
+                        sink.borrow_mut().push((k, v));
+                        Ok(self.gen_sends.pop_front().unwrap_or(Value::Null))
+                    }
+                    None => self.fail(PhpError::fatal(
+                        "The \"yield\" expression can only be used inside a function",
+                        self.cur_line,
+                    )),
+                }
+            }
+            Expr::YieldFrom(e) => {
+                let v = self.eval(e)?;
+                let sink = self.gen_sink.clone();
+                match sink {
+                    Some(sink) => {
+                        // `yield from` splices the inner keys verbatim —
+                        // duplicates and all — and doesn't touch the
+                        // keyless auto counter.
+                        let items = self.yield_from_collect(&v)?;
+                        sink.borrow_mut().extend(items);
+                        Ok(Value::Null)
+                    }
+                    None => self.fail(PhpError::fatal(
+                        "The \"yield from\" expression can only be used inside a function",
+                        self.cur_line,
+                    )),
+                }
             }
             Expr::Exit(arg) => {
                 let code = if let Some(a) = arg {
@@ -3962,11 +4046,17 @@ impl<'a> Interp<'a> {
     }
 
     /// Whether the expr is "set" — for isset()/empty() without warnings.
-    fn isset_eval(&mut self, e: &Expr) -> Result<bool, PhpError> {
+    /// `isset()` semantics returning the read value — `Some(v)` when the
+    /// operand exists and isn't null. `??`/`empty` consume the value
+    /// directly so calls and prop-getters evaluate exactly once.
+    fn isset_val(&mut self, e: &Expr) -> Result<Option<Value>, PhpError> {
         match e {
             Expr::Var(n) => Ok(match self.var_cell_opt(n) {
-                Some(c) => !matches!(*c.borrow(), Value::Null),
-                None => false,
+                Some(c) => match &*c.borrow() {
+                    Value::Null => None,
+                    v => Some(v.clone()),
+                },
+                None => None,
             }),
             Expr::Index { e, i } => {
                 // `isset($this->uninitTyped['k'])` and `$x ?? y` must not
@@ -3981,40 +4071,61 @@ impl<'a> Interp<'a> {
                             .message
                             .ends_with("must not be accessed before initialization")
                         {
-                            return Ok(false);
+                            return Ok(None);
                         }
                         return Err(err);
                     }
-                    Err(_) => return Ok(false),
+                    Err(_) => return Ok(None),
                 };
                 let key = match i {
                     Some(k) => self.eval(k)?,
-                    None => return Ok(false),
+                    None => return Ok(None),
                 };
                 match base {
                     Value::Array(a) => Ok(match a.borrow().get(&to_key(&key)) {
-                        Some(v) => !matches!(v, Value::Null),
-                        None => false,
+                        Some(v) => match v {
+                            Value::Null => None,
+                            _ => Some(v.clone()),
+                        },
+                        None => None,
                     }),
                     Value::Str(s) => {
                         let i = key.to_int();
-                        Ok(i >= 0 && (i as usize) < s.len())
+                        Ok(if i >= 0 && (i as usize) < s.len() {
+                            Some(Value::bytes(vec![s[i as usize]]))
+                        } else {
+                            None
+                        })
                     }
                     Value::Object(o) => {
                         if self.obj_is_a(&o, "ArrayAccess") {
                             match self.method_invoke(
-                                o,
+                                o.clone(),
                                 "offsetExists",
-                                CallArgs::positional(vec![cell(key)]),
+                                CallArgs::positional(vec![cell(key.clone())]),
                             ) {
-                                Ok(v) => Ok(v.is_truthy()),
+                                Ok(v) if v.is_truthy() => {
+                                    match self.method_invoke(
+                                        o,
+                                        "offsetGet",
+                                        CallArgs::positional(vec![cell(key)]),
+                                    ) {
+                                        Ok(v) => Ok(if matches!(v, Value::Null) {
+                                            None
+                                        } else {
+                                            Some(v)
+                                        }),
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                                Ok(_) => Ok(None),
                                 Err(e) => Err(e),
                             }
                         } else {
-                            Ok(false)
+                            Ok(None)
                         }
                     }
-                    _ => Ok(false),
+                    _ => Ok(None),
                 }
             }
             Expr::Prop { .. } => {
@@ -4022,7 +4133,11 @@ impl<'a> Interp<'a> {
                 let v = self.prop_read_loose(e);
                 self.silence -= 1;
                 match v {
-                    Ok(v) => Ok(!matches!(v, Value::Null)),
+                    Ok(v) => Ok(if matches!(v, Value::Null) {
+                        None
+                    } else {
+                        Some(v)
+                    }),
                     // A hooked get runs inside isset — its exceptions
                     // escape (write-only prop throws through the
                     // try/catch, not `false`).
@@ -4032,17 +4147,21 @@ impl<'a> Interp<'a> {
                         if e.message
                             .ends_with("must not be accessed before initialization")
                         {
-                            Ok(false)
+                            Ok(None)
                         } else {
                             Err(e)
                         }
                     }
-                    Err(_) => Ok(false),
+                    Err(_) => Ok(None),
                 }
             }
             _ => {
                 let v = self.eval(e)?;
-                Ok(!matches!(v, Value::Null))
+                Ok(if matches!(v, Value::Null) {
+                    None
+                } else {
+                    Some(v)
+                })
             }
         }
     }
@@ -5525,12 +5644,11 @@ impl<'a> Interp<'a> {
             "??" => {
                 // isset() semantics: undefined vars, missing offsets and
                 // uninitialized typed props fall through to the right.
-                if !self.isset_eval(l)? {
-                    return self.eval(r);
-                }
-                match self.eval(l)? {
-                    Value::Null => self.eval(r),
-                    v => Ok(v),
+                // isset_val returns the read value so calls and getters
+                // evaluate exactly once.
+                match self.isset_val(l)? {
+                    Some(v) => Ok(v),
+                    None => self.eval(r),
                 }
             }
             "." => {
@@ -7622,6 +7740,37 @@ impl<'a> Interp<'a> {
                 0,
             ));
         }
+        // A `yield`-bearing body makes the call a Generator factory:
+        // the caller gets a Generator object immediately and the body
+        // only runs when iteration first demands it.
+        if Self::decl_contains_yield(&decl.body) {
+            let dc = self.pending_decl_class.take();
+            let cc = self.pending_called_class.take();
+            return Ok(Value::Object(self.make_generator(
+                decl.clone(),
+                args,
+                this_obj,
+                scope_class,
+                dc,
+                cc,
+            )));
+        }
+        let dc = self.pending_decl_class.take();
+        let cc = self.pending_called_class.take();
+        self.invoke_fn_run(decl, args, this_obj, scope_class, dc, cc)
+    }
+
+    /// Frame push + body run — the part of invoke_fn the Generator
+    /// start path also uses (the yield check must not re-trip here).
+    fn invoke_fn_run(
+        &mut self,
+        decl: &Rc<FunctionDecl>,
+        args: CallArgs,
+        this_obj: Option<Rc<RefCell<PhpObject>>>,
+        scope_class: Option<Rc<PhpClass>>,
+        decl_class: Option<Rc<PhpClass>>,
+        called_class: Option<Rc<PhpClass>>,
+    ) -> Result<Value, PhpError> {
         let mut frame = Frame::new(decl.name.clone());
         frame.ns = decl.ns.clone();
         frame.ret_by_ref = decl.by_ref;
@@ -7630,8 +7779,8 @@ impl<'a> Interp<'a> {
                 .vars
                 .insert("this".to_string(), cell(Value::Object(obj.clone())));
         }
-        frame.decl_class = self.pending_decl_class.take();
-        frame.called_class = self.pending_called_class.take();
+        frame.decl_class = decl_class;
+        frame.called_class = called_class;
         frame.hook_prop = self.pending_hook_prop.take();
         frame.this_obj = this_obj;
         frame.scope_class = scope_class;
@@ -7642,6 +7791,417 @@ impl<'a> Interp<'a> {
         };
         self.stack.push(frame);
         self.bind_and_run(decl, args, Vec::new())
+    }
+
+    // ----- generators -----
+
+    /// Whether a function body yields — scanning skips nested closures
+    /// and function decls (each is its own generator context).
+    fn decl_contains_yield(stmts: &[Stmt]) -> bool {
+        stmts.iter().any(Self::stmt_contains_yield)
+    }
+
+    fn stmt_contains_yield(s: &Stmt) -> bool {
+        match s {
+            Stmt::Expr(e) => Self::expr_contains_yield(e),
+            Stmt::Echo(es) => es.iter().any(Self::expr_contains_yield),
+            Stmt::Return(Some(e)) => Self::expr_contains_yield(e),
+            Stmt::Block(b) => Self::decl_contains_yield(b),
+            Stmt::If { cond, then, else_ } => {
+                Self::expr_contains_yield(cond)
+                    || Self::decl_contains_yield(then)
+                    || Self::decl_contains_yield(else_)
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+                Self::expr_contains_yield(cond) || Self::decl_contains_yield(body)
+            }
+            Stmt::For {
+                init,
+                cond,
+                inc,
+                body,
+            } => {
+                init.iter()
+                    .chain(cond.iter())
+                    .chain(inc.iter())
+                    .any(Self::expr_contains_yield)
+                    || Self::decl_contains_yield(body)
+            }
+            Stmt::Foreach { arr, val, body, .. } => {
+                Self::expr_contains_yield(arr)
+                    || matches!(val, ForeachTarget::Lvalue(e) if Self::expr_contains_yield(e))
+                    || Self::decl_contains_yield(body)
+            }
+            Stmt::Switch { cond, cases } => {
+                Self::expr_contains_yield(cond)
+                    || cases.iter().any(|(c, b)| {
+                        c.as_ref().is_some_and(Self::expr_contains_yield)
+                            || Self::decl_contains_yield(b)
+                    })
+            }
+            Stmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                Self::decl_contains_yield(body)
+                    || catches.iter().any(|c| Self::decl_contains_yield(&c.body))
+                    || finally
+                        .as_ref()
+                        .is_some_and(|b| Self::decl_contains_yield(b))
+            }
+            Stmt::Static { vars, .. } => vars
+                .iter()
+                .any(|(_, e)| e.as_ref().is_some_and(Self::expr_contains_yield)),
+            Stmt::Unset(v) | Stmt::Global(v) => v.iter().any(Self::expr_contains_yield),
+            Stmt::ConstDecl(v) => v.iter().any(|(_, e)| Self::expr_contains_yield(e)),
+            Stmt::Declare { value, .. } => Self::expr_contains_yield(value),
+            // A nested `function` decl is its own generator context
+            // (its yields don't make the outer fn a generator).
+            Stmt::Function(_) | Stmt::Class(_) => false,
+            _ => false,
+        }
+    }
+
+    fn expr_contains_yield(e: &Expr) -> bool {
+        match e {
+            Expr::Yield { .. } | Expr::YieldFrom(_) => true,
+            // Nested closures/arrow fns are their own generator context.
+            Expr::Closure(_) | Expr::AnonClass(_) => false,
+            Expr::Assign { target, value, .. } => {
+                Self::expr_contains_yield(target) || Self::expr_contains_yield(value)
+            }
+            Expr::Binary { l, r, .. } => {
+                Self::expr_contains_yield(l) || Self::expr_contains_yield(r)
+            }
+            Expr::Unary { e, .. }
+            | Expr::Clone(e)
+            | Expr::ByRef(e)
+            | Expr::PreInc(e)
+            | Expr::PreDec(e)
+            | Expr::PostInc(e)
+            | Expr::PostDec(e)
+            | Expr::Empty(e)
+            | Expr::Print(e)
+            | Expr::VarVar(e)
+            | Expr::Paren(e)
+            | Expr::Fcc(e)
+            | Expr::Unpack(e)
+            | Expr::Cast { e, .. }
+            | Expr::Throw(e)
+            | Expr::Include { e, .. } => Self::expr_contains_yield(e),
+            Expr::Ternary { c, t, f } => {
+                Self::expr_contains_yield(c)
+                    || t.as_ref().is_some_and(|t| Self::expr_contains_yield(t))
+                    || Self::expr_contains_yield(f)
+            }
+            Expr::Call { name, args } => {
+                Self::expr_contains_yield(name) || args.iter().any(Self::expr_contains_yield)
+            }
+            Expr::MethodCall {
+                obj, name, args, ..
+            } => {
+                Self::expr_contains_yield(obj)
+                    || matches!(name, PropName::Expr(e) if Self::expr_contains_yield(e))
+                    || args.iter().any(Self::expr_contains_yield)
+            }
+            Expr::StaticCall { class, args, .. } => {
+                Self::expr_contains_yield(class) || args.iter().any(Self::expr_contains_yield)
+            }
+            Expr::StaticCallDyn { class, name, args } => {
+                Self::expr_contains_yield(class)
+                    || Self::expr_contains_yield(name)
+                    || args.iter().any(Self::expr_contains_yield)
+            }
+            Expr::Index { e, i } => {
+                Self::expr_contains_yield(e)
+                    || i.as_ref().is_some_and(|i| Self::expr_contains_yield(i))
+            }
+            Expr::Prop { obj, name, .. } => {
+                Self::expr_contains_yield(obj)
+                    || matches!(name, PropName::Expr(e) if Self::expr_contains_yield(e))
+            }
+            Expr::StaticProp { class, name } => {
+                Self::expr_contains_yield(class)
+                    || matches!(name, PropName::Expr(e) if Self::expr_contains_yield(e))
+            }
+            Expr::Isset(v) => v.iter().any(Self::expr_contains_yield),
+            Expr::List(v) => v.iter().flatten().any(Self::expr_contains_yield),
+            Expr::Exit(Some(e)) => Self::expr_contains_yield(e),
+            Expr::ArrayLit(items) => items.iter().any(|(k, v)| {
+                k.as_ref().is_some_and(Self::expr_contains_yield)
+                    || Self::expr_contains_yield(v)
+            }),
+            Expr::Match { subject, arms } => {
+                Self::expr_contains_yield(subject)
+                    || arms.iter().any(|a| {
+                        a.conds.iter().any(Self::expr_contains_yield)
+                            || Self::expr_contains_yield(&a.result)
+                    })
+            }
+            Expr::New { class, args } => {
+                Self::expr_contains_yield(class) || args.iter().any(Self::expr_contains_yield)
+            }
+            Expr::ClassConst { class, .. } => Self::expr_contains_yield(class),
+            Expr::Instanceof { obj, class } => {
+                Self::expr_contains_yield(obj) || Self::expr_contains_yield(class)
+            }
+            _ => false,
+        }
+    }
+
+    /// Build the deferred Generator object for a yielding call.
+    fn make_generator(
+        &mut self,
+        decl: Rc<FunctionDecl>,
+        args: CallArgs,
+        this_obj: Option<Rc<RefCell<PhpObject>>>,
+        scope_class: Option<Rc<PhpClass>>,
+        decl_class: Option<Rc<PhpClass>>,
+        called_class: Option<Rc<PhpClass>>,
+    ) -> Rc<RefCell<PhpObject>> {
+        let state = Rc::new(RefCell::new(GenState {
+            setup: GenSetup::Invoke {
+                decl,
+                args,
+                this_obj,
+                scope_class,
+                decl_class,
+                called_class,
+            },
+            items: Vec::new(),
+            pos: 0,
+            started: false,
+            finished: false,
+            return_val: Value::Null,
+            auto_key: 0,
+            sends: Vec::new(),
+        }));
+        let cls = self
+            .classes
+            .get("generator")
+            .cloned()
+            .expect("Generator class registered");
+        self.alloc_obj(PhpObject {
+            class: cls,
+            props: HashMap::new(),
+            prop_order: Vec::new(),
+            id: 0,
+            internal: Some(ObjectInternal::Generator(state)),
+        })
+    }
+
+    /// Run a not-yet-started generator body to completion, collecting
+    /// every yield into `state.items`. PHP defers body execution to the
+    /// first iterator access, which this mirrors (eager collection on
+    /// first use).
+    fn gen_start(&mut self, state: &Rc<RefCell<GenState>>) -> Result<(), PhpError> {
+        let (setup, sends) = {
+            let mut st = state.borrow_mut();
+            if st.started {
+                return Ok(());
+            }
+            st.started = true;
+            let setup = match &st.setup {
+                GenSetup::Invoke {
+                    decl,
+                    this_obj,
+                    scope_class,
+                    decl_class,
+                    called_class,
+                    ..
+                } => (
+                    decl.clone(),
+                    this_obj.clone(),
+                    scope_class.clone(),
+                    decl_class.clone(),
+                    called_class.clone(),
+                ),
+            };
+            (setup, st.sends.clone())
+        };
+        let (decl, this_obj, scope_class, decl_class, called_class) = setup;
+        // Re-evaluating stored arg cells is unnecessary — bind_and_run
+        // consumes the cells captured at call time.
+        let args = {
+            let mut st = state.borrow_mut();
+            match &mut st.setup {
+                GenSetup::Invoke { args, .. } => std::mem::replace(args, CallArgs::empty()),
+            }
+        };
+        let items = Rc::new(RefCell::new(Vec::new()));
+        let saved_sink = self.gen_sink.replace(items.clone());
+        let saved_sends = std::mem::replace(&mut self.gen_sends, sends.into_iter().collect());
+        let saved_auto = std::mem::replace(&mut self.gen_auto, 0);
+        let r = self.invoke_fn_run(&decl, args, this_obj, scope_class, decl_class, called_class);
+        self.gen_sink = saved_sink;
+        self.gen_sends = saved_sends;
+        self.gen_auto = saved_auto;
+        let collected = std::mem::take(&mut *items.borrow_mut());
+        let mut st = state.borrow_mut();
+        st.items = collected;
+        st.finished = true;
+        match r {
+            Ok(rv) => {
+                st.return_val = rv;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Native dispatch for the `Generator` class (Iterator + send/throw/
+    /// getReturn). `obj` must carry a Generator internal.
+    fn generator_method(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        name: &str,
+        args: &CallArgs,
+    ) -> Result<Option<Value>, PhpError> {
+        let state = match &obj.borrow().internal {
+            Some(ObjectInternal::Generator(st)) => st.clone(),
+            _ => return Ok(None),
+        };
+        let lname = name.to_lowercase();
+        match lname.as_str() {
+            "rewind" => {
+                let (started, finished) = {
+                    let st = state.borrow();
+                    (st.started, st.finished)
+                };
+                if finished {
+                    let v =
+                        self.exception("Exception", "Cannot traverse an already closed generator");
+                    return Err(self.throw(v));
+                }
+                if started {
+                    let v = self.exception(
+                        "Exception",
+                        "Cannot rewind a generator that was already run",
+                    );
+                    return Err(self.throw(v));
+                }
+                self.gen_start(&state)?;
+                Ok(Some(Value::Null))
+            }
+            "valid" => {
+                self.gen_start(&state)?;
+                let st = state.borrow();
+                Ok(Some(Value::Bool(st.pos < st.items.len())))
+            }
+            "current" => {
+                self.gen_start(&state)?;
+                let st = state.borrow();
+                Ok(Some(
+                    st.items.get(st.pos).map(|(_, v)| v.clone()).unwrap_or(Value::Null),
+                ))
+            }
+            "key" => {
+                self.gen_start(&state)?;
+                let st = state.borrow();
+                Ok(Some(
+                    st.items.get(st.pos).map(|(k, _)| k.clone()).unwrap_or(Value::Null),
+                ))
+            }
+            "next" => {
+                self.gen_start(&state)?;
+                state.borrow_mut().pos += 1;
+                Ok(Some(Value::Null))
+            }
+            "send" => {
+                let v = args.cells.first().map(|c| c.borrow().clone()).unwrap_or(Value::Null);
+                {
+                    let mut st = state.borrow_mut();
+                    st.sends.push(v);
+                    if st.started {
+                        // Eager model: re-run the body so queued sends
+                        // reach their yield expressions (the k-th send
+                        // feeds the k-th yield expr).
+                        st.started = false;
+                        st.finished = false;
+                        st.items.clear();
+                        st.pos = 0;
+                    }
+                }
+                self.gen_start(&state)?;
+                // The k-th send resumes at item k.
+                let mut st = state.borrow_mut();
+                st.pos = st.sends.len();
+                Ok(Some(
+                    st.items
+                        .get(st.pos)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Value::Null),
+                ))
+            }
+            "throw" => {
+                let e = args.cells.first().map(|c| c.borrow().clone()).unwrap_or(Value::Null);
+                state.borrow_mut().finished = true;
+                Err(self.throw(e))
+            }
+            "getreturn" => {
+                let st = state.borrow();
+                Ok(Some(st.return_val.clone()))
+            }
+            "__construct" => self.fail(PhpError::uncaught(
+                "Error",
+                "The \"Generator\" class is reserved for internal use and cannot be manually instantiated",
+                0,
+            )),
+            _ => Ok(None),
+        }
+    }
+
+    /// Materialize an iterable's (key, value) pairs for `yield from`.
+    pub fn yield_from_collect(&mut self, v: &Value) -> Result<Vec<(Value, Value)>, PhpError> {
+        match v {
+            Value::Array(a) => Ok(a
+                .borrow()
+                .iter()
+                .map(|(k, c)| (key_value(k), c.borrow().clone()))
+                .collect()),
+            Value::Object(o) => {
+                if self.obj_is_a(o, "IteratorAggregate") {
+                    let it = self.method_invoke(o.clone(), "getIterator", CallArgs::empty())?;
+                    return self.yield_from_collect(&it);
+                }
+                if self.obj_is_a(o, "Iterator")
+                    || o.borrow().class.name().eq_ignore_ascii_case("generator")
+                {
+                    let mut out = Vec::new();
+                    let _ = self.method_invoke(o.clone(), "rewind", CallArgs::empty())?;
+                    loop {
+                        let ok = self
+                            .method_invoke(o.clone(), "valid", CallArgs::empty())
+                            .map(|v| v.is_truthy())
+                            .unwrap_or(false);
+                        if !ok {
+                            break;
+                        }
+                        let k = self
+                            .method_invoke(o.clone(), "key", CallArgs::empty())
+                            .unwrap_or(Value::Null);
+                        let val = self
+                            .method_invoke(o.clone(), "current", CallArgs::empty())
+                            .unwrap_or(Value::Null);
+                        out.push((k, val));
+                        let _ = self.method_invoke(o.clone(), "next", CallArgs::empty())?;
+                    }
+                    Ok(out)
+                } else {
+                    self.fail(PhpError::uncaught(
+                        "TypeError",
+                        "Argument #1 must be of type Traversable|array",
+                        0,
+                    ))
+                }
+            }
+            _ => self.fail(PhpError::uncaught(
+                "TypeError",
+                "Argument #1 must be of type Traversable|array",
+                0,
+            )),
+        }
     }
 
     // ----- classes -----
@@ -8409,10 +8969,14 @@ impl<'a> Interp<'a> {
     /// once (FCC string args, class_exists).
     fn resolve_class(&mut self, name: &str) -> Option<String> {
         let n = name.trim_start_matches('\\');
-        if !self.classes.contains_key(&n.to_lowercase()) {
+        if !self.classes.contains_key(&n.to_lowercase())
+            && !self.interfaces.contains_key(&n.to_lowercase())
+        {
             self.run_autoload(n);
         }
-        if self.classes.contains_key(&n.to_lowercase()) {
+        if self.classes.contains_key(&n.to_lowercase())
+            || self.interfaces.contains_key(&n.to_lowercase())
+        {
             Some(n.to_string())
         } else {
             None
@@ -10909,6 +11473,12 @@ impl<'a> Interp<'a> {
                 return Ok(v);
             }
         }
+        // Generator: same pattern — native iteration state.
+        if cls.name().eq_ignore_ascii_case("generator") {
+            if let Some(v) = self.generator_method(&obj, name, &args)? {
+                return Ok(v);
+            }
+        }
         // PDO / PDOStatement: sqlite-backed storage surface (#15 spike).
         if cls.name().eq_ignore_ascii_case("pdo") {
             if let Some(v) = crate::pdo::pdo_method(self, &obj, name, &args)? {
@@ -11409,7 +11979,12 @@ impl<'a> Interp<'a> {
         if name == "class" {
             return Ok(Value::str(cname));
         }
-        let ckey = cname.to_lowercase();
+        // `X::CONST` on an unloaded class runs the autoloaders (real
+        // psr-4 code hits this constantly — e.g. `Language::ENGLISH`).
+        let ckey = self
+            .resolve_class(&cname)
+            .unwrap_or_else(|| cname.clone())
+            .to_lowercase();
         if let Some(iface) = self.interfaces.get(&ckey).cloned() {
             // Const on an interface (e.g. `FastRoute\Dispatcher::FOUND`):
             // walk it and its extended interfaces.

@@ -337,6 +337,14 @@ pub enum Expr {
     Isset(Vec<Expr>),
     Empty(Box<Expr>),
     Print(Box<Expr>),
+    /// `yield [k =>] v` — inside a function the call becomes a lazy
+    /// Generator; outside one it's a fatal at eval.
+    Yield {
+        key: Option<Box<Expr>>,
+        val: Option<Box<Expr>>,
+    },
+    /// `yield from iterable` — splices another iterable's items.
+    YieldFrom(Box<Expr>),
     Exit(Option<Box<Expr>>),
     /// `list($a, $b)` / `[$a, $b]` — only valid as an assignment target.
     List(Vec<Option<Expr>>),
