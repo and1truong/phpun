@@ -5164,7 +5164,8 @@ impl<'a> Interp<'a> {
                             }
                         }
                         if let Value::Object(no) = &nv {
-                            if no.borrow().class.find_method("__clone").is_some() {
+                            let ncls = no.borrow().class.clone();
+                            if self.find_method_in(&ncls, "__clone").is_some() {
                                 self.method_invoke(no.clone(), "__clone", CallArgs::empty())?;
                             }
                         }
@@ -5425,7 +5426,7 @@ impl<'a> Interp<'a> {
                         None => true,
                     } && !declared_live;
                     if missing {
-                        if cls.find_method("__isset").is_some() {
+                        if self.find_method_in(&cls, "__isset").is_some() {
                             let gkey = (Rc::as_ptr(o) as usize, 2u8, pn.clone());
                             if self.magic_guards.insert(gkey.clone()) {
                                 let res = self.method_invoke(
@@ -6121,7 +6122,9 @@ impl<'a> Interp<'a> {
                                 Some(_) => !self.prop_visible(&cls, &pn),
                                 None => true,
                             };
-                            if inaccessible && !declared_live && cls.find_method("__get").is_some()
+                            if inaccessible
+                                && !declared_live
+                                && self.find_method_in(&cls, "__get").is_some()
                             {
                                 let gkey = (Rc::as_ptr(o) as usize, 0u8, pn.clone());
                                 if self.magic_guards.insert(gkey.clone()) {
@@ -6518,7 +6521,7 @@ impl<'a> Interp<'a> {
                         // storage instead of recursing (bug63462).
                         let gkey = (Rc::as_ptr(&o) as usize, 1u8, pn.to_string());
                         if ob.unset_props.contains(&k)
-                            && cls.find_method("__set").is_some()
+                            && self.find_method_in(&cls, "__set").is_some()
                             && self.magic_guards.insert(gkey.clone())
                         {
                             drop(ob);
@@ -6540,7 +6543,7 @@ impl<'a> Interp<'a> {
                         ob.props.insert(k, cell(v.clone()));
                     }
                     Ok(v)
-                } else if cls.find_method("__set").is_some()
+                } else if self.find_method_in(&cls, "__set").is_some()
                     && self
                         .magic_guards
                         .insert((Rc::as_ptr(&o) as usize, 1u8, pn.to_string()))
@@ -6558,6 +6561,14 @@ impl<'a> Interp<'a> {
                     res?;
                     Ok(v)
                 } else {
+                    // Writing a DECLARED prop the scope can't see is
+                    // `Cannot access private/protected property` — the
+                    // declared name can't be shadowed by a dynamic prop
+                    // (bug38461's re-entrant __set write; direct writes
+                    // without __set too).
+                    if let Some(e) = self.hidden_decl_error(&o, pn) {
+                        return self.fail(e);
+                    }
                     // `\0` names error on the real-storage path before
                     // any deprecation (bug52484_2).
                     self.check_prop_name(pn)?;
@@ -8836,7 +8847,8 @@ impl<'a> Interp<'a> {
                 }
             }
             Value::Object(o) => {
-                if o.borrow().class.find_method("__invoke").is_some() {
+                let icls = o.borrow().class.clone();
+                if self.find_method_in(&icls, "__invoke").is_some() {
                     self.method_invoke_vis(o.clone(), "__invoke", args)
                 } else {
                     self.fail(PhpError::uncaught(
@@ -9023,7 +9035,8 @@ impl<'a> Interp<'a> {
                 }
             }
             Value::Object(o) => {
-                if o.borrow().class.find_method("__invoke").is_some() {
+                let icls = o.borrow().class.clone();
+                if self.find_method_in(&icls, "__invoke").is_some() {
                     Ok(Value::Callable(self.new_callable(PhpCallable {
                         id: std::cell::Cell::new(0),
                         kind: CallableKind::Method {
@@ -10154,7 +10167,10 @@ impl<'a> Interp<'a> {
                 Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) => true,
                 // Objects coerce via __toString only — a stdClass is a
                 // TypeError, not "" (scalar_return_basic_64bit).
-                Value::Object(o) => o.borrow().class.find_method("__tostring").is_some(),
+                Value::Object(o) => {
+                    let tcls = o.borrow().class.clone();
+                    self.find_method_in(&tcls, "__tostring").is_some()
+                }
                 _ => false,
             },
             "bool" => matches!(
@@ -14272,7 +14288,7 @@ impl<'a> Interp<'a> {
         if sl == "stringable"
             && (self
                 .lookup_class(t)
-                .map(|c| c.find_method("__tostring").is_some())
+                .map(|c| self.find_method_in(&c, "__tostring").is_some())
                 .unwrap_or(false)
                 || self.linking.iter().any(|c| {
                     c.name.eq_ignore_ascii_case(t)
@@ -16207,8 +16223,8 @@ impl<'a> Interp<'a> {
         // (typed_properties_051).
         if let Value::Object(o) = &v {
             if tys.iter().any(|t| t.eq_ignore_ascii_case("string")) {
-                let tostr = o.borrow().class.find_method("__tostring").is_some()
-                    || o.borrow().class.find_method("__toString").is_some();
+                let tcls = o.borrow().class.clone();
+                let tostr = self.find_method_in(&tcls, "__tostring").is_some();
                 if tostr {
                     let sv =
                         self.method_invoke(o.clone(), "__toString", CallArgs::positional(vec![]))?;
@@ -16494,8 +16510,8 @@ impl<'a> Interp<'a> {
         // (typed_properties_051).
         if let Value::Object(o) = &v {
             if tys.iter().any(|t| t.eq_ignore_ascii_case("string")) {
-                let tostr = o.borrow().class.find_method("__tostring").is_some()
-                    || o.borrow().class.find_method("__toString").is_some();
+                let tcls = o.borrow().class.clone();
+                let tostr = self.find_method_in(&tcls, "__tostring").is_some();
                 if tostr {
                     let sv =
                         self.method_invoke(o.clone(), "__toString", CallArgs::positional(vec![]))?;
@@ -18106,7 +18122,7 @@ impl<'a> Interp<'a> {
                 // Without __get, an unset() declared prop still reads
                 // as uninitialized; with __get it routes to magic
                 // (typed_properties_047 vs _009).
-                let has_get = cls.find_method("__get").is_some();
+                let has_get = self.find_method_in(&cls, "__get").is_some();
                 if !was_unset || !has_get {
                     if let Some((tpd, tdcls)) = self.decl_prop(&o, pn) {
                         if tpd.ty.is_some() {
@@ -18128,6 +18144,12 @@ impl<'a> Interp<'a> {
                 if has_get {
                     let gkey = (Rc::as_ptr(&o) as usize, 0u8, pn.to_string());
                     if !self.magic_guards.insert(gkey.clone()) {
+                        // Re-entrant access to a DECLARED prop the
+                        // magic scope can't see is a hard Error, not
+                        // an undefined-prop warning (bug48248).
+                        if let Some(e) = self.hidden_decl_error(&o, pn) {
+                            return self.fail(e);
+                        }
                         self.check_prop_name(pn)?;
                         self.warn(&format!("Undefined property: {}::${}", cls.name(), pn))?;
                         return Ok(Value::Null);
@@ -18280,9 +18302,9 @@ impl<'a> Interp<'a> {
                                 // `&__get` when it exists — the bound
                                 // ref sees __get's cell (073).
                                 let cls = o.borrow().class.clone();
-                                let get_by_ref = cls
-                                    .find_method("__get")
-                                    .map(|m| m.decl.by_ref)
+                                let get_by_ref = self
+                                    .find_method_in(&cls, "__get")
+                                    .map(|(m, _)| m.decl.by_ref)
                                     .unwrap_or(false);
                                 if get_by_ref {
                                     let gkey = (Rc::as_ptr(&o) as usize, 0u8, pn.clone());
@@ -18344,7 +18366,7 @@ impl<'a> Interp<'a> {
                     // write dies with an "Indirect modification"
                     // notice (bug32660, bug37667, bug43201).
                     let cls = o.borrow().class.clone();
-                    if let Some(gm) = cls.find_method("__get") {
+                    if let Some(gm) = self.find_method_in(&cls, "__get").map(|(m, _)| m) {
                         let gkey = (Rc::as_ptr(&o) as usize, 0u8, pn.clone());
                         if self.magic_guards.insert(gkey.clone()) {
                             self.last_ret_cell = None;
@@ -18364,6 +18386,12 @@ impl<'a> Interp<'a> {
                                 pn
                             ))?;
                             return Ok(cell(rv));
+                        }
+                        // Re-entrant `&`-fetch of a declared prop the
+                        // magic scope can't see is a hard Error
+                        // (bug48248 `&__get` returning `$this->priv`).
+                        if let Some(e) = self.hidden_decl_error(&o, &pn) {
+                            return self.fail(e);
                         }
                         return Ok(cell(Value::Null));
                     }
@@ -18491,7 +18519,7 @@ impl<'a> Interp<'a> {
                     // __unset only fires for UNDECLARED props — a
                     // declared one is simply marked uninitialized
                     // (typed_properties_magic_set).
-                } else if cls.find_method("__unset").is_some()
+                } else if self.find_method_in(&cls, "__unset").is_some()
                     && self
                         .magic_guards
                         .insert((Rc::as_ptr(&o) as usize, 3u8, pn.clone()))
@@ -19538,6 +19566,57 @@ impl<'a> Interp<'a> {
                 .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
         }
         (crate::ast::Visibility::Public, String::new())
+    }
+
+    /// `Error` when `pn` resolves to a DECLARED prop the current scope
+    /// can't see — zend throws `Cannot access private/protected
+    /// property` rather than creating a dynamic prop or warning
+    /// (bug38461/bug48248). None for undeclared or visible names.
+    fn hidden_decl_error(&mut self, o: &Rc<RefCell<PhpObject>>, pn: &str) -> Option<PhpError> {
+        // Zend checks the object's own class table for a same-named
+        // declaration: an inherited public/protected decl hides the
+        // name (Cannot-access when invisible), and a PRIVATE decl
+        // hides it only when the object's own class declares it —
+        // ancestor-private names still admit a dynamic prop
+        // (bug38461/bug48248 vs bug60536_001).
+        let (pd, dcls) = self.decl_prop(o, pn).or_else(|| {
+            let ob = o.borrow();
+            ob.class
+                .decl
+                .props
+                .iter()
+                .find(|p| {
+                    p.name == pn && !p.is_static && p.visibility == crate::ast::Visibility::Private
+                })
+                .map(|p| (p.clone(), ob.class.clone()))
+        })?;
+        let word = match pd.visibility {
+            crate::ast::Visibility::Private => "private",
+            crate::ast::Visibility::Protected => "protected",
+            crate::ast::Visibility::Public => return None,
+        };
+        let scope = self.stack.last().and_then(|f| {
+            f.decl_class
+                .as_ref()
+                .or(f.scope_class.as_ref())
+                .map(|s| s.decl.name.clone())
+        });
+        let dn = dcls.name().to_string();
+        let allows = match (pd.visibility, scope.as_deref()) {
+            (crate::ast::Visibility::Private, Some(s)) => s == dn,
+            (crate::ast::Visibility::Protected, Some(s)) => {
+                self.is_a_str(s, &dn) || self.is_a_str(&dn, s)
+            }
+            _ => false,
+        };
+        if allows {
+            return None;
+        }
+        Some(PhpError::uncaught(
+            "Error",
+            format!("Cannot access {} property {}::${}", word, dn, pn),
+            0,
+        ))
     }
 
     /// Whether prop `name` on `cls` is readable from the current scope
