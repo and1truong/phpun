@@ -8812,9 +8812,20 @@ pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
         "sprintf" | "printf" | "vsprintf" | "vprintf" => &[("format", "string")],
         "number_format" => &[("num", "float"), ("decimals", "int")],
         "preg_match" | "preg_match_all" => &[("pattern", "string"), ("subject", "string")],
-        "preg_replace" | "preg_filter" | "preg_replace_callback" => &[
+        "preg_replace" | "preg_filter" => &[
             ("pattern", "string|array"),
-            ("replacement", "string|array|callable"),
+            ("replacement", "string|array"),
+            ("subject", "string|array"),
+            ("limit", "int"),
+        ],
+        "preg_replace_callback" => &[
+            ("pattern", "string|array"),
+            ("callback", "callable"),
+            ("subject", "string|array"),
+            ("limit", "int"),
+        ],
+        "preg_replace_callback_array" => &[
+            ("pattern", "array"),
             ("subject", "string|array"),
             ("limit", "int"),
         ],

@@ -1171,6 +1171,10 @@ impl<'a> Interp<'a> {
             true,
         );
         reg(iface("UnitEnum", &[], &["cases"]), true);
+        reg(
+            iface("JsonSerializable", &[], &["jsonSerialize"]),
+            true,
+        );
         // PDO + PDOStatement + PDOException — sqlite storage spike (#15).
         reg(
             ClassDecl {
