@@ -4892,7 +4892,8 @@ impl<'a> Interp<'a> {
                     .and_then(|c| self.find_method_in(&c, "__construct"))
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
-                let argvals = self.arg_cells(args, &params, &format!("{}::__construct()", name))?;
+                let argvals =
+                    self.arg_cells(args, &params, &format!("{}::__construct()", name), false)?;
                 self.new_instance(&name, argvals)
             }
             Expr::Prop {
@@ -4936,7 +4937,7 @@ impl<'a> Interp<'a> {
                 let nv = self.eval(name)?;
                 let n = self.conv_str(&nv)?;
                 let argvals =
-                    self.arg_cells(args, &[], &format!("{}::{{closure}}()", cls.name()))?;
+                    self.arg_cells(args, &[], &format!("{}::{{closure}}()", cls.name()), false)?;
                 self.static_invoke_vis(cls, &n, argvals, None)
             }
             Expr::ClassConst { class, name } => self.class_const(class, name),
@@ -7925,7 +7926,7 @@ impl<'a> Interp<'a> {
                     Value::Callable(_) | Value::Object(_) => {
                         // $closure() / $obj->__invoke()
                         let params = self.callable_params(&v);
-                        let vals = self.arg_cells(args, &params, "")?;
+                        let vals = self.arg_cells(args, &params, "", false)?;
                         return self.call_value(&v, vals);
                     }
                     _ => self.conv_str(&v).unwrap_or_default(),
@@ -7940,13 +7941,13 @@ impl<'a> Interp<'a> {
                     .find_method_in(&cls, &mn)
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
-                let vals = self.arg_cells(args, &params, &format!("{}()", mn))?;
+                let vals = self.arg_cells(args, &params, &format!("{}()", mn), false)?;
                 return self.static_invoke_vis(cls, &mn, vals, None);
             }
             Expr::Prop { .. } | Expr::MethodCall { .. } | Expr::Index { .. } => {
                 let v = self.eval(name)?;
                 let params = self.callable_params(&v);
-                let vals = self.arg_cells(args, &params, "")?;
+                let vals = self.arg_cells(args, &params, "", false)?;
                 return self.call_value(&v, vals);
             }
             _ => {
@@ -7955,7 +7956,7 @@ impl<'a> Interp<'a> {
                     // `(expr)()` — IIFE on a closure/invokable value.
                     Value::Callable(_) | Value::Object(_) => {
                         let params = self.callable_params(&v);
-                        let vals = self.arg_cells(args, &params, "")?;
+                        let vals = self.arg_cells(args, &params, "", false)?;
                         return self.call_value(&v, vals);
                     }
                     _ => self.conv_str(&v).unwrap_or_default(),
@@ -7972,6 +7973,7 @@ impl<'a> Interp<'a> {
         args: &[Expr],
         decl: &[Param],
         ctx: &str,
+        internal: bool,
     ) -> Result<CallArgs, PhpError> {
         let mut out = CallArgs::empty();
         // Position of the *next positional* arg for by-ref lookup — named
@@ -8123,6 +8125,20 @@ impl<'a> Interp<'a> {
                         // The reported number is the PARAM slot, not the
                         // call position (cannot_pass_by_ref: `test(e: 42)`
                         // reports #2 for `function test($a, &$e)`).
+                        if internal {
+                            // Internal functions silently materialize
+                            // temporaries for by-ref params —
+                            // `current(array())` is legal (bug55754).
+                            let c = cell(self.eval(expr)?);
+                            if let Some(n) = name {
+                                out.named.push((n, c, true, false));
+                                seen_named = true;
+                            } else {
+                                out.cells.push(c);
+                                pos += 1;
+                            }
+                            continue;
+                        }
                         let argno = match &name {
                             Some(n) => decl
                                 .iter()
@@ -8320,6 +8336,7 @@ impl<'a> Interp<'a> {
                 .map(|d| d.params.as_slice())
                 .unwrap_or(&builtin_params),
             &format!("{}()", fname.trim_start_matches('\u{1}')),
+            decl.is_none(),
         )?;
         if !ns_resolved {
             if let Some(v) = self.call_builtin(&lname, &argvals)? {
@@ -11556,6 +11573,7 @@ impl<'a> Interp<'a> {
                 let checks_res = self.check_interface_sigs(&d);
                 self.linking.pop();
                 checks_res?;
+                self.magic_method_checks(&d)?;
                 self.interfaces.insert(lname.clone(), Rc::new(d));
                 self.decl_order.push(lname);
             }
@@ -11587,6 +11605,7 @@ impl<'a> Interp<'a> {
                     self.linking.pop();
                     merge_res?;
                 }
+                self.magic_method_checks(&d)?;
                 self.traits.insert(lname.clone(), Rc::new(d));
                 self.decl_order.push(lname);
             }
@@ -11703,6 +11722,7 @@ impl<'a> Interp<'a> {
                 }) {
                     self.warn("Private methods cannot be final as they are never overridden by other classes")?;
                 }
+                self.magic_method_checks(&d)?;
                 self.classes.insert(
                     lname.clone(),
                     Rc::new(PhpClass {
@@ -11723,6 +11743,164 @@ impl<'a> Interp<'a> {
             let res = self.process_variance_obligations(&decl);
             self.in_variance_pass = false;
             res?;
+        }
+        Ok(())
+    }
+
+    /// Zend's magic-method signature validation at class registration
+    /// (zend_compile_magic_method): non-public visibility is a warning
+    /// (ctor/dtor/clone exempt — private __clone is the
+    /// clone-prevention idiom); wrong static-ness, arity or by-ref
+    /// params are fatals. Checked after trait merge so merged methods
+    /// validate too; interfaces and traits get the same rules.
+    fn magic_method_checks(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
+        for m in &d.methods {
+            let n = m.decl.name.to_lowercase();
+            let (arity, want_static, vis_exempt): (Option<usize>, bool, bool) = match n.as_str() {
+                "__call" | "__callstatic" => (Some(2), n == "__callstatic", false),
+                "__get" | "__isset" | "__unset" | "__unserialize" => (Some(1), false, false),
+                "__set" => (Some(2), false, false),
+                "__set_state" => (Some(1), true, false),
+                "__sleep" | "__wakeup" | "__tostring" | "__serialize" | "__debuginfo" => {
+                    (Some(0), false, false)
+                }
+                "__invoke" => (None, false, false),
+                "__construct" => (None, false, true),
+                "__destruct" => (Some(0), false, true),
+                "__clone" => (Some(0), false, true),
+                _ => continue,
+            };
+            let cn = d.name.rsplit('\\').next().unwrap_or(&d.name);
+            // Zend echoes the declared spelling in all diagnostics.
+            let mn = &m.decl.name;
+            // Zend order: arity first, then static-ness, by-ref and
+            // type checks; the public-visibility warning only fires
+            // when the signature is otherwise valid
+            // (magic_methods_007/010).
+            let nargs = m.decl.params.len();
+            if let Some(need) = arity {
+                if nargs != need {
+                    return self.fail(PhpError::fatal(
+                        if need == 0 {
+                            format!("Method {}::{}() cannot take arguments", cn, mn)
+                        } else {
+                            format!(
+                                "Method {}::{}() must take exactly {} argument{}",
+                                cn,
+                                mn,
+                                need,
+                                if need == 1 { "" } else { "s" }
+                            )
+                        },
+                        m.decl.line,
+                    ));
+                }
+            }
+            if m.is_static != want_static {
+                return self.fail(PhpError::fatal(
+                    format!(
+                        "Method {}::{}() {}",
+                        cn,
+                        mn,
+                        if want_static {
+                            "must be static"
+                        } else {
+                            "cannot be static"
+                        }
+                    ),
+                    m.decl.line,
+                ));
+            }
+            if m.decl.params.iter().any(|p| p.by_ref) {
+                return self.fail(PhpError::fatal(
+                    format!("Method {}::{}() cannot take arguments by reference", cn, mn),
+                    m.decl.line,
+                ));
+            }
+            // Declared param types must still accept the values zend
+            // passes (`?string` and `iterable` are fine where `string`
+            // /`array` are required).
+            let req_params: &[&str] = match n.as_str() {
+                "__call" | "__callstatic" => &["string", "array"],
+                "__get" | "__set" | "__isset" | "__unset" => &["string"],
+                "__unserialize" | "__set_state" => &["array"],
+                _ => &[],
+            };
+            for (i, req) in req_params.iter().enumerate() {
+                if let Some(p) = m.decl.params.get(i) {
+                    if let Some(ty) = &p.ty {
+                        if !ty.iter().any(|t| {
+                            t == req || t == "mixed" || (*req == "array" && t == "iterable")
+                        }) {
+                            return self.fail(PhpError::fatal(
+                                format!(
+                                    "{}::{}(): Parameter #{} (${}) must be of type {} when declared",
+                                    cn,
+                                    mn,
+                                    i + 1,
+                                    p.name,
+                                    req
+                                ),
+                                m.decl.line,
+                            ));
+                        }
+                    }
+                }
+            }
+            // Declared return type must be a subtype of zend's
+            // requirement (nullable allowed only when required).
+            let req_ret: Option<&str> = match n.as_str() {
+                "__isset" => Some("bool"),
+                "__tostring" => Some("string"),
+                "__sleep" | "__serialize" => Some("array"),
+                "__debuginfo" => Some("?array"),
+                "__set" | "__unset" | "__unserialize" | "__wakeup" | "__clone" => Some("void"),
+                "__set_state" => Some("object"),
+                _ => None,
+            };
+            if let Some(req) = req_ret {
+                if let Some(ty) = &m.decl.ret {
+                    let req_nullable = req.starts_with('?');
+                    let req_base = req.trim_start_matches('?');
+                    let declared_nullable = ty.iter().any(|t| t == "null");
+                    let fits = (!declared_nullable || req_nullable)
+                        && ty.iter().filter(|t| *t != "null").all(|t| {
+                            t == req_base
+                                || (req_base == "bool" && (t == "true" || t == "false"))
+                                || (req_base == "object"
+                                    && !matches!(
+                                        t.as_str(),
+                                        "int"
+                                            | "float"
+                                            | "string"
+                                            | "bool"
+                                            | "array"
+                                            | "void"
+                                            | "iterable"
+                                            | "callable"
+                                            | "mixed"
+                                            | "never"
+                                            | "false"
+                                            | "true"
+                                    ))
+                        });
+                    if !fits {
+                        return self.fail(PhpError::fatal(
+                            format!(
+                                "{}::{}(): Return type must be {} when declared",
+                                cn, mn, req
+                            ),
+                            m.decl.line,
+                        ));
+                    }
+                }
+            }
+            if !vis_exempt && m.visibility != crate::ast::Visibility::Public {
+                self.warn(&format!(
+                    "The magic method {}::{}() must have public visibility",
+                    cn, mn
+                ))?;
+            }
         }
         Ok(())
     }
@@ -17809,7 +17987,7 @@ impl<'a> Interp<'a> {
                     .find_method_in(&o.borrow().class.clone(), &mn)
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
-                let argvals = self.arg_cells(args, &params, &format!("{}()", mn))?;
+                let argvals = self.arg_cells(args, &params, &format!("{}()", mn), false)?;
                 // method_invoke handles builtin (Throwable), __call, undefined.
                 self.method_invoke_vis(o.clone(), &mn, argvals)
             }
@@ -17830,13 +18008,13 @@ impl<'a> Interp<'a> {
                     CallableKind::Closure(d) => d.params.clone(),
                     _ => vec![],
                 };
-                let argvals = self.arg_cells(args, &params, &format!("{}()", mn))?;
+                let argvals = self.arg_cells(args, &params, &format!("{}()", mn), false)?;
                 self.call_value(&Value::Callable(c), argvals)
             }
             Value::Callable(c) if mn.eq_ignore_ascii_case("call") => {
                 // `$fn->call($newThis, ...$args)`: invoke rebound to
                 // $newThis (skipped for static closures).
-                let argvals = self.arg_cells(args, &[], &format!("{}()", mn))?;
+                let argvals = self.arg_cells(args, &[], &format!("{}()", mn), false)?;
                 let mut ca = argvals;
                 let newthis = ca
                     .cells
@@ -17856,7 +18034,7 @@ impl<'a> Interp<'a> {
                 self.call_value(&Value::Callable(c), ca)
             }
             Value::Callable(c) if mn.eq_ignore_ascii_case("bindto") => {
-                let argvals = self.arg_cells(args, &[], &format!("{}()", mn))?;
+                let argvals = self.arg_cells(args, &[], &format!("{}()", mn), false)?;
                 match argvals.cells.first().map(|c| c.borrow().clone()) {
                     Some(Value::Object(t)) => {
                         let mut nc = (*c).clone();
@@ -18579,7 +18757,7 @@ impl<'a> Interp<'a> {
             .find_method_in(&cls, name)
             .map(|m| m.0.decl.params.clone())
             .unwrap_or_default();
-        let argvals = self.arg_cells(args, &params, &format!("{}()", name))?;
+        let argvals = self.arg_cells(args, &params, &format!("{}()", name), false)?;
         // Forwarding calls (self::/parent::/static::) preserve the
         // current late-static-binding class instead of resetting it to
         // the resolved target: `parent::__construct()` on a subclass
