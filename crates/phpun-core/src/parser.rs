@@ -2397,21 +2397,36 @@ impl<'a> Parser<'a> {
                             // hook context at compile time.
                             if let Expr::StaticProp {
                                 class: pc,
-                                name: PropName::Name(pn),
+                                name: pname_expr,
                             } = &e
                             {
+                                // Static prop name: literal name or a
+                                // compile-time scalar `${0}`/`{'p'}` —
+                                // Zend applies the same hook-context
+                                // checks to both (gh17234).
+                                let literal_pn = match pname_expr {
+                                    PropName::Name(pn) => Some(pn.clone()),
+                                    PropName::Expr(inner) => match inner.as_ref() {
+                                        Expr::Int(i) => Some(i.to_string()),
+                                        Expr::Float(f) => Some(f.to_string()),
+                                        Expr::Str(s) => Some(s.clone()),
+                                        _ => None,
+                                    },
+                                    PropName::Var(_) => None,
+                                };
                                 if let Expr::Const(cn) = pc.as_ref() {
-                                    if cn.eq_ignore_ascii_case("parent")
-                                        && (n.eq_ignore_ascii_case("get")
-                                            || n.eq_ignore_ascii_case("set"))
-                                    {
-                                        if self.cur_class.is_empty() {
-                                            return Err(PhpError::fatal(
+                                    if let Some(pn) = &literal_pn {
+                                        if cn.eq_ignore_ascii_case("parent")
+                                            && (n.eq_ignore_ascii_case("get")
+                                                || n.eq_ignore_ascii_case("set"))
+                                        {
+                                            if self.cur_class.is_empty() {
+                                                return Err(PhpError::fatal(
                                                 "Cannot use \"parent\" when no class scope is active",
                                                 self.line(),
                                             ));
-                                        }
-                                        match &self.hook_ctx {
+                                            }
+                                            match &self.hook_ctx {
                                             None => {
                                                 return Err(PhpError::fatal(
                                                     format!(
@@ -2443,6 +2458,7 @@ impl<'a> Parser<'a> {
                                                     ));
                                                 }
                                             }
+                                        }
                                         }
                                     }
                                 }

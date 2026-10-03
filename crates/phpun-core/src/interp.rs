@@ -2711,6 +2711,16 @@ impl<'a> Interp<'a> {
                         let i = key.to_int();
                         Ok(i >= 0 && (i as usize) < s.len())
                     }
+                    Value::Object(o) => {
+                        if self.obj_is_a(&o, "ArrayAccess") {
+                            match self.method_invoke(o, "offsetExists", vec![cell(key)]) {
+                                Ok(v) => Ok(v.is_truthy()),
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            Ok(false)
+                        }
+                    }
                     _ => Ok(false),
                 }
             }
@@ -3056,6 +3066,22 @@ impl<'a> Interp<'a> {
             Late::Index { base, key, append } => {
                 // A clobbered (call-result) dim falls back to the RHS
                 // value; a real `[]` always appends (bug21961).
+                let aa_obj = {
+                    let b = base.borrow();
+                    match &*b {
+                        Value::Object(o) if self.obj_is_a(o, "ArrayAccess") => Some(o.clone()),
+                        _ => None,
+                    }
+                };
+                if let Some(o) = aa_obj {
+                    // `$o[k] = v` on ArrayAccess -> offsetSet.
+                    let kv = key.clone().unwrap_or_else(|| newv.clone());
+                    match self.method_invoke(o, "offsetSet", vec![cell(kv), cell(newv.clone())]) {
+                        Ok(_) => {}
+                        Err(e) => return Err(e),
+                    }
+                    return Ok(newv);
+                }
                 let mut b = base.borrow_mut();
                 if matches!(*b, Value::Null) {
                     *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
@@ -3431,6 +3457,32 @@ impl<'a> Interp<'a> {
         let mut c = self.eval_cell(e)?;
         let last = keys.len() - 1;
         for (n, k) in keys.iter().enumerate() {
+            // ArrayAccess object offset path: `$o[k]` dispatches to
+            // offsetSet/offsetGet instead of writing through a cell.
+            let as_obj = {
+                let b = c.borrow();
+                match &*b {
+                    Value::Object(o) if self.obj_is_a(o, "ArrayAccess") => Some(o.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(o) = as_obj {
+                if n == last {
+                    match self.method_invoke(
+                        o,
+                        "offsetSet",
+                        vec![cell(k.clone().unwrap_or(Value::Null)), cell(v.clone())],
+                    ) {
+                        Ok(_) => return Ok(v),
+                        Err(e) => return Err(e),
+                    }
+                }
+                let iv = self
+                    .method_invoke(o, "offsetGet", vec![cell(k.clone().unwrap_or(Value::Null))])
+                    .unwrap_or(Value::Null);
+                c = cell(iv);
+                continue;
+            }
             match self.index_into_key(c.clone(), k.clone()) {
                 Ok(nc) => {
                     if n == last {
@@ -3635,6 +3687,21 @@ impl<'a> Interp<'a> {
                             }
                             Ok(())
                         }
+                        // ArrayAccess object: `$o[k] = v` -> offsetSet.
+                        Ok(bc)
+                            if matches!(*bc.borrow(), Value::Object(ref o)
+                                if self.obj_is_a(o, "ArrayAccess")) =>
+                        {
+                            let o = match &*bc.borrow() {
+                                Value::Object(o) => o.clone(),
+                                _ => unreachable!(),
+                            };
+                            let kv = key.clone().unwrap_or(Value::Null);
+                            match self.method_invoke(o, "offsetSet", vec![cell(kv), cell(v)]) {
+                                Ok(_) => Ok(()),
+                                Err(e) => Err(e),
+                            }
+                        }
                         // Nested dim on a scalar is a Warning, not an Error
                         // (engine_assignExecutionOrder_002) — write is skipped.
                         Ok(bc) => {
@@ -3835,10 +3902,15 @@ impl<'a> Interp<'a> {
                 Ok(Value::Null)
             }
             Value::Object(o) => {
-                // ArrayAccess? basic prop fallback — try get
-                let _ = o;
+                if self.obj_is_a(&o, "ArrayAccess") {
+                    return match self.method_invoke(o, "offsetGet", vec![cell(key)]) {
+                        Ok(v) => Ok(v),
+                        Err(e) => Err(e),
+                    };
+                }
                 if self.silence == 0 {
-                    self.warn(&format!("Cannot use object of type {} as array", ""))?;
+                    let cn = o.borrow().class.name().to_string();
+                    self.warn(&format!("Cannot use object of type {} as array", cn))?;
                 }
                 Ok(Value::Null)
             }
@@ -3862,6 +3934,16 @@ impl<'a> Interp<'a> {
             Some(ie) => Some(self.eval(ie)?),
             None => None,
         };
+        // ArrayAccess object: `unset($o[k])` -> offsetUnset.
+        if let Ok(Value::Object(o)) = self.eval(e) {
+            if self.obj_is_a(&o, "ArrayAccess") {
+                let kv = key.unwrap_or(Value::Null);
+                return match self.method_invoke(o, "offsetUnset", vec![cell(kv)]) {
+                    Ok(_) => Ok(()),
+                    Err(err) => Err(err),
+                };
+            }
+        }
         match e {
             Expr::Var(name) => {
                 if let Some(c) = self.var_cell_opt(name) {
@@ -3875,6 +3957,15 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
             Expr::Index { e: inner, i: ii } => {
+                if let Ok(Value::Object(o)) = self.eval(inner) {
+                    if self.obj_is_a(&o, "ArrayAccess") {
+                        let kv = key.unwrap_or(Value::Null);
+                        match self.method_invoke(o, "offsetUnset", vec![cell(kv)]) {
+                            Ok(_) => return Ok(()),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
                 if let Ok(c) = self.index_cell(inner, ii.as_deref()) {
                     let mut b = c.borrow_mut();
                     if let Value::Array(rc) = &mut *b {
@@ -6489,12 +6580,17 @@ impl<'a> Interp<'a> {
         }) {
             return true;
         }
+        // Ancestor decls: a plain prop or a hook whose body relies on
+        // the implicit backing store (incl. `set => expr`, which the
+        // parser desugars to `$this->prop = e`) makes the effective
+        // property backed even when the nearest impl looks virtual —
+        // the slot already exists (gh20270: parent arrow-set read).
         let mut cur = Some(o.borrow().class.clone());
         while let Some(c) = cur {
             if c.decl
                 .props
                 .iter()
-                .any(|p| p.name == pn && p.hooks.is_none())
+                .any(|p| p.name == pn && (p.hooks.is_none() || Self::prop_is_backed(p)))
             {
                 return true;
             }
@@ -7171,10 +7267,48 @@ impl<'a> Interp<'a> {
                 ));
             }
         }
+        // Named args bind against the hook's params (or the implicit
+        // set's `$value` for a plain parent prop); unknown names are a
+        // catchable Error (gh20270).
+        let pnames: Vec<String> = match &hook {
+            Some((h, _)) => h.params.iter().map(|p| p.name.clone()).collect(),
+            None => {
+                if is_get {
+                    Vec::new()
+                } else {
+                    vec!["value".to_string()]
+                }
+            }
+        };
         let argvals = {
-            let mut vs = Vec::new();
+            let mut vs: Vec<Value> = Vec::new();
             for a in args {
-                vs.push(self.eval(a)?);
+                match a {
+                    Expr::Binary {
+                        op: "named", l, r, ..
+                    } => {
+                        let n = match self.eval(l)? {
+                            Value::Str(s) => s.to_string(),
+                            v => v.to_php_string(),
+                        };
+                        match pnames.iter().position(|p| *p == n) {
+                            Some(i) => {
+                                while vs.len() <= i {
+                                    vs.push(Value::Null);
+                                }
+                                vs[i] = self.eval(r)?;
+                            }
+                            None => {
+                                return self.fail(PhpError::uncaught(
+                                    "Error",
+                                    format!("Unknown named parameter ${}", n),
+                                    0,
+                                ));
+                            }
+                        }
+                    }
+                    _ => vs.push(self.eval(a)?),
+                }
             }
             vs
         };
@@ -7404,6 +7538,26 @@ impl<'a> Interp<'a> {
                             self.last_ret_cell = None;
                             let v = self.run_hook(&o, c, &pd.name, h, None)?;
                             return Ok(self.last_ret_cell.take().unwrap_or_else(|| cell(v)));
+                        }
+                        // `$obj->hooked[k] = v`: zend fetches the hooked
+                        // prop once; when the result is an object the
+                        // index op applies to the object itself (objects
+                        // pass by handle), e.g. ArrayAccess offsetSet
+                        // (object_in_hook.phpt). Arrays/scalars still
+                        // need `&get` for the write to land.
+                        if let Some((gh, gc)) = hs
+                            .iter()
+                            .find(|(h, _)| h.is_get && h.body.is_some())
+                            .map(|(h, c)| (h.clone(), c.clone()))
+                        {
+                            let vis = gh.visibility.unwrap_or(pd.visibility);
+                            if !self.hook_scope_allows(&o, &gc, &pd.name, vis) {
+                                return self.hook_visibility_error(&gc, &pd.name, vis);
+                            }
+                            let gv = self.run_hook(&o, &gc, &pd.name, &gh, None)?;
+                            if matches!(gv, Value::Object(_)) {
+                                return Ok(cell(gv));
+                            }
                         }
                         return self.fail(PhpError::uncaught(
                             "Error",
