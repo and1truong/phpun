@@ -21,9 +21,9 @@ pub struct Parser<'a> {
     /// (prop name, is_get) while inside a hook body — gates
     /// `parent::$p::get()/set()` syntax.
     hook_ctx: Option<(String, bool)>,
-    /// `#[Attr]` names consumed at the statement level, pending the
-    /// following class declaration.
-    pending_class_attrs: Vec<String>,
+    /// `#[Attr]` groups parsed before a declaration statement
+    /// (class or function — whichever consumes them first).
+    pending_class_attrs: Vec<crate::ast::AttrDecl>,
     /// Current `namespace` name ("" = global scope).
     cur_ns: String,
     /// `use` import maps for the current namespace block, keyed by
@@ -1220,73 +1220,104 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// Parse `#[Attr(...)]` groups and return the top-level attribute
-    /// names (possibly `\Qualified`; args are discarded).
-    fn parse_attrs(&mut self) -> Result<Vec<String>, PhpError> {
-        let mut names = Vec::new();
-        while self.eat_op("#[") {
-            let mut depth = 1i32;
-            let mut cur = String::new();
-            let mut in_name = true;
-            while depth > 0 {
-                match self.next() {
-                    Some(Token::Op("[")) | Some(Token::Op("#[")) => {
-                        depth += 1;
-                        in_name = false;
+    /// Line of the statement an attribute group attaches to: scans past
+    /// the group's closing `]` (and any further `]` from sibling groups
+    /// is not needed — the first `]` at depth 0 ends the scan).
+    /// Zend reports attribute-arg compile fatals on the attributed
+    /// declaration's line (first_class_callable_011,
+    /// named_params/attributes_*).
+    fn line_after_attr_group(&self) -> usize {
+        let mut i = self.pos;
+        let mut d = 0i32;
+        while i < self.toks.len() {
+            match &self.toks[i].token {
+                Token::Op("(") | Token::Op("[") | Token::Op("#[") => d += 1,
+                Token::Op(")") => {
+                    if d > 0 {
+                        d -= 1;
                     }
-                    Some(Token::Op("]")) => {
-                        depth -= 1;
-                        if depth == 0 && !cur.is_empty() {
-                            names.push(cur.clone());
-                        }
-                    }
-                    Some(Token::Op(",")) if depth == 1 => {
-                        if !cur.is_empty() {
-                            names.push(cur.clone());
-                        }
-                        cur = String::new();
-                        in_name = true;
-                    }
-                    Some(Token::Op("(")) => {
-                        // `(` followed by `...` is FCC syntax —
-                        // a compile-time fatal inside attribute
-                        // args (first_class_callable_011).
-                        if self.at_op("...") {
-                            // Zend reports the line of the attributed
-                            // declaration (the stmt after `]`), not the
-                            // arg itself (first_class_callable_011).
-                            let mut i = self.pos;
-                            let mut d = 1i32;
-                            while i < self.toks.len() && d > 0 {
-                                match &self.toks[i].token {
-                                    Token::Op("(") | Token::Op("[") | Token::Op("#[") => d += 1,
-                                    Token::Op(")") | Token::Op("]") => d -= 1,
-                                    _ => {}
-                                }
-                                i += 1;
-                            }
-                            // `i` now sits on the group's closing
-                            // `]` — the attributed stmt follows it.
-                            while self.toks.get(i).is_some_and(|t| t.token == Token::Op("]")) {
-                                i += 1;
-                            }
-                            let line = self.toks.get(i).map(|t| t.line).unwrap_or(0);
-                            return Err(PhpError::fatal(
-                                "Cannot create Closure as attribute argument",
-                                line,
-                            ));
-                        }
-                        depth += 1;
-                        in_name = false;
-                    }
-                    Some(Token::Ident(n)) if in_name => cur.push_str(&n),
-                    Some(Token::Op("\\")) if in_name => cur.push('\\'),
-                    Some(_) => {}
-                    None => return Ok(names),
                 }
+                Token::Op("]") => {
+                    if d == 0 {
+                        i += 1;
+                        break;
+                    }
+                    d -= 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        while self.toks.get(i).is_some_and(|t| t.token == Token::Op("]")) {
+            i += 1;
+        }
+        self.toks.get(i).map(|t| t.line).unwrap_or(0)
+    }
+
+    /// Parse `#[Attr(...)]` groups, keeping names and arg Exprs.
+    fn parse_attrs(&mut self) -> Result<Vec<crate::ast::AttrDecl>, PhpError> {
+        let mut attrs = Vec::new();
+        while self.eat_op("#[") {
+            loop {
+                let line = self.line();
+                let name = self.name_path().ok_or_else(|| {
+                    PhpError::parse(
+                        "syntax error, unexpected token, expecting attribute name",
+                        self.line(),
+                    )
+                })?;
+                let mut args = Vec::new();
+                if self.at_op("(") {
+                    // `(` followed by `...` is FCC syntax — a compile-time
+                    // fatal inside attribute args (first_class_callable_011),
+                    // reported on the attributed declaration's line.
+                    self.pos += 1;
+                    if self.at_op("...") {
+                        let line = self.line_after_attr_group();
+                        return Err(PhpError::compile_fatal(
+                            "Cannot create Closure as attribute argument",
+                            line,
+                        ));
+                    }
+                    self.pos -= 1;
+                    self.expect_op("(")?;
+                    match self.args() {
+                        Ok(list) => {
+                            // Duplicate named args are a compile-time
+                            // fatal for attribute args (unlike calls,
+                            // which warn at bind time).
+                            let mut seen = std::collections::HashSet::new();
+                            for a in &list {
+                                if let Expr::Binary { op: "named", l, .. } = a {
+                                    if let Expr::Str(n) = l.as_ref() {
+                                        if !seen.insert(n.clone()) {
+                                            let line = self.line_after_attr_group();
+                                            return Err(PhpError::compile_fatal(
+                                                format!("Duplicate named parameter ${}", n),
+                                                line,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            args = list;
+                        }
+                        Err(e) if matches!(e.kind, crate::error::ErrorKind::Fatal) => {
+                            let line = self.line_after_attr_group();
+                            return Err(PhpError::compile_fatal(&e.message, line));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                attrs.push(crate::ast::AttrDecl { name, args, line });
+                if self.eat_op(",") {
+                    continue;
+                }
+                self.expect_op("]")?;
+                break;
             }
         }
-        Ok(names)
+        Ok(attrs)
     }
 
     fn class_decl(&mut self) -> Result<Stmt, PhpError> {
@@ -1589,6 +1620,7 @@ impl<'a> Parser<'a> {
                 name,
                 params,
                 body,
+                attrs: vec![],
                 by_ref,
                 line,
                 file: String::new(),
@@ -1965,6 +1997,7 @@ impl<'a> Parser<'a> {
             name,
             params,
             body,
+            attrs: std::mem::take(&mut self.pending_class_attrs),
             by_ref,
             line,
             file: String::new(),
@@ -2028,6 +2061,7 @@ impl<'a> Parser<'a> {
                 name: String::new(),
                 params,
                 body,
+                attrs: vec![],
                 by_ref,
                 line,
                 file: String::new(),
@@ -3182,12 +3216,19 @@ impl<'a> Parser<'a> {
     fn args(&mut self) -> Result<Vec<Expr>, PhpError> {
         let mut args = Vec::new();
         let mut unpacked = false;
+        let mut seen_named = false;
         while !self.at_op(")") {
             if self.at_op("...") {
                 self.pos += 1;
                 if args.is_empty() && self.eat_op(")") {
                     // `f(...)` — first-class callable marker.
                     return Ok(vec![Expr::FccMark]);
+                }
+                if seen_named {
+                    return Err(PhpError::compile_fatal(
+                        "Cannot use argument unpacking after named arguments",
+                        self.line(),
+                    ));
                 }
                 args.push(Expr::Unpack(Box::new(self.expr()?)));
                 unpacked = true;
@@ -3208,9 +3249,16 @@ impl<'a> Parser<'a> {
                     l: Box::new(Expr::Str(n)),
                     r: Box::new(v),
                 });
+                seen_named = true;
             } else {
+                if seen_named {
+                    return Err(PhpError::compile_fatal(
+                        "Cannot use positional argument after named argument",
+                        self.line(),
+                    ));
+                }
                 if unpacked {
-                    return Err(PhpError::fatal(
+                    return Err(PhpError::compile_fatal(
                         "Cannot use positional argument after argument unpacking",
                         self.line(),
                     ));

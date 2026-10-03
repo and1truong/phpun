@@ -46,6 +46,42 @@ impl ObjHandle {
     }
 }
 
+/// Evaluated call arguments: positional cells (call order) plus named
+/// entries the callee binds by param name (Zend/tests/named_params).
+pub struct CallArgs {
+    pub cells: Vec<Cell>,
+    /// `(name, cell, by_ref_ok, from_traversable)` — by_ref_ok marks
+    /// entries whose source expression was refable (`ref: $x`);
+    /// literals bind by value with a warning on by-ref params
+    /// (named_params/call_user_func). from_traversable marks cells
+    /// produced by unpacking a Traversable — by-ref params bind them
+    /// by value with a different warning (named_params/unpack).
+    pub named: Vec<(String, Cell, bool, bool)>,
+    /// Positional indexes (into `cells`) produced by Traversable unpack.
+    pub trav_cells: Vec<usize>,
+}
+
+impl CallArgs {
+    pub fn positional(cells: Vec<Cell>) -> Self {
+        Self {
+            cells,
+            named: Vec::new(),
+            trav_cells: Vec::new(),
+        }
+    }
+    pub fn empty() -> Self {
+        Self::positional(Vec::new())
+    }
+}
+
+/// Reads (len/get/iter/index) treat the arg list as its positional cells.
+impl std::ops::Deref for CallArgs {
+    type Target = [Cell];
+    fn deref(&self) -> &[Cell] {
+        &self.cells
+    }
+}
+
 pub struct Frame {
     vars: HashMap<String, Cell>,
     /// Actual call args for func_get_args().
@@ -110,6 +146,9 @@ pub struct Interp<'a> {
     /// Accumulated program output (display_errors prints to stdout under
     /// CLI, and the PHPT harness merges streams via 2>&1).
     pub out: String,
+    /// PHP CLI logs every diagnostic to stderr as `PHP <Level>: msg` when
+    /// log_errors is on (default); the harness merges stderr after stdout.
+    pub err_buf: String,
     /// Headers queued by header()/setcookie() — `phpun serve` emits them
     /// into the HTTP response; CLI ignores them (like php-cli).
     pub out_headers: Vec<String>,
@@ -194,6 +233,10 @@ pub struct Interp<'a> {
     /// File the last `fail()` was raised in (uncaught-print attribution
     /// for engine errors — `self.file` is always the entry script).
     last_err_file: String,
+    /// Rendered arg list of the current `assert()` call — the
+    /// AssertionError message shows `assert(<args>)` as written
+    /// (named_params/assert's `assert(assertion: false)`).
+    pub(crate) assert_src: String,
     /// Bytes emitted so far — memory_limit bookkeeping.
     pub mem_used: u64,
     /// Size of the last emit — the 'tried to allocate' figure.
@@ -240,6 +283,9 @@ impl<'a> Interp<'a> {
         constants.insert("INI_PERDIR".into(), Value::Int(2));
         constants.insert("INI_SYSTEM".into(), Value::Int(4));
         constants.insert("INI_ALL".into(), Value::Int(7));
+        constants.insert("STR_PAD_RIGHT".into(), Value::Int(1));
+        constants.insert("STR_PAD_LEFT".into(), Value::Int(0));
+        constants.insert("STR_PAD_BOTH".into(), Value::Int(2));
         constants.insert("PHP_INT_MAX".into(), Value::Int(i64::MAX));
         constants.insert("PHP_INT_MIN".into(), Value::Int(i64::MIN));
         constants.insert("PHP_INT_SIZE".into(), Value::Int(8));
@@ -317,6 +363,7 @@ impl<'a> Interp<'a> {
             early_bound_classes: HashSet::new(),
             constants,
             out: String::new(),
+            err_buf: String::new(),
             out_headers: Vec::new(),
             resp_code: 200,
             ob_stack: Vec::new(),
@@ -348,6 +395,7 @@ impl<'a> Interp<'a> {
             internal_cb: 0,
             cur_file: file.to_string(),
             last_err_file: String::new(),
+            assert_src: String::new(),
             mem_used: 0,
             mem_last: 0,
             mem_exceeded: false,
@@ -463,6 +511,7 @@ impl<'a> Interp<'a> {
                     name: name.into(),
                     params: vec![],
                     body: vec![],
+                    attrs: vec![],
                     by_ref: false,
                     line: 0,
                     file: String::new(),
@@ -506,6 +555,7 @@ impl<'a> Interp<'a> {
                             name: m.to_string(),
                             params: vec![],
                             body: vec![],
+                            attrs: vec![],
                             by_ref: false,
                             line: 0,
                             file: String::new(),
@@ -537,6 +587,84 @@ impl<'a> Interp<'a> {
             true,
         );
         reg(iface("Countable", &[], &["count"]), true);
+        reg(iface("SeekableIterator", &["Iterator"], &["seek"]), true);
+        // ArrayIterator — SPL iterator over an array; methods are
+        // native-dispatched (array_iter_method) on the ArrayIter
+        // internal. Named-arg params carry the Zend stub names.
+        let stub_method = |name: &str, params: &[&str]| {
+            Rc::new(MethodDecl {
+                decl: FunctionDecl {
+                    name: name.into(),
+                    params: params
+                        .iter()
+                        .map(|n| Param {
+                            name: n.to_string(),
+                            default: None,
+                            by_ref: false,
+                            variadic: false,
+                            ty: None,
+                            promoted: false,
+                            vis: None,
+                            readonly: false,
+                            is_final: false,
+                            set_vis: None,
+                            hooks: None,
+                        })
+                        .collect(),
+                    body: vec![],
+                    attrs: vec![],
+                    by_ref: false,
+                    line: 0,
+                    file: String::new(),
+                    ns: String::new(),
+                },
+                is_static: false,
+                is_abstract: false,
+                is_final: false,
+                visibility: Visibility::Public,
+            })
+        };
+        reg(
+            ClassDecl {
+                name: "ArrayIterator".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![
+                    "SeekableIterator".into(),
+                    "ArrayAccess".into(),
+                    "Countable".into(),
+                ],
+                attrs: vec![],
+                traits: vec![],
+                methods: vec![
+                    stub_method("__construct", &["array", "flags"]),
+                    stub_method("rewind", &[]),
+                    stub_method("valid", &[]),
+                    stub_method("current", &[]),
+                    stub_method("key", &[]),
+                    stub_method("next", &[]),
+                    stub_method("count", &[]),
+                    stub_method("offsetGet", &["key"]),
+                    stub_method("offsetExists", &["key"]),
+                    stub_method("offsetSet", &["key", "value"]),
+                    stub_method("offsetUnset", &["key"]),
+                    stub_method("getArrayCopy", &[]),
+                    stub_method("seek", &["offset"]),
+                    stub_method("getFlags", &[]),
+                    stub_method("setFlags", &["flags"]),
+                    stub_method("asort", &["flags"]),
+                    stub_method("ksort", &["flags"]),
+                    stub_method("natcasesort", &[]),
+                    stub_method("natsort", &[]),
+                ],
+                props: vec![],
+                consts: vec![],
+            },
+            false,
+        );
         reg(
             iface(
                 "ArrayAccess",
@@ -626,6 +754,7 @@ impl<'a> Interp<'a> {
                             hooks: None,
                         }],
                         body: vec![],
+                        attrs: vec![],
                         by_ref: false,
                         line: 0,
                         file: String::new(),
@@ -651,6 +780,7 @@ impl<'a> Interp<'a> {
                     name: name.into(),
                     params,
                     body: vec![],
+                    attrs: vec![],
                     by_ref: false,
                     line: 0,
                     file: String::new(),
@@ -675,6 +805,19 @@ impl<'a> Interp<'a> {
             set_vis: None,
             hooks: None,
         };
+        let any_param = |n: &str, variadic: bool| Param {
+            name: n.into(),
+            default: None,
+            by_ref: false,
+            variadic,
+            ty: None,
+            promoted: false,
+            vis: None,
+            readonly: false,
+            is_final: false,
+            set_vis: None,
+            hooks: None,
+        };
         reg(
             ClassDecl {
                 name: "ReflectionClass".into(),
@@ -687,12 +830,119 @@ impl<'a> Interp<'a> {
                 attrs: vec![],
                 traits: vec![],
                 methods: vec![
-                    mk_method("__construct", vec![str_param("class")]),
+                    mk_method("__construct", vec![any_param("class", false)]),
                     mk_method("newInstanceWithoutConstructor", vec![]),
+                    mk_method("newInstance", vec![any_param("args", true)]),
+                    mk_method("newInstanceArgs", vec![any_param("args", false)]),
+                    mk_method("getName", vec![]),
+                    mk_method("getAttributes", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+            },
+            false,
+        );
+        reg(
+            ClassDecl {
+                name: "ReflectionFunction".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                methods: vec![
+                    mk_method("__construct", vec![any_param("function", false)]),
+                    mk_method("invoke", vec![any_param("args", true)]),
+                    mk_method("invokeArgs", vec![any_param("args", false)]),
+                    mk_method("getName", vec![]),
+                    mk_method("getAttributes", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+            },
+            false,
+        );
+        reg(
+            ClassDecl {
+                name: "ReflectionMethod".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                methods: vec![
+                    mk_method(
+                        "__construct",
+                        vec![any_param("class", false), any_param("name", false)],
+                    ),
+                    mk_method(
+                        "invoke",
+                        vec![any_param("object", false), any_param("args", true)],
+                    ),
+                    mk_method(
+                        "invokeArgs",
+                        vec![any_param("object", false), any_param("args", false)],
+                    ),
                     mk_method("getName", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
+            },
+            false,
+        );
+        // ReflectionAttribute — produced by getAttributes(); carries the
+        // attribute name + unevaluated arg exprs + target kind.
+        reg(
+            ClassDecl {
+                name: "ReflectionAttribute".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                methods: vec![
+                    mk_method("getName", vec![]),
+                    mk_method("getArguments", vec![]),
+                    mk_method("newInstance", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+            },
+            false,
+        );
+        // Attribute — the `#[Attribute]` marker class + TARGET_* flags.
+        reg(
+            ClassDecl {
+                name: "Attribute".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                methods: vec![],
+                props: vec![],
+                consts: vec![
+                    ("TARGET_CLASS".into(), Expr::Int(1)),
+                    ("TARGET_FUNCTION".into(), Expr::Int(2)),
+                    ("TARGET_METHOD".into(), Expr::Int(4)),
+                    ("TARGET_PROPERTY".into(), Expr::Int(8)),
+                    ("TARGET_CLASS_CONSTANT".into(), Expr::Int(16)),
+                    ("TARGET_PARAMETER".into(), Expr::Int(32)),
+                    ("TARGET_ALL".into(), Expr::Int(63)),
+                    ("IS_REPEATABLE".into(), Expr::Int(64)),
+                ],
             },
             false,
         );
@@ -847,7 +1097,7 @@ impl<'a> Interp<'a> {
                 // set_exception_handler replaces the uncaught display
                 // entirely; exit is still 255 (bug23279).
                 if let Some(h) = self.exception_handler.clone() {
-                    let _ = self.call_value(&h, vec![cell(v)]);
+                    let _ = self.call_value(&h, CallArgs::positional(vec![cell(v)]));
                 } else {
                     self.uncaught(&v);
                 }
@@ -871,7 +1121,7 @@ impl<'a> Interp<'a> {
     fn run_shutdown(&mut self) {
         let fns = std::mem::take(&mut self.shutdown_fns);
         for (f, args) in fns {
-            let _ = self.call_value(&f, args);
+            let _ = self.call_value(&f, CallArgs::positional(args));
         }
         // Zend calls __destruct on live objects after shutdown functions
         // and before output buffers flush — destructors still see their
@@ -888,7 +1138,7 @@ impl<'a> Interp<'a> {
                 .is_some()
             {
                 self.destructed.insert(key);
-                let _ = self.method_invoke(o.clone(), "__destruct", vec![]);
+                let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
             }
         }
         if !self.mem_exceeded {
@@ -1161,7 +1411,7 @@ impl<'a> Interp<'a> {
                 cell(Value::Int(self.cur_line as i64)),
             ];
             self.in_handler = true;
-            let r = self.call_value(&h, args);
+            let r = self.call_value(&h, CallArgs::positional(args));
             self.in_handler = false;
             match r {
                 Err(e) => return Err(e),
@@ -1204,8 +1454,9 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// PHP CLI also logs a `PHP <Level>:` line to stderr, but PHPT EXPECT
-    /// sections only contain the display_errors output: `\n<Level>: msg`.
+    /// PHP CLI also logs a `PHP <Level>:` line to stderr (log_errors is
+    /// on by default) — buffered separately so it lands after stdout in
+    /// the merged PHPT stream.
     /// html_errors=1 switches to the `<b>` docref format (bug35176).
     fn diag(&mut self, level: &str, msg: &str) {
         if self.ini_on("html_errors") {
@@ -1226,6 +1477,27 @@ impl<'a> Interp<'a> {
                 self.cur_line
             ));
         }
+        self.log_diag(level, msg);
+    }
+
+    /// stderr copy of a diagnostic (`PHP Warning: ...`); log_errors
+    /// defaults on and error_log to a file would change the destination,
+    /// which we don't model yet.
+    fn log_diag(&mut self, level: &str, msg: &str) {
+        let log_errors = self
+            .ini
+            .get("log_errors")
+            .is_none_or(|v| matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes"));
+        if !log_errors {
+            return;
+        }
+        self.err_buf.push_str(&format!(
+            "PHP {}:  {} in {} on line {}\n",
+            level,
+            msg,
+            self.diag_file(),
+            self.cur_line
+        ));
     }
 
     /// html_errors docref: `fn(args): rest` becomes
@@ -1293,6 +1565,16 @@ impl<'a> Interp<'a> {
             "\nParse error: {} in {} on line {}\n",
             e.message, self.file, e.line
         ));
+        let log_errors = self
+            .ini
+            .get("log_errors")
+            .is_none_or(|v| matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes"));
+        if log_errors {
+            self.err_buf.push_str(&format!(
+                "PHP Parse error:  {} in {} on line {}\n",
+                e.message, self.file, e.line
+            ));
+        }
     }
 
     fn print_fatal(&mut self, e: &PhpError) {
@@ -1305,9 +1587,9 @@ impl<'a> Interp<'a> {
                 }
                 t.push_str(&format!("#{} {{main}}\n", frames.len()));
                 let ef = if self.last_err_file.is_empty() {
-                    self.file
+                    self.file.to_string()
                 } else {
-                    &self.last_err_file
+                    self.last_err_file.clone()
                 };
                 self.emit(&format!(
                     "\nFatal error: Uncaught {}: {} in {}:{}\nStack trace:\n{}  thrown in {} on line {}\n",
@@ -1319,17 +1601,48 @@ impl<'a> Interp<'a> {
                     ef,
                     e.thrown_line.unwrap_or(e.line)
                 ));
+                let log_errors = self.ini.get("log_errors").is_none_or(|v| {
+                    matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
+                });
+                if log_errors {
+                    self.err_buf.push_str(&format!(
+                        "PHP Fatal error:  Uncaught {}: {} in {}:{}\nStack trace:\n{}  thrown in {} on line {}\n",
+                        class,
+                        e.message,
+                        ef,
+                        e.line,
+                        t,
+                        ef,
+                        e.thrown_line.unwrap_or(e.line)
+                    ));
+                }
             }
-            // Plain fatals (compile errors, E_ERROR) print no trace.
+            // Plain fatals (E_ERROR) print no trace; compile fatals
+            // (duplicate named args, positional-after-named, ...) carry a
+            // `Stack trace:\n#0 {main}` block like the engine's.
             _ => {
                 let ef = if self.last_err_file.is_empty() {
-                    self.file
+                    self.file.to_string()
                 } else {
-                    &self.last_err_file
+                    self.last_err_file.clone()
+                };
+                let backtraces = self.ini.get("fatal_error_backtraces").is_none_or(|v| {
+                    !matches!(v.to_lowercase().as_str(), "0" | "off" | "false" | "no" | "")
+                });
+                let tr = match &e.trace {
+                    Some(frames) if backtraces => {
+                        let mut t = String::from("Stack trace:\n");
+                        for (i, fr) in frames.iter().enumerate() {
+                            t.push_str(&format!("#{} {}\n", i, fr));
+                        }
+                        t.push_str(&format!("#{} {{main}}\n", frames.len()));
+                        t
+                    }
+                    _ => String::new(),
                 };
                 let s = format!(
-                    "\nFatal error: {} in {} on line {}\n",
-                    e.message, ef, e.line
+                    "\nFatal error: {} in {} on line {}\n{}",
+                    e.message, ef, e.line, tr
                 );
                 if self.mem_exceeded {
                     // Memory-exhausted: buffers are dropped, so the
@@ -1337,6 +1650,15 @@ impl<'a> Interp<'a> {
                     self.out.push_str(&s);
                 } else {
                     self.emit(&s);
+                }
+                let log_errors = self.ini.get("log_errors").is_none_or(|v| {
+                    matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
+                });
+                if log_errors {
+                    self.err_buf.push_str(&format!(
+                        "PHP Fatal error:  {} in {} on line {}\n{}",
+                        e.message, ef, e.line, tr
+                    ));
                 }
             }
         }
@@ -1415,6 +1737,19 @@ impl<'a> Interp<'a> {
                         "\nFatal error: Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
                         class, colon, msg, file, line, tr, file, thrown
                     ));
+                    // The PHP CLI SAPI also logs the uncaught to stderr
+                    // when log_errors is on (its default); merged-output
+                    // PHPT runs see it as a `PHP Fatal error:` copy of
+                    // the same block.
+                    let log_errors = self.ini.get("log_errors").is_none_or(|v| {
+                        matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
+                    });
+                    if log_errors {
+                        self.err_buf.push_str(&format!(
+                            "PHP Fatal error:  Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
+                            class, colon, msg, file, line, tr, file, thrown
+                        ));
+                    }
                 }
             }
         } else {
@@ -1476,7 +1811,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Builtin call — errors become catchable throwables via `fail`.
-    fn call_builtin(&mut self, name: &str, args: &[Cell]) -> Result<Option<Value>, PhpError> {
+    fn call_builtin(&mut self, name: &str, args: &CallArgs) -> Result<Option<Value>, PhpError> {
         self.call_trace.push(TraceFrame {
             function: name.to_string(),
             class: None,
@@ -1484,14 +1819,269 @@ impl<'a> Interp<'a> {
             file: self.diag_file(),
             line: self.cur_line as u32,
             args: args.to_vec(),
+            named_args: args
+                .named
+                .iter()
+                .map(|(n, c, ..)| (n.clone(), c.clone()))
+                .collect(),
             internal: true,
         });
-        let r = builtins::call(self, name, args);
-        self.call_trace.pop();
-        match r {
-            Ok(r) => Ok(r),
-            Err(e) => self.fail(e),
+        if name == "assert" {
+            // AssertionError message = `assert(<args>)` as written.
+            let mut parts: Vec<String> = Vec::new();
+            for c in &args.cells {
+                parts.push(assert_arg_repr(&c.borrow()));
+            }
+            for (n, c, ..) in &args.named {
+                parts.push(format!("{}: {}", n, assert_arg_repr(&c.borrow())));
+            }
+            self.assert_src = parts.join(", ");
         }
+        if !args.named.is_empty() && matches!(name, "call_user_func" | "forward_static_call") {
+            // call_user_func forwards named args to the callee, not to
+            // its own `callback` param (named_params/call_user_func).
+            let cb = args
+                .cells
+                .first()
+                .map(|c| c.borrow().clone())
+                .unwrap_or(Value::Null);
+            let ca = CallArgs {
+                cells: args.cells[1.min(args.cells.len())..].to_vec(),
+                named: args.named.clone(),
+                trav_cells: args
+                    .trav_cells
+                    .iter()
+                    .filter(|i| **i >= 1)
+                    .map(|i| i - 1)
+                    .collect(),
+            };
+            let r = self.call_value(&cb, ca);
+            self.call_trace.pop();
+            return match r {
+                Ok(v) => Ok(Some(v)),
+                Err(e) => self.fail(e),
+            };
+        }
+        match builtins::builtin_params(name) {
+            // Internal fns with a known signature get Zend's named-arg
+            // resolution AND positional arity checks.
+            Some(params) => {
+                let r = match self.resolve_named_builtin(name, params, args) {
+                    Ok(cells) => builtins::call(self, name, &cells),
+                    Err(e) => Err(e),
+                };
+                // fail() captures call_trace — pop AFTER it so the
+                // builtin's own frame shows in the backtrace
+                // (`array_multisort(: 1)` in call_user_func_array_variadic).
+                let r = match r {
+                    Ok(v) => Ok(v),
+                    Err(e) => self.fail(e),
+                };
+                self.call_trace.pop();
+                r
+            }
+            // Internal fns without a signature accept no named args;
+            // names that aren't builtins at all fall through so the
+            // userland invoke path sees them.
+            None if builtins::is_builtin(name) && !args.named.is_empty() => {
+                let r = self.fail(PhpError::uncaught(
+                    "Error",
+                    format!("Unknown named parameter ${}", args.named[0].0),
+                    0,
+                ));
+                self.call_trace.pop();
+                r
+            }
+            None => {
+                let r = builtins::call(self, name, args);
+                let r = match r {
+                    Ok(r) => Ok(r),
+                    Err(e) => self.fail(e),
+                };
+                self.call_trace.pop();
+                r
+            }
+        }
+    }
+
+    /// Reorder named args to positional cells against an internal
+    /// function's stub signature (Zend/tests/named_params/internal*).
+    /// By-ref params receive the caller's cell; defaults fill interior
+    /// gaps; unknown names are the "Unknown named parameter" Error
+    /// (variadic-only stubs reject with a different message).
+    fn resolve_named_builtin(
+        &mut self,
+        name: &str,
+        params: &[(&'static str, builtins::BDef)],
+        args: &CallArgs,
+    ) -> Result<Vec<Cell>, PhpError> {
+        use builtins::BDef;
+        // Internal functions whose variadic is declared Z_PARAM_VARIADIC
+        // ('*') reject every named arg (zend_compile "does not accept
+        // unknown named parameters").
+        const NAMED_REJECT: &[&str] = &[
+            "array_merge",
+            "array_merge_recursive",
+            "array_diff",
+            "array_diff_key",
+            "array_diff_assoc",
+            "array_diff_ukey",
+            "array_diff_uassoc",
+            "array_udiff",
+            "array_udiff_assoc",
+            "array_udiff_uassoc",
+            "array_intersect",
+            "array_intersect_key",
+            "array_intersect_assoc",
+            "array_intersect_ukey",
+            "array_intersect_uassoc",
+            "array_uintersect",
+            "array_uintersect_assoc",
+            "array_uintersect_uassoc",
+        ];
+        if NAMED_REJECT.contains(&name) && !args.named.is_empty() {
+            return Err(PhpError::uncaught(
+                "ArgumentCountError",
+                format!("{}() does not accept unknown named parameters", name),
+                0,
+            ));
+        }
+        let variadic = params.iter().any(|(_, d)| matches!(d, BDef::Var));
+        let n_fixed = params
+            .iter()
+            .take_while(|(_, d)| !matches!(d, BDef::Var))
+            .count();
+        let required = params[..n_fixed]
+            .iter()
+            .filter(|(_, d)| matches!(d, BDef::Req))
+            .count();
+        // Positional arity errors use Zend's internal-function wording:
+        // "expects exactly" when all fixed params are required, else
+        // "at least"/"at most" with the required/fixed bound.
+        let arity_err = |got: usize, over: bool| {
+            let (word, n) = if !variadic && over {
+                if required == n_fixed {
+                    ("exactly", n_fixed)
+                } else {
+                    ("at most", n_fixed)
+                }
+            } else if required == n_fixed && !variadic {
+                ("exactly", required)
+            } else {
+                // Optional params or a variadic tail: "at least".
+                ("at least", required)
+            };
+            PhpError::uncaught(
+                "ArgumentCountError",
+                format!(
+                    "{}() expects {} {} argument{}, {} given",
+                    name,
+                    word,
+                    n,
+                    if n == 1 { "" } else { "s" },
+                    got
+                ),
+                0,
+            )
+        };
+        let mut slot: Vec<Option<Cell>> = vec![None; n_fixed];
+        let mut extra_pos: Vec<Cell> = Vec::new();
+        for (i, c) in args.cells.iter().enumerate() {
+            if i < n_fixed {
+                slot[i] = Some(c.clone());
+            } else {
+                extra_pos.push(c.clone());
+            }
+        }
+        if !variadic && !extra_pos.is_empty() {
+            return Err(arity_err(args.cells.len(), true));
+        }
+        // `assert(description: X)` with no positional/assertion arg hits
+        // a Zend arg-parsing quirk that reports an overwrite (assert.phpt).
+        if name == "assert" && args.cells.is_empty() {
+            if let Some((n, ..)) = args.named.iter().find(|(n, ..)| n == "description") {
+                if !args.named.iter().any(|(n, ..)| n == "assertion") {
+                    return Err(PhpError::uncaught(
+                        "Error",
+                        format!("Named parameter ${} overwrites previous argument", n),
+                        0,
+                    ));
+                }
+            }
+        }
+        let mut any_fixed_named = false;
+        for (n, c, ..) in &args.named {
+            match params[..n_fixed]
+                .iter()
+                .position(|(pn, _)| *pn == n.as_str())
+            {
+                Some(j) if slot[j].is_some() => {
+                    return Err(PhpError::uncaught(
+                        "Error",
+                        format!("Named parameter ${} overwrites previous argument", n),
+                        0,
+                    ))
+                }
+                Some(j) => {
+                    slot[j] = Some(c.clone());
+                    any_fixed_named = true;
+                }
+                None if variadic => extra_pos.push(c.clone()),
+                None => {
+                    return Err(PhpError::uncaught(
+                        "Error",
+                        format!("Unknown named parameter ${}", n),
+                        0,
+                    ))
+                }
+            }
+        }
+        // Materialize through the last bound slot: interior gaps take
+        // the param default (an "unknown default" param errors instead),
+        // unbound required params throw ArgumentCountError, unbound
+        // optional tail params are omitted.
+        let last_bound = slot
+            .iter()
+            .rposition(|s| s.is_some())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let mut out: Vec<Cell> = Vec::new();
+        for (i, s) in slot.iter().enumerate() {
+            match s {
+                Some(c) => out.push(c.clone()),
+                None if matches!(params[i].1, BDef::Req) => {
+                    if any_fixed_named {
+                        return Err(PhpError::uncaught(
+                            "ArgumentCountError",
+                            format!(
+                                "{}(): Argument #{} (${}) not passed",
+                                name,
+                                i + 1,
+                                params[i].0
+                            ),
+                            0,
+                        ));
+                    }
+                    return Err(arity_err(args.cells.len(), false));
+                }
+                None if matches!(params[i].1, BDef::Unk) && i < last_bound => {
+                    return Err(PhpError::uncaught(
+                        "ArgumentCountError",
+                        format!(
+                            "{}(): Argument #{} (${}) must be passed explicitly, because the default value is not known",
+                            name,
+                            i + 1,
+                            params[i].0
+                        ),
+                        0,
+                    ));
+                }
+                None if i < last_bound => out.push(cell(params[i].1.val())),
+                None => break,
+            }
+        }
+        out.extend(extra_pos);
+        Ok(out)
     }
 
     fn fail<T>(&mut self, e: PhpError) -> Result<T, PhpError> {
@@ -2263,10 +2853,12 @@ impl<'a> Interp<'a> {
                 if self.obj_is_a(&o, "IteratorAggregate") {
                     let mut cur = o.clone();
                     loop {
-                        let it_obj = match self.method_invoke(cur.clone(), "getIterator", vec![]) {
-                            Ok(v) => v,
-                            Err(e) => return self.err_flow(e),
-                        };
+                        let it_obj =
+                            match self.method_invoke(cur.clone(), "getIterator", CallArgs::empty())
+                            {
+                                Ok(v) => v,
+                                Err(e) => return self.err_flow(e),
+                            };
                         match it_obj {
                             Value::Object(io) if self.obj_is_a(&io, "IteratorAggregate") => {
                                 cur = io;
@@ -2500,10 +3092,10 @@ impl<'a> Interp<'a> {
         val: &ForeachTarget,
         body: &[Stmt],
     ) -> Flow {
-        let _ = self.method_invoke(it.clone(), "rewind", vec![]);
+        let _ = self.method_invoke(it.clone(), "rewind", CallArgs::empty());
         loop {
             let ok = self
-                .method_invoke(it.clone(), "valid", vec![])
+                .method_invoke(it.clone(), "valid", CallArgs::empty())
                 .map(|v| v.is_truthy())
                 .unwrap_or(false);
             if !ok {
@@ -2511,11 +3103,11 @@ impl<'a> Interp<'a> {
             }
             // PHP calls current() before key() on each iteration.
             let v = self
-                .method_invoke(it.clone(), "current", vec![])
+                .method_invoke(it.clone(), "current", CallArgs::empty())
                 .unwrap_or(Value::Null);
             if let Some(ForeachKey::Var(kn)) = key {
                 let k = self
-                    .method_invoke(it.clone(), "key", vec![])
+                    .method_invoke(it.clone(), "key", CallArgs::empty())
                     .unwrap_or(Value::Null);
                 self.var_set(kn, k);
             }
@@ -2540,7 +3132,7 @@ impl<'a> Interp<'a> {
                 Flow::Normal => {}
                 f => return f,
             }
-            let _ = self.method_invoke(it.clone(), "next", vec![]);
+            let _ = self.method_invoke(it.clone(), "next", CallArgs::empty());
         }
         Flow::Normal
     }
@@ -2943,7 +3535,7 @@ impl<'a> Interp<'a> {
                         // __clone magic
                         if let Value::Object(no) = &nv {
                             if no.borrow().class.find_method("__clone").is_some() {
-                                self.method_invoke(no.clone(), "__clone", vec![])?;
+                                self.method_invoke(no.clone(), "__clone", CallArgs::empty())?;
                             }
                         }
                         Ok(nv)
@@ -3073,7 +3665,11 @@ impl<'a> Interp<'a> {
                     }
                     Value::Object(o) => {
                         if self.obj_is_a(&o, "ArrayAccess") {
-                            match self.method_invoke(o, "offsetExists", vec![cell(key)]) {
+                            match self.method_invoke(
+                                o,
+                                "offsetExists",
+                                CallArgs::positional(vec![cell(key)]),
+                            ) {
                                 Ok(v) => Ok(v.is_truthy()),
                                 Err(e) => Err(e),
                             }
@@ -3135,7 +3731,7 @@ impl<'a> Interp<'a> {
             Value::Object(o) => {
                 let class = o.borrow().class.clone();
                 if class.find_method("__tostring").is_some() {
-                    let r = self.method_invoke(o.clone(), "__tostring", vec![])?;
+                    let r = self.method_invoke(o.clone(), "__tostring", CallArgs::empty())?;
                     Ok(r.to_php_string())
                 } else {
                     let cname = class.name().to_string();
@@ -3447,7 +4043,11 @@ impl<'a> Interp<'a> {
                 if let Some(o) = aa_obj {
                     // `$o[k] = v` on ArrayAccess -> offsetSet.
                     let kv = key.clone().unwrap_or_else(|| newv.clone());
-                    match self.method_invoke(o, "offsetSet", vec![cell(kv), cell(newv.clone())]) {
+                    match self.method_invoke(
+                        o,
+                        "offsetSet",
+                        CallArgs::positional(vec![cell(kv), cell(newv.clone())]),
+                    ) {
                         Ok(_) => {}
                         Err(e) => return Err(e),
                     }
@@ -3779,7 +4379,7 @@ impl<'a> Interp<'a> {
                     self.method_invoke(
                         o.clone(),
                         "__set",
-                        vec![cell(Value::str(pn.to_string())), cell(v)],
+                        CallArgs::positional(vec![cell(Value::str(pn.to_string())), cell(v)]),
                     )?;
                     Ok(())
                 } else {
@@ -3794,9 +4394,10 @@ impl<'a> Interp<'a> {
                     // deprecation (property_hooks/foreach_002).
                     let exempt = self.obj_is_a(&o, "stdclass")
                         || cls.decl.attrs.iter().any(|a| {
-                            a.rsplit('\\')
+                            a.name
+                                .rsplit('\\')
                                 .next()
-                                .unwrap_or(a)
+                                .unwrap_or(&a.name)
                                 .eq_ignore_ascii_case("AllowDynamicProperties")
                         });
                     if is_new && !exempt {
@@ -3865,14 +4466,21 @@ impl<'a> Interp<'a> {
                     match self.method_invoke(
                         o,
                         "offsetSet",
-                        vec![cell(k.clone().unwrap_or(Value::Null)), cell(v.clone())],
+                        CallArgs::positional(vec![
+                            cell(k.clone().unwrap_or(Value::Null)),
+                            cell(v.clone()),
+                        ]),
                     ) {
                         Ok(_) => return Ok(v),
                         Err(e) => return Err(e),
                     }
                 }
                 let iv = self
-                    .method_invoke(o, "offsetGet", vec![cell(k.clone().unwrap_or(Value::Null))])
+                    .method_invoke(
+                        o,
+                        "offsetGet",
+                        CallArgs::positional(vec![cell(k.clone().unwrap_or(Value::Null))]),
+                    )
                     .unwrap_or(Value::Null);
                 c = cell(iv);
                 continue;
@@ -4091,7 +4699,11 @@ impl<'a> Interp<'a> {
                                 _ => unreachable!(),
                             };
                             let kv = key.clone().unwrap_or(Value::Null);
-                            match self.method_invoke(o, "offsetSet", vec![cell(kv), cell(v)]) {
+                            match self.method_invoke(
+                                o,
+                                "offsetSet",
+                                CallArgs::positional(vec![cell(kv), cell(v)]),
+                            ) {
                                 Ok(_) => Ok(()),
                                 Err(e) => Err(e),
                             }
@@ -4297,7 +4909,11 @@ impl<'a> Interp<'a> {
             }
             Value::Object(o) => {
                 if self.obj_is_a(&o, "ArrayAccess") {
-                    return match self.method_invoke(o, "offsetGet", vec![cell(key)]) {
+                    return match self.method_invoke(
+                        o,
+                        "offsetGet",
+                        CallArgs::positional(vec![cell(key)]),
+                    ) {
                         Ok(v) => Ok(v),
                         Err(e) => Err(e),
                     };
@@ -4332,7 +4948,11 @@ impl<'a> Interp<'a> {
         if let Ok(Value::Object(o)) = self.eval(e) {
             if self.obj_is_a(&o, "ArrayAccess") {
                 let kv = key.unwrap_or(Value::Null);
-                return match self.method_invoke(o, "offsetUnset", vec![cell(kv)]) {
+                return match self.method_invoke(
+                    o,
+                    "offsetUnset",
+                    CallArgs::positional(vec![cell(kv)]),
+                ) {
                     Ok(_) => Ok(()),
                     Err(err) => Err(err),
                 };
@@ -4354,7 +4974,11 @@ impl<'a> Interp<'a> {
                 if let Ok(Value::Object(o)) = self.eval(inner) {
                     if self.obj_is_a(&o, "ArrayAccess") {
                         let kv = key.unwrap_or(Value::Null);
-                        match self.method_invoke(o, "offsetUnset", vec![cell(kv)]) {
+                        match self.method_invoke(
+                            o,
+                            "offsetUnset",
+                            CallArgs::positional(vec![cell(kv)]),
+                        ) {
                             Ok(_) => return Ok(()),
                             Err(e) => return Err(e),
                         }
@@ -5027,20 +5651,115 @@ impl<'a> Interp<'a> {
         args: &[Expr],
         decl: &[Param],
         ctx: &str,
-    ) -> Result<Vec<Cell>, PhpError> {
-        let mut out = Vec::with_capacity(args.len());
-        for (i, a) in args.iter().enumerate() {
-            // named argument wrapper
-            let a = match a {
-                Expr::Binary { op: "named", r, .. } => r.as_ref(),
-                _ => a,
+    ) -> Result<CallArgs, PhpError> {
+        let mut out = CallArgs::empty();
+        // Position of the *next positional* arg for by-ref lookup — named
+        // args don't advance it (they bind by name at call time).
+        let mut pos = 0usize;
+        let mut seen_named = false;
+        for a in args {
+            let (name, expr): (Option<String>, &Expr) = match a {
+                Expr::Binary {
+                    op: "named", l, r, ..
+                } => {
+                    let n = match l.as_ref() {
+                        Expr::Str(s) => s.clone(),
+                        _ => match self.eval(l)? {
+                            Value::Str(s) => s.to_string(),
+                            v => v.to_php_string(),
+                        },
+                    };
+                    (Some(n), r.as_ref())
+                }
+                _ => (None, a),
             };
-            let by_ref = decl.get(i).map(|p| p.by_ref).unwrap_or(false);
+            if let Expr::Unpack(e) = expr {
+                // `...$arr`: int-keyed entries become positionals (in
+                // iteration order), string-keyed become named args
+                // (named_params/unpack*). Entries from a Traversable are
+                // fresh cells — a by-ref param gets the unpack warning
+                // and a by-value bind (named_params/unpack's test2).
+                if seen_named {
+                    // The parser rejects `...` after named at compile
+                    // time; unreachable for normal calls.
+                    return self.fail(PhpError::fatal(
+                        "Cannot use argument unpacking after named arguments",
+                        0,
+                    ));
+                }
+                let mut v = self.eval(e)?;
+                if let (Expr::Var(_), Value::Array(a)) = (e.as_ref(), &v) {
+                    // `...$ary` may hand out element cells for by-ref
+                    // binding — Zend cow-separates $ary first so other
+                    // variables sharing the array keep the old cells
+                    // (named_params/unpack's $ary2 stays 0).
+                    if Rc::strong_count(a) > 1 {
+                        let mut na = a.borrow().clone();
+                        for (_, c) in na.entries.iter_mut() {
+                            let v = c.borrow().clone();
+                            *c = cell(v);
+                        }
+                        let nv = Value::Array(Rc::new(RefCell::new(na)));
+                        if let Ok(c) = self.eval_cell(e) {
+                            *c.borrow_mut() = nv.clone();
+                        }
+                        v = nv;
+                    }
+                }
+                let trav = matches!(&v, Value::Object(_));
+                let mut unpack_named = false;
+                for (k, c) in self.unpack_items(&v)? {
+                    match k {
+                        Some(n) => {
+                            seen_named = true;
+                            unpack_named = true;
+                            out.named.push((n.to_string(), c, true, trav));
+                        }
+                        None if unpack_named => {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                "Cannot use positional argument after named argument during unpacking",
+                                0,
+                            ));
+                        }
+                        None => {
+                            if trav {
+                                out.trav_cells.push(out.cells.len());
+                            }
+                            out.cells.push(c);
+                            pos += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+            let by_ref = match &name {
+                // Unknown named args land in the variadic — a by-ref
+                // `&...$refs` variadic binds them as cells
+                // (named_params/variadic's test2 increments $x/$y).
+                Some(n) => decl
+                    .iter()
+                    .find(|p| !p.variadic && p.name == *n)
+                    .map(|p| p.by_ref)
+                    .unwrap_or_else(|| decl.iter().any(|p| p.variadic && p.by_ref)),
+                None => decl
+                    .get(pos)
+                    .map(|p| p.by_ref)
+                    .unwrap_or_else(|| decl.iter().any(|p| p.variadic && p.by_ref)),
+            };
             if by_ref {
-                match a {
+                match expr {
                     Expr::Var(_) | Expr::Index { .. } | Expr::Prop { .. } | Expr::VarVar(_) => {
-                        match self.eval_cell(a) {
-                            Ok(c) => out.push(c),
+                        match self.eval_cell(expr) {
+                            Ok(c) => {
+                                if let Some(n) = name {
+                                    out.named.push((n, c, true, false));
+                                    seen_named = true;
+                                } else {
+                                    out.cells.push(c);
+                                    pos += 1;
+                                }
+                            }
                             Err(_) => {
                                 return self.fail(PhpError::fatal(
                                     "Only variables should be passed by reference",
@@ -5054,49 +5773,158 @@ impl<'a> Interp<'a> {
                     } => {
                         // `f($x =& v)` binds the target by reference
                         // (passByReference_010); plain `=` throws Error below.
-                        self.eval(a)?;
-                        out.push(self.eval_cell(target)?);
+                        self.eval(expr)?;
+                        let c = self.eval_cell(target)?;
+                        if let Some(n) = name {
+                            out.named.push((n, c, true, false));
+                            seen_named = true;
+                        } else {
+                            out.cells.push(c);
+                            pos += 1;
+                        }
                     }
                     Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. } => {
                         // `f(g())`: binds only when g() returns by reference,
                         // otherwise a notice and pass by value (passByReference_004/007).
-                        let (c, was_ref) = self.eval_call_cell(a)?;
+                        let (c, was_ref) = self.eval_call_cell(expr)?;
                         if !was_ref {
                             self.notice("Only variables should be passed by reference")?;
                         }
-                        out.push(c);
+                        if let Some(n) = name {
+                            out.named.push((n, c, was_ref, false));
+                            seen_named = true;
+                        } else {
+                            out.cells.push(c);
+                            pos += 1;
+                        }
                     }
                     _ => {
+                        // The reported number is the PARAM slot, not the
+                        // call position (cannot_pass_by_ref: `test(e: 42)`
+                        // reports #2 for `function test($a, &$e)`).
+                        let argno = match &name {
+                            Some(n) => decl
+                                .iter()
+                                .position(|p| !p.variadic && p.name == *n)
+                                .map(|i| i + 1)
+                                .unwrap_or(pos + 1),
+                            None => pos + 1,
+                        };
                         return self.fail(PhpError::uncaught(
                             "Error",
                             format!(
                                 "{}: Argument #{} (${}) could not be passed by reference",
                                 ctx,
-                                i + 1,
-                                decl.get(i).map(|p| p.name.as_str()).unwrap_or("")
+                                argno,
+                                name.as_deref()
+                                    .or_else(|| decl.get(pos).map(|p| p.name.as_str()))
+                                    .unwrap_or("")
                             ),
                             0,
-                        ))
+                        ));
                     }
                 }
             } else {
-                match a {
-                    Expr::Var(_) | Expr::Index { .. } | Expr::Prop { .. } => {
-                        // Even by-value args evaluated once; fresh cell wraps
-                        // a clone so callee can't alias caller storage.
-                        {
-                            let v = self.eval(a)?;
-                            out.push(cell(v))
-                        }
-                    }
-                    _ => {
-                        let v = self.eval(a)?;
-                        out.push(cell(v))
-                    }
+                let v = self.eval(expr)?;
+                if let Some(n) = name {
+                    out.named.push((n, cell(v), false, false));
+                    seen_named = true;
+                } else {
+                    out.cells.push(cell(v));
+                    pos += 1;
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Spreadable items of `...$v`: arrays yield entries, Traversables
+    /// iterate via the rewind/valid/current/key/next protocol
+    /// (IteratorAggregate chains resolve first). `None` key = positional.
+    #[allow(clippy::type_complexity)]
+    fn unpack_items(&mut self, v: &Value) -> Result<Vec<(Option<Rc<str>>, Cell)>, PhpError> {
+        match v {
+            Value::Array(a) => {
+                // Element cells are handed to the call as potential
+                // references — Zend separates the array first so a
+                // shared copy (e.g. `$ary2 = $ary`) keeps its own
+                // values (named_params/unpack).
+                for (_, c) in a.borrow_mut().entries.iter_mut() {
+                    let fresh = cell(c.borrow().clone());
+                    *c = fresh;
+                }
+                let mut out = Vec::new();
+                for (k, c) in a.borrow().iter() {
+                    let n = match k {
+                        ArrKey::Str(s) => Some(s.clone()),
+                        _ => None,
+                    };
+                    out.push((n, c.clone()));
+                }
+                Ok(out)
+            }
+            Value::Object(o) => {
+                // IteratorAggregate → getIterator() chain to a real Iterator.
+                let mut cur = o.clone();
+                let it = loop {
+                    if self.obj_is_a(&cur, "IteratorAggregate") {
+                        match self.method_invoke(cur.clone(), "getIterator", CallArgs::empty())? {
+                            Value::Object(io) => cur = io,
+                            _ => {
+                                return self.fail(PhpError::uncaught(
+                                    "Exception",
+                                    "Objects returned by getIterator() must be traversable or implement interface Iterator",
+                                    0,
+                                ))
+                            }
+                        }
+                    } else if self.obj_is_a(&cur, "Iterator") {
+                        break cur;
+                    } else {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Only arrays and Traversables can be unpacked, {} given",
+                                cur.borrow().class.name()
+                            ),
+                            0,
+                        ));
+                    }
+                };
+                let _ = self.method_invoke(it.clone(), "rewind", CallArgs::empty());
+                let mut out = Vec::new();
+                loop {
+                    let ok = self
+                        .method_invoke(it.clone(), "valid", CallArgs::empty())
+                        .map(|v| v.is_truthy())
+                        .unwrap_or(false);
+                    if !ok {
+                        break;
+                    }
+                    let val = self
+                        .method_invoke(it.clone(), "current", CallArgs::empty())
+                        .unwrap_or(Value::Null);
+                    let key = self
+                        .method_invoke(it.clone(), "key", CallArgs::empty())
+                        .unwrap_or(Value::Null);
+                    let n = match &key {
+                        Value::Str(s) => Some(s.clone()),
+                        _ => None,
+                    };
+                    out.push((n, cell(val)));
+                    let _ = self.method_invoke(it.clone(), "next", CallArgs::empty());
+                }
+                Ok(out)
+            }
+            _ => self.fail(PhpError::uncaught(
+                "Error",
+                format!(
+                    "Only arrays and Traversables can be unpacked, {} given",
+                    self.zval_type_name(v)
+                ),
+                0,
+            )),
+        }
     }
 
     /// Call a named function (builtin or user-defined).
@@ -5190,7 +6018,7 @@ impl<'a> Interp<'a> {
 
     /// Call any callable-ish Value: Callable, string name, [obj,'m'], obj
     /// with __invoke.
-    pub fn call_value(&mut self, v: &Value, args: Vec<Cell>) -> Result<Value, PhpError> {
+    pub fn call_value(&mut self, v: &Value, args: CallArgs) -> Result<Value, PhpError> {
         match v {
             Value::Callable(c) => {
                 match &c.kind {
@@ -5861,7 +6689,7 @@ impl<'a> Interp<'a> {
     pub fn run_autoload(&mut self, name: &str) {
         let fns = self.autoload_fns.clone();
         for f in fns {
-            let _ = self.call_value(&f, vec![cell(Value::str(name))]);
+            let _ = self.call_value(&f, CallArgs::positional(vec![cell(Value::str(name))]));
             if self.classes.contains_key(&name.to_lowercase()) {
                 return;
             }
@@ -5871,7 +6699,7 @@ impl<'a> Interp<'a> {
     fn bind_and_run(
         &mut self,
         decl: &FunctionDecl,
-        args: Vec<Cell>,
+        args: CallArgs,
         unused: Vec<Cell>,
     ) -> Result<Value, PhpError> {
         // Callee `Stmt::Line` markers must not leak into the caller:
@@ -5900,6 +6728,58 @@ impl<'a> Interp<'a> {
                 .unwrap_or_else(|| self.cur_file.clone());
             (sf, saved_line as u32)
         };
+        // Trace args are the send list normalized through the last
+        // bound slot (unbound params render null; named args appear in
+        // declaration order — `test3(NULL, 'B')` in named_params/defaults).
+        // Named args collected by a variadic stay keyed
+        // (`test(1, 2, x: 3, y: 4)` in named_params/backtrace).
+        let mut targs_named: Vec<(String, Cell)> = Vec::new();
+        let targs: Vec<Cell> = if args.named.is_empty() {
+            args.cells.clone()
+        } else {
+            let mut last: i64 = -1;
+            for (i, p) in decl.params.iter().enumerate() {
+                if p.variadic {
+                    break;
+                }
+                if args.cells.get(i).is_some() || args.named.iter().any(|(n, ..)| *n == p.name) {
+                    last = i as i64;
+                }
+            }
+            let mut t: Vec<Cell> = Vec::new();
+            for (i, p) in decl.params.iter().enumerate() {
+                if p.variadic || i as i64 > last {
+                    break;
+                }
+                let c = args
+                    .cells
+                    .get(i)
+                    .cloned()
+                    .or_else(|| {
+                        args.named
+                            .iter()
+                            .find(|(n, ..)| *n == p.name)
+                            .map(|(_, c, ..)| c.clone())
+                    })
+                    .unwrap_or_else(|| cell(Value::Null));
+                t.push(c);
+            }
+            if decl.params.iter().any(|p| p.variadic) {
+                // Variadic: every sent positional shows up; named args
+                // that matched no declared param stay keyed.
+                for (i, c) in args.cells.iter().enumerate() {
+                    if i >= t.len() {
+                        t.push(c.clone());
+                    }
+                }
+                for (n, c, ..) in &args.named {
+                    if !decl.params.iter().any(|p| !p.variadic && p.name == *n) {
+                        targs_named.push((n.clone(), c.clone()));
+                    }
+                }
+            }
+            t
+        };
         let fr = self
             .stack
             .last()
@@ -5916,7 +6796,8 @@ impl<'a> Interp<'a> {
                 .to_string(),
                 file: site_file.clone(),
                 line: site_line,
-                args: args.clone(),
+                args: targs.clone(),
+                named_args: targs_named.clone(),
                 internal: false,
             })
             .unwrap_or_else(|| TraceFrame {
@@ -5925,7 +6806,8 @@ impl<'a> Interp<'a> {
                 ty: String::new(),
                 file: site_file,
                 line: site_line,
-                args: args.clone(),
+                args: targs,
+                named_args: targs_named,
                 internal: false,
             });
         self.call_trace.push(fr);
@@ -6041,10 +6923,25 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Display name for a decl in diagnostics — closures are named
+    /// `{closure:FILE:LINE}` like Zend (named_params/call_user_func).
+    fn decl_fname(&self, decl: &FunctionDecl) -> String {
+        let base = if decl.name.is_empty() {
+            format!("{{closure:{}:{}}}", decl.file, decl.line)
+        } else {
+            decl.name.clone()
+        };
+        self.stack
+            .last()
+            .and_then(|f| f.decl_class.as_ref().map(|c| c.name().to_string()))
+            .map(|c| format!("{}::{}", c, base))
+            .unwrap_or(base)
+    }
+
     fn bind_and_run_inner(
         &mut self,
         decl: &FunctionDecl,
-        args: Vec<Cell>,
+        args: CallArgs,
         _unused: Vec<Cell>,
     ) -> Result<Value, PhpError> {
         let required = decl
@@ -6052,7 +6949,10 @@ impl<'a> Interp<'a> {
             .iter()
             .filter(|p| p.default.is_none() && !p.variadic)
             .count();
-        if args.len() < required {
+        // With named args, missing-required is reported per-param during
+        // binding ("Argument #N ($x) not passed"); the count check below
+        // is the positional-only form.
+        if args.named.is_empty() && args.len() < required {
             self.stack.pop();
             return self.fail(PhpError::uncaught(
                 "ArgumentCountError",
@@ -6060,9 +6960,43 @@ impl<'a> Interp<'a> {
                 0,
             ));
         }
+        // Named arguments resolve against decl.params by name
+        // (Zend/tests/named_params): unknown names land in a trailing
+        // variadic's array as string keys, else "Unknown named
+        // parameter"; a name colliding with a positional or a prior
+        // named arg is the "overwrites previous argument" Error.
+        let n_pos = args.cells.len();
+        let mut by_name: Vec<Option<(Cell, bool, bool)>> = vec![None; decl.params.len()];
+        let mut variadic_named: Vec<(String, Cell)> = Vec::new();
+        let has_variadic = decl.params.iter().any(|p| p.variadic);
+        for (n, c, refable, trav) in &args.named {
+            match decl.params.iter().position(|p| !p.variadic && p.name == *n) {
+                Some(j) if j < n_pos || by_name[j].is_some() => {
+                    self.stack.pop();
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Named parameter ${} overwrites previous argument", n),
+                        0,
+                    ));
+                }
+                Some(j) => by_name[j] = Some((c.clone(), *refable, *trav)),
+                None if has_variadic => variadic_named.push((n.clone(), c.clone())),
+                None => {
+                    self.stack.pop();
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Unknown named parameter ${}", n),
+                        0,
+                    ));
+                }
+            }
+        }
         // Enforce declared param types (tests/lang/type_hints_*.phpt).
         for (i, p) in decl.params.iter().enumerate() {
-            let (Some(ty), Some(a)) = (&p.ty, args.get(i)) else {
+            let (Some(ty), Some(a)) = (
+                &p.ty,
+                args.cells.get(i).or(by_name[i].as_ref().map(|t| &t.0)),
+            ) else {
                 continue;
             };
             let v = a.borrow().clone();
@@ -6075,12 +7009,7 @@ impl<'a> Interp<'a> {
             let ok = (implicit_null && matches!(v, Value::Null))
                 || ty.iter().any(|m| self.param_type_match(m, &v));
             if !ok {
-                let fname = self
-                    .stack
-                    .last()
-                    .and_then(|f| f.decl_class.as_ref().map(|c| c.name().to_string()))
-                    .map(|c| format!("{}::{}", c, decl.name))
-                    .unwrap_or_else(|| decl.name.clone());
+                let fname = self.decl_fname(decl);
                 let mut disp: Vec<String> = ty
                     .iter()
                     .filter(|m| !m.eq_ignore_ascii_case("null"))
@@ -6148,15 +7077,57 @@ impl<'a> Interp<'a> {
             for (i, p) in decl.params.iter().enumerate() {
                 if p.variadic {
                     let mut arr = PhpArray::new();
-                    for v in &args[i.min(args.len())..] {
-                        arr.push(v.borrow().clone());
+                    // `&...$refs` aliases the arg cells themselves
+                    // (named_params/variadic's test2 increments $x/$y) —
+                    // an array containing references is itself a
+                    // reference set: by-ref foreach iterates it live
+                    // without separating.
+                    for v in &args.cells[i.min(args.cells.len())..] {
+                        if p.by_ref {
+                            arr.is_ref = true;
+                            arr.push_cell(v.clone());
+                        } else {
+                            arr.push(v.borrow().clone());
+                        }
+                    }
+                    for (n, c) in &variadic_named {
+                        if p.by_ref {
+                            arr.is_ref = true;
+                            arr.set_cell(ArrKey::Str(n.clone().into()), c.clone());
+                        } else {
+                            arr.set(ArrKey::Str(n.clone().into()), c.borrow().clone());
+                        }
                     }
                     binds.push((
                         p.name.clone(),
                         cell(Value::Array(Rc::new(RefCell::new(arr)))),
                     ));
-                } else if let Some(v) = args.get(i) {
+                } else if let Some((v, refable, trav)) = args
+                    .cells
+                    .get(i)
+                    .map(|c| (c, true, args.trav_cells.contains(&i)))
+                    .or(by_name[i].as_ref().map(|t| (&t.0, t.1, t.2)))
+                {
                     if p.by_ref {
+                        if trav {
+                            let fname = self.decl_fname(decl);
+                            self.warn(&format!(
+                                "Cannot pass by-reference argument {} of {}() by unpacking a Traversable, passing by-value instead",
+                                i + 1,
+                                fname
+                            ))?;
+                            binds.push((p.name.clone(), cell(v.borrow().clone())));
+                            continue;
+                        }
+                        if !refable {
+                            let fname = self.decl_fname(decl);
+                            self.warn(&format!(
+                                "{}(): Argument #{} (${}) must be passed by reference, value given",
+                                fname,
+                                i + 1,
+                                p.name
+                            ))?;
+                        }
                         binds.push((p.name.clone(), v.clone()));
                     } else {
                         binds.push((p.name.clone(), cell(v.borrow().clone())));
@@ -6164,7 +7135,10 @@ impl<'a> Interp<'a> {
                 } else if let Some(d) = &p.default {
                     // Default exprs are evaluated at call time; an error
                     // (e.g. an undefined constant) propagates as the
-                    // call's failure (namespaces/ns_077).
+                    // call's failure (namespaces/ns_077) and attributes
+                    // to the declaration line (named_params/defaults).
+                    let prev_line = self.cur_line;
+                    self.cur_line = decl.line;
                     let prev = self
                         .stack
                         .last()
@@ -6175,6 +7149,7 @@ impl<'a> Interp<'a> {
                     };
                     let r = self.eval_const(d);
                     self.const_self = old;
+                    self.cur_line = prev_line;
                     let dv = match r {
                         Ok(v) => v,
                         Err(e) => {
@@ -6184,20 +7159,36 @@ impl<'a> Interp<'a> {
                     };
                     binds.push((p.name.clone(), cell(dv)));
                 } else {
-                    binds.push((p.name.clone(), cell(Value::Null)));
+                    // Unbound required param — only reachable via named
+                    // args (the positional count check runs earlier).
+                    let fname = self.decl_fname(decl);
+                    self.stack.pop();
+                    return self.fail(PhpError::uncaught(
+                        "ArgumentCountError",
+                        format!("{}(): Argument #{} (${}) not passed", fname, i + 1, p.name),
+                        0,
+                    ));
                 }
             }
             let frame = self.stack.last_mut().unwrap();
-            // func_get_arg(i) sees the param's CURRENT value, so frame args
-            // are the bound param cells plus any extra call args.
+            // func_get_arg(i)/func_num_args(): the bound non-variadic
+            // params (named or positional) plus positional extras —
+            // variadic extras don't count (named_params/variadic).
+            let n_fixed = decl.params.iter().take_while(|p| !p.variadic).count();
+            // func_num_args()/func_get_args(): Zend binds named args into
+            // the CV table positionally, so a named call fills the table
+            // up to the highest bound param — `test(c:'C', a:'A')`
+            // reports 3 args, not 2 (named_params/func_get_args).
+            let max_bound = (0..n_fixed)
+                .filter(|i| args.cells.get(*i).is_some() || by_name[*i].is_some())
+                .max();
             let mut fa: Vec<Cell> = Vec::new();
-            for (i, p) in decl.params.iter().enumerate() {
-                if p.variadic {
-                    break;
+            if let Some(max_i) = max_bound {
+                for bind in binds.iter().take(max_i + 1) {
+                    fa.push(bind.1.clone());
                 }
-                fa.push(binds[i].1.clone());
             }
-            for a in &args[fa.len().min(args.len())..] {
+            for a in &args.cells[n_fixed.min(args.cells.len())..] {
                 fa.push(a.clone());
             }
             // Promoted ctor params: declare+assign $this->{name}
@@ -6257,7 +7248,7 @@ impl<'a> Interp<'a> {
     fn invoke_fn(
         &mut self,
         decl: &Rc<FunctionDecl>,
-        args: Vec<Cell>,
+        args: CallArgs,
         this_obj: Option<Rc<RefCell<PhpObject>>>,
         scope_class: Option<Rc<PhpClass>>,
     ) -> Result<Value, PhpError> {
@@ -6266,7 +7257,7 @@ impl<'a> Interp<'a> {
             .iter()
             .filter(|p| p.default.is_none() && !p.variadic)
             .count();
-        if args.len() < required {
+        if args.named.is_empty() && args.len() < required {
             return self.fail(PhpError::uncaught(
                 "ArgumentCountError",
                 format!(
@@ -7118,7 +8109,7 @@ impl<'a> Interp<'a> {
     }
 
     /// `new X(args)` — instantiate + call __construct.
-    fn new_instance(&mut self, name: &str, args: Vec<Cell>) -> Result<Value, PhpError> {
+    fn new_instance(&mut self, name: &str, args: CallArgs) -> Result<Value, PhpError> {
         let lname = name.to_lowercase();
         if !self.classes.contains_key(&lname) {
             self.run_autoload(name.trim_start_matches('\\'));
@@ -7147,10 +8138,20 @@ impl<'a> Interp<'a> {
                 0,
             ));
         }
+        let has_ctor = self.find_method_in(&cls, "__construct").is_some();
+        if !has_ctor {
+            if let Some((n, ..)) = args.named.first() {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    format!("Unknown named parameter ${}", n),
+                    0,
+                ));
+            }
+        }
         let obj = self.instantiate(&lname, &[])?;
         // __construct (native for builtins via method_invoke's
         // interception); the ctor may be inherited (property_hooks/foreach).
-        if self.find_method_in(&cls, "__construct").is_some() {
+        if has_ctor {
             if let Value::Object(o) = &obj {
                 self.method_invoke(o.clone(), "__construct", args)?;
             }
@@ -8123,6 +9124,7 @@ impl<'a> Interp<'a> {
             name: format!("${}::{}", pname, kind),
             params,
             body: hook.body.clone().unwrap_or_default(),
+            attrs: vec![],
             by_ref: hook.by_ref,
             line: self.cur_line,
             file: self.cur_file.clone(),
@@ -8134,7 +9136,12 @@ impl<'a> Interp<'a> {
         self.pending_hook_prop = Some((o.borrow().id, pname.to_string(), hook.is_get, owner));
         let called = o.borrow().class.clone();
         self.pending_called_class = Some(called);
-        let r = self.invoke_fn(&decl, args, Some(o.clone()), Some(dcls.clone()));
+        let r = self.invoke_fn(
+            &decl,
+            CallArgs::positional(args),
+            Some(o.clone()),
+            Some(dcls.clone()),
+        );
         self.pending_decl_class = None;
         self.pending_called_class = None;
         self.pending_hook_prop = None;
@@ -8593,13 +9600,221 @@ impl<'a> Interp<'a> {
         ))
     }
 
-    /// Native bodies for the ReflectionClass/ReflectionProperty stubs.
-    /// The reflected class/prop names live under `\0rc\0` prop keys.
+    /// Native bodies for the ArrayIterator stub. Iteration state lives in
+    /// the `ArrayIter` object internal; unknown methods return None so
+    /// the generic dispatch can report `Call to undefined method`.
+    fn array_iter_method(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        name: &str,
+        args: &CallArgs,
+    ) -> Result<Option<Value>, PhpError> {
+        let lname = name.to_lowercase();
+        let mk_arr = |ob: &mut PhpObject, a: Rc<RefCell<PhpArray>>, flags: i64| {
+            ob.internal = Some(ObjectInternal::ArrayIter {
+                arr: a,
+                pos: 0,
+                flags,
+            });
+            Value::Null
+        };
+        match lname.as_str() {
+            "__construct" => {
+                let flags = args.cells.get(1).map(|c| c.borrow().to_int()).unwrap_or(0);
+                let mut ob = obj.borrow_mut();
+                let a = match args.cells.first().map(|c| c.borrow().clone()) {
+                    Some(Value::Array(a)) => {
+                        let mut copy = PhpArray::new();
+                        for (k, c) in &a.borrow().entries {
+                            copy.set(k.clone(), c.borrow().clone());
+                        }
+                        Rc::new(RefCell::new(copy))
+                    }
+                    // Objects iterate their public props (Zend casts).
+                    Some(Value::Object(o)) => {
+                        let mut copy = PhpArray::new();
+                        for (k, c) in &o.borrow().props {
+                            copy.set(ArrKey::Str(Rc::from(k.as_str())), c.borrow().clone());
+                        }
+                        Rc::new(RefCell::new(copy))
+                    }
+                    _ => Rc::new(RefCell::new(PhpArray::new())),
+                };
+                Ok(Some(mk_arr(&mut ob, a, flags)))
+            }
+            _ => {
+                // All remaining methods need initialized state.
+                let (arr, pos) = {
+                    let ob = obj.borrow();
+                    match &ob.internal {
+                        Some(ObjectInternal::ArrayIter { arr, pos, .. }) => (arr.clone(), *pos),
+                        _ => return Ok(None),
+                    }
+                };
+                let v = match lname.as_str() {
+                    "rewind" => {
+                        if let Some(ObjectInternal::ArrayIter { pos: p, .. }) =
+                            &mut obj.borrow_mut().internal
+                        {
+                            *p = 0;
+                        }
+                        Value::Null
+                    }
+                    "valid" => Value::Bool(pos < arr.borrow().entries.len()),
+                    "current" => arr
+                        .borrow()
+                        .entries
+                        .get(pos)
+                        .map(|(_, c)| c.borrow().clone())
+                        .unwrap_or(Value::Bool(false)),
+                    "key" => arr
+                        .borrow()
+                        .entries
+                        .get(pos)
+                        .map(|(k, _)| key_value(k))
+                        .unwrap_or(Value::Null),
+                    "next" => {
+                        if let Some(ObjectInternal::ArrayIter { pos: p, .. }) =
+                            &mut obj.borrow_mut().internal
+                        {
+                            *p += 1;
+                        }
+                        Value::Null
+                    }
+                    "seek" => {
+                        let i = args.cells.first().map(|c| c.borrow().to_int()).unwrap_or(0);
+                        let len = arr.borrow().entries.len() as i64;
+                        if i < 0 || i >= len.max(1) && !(i == 0 && len == 0) {
+                            return self.fail(PhpError::uncaught(
+                                "OutOfBoundsException",
+                                format!("Seek position {} is out of range", i),
+                                0,
+                            ));
+                        }
+                        if let Some(ObjectInternal::ArrayIter { pos: p, .. }) =
+                            &mut obj.borrow_mut().internal
+                        {
+                            *p = i as usize;
+                        }
+                        Value::Null
+                    }
+                    "count" => Value::Int(arr.borrow().entries.len() as i64),
+                    "getarraycopy" => Value::Array(arr.clone()),
+                    "offsetget" => {
+                        let k = args
+                            .cells
+                            .first()
+                            .map(|c| to_key(&c.borrow()))
+                            .unwrap_or(ArrKey::Int(0));
+                        match arr.borrow().get(&k) {
+                            Some(v) => v,
+                            None => {
+                                let kn = key_value(&k).to_php_string();
+                                let _ = self.warn(&format!("Undefined array key {}", kn));
+                                Value::Null
+                            }
+                        }
+                    }
+                    "offsetexists" => {
+                        let k = args
+                            .cells
+                            .first()
+                            .map(|c| to_key(&c.borrow()))
+                            .unwrap_or(ArrKey::Int(0));
+                        Value::Bool(arr.borrow().get(&k).is_some())
+                    }
+                    "offsetset" => {
+                        let v = args
+                            .cells
+                            .get(1)
+                            .map(|c| c.borrow().clone())
+                            .unwrap_or(Value::Null);
+                        match args.cells.first().map(|c| c.borrow().clone()) {
+                            Some(Value::Null) | None => arr.borrow_mut().push(v),
+                            Some(kv) => arr.borrow_mut().set(to_key(&kv), v),
+                        }
+                        Value::Null
+                    }
+                    "offsetunset" => {
+                        let k = args
+                            .cells
+                            .first()
+                            .map(|c| to_key(&c.borrow()))
+                            .unwrap_or(ArrKey::Int(0));
+                        arr.borrow_mut().unset(&k);
+                        Value::Null
+                    }
+                    "getflags" => Value::Int({
+                        let ob = obj.borrow();
+                        match &ob.internal {
+                            Some(ObjectInternal::ArrayIter { flags, .. }) => *flags,
+                            _ => 0,
+                        }
+                    }),
+                    "setflags" => {
+                        let f = args.cells.first().map(|c| c.borrow().to_int()).unwrap_or(0);
+                        if let Some(ObjectInternal::ArrayIter { flags, .. }) =
+                            &mut obj.borrow_mut().internal
+                        {
+                            *flags = f;
+                        }
+                        Value::Null
+                    }
+                    "asort" | "ksort" => {
+                        let mut a = arr.borrow_mut();
+                        if lname == "asort" {
+                            a.entries
+                                .sort_by(|(_, x), (_, y)| compare(&x.borrow(), &y.borrow()));
+                        } else {
+                            a.entries.sort_by(|(x, _), (y, _)| match (x, y) {
+                                (ArrKey::Int(a), ArrKey::Int(b)) => a.cmp(b),
+                                _ => compare(&key_value(x), &key_value(y)),
+                            });
+                        }
+                        Value::Bool(true)
+                    }
+                    "natsort" | "natcasesort" => {
+                        let ci = lname == "natcasesort";
+                        arr.borrow_mut().entries.sort_by(|(_, x), (_, y)| {
+                            let mut a = x.borrow().to_php_string();
+                            let mut b = y.borrow().to_php_string();
+                            if ci {
+                                a = a.to_lowercase();
+                                b = b.to_lowercase();
+                            }
+                            compare(&Value::str(a), &Value::str(b))
+                        });
+                        Value::Bool(true)
+                    }
+                    _ => return Ok(None),
+                };
+                Ok(Some(v))
+            }
+        }
+    }
+
+    /// Call-arg list for `invokeArgs`/`newInstanceArgs`: array entries
+    /// with string keys become named args (named_params/call_user_func).
+    fn args_from_array(&mut self, v: &Value) -> CallArgs {
+        let mut ca = CallArgs::empty();
+        if let Value::Array(a) = v {
+            for (k, c) in a.borrow().iter() {
+                match k {
+                    ArrKey::Str(s) => ca.named.push((s.to_string(), c.clone(), true, false)),
+                    _ => ca.cells.push(c.clone()),
+                }
+            }
+        }
+        ca
+    }
+
+    /// Native bodies for the Reflection* stubs. The reflected
+    /// class/function/prop names live under `\0rc\0` prop keys.
     fn reflection_method(
         &mut self,
         obj: &Rc<RefCell<PhpObject>>,
         name: &str,
-        args: &[Cell],
+        args: &CallArgs,
     ) -> Result<Option<Value>, PhpError> {
         let lname = name.to_lowercase();
         match lname.as_str() {
@@ -8617,13 +9832,314 @@ impl<'a> Interp<'a> {
                 ob.props.insert("\0rc\0prop".into(), cell(prop));
                 Ok(Some(Value::Null))
             }
-            "getname" => Ok(Some(
-                obj.borrow()
+            // ReflectionFunction::invoke(...$args) and
+            // ReflectionMethod::invoke($object, ...$args) forward named
+            // args to the target (named_params/call_user_func).
+            "invoke" => {
+                let is_method = obj
+                    .borrow()
+                    .class
+                    .name()
+                    .eq_ignore_ascii_case("reflectionmethod");
+                if is_method {
+                    let target = args
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let mn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0prop")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let mn = self.conv_str(&mn)?.to_string();
+                    let ca = CallArgs {
+                        cells: args.cells[1.min(args.cells.len())..].to_vec(),
+                        named: args.named.clone(),
+                        trav_cells: Vec::new(),
+                    };
+                    match target {
+                        Value::Object(o) => Ok(Some(self.method_invoke(o, &mn, ca)?)),
+                        Value::Null => {
+                            // Static context: Class::method or null $this.
+                            let cn = obj
+                                .borrow()
+                                .props
+                                .get("\0rc\0class")
+                                .map(|c| c.borrow().clone())
+                                .unwrap_or(Value::Null);
+                            let cn = self.conv_str(&cn)?.to_string();
+                            Ok(Some(self.call_named(&format!("{}::{}", cn, mn), &[])?))
+                        }
+                        _ => Ok(Some(Value::Null)),
+                    }
+                } else {
+                    let cb = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let ca = CallArgs {
+                        cells: args.cells.clone(),
+                        named: args.named.clone(),
+                        trav_cells: args.trav_cells.clone(),
+                    };
+                    Ok(Some(self.call_value(&cb, ca)?))
+                }
+            }
+            "invokeargs" => {
+                let is_method = obj
+                    .borrow()
+                    .class
+                    .name()
+                    .eq_ignore_ascii_case("reflectionmethod");
+                if is_method {
+                    let target = args
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let arr = args
+                        .get(1)
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let mn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0prop")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let mn = self.conv_str(&mn)?.to_string();
+                    let ca = self.args_from_array(&arr);
+                    match target {
+                        Value::Object(o) => Ok(Some(self.method_invoke(o, &mn, ca)?)),
+                        _ => Ok(Some(Value::Null)),
+                    }
+                } else {
+                    let arr = args
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let cb = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let ca = self.args_from_array(&arr);
+                    Ok(Some(self.call_value(&cb, ca)?))
+                }
+            }
+            "getattributes" => {
+                let is_fn = obj
+                    .borrow()
+                    .class
+                    .name()
+                    .eq_ignore_ascii_case("reflectionfunction");
+                let tn = obj
+                    .borrow()
                     .props
                     .get("\0rc\0class")
                     .map(|c| c.borrow().clone())
-                    .unwrap_or(Value::Null),
-            )),
+                    .unwrap_or(Value::Null);
+                let tn = self.conv_str(&tn)?.to_string();
+                let (decls, target): (Vec<crate::ast::AttrDecl>, i64) = if is_fn {
+                    (
+                        self.functions
+                            .get(&tn.to_lowercase())
+                            .map(|d| d.attrs.clone())
+                            .unwrap_or_default(),
+                        2,
+                    )
+                } else {
+                    (
+                        self.classes
+                            .get(&tn.to_lowercase())
+                            .map(|c| c.decl.attrs.clone())
+                            .unwrap_or_default(),
+                        1,
+                    )
+                };
+                let mut arr = PhpArray::default();
+                for a in decls {
+                    let v = self.instantiate("reflectionattribute", &[])?;
+                    if let Value::Object(o) = &v {
+                        o.borrow_mut().internal = Some(ObjectInternal::ReflectionAttribute {
+                            name: a.name.clone(),
+                            args: Rc::new(a.args.clone()),
+                            target,
+                        });
+                    }
+                    arr.push(v);
+                }
+                Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
+            }
+            "getarguments" => {
+                let exprs = match &obj.borrow().internal {
+                    Some(ObjectInternal::ReflectionAttribute { args, .. }) => args.clone(),
+                    _ => return Ok(Some(Value::Null)),
+                };
+                let mut arr = PhpArray::default();
+                for e in exprs.iter() {
+                    if let Expr::Binary { op: "named", l, r } = e {
+                        if let Expr::Str(n) = l.as_ref() {
+                            let v = self.eval_const(r)?;
+                            arr.set(ArrKey::Str(n.as_str().into()), v);
+                            continue;
+                        }
+                    }
+                    arr.push(self.eval_const(e)?);
+                }
+                Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
+            }
+            "newinstance" | "newinstanceargs" => {
+                if let Some(ObjectInternal::ReflectionAttribute {
+                    name,
+                    args: aexprs,
+                    target,
+                }) = &obj.borrow().internal
+                {
+                    let (name, aexprs, target) = (name.clone(), aexprs.clone(), *target);
+                    let lname = name.trim_start_matches('\\').to_lowercase();
+                    let cls = match self.classes.get(&lname).cloned() {
+                        Some(c) => c,
+                        None => {
+                            return self
+                                .fail::<Option<Value>>(PhpError::uncaught(
+                                    "Error",
+                                    format!("Class \"{}\" not found", name),
+                                    0,
+                                ))
+                                .map(|_| None);
+                        }
+                    };
+                    let short = |n: &str| n.rsplit('\\').next().unwrap_or(n).to_string();
+                    let marker = cls
+                        .decl
+                        .attrs
+                        .iter()
+                        .find(|a| short(&a.name).eq_ignore_ascii_case("attribute"));
+                    let Some(marker) = marker else {
+                        return self
+                            .fail::<Option<Value>>(PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Attempting to use non-attribute class \"{}\" as attribute",
+                                    name
+                                ),
+                                0,
+                            ))
+                            .map(|_| None);
+                    };
+                    // `#[Attribute(flags: N)]` (or first positional) gates
+                    // which declarations the attribute may target.
+                    let mut mask = 63i64;
+                    let flags_e = marker
+                        .args
+                        .iter()
+                        .find_map(|a| {
+                            if let Expr::Binary { op: "named", l, r } = a {
+                                if matches!(l.as_ref(), Expr::Str(n) if n == "flags") {
+                                    return Some(r.as_ref());
+                                }
+                                None
+                            } else {
+                                None
+                            }
+                        })
+                        .or_else(|| marker.args.first());
+                    if let Some(e) = flags_e {
+                        mask = self.eval_const(e)?.to_int();
+                    }
+                    if mask & target == 0 {
+                        let tn = match target {
+                            1 => "class",
+                            2 => "function",
+                            4 => "method",
+                            8 => "property",
+                            16 => "class constant",
+                            32 => "parameter",
+                            _ => "unknown",
+                        };
+                        let allowed: Vec<&str> = [
+                            (1i64, "class"),
+                            (2, "function"),
+                            (4, "method"),
+                            (8, "property"),
+                            (16, "class constant"),
+                            (32, "parameter"),
+                        ]
+                        .iter()
+                        .filter(|(b, _)| mask & b != 0)
+                        .map(|(_, n)| *n)
+                        .collect();
+                        return self
+                            .fail::<Option<Value>>(PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Attribute \"{}\" cannot target {} (allowed targets: {})",
+                                    name,
+                                    tn,
+                                    allowed.join(", ")
+                                ),
+                                0,
+                            ))
+                            .map(|_| None);
+                    }
+                    let mut cells = Vec::new();
+                    let mut named = Vec::new();
+                    for e in aexprs.iter() {
+                        if let Expr::Binary { op: "named", l, r } = e {
+                            if let Expr::Str(n) = l.as_ref() {
+                                named.push((n.clone(), cell(self.eval_const(r)?), true, false));
+                                continue;
+                            }
+                        }
+                        cells.push(cell(self.eval_const(e)?));
+                    }
+                    let ca = CallArgs {
+                        cells,
+                        named,
+                        trav_cells: Vec::new(),
+                    };
+                    return self.new_instance(&name, ca).map(Some);
+                }
+                let ca = if lname == "newinstanceargs" {
+                    let arr = args
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    self.args_from_array(&arr)
+                } else {
+                    CallArgs {
+                        cells: args.cells.clone(),
+                        named: args.named.clone(),
+                        trav_cells: args.trav_cells.clone(),
+                    }
+                };
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                Ok(Some(self.new_instance(&cn, ca)?))
+            }
+            "getname" => {
+                if let Some(ObjectInternal::ReflectionAttribute { name, .. }) =
+                    &obj.borrow().internal
+                {
+                    return Ok(Some(Value::str(name.clone())));
+                }
+                Ok(Some(
+                    obj.borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null),
+                ))
+            }
             "newinstancewithoutconstructor" => {
                 let cn = obj
                     .borrow()
@@ -8693,7 +10209,11 @@ impl<'a> Interp<'a> {
                 }
                 // __get magic
                 if cls.find_method("__get").is_some() {
-                    return self.method_invoke(o.clone(), "__get", vec![cell(Value::str(pn))]);
+                    return self.method_invoke(
+                        o.clone(),
+                        "__get",
+                        CallArgs::positional(vec![cell(Value::str(pn))]),
+                    );
                 }
                 self.warn(&format!("Undefined property: {}::${}", cls.name(), pn))?;
                 Ok(Value::Null)
@@ -8858,7 +10378,11 @@ impl<'a> Interp<'a> {
                 if let Some(k) = self.obj_prop_key(&o, &pn) {
                     o.borrow_mut().props.remove(&k);
                 } else if cls.find_method("__unset").is_some() {
-                    self.method_invoke(o.clone(), "__unset", vec![cell(Value::str(pn))])?;
+                    self.method_invoke(
+                        o.clone(),
+                        "__unset",
+                        CallArgs::positional(vec![cell(Value::str(pn))]),
+                    )?;
                 }
             }
         }
@@ -8895,6 +10419,45 @@ impl<'a> Interp<'a> {
                     0,
                 ))
             }
+            // Closures expose Closure::__invoke/call/bindTo
+            // (named_params/call_user_func's `$closure->__invoke(...)`).
+            Value::Callable(c) if mn.eq_ignore_ascii_case("__invoke") => {
+                let params = match &c.kind {
+                    CallableKind::Closure(d) => d.params.clone(),
+                    _ => vec![],
+                };
+                let argvals = self.arg_cells(args, &params, &format!("{}()", mn))?;
+                self.call_value(&Value::Callable(c), argvals)
+            }
+            Value::Callable(c) if mn.eq_ignore_ascii_case("call") => {
+                // `$fn->call($newThis, ...$args)`: invoke rebound to
+                // $newThis (skipped for static closures).
+                let argvals = self.arg_cells(args, &[], &format!("{}()", mn))?;
+                let mut ca = argvals;
+                let newthis = ca
+                    .cells
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                if let Value::Object(t) = newthis {
+                    let mut nc = (*c).clone();
+                    nc.this_obj = Some(t);
+                    ca.cells.remove(0);
+                    return self.call_value(&Value::Callable(Rc::new(nc)), ca);
+                }
+                self.call_value(&Value::Callable(c), ca)
+            }
+            Value::Callable(c) if mn.eq_ignore_ascii_case("bindto") => {
+                let argvals = self.arg_cells(args, &[], &format!("{}()", mn))?;
+                match argvals.cells.first().map(|c| c.borrow().clone()) {
+                    Some(Value::Object(t)) => {
+                        let mut nc = (*c).clone();
+                        nc.this_obj = Some(t);
+                        Ok(Value::Callable(Rc::new(nc)))
+                    }
+                    _ => Ok(Value::Null),
+                }
+            }
             other => self.fail(PhpError::uncaught(
                 "Error",
                 format!("Call to a member function {}() on {}", mn, other.gettype()),
@@ -8909,7 +10472,7 @@ impl<'a> Interp<'a> {
         &mut self,
         obj: Rc<RefCell<PhpObject>>,
         m: &Rc<MethodDecl>,
-        args: Vec<Cell>,
+        args: CallArgs,
         dc: Rc<PhpClass>,
     ) -> Result<Value, PhpError> {
         let called = obj.borrow().class.clone();
@@ -8930,7 +10493,7 @@ impl<'a> Interp<'a> {
         &mut self,
         obj: Rc<RefCell<PhpObject>>,
         name: &str,
-        args: Vec<Cell>,
+        args: CallArgs,
     ) -> Result<Value, PhpError> {
         // Builtin exception methods implemented natively.
         if let Value::Object(_) = Value::Object(obj.clone()) {}
@@ -8959,17 +10522,35 @@ impl<'a> Interp<'a> {
         }
         // Reflection stubs are native: constructor stores the target
         // name, methods act on it (gh15438_2).
-        if cls.name().eq_ignore_ascii_case("reflectionclass")
-            || cls.name().eq_ignore_ascii_case("reflectionproperty")
-        {
+        if cls.name().starts_with("Reflection") || cls.name().starts_with("reflection") {
             let stub = self
                 .find_method_in(&cls, name)
                 .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
                 .unwrap_or(false);
             if stub {
-                if let Some(v) = self.reflection_method(&obj, name, &args)? {
+                // Native Reflection calls leave a `Cls->m()` frame in
+                // uncaught traces (named_params/attributes_named_flags).
+                self.call_trace.push(TraceFrame {
+                    file: self.diag_file(),
+                    line: self.cur_line as u32,
+                    function: name.to_string(),
+                    class: Some(cls.name().to_string()),
+                    ty: "->".into(),
+                    args: Vec::new(),
+                    named_args: Vec::new(),
+                    internal: false,
+                });
+                let r = self.reflection_method(&obj, name, &args);
+                self.call_trace.pop();
+                if let Some(v) = r? {
                     return Ok(v);
                 }
+            }
+        }
+        // ArrayIterator: native iteration state on the object internal.
+        if cls.name().eq_ignore_ascii_case("arrayiterator") {
+            if let Some(v) = self.array_iter_method(&obj, name, &args)? {
+                return Ok(v);
             }
         }
         match self.find_method_in(&cls, name) {
@@ -8986,16 +10567,19 @@ impl<'a> Interp<'a> {
             None => {
                 if let Some((m, dc)) = self.find_method_in(&cls, "__call") {
                     let mut arr = PhpArray::new();
-                    for a in &args {
+                    for a in &args.cells {
                         arr.push(a.borrow().clone());
+                    }
+                    for (n, a, ..) in &args.named {
+                        arr.set(ArrKey::Str(Rc::from(n.as_str())), a.borrow().clone());
                     }
                     return self.invoke_method(
                         obj,
                         &m,
-                        vec![
+                        CallArgs::positional(vec![
                             cell(Value::str(name)),
                             cell(Value::Array(Rc::new(RefCell::new(arr)))),
-                        ],
+                        ]),
                         dc,
                     );
                 }
@@ -9064,6 +10648,9 @@ impl<'a> Interp<'a> {
                     for av in &fr.args {
                         a.push(av.borrow().clone());
                     }
+                    for (n, av) in &fr.named_args {
+                        a.set(ArrKey::Str(n.clone().into()), av.borrow().clone());
+                    }
                     f.set(
                         ArrKey::Str("args".into()),
                         Value::Array(Rc::new(RefCell::new(a))),
@@ -9088,16 +10675,32 @@ impl<'a> Interp<'a> {
                     .get("message")
                     .map(|c| c.borrow().to_php_string())
                     .unwrap_or_default();
-                let (file, line) = match &ob.internal {
-                    Some(ObjectInternal::Exception { file, line, .. }) => (file.clone(), *line),
-                    _ => (self.diag_file(), self.cur_line as u32),
+                let (file, line, trace) = match &ob.internal {
+                    Some(ObjectInternal::Exception {
+                        file,
+                        line,
+                        trace,
+                        frames,
+                        ..
+                    }) => {
+                        let t = if !trace.is_empty() {
+                            trace.clone()
+                        } else if !frames.is_empty() {
+                            format_trace(frames)
+                        } else {
+                            "#0 {main}".into()
+                        };
+                        (file.clone(), *line, t)
+                    }
+                    _ => (self.diag_file(), self.cur_line as u32, "#0 {main}".into()),
                 };
                 Some(Value::str(format!(
-                    "{}: {} in {}:{}\nStack trace:\n#0 {{main}}",
+                    "{}: {} in {}:{}\nStack trace:\n{}",
                     ob.class.name(),
                     msg,
                     file,
-                    line
+                    line,
+                    trace
                 )))
             }
             "__construct" => {
@@ -9199,7 +10802,7 @@ impl<'a> Interp<'a> {
         &mut self,
         cls: Rc<PhpClass>,
         name: &str,
-        args: Vec<Cell>,
+        args: CallArgs,
     ) -> Result<Value, PhpError> {
         // Throwable methods are instance-only; look up incl. parents.
         match self.find_method_in(&cls, name) {
@@ -9235,17 +10838,20 @@ impl<'a> Interp<'a> {
             None => {
                 if let Some((m, dc)) = self.find_method_in(&cls, "__callstatic") {
                     let mut arr = PhpArray::new();
-                    for a in &args {
+                    for a in &args.cells {
                         arr.push(a.borrow().clone());
+                    }
+                    for (n, a, ..) in &args.named {
+                        arr.set(ArrKey::Str(Rc::from(n.as_str())), a.borrow().clone());
                     }
                     self.pending_decl_class = Some(dc.clone());
                     self.pending_called_class = Some(cls.clone());
                     let r = self.invoke_fn(
                         &Rc::new(m.decl.clone()),
-                        vec![
+                        CallArgs::positional(vec![
                             cell(Value::str(name)),
                             cell(Value::Array(Rc::new(RefCell::new(arr)))),
-                        ],
+                        ]),
                         None,
                         Some(dc),
                     );
@@ -9511,6 +11117,7 @@ impl<'a> Interp<'a> {
             file: self.diag_file(),
             line: self.cur_line as u32,
             args: vec![cell(pathv.clone())],
+            named_args: Vec::new(),
             internal: true,
         });
         let inc_pop = |it: &mut Interp| {
@@ -9767,7 +11374,10 @@ impl<'a> Interp<'a> {
                 // A handler throwing inside ob_end_clean propagates as an
                 // uncaught exception (bug32828).
                 self.internal_cb += 1;
-                let out = self.call_value(&h, vec![cell(Value::str(buf)), cell(Value::Int(m))]);
+                let out = self.call_value(
+                    &h,
+                    CallArgs::positional(vec![cell(Value::str(buf)), cell(Value::Int(m))]),
+                );
                 self.internal_cb -= 1;
                 Ok(Some(out?.to_php_string()))
             }
@@ -9911,14 +11521,14 @@ impl<'a> Interp<'a> {
             .cloned()
     }
     pub fn instantiate_class(&mut self, name: &str, args: Vec<Cell>) -> Result<Value, PhpError> {
-        self.new_instance(name, args)
+        self.new_instance(name, CallArgs::positional(args))
     }
     pub fn call_closure(
         &mut self,
         c: &Rc<PhpCallable>,
         args: Vec<Cell>,
     ) -> Result<Value, PhpError> {
-        self.call_value(&Value::Callable(c.clone()), args)
+        self.call_value(&Value::Callable(c.clone()), CallArgs::positional(args))
     }
     pub fn var_name_set(&mut self, name: &str, v: Value) {
         self.var_set(name, v);
@@ -9943,7 +11553,7 @@ impl<'a> Interp<'a> {
         self.emit_diag(name, errno, msg)
     }
     pub fn invoke_callable_str(&mut self, name: &str, args: Vec<Cell>) -> Result<Value, PhpError> {
-        self.call_value(&Value::str(name), args)
+        self.call_value(&Value::str(name), CallArgs::positional(args))
     }
     pub fn prop_set(&mut self, obj: &Rc<RefCell<PhpObject>>, name: &str, v: Value) {
         obj.borrow_mut().props.insert(name.to_string(), cell(v));
@@ -9969,6 +11579,21 @@ type MergedHooks = Vec<(PropHook, Rc<PhpClass>)>;
 /// `(emitted key, slot key, decl+decl class)` — `None` decl means a
 /// dynamic property (property-hooks serialization views).
 type SerialEntry = (String, String, Option<(PropDecl, Rc<PhpClass>)>);
+
+/// Zend-style render for the `assert(<args>)` AssertionError message.
+fn assert_arg_repr(v: &Value) -> String {
+    match v {
+        Value::Bool(b) => if *b { "true" } else { "false" }.into(),
+        Value::Null => "NULL".into(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => crate::value::trace_arg(&Value::Float(*f)),
+        Value::Str(s) => format!("'{}'", s),
+        Value::Array(_) => "Array".into(),
+        Value::Object(o) => format!("Object({})", o.borrow().class.name()),
+        Value::Callable(_) => "Object(Closure)".into(),
+        Value::Resource(_) => "Resource id #1".into(),
+    }
+}
 
 fn cell(v: Value) -> Cell {
     Rc::new(RefCell::new(v))

@@ -63,6 +63,20 @@ impl PhpError {
         }
     }
 
+    /// Compile-time fatals (duplicate named args, positional-after-named,
+    /// ...) print a `Stack trace:\n#0 {main}` block in PHP, unlike plain
+    /// E_ERRORs which carry no trace.
+    pub fn compile_fatal(message: impl Into<String>, line: usize) -> Self {
+        Self {
+            kind: ErrorKind::Fatal,
+            message: message.into(),
+            line,
+            trace: Some(vec![]),
+            thrown_line: None,
+            display_msg: None,
+        }
+    }
+
     pub fn uncaught(class: &'static str, message: impl Into<String>, line: usize) -> Self {
         Self {
             kind: ErrorKind::Uncaught { class },

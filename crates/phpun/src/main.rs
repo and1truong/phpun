@@ -83,6 +83,7 @@ fn run_script(args: &[String]) -> ExitCode {
     }
     let res = it.run_source(&src);
     print!("{}", it.out);
+    eprint!("{}", it.err_buf);
     ExitCode::from((res.exit_code & 0xff) as u8)
 }
 

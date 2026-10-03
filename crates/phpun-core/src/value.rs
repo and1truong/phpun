@@ -67,6 +67,12 @@ impl PhpArray {
         self.next += 1;
     }
 
+    /// Append an existing cell (by-ref variadics alias their args).
+    pub fn push_cell(&mut self, c: Cell) {
+        self.entries.push((ArrKey::Int(self.next), c));
+        self.next += 1;
+    }
+
     pub fn set(&mut self, k: ArrKey, v: Value) {
         self.set_cell(k, Rc::new(RefCell::new(v)));
     }
@@ -176,10 +182,28 @@ pub fn to_key(v: &Value) -> ArrKey {
 /// Render Zend-style stack frames innermost-first, `#N {main}` last:
 /// `#0 file(7): fn('a', 2)` / `#0 [internal function]: cb('x')`.
 /// Internal callees hide their args (PHP: no arg info for builtins).
+/// call_user_func*/forward_static_call trampolines are
+/// ZEND_ACC_CALL_VIA_TRAMPOLINE — Zend omits them from backtraces
+/// (named_params/call_user_func_array_variadic shows only the
+/// forwarded `array_multisort(: 1)` frame).
+pub fn trace_frame_hidden(fr: &TraceFrame) -> bool {
+    fr.internal
+        && matches!(
+            fr.function.as_str(),
+            "call_user_func"
+                | "call_user_func_array"
+                | "forward_static_call"
+                | "forward_static_call_array"
+        )
+}
+
 pub fn format_trace(frames: &[TraceFrame]) -> String {
     let rev: Vec<TraceFrame> = frames.iter().rev().cloned().collect();
     let mut t = format_backtrace_frames(&rev);
-    t.push_str(&format!("#{} {{main}}", frames.len()));
+    t.push_str(&format!(
+        "#{} {{main}}",
+        frames.iter().filter(|f| !trace_frame_hidden(f)).count()
+    ));
     t
 }
 
@@ -187,7 +211,11 @@ pub fn format_trace(frames: &[TraceFrame]) -> String {
 /// by the caller, no `{main}` trailer.
 pub fn format_backtrace_frames(frames: &[TraceFrame]) -> String {
     let mut t = String::new();
-    for (i, fr) in frames.iter().enumerate() {
+    let mut i = 0;
+    for fr in frames.iter() {
+        if trace_frame_hidden(fr) {
+            continue;
+        }
         let site = if fr.file == "[internal function]" {
             fr.file.clone()
         } else {
@@ -197,16 +225,15 @@ pub fn format_backtrace_frames(frames: &[TraceFrame]) -> String {
             Some(c) => format!("{}{}{}", c, fr.ty, fr.function),
             None => fr.function.clone(),
         };
-        let args = if fr.internal {
-            String::new()
-        } else {
-            fr.args
-                .iter()
-                .map(|c| trace_arg(&c.borrow()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+        // Internal callees render their args too (PHP 8 shows
+        // `strlen('a', 'b')`); named args render `name: value`.
+        let mut arg_strs: Vec<String> = fr.args.iter().map(|c| trace_arg(&c.borrow())).collect();
+        for (n, c) in &fr.named_args {
+            arg_strs.push(format!("{}: {}", n, trace_arg(&c.borrow())));
+        }
+        let args = arg_strs.join(", ");
         t.push_str(&format!("#{} {}: {}({})\n", i, site, callee, args));
+        i += 1;
     }
     t
 }
@@ -775,9 +802,12 @@ pub struct TraceFrame {
     /// is a builtin (e.g. a userland callback invoked from ob_end_clean).
     pub file: String,
     pub line: u32,
-    /// Call args (rendered with trace_arg; hidden for internal callees).
+    /// Call args (rendered with trace_arg).
     pub args: Vec<Cell>,
-    /// Callee is an internal/builtin function — PHP omits its args.
+    /// Named args, rendered `name: value` after the positionals.
+    pub named_args: Vec<(String, Cell)>,
+    /// Callee is an internal/builtin function — marks builtin frames so
+    /// callers can attribute userland callbacks (`[internal function]`).
     pub internal: bool,
 }
 
@@ -803,11 +833,24 @@ pub enum ObjectInternal {
         /// Call stack snapshot at construction → getTrace() (tests/lang/038).
         frames: Rc<Vec<TraceFrame>>,
     },
+    /// SPL ArrayIterator state: backing array + iteration cursor.
+    ArrayIter {
+        arr: Rc<RefCell<PhpArray>>,
+        pos: usize,
+        flags: i64,
+    },
+    /// ReflectionAttribute payload: the attribute's name, unevaluated arg
+    /// Exprs, and the TARGET_* bit of the declaration it was read from.
+    ReflectionAttribute {
+        name: String,
+        args: Rc<Vec<crate::ast::Expr>>,
+        target: i64,
+    },
     /// DateTime, closures-as-objects, etc. — opaque marker.
     None,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PhpCallable {
     /// Zend object-store handle id (var_dump `object(Closure)#N`).
     pub id: std::cell::Cell<u64>,
@@ -821,7 +864,7 @@ pub struct PhpCallable {
     pub scope_class: Option<Rc<PhpClass>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CallableKind {
     /// Closure / arrow fn built from a decl.
     Closure(Rc<crate::ast::FunctionDecl>),

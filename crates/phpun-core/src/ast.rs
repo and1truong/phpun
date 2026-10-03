@@ -98,9 +98,9 @@ pub struct ClassDecl {
     pub readonly: bool,
     pub parent: Option<String>,
     pub implements: Vec<String>,
-    /// `#[Attr]` names preceding the declaration (AllowDynamicProperties
-    /// detection; args are not preserved).
-    pub attrs: Vec<String>,
+    /// `#[Attr]` groups preceding the declaration (AllowDynamicProperties
+    /// detection, ReflectionAttribute::getAttributes).
+    pub attrs: Vec<AttrDecl>,
     /// `use`d traits (inside the body).
     pub traits: Vec<String>,
     pub methods: Vec<Rc<MethodDecl>>,
@@ -230,11 +230,25 @@ pub enum ForeachTarget {
     List(Vec<Option<ForeachTarget>>),
 }
 
+/// A parsed `#[Name(args)]` attribute group entry — args stay as Exprs
+/// and are evaluated lazily by ReflectionAttribute::getArguments() and
+/// ::newInstance().
+#[derive(Debug, Clone)]
+pub struct AttrDecl {
+    pub name: String,
+    pub args: Vec<Expr>,
+    /// Line of the `#[` token (compile-fatals attribute to the
+    /// attributed declaration, which Zend reports a line later).
+    pub line: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct FunctionDecl {
     pub name: String,
     pub params: Vec<Param>,
     pub body: Vec<Stmt>,
+    /// `#[Attr]` groups preceding the declaration.
+    pub attrs: Vec<AttrDecl>,
     /// `&name(` — returns by reference.
     pub by_ref: bool,
     /// Source line of the `function` keyword (for TypeError "defined in"

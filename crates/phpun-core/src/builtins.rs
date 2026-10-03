@@ -490,13 +490,45 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "htmlspecialchars" | "htmlentities" => {
             let s = arg_str(it, args, 0);
-            Value::str(
-                s.replace('&', "&amp;")
-                    .replace('<', "&lt;")
-                    .replace('>', "&gt;")
-                    .replace('"', "&quot;")
-                    .replace('\'', "&#039;"),
-            )
+            // `double_encode: false` skips existing entities (bug80096).
+            let double = args.len() < 4 || arg(args, 3).is_truthy();
+            let mut out = String::with_capacity(s.len());
+            let bytes = s.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'&' {
+                    if !double {
+                        if let Some(semi) = s[i + 1..].find(';').map(|o| i + 1 + o) {
+                            let ent = &s[i + 1..semi];
+                            if ent.starts_with('#')
+                                || ent.chars().all(|c| c.is_ascii_alphanumeric() || c == '#')
+                                    && !ent.is_empty()
+                            {
+                                out.push_str(&s[i..=semi]);
+                                i = semi + 1;
+                                continue;
+                            }
+                        }
+                    }
+                    out.push_str("&amp;");
+                } else {
+                    out.push_str(match bytes[i] {
+                        b'<' => "&lt;",
+                        b'>' => "&gt;",
+                        b'"' => "&quot;",
+                        b'\'' => "&#039;",
+                        _ => {
+                            // Copy the full UTF-8 char, not the byte.
+                            let ch_len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                            out.push_str(&s[i..i + ch_len]);
+                            i += ch_len;
+                            continue;
+                        }
+                    });
+                }
+                i += 1;
+            }
+            Value::str(out)
         }
         "htmlspecialchars_decode" | "html_entity_decode" => {
             let s = arg_str(it, args, 0);
@@ -618,7 +650,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "count" | "sizeof" => match arg(args, 0) {
             Value::Array(a) => Value::Int(a.borrow().len() as i64),
             Value::Object(o) if it.obj_is_a(&o, "Countable") => {
-                it.method_invoke(o.clone(), "count", vec![])?
+                it.method_invoke(o.clone(), "count", crate::interp::CallArgs::empty())?
             }
             Value::Null => Value::Int(0),
             v => {
@@ -628,8 +660,21 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         },
         "array_keys" => match arg(args, 0) {
             Value::Array(a) => {
+                let search = args.get(1).map(|c| c.borrow().clone());
+                let strict = arg(args, 2).is_truthy();
                 let mut out = PhpArray::new();
-                for (k, _) in a.borrow().iter() {
+                for (k, c) in a.borrow().iter() {
+                    if let Some(sv) = &search {
+                        let ev = c.borrow();
+                        let hit = if strict {
+                            crate::value::identical(&ev, sv)
+                        } else {
+                            crate::value::compare(&ev, sv) == std::cmp::Ordering::Equal
+                        };
+                        if !hit {
+                            continue;
+                        }
+                    }
                     out.push(match k {
                         ArrKey::Int(i) => Value::Int(*i),
                         ArrKey::Str(s) => Value::str(s.to_string()),
@@ -772,7 +817,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     } else {
                         off.min(n)
                     };
-                    let len = if args.len() > 2 {
+                    let len = if args.len() > 2 && !matches!(arg(args, 2), Value::Null) {
                         let l = arg(args, 2).to_int();
                         if l < 0 {
                             (n - off + l).max(0)
@@ -1109,7 +1154,10 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     let v = c.borrow().clone();
                     let keep = match &cb {
                         Some(cb) => {
-                            let r = it.call_value(cb, vec![cell(v.clone())])?;
+                            let r = it.call_value(
+                                cb,
+                                crate::interp::CallArgs::positional(vec![cell(v.clone())]),
+                            )?;
                             r.is_truthy()
                         }
                         None => v.is_truthy(),
@@ -1127,7 +1175,10 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             if args.len() == 2 {
                 if let Value::Array(a) = arg(args, 1) {
                     for (_, c) in a.borrow().iter() {
-                        let v = it.call_value(&cb, vec![cell(c.borrow().clone())])?;
+                        let v = it.call_value(
+                            &cb,
+                            crate::interp::CallArgs::positional(vec![cell(c.borrow().clone())]),
+                        )?;
                         out.push(v);
                     }
                 }
@@ -1151,7 +1202,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                         .iter()
                         .map(|a| cell(a.get(i).cloned().unwrap_or(Value::Null)))
                         .collect();
-                    let v = it.call_value(&cb, call_args)?;
+                    let v = it.call_value(&cb, crate::interp::CallArgs::positional(call_args))?;
                     out.push(v);
                 }
             }
@@ -1163,7 +1214,13 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let mut acc = arg(args, 2);
             if let Value::Array(a) = arg(args, 0) {
                 for (_, c) in a.borrow().iter() {
-                    acc = it.call_value(&cb, vec![cell(acc), cell(c.borrow().clone())])?;
+                    acc = it.call_value(
+                        &cb,
+                        crate::interp::CallArgs::positional(vec![
+                            cell(acc),
+                            cell(c.borrow().clone()),
+                        ]),
+                    )?;
                 }
             }
             acc
@@ -1200,7 +1257,11 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                         .to_string();
                     it.call_value(
                         &cb,
-                        vec![cell(v), cell(Value::str(plain)), cell(extra.clone())],
+                        crate::interp::CallArgs::positional(vec![
+                            cell(v),
+                            cell(Value::str(plain)),
+                            cell(extra.clone()),
+                        ]),
                     )?;
                 }
                 if walked {
@@ -1212,7 +1273,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 for (k, c) in cells {
                     it.call_value(
                         &cb,
-                        vec![
+                        crate::interp::CallArgs::positional(vec![
                             c.clone(),
                             cell(match k {
                                 ArrKey::Int(i) => Value::Int(i),
@@ -1220,7 +1281,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                                 ArrKey::Tomb => Value::Null,
                             }),
                             cell(extra.clone()),
-                        ],
+                        ]),
                     )?;
                 }
             }
@@ -1884,6 +1945,11 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 for av in &fr.args {
                     a.push(av.borrow().clone());
                 }
+                // Variadic-collected named args keep their string keys
+                // (named_params/backtrace: `x`/`y` after the positionals).
+                for (n, av) in &fr.named_args {
+                    a.set(ArrKey::Str(n.clone().into()), av.borrow().clone());
+                }
                 f.set(
                     ArrKey::Str("args".into()),
                     Value::Array(Rc::new(RefCell::new(a))),
@@ -1971,15 +2037,35 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         | "forward_static_call"
         | "forward_static_call_array" => {
             let cb = arg(args, 0);
-            let call_args: Vec<Cell> = if name.ends_with("_array") {
-                match arg(args, 1) {
-                    Value::Array(a) => a.borrow().iter().map(|(_, c)| c.clone()).collect(),
-                    _ => vec![],
+            // `*_array` unpacks the args array: string keys become named
+            // args (a later int key is the positional-after-named Error).
+            if name.ends_with("_array") {
+                let mut ca = crate::interp::CallArgs::empty();
+                let mut seen_str = false;
+                if let Value::Array(a) = arg(args, 1) {
+                    for (k, c) in a.borrow().iter() {
+                        match k {
+                            ArrKey::Str(s) => {
+                                seen_str = true;
+                                ca.named.push((s.to_string(), c.clone(), true, false));
+                            }
+                            _ if seen_str => {
+                                return err::<Option<Value>>(
+                                    "Error",
+                                    "Cannot use positional argument after named argument",
+                                );
+                            }
+                            _ => ca.cells.push(c.clone()),
+                        }
+                    }
                 }
+                it.call_value(&cb, ca)?
             } else {
-                args[1.min(args.len())..].to_vec()
-            };
-            it.call_value(&cb, call_args)?
+                it.call_value(
+                    &cb,
+                    crate::interp::CallArgs::positional(args[1.min(args.len())..].to_vec()),
+                )?
+            }
         }
         "register_shutdown_function" => {
             let f = arg(args, 0);
@@ -2762,7 +2848,15 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             if v.is_truthy() {
                 Value::Bool(true)
             } else {
-                return err("AssertionError", "assert(false)");
+                // A `description` arg is the message; otherwise the call
+                // renders as `assert(<args>)` (named_params/assert).
+                let desc = arg(args, 1);
+                let msg = if matches!(desc, Value::Null) || desc.to_php_string().is_empty() {
+                    format!("assert({})", std::mem::take(&mut it.assert_src))
+                } else {
+                    desc.to_php_string()
+                };
+                return err("AssertionError", &msg);
             }
         }
         "assert_options" => Value::Bool(true),
@@ -4327,8 +4421,8 @@ fn str_pad(s: &str, len: usize, pad: &str, ty: i64) -> String {
     let need = len - s.len();
     let mk = |n: usize| -> String { pad.repeat(n / pad.len() + 1)[..n].to_string() };
     match ty {
-        0 => format!("{}{}", s, mk(need)), // STR_PAD_RIGHT
-        1 => format!("{}{}", mk(need), s), // STR_PAD_LEFT
+        0 => format!("{}{}", mk(need), s), // STR_PAD_LEFT
+        1 => format!("{}{}", s, mk(need)), // STR_PAD_RIGHT
         2 => {
             // STR_PAD_BOTH
             let l = need / 2;
@@ -4541,7 +4635,7 @@ fn sort_array(
                             ],
                             _ => vec![ca.clone(), cbb.clone()],
                         };
-                        let r = it.call_value(&cb, args)?;
+                        let r = it.call_value(&cb, crate::interp::CallArgs::positional(args))?;
                         if r.to_int() > 0 {
                             sorted.swap(i, i + 1);
                             swapped = true;
@@ -4795,7 +4889,7 @@ fn json_encode(_it: &mut Interp, v: &Value) -> Result<String, ()> {
                 .is_some()
             {
                 let v = _it
-                    .method_invoke(o.clone(), "jsonSerialize", Vec::new())
+                    .method_invoke(o.clone(), "jsonSerialize", crate::interp::CallArgs::empty())
                     .unwrap_or(Value::Null);
                 return json_encode(_it, &v);
             }
@@ -5327,7 +5421,9 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                         }
                         let r = it.call_value(
                             &cb,
-                            vec![cell(Value::Array(Rc::new(RefCell::new(group_arr))))],
+                            crate::interp::CallArgs::positional(vec![cell(Value::Array(Rc::new(
+                                RefCell::new(group_arr),
+                            )))]),
                         )?;
                         out.push_str(&r.to_php_string());
                         last = *me;
@@ -5962,4 +6058,256 @@ fn cast_to(v: &Value, t: &str) -> Value {
         "object" => v.clone(),
         _ => v.clone(),
     }
+}
+
+/// Named-argument resolution for internal functions
+/// (Zend/tests/named_params/internal*). Param names follow the Zend
+/// stubs; `BDef::Var` as the last entry marks a variadic tail, which
+/// rejects unknown named params with a different message.
+#[derive(Clone, Copy)]
+pub enum BDef {
+    Req,
+    Null,
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(&'static str),
+    Arr,
+    /// "Unknown default" — must be passed explicitly when a later param
+    /// is bound (array_keys' $filter_value, named_params/missing_param).
+    Unk,
+    Var,
+}
+
+impl BDef {
+    pub fn val(self) -> Value {
+        match self {
+            BDef::Req | BDef::Var => Value::Null,
+            BDef::Null | BDef::Unk => Value::Null,
+            BDef::Int(i) => Value::Int(i),
+            BDef::Float(f) => Value::Float(f),
+            BDef::Bool(b) => Value::Bool(b),
+            BDef::Str(s) => Value::str(s),
+            BDef::Arr => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+        }
+    }
+}
+
+type BParams = &'static [(&'static str, BDef)];
+
+macro_rules! bp {
+    ($(($n:literal, $d:expr)),* $(,)?) => {
+        &[$(($n, $d)),*]
+    };
+}
+
+/// Positional signatures of the internal functions userland code
+/// commonly calls with named args. Entries are `(name, default)`;
+/// `Req` marks a required param, `Var` a variadic tail.
+pub fn builtin_params(name: &str) -> Option<BParams> {
+    use BDef::*;
+    Some(match name {
+        "strlen" | "strtoupper" | "strtolower" | "strrev" | "lcfirst" | "ucfirst" | "ord"
+        | "chr" => bp!(("string", Req)),
+        "str_pad" => bp!(
+            ("string", Req),
+            ("length", Req),
+            ("pad_string", Str(" ")),
+            ("pad_type", Int(1))
+        ),
+        "str_repeat" => bp!(("string", Req), ("times", Req)),
+        "substr" => bp!(("string", Req), ("start", Req), ("length", Null)),
+        "strpos" | "stripos" | "strrpos" | "strripos" => {
+            bp!(("haystack", Req), ("needle", Req), ("offset", Int(0)))
+        }
+        "str_contains" | "str_starts_with" | "str_ends_with" => {
+            bp!(("haystack", Req), ("needle", Req))
+        }
+        "strcmp" | "strcasecmp" => bp!(("string1", Req), ("string2", Req)),
+        "strncmp" | "strncasecmp" => {
+            bp!(("string1", Req), ("string2", Req), ("length", Req))
+        }
+        "str_replace" | "str_ireplace" => bp!(
+            ("search", Req),
+            ("replace", Req),
+            ("subject", Req),
+            ("count", Null)
+        ),
+        "substr_replace" => bp!(
+            ("string", Req),
+            ("replace", Req),
+            ("start", Req),
+            ("length", Null)
+        ),
+        "trim" | "ltrim" | "rtrim" => {
+            bp!(("string", Req), ("characters", Str(" \n\r\t\u{b}\0")))
+        }
+        "explode" => bp!(
+            ("separator", Req),
+            ("string", Req),
+            ("limit", Int(i64::MAX))
+        ),
+        "implode" | "join" => bp!(("separator", Str("")), ("array", Req)),
+        "ucwords" => bp!(("string", Req), ("separators", Str(" \t\r\n\u{c}\u{b}"))),
+        "wordwrap" => bp!(
+            ("string", Req),
+            ("width", Int(75)),
+            ("break", Str("\n")),
+            ("cut_long_words", Bool(false))
+        ),
+        "nl2br" => bp!(("string", Req), ("use_xhtml", Bool(true))),
+        "sprintf" | "printf" | "vsprintf" | "fprintf" => {
+            bp!(("format", Req), ("...", Var))
+        }
+        "number_format" => bp!(
+            ("num", Req),
+            ("decimals", Int(0)),
+            ("decimal_separator", Str(".")),
+            ("thousands_separator", Str(","))
+        ),
+        "round" => bp!(("num", Req), ("precision", Int(0)), ("mode", Int(1))),
+        "intval" | "floatval" | "doubleval" | "strval" | "boolval" => {
+            bp!(("value", Req))
+        }
+        "count" | "sizeof" => bp!(("value", Req), ("mode", Int(0))),
+        "array_slice" => bp!(
+            ("array", Req),
+            ("offset", Req),
+            ("length", Null),
+            ("preserve_keys", Bool(false))
+        ),
+        "array_splice" => bp!(
+            ("array", Req),
+            ("offset", Req),
+            ("length", Null),
+            ("replacement", Arr)
+        ),
+        "array_keys" => bp!(
+            ("array", Req),
+            ("filter_value", Unk),
+            ("strict", Bool(false))
+        ),
+        "array_values"
+        | "array_flip"
+        | "array_pop"
+        | "array_shift"
+        | "array_sum"
+        | "array_product"
+        | "array_rand"
+        | "array_change_key_case" => {
+            bp!(("array", Req))
+        }
+        "array_reverse" => bp!(("array", Req), ("preserve_keys", Bool(false))),
+        "array_pad" => bp!(("array", Req), ("length", Req), ("value", Req)),
+        "array_fill" => bp!(("start_index", Req), ("count", Req), ("value", Req)),
+        "array_fill_keys" => bp!(("keys", Req), ("value", Req)),
+        "array_combine" => bp!(("keys", Req), ("values", Req)),
+        "array_search" | "in_array" => {
+            bp!(("needle", Req), ("haystack", Req), ("strict", Bool(false)))
+        }
+        "array_key_exists" | "key_exists" => bp!(("key", Req), ("array", Req)),
+        "assert" => bp!(("assertion", Req), ("description", Null)),
+        "array_map" => bp!(("callback", Req), ("array", Req), ("...", Var)),
+        "array_filter" => bp!(("array", Req), ("callback", Null), ("mode", Int(0))),
+        "array_reduce" => bp!(("array", Req), ("callback", Req), ("initial", Null)),
+        "array_walk" | "array_walk_recursive" => {
+            bp!(("array", Req), ("callback", Req), ("arg", Null))
+        }
+        "array_merge"
+        | "array_merge_recursive"
+        | "array_diff"
+        | "array_diff_key"
+        | "array_diff_assoc"
+        | "array_intersect"
+        | "array_intersect_key"
+        | "array_intersect_assoc" => bp!(("...", Var)),
+        "array_multisort" | "array_replace" | "array_replace_recursive" => {
+            bp!(("array", Req), ("...", Var))
+        }
+        "array_push" | "array_unshift" => bp!(("array", Req), ("...", Var)),
+        "max" | "min" => bp!(("value", Req), ("...", Var)),
+        "compact" => bp!(("var_name", Req), ("...", Var)),
+        "array_column" => bp!(("array", Req), ("column_key", Req), ("index_key", Null)),
+        "array_unique" => bp!(("array", Req), ("flags", Int(2))),
+        "sort" | "rsort" | "asort" | "arsort" | "ksort" | "krsort" | "natsort" | "natcasesort" => {
+            bp!(("array", Req), ("flags", Int(0)))
+        }
+        "usort" | "uasort" | "uksort" => bp!(("array", Req), ("callback", Req)),
+        "range" => bp!(("start", Req), ("end", Req), ("step", Int(1))),
+        "preg_match" | "preg_match_all" => bp!(
+            ("pattern", Req),
+            ("subject", Req),
+            ("matches", Null),
+            ("flags", Int(0)),
+            ("offset", Int(0))
+        ),
+        "preg_replace" | "preg_filter" | "preg_replace_callback" => bp!(
+            ("pattern", Req),
+            ("replacement", Req),
+            ("subject", Req),
+            ("limit", Int(-1)),
+            ("count", Null)
+        ),
+        "preg_split" => bp!(
+            ("pattern", Req),
+            ("subject", Req),
+            ("limit", Int(-1)),
+            ("flags", Int(0))
+        ),
+        "preg_quote" => bp!(("str", Req), ("delimiter", Null)),
+        "preg_grep" => bp!(("pattern", Req), ("array", Req), ("flags", Int(0))),
+        "json_encode" => bp!(("value", Req), ("flags", Int(0)), ("depth", Int(512))),
+        "json_decode" => bp!(
+            ("json", Req),
+            ("associative", Null),
+            ("depth", Int(512)),
+            ("flags", Int(0))
+        ),
+        "htmlspecialchars" | "htmlentities" => bp!(
+            ("string", Req),
+            ("flags", Int(11)),
+            ("encoding", Null),
+            ("double_encode", Bool(true))
+        ),
+        "htmlspecialchars_decode" | "html_entity_decode" => {
+            bp!(("string", Req), ("flags", Int(11)), ("encoding", Null))
+        }
+        "define" => bp!(
+            ("constant_name", Req),
+            ("value", Req),
+            ("case_insensitive", Bool(false))
+        ),
+        "defined" | "constant" => bp!(("constant_name", Req)),
+        "ini_set" | "ini_alter" => bp!(("option", Req), ("value", Req)),
+        "ini_get" | "ini_get_all" => bp!(("option", Req)),
+        "error_reporting" => bp!(("error_level", Null)),
+        "microtime" => bp!(("as_float", Bool(false))),
+        "usleep" => bp!(("microseconds", Req)),
+        "sleep" => bp!(("seconds", Req)),
+        "md5" | "sha1" | "crc32" => bp!(("string", Req), ("binary", Bool(false))),
+        "file_get_contents" => bp!(
+            ("filename", Req),
+            ("use_include_path", Bool(false)),
+            ("context", Null),
+            ("offset", Int(0)),
+            ("length", Null)
+        ),
+        "file_put_contents" => {
+            bp!(
+                ("filename", Req),
+                ("data", Req),
+                ("flags", Int(0)),
+                ("context", Null)
+            )
+        }
+        "var_export" => bp!(("value", Req), ("return", Bool(false))),
+        "getenv" => bp!(("name", Req), ("local_only", Bool(false))),
+        "header" => bp!(
+            ("header", Req),
+            ("replace", Bool(true)),
+            ("response_code", Int(0))
+        ),
+        "setcookie" => bp!(("...", Var)),
+        _ => return None,
+    })
 }

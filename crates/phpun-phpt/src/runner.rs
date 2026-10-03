@@ -40,6 +40,7 @@ const DEFAULT_INI: &[&str] = &[
     "display_errors=1",
     "display_startup_errors=1",
     "log_errors=0",
+    "fatal_error_backtraces=Off",
     "html_errors=0",
     "track_errors=0",
     "report_zend_debug=0",
