@@ -2347,6 +2347,100 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             out.set(ArrKey::Str("filename".into()), Value::str(stem));
             Value::Array(Rc::new(RefCell::new(out)))
         }
+        // scheme://user:pass@host:port/path?query#fragment — component arg
+        // selects one part (PHP_URL_*), -1 returns the present parts.
+        "parse_url" => {
+            let url = arg_str(it, args, 0);
+            let comp = arg(args, 1).to_int();
+            let (rest, fragment) = match url.split_once('#') {
+                Some((a, b)) => (a.to_string(), Some(b.to_string())),
+                None => (url.clone(), None),
+            };
+            let (rest, query) = match rest.split_once('?') {
+                Some((a, b)) => (a.to_string(), Some(b.to_string())),
+                None => (rest, None),
+            };
+            let (scheme, rest) = match rest.split_once("://") {
+                Some((s, r)) => (Some(s.to_lowercase()), r.to_string()),
+                None => (None, rest),
+            };
+            let (authority, path) = if scheme.is_some() || rest.starts_with("//") {
+                let rest = rest.trim_start_matches('/');
+                match rest.split_once('/') {
+                    Some((a, p)) => (Some(a.to_string()), format!("/{}", p)),
+                    None => (
+                        if rest.is_empty() {
+                            None
+                        } else {
+                            Some(rest.to_string())
+                        },
+                        String::new(),
+                    ),
+                }
+            } else {
+                (None, rest)
+            };
+            let (user, pass, host, port) = match &authority {
+                Some(auth) => {
+                    let (up, hp) = match auth.split_once('@') {
+                        Some((u, h)) => (Some(u), h),
+                        None => (None, auth.as_str()),
+                    };
+                    let (user, pass) = up
+                        .map(|u| match u.split_once(':') {
+                            Some((a, b)) => (Some(a.to_string()), Some(b.to_string())),
+                            None => (Some(u.to_string()), None),
+                        })
+                        .unwrap_or((None, None));
+                    let (host, port) = match hp.rsplit_once(':') {
+                        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+                            (h.to_string(), p.parse::<i64>().ok())
+                        }
+                        _ => (hp.to_string(), None),
+                    };
+                    (user, pass, Some(host), port)
+                }
+                None => (None, None, None, None),
+            };
+            let part = |i: i64| -> Option<Value> {
+                match i {
+                    0 => scheme.clone().map(Value::str),
+                    1 => host.clone().map(Value::str),
+                    2 => port.map(Value::Int),
+                    3 => user.clone().map(Value::str),
+                    4 => pass.clone().map(Value::str),
+                    5 => {
+                        if path.is_empty() {
+                            None
+                        } else {
+                            Some(Value::str(path.clone()))
+                        }
+                    }
+                    6 => query.clone().map(Value::str),
+                    7 => fragment.clone().map(Value::str),
+                    _ => None,
+                }
+            };
+            if comp >= 0 {
+                return Ok(Some(part(comp).unwrap_or(Value::Null)));
+            }
+            let mut out = PhpArray::new();
+            for (i, key) in [
+                (0, "scheme"),
+                (1, "host"),
+                (2, "port"),
+                (3, "user"),
+                (4, "pass"),
+                (5, "path"),
+                (6, "query"),
+                (7, "fragment"),
+            ] {
+                if let Some(v) = part(i) {
+                    out.set(ArrKey::Str(key.into()), v);
+                }
+            }
+            Value::Array(Rc::new(RefCell::new(out)))
+        }
         "tempnam" => {
             let dir = arg_str(it, args, 0);
             let prefix = arg_str(it, args, 1);
@@ -2974,12 +3068,133 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "token_get_all" | "token_name" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
         "highlight_string" | "highlight_file" | "php_strip_whitespace" => Value::Bool(true),
         "pack" | "unpack" => Value::Bool(false), // TODO
-        "headers_sent"
-        | "headers_list"
-        | "header"
-        | "header_remove"
-        | "header_register_callback" => Value::Bool(false),
-        "setcookie" | "setrawcookie" => Value::Bool(true),
+        "header" => {
+            let h = arg_str(it, args, 0);
+            let replace = args.get(1).map(|c| c.borrow().is_truthy()).unwrap_or(true);
+            let code = arg(args, 2).to_int();
+            let lower = h.to_lowercase();
+            if lower.starts_with("http/") {
+                // Status-line form: header("HTTP/1.1 404 Not Found").
+                if let Some(c) = h
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    it.resp_code = c;
+                }
+            } else {
+                let name = h.split(':').next().unwrap_or("").trim().to_lowercase();
+                if replace && !name.is_empty() {
+                    let prefix = format!("{}:", name);
+                    it.out_headers
+                        .retain(|x| !x.to_lowercase().starts_with(&prefix));
+                }
+                it.out_headers.push(h);
+                if code > 0 {
+                    it.resp_code = code;
+                } else if name == "location" {
+                    it.resp_code = 302;
+                }
+            }
+            Value::Null
+        }
+        "headers_sent" => Value::Bool(false),
+        "headers_list" => {
+            let mut a = PhpArray::new();
+            for h in &it.out_headers {
+                a.push(Value::str(h.clone()));
+            }
+            Value::Array(Rc::new(RefCell::new(a)))
+        }
+        "header_remove" => {
+            if args.is_empty() {
+                it.out_headers.clear();
+            } else {
+                let prefix = format!("{}:", arg_str(it, args, 0).to_lowercase());
+                it.out_headers
+                    .retain(|x| !x.to_lowercase().starts_with(&prefix));
+            }
+            Value::Null
+        }
+        "header_register_callback" => Value::Bool(false),
+        "http_response_code" => {
+            if args.is_empty() {
+                Value::Int(it.resp_code)
+            } else {
+                let code = arg(args, 0).to_int();
+                it.resp_code = code;
+                Value::Int(code)
+            }
+        }
+        "setcookie" | "setrawcookie" => {
+            let cname = arg_str(it, args, 0);
+            let cval = if name == "setcookie" {
+                urlencode(&arg_str(it, args, 1), true)
+            } else {
+                arg_str(it, args, 1)
+            };
+            let mut line = format!("Set-Cookie: {}={}", cname, cval);
+            let opts = arg(args, 2);
+            let (expires, path, domain, secure, httponly, samesite) = match &opts {
+                Value::Array(a) => {
+                    let a = a.borrow();
+                    let get = |k: &str| {
+                        a.entries
+                            .iter()
+                            .find(|(ek, _)| matches!(ek, ArrKey::Str(s) if s.as_ref() == k))
+                            .map(|(_, c)| c.borrow().clone())
+                    };
+                    (
+                        get("expires").map(|v| v.to_int()).unwrap_or(0),
+                        get("path").map(|v| it.to_string_of(&v)).unwrap_or_default(),
+                        get("domain")
+                            .map(|v| it.to_string_of(&v))
+                            .unwrap_or_default(),
+                        get("secure").map(|v| v.is_truthy()).unwrap_or(false),
+                        get("httponly").map(|v| v.is_truthy()).unwrap_or(false),
+                        get("samesite")
+                            .map(|v| it.to_string_of(&v))
+                            .unwrap_or_default(),
+                    )
+                }
+                v => (
+                    v.to_int(),
+                    arg_str(it, args, 3),
+                    arg_str(it, args, 4),
+                    arg(args, 5).is_truthy(),
+                    arg(args, 6).is_truthy(),
+                    String::new(),
+                ),
+            };
+            if expires > 0 {
+                line.push_str(&format!(
+                    "; expires={}; Max-Age={}",
+                    date_format("D, d M Y H:i:s", expires),
+                    expires
+                        - std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0)
+                ));
+            }
+            if !path.is_empty() {
+                line.push_str(&format!("; path={}", path));
+            }
+            if !domain.is_empty() {
+                line.push_str(&format!("; domain={}", domain));
+            }
+            if secure {
+                line.push_str("; secure");
+            }
+            if httponly {
+                line.push_str("; HttpOnly");
+            }
+            if !samesite.is_empty() {
+                line.push_str(&format!("; SameSite={}", samesite));
+            }
+            it.out_headers.push(line);
+            Value::Bool(true)
+        }
         "connection_status" | "connection_aborted" => Value::Int(0),
         "fastcgi_finish_request" => Value::Bool(true),
         "preg_jit" => Value::Bool(false),
@@ -3198,10 +3413,16 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "glob"
             | "hash"
             | "hash_equals"
+            | "header"
+            | "header_register_callback"
+            | "header_remove"
+            | "headers_list"
+            | "headers_sent"
             | "hex2bin"
             | "hexdec"
             | "hrtime"
             | "http_build_query"
+            | "http_response_code"
             | "hypot"
             | "ignore_user_abort"
             | "in_array"
@@ -3271,6 +3492,7 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "ord"
             | "output_reset_rewrite_vars"
             | "parse_str"
+            | "parse_url"
             | "pathinfo"
             | "php_check_syntax"
             | "php_sapi_name"
@@ -3301,7 +3523,9 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "set_error_handler"
             | "set_exception_handler"
             | "set_time_limit"
+            | "setcookie"
             | "setlocale"
+            | "setrawcookie"
             | "settype"
             | "sha1"
             | "similar_text"
@@ -4887,7 +5111,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn urlencode(s: &str, raw: bool) -> String {
+pub(crate) fn urlencode(s: &str, raw: bool) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
@@ -4900,7 +5124,7 @@ fn urlencode(s: &str, raw: bool) -> String {
     out
 }
 
-fn urldecode(s: &str, raw: bool) -> String {
+pub(crate) fn urldecode(s: &str, raw: bool) -> String {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -4957,6 +5181,11 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
             let all = name == "preg_match_all";
             let mut matches_arr = PhpArray::new();
             let mut count = 0i64;
+            // PHP duplicates a named capture under its string key
+            // immediately BEFORE the group's int key.
+            let group_name = |re: &regex::Regex, g: usize| {
+                re.capture_names().nth(g).flatten().map(|n| n.to_string())
+            };
             if all {
                 // group by capture index
                 let ngroups = re.captures_len();
@@ -4971,17 +5200,26 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                         grp.push(Value::str(m));
                     }
                 }
-                for g in groups {
-                    matches_arr.push(Value::Array(Rc::new(RefCell::new(g))));
+                for (g, grp) in groups.into_iter().enumerate() {
+                    if let Some(n) = group_name(&re, g) {
+                        matches_arr.set(
+                            ArrKey::Str(n.into()),
+                            Value::Array(Rc::new(RefCell::new(grp.clone()))),
+                        );
+                    }
+                    matches_arr.push(Value::Array(Rc::new(RefCell::new(grp))));
                 }
             } else if let Some(cap) = re.captures(&subj) {
                 count = 1;
                 for g in 0..cap.len() {
-                    matches_arr.push(
-                        cap.get(g)
-                            .map(|m| Value::str(m.as_str()))
-                            .unwrap_or(Value::str("")),
-                    );
+                    let v = cap
+                        .get(g)
+                        .map(|m| Value::str(m.as_str()))
+                        .unwrap_or(Value::str(""));
+                    if let Some(n) = group_name(&re, g) {
+                        matches_arr.set(ArrKey::Str(n.into()), v.clone());
+                    }
+                    matches_arr.push(v);
                 }
             }
             if let Some(c) = args.get(2) {

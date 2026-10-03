@@ -110,6 +110,12 @@ pub struct Interp<'a> {
     /// Accumulated program output (display_errors prints to stdout under
     /// CLI, and the PHPT harness merges streams via 2>&1).
     pub out: String,
+    /// Headers queued by header()/setcookie() — `phpun serve` emits them
+    /// into the HTTP response; CLI ignores them (like php-cli).
+    pub out_headers: Vec<String>,
+    /// Response status code set via http_response_code() or the third
+    /// arg of header() — serve mode reads it (200 default).
+    pub resp_code: i64,
     /// Output buffer stack for ob_*().
     ob_stack: Vec<ObLevel>,
     /// While >0, warnings are suppressed (implements `??`, `isset`,
@@ -263,6 +269,15 @@ impl<'a> Interp<'a> {
         constants.insert("PHP_OUTPUT_HANDLER_FLUSHABLE".into(), Value::Int(32));
         constants.insert("PHP_OUTPUT_HANDLER_REMOVABLE".into(), Value::Int(64));
         constants.insert("PHP_OUTPUT_HANDLER_STDFLAGS".into(), Value::Int(112));
+        // parse_url() component selectors.
+        constants.insert("PHP_URL_SCHEME".into(), Value::Int(0));
+        constants.insert("PHP_URL_HOST".into(), Value::Int(1));
+        constants.insert("PHP_URL_PORT".into(), Value::Int(2));
+        constants.insert("PHP_URL_USER".into(), Value::Int(3));
+        constants.insert("PHP_URL_PASS".into(), Value::Int(4));
+        constants.insert("PHP_URL_PATH".into(), Value::Int(5));
+        constants.insert("PHP_URL_QUERY".into(), Value::Int(6));
+        constants.insert("PHP_URL_FRAGMENT".into(), Value::Int(7));
         constants.insert("E_RECOVERABLE_ERROR".into(), Value::Int(4096));
         constants.insert("E_CORE_ERROR".into(), Value::Int(16));
         constants.insert("E_CORE_WARNING".into(), Value::Int(32));
@@ -291,6 +306,8 @@ impl<'a> Interp<'a> {
             early_bound_classes: HashSet::new(),
             constants,
             out: String::new(),
+            out_headers: Vec::new(),
+            resp_code: 200,
             ob_stack: Vec::new(),
             silence: 0,
             statics: HashMap::new(),
@@ -879,6 +896,27 @@ impl<'a> Interp<'a> {
             Some(v) => matches!(v.as_str(), "1" | "on" | "true" | "yes"),
             None => false,
         }
+    }
+
+    /// phpun serve: replace a request superglobal ($_GET/$_POST/...).
+    pub fn set_superglobal(&mut self, name: &str, arr: PhpArray) {
+        self.globals.vars.insert(
+            name.to_string(),
+            cell(Value::Array(Rc::new(RefCell::new(arr)))),
+        );
+    }
+
+    /// phpun serve: set one $_SERVER entry (REQUEST_METHOD, HTTP_*, ...).
+    pub fn set_server_var(&mut self, k: &str, v: &str) {
+        let c = match self.globals.vars.get("_SERVER") {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        let arr = match &*c.borrow() {
+            Value::Array(a) => a.clone(),
+            _ => return,
+        };
+        arr.borrow_mut().set(ArrKey::Str(k.into()), Value::str(v));
     }
 
     pub fn run_source(&mut self, src: &str) -> RunResult {
