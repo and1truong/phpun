@@ -206,6 +206,10 @@ pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
     Ok((e, diags))
 }
 
+const ASSIGN_OPS: &[&str] = &[
+    "=", "+=", "-=", "*=", "/=", ".=", "%=", "&=", "|=", "^=", "<<=", ">>=", "**=", "??=",
+];
+
 impl<'a> Parser<'a> {
     fn peek(&self) -> Option<&Token> {
         self.toks.get(self.pos).map(|l| &l.token)
@@ -2504,9 +2508,7 @@ impl<'a> Parser<'a> {
 
     fn assign(&mut self) -> Result<Expr, PhpError> {
         let e = self.ternary()?;
-        const ASSIGN_OPS: &[&str] = &[
-            "=", "+=", "-=", "*=", "/=", ".=", "%=", "&=", "|=", "^=", "<<=", ">>=", "**=", "??=",
-        ];
+
         if let Some(Token::Op(op)) = self.peek() {
             if ASSIGN_OPS.contains(op) {
                 let mut op: &'static str = op;
@@ -2530,7 +2532,13 @@ impl<'a> Parser<'a> {
     fn list_target(&mut self, e: Expr) -> Result<Expr, PhpError> {
         match e {
             Expr::ArrayLit(items) => Ok(Expr::List(
-                items.into_iter().map(|(_, v)| Some(v)).collect(),
+                items
+                    .into_iter()
+                    .map(|(_, v)| match v {
+                        Expr::Null => None,
+                        other => Some(other),
+                    })
+                    .collect(),
             )),
             Expr::Call { name, args } => match *name {
                 Expr::Str(n) if n.eq_ignore_ascii_case("list") => {
@@ -2913,6 +2921,33 @@ impl<'a> Parser<'a> {
                 obj: Box::new(e),
                 class: Box::new(c),
             };
+        }
+        // `=` binds to the rightmost operand at any precedence — PHP's
+        // `expr: variable '=' expr` production makes
+        // `false !== $lastPos = strrpos(...)` (Composer's ClassLoader)
+        // parse as `!==` applied to an assignment.
+        if let Some(Token::Op(op)) = self.peek() {
+            let is_assign = ASSIGN_OPS.contains(op)
+                // `=&` stays with the statement-level assign() handler.
+                && !(op == &"="
+                    && matches!(
+                        self.toks.get(self.pos + 1).map(|l| &l.token),
+                        Some(Token::Op("&"))
+                    ));
+            if is_assign {
+                let mut op: &'static str = op;
+                self.pos += 1;
+                if op == "=" && self.eat_op("&") {
+                    op = "=&";
+                }
+                let rhs = self.assign()?;
+                let target = self.list_target(e)?;
+                return Ok(Expr::Assign {
+                    target: Box::new(target),
+                    op,
+                    value: Box::new(rhs),
+                });
+            }
         }
         Ok(e)
     }
@@ -3606,6 +3641,13 @@ impl<'a> Parser<'a> {
     fn array_items(&mut self, close: &str) -> Result<Vec<(Option<Expr>, Expr)>, PhpError> {
         let mut items = Vec::new();
         while !self.at_op(close) {
+            // List-destructuring hole: `[, $b] = ...` / `[$a, , $c]`.
+            // Expr::Null marks the skipped slot; list_target maps it to
+            // None. (In array-literal position a hole is a superset.)
+            if self.eat_op(",") {
+                items.push((None, Expr::Null));
+                continue;
+            }
             let first = self.array_elem()?;
             if self.eat_op("=>") {
                 let v = self.array_elem()?;

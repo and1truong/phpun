@@ -159,6 +159,8 @@ pub struct Interp<'a> {
     /// Response status code set via http_response_code() or the third
     /// arg of header() — serve mode reads it (200 default).
     pub resp_code: i64,
+    /// Set by json_encode/json_decode for json_last_error().
+    pub last_json_error: i64,
     /// Raw request body for php://input — serve mode fills it.
     pub php_input: std::rc::Rc<Vec<u8>>,
     /// Real upload tmp paths created this request — is_uploaded_file()
@@ -356,6 +358,50 @@ impl<'a> Interp<'a> {
         constants.insert("PREG_SPLIT_DELIM_CAPTURE".into(), Value::Int(2));
         constants.insert("PREG_SPLIT_OFFSET_CAPTURE".into(), Value::Int(4));
         constants.insert("PREG_GREP_INVERT".into(), Value::Int(1));
+        // ext/filter.
+        constants.insert("FILTER_VALIDATE_INT".into(), Value::Int(257));
+        constants.insert("FILTER_VALIDATE_BOOL".into(), Value::Int(258));
+        constants.insert("FILTER_VALIDATE_FLOAT".into(), Value::Int(259));
+        constants.insert("FILTER_VALIDATE_REGEXP".into(), Value::Int(272));
+        constants.insert("FILTER_VALIDATE_URL".into(), Value::Int(273));
+        constants.insert("FILTER_VALIDATE_EMAIL".into(), Value::Int(274));
+        constants.insert("FILTER_VALIDATE_IP".into(), Value::Int(275));
+        constants.insert("FILTER_VALIDATE_DOMAIN".into(), Value::Int(277));
+        constants.insert("FILTER_DEFAULT".into(), Value::Int(516));
+        constants.insert("FILTER_CALLBACK".into(), Value::Int(1024));
+        constants.insert("FILTER_REQUIRE_ARRAY".into(), Value::Int(16777216));
+        constants.insert("FILTER_REQUIRE_SCALAR".into(), Value::Int(33554432));
+        constants.insert("FILTER_FORCE_ARRAY".into(), Value::Int(67108864));
+        constants.insert("FILTER_NULL_ON_FAILURE".into(), Value::Int(134217728));
+        constants.insert("FILTER_FLAG_IPV4".into(), Value::Int(1048576));
+        constants.insert("FILTER_FLAG_IPV6".into(), Value::Int(2097152));
+        // ext-json.
+        constants.insert("JSON_ERROR_NONE".into(), Value::Int(0));
+        constants.insert("JSON_ERROR_DEPTH".into(), Value::Int(1));
+        constants.insert("JSON_ERROR_STATE_MISMATCH".into(), Value::Int(2));
+        constants.insert("JSON_ERROR_CTRL_CHAR".into(), Value::Int(3));
+        constants.insert("JSON_ERROR_SYNTAX".into(), Value::Int(4));
+        constants.insert("JSON_ERROR_UTF8".into(), Value::Int(5));
+        constants.insert("JSON_ERROR_RECURSION".into(), Value::Int(6));
+        constants.insert("JSON_ERROR_INF_OR_NAN".into(), Value::Int(7));
+        constants.insert("JSON_ERROR_UNSUPPORTED_TYPE".into(), Value::Int(8));
+        constants.insert("JSON_HEX_TAG".into(), Value::Int(1));
+        constants.insert("JSON_HEX_AMP".into(), Value::Int(2));
+        constants.insert("JSON_HEX_APOS".into(), Value::Int(4));
+        constants.insert("JSON_HEX_QUOT".into(), Value::Int(8));
+        constants.insert("JSON_FORCE_OBJECT".into(), Value::Int(16));
+        constants.insert("JSON_NUMERIC_CHECK".into(), Value::Int(32));
+        constants.insert("JSON_UNESCAPED_SLASHES".into(), Value::Int(64));
+        constants.insert("JSON_PRETTY_PRINT".into(), Value::Int(128));
+        constants.insert("JSON_UNESCAPED_UNICODE".into(), Value::Int(256));
+        constants.insert("JSON_PARTIAL_OUTPUT_ON_ERROR".into(), Value::Int(512));
+        constants.insert("JSON_PRESERVE_ZERO_FRACTION".into(), Value::Int(1024));
+        constants.insert("JSON_UNESCAPED_LINE_TERMINATORS".into(), Value::Int(2048));
+        constants.insert("JSON_INVALID_UTF8_IGNORE".into(), Value::Int(1048576));
+        constants.insert("JSON_INVALID_UTF8_SUBSTITUTE".into(), Value::Int(2097152));
+        constants.insert("JSON_THROW_ON_ERROR".into(), Value::Int(4194304));
+        constants.insert("JSON_OBJECT_AS_ARRAY".into(), Value::Int(1));
+        constants.insert("JSON_BIGINT_AS_STRING".into(), Value::Int(2));
         constants.insert("E_RECOVERABLE_ERROR".into(), Value::Int(4096));
         constants.insert("E_CORE_ERROR".into(), Value::Int(16));
         constants.insert("E_CORE_WARNING".into(), Value::Int(32));
@@ -388,6 +434,7 @@ impl<'a> Interp<'a> {
             decl_file_ctx: None,
             out_headers: Vec::new(),
             resp_code: 200,
+            last_json_error: 0,
             php_input: std::rc::Rc::new(Vec::new()),
             uploads: Vec::new(),
             ob_stack: Vec::new(),
@@ -3783,7 +3830,24 @@ impl<'a> Interp<'a> {
                 None => false,
             }),
             Expr::Index { e, i } => {
-                let base = self.eval(e)?;
+                // `isset($this->uninitTyped['k'])` and `$x ?? y` must not
+                // throw on uninitialized typed properties.
+                self.silence += 1;
+                let base = self.prop_read_loose(e);
+                self.silence -= 1;
+                let base = match base {
+                    Ok(b) => b,
+                    Err(err) if matches!(err.kind, ErrorKind::Throw) => {
+                        if err
+                            .message
+                            .ends_with("must not be accessed before initialization")
+                        {
+                            return Ok(false);
+                        }
+                        return Err(err);
+                    }
+                    Err(_) => return Ok(false),
+                };
                 let key = match i {
                     Some(k) => self.eval(k)?,
                     None => return Ok(false),
@@ -5313,10 +5377,12 @@ impl<'a> Interp<'a> {
                 Ok(Value::Bool(lv ^ rv))
             }
             "??" => {
-                self.silence += 1;
-                let lv = self.eval(l);
-                self.silence -= 1;
-                match lv? {
+                // isset() semantics: undefined vars, missing offsets and
+                // uninitialized typed props fall through to the right.
+                if !self.isset_eval(l)? {
+                    return self.eval(r);
+                }
+                match self.eval(l)? {
                     Value::Null => self.eval(r),
                     v => Ok(v),
                 }
