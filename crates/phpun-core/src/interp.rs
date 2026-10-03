@@ -278,6 +278,14 @@ impl<'a> Interp<'a> {
         constants.insert("PHP_URL_PATH".into(), Value::Int(5));
         constants.insert("PHP_URL_QUERY".into(), Value::Int(6));
         constants.insert("PHP_URL_FRAGMENT".into(), Value::Int(7));
+        constants.insert("PREG_PATTERN_ORDER".into(), Value::Int(1));
+        constants.insert("PREG_SET_ORDER".into(), Value::Int(2));
+        constants.insert("PREG_OFFSET_CAPTURE".into(), Value::Int(256));
+        constants.insert("PREG_UNMATCHED_AS_NULL".into(), Value::Int(512));
+        constants.insert("PREG_SPLIT_NO_EMPTY".into(), Value::Int(1));
+        constants.insert("PREG_SPLIT_DELIM_CAPTURE".into(), Value::Int(2));
+        constants.insert("PREG_SPLIT_OFFSET_CAPTURE".into(), Value::Int(4));
+        constants.insert("PREG_GREP_INVERT".into(), Value::Int(1));
         constants.insert("E_RECOVERABLE_ERROR".into(), Value::Int(4096));
         constants.insert("E_CORE_ERROR".into(), Value::Int(16));
         constants.insert("E_CORE_WARNING".into(), Value::Int(32));
@@ -2035,11 +2043,12 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
-            cur = c
+            let nxt = c
                 .decl
                 .parent
                 .as_ref()
                 .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = nxt;
         }
         false
     }
@@ -4635,6 +4644,21 @@ impl<'a> Interp<'a> {
             _ => {}
         }
 
+        // `array + array` is PHP's union operator: lhs keys win and rhs
+        // supplies only missing keys (not arithmetic — arrays never
+        // reach the numeric path).
+        if op == "+" {
+            if let (Value::Array(a), Value::Array(b)) = (&l, &r) {
+                let mut out = a.borrow().clone();
+                for (k, c) in b.borrow().entries.iter() {
+                    if out.get_cell(k).is_none() {
+                        out.set(k.clone(), c.borrow().clone());
+                    }
+                }
+                return Ok(Value::Array(Rc::new(RefCell::new(out))));
+            }
+        }
+
         let (ln, warn_l) = self.num(&l);
         let (rn, warn_r) = self.num(&r);
         if warn_l {
@@ -6229,6 +6253,28 @@ impl<'a> Interp<'a> {
     // ----- classes -----
 
     fn register_class(&mut self, decl: Rc<ClassDecl>) -> Result<(), PhpError> {
+        // PHP links a declared class eagerly: the parent class, every
+        // implemented interface, and every used trait must resolve at
+        // declaration time, autoloading them when unregistered
+        // (composer PSR-4 trees depend on this — MarkBased links
+        // RegexBasedAbstract and the DataGenerator interface here).
+        if let Some(p) = &decl.parent {
+            if !self.classes.contains_key(&p.to_lowercase()) {
+                self.run_autoload(p.trim_start_matches('\\'));
+            }
+        }
+        for i in &decl.implements {
+            if !self.interfaces.contains_key(&i.to_lowercase())
+                && !self.classes.contains_key(&i.to_lowercase())
+            {
+                self.run_autoload(i.trim_start_matches('\\'));
+            }
+        }
+        for t in &decl.traits {
+            if !self.traits.contains_key(&t.to_lowercase()) {
+                self.run_autoload(t.trim_start_matches('\\'));
+            }
+        }
         let mut d = (*decl).clone();
         // Synthesize PropDecls from promoted constructor params
         // (`__construct(public readonly int $x)`) — they behave as
@@ -9294,7 +9340,42 @@ impl<'a> Interp<'a> {
         if name == "class" {
             return Ok(Value::str(cname));
         }
-        let cls = match self.classes.get(&cname.to_lowercase()) {
+        let ckey = cname.to_lowercase();
+        if let Some(iface) = self.interfaces.get(&ckey).cloned() {
+            // Const on an interface (e.g. `FastRoute\Dispatcher::FOUND`):
+            // walk it and its extended interfaces.
+            let mut seen = std::collections::HashSet::new();
+            let mut stack = vec![iface];
+            while let Some(c) = stack.pop() {
+                if !seen.insert(c.name.to_lowercase()) {
+                    continue;
+                }
+                for (n, e) in &c.consts {
+                    if n == name {
+                        self.class_const_ctx += 1;
+                        let r = self.eval_const(e);
+                        self.class_const_ctx -= 1;
+                        return r;
+                    }
+                }
+                for i in &c.implements {
+                    if let Some(f) = self.interfaces.get(&i.to_lowercase()).cloned() {
+                        stack.push(f);
+                    }
+                }
+                if let Some(p) = &c.parent {
+                    if let Some(f) = self.interfaces.get(&p.to_lowercase()).cloned() {
+                        stack.push(f);
+                    }
+                }
+            }
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!("Undefined constant {}", name),
+                0,
+            ));
+        }
+        let cls = match self.classes.get(&ckey) {
             Some(c) => c.clone(),
             None => {
                 return self.fail(PhpError::uncaught(
@@ -9304,8 +9385,10 @@ impl<'a> Interp<'a> {
                 ))
             }
         };
-        // Walk chain for the const.
-        let mut cur = Some(cls);
+        // Walk chain for the const (class first, then implemented
+        // interfaces transitively — interface consts are inherited).
+        let mut cur = Some(cls.clone());
+        let mut ifaces: Vec<String> = Vec::new();
         while let Some(c) = cur {
             for (n, e) in &c.decl.consts {
                 if n == name {
@@ -9317,11 +9400,35 @@ impl<'a> Interp<'a> {
                     return r;
                 }
             }
+            ifaces.extend(c.decl.implements.iter().cloned());
             cur = c
                 .decl
                 .parent
                 .as_ref()
                 .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut queue: Vec<String> = ifaces;
+        while let Some(iname) = queue.pop() {
+            if !seen.insert(iname.to_lowercase()) {
+                continue;
+            }
+            if let Some(c) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+                for (n, e) in &c.consts {
+                    if n == name {
+                        let old = self.const_self.replace(cls.clone());
+                        self.class_const_ctx += 1;
+                        let r = self.eval_const(e);
+                        self.class_const_ctx -= 1;
+                        self.const_self = old;
+                        return r;
+                    }
+                }
+                queue.extend(c.implements.iter().cloned());
+                if let Some(p) = &c.parent {
+                    queue.push(p.clone());
+                }
+            }
         }
         self.fail(PhpError::uncaught(
             "Error",
@@ -9946,7 +10053,7 @@ fn builtin_byref(name: &str) -> Option<&'static [bool]> {
         | "ksort" | "krsort" | "usort" | "uasort" | "uksort" | "natsort" | "natcasesort"
         | "shuffle" | "reset" | "end" | "next" | "prev" | "current" | "pos" | "each"
         | "array_push" | "array_unshift" | "array_splice" | "array_multisort" => &[true],
-        "preg_match" | "preg_match_all" => &[false, false, true, true],
+        "preg_match" | "preg_match_all" => &[false, false, true],
         "preg_replace"
         | "preg_replace_callback"
         | "preg_replace_callback_array"
