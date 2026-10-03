@@ -292,6 +292,9 @@ pub struct Interp<'a> {
     /// (typed_properties_045). The stored clone keeps the slot alive so
     /// the pointer key stays unique.
     pub typed_slots: std::collections::HashMap<usize, (Cell, Vec<String>, String, String)>,
+    /// Additional typed-prop owners of a shared ref cell (the
+    /// `typed_slots` entry holds the first) — `union_types/prop_ref_assign`.
+    pub slot_owners: std::collections::HashMap<usize, Vec<(Vec<String>, String, String)>>,
     /// Interfaces registered by the builtin-class table — their method
     /// signatures carry *tentative* return types: implementations may
     /// declare any return type (typed_properties_065).
@@ -570,6 +573,7 @@ impl<'a> Interp<'a> {
             cur_file: file.to_string(),
             strict_files: std::collections::HashSet::new(),
             typed_slots: std::collections::HashMap::new(),
+            slot_owners: std::collections::HashMap::new(),
             builtin_ifaces: std::collections::HashSet::new(),
             dep_seen: std::collections::HashSet::new(),
             last_err_file: String::new(),
@@ -5343,8 +5347,38 @@ impl<'a> Interp<'a> {
                         // source (076/068 conflict); the shared cell
                         // then stays gated through typed_slots (071).
                         let mut merged: Option<Vec<String>> = None;
+                        let mut owner_ty: Option<Vec<String>> = None;
                         if let Some((pd, dcls)) = self.decl_prop(o, &pn) {
-                            if pd.ty.is_some() {
+                            if let Some(pt) = &pd.ty {
+                                owner_ty = Some(pt.clone());
+                                // Binding a cell already owned by another
+                                // typed prop: the shared value must satisfy
+                                // the new type as-is
+                                // (union_types/prop_ref_assign).
+                                let sptr = Rc::as_ptr(&src) as usize;
+                                let owned = self
+                                    .typed_slots
+                                    .get(&sptr)
+                                    .map(|(_, t, n, p)| (t.clone(), n.clone(), p.clone()));
+                                if let Some((otys, ocn, opn)) = owned {
+                                    if !self.ty_weak_exact(pt, &src.borrow()) {
+                                        let sv = src.borrow().clone();
+                                        return self.fail(PhpError::uncaught(
+                                            "TypeError",
+                                            format!(
+                                                "Reference with value of type {} held by property {}::${} of type {} is not compatible with property {}::${} of type {}",
+                                                self.zval_type_name(&sv),
+                                                ocn,
+                                                opn,
+                                                ty_disp(&otys),
+                                                dcls.name(),
+                                                pn,
+                                                ty_disp(pt)
+                                            ),
+                                            0,
+                                        ));
+                                    }
+                                }
                                 merged = Some(self.bind_typed_check(&pd, &dcls, &src)?);
                             }
                         }
@@ -5356,10 +5390,19 @@ impl<'a> Interp<'a> {
                         ob.props.insert(key, src.clone());
                         drop(ob);
                         if let (Some(m), Some((_, dcls))) = (merged, self.decl_prop(o, &pn)) {
+                            let sptr = Rc::as_ptr(&src) as usize;
                             self.typed_slots.insert(
-                                Rc::as_ptr(&src) as usize,
-                                (src, m, dcls.name().to_string(), pn.clone()),
+                                sptr,
+                                (src.clone(), m, dcls.name().to_string(), pn.clone()),
                             );
+                            // Owners keep their *declared* type — a
+                            // shared write must satisfy each and yield
+                            // one consistent result.
+                            self.slot_owners.entry(sptr).or_default().push((
+                                owner_ty.unwrap_or_default(),
+                                dcls.name().to_string(),
+                                pn.clone(),
+                            ));
                         }
                         return Ok(());
                     }
@@ -6236,28 +6279,21 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// A write reaching a cell that backs a declared-typed prop must
-    /// satisfy the declared type — Zend reports it as a write "to
-    /// reference held by property" (typed_properties_033/045).
-    fn typed_slot_store(&mut self, c: &Cell, v: Value) -> Result<Value, PhpError> {
-        let Some((_, tys, cn, pn)) = self
-            .typed_slots
-            .get(&(Rc::as_ptr(c) as usize))
-            .map(|(cc, t, n, p)| (cc.clone(), t.clone(), n.clone(), p.clone()))
-        else {
-            return Ok(v);
-        };
-        if self.ty_exact(&tys, &v) {
+    /// The write result one typed-slot owner would produce — exact
+    /// match widens `int` into a `float` member, weak files coerce;
+    /// `None` when the type can't be satisfied (union_types/prop_ref_assign).
+    fn slot_write_one(&mut self, tys: &[String], v: &Value) -> Result<Option<Value>, PhpError> {
+        if self.ty_exact(tys, v) {
             if tys.iter().any(|t| t.eq_ignore_ascii_case("float")) {
                 if let Value::Int(i) = v {
-                    return Ok(Value::Float(i as f64));
+                    return Ok(Some(Value::Float(*i as f64)));
                 }
             }
-            return Ok(v);
+            return Ok(Some(v.clone()));
         }
         if !self.exec_file_strict() {
             // Object with __toString coerces into a `string` slot (107).
-            if let Value::Object(o) = &v {
+            if let Value::Object(o) = v {
                 if tys.iter().any(|t| t.eq_ignore_ascii_case("string"))
                     && (self
                         .find_method_in(&o.borrow().class, "__tostring")
@@ -6269,27 +6305,89 @@ impl<'a> Interp<'a> {
                     let sv =
                         self.method_invoke(o.clone(), "__toString", CallArgs::positional(vec![]))?;
                     let svs = self.conv_str(&sv)?;
-                    return Ok(Value::str(svs));
+                    return Ok(Some(Value::str(svs)));
                 }
             }
-            if let Some(cv) = weak_ty_coerce(&tys, &v) {
-                self.deprecate_lossy_int(&tys, &v, &cv);
-                return Ok(cv);
+            if let Some(cv) = weak_ty_coerce(tys, v) {
+                self.deprecate_lossy_int(tys, v, &cv);
+                return Ok(Some(cv));
             }
         }
-        let mut e = PhpError::uncaught(
-            "TypeError",
-            format!(
-                "Cannot assign {} to reference held by property {}::${} of type {}",
-                self.zval_type_name(&v),
-                cn,
-                pn,
-                ty_disp(&tys)
-            ),
-            0,
-        );
+        Ok(None)
+    }
+
+    fn typed_slot_store(&mut self, c: &Cell, v: Value) -> Result<Value, PhpError> {
+        let ptr = Rc::as_ptr(c) as usize;
+        let owners: Vec<(Vec<String>, String, String)> =
+            if let Some(os) = self.slot_owners.get(&ptr) {
+                os.clone()
+            } else {
+                match self
+                    .typed_slots
+                    .get(&ptr)
+                    .map(|(_, t, n, p)| (t.clone(), n.clone(), p.clone()))
+                {
+                    Some(o) => vec![o],
+                    None => return Ok(v),
+                }
+            };
+        let mut results: Vec<Option<Value>> = Vec::with_capacity(owners.len());
+        for (tys, _, _) in &owners {
+            results.push(self.slot_write_one(tys, &v)?);
+        }
+        let consistent = results.iter().all(|r| r.is_some())
+            && results
+                .iter()
+                .map(|r| r.clone().unwrap())
+                .all(|rv| Self::value_identical(&rv, results[0].as_ref().unwrap()));
+        if consistent {
+            return Ok(results.into_iter().next().unwrap().unwrap());
+        }
+        let mut e = if owners.len() == 1 {
+            let (tys, cn, pn) = &owners[0];
+            PhpError::uncaught(
+                "TypeError",
+                format!(
+                    "Cannot assign {} to reference held by property {}::${} of type {}",
+                    self.zval_type_name(&v),
+                    cn,
+                    pn,
+                    ty_disp(tys)
+                ),
+                0,
+            )
+        } else {
+            let held: Vec<String> = owners
+                .iter()
+                .map(|(tys, cn, pn)| format!("property {}::${} of type {}", cn, pn, ty_disp(tys)))
+                .collect();
+            PhpError::uncaught(
+                "TypeError",
+                format!(
+                    "Cannot assign {} to reference held by {}, as this would result in an inconsistent type conversion",
+                    self.zval_type_name(&v),
+                    held.join(" and ")
+                ),
+                0,
+            )
+        };
         e.thrown_line = Some(self.cur_line);
         self.fail(e)
+    }
+
+    /// Same-type same-value — owners must agree on the *exact* result
+    /// (int(42) vs float(42.0) is inconsistent).
+    fn value_identical(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            (Value::Int(x), Value::Int(y)) => x == y,
+            (Value::Float(x), Value::Float(y)) => x == y,
+            (Value::Str(x), Value::Str(y)) => x == y,
+            (Value::Object(x), Value::Object(y)) => Rc::ptr_eq(x, y),
+            (Value::Array(x), Value::Array(y)) => Rc::ptr_eq(x, y),
+            _ => false,
+        }
     }
 
     fn incdec(&mut self, target: &Expr, delta: i64, post: bool) -> Result<Value, PhpError> {
@@ -6319,27 +6417,41 @@ impl<'a> Interp<'a> {
         // "property" when the target IS that prop, "a reference held
         // by property" when reached through an alias/bound ref.
         if matches!(old, Value::Int(i) if i.checked_add(delta).is_none()) {
-            let ent = self.eval_cell(target).ok().and_then(|c| {
-                self.typed_slots
+            let ent = self.eval_cell(target).ok().map(|c| {
+                // Unaliased count is 3 (storage + typed_slots + this
+                // temp); a `=&` bind adds a var slot -> "a reference
+                // held by" (union_types/incdec_prop).
+                let shared = Rc::strong_count(&c) > 3;
+                let e = self
+                    .typed_slots
                     .get(&(Rc::as_ptr(&c) as usize))
-                    .map(|(cc, t, n, p)| (cc.clone(), t.clone(), n.clone(), p.clone()))
+                    .map(|(cc, t, n, p)| (cc.clone(), t.clone(), n.clone(), p.clone()));
+                (shared, e)
             });
-            if let Some((_, tys, cn, cpn)) = ent {
+            if let Some((shared, Some((_, tys, cn, cpn)))) = ent {
                 if tys.iter().any(|m| m.eq_ignore_ascii_case("int"))
                     && !tys.iter().any(|m| m.eq_ignore_ascii_case("float"))
                 {
                     let dir = if delta > 0 { "increment" } else { "decrement" };
                     let bound = if delta > 0 { "maximal" } else { "minimal" };
-                    let own = match target {
-                        Expr::Prop { name, .. } | Expr::StaticProp { name, .. } => {
-                            self.prop_name(name).map(|pn| pn == cpn).unwrap_or(false)
-                        }
-                        _ => false,
-                    };
+                    // "a reference held by" once the slot is aliased —
+                    // a `&$prop` bind makes the storage cell shared
+                    // (union_types/incdec_prop).
+                    let own = !shared
+                        && match target {
+                            Expr::Prop { name, .. } | Expr::StaticProp { name, .. } => {
+                                self.prop_name(name).map(|pn| pn == cpn).unwrap_or(false)
+                            }
+                            _ => false,
+                        };
                     let msg = if own {
                         format!(
-                            "Cannot {} property {}::${} of type int past its {} value",
-                            dir, cn, cpn, bound
+                            "Cannot {} property {}::${} of type {} past its {} value",
+                            dir,
+                            cn,
+                            cpn,
+                            ty_disp(&tys),
+                            bound
                         )
                     } else {
                         format!(
@@ -8234,14 +8346,35 @@ impl<'a> Interp<'a> {
                         ))?;
                     }
                 }
-                Some(Expr::Int(_)) | Some(Expr::Float(_)) | Some(Expr::Str(_))
-                | Some(Expr::Bool(_)) => {
+                Some(Expr::Int(_))
+                | Some(Expr::Float(_))
+                | Some(Expr::Str(_))
+                | Some(Expr::Bool(_))
+                | Some(Expr::Interp(_)) => {
+                    // An Interp made of only literal parts is still a
+                    // string literal default (`"x"` lexes as Interp);
+                    // one with real interpolations isn't a literal.
+                    let literal_interp = !matches!(
+                        &p.default,
+                        Some(Expr::Interp(parts)) if !parts
+                            .iter()
+                            .all(|p| matches!(p, crate::lexer::StringPart::Lit(_)))
+                    );
                     let kind = match p.default {
                         Some(Expr::Int(_)) => "int",
                         Some(Expr::Float(_)) => "float",
-                        Some(Expr::Str(_)) => "string",
+                        Some(Expr::Str(_)) | Some(Expr::Interp(_)) => "string",
                         _ => "bool",
                     };
+                    if !literal_interp {
+                        if let Some(ty) = &p.ty {
+                            if let Err(e) = self.check_ty_redundant(ty, &cls_ctx) {
+                                self.cur_line = saved;
+                                return Err(e);
+                            }
+                        }
+                        continue;
+                    }
                     let mut disp = Self::zpp_ty_disp(ty);
                     disp.retain(|m| !m.eq_ignore_ascii_case("null"));
                     let tn = disp.join("|");
@@ -8598,7 +8731,29 @@ impl<'a> Interp<'a> {
                 None
             };
         }
-        for m in ty {
+        // Zend weak-union coercion preference (type_checking_weak): a
+        // numeric string picks the member matching its own kind first
+        // (`"42.0"` prefers `float`), then members are tried in scalar
+        // order int -> float -> string -> bool family. Non-scalar
+        // members never coerce.
+        let has = |n: &str| ty.iter().any(|m| m.eq_ignore_ascii_case(n));
+        let kind_flt = matches!(v, Value::Str(b) if matches!(numeric(b), Numeric::Float(_)));
+        let mut order: Vec<String> = Vec::with_capacity(4);
+        if kind_flt && has("float") {
+            order.push("float".into());
+        }
+        for n in ["int", "float", "string"] {
+            if has(n) && !order.iter().any(|o| o == n) {
+                order.push(n.into());
+            }
+        }
+        if let Some(b) = ty
+            .iter()
+            .find(|m| matches!(m.to_lowercase().as_str(), "bool" | "false" | "true"))
+        {
+            order.push(b.clone());
+        }
+        for m in &order {
             let l = m.to_lowercase();
             match l.as_str() {
                 "int" => match v {
@@ -8614,9 +8769,7 @@ impl<'a> Interp<'a> {
                     Value::Str(b) => match numeric(b) {
                         Numeric::Int(i) => return Some(Value::Int(i)),
                         Numeric::Float(f) => return Some(Value::Int(f as i64)),
-                        Numeric::Leading(f, true) => return Some(Value::Int(f as i64)),
-                        Numeric::Leading(f, false) => return Some(Value::Float(f)),
-                        Numeric::NonNumeric => {}
+                        _ => {}
                     },
                     _ => {}
                 },
@@ -8626,8 +8779,8 @@ impl<'a> Interp<'a> {
                     Value::Bool(b) => return Some(Value::Float(*b as i64 as f64)),
                     Value::Str(b) => match numeric(b) {
                         Numeric::Int(i) => return Some(Value::Float(i as f64)),
-                        Numeric::Float(f) | Numeric::Leading(f, _) => return Some(Value::Float(f)),
-                        Numeric::NonNumeric => {}
+                        Numeric::Float(f) => return Some(Value::Float(f)),
+                        _ => {}
                     },
                     _ => {}
                 },
@@ -8645,7 +8798,7 @@ impl<'a> Interp<'a> {
                         return Some(Value::Str(b.into()));
                     }
                 }
-                "bool" => {
+                "bool" | "false" | "true" => {
                     if let Value::Float(f) = v {
                         if f.is_nan() {
                             let _ = self.emit_diag(
@@ -8655,13 +8808,56 @@ impl<'a> Interp<'a> {
                             );
                         }
                     }
-                    return Some(Value::Bool(v.is_truthy()));
+                    let t = v.is_truthy();
+                    // Standalone `false`/`true` members only accept
+                    // values that coerce to exactly that bool.
+                    if l == "bool" || t == (l == "true") {
+                        return Some(Value::Bool(t));
+                    }
                 }
-                "null" if matches!(v, Value::Null) => return Some(Value::Null),
                 _ => {}
             }
         }
         None
+    }
+
+    /// Strict value-in-members test for the weak path: weak union
+    /// coercion only applies when the value doesn't exactly match a
+    /// member — `bool|array` + `[]` stays `[]`, `float|int` + 1 stays
+    /// int(1) (union_types/type_checking_weak, legal_default_values).
+    /// Unlike `ty_exact` (strict boundary), an int is NOT exact for
+    /// `float` — it still widens through coercion.
+    fn ty_weak_exact(&mut self, ty: &[String], v: &Value) -> bool {
+        ty.iter().any(|m| {
+            let l = m.to_lowercase();
+            match l.as_str() {
+                "int" => matches!(v, Value::Int(_)),
+                "float" => matches!(v, Value::Float(_)),
+                "string" => matches!(v, Value::Str(_)),
+                "bool" => matches!(v, Value::Bool(_)),
+                "false" => matches!(v, Value::Bool(false)),
+                "true" => matches!(v, Value::Bool(true)),
+                "null" => matches!(v, Value::Null),
+                "array" => matches!(v, Value::Array(_)),
+                "iterable" => {
+                    matches!(v, Value::Array(_))
+                        || matches!(v, Value::Object(o) if self.obj_is_a(o, "Traversable"))
+                }
+                "object" => matches!(v, Value::Object(_)),
+                "callable" => self.is_callable_value(v),
+                "mixed" | "void" | "never" | "self" | "static" | "parent" => true,
+                _ if m.contains('&') => m
+                    .trim_start_matches('(')
+                    .trim_end_matches(')')
+                    .split('&')
+                    .all(|p| self.ty_weak_exact(&[p.to_string()], v)),
+                _ => match v {
+                    Value::Callable(_) => m.eq_ignore_ascii_case("closure"),
+                    Value::Object(o) => self.obj_is_a(o, m),
+                    _ => false,
+                },
+            }
+        })
     }
 
     /// Is the currently-executing code inside a `strict_types=1` file?
@@ -8759,6 +8955,8 @@ impl<'a> Interp<'a> {
             .flat_map(|m| {
                 if m.eq_ignore_ascii_case("iterable") {
                     vec!["Traversable".to_string(), "array".to_string()]
+                } else if m.starts_with("class@anonymous$") {
+                    vec!["class@anonymous".to_string()]
                 } else {
                     vec![m.clone()]
                 }
@@ -8857,8 +9055,10 @@ impl<'a> Interp<'a> {
                 // cell (scalar_weak_reference).
                 if !self.caller_file_strict() {
                     let bv = a.borrow().clone();
-                    if let Some(cv) = self.coerce_scalar(ty, &bv) {
-                        *a.borrow_mut() = cv;
+                    if !self.ty_weak_exact(ty, &bv) {
+                        if let Some(cv) = self.coerce_scalar(ty, &bv) {
+                            *a.borrow_mut() = cv;
+                        }
                     }
                 }
                 continue;
@@ -8877,7 +9077,7 @@ impl<'a> Interp<'a> {
                     ty.iter().any(|m| self.param_type_match(m, &v))
                 };
             let caller_strict = self.caller_file_strict();
-            if ok && !caller_strict {
+            if ok && !caller_strict && !self.ty_weak_exact(ty, &v) {
                 if let Some(cv) = self.coerce_scalar(ty, &v) {
                     // Arg-coercion deprecations attribute to the
                     // callee's declaration line (scalar_basic).
@@ -8890,13 +9090,22 @@ impl<'a> Interp<'a> {
             }
             // strict mode still allows the int->float widening stored
             // back for visibility in the callee.
-            if ok && caller_strict && ty.iter().any(|m| m.eq_ignore_ascii_case("float")) {
+            if ok
+                && caller_strict
+                && ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                && !self.ty_weak_exact(ty, &v)
+            {
                 if let Value::Int(i) = v {
                     *a.borrow_mut() = Value::Float(i as f64);
                 }
             }
             if !ok {
-                let fname = self.decl_fname(decl);
+                let mut fname = self.decl_fname(decl);
+                // Anonymous-class methods report args under just the
+                // class name (union_types/anonymous_class).
+                if fname.starts_with("class@anonymous::") {
+                    fname = "class@anonymous".into();
+                }
                 let mut disp: Vec<String> = Self::zpp_ty_disp(ty);
                 disp.retain(|m| !m.eq_ignore_ascii_case("null"));
                 if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) || implicit_null {
@@ -9062,15 +9271,15 @@ impl<'a> Interp<'a> {
                     };
                     // `float $f = 0` — the int default widens to float
                     // at bind time, even under strict_types
-                    // (scalar_float_with_integer_default_strict).
+                    // (scalar_float_with_integer_default_strict). In a
+                    // union this applies whenever no `int` member can
+                    // take it exactly (`float|string` = 3 -> float(3);
+                    // `int|float` = 1 stays int — legal_default_values).
                     if let Some(ty) = &p.ty {
-                        let float_only = ty.iter().all(|m| {
-                            m.eq_ignore_ascii_case("float") || m.eq_ignore_ascii_case("null")
-                        });
-                        if float_only {
-                            if let (Value::Int(i), true) =
-                                (&dv, ty.iter().any(|m| m.eq_ignore_ascii_case("float")))
-                            {
+                        let float_widens = ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                            && !ty.iter().any(|m| m.eq_ignore_ascii_case("int"));
+                        if float_widens {
+                            if let Value::Int(i) = &dv {
                                 dv = Value::Float(*i as f64);
                             }
                         }
@@ -9110,7 +9319,7 @@ impl<'a> Interp<'a> {
                             );
                             return self.fail(PhpError::uncaught("TypeError", msg, self.cur_line));
                         }
-                        if !self.caller_file_strict() {
+                        if !self.caller_file_strict() && !self.ty_weak_exact(ty, &dv) {
                             if let Some(cv) = self.coerce_scalar(ty, &dv) {
                                 dv = cv;
                             }
@@ -9192,7 +9401,7 @@ impl<'a> Interp<'a> {
                         .any(|m| self.param_type_match(m, &v) || m.eq_ignore_ascii_case("void"))
                         && (!ret_strict || self.ty_exact(ty, &v));
                     if ok {
-                        if !ret_strict {
+                        if !ret_strict && !self.ty_weak_exact(ty, &v) {
                             match self.coerce_scalar(ty, &v) {
                                 Some(cv) => {
                                     let pl = self.cur_line;
@@ -10007,6 +10216,7 @@ impl<'a> Interp<'a> {
         if d.file.is_empty() {
             d.file = self.cur_file.clone();
         }
+
         // Synthesize PropDecls from promoted constructor params
         // (`__construct(public readonly int $x)`) — they behave as
         // declared props for visibility/type/readonly and hooks.
@@ -10049,6 +10259,7 @@ impl<'a> Interp<'a> {
                         self.cur_line,
                     ));
                 }
+                Self::resolve_scope_tys(&mut d);
                 self.interfaces.insert(lname.clone(), Rc::new(d));
                 self.decl_order.push(lname);
             }
@@ -10118,6 +10329,15 @@ impl<'a> Interp<'a> {
                     self.linking.pop();
                     merge_res?;
                 }
+                // `self`/`static`/`parent` in member types bind to the
+                // declaring class at registration — a `self` member
+                // otherwise wildcard-matches everything
+                // (union_types/anonymous_class). This runs AFTER trait
+                // merge so trait methods' `self` resolves to the
+                // consuming class (traits/abstract_method_8). `static`
+                // loses late-static nuance, which type checks don't
+                // distinguish anyway.
+                Self::resolve_scope_tys(&mut d);
                 // `extends <trait>` → fatal (error_005-ish).
                 if let Some(pn) = &d.parent {
                     if self.traits.contains_key(&pn.to_lowercase()) {
@@ -10182,6 +10402,41 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(())
+    }
+
+    /// `self`/`static`/`parent` members in method/prop types bind to
+    /// the declaring class name at registration (anonymous_class).
+    fn resolve_scope_tys(d: &mut ClassDecl) {
+        let (dn, dp) = (d.name.clone(), d.parent.clone());
+        let resolve = |ms: &mut Vec<String>| {
+            for m in ms.iter_mut() {
+                let l = m.to_lowercase();
+                if l == "self" || l == "static" {
+                    *m = dn.clone();
+                } else if l == "parent" {
+                    if let Some(p) = &dp {
+                        *m = p.clone();
+                    }
+                }
+            }
+        };
+        for m in d.methods.iter_mut() {
+            let mut mm = (**m).clone();
+            for p in mm.decl.params.iter_mut() {
+                if let Some(ty) = &mut p.ty {
+                    resolve(ty);
+                }
+            }
+            if let Some(ty) = &mut mm.decl.ret {
+                resolve(ty);
+            }
+            *m = Rc::new(mm);
+        }
+        for p in d.props.iter_mut() {
+            if let Some(ty) = &mut p.ty {
+                resolve(ty);
+            }
+        }
     }
 
     /// Merge used traits' methods into `d`, applying `insteadof`
@@ -11222,6 +11477,72 @@ impl<'a> Interp<'a> {
         ))
     }
 
+    /// Resolve `self`/`static`/`parent` members against a declaring
+    /// class given only its name + parent name (variance checks run
+    /// while the child class is still mid-registration).
+    fn ty_scope_resolve(&self, ty: &[String], name: &str, parent: &Option<String>) -> Vec<String> {
+        ty.iter()
+            .map(|m| match m.to_lowercase().as_str() {
+                "self" | "static" => name.to_string(),
+                "parent" => parent.clone().unwrap_or_else(|| "\\0parent".to_string()),
+                _ => m.clone(),
+            })
+            .collect()
+    }
+
+    /// `iterable` ≡ `Traversable|array` for type-set comparisons.
+    fn ty_expand_iterable(ty: &[String]) -> Vec<String> {
+        let mut out = Vec::with_capacity(ty.len() + 1);
+        for m in ty {
+            if m.eq_ignore_ascii_case("iterable") {
+                out.push("Traversable".into());
+                out.push("array".into());
+            } else {
+                out.push(m.clone());
+            }
+        }
+        out
+    }
+
+    /// Member coverage: `covers(big, small)` — every value matching
+    /// `small` also matches `big`. Drives semantic type equality for
+    /// prop variance (union_types/variance/valid).
+    fn ty_covers(&mut self, big: &str, small: &str) -> bool {
+        let bl = big.to_lowercase();
+        let sl = small.to_lowercase();
+        if bl == sl {
+            return true;
+        }
+        let s_inner = small.trim_start_matches('(').trim_end_matches(')');
+        if s_inner.contains('&') {
+            // `A&B` ⊆ anything covering one of its parts.
+            return s_inner.split('&').any(|p| self.ty_covers(big, p));
+        }
+        let b_inner = big.trim_start_matches('(').trim_end_matches(')');
+        if b_inner.contains('&') {
+            // `X` ⊆ `A&B` iff X ⊆ A and X ⊆ B.
+            return b_inner.split('&').all(|p| self.ty_covers(p, small));
+        }
+        const SCALARS: &[&str] = &[
+            "int", "float", "string", "bool", "array", "callable", "object", "mixed", "void",
+            "never", "null", "false", "true", "iterable", "resource", "numeric",
+        ];
+        match bl.as_str() {
+            "mixed" => true,
+            "bool" => sl == "false" || sl == "true",
+            "float" => sl == "int",
+            "object" => !SCALARS.contains(&sl.as_str()),
+            "callable" => sl == "closure" || sl == "callable",
+            _ => {
+                if SCALARS.contains(&sl.as_str()) || SCALARS.contains(&bl.as_str()) {
+                    false
+                } else {
+                    self.is_a_str(&sl, &bl)
+                }
+            }
+        }
+    }
+
     /// `final` props/hooks may not be overridden by a subclass.
     fn check_final_override(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
         let mut an = d.parent.clone();
@@ -11287,13 +11608,25 @@ impl<'a> Interp<'a> {
                     || Self::prop_is_backed(ap)
                     || cp.hooks.is_none()
                     || Self::prop_is_backed(cp);
-                let norm = |t: &Option<Vec<String>>| {
-                    let mut v = t.clone().unwrap_or_default();
-                    v.sort();
-                    v.dedup();
-                    v
-                };
-                if backed && norm(&cp.ty) != norm(&ap.ty) {
+                // Prop types are invariant but compared SEMANTICALLY:
+                // `X|Y` ≡ `X` when Y extends X (dropping a member
+                // subsumed by another is identity), and `iterable`
+                // expands to `Traversable|array` (union variance
+                // valid.phpt). Untyped props stay exact `==`.
+                let mut ty_equiv =
+                    |ct: &Option<Vec<String>>, at: &Option<Vec<String>>| match (ct, at) {
+                        (None, None) => true,
+                        (Some(c), Some(a)) => {
+                            let ce = self.ty_scope_resolve(c, &d.name, &d.parent);
+                            let ae = self.ty_scope_resolve(a, &pc.decl.name, &pc.decl.parent);
+                            let ce = Self::ty_expand_iterable(&ce);
+                            let ae = Self::ty_expand_iterable(&ae);
+                            ce.iter().all(|c| ae.iter().any(|a| self.ty_covers(a, c)))
+                                && ae.iter().all(|a| ce.iter().any(|c| self.ty_covers(c, a)))
+                        }
+                        _ => false,
+                    };
+                if backed && !ty_equiv(&cp.ty, &ap.ty) {
                     // Child re-types an untyped parent prop → "must be
                     // omitted"; typed-vs-typed mismatch → "must be T".
                     if ap.ty.is_none() && cp.ty.is_some() {
@@ -13780,8 +14113,12 @@ impl<'a> Interp<'a> {
         let tys = &resolved;
         if self.ty_exact(tys, &v) {
             // int stored into a `float` prop widens to a float even in
-            // strict mode (typed_properties_031).
-            if tys.iter().any(|t| t.eq_ignore_ascii_case("float")) {
+            // strict mode (typed_properties_031) — but only when no
+            // `int` member takes it exactly (`int|float` keeps int,
+            // legal_default_values).
+            if tys.iter().any(|t| t.eq_ignore_ascii_case("float"))
+                && !tys.iter().any(|t| t.eq_ignore_ascii_case("int"))
+            {
                 if let Value::Int(i) = v {
                     return Ok(Value::Float(i as f64));
                 }
@@ -15289,7 +15626,21 @@ impl<'a> Interp<'a> {
                     if let Some(c) = ob.props.remove(&k) {
                         // unset() severs the typed slot: refs bound to it
                         // become plain variables again (typed_properties_090).
-                        self.typed_slots.remove(&(Rc::as_ptr(&c) as usize));
+                        let ptr = Rc::as_ptr(&c) as usize;
+                        if let Some(os) = self.slot_owners.get_mut(&ptr) {
+                            os.retain(|(_, _, op)| op != &pn);
+                            if os.is_empty() {
+                                self.slot_owners.remove(&ptr);
+                            }
+                        }
+                        if self
+                            .typed_slots
+                            .get(&ptr)
+                            .map(|(_, _, _, sp)| sp == &pn)
+                            .unwrap_or(false)
+                        {
+                            self.typed_slots.remove(&ptr);
+                        }
                     }
                     ob.unset_props.insert(k);
                 } else if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
@@ -17527,7 +17878,14 @@ fn ty_disp(ty: &[String]) -> String {
         } else {
             rest.push(
                 m.split('&')
-                    .map(|p| p.trim_start_matches('\\'))
+                    .map(|p| {
+                        let p = p.trim_start_matches('\\');
+                        if p.starts_with("class@anonymous$") {
+                            "class@anonymous".to_string()
+                        } else {
+                            p.to_string()
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("&"),
             );

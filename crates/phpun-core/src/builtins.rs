@@ -620,7 +620,11 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             } else {
                 b" ".to_vec()
             };
-            let ty = arg(args, 3).to_int(); // STR_PAD_RIGHT=1 default
+            let ty = if args.len() > 3 {
+                arg(args, 3).to_int()
+            } else {
+                1
+            };
             Value::bytes(str_pad(&s, len, &pad, ty))
         }
         "str_split" => {

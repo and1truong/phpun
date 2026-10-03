@@ -2363,6 +2363,8 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_op("{")?;
+            self.class_ctx
+                .push((parent.is_some() || !implements.is_empty(), false));
             let mut methods = Vec::new();
             let mut props = Vec::new();
             let mut consts = Vec::new();
@@ -2545,6 +2547,7 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_op("}")?;
+            self.class_ctx.pop();
             return Ok((
                 Expr::AnonClass(Rc::new(ClassDecl {
                     attrs: vec![],
@@ -2751,7 +2754,7 @@ impl<'a> Parser<'a> {
         if nullable {
             members.push("null".into());
         }
-        let members = if members.is_empty() {
+        let mut members = if members.is_empty() {
             None
         } else {
             // `mixed` already covers every type incl. null: `?mixed` and
@@ -2778,6 +2781,15 @@ impl<'a> Parser<'a> {
             {
                 return Err(PhpError::compile_fatal(
                     "Void can only be used as a standalone type",
+                    self.line(),
+                ));
+            }
+            // `never` is standalone-only too (never_with_class).
+            if members.iter().any(|m| m.eq_ignore_ascii_case("never"))
+                && (members.len() > 1 || nullable)
+            {
+                return Err(PhpError::compile_fatal(
+                    "never can only be used as a standalone type",
                     self.line(),
                 ));
             }
@@ -2888,6 +2900,33 @@ impl<'a> Parser<'a> {
                     .collect::<Result<Vec<_>, _>>()?,
             )
         };
+        // Zend stores union members canonically: class-like types in
+        // declared order first, then builtin scalars in a fixed rank
+        // (callable < object < array < string < int < float < bool <
+        // false/true < resource < mixed < void < never < null). This
+        // order drives both message display and weak coercion
+        // preference (union_types/type_checking_*).
+        if let Some(ms) = &mut members {
+            const SCALARS: &[&str] = &[
+                "int", "float", "string", "bool", "array", "callable", "iterable", "object",
+                "mixed", "void", "never", "null", "false", "true", "numeric", "resource",
+            ];
+            const RANK: &[&str] = &[
+                "callable", "object", "array", "iterable", "string", "int", "float", "bool",
+                "false", "true", "resource", "mixed", "void", "never", "null",
+            ];
+            let rank = |m: &String| -> usize {
+                RANK.iter()
+                    .position(|r| *r == m.to_lowercase())
+                    .unwrap_or(usize::MAX)
+            };
+            let (mut classes, mut scalars): (Vec<String>, Vec<String>) = ms
+                .drain(..)
+                .partition(|m| !SCALARS.contains(&m.to_lowercase().as_str()));
+            scalars.sort_by_key(rank);
+            classes.extend(scalars);
+            *ms = classes;
+        }
         Ok(members)
     }
 
