@@ -5013,6 +5013,20 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
         }
         Value::Object(o) => {
             let ob = o.borrow();
+            // Enum cases print `enum(E::Case1)` (single line).
+            if ob.class.decl.kind == crate::ast::ClassKind::Enum {
+                if let Some(nm) = ob.props.get("name") {
+                    if let Value::Str(case) = &*nm.borrow() {
+                        it.emit(&format!(
+                            "{}enum({}::{})\n",
+                            pad,
+                            ob.class.name(),
+                            crate::value::lossy(case)
+                        ));
+                        return;
+                    }
+                }
+            }
             // Count live props only — unset() tombstones prop_order slots.
             let live = ob
                 .prop_order

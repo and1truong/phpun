@@ -1505,41 +1505,55 @@ impl<'a> Parser<'a> {
             }
             if self.ident_is("const") {
                 self.pos += 1;
+                // Typed class constants (PHP 8.3): `const string C` —
+                // a type is present iff the run of type tokens is
+                // followed by `=`; the type applies to every declarator
+                // in the statement (`const int X = 1, Y = 'y'`).
+                let mut decl_ty = {
+                    let mut j = self.pos;
+                    let mut run = 0usize;
+                    loop {
+                        match self.toks.get(j).map(|l| &l.token) {
+                            Some(Token::Ident(_)) => {
+                                j += 1;
+                                run += 1;
+                            }
+                            Some(Token::Op(o))
+                                if matches!(*o, "?" | "|" | "&" | "\\" | "(" | ")") =>
+                            {
+                                j += 1;
+                                run += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if run > 1
+                        && matches!(
+                            self.toks.get(j).map(|l| &l.token),
+                            Some(Token::Op(o)) if *o == "="
+                        )
+                    {
+                        self.take_type()
+                    } else {
+                        None
+                    }
+                };
                 loop {
-                    // Typed class constants (PHP 8.3): `const string C`
-                    // — a type is present iff the run of type tokens is
-                    // followed by `=`: the last Ident before `=` is the
-                    // const's name, everything before it is the type.
-                    let ty = {
-                        let mut j = self.pos;
-                        let mut run = 0usize;
-                        loop {
-                            match self.toks.get(j).map(|l| &l.token) {
-                                Some(Token::Ident(_)) => {
-                                    j += 1;
-                                    run += 1;
+                    let mut cname = self.ident().unwrap_or_default();
+                    // take_type greedily merges the const name into the
+                    // final type member (`string CONST1` → `string\CONST1`)
+                    // — recover it as the last `\`-segment.
+                    if cname.is_empty() {
+                        if let Some(ty) = decl_ty.as_mut() {
+                            for member in ty.iter_mut().rev() {
+                                if let Some(p) = member.rfind('\\') {
+                                    cname = member[p + 1..].to_string();
+                                    member.truncate(p);
+                                    break;
                                 }
-                                Some(Token::Op(o))
-                                    if matches!(*o, "?" | "|" | "&" | "\\" | "(" | ")") =>
-                                {
-                                    j += 1;
-                                    run += 1;
-                                }
-                                _ => break,
                             }
                         }
-                        if run > 1
-                            && matches!(
-                                self.toks.get(j).map(|l| &l.token),
-                                Some(Token::Op(o)) if *o == "="
-                            )
-                        {
-                            self.take_type()
-                        } else {
-                            None
-                        }
-                    };
-                    let cname = self.ident().unwrap_or_default();
+                    }
                     self.expect_op("=")?;
                     let cv = self.expr()?;
                     consts.push(crate::ast::ConstDecl {
@@ -1547,9 +1561,10 @@ impl<'a> Parser<'a> {
                         value: cv,
                         visibility: vis,
                         is_final: m_final,
-                        ty,
+                        ty: decl_ty.clone(),
                         attrs: member_attrs.clone(),
                         decl_in: None,
+                        enum_case: false,
                     });
                     if !self.eat_op(",") {
                         break;
@@ -1660,6 +1675,7 @@ impl<'a> Parser<'a> {
                     ty: None,
                     attrs: vec![],
                     decl_in: None,
+                    enum_case: true,
                 });
                 self.expect_op(";")?;
                 continue;
@@ -2339,6 +2355,7 @@ impl<'a> Parser<'a> {
                             ty: None,
                             attrs: vec![],
                             decl_in: None,
+                            enum_case: false,
                         });
                         if !self.eat_op(",") {
                             break;
@@ -2386,6 +2403,7 @@ impl<'a> Parser<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     });
                     self.expect_op(";")?;
                     continue;
@@ -2614,10 +2632,14 @@ impl<'a> Parser<'a> {
                     nullable = true;
                     self.pos += 1;
                 }
-                Some(Token::Op("|")) | Some(Token::Op("&")) => {
+                Some(Token::Op("|")) => {
                     if !name.is_empty() {
                         members.push(std::mem::take(&mut name));
                     }
+                    self.pos += 1;
+                }
+                Some(Token::Op("&")) => {
+                    name.push('&');
                     self.pos += 1;
                 }
                 Some(Token::Op("(")) => {

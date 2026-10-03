@@ -164,6 +164,10 @@ pub struct Interp<'a> {
     /// get_declared_{classes,interfaces,traits} output (Zend lists
     /// aliases lowercased, right after real decls).
     pub decl_aliases: Vec<(crate::ast::ClassKind, String)>,
+    /// Enum case singletons keyed `"cls\0case"` — `E::Foo === E::Foo`.
+    enum_cases: std::collections::HashMap<String, Value>,
+    /// Classes whose const initializers were already link-evaluated.
+    consts_linked: std::collections::HashSet<String>,
     /// Top-level parentless classes registered by hoisting (early
     /// binding); their decl stmt then no-ops (namespaces/ns_060).
     early_bound_classes: HashSet<String>,
@@ -499,6 +503,8 @@ impl<'a> Interp<'a> {
             autoloading: std::collections::HashSet::new(),
             interfaces: HashMap::new(),
             decl_order: Vec::new(),
+            enum_cases: std::collections::HashMap::new(),
+            consts_linked: std::collections::HashSet::new(),
             decl_aliases: Vec::new(),
             early_bound_classes: HashSet::new(),
             constants,
@@ -1080,6 +1086,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "FETCH_NUM".into(),
@@ -1089,6 +1096,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "FETCH_BOTH".into(),
@@ -1098,6 +1106,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "FETCH_OBJ".into(),
@@ -1107,6 +1116,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "ATTR_ERRMODE".into(),
@@ -1116,6 +1126,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "ATTR_DEFAULT_FETCH_MODE".into(),
@@ -1125,6 +1136,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "ATTR_EMULATE_PREPARES".into(),
@@ -1134,6 +1146,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "ERRMODE_SILENT".into(),
@@ -1143,6 +1156,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "ERRMODE_WARNING".into(),
@@ -1152,6 +1166,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "ERRMODE_EXCEPTION".into(),
@@ -1161,6 +1176,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_STR".into(),
@@ -1170,6 +1186,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_INT".into(),
@@ -1179,6 +1196,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_BOOL".into(),
@@ -1188,6 +1206,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_NULL".into(),
@@ -1197,6 +1216,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_LOB".into(),
@@ -1206,6 +1226,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                 ],
                 file: String::new(),
@@ -1300,6 +1321,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "ARRAY_AS_PROPS".into(),
@@ -1309,6 +1331,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                 ],
                 file: String::new(),
@@ -1593,6 +1616,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_FUNCTION".into(),
@@ -1602,6 +1626,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_METHOD".into(),
@@ -1611,6 +1636,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_PROPERTY".into(),
@@ -1620,6 +1646,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_CLASS_CONSTANT".into(),
@@ -1629,6 +1656,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_PARAMETER".into(),
@@ -1638,6 +1666,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_ALL".into(),
@@ -1647,6 +1676,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                     crate::ast::ConstDecl {
                         name: "IS_REPEATABLE".into(),
@@ -1656,6 +1686,7 @@ impl<'a> Interp<'a> {
                         ty: None,
                         attrs: vec![],
                         decl_in: None,
+                        enum_case: false,
                     },
                 ],
                 file: String::new(),
@@ -9258,7 +9289,8 @@ impl<'a> Interp<'a> {
                     .and_then(|_| self.check_abstract_hooks(&d))
                     .and_then(|_| self.check_abstract_methods(&d))
                     .and_then(|_| self.check_final_override(&d))
-                    .and_then(|_| self.check_override_sigs(&d));
+                    .and_then(|_| self.check_override_sigs(&d))
+                    .and_then(|_| self.check_const_types(&d));
                 self.linking.pop();
                 checks_res?;
                 // A private+final method (declared outright or produced
@@ -9818,6 +9850,7 @@ impl<'a> Interp<'a> {
                 if let Some(ex) = d.consts.iter().find(|x| x.name == cd.name) {
                     let compat = ex.visibility == cd.visibility
                         && ex.is_final == cd.is_final
+                        && ty_list_eq(&ex.ty, &cd.ty)
                         && self.const_exprs_eq(
                             &Some(ex.value.clone()),
                             &ex.decl_in.clone().unwrap_or_else(|| dname.clone()),
@@ -10769,10 +10802,41 @@ impl<'a> Interp<'a> {
         if s.eq_ignore_ascii_case(t) || s.eq_ignore_ascii_case("mixed") {
             return true;
         }
+        if t.contains('&') {
+            return t.split('&').any(|sm| self.ty_member_is_a(sm, s));
+        }
         if t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("mixed") {
             return false;
         }
-        if let Some(iface) = self.interfaces.get(&t.to_lowercase()).cloned() {
+        let tl = t.to_lowercase();
+        let sl = s.to_lowercase();
+        if sl == "iterable"
+            && ["array", "traversable", "iterator", "generator"].contains(&tl.as_str())
+        {
+            return true;
+        }
+        if sl == "callable" && tl == "closure" {
+            return true;
+        }
+        if sl == "object" && tl == "closure" {
+            return true;
+        }
+        if sl == "float" && tl == "int" {
+            return true;
+        }
+        if sl == "object" {
+            const SCALARS: &[&str] = &[
+                "int", "float", "string", "bool", "array", "callable", "iterable", "void", "never",
+                "null", "false", "true", "resource", "numeric",
+            ];
+            if !SCALARS.contains(&tl.as_str()) {
+                return true;
+            }
+        }
+        if sl == "bool" && (tl == "true" || tl == "false") {
+            return true;
+        }
+        if let Some(iface) = self.interfaces.get(&tl).cloned() {
             let mut stack = vec![iface];
             while let Some(f) = stack.pop() {
                 for p in &f.implements {
@@ -10787,6 +10851,259 @@ impl<'a> Interp<'a> {
             return false;
         }
         self.is_a_str(t, s)
+    }
+
+    /// Typed class constants (PHP 8.3): forbidden members, the
+    /// declared-value check (strict — no coercion), and the
+    /// inheritance variance rule (child ⊆ parent when the parent side
+    /// declares a type; private consts exempt).
+    fn check_const_types(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
+        for cd in &d.consts {
+            let Some(ty) = &cd.ty else { continue };
+            for m in ty {
+                let l = m.to_lowercase();
+                if ["callable", "void", "never"].contains(&l.as_str()) {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Class constant {}::{} cannot have type {}",
+                            d.name, cd.name, m
+                        ),
+                        self.cur_line,
+                    ));
+                }
+            }
+            // Compile-time values: fatal now. Runtime values (define'd
+            // consts, `new`) defer to the access-time TypeError below.
+            if is_compile_const(&cd.value) {
+                if let Ok(v) = self.eval_decl_const(&cd.value, &d.file) {
+                    if !self.const_ty_accepts(ty, &v, &d.name) {
+                        let tn = self.zval_type_name(&v);
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Cannot use {} as value for class constant {}::{} of type {}",
+                                tn,
+                                d.name,
+                                cd.name,
+                                ty_disp(ty)
+                            ),
+                            self.cur_line,
+                        ));
+                    }
+                }
+            }
+        }
+        // Inheritance variance — parent classes and implemented
+        // interfaces' same-name consts constrain this class's.
+        let mut supers: Vec<(String, crate::ast::ConstDecl)> = Vec::new();
+        let mut pn = d.parent.clone();
+        while let Some(p) = pn {
+            let Some(pc) = self.classes.get(&p.to_lowercase()).cloned() else {
+                break;
+            };
+            for cd in &pc.decl.consts {
+                if cd.visibility != crate::ast::Visibility::Private {
+                    supers.push((pc.decl.name.clone(), cd.clone()));
+                }
+            }
+            pn = pc.decl.parent.clone();
+        }
+        for i in &d.implements {
+            if let Some(id) = self.interfaces.get(&i.to_lowercase()).cloned() {
+                for cd in &id.consts {
+                    supers.push((id.name.clone(), cd.clone()));
+                }
+            }
+        }
+        for cd in &d.consts {
+            if cd.visibility == crate::ast::Visibility::Private {
+                continue;
+            }
+            for (sn, scd) in &supers {
+                if scd.name != cd.name {
+                    continue;
+                }
+                let Some(pty) = &scd.ty else { continue };
+                let ok = match &cd.ty {
+                    Some(cty) => self.ty_sup(pty, cty),
+                    None => false,
+                };
+                if !ok {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Type of {}::{} must be compatible with {}::{} of type {}",
+                            d.name,
+                            cd.name,
+                            sn,
+                            cd.name,
+                            ty_disp(pty)
+                        ),
+                        self.cur_line,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Strict const-value acceptance: any union member (intersections
+    /// are flattened to union members by take_type — DNF types in const
+    /// positions behave the same for the tests at hand). `self`/`static`
+    ////`parent` resolve against the declaring class.
+    fn const_ty_accepts(&mut self, ty: &[String], v: &Value, dname: &str) -> bool {
+        ty.iter().any(|m| {
+            if m.contains('&') {
+                return m
+                    .split('&')
+                    .all(|sm| self.const_ty_accepts(&[sm.to_string()], v, dname));
+            }
+            let l = m.to_lowercase();
+            match l.as_str() {
+                "null" => matches!(v, Value::Null),
+                "bool" | "true" | "false" => {
+                    matches!(v, Value::Bool(b) if l == "bool" || (*b) == (l == "true"))
+                }
+                "int" => matches!(v, Value::Int(_)),
+                "float" => matches!(v, Value::Float(_) | Value::Int(_)),
+                "string" => matches!(v, Value::Str(_)),
+                "array" => matches!(v, Value::Array(_)),
+                "object" => matches!(v, Value::Object(_)),
+                "iterable" => {
+                    matches!(v, Value::Array(_))
+                        || matches!(v, Value::Object(o) if self.obj_is_a(o, "Traversable"))
+                }
+                "mixed" => true,
+                "self" | "static" => match v {
+                    Value::Object(o) => self.obj_is_a(o, dname),
+                    _ => false,
+                },
+                "parent" => match v {
+                    Value::Object(o) => {
+                        let p = self
+                            .classes
+                            .get(&dname.to_lowercase())
+                            .and_then(|c| c.decl.parent.clone());
+                        match p {
+                            Some(pn) => self.obj_is_a(o, &pn),
+                            None => false,
+                        }
+                    }
+                    _ => false,
+                },
+                _ => match v {
+                    Value::Object(o) => self.obj_is_a(o, m),
+                    Value::Callable(_) => m.eq_ignore_ascii_case("closure"),
+                    _ => false,
+                },
+            }
+        })
+    }
+
+    /// Zend link semantics: at a class's first use, every const
+    /// initializer is evaluated — eval errors (undefined constant)
+    /// propagate as Errors, then typed checks raise TypeErrors.
+    fn link_const_inits(&mut self, cls: &Rc<PhpClass>) -> Result<(), PhpError> {
+        let lname = cls.decl.name.to_lowercase();
+        if !self.consts_linked.insert(lname) {
+            return Ok(());
+        }
+        let mut chain = vec![cls.clone()];
+        let mut pn = cls.decl.parent.clone();
+        while let Some(p) = pn {
+            let Some(pc) = self.classes.get(&p.to_lowercase()).cloned() else {
+                break;
+            };
+            if !self.consts_linked.insert(pc.decl.name.to_lowercase()) {
+                break;
+            }
+            pn = pc.decl.parent.clone();
+            chain.push(pc);
+        }
+        for c in chain {
+            for cd in &c.decl.consts {
+                if cd.enum_case {
+                    continue;
+                }
+                let file = c.decl.file.clone();
+                self.class_const_ctx += 1;
+                let r = self.eval_decl_const(&cd.value, &file);
+                self.class_const_ctx -= 1;
+                match r {
+                    Ok(v) => {
+                        self.const_apply_ty(cd, &c.decl.name, v)?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Unit/backed enum case singleton: `E::Foo` is an object of class
+    /// E with `name` (+ `value` for backed enums) props; one instance
+    /// per case so `===` holds.
+    fn enum_case_value(
+        &mut self,
+        cls: &str,
+        case: &str,
+        cd: &crate::ast::ConstDecl,
+    ) -> Result<Value, PhpError> {
+        let key = format!("{}\0{}", cls.to_lowercase(), case);
+        if let Some(v) = self.enum_cases.get(&key) {
+            return Ok(v.clone());
+        }
+        let mut props = std::collections::HashMap::new();
+        props.insert("name".to_string(), Value::str(case));
+        let is_unit = matches!(cd.value, Expr::Null);
+        if !is_unit {
+            let file = self
+                .classes
+                .get(&cls.to_lowercase())
+                .map(|c| c.decl.file.clone())
+                .unwrap_or_default();
+            let v = self.eval_decl_const(&cd.value, &file)?;
+            props.insert("value".to_string(), v);
+        }
+        let o = self.instantiate(cls, &[])?;
+        if let Value::Object(h) = &o {
+            for (k, v) in props {
+                h.borrow_mut().props.insert(k, cell(v));
+            }
+        }
+        self.enum_cases.insert(key, o.clone());
+        Ok(o)
+    }
+
+    /// Access-time typed-const enforcement: int→float widening, else
+    /// a catchable TypeError ("Cannot assign ...").
+    fn const_apply_ty(
+        &mut self,
+        cd: &crate::ast::ConstDecl,
+        owner: &str,
+        v: Value,
+    ) -> Result<Value, PhpError> {
+        let Some(ty) = &cd.ty else { return Ok(v) };
+        let v = if ty.iter().any(|m| m.eq_ignore_ascii_case("float")) {
+            match v {
+                Value::Int(i) => Value::Float(i as f64),
+                _ => v,
+            }
+        } else {
+            v
+        };
+        if !self.const_ty_accepts(ty, &v, owner) {
+            return self.fail(PhpError::uncaught(
+                "TypeError",
+                format!(
+                    "Cannot assign {} to class constant {}::{} of type {}",
+                    self.zval_type_name(&v),
+                    owner,
+                    cd.name,
+                    ty_disp(ty)
+                ),
+                0,
+            ));
+        }
+        Ok(v)
     }
 
     /// Every visible override must be signature-compatible with the
@@ -11139,6 +11456,7 @@ impl<'a> Interp<'a> {
                 0,
             ));
         }
+        self.link_const_inits(&cls)?;
         let has_ctor = self.find_method_in(&cls, "__construct").is_some();
         if !has_ctor {
             if let Some((n, ..)) = args.named.first() {
@@ -14942,7 +15260,10 @@ impl<'a> Interp<'a> {
                         self.class_const_ctx += 1;
                         let r = self.eval_decl_const(&cd.value, &c.file);
                         self.class_const_ctx -= 1;
-                        return r;
+                        return match r {
+                            Ok(v) => self.const_apply_ty(cd, &c.name, v),
+                            Err(e) => Err(e),
+                        };
                     }
                 }
                 for i in &c.implements {
@@ -14979,12 +15300,18 @@ impl<'a> Interp<'a> {
         while let Some(c) = cur {
             for cd in &c.decl.consts {
                 if cd.name == name {
+                    if cd.enum_case {
+                        return self.enum_case_value(&c.decl.name, &cd.name, cd);
+                    }
                     let old = self.const_self.replace(c.clone());
                     self.class_const_ctx += 1;
                     let r = self.eval_decl_const(&cd.value, &c.decl.file);
                     self.class_const_ctx -= 1;
                     self.const_self = old;
-                    return r;
+                    return match r {
+                        Ok(v) => self.const_apply_ty(cd, &c.decl.name, v),
+                        Err(e) => Err(e),
+                    };
                 }
             }
             ifaces.extend(c.decl.implements.iter().cloned());
@@ -15005,7 +15332,9 @@ impl<'a> Interp<'a> {
                     if cd.name == name {
                         let old = self.const_self.replace(cls.clone());
                         self.class_const_ctx += 1;
-                        let r = self.eval_decl_const(&cd.value, &c.file);
+                        let r = self
+                            .eval_decl_const(&cd.value, &c.file)
+                            .and_then(|v| self.const_apply_ty(cd, &c.name, v));
                         self.class_const_ctx -= 1;
                         self.const_self = old;
                         return r;
@@ -15754,4 +16083,69 @@ fn weak_ty_coerce(tys: &[String], v: &Value) -> Option<Value> {
         }
     }
     None
+}
+
+/// Render a parsed type member list the way Zend prints it — a union
+/// containing `null` displays as `?T`.
+fn ty_disp(ty: &[String]) -> String {
+    let mut nullable = false;
+    let mut rest: Vec<String> = Vec::new();
+    for m in ty {
+        if m.eq_ignore_ascii_case("null") {
+            nullable = true;
+        } else {
+            rest.push(
+                m.split('&')
+                    .map(|p| p.trim_start_matches('\\'))
+                    .collect::<Vec<_>>()
+                    .join("&"),
+            );
+        }
+    }
+    let joined = rest.join("|");
+    if nullable && rest.len() == 1 {
+        format!("?{}", joined)
+    } else if nullable {
+        format!("{}|null", joined)
+    } else {
+        joined
+    }
+}
+
+/// Typed-const compat in trait composition: same member list
+/// (case-insensitive; both `None` is compatible).
+fn ty_list_eq(a: &Option<Vec<String>>, b: &Option<Vec<String>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|(m, n)| m.eq_ignore_ascii_case(n))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a const initializer is a pure compile-time expression
+/// (literals and operators over them — no fetches, calls, `new`).
+/// Only these get Zend's eager "Cannot use ... as value" fatal at
+/// class registration; everything else type-checks lazily at access.
+fn is_compile_const(e: &Expr) -> bool {
+    match e {
+        Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::Str(_) => true,
+        Expr::Interp(parts) => parts
+            .iter()
+            .all(|p| matches!(p, crate::lexer::StringPart::Lit(_))),
+        Expr::ArrayLit(items) => items.iter().all(|(_, v)| is_compile_const(v)),
+        Expr::Unary { e, .. } => is_compile_const(e),
+        Expr::Binary { l, r, .. } => is_compile_const(l) && is_compile_const(r),
+        Expr::Cast { e, .. } => is_compile_const(e),
+        Expr::Ternary { c, t, f } => {
+            is_compile_const(c)
+                && t.as_ref().map(|x| is_compile_const(x)).unwrap_or(true)
+                && is_compile_const(f)
+        }
+        _ => false,
+    }
 }

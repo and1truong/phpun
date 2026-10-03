@@ -168,6 +168,8 @@ pub struct ConstDecl {
     pub attrs: Vec<AttrDecl>,
     /// Trait the const was merged from (`use T`); None = declared here.
     pub decl_in: Option<String>,
+    /// `case` member of an enum — materializes a singleton case object.
+    pub enum_case: bool,
 }
 
 #[derive(Debug, Clone)]
