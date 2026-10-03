@@ -3550,6 +3550,11 @@ impl<'a> Interp<'a> {
                 Expr::Var(n) if self.var_lookup(n).is_none() => Flow::Normal,
                 _ => {
                     let base = self.expr_temps.len();
+                    // A previous statement's `return $lval` can leave a
+                    // stale last_ret_cell pinned to a real storage cell
+                    // (inflating its strong_count → `&` in var_dump);
+                    // only the current statement may consume it.
+                    self.last_ret_cell = None;
                     let r = self.eval(e);
                     match r {
                         Ok(v) => {
@@ -6475,6 +6480,7 @@ impl<'a> Interp<'a> {
                 // their mangled `\0C\0p` slot even on first write (the
                 // promoted-ctor write reaches here); undeclared names
                 // fall through to __set/dynamic.
+                let cls = o.borrow().class.clone();
                 let k = self.obj_prop_key(&o, pn).or_else(|| {
                     self.decl_prop(&o, pn).map(|(pd, dcls)| {
                         if pd.visibility == crate::ast::Visibility::Private {
@@ -6484,7 +6490,13 @@ impl<'a> Interp<'a> {
                         }
                     })
                 });
-                let cls = o.borrow().class.clone();
+                // A slot the caller can't see is __set territory —
+                // zend never writes it directly from an outside scope
+                // (overloaded_prop_assign_op_refs).
+                let k = match k {
+                    Some(k) if self.prop_visible(&cls, pn) => Some(k),
+                    _ => None,
+                };
                 if let Some(k) = k {
                     let mut ob = o.borrow_mut();
                     // Write into the existing slot — a `&`-bound
