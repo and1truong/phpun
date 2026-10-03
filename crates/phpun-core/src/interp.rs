@@ -286,12 +286,18 @@ pub struct Interp<'a> {
     /// Per-callsite unqualified fn resolution cache — Zend resolves
     /// `ns\f -> f` once per call site (constexpr/namespace_004).
     fcc_fn_cache: HashMap<(String, String, String), Option<String>>,
-    /// Object ptrs whose __destruct already ran (shutdown pass).
-    destructed: HashSet<usize>,
+    /// Objects whose __destruct already ran (shutdown pass). The Rc
+    /// is pinned so a later object's allocation can't reuse the
+    /// address and collide with an entry (bug74053).
+    destructed: HashMap<usize, Rc<RefCell<PhpObject>>>,
     /// `new` temporaries of the running expression statement — swept
     /// at statement end so unowned objects destruct promptly
     /// (bug29368_2/_3).
     expr_temps: Vec<Rc<RefCell<PhpObject>>>,
+    /// Frame popped inside `bind_and_run_inner`, handed off to the
+    /// `bind_and_run` wrapper which runs its deferred __destruct
+    /// pass after the call-trace pop (bug52361).
+    last_popped_frame: Option<Frame>,
     /// Nonzero while a callable is invoked from inside a builtin's
     /// internals (ob handlers) — marks its trace site internal-function.
     internal_cb: u32,
@@ -655,8 +661,9 @@ impl<'a> Interp<'a> {
             autoload_fns: Vec::new(),
             obj_handles: Vec::new(),
             fcc_fn_cache: HashMap::new(),
-            destructed: HashSet::new(),
+            destructed: HashMap::new(),
             expr_temps: Vec::new(),
+            last_popped_frame: None,
             internal_cb: 0,
             cur_file: file.to_string(),
             strict_files: std::collections::HashSet::new(),
@@ -1827,6 +1834,8 @@ impl<'a> Interp<'a> {
                 adaptations: vec![],
                 methods: vec![
                     mk_method("isCallable", vec![]),
+                    mk_method("isVariadic", vec![]),
+                    mk_method("getType", vec![]),
                     mk_method("getName", vec![]),
                 ],
                 props: vec![],
@@ -2027,6 +2036,8 @@ impl<'a> Interp<'a> {
                     ),
                     mk_method("getName", vec![]),
                     mk_method("getType", vec![]),
+                    mk_method("getValue", vec![str_param("object")]),
+                    mk_method("setValue", vec![str_param("object"), str_param("value")]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -2253,37 +2264,46 @@ impl<'a> Interp<'a> {
             if Rc::strong_count(&o) != 2 {
                 continue;
             }
-            let key = Rc::as_ptr(&o) as usize;
             if self
                 .find_method_in(&o.borrow().class, "__destruct")
                 .is_some()
-                && self.destructed.insert(key)
+                && self.mark_destructed(&o)
             {
                 let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
             }
         }
         self.globals.vars.clear();
-        let mut i = 0;
-        while i < self.obj_handles.len() {
-            let w = match &self.obj_handles[i] {
-                ObjHandle::Obj(w) => w.clone(),
-                _ => {
-                    i += 1;
+        // Objects a dtor spawns may land in already-visited recycled
+        // handle slots — rescan until a full pass runs nothing new
+        // (bug51822/bug74053).
+        loop {
+            let mut progressed = false;
+            let mut i = 0;
+            while i < self.obj_handles.len() {
+                let w = match &self.obj_handles[i] {
+                    ObjHandle::Obj(w) => w.clone(),
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                };
+                i += 1;
+                let Some(o) = w.upgrade() else { continue };
+                let key = Rc::as_ptr(&o) as usize;
+                if self.destructed.contains_key(&key) {
                     continue;
                 }
-            };
-            i += 1;
-            let Some(o) = w.upgrade() else { continue };
-            let key = Rc::as_ptr(&o) as usize;
-            if self.destructed.contains(&key) {
-                continue;
+                if self
+                    .find_method_in(&o.borrow().class, "__destruct")
+                    .is_some()
+                {
+                    self.mark_destructed(&o);
+                    progressed = true;
+                    let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                }
             }
-            if self
-                .find_method_in(&o.borrow().class, "__destruct")
-                .is_some()
-            {
-                self.destructed.insert(key);
-                let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+            if !progressed {
+                break;
             }
         }
         if !self.mem_exceeded {
@@ -2304,15 +2324,61 @@ impl<'a> Interp<'a> {
                 continue;
             }
             let key = Rc::as_ptr(&o) as usize;
-            if self.destructed.contains(&key) {
+            if self.destructed.contains_key(&key) {
                 continue;
             }
             if self
                 .find_method_in(&o.borrow().class, "__destruct")
                 .is_some()
             {
-                self.destructed.insert(key);
+                self.mark_destructed(&o);
                 self.method_invoke(o.clone(), "__destruct", CallArgs::empty())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Decref the running frame's CVs (vars/args/$this): an object
+    /// whose strong refs are exactly the cells this frame is about
+    /// to drop runs its __destruct now — Zend's behavior at function
+    /// exit and exception unwind (bug52361).
+    fn destruct_frame_objs(&mut self, f: &Frame) -> Result<(), PhpError> {
+        let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
+        let mut tally = |c: &Cell| {
+            if let Value::Object(o) = &*c.borrow() {
+                held.entry(Rc::as_ptr(o) as usize)
+                    .or_insert_with(|| (0, o.clone()))
+                    .0 += 1;
+            }
+        };
+        for c in f.vars.values() {
+            tally(c);
+        }
+        for c in f.args.iter() {
+            tally(c);
+        }
+        if let Some(o) = &f.this_obj {
+            held.entry(Rc::as_ptr(o) as usize)
+                .or_insert_with(|| (0, o.clone()))
+                .0 += 1;
+        }
+        for (_, (n, o)) in held {
+            // +1 for the `o` clone sitting in `held` itself.
+            if Rc::strong_count(&o) != n + 1 {
+                continue;
+            }
+            let key = Rc::as_ptr(&o) as usize;
+            if !self.destructed.contains_key(&key)
+                && self
+                    .find_method_in(&o.borrow().class, "__destruct")
+                    .is_some()
+            {
+                self.mark_destructed(&o);
+                // A throw inside the dtor must not clobber the
+                // in-flight exception being unwound (bug52361).
+                let saved = self.pending_exception.take();
+                let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                self.pending_exception = saved.or(self.pending_exception.take());
             }
         }
         Ok(())
@@ -2416,6 +2482,13 @@ impl<'a> Interp<'a> {
         self.pending_exception = None;
         self.call_trace.clear();
         self.deadline = None;
+    }
+
+    /// Record an object as destructed: true iff newly marked.
+    fn mark_destructed(&mut self, o: &Rc<RefCell<PhpObject>>) -> bool {
+        self.destructed
+            .insert(Rc::as_ptr(o) as usize, o.clone())
+            .is_none()
     }
 
     /// Worker mode: objects created during boot are application state and
@@ -3568,17 +3641,15 @@ impl<'a> Interp<'a> {
                                     && self
                                         .find_method_in(&o.borrow().class, "__destruct")
                                         .is_some()
+                                    && self.mark_destructed(o)
                                 {
-                                    let oid = Rc::as_ptr(o) as usize;
-                                    if self.destructed.insert(oid) {
-                                        if let Err(e) = self.method_invoke(
-                                            o.clone(),
-                                            "__destruct",
-                                            CallArgs::empty(),
-                                        ) {
-                                            self.expr_temps.truncate(base);
-                                            return self.err_flow(e);
-                                        }
+                                    if let Err(e) = self.method_invoke(
+                                        o.clone(),
+                                        "__destruct",
+                                        CallArgs::empty(),
+                                    ) {
+                                        self.expr_temps.truncate(base);
+                                        return self.err_flow(e);
                                     }
                                 }
                             }
@@ -3889,20 +3960,18 @@ impl<'a> Interp<'a> {
                                 let v = c.borrow().clone();
                                 drop(c);
                                 if let Value::Object(o) = v {
-                                    if Rc::strong_count(&o) == 1 {
-                                        let oid = Rc::as_ptr(&o) as usize;
-                                        if self
+                                    if Rc::strong_count(&o) == 1
+                                        && self
                                             .find_method_in(&o.borrow().class, "__destruct")
                                             .is_some()
-                                            && self.destructed.insert(oid)
-                                        {
-                                            if let Err(e) = self.method_invoke(
-                                                o.clone(),
-                                                "__destruct",
-                                                CallArgs::empty(),
-                                            ) {
-                                                return self.err_flow(e);
-                                            }
+                                        && self.mark_destructed(&o)
+                                    {
+                                        if let Err(e) = self.method_invoke(
+                                            o.clone(),
+                                            "__destruct",
+                                            CallArgs::empty(),
+                                        ) {
+                                            return self.err_flow(e);
                                         }
                                     }
                                 }
@@ -4562,12 +4631,12 @@ impl<'a> Interp<'a> {
         if Rc::strong_count(&it) == 2 && self.expr_temps.iter().any(|o| Rc::ptr_eq(o, &it)) {
             self.expr_temps.retain(|o| !Rc::ptr_eq(o, &it));
             let key = Rc::as_ptr(&it) as usize;
-            if !self.destructed.contains(&key)
+            if !self.destructed.contains_key(&key)
                 && self
                     .find_method_in(&it.borrow().class, "__destruct")
                     .is_some()
             {
-                self.destructed.insert(key);
+                self.mark_destructed(&it);
                 if let Err(e) = self.method_invoke(it.clone(), "__destruct", CallArgs::empty()) {
                     return self.err_flow(e);
                 }
@@ -5071,7 +5140,7 @@ impl<'a> Interp<'a> {
                 let cls = self.class_of(class)?;
                 let nv = self.eval(name)?;
                 let n = match nv {
-                    Value::Str(s) => crate::value::lossy(&s).into_owned(),
+                    Value::Str(s) => Self::nul_trunc(&crate::value::lossy(&s)),
                     _ => {
                         return self.fail(PhpError::uncaught(
                             "Error",
@@ -5364,6 +5433,10 @@ impl<'a> Interp<'a> {
                                 "offsetExists",
                                 CallArgs::positional(vec![cell(key.clone())]),
                             ) {
+                                // isset() consults offsetExists alone —
+                                // offsetGet is only chained by ??/empty
+                                // (bug31683).
+                                Ok(v) if v.is_truthy() && mode == 0 => Ok(Some(Value::Bool(true))),
                                 Ok(v) if v.is_truthy() => {
                                     match self.method_invoke(
                                         o,
@@ -7488,6 +7561,36 @@ impl<'a> Interp<'a> {
         self.fail(e)
     }
 
+    /// Synthesized signature of a magic-method trampoline FCC:
+    /// `mixed ...$arguments` (trampoline_closure_named_arguments).
+    fn trampoline_decl() -> Rc<crate::ast::FunctionDecl> {
+        Rc::new(crate::ast::FunctionDecl {
+            name: "{trampoline}".into(),
+            params: vec![crate::ast::Param {
+                name: "arguments".into(),
+                default: None,
+                by_ref: false,
+                variadic: true,
+                ty: Some(vec!["mixed".into()]),
+                promoted: false,
+                vis: None,
+                readonly: false,
+                is_final: false,
+                set_vis: None,
+                hooks: None,
+            }],
+            ret: None,
+            body: vec![],
+            attrs: vec![],
+            by_ref: false,
+            line: 0,
+            end_line: 0,
+            file: String::new(),
+            ns: String::new(),
+            decl_in: None,
+        })
+    }
+
     /// Same-type same-value — owners must agree on the *exact* result
     /// (int(42) vs float(42.0) is inconsistent).
     fn value_identical(a: &Value, b: &Value) -> bool {
@@ -7523,7 +7626,9 @@ impl<'a> Interp<'a> {
                 }
                 self.index_read_base(base, key).unwrap_or(Value::Null)
             }
-            Expr::Prop { .. } => self.prop_read_loose(target).unwrap_or(Value::Null),
+            // ++/-- reads through __get first — its exceptions
+            // propagate (the __set is never reached, bug38624).
+            Expr::Prop { .. } => self.prop_read_loose(target)?,
             Expr::VarVar(inner) => {
                 let n = self.eval(inner)?;
                 let name = self.conv_str(&n)?;
@@ -8290,7 +8395,7 @@ impl<'a> Interp<'a> {
             Expr::StaticProp { class, name } => {
                 // `C::$var()` — dynamic static method call.
                 let cls = self.class_of(class)?;
-                let mn = self.prop_name(name)?;
+                let mn = Self::nul_trunc(&self.prop_name(name)?);
                 let params = self
                     .find_method_in(&cls, &mn)
                     .map(|m| m.0.decl.params.clone())
@@ -8849,7 +8954,10 @@ impl<'a> Interp<'a> {
             Value::Object(o) => {
                 let icls = o.borrow().class.clone();
                 if self.find_method_in(&icls, "__invoke").is_some() {
-                    self.method_invoke_vis(o.clone(), "__invoke", args)
+                    // `$b()` calls __invoke with NO visibility check —
+                    // only an explicit `->` invoke is gated
+                    // (bug61025).
+                    self.method_invoke(o.clone(), "__invoke", args)
                 } else {
                     self.fail(PhpError::uncaught(
                         "Error",
@@ -8875,7 +8983,7 @@ impl<'a> Interp<'a> {
             },
             Expr::MethodCall { obj, name, .. } => {
                 let ov = self.eval(obj)?;
-                let mn = self.prop_name(name)?;
+                let mn = Self::nul_trunc(&self.prop_name(name)?);
                 self.fcc_method(&ov, &mn)
             }
             Expr::StaticCall { class, name, .. } => {
@@ -8886,7 +8994,7 @@ impl<'a> Interp<'a> {
                 let cls = self.fcc_class_of(class)?;
                 let nv = self.eval(name)?;
                 let mn = match nv {
-                    Value::Str(s) => crate::value::lossy(&s).into_owned(),
+                    Value::Str(s) => Self::nul_trunc(&crate::value::lossy(&s)),
                     _ => {
                         return self.fail(PhpError::uncaught(
                             "Error",
@@ -9623,6 +9731,12 @@ impl<'a> Interp<'a> {
         self.last_call_by_ref = decl.by_ref;
         self.call_trace.pop();
         self.cur_line = saved_line;
+        // Zend decrefs the frame's CVs at unwind — a local object
+        // whose last strong refs are that frame's cells runs its
+        // __destruct now (bug52361).
+        if let Some(f) = self.last_popped_frame.take() {
+            let _ = self.destruct_frame_objs(&f);
+        }
         r
     }
 
@@ -10983,7 +11097,12 @@ impl<'a> Interp<'a> {
         // `static` resolves against THIS frame's called class — after
         // the pop, `stack.last()` is the caller (static_type_return).
         let resolved_ret = decl.ret.as_ref().map(|ty| self.resolve_static(ty));
-        self.stack.pop();
+        let popped = self.stack.pop();
+        // Zend decrefs the frame's CVs at unwind — the popped frame
+        // is handed to bind_and_run, which runs its __destruct pass
+        // after the call-trace pop so the dtor's trace attributes to
+        // the caller's site (bug52361).
+        self.last_popped_frame = popped;
         match flow {
             Flow::Return(v) => {
                 // In a generator body `return v` is the iterator's
@@ -11034,7 +11153,30 @@ impl<'a> Interp<'a> {
                         self.fail(PhpError::uncaught("TypeError", msg, self.cur_line))
                     }
                 } else {
-                    Ok(v)
+                    // __toString carries an implicit `string` contract
+                    // — scalars coerce weakly; other types are
+                    // TypeErrors (bug26166).
+                    if decl.name.eq_ignore_ascii_case("__tostring") {
+                        match &v {
+                            Value::Str(_) => Ok(v),
+                            Value::Int(_) | Value::Float(_) | Value::Bool(_) => {
+                                Ok(Value::str(v.to_php_string()))
+                            }
+                            other => {
+                                let given = self.zval_type_name(other);
+                                self.fail(PhpError::uncaught(
+                                    "TypeError",
+                                    format!(
+                                        "{}(): Return value must be of type string, {} returned",
+                                        ret_fname, given
+                                    ),
+                                    self.cur_line,
+                                ))
+                            }
+                        }
+                    } else {
+                        Ok(v)
+                    }
                 }
             }
             Flow::Throw(v) => {
@@ -11100,6 +11242,20 @@ impl<'a> Interp<'a> {
                         e.thrown_line = Some(decl.end_line);
                         return self.fail(e);
                     }
+                }
+                // Falling off an untyped __toString is the same
+                // `none returned` TypeError (bug26166).
+                if decl.name.eq_ignore_ascii_case("__tostring") {
+                    let mut e = PhpError::uncaught(
+                        "TypeError",
+                        format!(
+                            "{}(): Return value must be of type string, none returned",
+                            ret_fname
+                        ),
+                        self.cur_line,
+                    );
+                    e.thrown_line = Some(decl.end_line);
+                    return self.fail(e);
                 }
                 Ok(Value::Null)
             }
@@ -15059,7 +15215,7 @@ impl<'a> Interp<'a> {
                 if let Err(e) = self.method_invoke_vis(o.clone(), "__construct", args) {
                     // A ctor that throws leaves a half-built object;
                     // zend never runs its __destruct (bug29368_1/_3).
-                    self.destructed.insert(Rc::as_ptr(o) as usize);
+                    self.mark_destructed(o);
                     return Err(e);
                 }
             }
@@ -15244,17 +15400,27 @@ impl<'a> Interp<'a> {
     }
 
     fn prop_name(&mut self, n: &PropName) -> Result<String, PhpError> {
-        match n {
-            PropName::Name(s) => Ok(s.clone()),
+        let s = match n {
+            PropName::Name(s) => return Ok(s.clone()),
             PropName::Var(v) => {
                 let val = self.var_get(v)?;
-                self.conv_str(&val)
+                self.conv_str(&val)?
             }
             PropName::Expr(e) => {
                 let v = self.eval(e)?;
-                self.conv_str(&v)
+                self.conv_str(&v)?
             }
-        }
+        };
+        // Property names keep NUL bytes — the private-name-mangle
+        // check fires downstream (bug52484). METHOD names truncate
+        // at their call sites (bug46238).
+        Ok(s)
+    }
+
+    /// Zend method names are C strings — a NUL byte truncates the
+    /// name (`"\0"` invokes `""`; bug46238).
+    fn nul_trunc(s: &str) -> String {
+        s.split('\0').next().unwrap_or_default().to_string()
     }
 
     // ----- property hooks (PHP 8.4, Zend/tests/property_hooks) -----
@@ -17388,7 +17554,48 @@ impl<'a> Interp<'a> {
                         None => Ok(Some(Value::Null)),
                     }
                 } else {
-                    Ok(Some(Value::Null))
+                    // ReflectionParameter::getType() — members stored
+                    // under \0rp\0ty by getParameters()
+                    // (trampoline_closure_named_arguments).
+                    let is_param = obj
+                        .borrow()
+                        .class
+                        .name()
+                        .eq_ignore_ascii_case("reflectionparameter");
+                    let tys = if is_param {
+                        obj.borrow()
+                            .props
+                            .get("\0rp\0ty")
+                            .map(|c| c.borrow().clone())
+                            .and_then(|v| match v {
+                                Value::Array(a) => Some(a),
+                                _ => None,
+                            })
+                    } else {
+                        None
+                    };
+                    match tys {
+                        Some(ta) => {
+                            let members: Vec<String> = ta
+                                .borrow()
+                                .entries
+                                .iter()
+                                .map(|(_, c)| c.borrow().to_php_string())
+                                .collect();
+                            let nt = self.instantiate("reflectionnamedtype", &[])?;
+                            if let Value::Object(o) = &nt {
+                                let mut ob = o.borrow_mut();
+                                ob.props
+                                    .insert("\0rp\0ty".into(), cell(Value::Array(ta.clone())));
+                                if let Some(first) = members.first() {
+                                    ob.props
+                                        .insert("name".into(), cell(Value::str(first.clone())));
+                                }
+                            }
+                            Ok(Some(nt))
+                        }
+                        None => Ok(Some(Value::Null)),
+                    }
                 }
             }
             // ReflectionClass::getDefaultProperties(): prop defaults
@@ -17493,7 +17700,23 @@ impl<'a> Interp<'a> {
                                 match c {
                                     Some(c) => self
                                         .find_method_in(&c, name)
-                                        .map(|(m, _)| Rc::new(m.decl.clone())),
+                                        .map(|(m, _)| Rc::new(m.decl.clone()))
+                                        // A magic-method trampoline
+                                        // (`C::undef(...)` on
+                                        // __callStatic / `$o->undef(...)`
+                                        // on __call) reflects as
+                                        // `mixed ...$arguments`
+                                        // (trampoline_closure_named_arguments).
+                                        .or_else(|| {
+                                            let magic = if obj.is_some() {
+                                                "__call"
+                                            } else {
+                                                "__callstatic"
+                                            };
+                                            self.find_method_in(&c, magic)
+                                                .is_some()
+                                                .then(Self::trampoline_decl)
+                                        }),
                                     None => None,
                                 }
                             }
@@ -17509,6 +17732,17 @@ impl<'a> Interp<'a> {
                             o.borrow_mut()
                                 .props
                                 .insert("\0rp\0name".into(), cell(Value::str(&p.name)));
+                            // Zend's ReflectionParameter exposes the name
+                            // as a public prop rendered by var_dump.
+                            let mut ob = o.borrow_mut();
+                            ob.props.insert("name".into(), cell(Value::str(&p.name)));
+                            if !ob.prop_order.contains(&"name".into()) {
+                                ob.prop_order.push("name".into());
+                            }
+                            drop(ob);
+                            o.borrow_mut()
+                                .props
+                                .insert("\0rp\0variadic".into(), cell(Value::Bool(p.variadic)));
                             let mut ta = PhpArray::default();
                             if let Some(ty) = &p.ty {
                                 for m in ty {
@@ -17525,6 +17759,12 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
             }
+            "isvariadic" => Ok(Some(Value::Bool(
+                obj.borrow()
+                    .props
+                    .get("\0rp\0variadic")
+                    .is_some_and(|c| c.borrow().is_truthy()),
+            ))),
             "iscallable" => {
                 self.deprecated(
                     "Method ReflectionParameter::isCallable() is deprecated since 8.0, use ReflectionParameter::getType() instead",
@@ -17832,6 +18072,7 @@ impl<'a> Interp<'a> {
                 let key = match clsname.as_str() {
                     "reflectionclassconstant" => "name",
                     "reflectionproperty" => "\0rc\0prop",
+                    "reflectionparameter" => "\0rp\0name",
                     _ => "\0rc\0class",
                 };
                 Ok(Some(
@@ -18034,6 +18275,31 @@ impl<'a> Interp<'a> {
                     Some((cd, f)) => Ok(Some(self.eval_decl_const(&cd.value, &f)?)),
                     None => Ok(Some(Value::Null)),
                 }
+            }
+            "setvalue" => {
+                // ReflectionProperty::setValue($object, $value) —
+                // bypasses prop visibility without __set (bug72177).
+                let pn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0prop")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let pn = self.conv_str(&pn)?.to_string();
+                let target = args.first().map(|c| c.borrow().clone());
+                let val = args
+                    .get(1)
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                if let Some(Value::Object(t)) = target {
+                    let mut tb = t.borrow_mut();
+                    if !tb.props.contains_key(&pn) && !tb.prop_order.iter().any(|k| k == &pn) {
+                        tb.prop_order.push(pn.clone());
+                    }
+                    tb.props.insert(pn.clone(), cell(val));
+                    tb.unset_props.remove(&pn);
+                }
+                Ok(Some(Value::Null))
             }
             "getdeclaringclass" => {
                 let cn = obj
@@ -18549,7 +18815,7 @@ impl<'a> Interp<'a> {
         args: &[Expr],
         nullsafe: bool,
     ) -> Result<Value, PhpError> {
-        let mn = self.prop_name(name)?;
+        let mn = Self::nul_trunc(&self.prop_name(name)?);
         let ov = self.eval(obj)?;
         match ov {
             Value::Null if nullsafe => Ok(Value::Null),
@@ -18661,6 +18927,28 @@ impl<'a> Interp<'a> {
     }
 
     /// Dispatch `$obj->name($args)` through `__call(name, args)`.
+    /// Zend's $args array for __call/__callStatic: elements that were
+    /// references in the caller's send array stay shared (bug50394);
+    /// plain zvals are copied so var_dump shows no `&`
+    /// (trampoline_closure_named_arguments).
+    fn magic_args_array(&self, args: &CallArgs) -> PhpArray {
+        let mut arr = PhpArray::new();
+        let share = |a: &Cell| {
+            if self.ref_cells.contains(&(Rc::as_ptr(a) as usize)) {
+                a.clone()
+            } else {
+                cell(a.borrow().clone())
+            }
+        };
+        for a in &args.cells {
+            arr.push_cell(share(a));
+        }
+        for (n, a, ..) in &args.named {
+            arr.set_cell(ArrKey::Str(Rc::from(n.as_str())), share(a));
+        }
+        arr
+    }
+
     fn call_via_magic(
         &mut self,
         obj: Rc<RefCell<PhpObject>>,
@@ -18669,13 +18957,7 @@ impl<'a> Interp<'a> {
         name: &str,
         args: CallArgs,
     ) -> Result<Value, PhpError> {
-        let mut arr = PhpArray::new();
-        for a in &args.cells {
-            arr.push(a.borrow().clone());
-        }
-        for (n, a, ..) in &args.named {
-            arr.set(ArrKey::Str(Rc::from(n.as_str())), a.borrow().clone());
-        }
+        let arr = self.magic_args_array(&args);
         self.invoke_method(
             obj,
             m,
@@ -18759,13 +19041,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 if let Some((cm, cdc)) = self.find_method_in(&cls, "__callstatic") {
-                    let mut arr = PhpArray::new();
-                    for a in &args.cells {
-                        arr.push(a.borrow().clone());
-                    }
-                    for (n, a, ..) in &args.named {
-                        arr.set(ArrKey::Str(Rc::from(n.as_str())), a.borrow().clone());
-                    }
+                    let arr = self.magic_args_array(&args);
                     self.pending_decl_class = Some(cdc.clone());
                     self.pending_called_class = Some(called_class.unwrap_or(cls.clone()));
                     let r = self.invoke_fn(
