@@ -819,6 +819,7 @@ impl<'a> Parser<'a> {
         } else {
             std::mem::take(&mut self.pending_class_attrs)
         };
+        let mut is_readonly = false;
         let mut is_abstract = false;
         let mut is_final = false;
         loop {
@@ -829,6 +830,7 @@ impl<'a> Parser<'a> {
                 is_final = true;
                 self.pos += 1;
             } else if self.ident_is("readonly") {
+                is_readonly = true;
                 self.pos += 1;
             } else {
                 break;
@@ -1055,6 +1057,7 @@ impl<'a> Parser<'a> {
             kind,
             is_abstract,
             is_final,
+            readonly: is_readonly,
             parent,
             implements,
             traits,
@@ -1738,6 +1741,7 @@ impl<'a> Parser<'a> {
                     kind: ClassKind::Class,
                     is_abstract: false,
                     is_final: false,
+                    readonly: false,
                     parent,
                     implements,
                     traits,

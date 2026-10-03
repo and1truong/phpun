@@ -334,6 +334,7 @@ impl<'a> Interp<'a> {
                 kind: ClassKind::Class,
                 is_abstract: false,
                 is_final: false,
+                readonly: false,
                 parent: parent.map(|s| s.to_string()),
                 implements: vec!["Throwable".into()],
                 attrs: vec![],
@@ -404,6 +405,7 @@ impl<'a> Interp<'a> {
             kind: ClassKind::Interface,
             is_abstract: false,
             is_final: false,
+            readonly: false,
             parent: None,
             implements: parents.iter().map(|s| s.to_string()).collect(),
             attrs: vec![],
@@ -466,6 +468,7 @@ impl<'a> Interp<'a> {
                 kind: ClassKind::Class,
                 is_abstract: false,
                 is_final: false,
+                readonly: false,
                 parent: None,
                 implements: vec![],
                 attrs: vec![],
@@ -485,6 +488,7 @@ impl<'a> Interp<'a> {
                 kind: ClassKind::Class,
                 is_abstract: false,
                 is_final: false,
+                readonly: false,
                 parent: None,
                 implements: vec![],
                 attrs: vec![],
@@ -559,6 +563,7 @@ impl<'a> Interp<'a> {
                 kind: ClassKind::Class,
                 is_abstract: false,
                 is_final: false,
+                readonly: false,
                 parent: None,
                 implements: vec![],
                 attrs: vec![],
@@ -579,6 +584,7 @@ impl<'a> Interp<'a> {
                 kind: ClassKind::Class,
                 is_abstract: false,
                 is_final: false,
+                readonly: false,
                 parent: None,
                 implements: vec![],
                 attrs: vec![],
@@ -5594,6 +5600,14 @@ impl<'a> Interp<'a> {
                 ));
             }
             let Some(hs) = &p.hooks else { continue };
+            // readonly classes forbid hooked props entirely, whether
+            // declared or ctor-promoted (gh15419_1, gh15419_2).
+            if d.readonly {
+                return Err(PhpError::fatal(
+                    "Hooked properties cannot be readonly",
+                    self.cur_line,
+                ));
+            }
             if p.is_abstract && hs.iter().all(|h| h.body.is_some()) {
                 return Err(PhpError::fatal(
                     format!(
@@ -6032,6 +6046,7 @@ impl<'a> Interp<'a> {
                             kind: ClassKind::Class,
                             is_abstract: false,
                             is_final: false,
+                            readonly: false,
                             parent: None,
                             implements: vec![],
                             attrs: vec![],

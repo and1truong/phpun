@@ -82,6 +82,8 @@ pub struct ClassDecl {
     pub kind: ClassKind,
     pub is_abstract: bool,
     pub is_final: bool,
+    /// `readonly class` modifier — forbids hooked props (gh15419).
+    pub readonly: bool,
     pub parent: Option<String>,
     pub implements: Vec<String>,
     /// `#[Attr]` names preceding the declaration (AllowDynamicProperties
