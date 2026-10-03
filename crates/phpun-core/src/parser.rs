@@ -1792,6 +1792,7 @@ impl<'a> Parser<'a> {
                     set_vis: m_set_vis,
                     decl_in: None,
                     hooks: None,
+                    attrs: member_attrs.clone(),
                     line: pline,
                 });
                 if !self.eat_op(",") {
@@ -2530,6 +2531,7 @@ impl<'a> Parser<'a> {
                         set_vis: m_set_vis,
                         decl_in: None,
                         hooks: None,
+                        attrs: vec![],
                         line: pline,
                     });
                     if !self.eat_op(",") {

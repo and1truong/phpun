@@ -707,6 +707,7 @@ impl<'a> Interp<'a> {
                         set_vis: None,
                         decl_in: None,
                         hooks: None,
+                        attrs: vec![],
                         line: 0,
                     })
                     .collect(),
@@ -8309,12 +8310,37 @@ impl<'a> Interp<'a> {
     /// PHP's compile-time checks on typed params (tests/lang/type_hints_*):
     /// `= null` on a non-nullable type is the implicit-nullable deprecation;
     /// a scalar literal default on a class type is a fatal.
+    /// `#[ReturnTypeWillChange]` is method-only — any other target is
+    /// a compile fatal (variance/return_type_will_change_*).
+    fn check_rtwc_attr(
+        &self,
+        attrs: &[crate::ast::AttrDecl],
+        target: &str,
+    ) -> Result<(), PhpError> {
+        for a in attrs {
+            let short = a.name.rsplit('\\').next().unwrap_or(&a.name);
+            if short.eq_ignore_ascii_case("ReturnTypeWillChange") {
+                return Err(PhpError::compile_fatal(
+                    format!(
+                        "Attribute \"ReturnTypeWillChange\" cannot target {} (allowed targets: method)",
+                        target
+                    ),
+                    a.line,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn decl_type_checks(
         &mut self,
         fname: &str,
         decl: &FunctionDecl,
         cls_ctx: Option<(&str, Option<String>)>,
     ) -> Result<(), PhpError> {
+        if cls_ctx.is_none() {
+            self.check_rtwc_attr(&decl.attrs, "function")?;
+        }
         let builtins = [
             "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed",
             "void", "never", "false", "true", "self", "parent", "static", "null",
@@ -8596,11 +8622,13 @@ impl<'a> Interp<'a> {
                 vec![m.clone()]
             };
             for e in exps {
-                // self/static/parent resolve for comparison only.
+                // self/parent resolve for comparison only — `static`
+                // stays itself (`static|self` is not redundant;
+                // static_to_self_to_unions).
                 let cmp = {
                     let el = e.to_lowercase();
                     match (el.as_str(), cls.as_ref()) {
-                        ("self" | "static", Some((c, _))) => c.to_string(),
+                        ("self", Some((c, _))) => c.to_string(),
                         ("parent", Some((_, p))) => p.clone().unwrap_or_else(|| e.clone()),
                         _ => e.clone(),
                     }
@@ -10194,8 +10222,42 @@ impl<'a> Interp<'a> {
         // (composer PSR-4 trees depend on this — MarkBased links
         // RegexBasedAbstract and the DataGenerator interface here).
         if let Some(p) = &decl.parent {
-            if !self.classes.contains_key(&p.to_lowercase()) {
+            let pl = p.to_lowercase();
+            // Kind-mismatched parents (a trait/interface under
+            // `extends`) count as "found" so the dedicated fatals
+            // below report them (error_009). Names still on the
+            // linking stack are mid-registration CEs — resolvable
+            // (traits/abstract_method_9).
+            let mut found = if decl.kind == ClassKind::Interface {
+                self.interfaces.contains_key(&pl)
+            } else {
+                self.classes.contains_key(&pl)
+                    || self.traits.contains_key(&pl)
+                    || self.interfaces.contains_key(&pl)
+                    || self
+                        .linking
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(&pl))
+            };
+            if !found {
                 self.run_autoload(p.trim_start_matches('\\'))?;
+                found = if decl.kind == ClassKind::Interface {
+                    self.interfaces.contains_key(&pl)
+                } else {
+                    self.classes.contains_key(&pl)
+                        || self.traits.contains_key(&pl)
+                        || self.interfaces.contains_key(&pl)
+                        || self
+                            .linking
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(&pl))
+                };
+            }
+            // Still unlinked after autoload — catchable Error
+            // (variance/unlinked_parent_1).
+            if !found {
+                let v = self.exception("Error", &format!("Class \"{}\" not found", p));
+                return Err(self.throw(v));
             }
         }
         for i in &decl.implements {
@@ -10240,6 +10302,7 @@ impl<'a> Interp<'a> {
                             set_vis: p.set_vis,
                             decl_in: None,
                             hooks: p.hooks.clone(),
+                            attrs: vec![],
                             line: 0,
                         });
                     }
@@ -10338,11 +10401,23 @@ impl<'a> Interp<'a> {
                 // loses late-static nuance, which type checks don't
                 // distinguish anyway.
                 Self::resolve_scope_tys(&mut d);
-                // `extends <trait>` → fatal (error_005-ish).
+                self.check_rtwc_attr(&d.attrs, "class")?;
+                for p in &d.props {
+                    self.check_rtwc_attr(&p.attrs, "property")?;
+                }
+                // `extends <trait>` / `extends <interface>` → fatal
+                // (error_009/error_010).
                 if let Some(pn) = &d.parent {
-                    if self.traits.contains_key(&pn.to_lowercase()) {
+                    let pl = pn.to_lowercase();
+                    if self.traits.contains_key(&pl) {
                         return Err(PhpError::fatal(
                             format!("Class {} cannot extend trait {}", d.name, pn),
+                            self.cur_line,
+                        ));
+                    }
+                    if self.interfaces.contains_key(&pl) {
+                        return Err(PhpError::fatal(
+                            format!("Class {} cannot extend interface {}", d.name, pn),
                             self.cur_line,
                         ));
                     }
@@ -10350,14 +10425,19 @@ impl<'a> Interp<'a> {
                 // `implements <non-interface>` → fatal (error_008).
                 for i in &d.implements {
                     if !self.interfaces.contains_key(&i.to_lowercase()) {
-                        let msg = if self.lookup_class(i).is_some()
-                            || self.traits.contains_key(&i.to_lowercase())
-                        {
-                            format!("{} cannot implement {} - it is not an interface", d.name, i)
-                        } else {
-                            format!("Interface \"{}\" not found", i)
-                        };
-                        return Err(PhpError::fatal(msg, self.cur_line));
+                        let missing = !(self.lookup_class(i).is_some()
+                            || self.traits.contains_key(&i.to_lowercase()));
+                        if missing {
+                            // Catchable Error like a missing trait
+                            // (variance/unlinked_parent_2).
+                            let v =
+                                self.exception("Error", &format!("Interface \"{}\" not found", i));
+                            return Err(self.throw(v));
+                        }
+                        return Err(PhpError::fatal(
+                            format!("{} cannot implement {} - it is not an interface", d.name, i),
+                            self.cur_line,
+                        ));
                     }
                 }
                 // Implementing Serializable is deprecated (8.1+) — the
@@ -10411,7 +10491,9 @@ impl<'a> Interp<'a> {
         let resolve = |ms: &mut Vec<String>| {
             for m in ms.iter_mut() {
                 let l = m.to_lowercase();
-                if l == "self" || l == "static" {
+                // `static` stays literal — late-static binds to the
+                // called class, resolved at check time.
+                if l == "self" {
                     *m = dn.clone();
                 } else if l == "parent" {
                     if let Some(p) = &dp {
@@ -11167,6 +11249,10 @@ impl<'a> Interp<'a> {
                 || (!abs_m.decl.params.iter().any(|p| p.variadic)
                     && impl_m.decl.params.len() >= abs_m.decl.params.len()));
         let mut ok = count_ok;
+        // An unresolvable class member makes the check impossible
+        // rather than incompatible — Zend reports which class it
+        // couldn't load (variance/trait_error, abstract_constructor).
+        let mut miss: Option<String> = None;
         if ok {
             for (i, ap) in abs_m.decl.params.iter().enumerate() {
                 if ap.variadic {
@@ -11186,6 +11272,7 @@ impl<'a> Interp<'a> {
                 let it = ip.ty.clone().unwrap_or_else(|| vec!["mixed".into()]);
                 let at = ap.ty.clone().unwrap_or_else(|| vec!["mixed".into()]);
                 if !self.ty_sup(&it, &at) {
+                    miss = self.first_unres(&it).or_else(|| self.first_unres(&at));
                     ok = false;
                     break;
                 }
@@ -11211,7 +11298,34 @@ impl<'a> Interp<'a> {
                             .collect()
                     };
                     let (ir2, ar2) = (resolve(ir), resolve(ar));
-                    ir2.iter().any(|m| m.eq_ignore_ascii_case("never")) || self.ty_sup(&ar2, &ir2)
+                    // `static` in the abstract keeps its late-static
+                    // meaning: the impl's own class satisfies it only
+                    // when the class is final (self == static then);
+                    // a real subclass member always narrows it
+                    // (override_static_with_self/*).
+                    let impl_final = self.linking.last().map(|c| c.is_final).unwrap_or(false);
+                    let covers = ir2.iter().all(|t| {
+                        ar2.iter().any(|s| {
+                            if s.eq_ignore_ascii_case("static") {
+                                t.eq_ignore_ascii_case("static")
+                                    || (t.eq_ignore_ascii_case(impl_disp) && impl_final)
+                                    || self.ty_member_is_a(t, impl_disp)
+                                        && !t.eq_ignore_ascii_case(impl_disp)
+                            } else if t.eq_ignore_ascii_case("static") {
+                                // impl-side `static` ⊆ s when the impl
+                                // class is-a s (any late-static callee
+                                // is still an s) (static_variance_success).
+                                self.ty_member_is_a(impl_disp, s)
+                            } else {
+                                self.ty_member_is_a(t, s)
+                            }
+                        })
+                    });
+                    let pass = ir2.iter().any(|m| m.eq_ignore_ascii_case("never")) || covers;
+                    if !pass {
+                        miss = self.first_unres(&ir2).or_else(|| self.first_unres(&ar2));
+                    }
+                    pass
                 }
             };
         }
@@ -11221,6 +11335,29 @@ impl<'a> Interp<'a> {
         }
         if ok {
             return None;
+        }
+        // An unresolvable class member makes the check impossible
+        // rather than incompatible — Zend reports which class it
+        // couldn't load (variance/trait_error, abstract_constructor).
+        if let Some(cn) = miss {
+            let mut e = PhpError::fatal(
+                format!(
+                    "Could not check compatibility between {}::{}{} and {}::{}{}, because class {} is not available",
+                    impl_disp,
+                    m,
+                    Self::sig_str_full(&impl_m.decl, impl_disp),
+                    abs_disp,
+                    m,
+                    Self::sig_str_full(&abs_m.decl, impl_disp),
+                    cn
+                ),
+                impl_m.decl.line,
+            );
+            e.line = impl_m.decl.line;
+            if impl_m.decl.file != self.diag_file() {
+                self.last_err_file = impl_m.decl.file.clone();
+            }
+            return Some(e);
         }
         // Zend cites the implementing method's declaration — for merged
         // trait methods that's the trait's own file/line (bug81192).
@@ -12004,6 +12141,38 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// First type member naming a class that can't be resolved even
+    /// after an autoload attempt — builtins, `self`/`parent`/`static`,
+    /// registered classes/interfaces, and names on the linking stack
+    /// all count as resolvable (variance/mixed_return_type: members
+    /// covered without resolution never reach here).
+    fn first_unres(&mut self, tys: &[String]) -> Option<String> {
+        const BUILTIN_T: &[&str] = &[
+            "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed",
+            "void", "never", "false", "true", "null", "resource", "self", "parent", "static",
+        ];
+        tys.iter()
+            .flat_map(|m| m.split('&').map(str::to_string).collect::<Vec<_>>())
+            .find(|m| {
+                let ml = m.trim_start_matches('\\').to_lowercase();
+                if BUILTIN_T.contains(&ml.as_str())
+                    || self.classes.contains_key(&ml)
+                    || self.interfaces.contains_key(&ml)
+                    || self
+                        .linking
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(&ml))
+                {
+                    return false;
+                }
+                if self.run_autoload(m.trim_start_matches('\\')).is_err() {
+                    self.pending_exception = None;
+                }
+                !self.classes.contains_key(&ml) && !self.interfaces.contains_key(&ml)
+            })
+            .map(|m| m.trim_start_matches('\\').to_string())
+    }
+
     /// `sup` is a supertype of `sub` when every `sub` member is admitted
     /// by some `sup` member — equal names, `mixed`, or a class/interface
     /// the member is-a (set_value_parameter_type_variance_006).
@@ -12059,6 +12228,22 @@ impl<'a> Interp<'a> {
             }
         }
         if sl == "bool" && (tl == "true" || tl == "false") {
+            return true;
+        }
+        // A class declaring __toString implicitly implements
+        // Stringable for variance (variance/stringable).
+        if sl == "stringable"
+            && (self
+                .lookup_class(t)
+                .map(|c| c.find_method("__tostring").is_some())
+                .unwrap_or(false)
+                || self.linking.iter().any(|c| {
+                    c.name.eq_ignore_ascii_case(t)
+                        && c.methods
+                            .iter()
+                            .any(|mm| mm.decl.name.eq_ignore_ascii_case("__tostring"))
+                }))
+        {
             return true;
         }
         if let Some(iface) = self.interfaces.get(&tl).cloned() {

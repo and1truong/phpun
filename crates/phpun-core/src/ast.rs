@@ -196,6 +196,9 @@ pub struct PropDecl {
     /// PHP 8.4 property hooks (`public $p { get => ..; set => .. }`);
     /// None for a plain property.
     pub hooks: Option<Vec<PropHook>>,
+    /// `#[Attr]` groups preceding the declaration (compile-checked
+    /// builtins like ReturnTypeWillChange).
+    pub attrs: Vec<AttrDecl>,
     /// Source line of the declaration (Zend reports hook/prop
     /// incompatibilities on the prop's own line).
     pub line: usize,
