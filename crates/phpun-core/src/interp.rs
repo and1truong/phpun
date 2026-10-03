@@ -708,6 +708,25 @@ impl<'a> Interp<'a> {
                 visibility: Visibility::Public,
             })
         };
+        // stub where `req` params are required and `opt` have null defaults
+        let stub_method_mix = |name: &str, req: &[&str], opt: &[&str]| {
+            let m = stub_method(
+                name,
+                &req.iter().chain(opt.iter()).copied().collect::<Vec<_>>(),
+            );
+            let mut decl = m.decl.clone();
+            for p in decl.params.iter_mut().skip(req.len()) {
+                p.default = Some(Expr::Null);
+            }
+            Rc::new(MethodDecl {
+                decl,
+                is_static: m.is_static,
+                is_abstract: m.is_abstract,
+                is_final: m.is_final,
+                visibility: m.visibility,
+            })
+        };
+
         reg(
             ClassDecl {
                 name: "ArrayIterator".into(),
@@ -763,6 +782,97 @@ impl<'a> Interp<'a> {
             true,
         );
         reg(iface("UnitEnum", &[], &["cases"]), true);
+        // PDO + PDOStatement + PDOException — sqlite storage spike (#15).
+        reg(
+            ClassDecl {
+                name: "PDO".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                methods: vec![
+                    stub_method_mix(
+                        "__construct",
+                        &["dsn"],
+                        &["username", "password", "options"],
+                    ),
+                    stub_method("query", &["query"]),
+                    stub_method("exec", &["statement"]),
+                    stub_method_mix("prepare", &["query"], &["options"]),
+                    stub_method_mix("lastInsertId", &[], &["name"]),
+                    stub_method("beginTransaction", &[]),
+                    stub_method("commit", &[]),
+                    stub_method("rollBack", &[]),
+                    stub_method("inTransaction", &[]),
+                    stub_method_mix("quote", &["string"], &["type"]),
+                    stub_method("setAttribute", &["attribute", "value"]),
+                    stub_method("getAttribute", &["attribute"]),
+                    stub_method("errorCode", &[]),
+                    stub_method("errorInfo", &[]),
+                ],
+                props: vec![],
+                consts: vec![
+                    ("FETCH_ASSOC".into(), Expr::Int(2)),
+                    ("FETCH_NUM".into(), Expr::Int(3)),
+                    ("FETCH_BOTH".into(), Expr::Int(4)),
+                    ("FETCH_OBJ".into(), Expr::Int(5)),
+                    ("ATTR_ERRMODE".into(), Expr::Int(3)),
+                    ("ATTR_DEFAULT_FETCH_MODE".into(), Expr::Int(19)),
+                    ("ATTR_EMULATE_PREPARES".into(), Expr::Int(20)),
+                    ("ERRMODE_SILENT".into(), Expr::Int(0)),
+                    ("ERRMODE_WARNING".into(), Expr::Int(1)),
+                    ("ERRMODE_EXCEPTION".into(), Expr::Int(2)),
+                    ("PARAM_STR".into(), Expr::Int(2)),
+                    ("PARAM_INT".into(), Expr::Int(1)),
+                    ("PARAM_BOOL".into(), Expr::Int(5)),
+                    ("PARAM_NULL".into(), Expr::Int(0)),
+                    ("PARAM_LOB".into(), Expr::Int(3)),
+                ],
+                file: String::new(),
+            },
+            false,
+        );
+        reg(
+            ClassDecl {
+                name: "PDOStatement".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                methods: vec![
+                    stub_method_mix("execute", &[], &["params"]),
+                    stub_method_mix("fetch", &[], &["mode", "cursorOrientation", "cursorOffset"]),
+                    stub_method_mix("fetchObject", &[], &["class", "constructorArgs"]),
+                    stub_method_mix("fetchAll", &[], &["mode", "args"]),
+                    stub_method_mix("fetchColumn", &[], &["column"]),
+                    stub_method("rowCount", &[]),
+                    stub_method("columnCount", &[]),
+                    stub_method_mix("bindValue", &["param", "value"], &["type"]),
+                    stub_method_mix(
+                        "bindParam",
+                        &["param", "var"],
+                        &["type", "maxLength", "driverOptions"],
+                    ),
+                    stub_method("closeCursor", &[]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        reg(
+            throwable_class("PDOException", Some("RuntimeException"), &[]),
+            true,
+        );
         // stdClass — the universal empty object.
         reg(
             ClassDecl {
@@ -10769,6 +10879,17 @@ impl<'a> Interp<'a> {
         // ArrayIterator: native iteration state on the object internal.
         if cls.name().eq_ignore_ascii_case("arrayiterator") {
             if let Some(v) = self.array_iter_method(&obj, name, &args)? {
+                return Ok(v);
+            }
+        }
+        // PDO / PDOStatement: sqlite-backed storage surface (#15 spike).
+        if cls.name().eq_ignore_ascii_case("pdo") {
+            if let Some(v) = crate::pdo::pdo_method(self, &obj, name, &args)? {
+                return Ok(v);
+            }
+        }
+        if cls.name().eq_ignore_ascii_case("pdostatement") {
+            if let Some(v) = crate::pdo::pdostmt_method(self, &obj, name, &args)? {
                 return Ok(v);
             }
         }

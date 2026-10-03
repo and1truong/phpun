@@ -12,6 +12,7 @@ pub mod interp;
 pub mod lexer;
 pub mod parser;
 mod pcre;
+pub mod pdo;
 pub mod serve;
 pub mod value;
 

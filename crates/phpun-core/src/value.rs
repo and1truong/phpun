@@ -811,7 +811,6 @@ pub struct TraceFrame {
     pub internal: bool,
 }
 
-#[derive(Debug)]
 pub enum ObjectInternal {
     /// Throwable fields (message/code/file/line/trace string).
     Exception {
@@ -846,8 +845,39 @@ pub enum ObjectInternal {
         args: Rc<Vec<crate::ast::Expr>>,
         target: i64,
     },
+    /// PDO connection (spike #15): sqlite via rusqlite.
+    Sqlite {
+        conn: Rc<RefCell<rusqlite::Connection>>,
+    },
+    /// PDOStatement state: compiled query + materialized rows + cursor.
+    SqliteStmt {
+        conn: Rc<RefCell<rusqlite::Connection>>,
+        sql: String,
+        /// executed result rows: [(col_name, value)] per row
+        rows: Vec<Vec<(String, Value)>>,
+        affected: i64,
+        /// fetch cursor
+        pos: usize,
+        /// positional binds from bindValue/bindParam
+        bound: Vec<Value>,
+        /// named binds (':' stripped)
+        named: HashMap<String, Value>,
+    },
     /// DateTime, closures-as-objects, etc. — opaque marker.
     None,
+}
+
+impl std::fmt::Debug for ObjectInternal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ObjectInternal::Exception { .. } => f.write_str("Exception"),
+            ObjectInternal::ArrayIter { .. } => f.write_str("ArrayIter"),
+            ObjectInternal::ReflectionAttribute { .. } => f.write_str("ReflectionAttribute"),
+            ObjectInternal::Sqlite { .. } => f.write_str("Sqlite"),
+            ObjectInternal::SqliteStmt { .. } => f.write_str("SqliteStmt"),
+            ObjectInternal::None => f.write_str("None"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
