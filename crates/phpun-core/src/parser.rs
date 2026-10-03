@@ -58,16 +58,22 @@ pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
 /// leading tag falls back to classic tag mode for legacy sources).
 /// If pure-source parsing fails and the source contains a `<?` tag
 /// anywhere, the legacy tag-mode parse is tried so HTML-embedded PHP
-/// keeps working; the pure-mode error is preferred if both fail.
+/// keeps working; when both fail the tag-mode error is preferred (the
+/// file was real tag-mode PHP, and its error is the meaningful one).
 pub fn parse_source(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
-    parse_pure(src, short_open).or_else(|e| {
-        if src.contains("<?") {
-            if let Ok(stmts) = parse_with(src, short_open) {
-                return Ok(stmts);
+    match parse_pure(src, short_open) {
+        Ok(stmts) => Ok(stmts),
+        Err(e) => {
+            if src.contains("<?") {
+                // Tag-mode parse of HTML-embedded PHP: prefer ITS error
+                // over the pure-mode one (a `hi<?php declare(strict_types)`
+                // file's real failure is the strict_types fatal, not the
+                // pure lexer's `?` confusion — placement_003).
+                return parse_with(src, short_open);
             }
+            Err(e)
         }
-        Err(e)
-    })
+    }
 }
 
 /// Strict pure-source parse — no tag-mode detection or retry. Used for
@@ -305,6 +311,10 @@ impl<'a> Parser<'a> {
         let mut stmts = Vec::new();
         let mut saw_code = false;
         let mut saw_ns = false;
+        // `declare(strict_types)` must be the very first statement —
+        // any preceding stmt (even another declare) is a fatal
+        // (scalar_strict_declaration_placement_*).
+        let mut saw_any = false;
         // Everything after `__HALT_COMPILER()` is ignored entirely —
         // the lexer stops there (namespaces/ns_080).
         let mut halted = false;
@@ -312,6 +322,15 @@ impl<'a> Parser<'a> {
             let stmt_line = self.line();
             stmts.push(Stmt::Line(stmt_line));
             let s = self.stmt()?;
+            if let Stmt::Declare { name, .. } = &s {
+                if name.eq_ignore_ascii_case("strict_types") && saw_any {
+                    return Err(PhpError::fatal(
+                        "strict_types declaration must be the very first statement in the script",
+                        stmt_line,
+                    ));
+                }
+            }
+            saw_any = true;
             let is_ns = matches!(&s, Stmt::Namespace(_))
                 || matches!(&s, Stmt::Block(v) if matches!(v.first(), Some(Stmt::Namespace(_))));
             // The first `namespace` declaration must precede all code
@@ -1091,6 +1110,22 @@ impl<'a> Parser<'a> {
                 format!(
                     "Cannot use {} as {} because the name is already in use",
                     fq, alias
+                ),
+                self.line(),
+            ));
+        }
+        // `use X as int` / `use int` — reserved scalar names can't be
+        // imported (scalar_reserved*_use).
+        const RESERVED_ALS: &[&str] = &[
+            "int", "float", "string", "bool", "void", "iterable", "object", "mixed", "never",
+            "null", "false", "true",
+        ];
+        let short = alias.rsplit('\\').next().unwrap_or(alias).to_lowercase();
+        if kind == NsKind::Class && RESERVED_ALS.contains(&short.as_str()) {
+            return Err(PhpError::compile_fatal(
+                format!(
+                    "Cannot use {} as {} because '{}' is a special class name",
+                    fq, alias, short
                 ),
                 self.line(),
             ));
@@ -2710,7 +2745,7 @@ impl<'a> Parser<'a> {
             Some(
                 members
                     .into_iter()
-                    .map(|m| {
+                    .map(|m| -> Result<String, PhpError> {
                         let (pre, inner, post) = if m.starts_with('(') && m.ends_with(')') {
                             ("(", &m[1..m.len() - 1], ")")
                         } else {
@@ -2719,19 +2754,43 @@ impl<'a> Parser<'a> {
                         let resolved = inner
                             .split('&')
                             .map(|p| {
-                                let p = p.trim_start_matches('\\');
-                                if p.is_empty() || BUILTIN_TYS.contains(&p.to_lowercase().as_str())
+                                let t = p.trim_start_matches('\\');
+                                if t.is_empty() || BUILTIN_TYS.contains(&t.to_lowercase().as_str())
                                 {
-                                    p.to_string()
+                                    Ok(t.to_string())
                                 } else {
-                                    self.ns_resolve(p, NsKind::Class)
+                                    // Resolve the RAW part — a leading `\`
+                                    // marks the name as fully qualified
+                                    // (namespaces/ns_055).
+                                    let r = self.ns_resolve(p, NsKind::Class);
+                                    // `bar\int` — qualified name ending in a
+                                    // reserved scalar type (scalar_relative_).
+                                    let seg = r
+                                        .rsplit('\\')
+                                        .next()
+                                        .unwrap_or(&r)
+                                        .to_lowercase();
+                                    const RESERVED_T: &[&str] = &[
+                                        "int", "float", "string", "bool", "void", "iterable",
+                                        "object", "mixed", "never", "null", "false", "true",
+                                    ];
+                                    if r.contains('\\') && RESERVED_T.contains(&seg.as_str()) {
+                                        return Err(PhpError::compile_fatal(
+                                            format!(
+                                                "Cannot use \"{}\" as a type name as it is reserved",
+                                                r
+                                            ),
+                                            self.line(),
+                                        ));
+                                    }
+                                    Ok(r)
                                 }
                             })
-                            .collect::<Vec<_>>()
+                            .collect::<Result<Vec<_>, _>>()?
                             .join("&");
-                        format!("{pre}{resolved}{post}")
+                        Ok(format!("{pre}{resolved}{post}"))
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>, _>>()?,
             )
         };
         Ok(members)

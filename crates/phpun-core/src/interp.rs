@@ -8566,6 +8566,15 @@ impl<'a> Interp<'a> {
     /// coerced value, or None when no scalar member applies (objects
     /// pass through unchanged).
     fn coerce_scalar(&mut self, ty: &[String], v: &Value) -> Option<Value> {
+        // A null value is never coerced to a scalar — `?T` params keep
+        // null (scalar_null). The caller's `ok` check gates the member.
+        if matches!(v, Value::Null) {
+            return if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) {
+                Some(Value::Null)
+            } else {
+                None
+            };
+        }
         for m in ty {
             let l = m.to_lowercase();
             match l.as_str() {
@@ -8786,7 +8795,15 @@ impl<'a> Interp<'a> {
             };
             if p.by_ref {
                 // By-ref params bind cells, not values — the contained
-                // value isn't checked at the boundary (typed_properties_010).
+                // value isn't checked at the boundary (typed_properties_010),
+                // but weak scalar args still coerce into the caller's
+                // cell (scalar_weak_reference).
+                if !self.caller_file_strict() {
+                    let bv = a.borrow().clone();
+                    if let Some(cv) = self.coerce_scalar(ty, &bv) {
+                        *a.borrow_mut() = cv;
+                    }
+                }
                 continue;
             }
             let v = a.borrow().clone();
@@ -8973,13 +8990,28 @@ impl<'a> Interp<'a> {
                     let r = self.eval_decl_const(d, &decl.file);
                     self.const_self = old;
                     self.cur_line = prev_line;
-                    let dv = match r {
+                    let mut dv = match r {
                         Ok(v) => v,
                         Err(e) => {
                             self.stack.pop();
                             return self.fail(e);
                         }
                     };
+                    // `float $f = 0` — the int default widens to float
+                    // at bind time, even under strict_types
+                    // (scalar_float_with_integer_default_strict).
+                    if let Some(ty) = &p.ty {
+                        let float_only = ty.iter().all(|m| {
+                            m.eq_ignore_ascii_case("float") || m.eq_ignore_ascii_case("null")
+                        });
+                        if float_only {
+                            if let (Value::Int(i), true) =
+                                (&dv, ty.iter().any(|m| m.eq_ignore_ascii_case("float")))
+                            {
+                                dv = Value::Float(*i as f64);
+                            }
+                        }
+                    }
                     binds.push((p.name.clone(), cell(dv)));
                 } else {
                     // Unbound required param — only reachable via named
@@ -9811,6 +9843,28 @@ impl<'a> Interp<'a> {
     // ----- classes -----
 
     fn register_class(&mut self, decl: Rc<ClassDecl>) -> Result<(), PhpError> {
+        // Reserved scalar names can't name a class/interface/trait/enum
+        // (scalar_reserved*): `class int {}` is a compile fatal.
+        let short = decl.name.rsplit('\\').next().unwrap_or(&decl.name);
+        const RESERVED_DECL: &[&str] = &[
+            "int", "float", "string", "bool", "void", "iterable", "object", "mixed", "never",
+            "null", "false", "true",
+        ];
+        if RESERVED_DECL.contains(&short.to_lowercase().as_str()) {
+            let kind = match decl.kind {
+                ClassKind::Interface => "an interface",
+                ClassKind::Trait => "a trait",
+                ClassKind::Enum => "an enum",
+                ClassKind::Class => "a class",
+            };
+            return Err(PhpError::compile_fatal(
+                format!(
+                    "Cannot use \"{}\" as {} name as it is reserved",
+                    short, kind
+                ),
+                self.cur_line,
+            ));
+        }
         // PHP links a declared class eagerly: the parent class, every
         // implemented interface, and every used trait must resolve at
         // declaration time, autoloading them when unregistered
@@ -16106,6 +16160,27 @@ impl<'a> Interp<'a> {
     /// class_alias($name, $alias): alias entries resolve like the
     /// original (classes, interfaces and traits alike).
     pub fn class_alias(&mut self, name: &str, alias: &str) -> Result<bool, PhpError> {
+        // `class_alias($cls, 'int')` — the alias may not be a reserved
+        // scalar type name (scalar_reserved*_class_alias).
+        let short = alias
+            .trim_start_matches('\\')
+            .rsplit('\\')
+            .next()
+            .unwrap_or(alias)
+            .to_lowercase();
+        const RESERVED_ALS: &[&str] = &[
+            "int", "float", "string", "bool", "void", "iterable", "object", "mixed", "never",
+            "null", "false", "true",
+        ];
+        if RESERVED_ALS.contains(&short.as_str()) {
+            return Err(PhpError::fatal(
+                format!(
+                    "Cannot use \"{}\" as a class alias as it is reserved",
+                    short
+                ),
+                self.cur_line,
+            ));
+        }
         let alias_l = alias.trim_start_matches('\\').to_lowercase();
         let key = name.trim_start_matches('\\').to_lowercase();
         if let Some(c) = self.classes.get(&key).cloned() {
