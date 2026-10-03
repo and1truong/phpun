@@ -2656,7 +2656,7 @@ impl<'a> Parser<'a> {
         if !name.is_empty() {
             members.push(name);
         }
-        if nullable && !members.iter().any(|m| m.eq_ignore_ascii_case("null")) {
+        if nullable {
             members.push("null".into());
         }
         if members.is_empty() {

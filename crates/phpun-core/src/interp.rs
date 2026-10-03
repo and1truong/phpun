@@ -1812,7 +1812,7 @@ impl<'a> Interp<'a> {
         for s in stmts {
             match s {
                 Stmt::Function(d) => {
-                    let _ = self.decl_type_checks(&d.name, d);
+                    let _ = self.decl_type_checks(&d.name, d, None);
                     let mut d = d.clone();
                     d.file = self.cur_file.clone();
                     self.functions.insert(d.name.to_lowercase(), Rc::new(d));
@@ -3202,7 +3202,7 @@ impl<'a> Interp<'a> {
                 Flow::Normal
             }
             Stmt::Function(d) => {
-                if let Err(e) = self.decl_type_checks(&d.name, d) {
+                if let Err(e) = self.decl_type_checks(&d.name, d, None) {
                     return self.err_flow(e);
                 }
                 let mut d = d.clone();
@@ -3213,7 +3213,9 @@ impl<'a> Interp<'a> {
             Stmt::Class(d) => {
                 for m in &d.methods {
                     let fname = format!("{}::{}", d.name, m.decl.name);
-                    if let Err(e) = self.decl_type_checks(&fname, &m.decl) {
+                    if let Err(e) =
+                        self.decl_type_checks(&fname, &m.decl, Some((&d.name, d.parent.clone())))
+                    {
                         return self.err_flow(e);
                     }
                 }
@@ -4364,7 +4366,7 @@ impl<'a> Interp<'a> {
                 if decl.file.is_empty() {
                     decl.file = cfile;
                 }
-                self.decl_type_checks(&fname, &decl)?;
+                self.decl_type_checks(&fname, &decl, None)?;
                 let mut captures = Vec::new();
                 if c.arrow {
                     // `fn` captures whole scope by value.
@@ -7920,7 +7922,12 @@ impl<'a> Interp<'a> {
     /// PHP's compile-time checks on typed params (tests/lang/type_hints_*):
     /// `= null` on a non-nullable type is the implicit-nullable deprecation;
     /// a scalar literal default on a class type is a fatal.
-    fn decl_type_checks(&mut self, fname: &str, decl: &FunctionDecl) -> Result<(), PhpError> {
+    fn decl_type_checks(
+        &mut self,
+        fname: &str,
+        decl: &FunctionDecl,
+        cls_ctx: Option<(&str, Option<String>)>,
+    ) -> Result<(), PhpError> {
         let builtins = [
             "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed",
             "void", "never", "false", "true", "self", "parent", "static", "null",
@@ -7975,8 +7982,121 @@ impl<'a> Interp<'a> {
                 }
                 _ => {}
             }
+            if let Some(ty) = &p.ty {
+                if let Err(e) = self.check_ty_redundant(ty, &cls_ctx) {
+                    self.cur_line = saved;
+                    return Err(e);
+                }
+            }
+        }
+        if let Some(ty) = &decl.ret {
+            if let Err(e) = self.check_ty_redundant(ty, &cls_ctx) {
+                self.cur_line = saved;
+                return Err(e);
+            }
         }
         self.cur_line = saved;
+        Ok(())
+    }
+
+    /// Union-type redundancy rules at decl time (PHP 8.x compile
+    /// checks): iterable expands to array|Traversable; self/parent/
+    /// static resolve against the declaring class; reports the member
+    /// as written (or the expanded member it collides with).
+    fn check_ty_redundant(
+        &mut self,
+        ty: &[String],
+        cls: &Option<(&str, Option<String>)>,
+    ) -> Result<(), PhpError> {
+        if ty.len() < 2 {
+            return Ok(());
+        }
+        let builtins = [
+            "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed",
+            "void", "never", "false", "true", "null",
+        ];
+        // `T|object` — a class member alongside `object` is redundant.
+        if ty.iter().any(|m| m.eq_ignore_ascii_case("object"))
+            && ty
+                .iter()
+                .any(|m| !m.contains('&') && !builtins.contains(&m.to_lowercase().as_str()))
+        {
+            return Err(PhpError::fatal(
+                format!(
+                    "Type {} contains both object and a class type, which is redundant",
+                    ty_norm_disp(ty)
+                ),
+                self.cur_line,
+            ));
+        }
+        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut seen_true = false;
+        let mut seen_false = false;
+        for m in ty {
+            let l = m.to_lowercase();
+            let exps: Vec<String> = if l == "iterable" {
+                vec!["array".into(), "Traversable".into()]
+            } else {
+                vec![m.clone()]
+            };
+            for e in exps {
+                // self/static/parent resolve for comparison only.
+                let cmp = {
+                    let el = e.to_lowercase();
+                    match (el.as_str(), cls.as_ref()) {
+                        ("self" | "static", Some((c, _))) => c.to_string(),
+                        ("parent", Some((_, p))) => p.clone().unwrap_or_else(|| e.clone()),
+                        _ => e.clone(),
+                    }
+                };
+                let dup = seen.iter().any(|(s, _)| {
+                    s.eq_ignore_ascii_case(&cmp)
+                        || (cmp.eq_ignore_ascii_case("false") || cmp.eq_ignore_ascii_case("true"))
+                            && s.eq_ignore_ascii_case("bool")
+                        || cmp.eq_ignore_ascii_case("closure") && s.eq_ignore_ascii_case("callable")
+                });
+                if dup {
+                    if cmp.eq_ignore_ascii_case("null") {
+                        return Err(PhpError::fatal(
+                            "null cannot be marked as nullable".to_string(),
+                            self.cur_line,
+                        ));
+                    }
+                    let el = e.to_lowercase();
+                    let builtin = [
+                        "int", "float", "string", "bool", "array", "object", "callable",
+                        "iterable", "mixed", "void", "never", "false", "true", "null",
+                    ]
+                    .contains(&el.as_str());
+                    let shown = if el == "static" {
+                        e.clone()
+                    } else if ["self", "parent"].contains(&el.as_str()) {
+                        cmp.clone()
+                    } else if builtin {
+                        el.clone()
+                    } else {
+                        e.clone()
+                    };
+                    return Err(PhpError::fatal(
+                        format!("Duplicate type {} is redundant", shown),
+                        self.cur_line,
+                    ));
+                }
+                if cmp.eq_ignore_ascii_case("true") {
+                    seen_true = true;
+                }
+                if cmp.eq_ignore_ascii_case("false") {
+                    seen_false = true;
+                }
+                seen.push((cmp, e));
+            }
+        }
+        if seen_true && seen_false {
+            return Err(PhpError::fatal(
+                "Type contains both true and false, bool must be used instead".to_string(),
+                self.cur_line,
+            ));
+        }
         Ok(())
     }
 
@@ -10890,6 +11010,12 @@ impl<'a> Interp<'a> {
                         ));
                     }
                 }
+            }
+        }
+        for pd in &d.props {
+            if let Some(ty) = &pd.ty {
+                let ctx = Some((d.name.as_str(), d.parent.clone()));
+                self.check_ty_redundant(ty, &ctx)?;
             }
         }
         // Inheritance variance — parent classes and implemented
@@ -16144,4 +16270,58 @@ fn is_compile_const(e: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Zend's normalized union display for redundancy errors: iterable
+/// expands to its members, class names first (written order), then
+/// `object`, then `array`, then remaining builtins, `null` last.
+fn ty_norm_disp(ty: &[String]) -> String {
+    let mut classes: Vec<String> = Vec::new();
+    let mut scalars: Vec<String> = Vec::new();
+    let mut obj = false;
+    let mut arr = false;
+    let mut nul = false;
+    for m in ty {
+        let mut members: Vec<String> = if m.eq_ignore_ascii_case("iterable") {
+            vec!["Traversable".into(), "array".into()]
+        } else {
+            vec![m.clone()]
+        };
+        for e in members.drain(..) {
+            let el = e.to_lowercase();
+            match el.as_str() {
+                "null" => nul = true,
+                "object" => obj = true,
+                "array" => arr = true,
+                "self" | "static" | "parent" => {
+                    if !classes.iter().any(|c| c.eq_ignore_ascii_case(&e)) {
+                        classes.push(e);
+                    }
+                }
+                "int" | "float" | "string" | "bool" | "callable" | "iterable" | "mixed"
+                | "void" | "never" | "false" | "true" => {
+                    if !scalars.iter().any(|c| c == &el) {
+                        scalars.push(el);
+                    }
+                }
+                _ => {
+                    if !classes.iter().any(|c| c.eq_ignore_ascii_case(&e)) {
+                        classes.push(e);
+                    }
+                }
+            }
+        }
+    }
+    let mut out = classes;
+    if obj {
+        out.push("object".into());
+    }
+    if arr {
+        out.push("array".into());
+    }
+    out.extend(scalars);
+    if nul {
+        out.push("null".into());
+    }
+    out.join("|")
 }
