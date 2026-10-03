@@ -51,6 +51,19 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
 /// `parse` honoring `short_open_tag` (INI `short_open_tag=On`).
 pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
     let toks = lex_with(src, short_open)?;
+    // Compile-time diagnostics ride the token stream; drain them and
+    // emit before execution (Zend emits compile warnings upfront).
+    let mut lex_diags: Vec<(String, &'static str, usize)> = Vec::new();
+    let toks: Vec<Lexed> = toks
+        .into_iter()
+        .filter_map(|t| match t.token {
+            Token::Diag(level, msg) => {
+                lex_diags.push((msg, level, t.line));
+                None
+            }
+            _ => Some(t),
+        })
+        .collect();
     bracket_check(&toks)?;
     let mut p = Parser {
         toks: &toks,
@@ -68,8 +81,15 @@ pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
         ns_style: 0,
     };
     let mut stmts = p.program()?;
-    for (i, (msg, line)) in std::mem::take(&mut p.deprecations).into_iter().enumerate() {
-        stmts.insert(i, Stmt::Deprecated { msg, line });
+    let mut diags: Vec<(String, &'static str, usize)> = lex_diags;
+    diags.extend(
+        std::mem::take(&mut p.deprecations)
+            .into_iter()
+            .map(|(msg, line)| (msg, "Deprecated", line)),
+    );
+    diags.sort_by_key(|(_, _, line)| *line);
+    for (i, (msg, level, line)) in diags.into_iter().enumerate() {
+        stmts.insert(i, Stmt::Diag { level, msg, line });
     }
     Ok(stmts)
 }
@@ -118,10 +138,28 @@ fn bracket_check(toks: &[crate::lexer::Lexed]) -> Result<(), PhpError> {
     Ok(())
 }
 
-/// Parse a standalone PHP expression source (used for string interpolation).
-pub fn parse_expr_src(src: &str) -> Result<Expr, PhpError> {
+/// A compile-time diagnostic produced while re-lexing an embedded
+/// source: (level, message, line).
+pub type SrcDiags = Vec<(&'static str, String, usize)>;
+
+/// Parse a standalone PHP expression source (used for string
+/// interpolation). Diagnostics produced while re-lexing the embedded
+/// source (e.g. octal overflow inside `${"\400"}`) come back in the
+/// second tuple element so the evaluator can print them inline.
+pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
     let wrapped = format!("<?php {};", src);
     let toks = lex(&wrapped)?;
+    let mut diags = Vec::new();
+    let toks: Vec<Lexed> = toks
+        .into_iter()
+        .filter_map(|t| match t.token {
+            Token::Diag(level, msg) => {
+                diags.push((level, msg, t.line));
+                None
+            }
+            _ => Some(t),
+        })
+        .collect();
     let mut p = Parser {
         toks: &toks,
         pos: 0,
@@ -138,7 +176,7 @@ pub fn parse_expr_src(src: &str) -> Result<Expr, PhpError> {
         ns_style: 0,
     };
     let e = p.expr()?;
-    Ok(e)
+    Ok((e, diags))
 }
 
 impl<'a> Parser<'a> {

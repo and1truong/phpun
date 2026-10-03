@@ -1457,6 +1457,18 @@ impl<'a> Interp<'a> {
                 self.cur_line = *l;
                 Flow::Normal
             }
+            Stmt::Diag { level, msg, line } => {
+                self.cur_line = *line;
+                let r = match *level {
+                    "Warning" => self.warn(msg),
+                    "Notice" => self.notice(msg),
+                    _ => self.deprecated(msg),
+                };
+                match r {
+                    Ok(()) => Flow::Normal,
+                    Err(e) => self.err_flow(e),
+                }
+            }
             Stmt::Deprecated { msg, line } => {
                 self.cur_line = *line;
                 match self.deprecated(msg) {
@@ -2417,9 +2429,21 @@ impl<'a> Interp<'a> {
                             s.push_str(&cs);
                         }
                         StringPart::Expr(src) => {
-                            let expr = parser::parse_expr_src(src)
+                            let (expr, _) = parser::parse_expr_src(src)
                                 .map_err(|e| PhpError::parse(e.message, e.line))?;
                             let v = self.eval(&expr)?;
+                            s.push_str(&self.conv_str(&v)?);
+                        }
+                        StringPart::DollarBraceExpr(src) => {
+                            // `${expr}` — deprecated variable-variable
+                            // interpolation; its deprecation + inner
+                            // diagnostics already emitted at lex time
+                            // (heredoc_nowdoc/flexible-heredoc-complex-*).
+                            let (expr, _) = parser::parse_expr_src(src)
+                                .map_err(|e| PhpError::parse(e.message, e.line))?;
+                            let nv = self.eval(&expr)?;
+                            let name = self.conv_str(&nv)?;
+                            let v = self.var_get(&name)?;
                             s.push_str(&self.conv_str(&v)?);
                         }
                     }

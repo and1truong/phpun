@@ -18,6 +18,10 @@ pub enum Token {
     InterpString(Vec<StringPart>),
     /// `<?=` echo tag — emitted as Token::Echo by the lexer.
     Echo,
+    /// Compile-time diagnostic emitted by the scanner (octal overflow,
+    /// etc.) — drained by `parse_with` and prepended as `Stmt::Diag`
+    /// so it prints before execution like Zend compile warnings.
+    Diag(&'static str, String),
     Op(&'static str),
 }
 
@@ -28,6 +32,9 @@ pub enum StringPart {
     Var(String),
     /// `{$expr_source}` — re-lexed lazily by the parser.
     Expr(String),
+    /// `${expr_source}` — deprecated variable-variable interpolation
+    /// (evaluates the expr to a *name*, then reads that variable).
+    DollarBraceExpr(String),
 }
 
 #[derive(Debug, Clone)]
@@ -314,9 +321,10 @@ fn lex_php(
                 pos += n;
             }
             b'"' => {
-                let (parts, n) = double_string(src, pos, *line)?;
+                let start = *line;
+                let (parts, n) = double_string(src, pos, start, out)?;
                 *line += s_matches(&src[pos..pos + n]);
-                push(out, Token::InterpString(parts), *line);
+                push(out, Token::InterpString(parts), start);
                 pos += n;
             }
             b'`' => {
@@ -325,7 +333,24 @@ fn lex_php(
                     *line,
                 ));
             }
+            b'<' if src[pos..].starts_with("<<<") => {
+                let start = *line;
+                let (tok, n) = heredoc(src, pos, start, out)?;
+                *line += s_matches(&src[pos..pos + n]);
+                push(out, tok, start);
+                pos += n;
+            }
             _ => {
+                if src[pos..].starts_with("b<<<") {
+                    // `b` binary-string prefix: accepted and ignored
+                    // (heredoc_002, nowdoc_002).
+                    let start = *line;
+                    let (tok, n) = heredoc(src, pos + 1, start, out)?;
+                    *line += s_matches(&src[pos..pos + n + 1]);
+                    push(out, tok, start);
+                    pos += n + 1;
+                    continue;
+                }
                 if c == b'_' || c.is_ascii_alphabetic() || c >= 0x80 {
                     let (name, n) = ident(src, pos);
                     push(out, Token::Ident(name), *line);
@@ -358,8 +383,27 @@ fn lex_php(
     }
 }
 
+/// Count logical line breaks: `\n`, `\r\n`, and lone `\r` each
+/// count once (heredoc bodies in eval'd code use all three —
+/// heredoc_nowdoc/bug79934).
 fn s_matches(s: &str) -> usize {
-    s.matches('\n').count()
+    let b = s.as_bytes();
+    let mut n = 0;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\n' => n += 1,
+            b'\r' => {
+                n += 1;
+                if b.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    n
 }
 
 fn ident(src: &str, pos: usize) -> (String, usize) {
@@ -519,9 +563,30 @@ fn single_string(src: &str, pos: usize, line: usize) -> Result<(String, usize), 
     }
 }
 
-fn double_string(src: &str, pos: usize, line: usize) -> Result<(Vec<StringPart>, usize), PhpError> {
+fn double_string(
+    src: &str,
+    pos: usize,
+    line: usize,
+    out: &mut Vec<Lexed>,
+) -> Result<(Vec<StringPart>, usize), PhpError> {
+    let (parts, n) = interp_scan(src, pos, 1, line, b'"', out)?;
+    Ok((parts, n))
+}
+
+/// Shared interpolation scanner for `"..."` and heredoc bodies.
+/// `end` is the closing byte (`b'"'` for dstrings); `end == 0` means the
+/// body runs to end of `src` (heredoc pre-slices its body, so a bare `"`
+/// inside is literal text).
+fn interp_scan(
+    src: &str,
+    pos: usize,
+    n0: usize,
+    line: usize,
+    end: u8,
+    diags: &mut Vec<Lexed>,
+) -> Result<(Vec<StringPart>, usize), PhpError> {
     let b = src.as_bytes();
-    let mut n = 1;
+    let mut n = n0;
     let mut parts: Vec<StringPart> = Vec::new();
     let mut lit = String::new();
     macro_rules! flush {
@@ -533,8 +598,14 @@ fn double_string(src: &str, pos: usize, line: usize) -> Result<(Vec<StringPart>,
     }
     loop {
         match b.get(pos + n) {
-            None => return Err(PhpError::parse("syntax error, unterminated string", line)),
-            Some(&b'"') => {
+            None => {
+                if end == 0 {
+                    flush!();
+                    return Ok((parts, n));
+                }
+                return Err(PhpError::parse("syntax error, unterminated string", line));
+            }
+            Some(&c) if c == end => {
                 flush!();
                 return Ok((parts, n + 1));
             }
@@ -562,7 +633,24 @@ fn double_string(src: &str, pos: usize, line: usize) -> Result<(Vec<StringPart>,
                                 _ => break,
                             }
                         }
-                        (char::from_u32(v).unwrap_or('\u{fffd}'), k)
+                        if v > 0o377 {
+                            // Zend warns at compile time and wraps the
+                            // value to a byte (warning_during_heredoc_*).
+                            diags.push(Lexed {
+                                token: Token::Diag(
+                                    "Warning",
+                                    format!(
+                                        "Octal escape sequence overflow \\{:o} is greater than \\377",
+                                        v
+                                    ),
+                                ),
+                                line: line + s_matches(&src[pos..pos + n]),
+                                ws_adj: 0,
+                            });
+                            (char::from_u32(v & 0xff).unwrap_or('\u{fffd}'), k)
+                        } else {
+                            (char::from_u32(v).unwrap_or('\u{fffd}'), k)
+                        }
                     }
                     Some(b'x') => {
                         let mut v = 0u32;
@@ -655,6 +743,20 @@ fn double_string(src: &str, pos: usize, line: usize) -> Result<(Vec<StringPart>,
                     ));
                 }
                 flush!();
+                // Compile-time diags inside `{$expr}` (e.g. octal
+                // overflow) scan at lex time like Zend.
+                let inner = &src[pos + n + 1..pos + k];
+                if let Ok(toks) = lex(&format!("<?php {}", inner)) {
+                    for t in toks {
+                        if let Token::Diag(level, msg) = t.token {
+                            diags.push(Lexed {
+                                token: Token::Diag(level, msg),
+                                line: line + s_matches(&src[pos..pos + n]),
+                                ws_adj: 0,
+                            });
+                        }
+                    }
+                }
                 parts.push(StringPart::Expr(src[pos + n + 1..pos + k].to_string()));
                 n = k + 1;
             }
@@ -681,7 +783,33 @@ fn double_string(src: &str, pos: usize, line: usize) -> Result<(Vec<StringPart>,
                         ));
                     }
                     flush!();
-                    parts.push(StringPart::Expr(src[pos + n + 2..pos + k].to_string()));
+                    // Zend reports diagnostics found while scanning the
+                    // inner source *before* the `${` deprecation itself
+                    // (warning_during_heredoc_scan_ahead): lex it now so
+                    // its own diags (octal, nested `${`) emit in order.
+                    let inner = &src[pos + n + 2..pos + k];
+                    if let Ok(toks) = lex(&format!("<?php {}", inner)) {
+                        for t in toks {
+                            if let Token::Diag(level, msg) = t.token {
+                                diags.push(Lexed {
+                                    token: Token::Diag(level, msg),
+                                    line: line + s_matches(&src[pos..pos + n]),
+                                    ws_adj: 0,
+                                });
+                            }
+                        }
+                    }
+                    diags.push(Lexed {
+                        token: Token::Diag(
+                            "Deprecated",
+                            "Using ${expr} (variable variables) in strings is deprecated, use {${expr}} instead".into(),
+                        ),
+                        line: line + s_matches(&src[pos..pos + n]),
+                        ws_adj: 0,
+                    });
+                    parts.push(StringPart::DollarBraceExpr(
+                        src[pos + n + 2..pos + k].to_string(),
+                    ));
                     n = k + 1;
                 } else {
                     let (name, len) = ident(src, pos + n + 1);
@@ -744,6 +872,203 @@ fn double_string(src: &str, pos: usize, line: usize) -> Result<(Vec<StringPart>,
                 n += ch.len_utf8();
             }
         }
+    }
+}
+
+/// Heredoc/nowdoc: `<<<` `ID` / `"ID"` / `'ID'` then lines until a
+/// line-start `{ws}{ID}` closer (PHP 7.3+ flexible: the closer's indent
+/// is stripped from every body line; mixed tab/space indents are parse
+/// errors — Zend/tests/heredoc_nowdoc).
+fn heredoc(
+    src: &str,
+    pos: usize,
+    line: usize,
+    out: &mut Vec<Lexed>,
+) -> Result<(Token, usize), PhpError> {
+    let b = src.as_bytes();
+    let mut n = 3; // <<<
+    while matches!(b.get(pos + n), Some(b' ') | Some(b'\t')) {
+        n += 1;
+    }
+    // Marker: 'ID' = nowdoc, "ID"/ID = heredoc.
+    let (marker, nowdoc, mlen) = match b.get(pos + n) {
+        Some(&q @ (b'\'' | b'"')) => {
+            let (m, l) = ident(src, pos + n + 1);
+            if m.is_empty() || b.get(pos + n + 1 + l) != Some(&q) {
+                return Err(PhpError::parse("syntax error, unexpected token", line));
+            }
+            (m, q == b'\'', l + 2)
+        }
+        _ => {
+            let (m, l) = ident(src, pos + n);
+            if m.is_empty() {
+                return Err(PhpError::parse("syntax error, unexpected token", line));
+            }
+            (m, false, l)
+        }
+    };
+    n += mlen;
+    // The marker line must end in a newline (or EOF → unterminated).
+    let eol = match b.get(pos + n) {
+        None => 0,
+        Some(&b'\r') if b.get(pos + n + 1) == Some(&b'\n') => 2,
+        Some(&b'\n') | Some(&b'\r') => 1,
+        Some(_) => {
+            return Err(PhpError::parse(
+                "syntax error, unexpected end of file",
+                line + s_matches(&src[pos..pos + n]),
+            ))
+        }
+    };
+    if eol == 0 {
+        return Err(PhpError::parse(
+            "syntax error, unexpected end of file",
+            line + s_matches(&src[pos..pos + n]),
+        ));
+    }
+    n += eol;
+    let body_start = pos + n;
+    let is_label = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    // End-of-line length at byte index `i` (`\r\n`, `\n`, `\r`).
+    let eol_at = |i: usize| -> usize {
+        match b.get(i) {
+            Some(b'\n') => 1,
+            Some(b'\r') if b.get(i + 1) == Some(&b'\n') => 2,
+            Some(b'\r') => 1,
+            _ => 0,
+        }
+    };
+    // Skip a `{$` or `${` interpolation span so a same-named marker
+    // inside one can't close the heredoc (flexible-heredoc-complex-*).
+    // Mirrors the brace-depth scan `interp_scan` applies.
+    let skip_interp = |mut i: usize| -> usize {
+        let mut depth = 1usize;
+        while depth > 0 {
+            match b.get(i) {
+                None => break,
+                Some(&b'{') => depth += 1,
+                Some(&b'}') => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        i
+    };
+    // Find the closer: at a line start, [ \t]* marker then a
+    // non-label char. `{$`/`${` regions are skipped char-wise so a
+    // same-named marker inside an interpolation can't close the
+    // heredoc (flexible-heredoc-complex-2/4).
+    let mut cur = body_start;
+    let (closer_line_start, indent_len) = loop {
+        if cur >= src.len() {
+            // Body non-empty → the expecting-list form; a marker line
+            // with nothing after it reports plain `unexpected end of
+            // file` (flexible-heredoc-error6 vs error7).
+            let eof_line = line + s_matches(&src[pos..cur]);
+            if cur == body_start {
+                return Err(PhpError::parse(
+                    "syntax error, unexpected end of file",
+                    eof_line,
+                ));
+            }
+            return Err(PhpError::parse(
+                "syntax error, unexpected end of file, expecting variable or heredoc end or \"${\" or \"{$\"",
+                eof_line,
+            ));
+        }
+        if !nowdoc && (src[cur..].starts_with("${") || src[cur..].starts_with("{$")) {
+            cur = skip_interp(cur + 2);
+            continue;
+        }
+        if cur == body_start || eol_at(cur.wrapping_sub(1)) > 0 && cur > 0 {
+            let mut le = cur;
+            while le < src.len() && eol_at(le) == 0 {
+                le += 1;
+            }
+            let mut ind_end = cur;
+            while matches!(b.get(ind_end), Some(b' ') | Some(b'\t')) && ind_end < le {
+                ind_end += 1;
+            }
+            if le - ind_end >= marker.len() && src[ind_end..].starts_with(&marker) {
+                let after = ind_end + marker.len();
+                if !matches!(b.get(after), Some(&c) if is_label(c)) {
+                    break (cur, ind_end - cur);
+                }
+            }
+        }
+        cur += 1;
+    };
+    let indent = &src[closer_line_start..closer_line_start + indent_len];
+    if indent.contains('\t') && indent.contains(' ') {
+        return Err(PhpError::parse(
+            "Invalid indentation - tabs and spaces cannot be mixed",
+            line + s_matches(&src[pos..closer_line_start]),
+        ));
+    }
+    // Dedent + validate every body line against the closer's indent.
+    let raw_region = &src[body_start..closer_line_start];
+    let mut body = String::with_capacity(raw_region.len());
+    let mut idx = 0usize; // body line index (marker line is `line`, body is line+1+idx)
+    let mut cur = 0usize;
+    let rb = raw_region.as_bytes();
+    // The newline that ends the last body line is not part of the value.
+    let raw_body = raw_region
+        .strip_suffix('\n')
+        .map(|x| x.strip_suffix('\r').unwrap_or(x))
+        .or_else(|| raw_region.strip_suffix('\r'))
+        .unwrap_or(raw_region);
+    let rb = &rb[..raw_body.len()];
+    while cur <= rb.len() {
+        let mut le = cur;
+        while le < rb.len() && rb[le] != b'\n' && rb[le] != b'\r' {
+            le += 1;
+        }
+        let l = &raw_body[cur..le];
+        if !indent.is_empty() {
+            if l.trim_start_matches([' ', '\t']).is_empty() {
+                // Whitespace-only lines dedent fully and never error.
+            } else if let Some(r) = l.strip_prefix(indent) {
+                body.push_str(r);
+            } else {
+                let lead = l.len() - l.trim_start_matches([' ', '\t']).len();
+                let mixed = l[..lead].chars().zip(indent.chars()).any(|(a, c)| a != c);
+                let bad_line = line + 1 + idx;
+                if mixed {
+                    return Err(PhpError::parse(
+                        "Invalid indentation - tabs and spaces cannot be mixed",
+                        bad_line,
+                    ));
+                }
+                return Err(PhpError::parse(
+                    format!(
+                        "Invalid body indentation level (expecting an indentation level of at least {})",
+                        indent.len()
+                    ),
+                    bad_line,
+                ));
+            }
+        } else {
+            body.push_str(l);
+        }
+        if le >= rb.len() {
+            break;
+        }
+        let el = match rb[le] {
+            b'\r' if rb.get(le + 1) == Some(&b'\n') => 2,
+            _ => 1,
+        };
+        body.push_str(&raw_body[le..le + el]);
+        cur = le + el;
+        idx += 1;
+    }
+    let consumed = (closer_line_start + indent_len + marker.len()) - pos;
+    if nowdoc {
+        Ok((Token::SimpleString(body), consumed))
+    } else {
+        let mut diags = Vec::new();
+        let (parts, _) = interp_scan(&body, 0, 0, line + 1, 0, &mut diags)?;
+        out.extend(diags);
+        Ok((Token::InterpString(parts), consumed))
     }
 }
 

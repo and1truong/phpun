@@ -7,6 +7,13 @@ pub enum Stmt {
     Line(usize),
     /// Parser-injected compile-time deprecation (e.g. `case e;` —
     /// tests/lang/033). PHP prints these before execution begins.
+    /// Compile-time diagnostic drained from `Token::Diag`: printed
+    /// before execution, like Zend's compile warnings (octal overflow).
+    Diag {
+        level: &'static str,
+        msg: String,
+        line: usize,
+    },
     Deprecated {
         msg: String,
         line: usize,

@@ -427,6 +427,50 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             }
             Value::str(out)
         }
+        "addcslashes" => {
+            // Escapes chars in the charlist (with `a..z` ranges) as
+            // C-escapes or \ooo octal (heredoc_nowdoc/bug79934).
+            let s = arg_str(it, args, 0);
+            let list = arg_str(it, args, 1);
+            let lb = list.as_bytes();
+            let mut set = [false; 256];
+            let mut i = 0;
+            while i < lb.len() {
+                if i + 3 < lb.len() && lb[i + 1] == b'.' && lb[i + 2] == b'.' {
+                    let (lo, hi) = (lb[i], lb[i + 3]);
+                    if lo <= hi {
+                        for c in lo..=hi {
+                            set[c as usize] = true;
+                        }
+                    }
+                    i += 4;
+                } else {
+                    set[lb[i] as usize] = true;
+                    i += 1;
+                }
+            }
+            let mut out = String::new();
+            for c in s.chars() {
+                let cp = c as u32;
+                if cp < 256 && set[cp as usize] {
+                    match c {
+                        '\0' => out.push_str("\\0"),
+                        '\x07' => out.push_str("\\a"),
+                        '\x08' => out.push_str("\\b"),
+                        '\t' => out.push_str("\\t"),
+                        '\n' => out.push_str("\\n"),
+                        '\x0b' => out.push_str("\\v"),
+                        '\x0c' => out.push_str("\\f"),
+                        '\r' => out.push_str("\\r"),
+                        _ if (0x20..0x7f).contains(&cp) => out.push_str(&format!("\\{}", c)),
+                        _ => out.push_str(&format!("\\{:03o}", cp)),
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            Value::str(out)
+        }
         "stripslashes" => {
             let s = arg_str(it, args, 0);
             let mut out = String::new();
