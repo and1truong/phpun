@@ -25,6 +25,7 @@ fn main() -> ExitCode {
 /// can invoke phpun with the same argv as reference php.
 fn run_script(args: &[String]) -> ExitCode {
     let mut file: Option<&str> = None;
+    let mut ini: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -37,7 +38,10 @@ fn run_script(args: &[String]) -> ExitCode {
                 break;
             }
             "-d" => {
-                i += 2; // skip ini assignment; not honored yet
+                if i + 1 < args.len() {
+                    ini.push(args[i + 1].clone());
+                }
+                i += 2;
                 continue;
             }
             "-f" | "-q" => {
@@ -45,7 +49,7 @@ fn run_script(args: &[String]) -> ExitCode {
                 continue;
             }
             s if s.starts_with("-d") => {
-                let _ = s;
+                ini.push(s[2..].to_string());
                 i += 1;
                 continue;
             }
@@ -68,6 +72,13 @@ fn run_script(args: &[String]) -> ExitCode {
         }
     };
     let mut it = Interp::new(file);
+    for kv in ini {
+        if let Some((k, v)) = kv.split_once('=') {
+            it.ini.insert(k.trim().to_string(), v.trim().to_string());
+        } else {
+            it.ini.insert(kv, String::new());
+        }
+    }
     let res = it.run_source(&src);
     print!("{}", it.out);
     ExitCode::from((res.exit_code & 0xff) as u8)

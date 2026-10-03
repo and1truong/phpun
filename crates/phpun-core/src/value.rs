@@ -12,6 +12,10 @@ use std::rc::Rc;
 pub enum ArrKey {
     Int(i64),
     Str(Rc<str>),
+    /// Zend-style tombstone: `unset`/`array_shift` mark a bucket dead but
+    /// keep its position so a live `foreach (&$v)` iteration over bucket
+    /// positions still sees later elements (foreachLoop.013/.015).
+    Tomb,
 }
 
 pub type Cell = Rc<RefCell<Value>>;
@@ -22,6 +26,9 @@ pub struct PhpArray {
     pub entries: Vec<(ArrKey, Cell)>,
     /// Next free integer key for `$arr[] = ...` (max int key seen + 1).
     pub next: i64,
+    /// Zend's is_ref: once elements are aliased (`foreach &$v`, `=&`),
+    /// writes through a shared (copied) zval must NOT copy-on-write split.
+    pub is_ref: bool,
 }
 
 impl Default for PhpArray {
@@ -35,6 +42,7 @@ impl PhpArray {
         Self {
             entries: Vec::new(),
             next: 0,
+            is_ref: false,
         }
     }
 
@@ -67,6 +75,11 @@ impl PhpArray {
     /// value (so aliases bound to the cell see it); a missing key appends.
     pub fn set_cell(&mut self, k: ArrKey, c: Cell) {
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
+            // Same cell on both sides (a $GLOBALS sync can alias the slot to
+            // its own global) — writing it would borrow_mut+borrow itself.
+            if Rc::ptr_eq(&slot.1, &c) {
+                return;
+            }
             *slot.1.borrow_mut() = c.borrow().clone();
             return;
         }
@@ -94,23 +107,31 @@ impl PhpArray {
         }
     }
 
-    /// Remove a key (unset). Returns whether it existed.
+    /// Remove a key (unset). The bucket is tombstoned — position kept,
+    /// value gone (see ArrKey::Tomb). Returns whether it existed.
     pub fn unset(&mut self, k: &ArrKey) -> bool {
-        let n = self.entries.len();
-        self.entries.retain(|(ek, _)| ek != k);
-        self.entries.len() != n
+        if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| ek == k) {
+            slot.0 = ArrKey::Tomb;
+            true
+        } else {
+            false
+        }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &(ArrKey, Cell)> {
-        self.entries.iter()
+    /// Live entries only (tombstones skipped).
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &(ArrKey, Cell)> {
+        self.entries
+            .iter()
+            .filter(|(k, _)| !matches!(k, ArrKey::Tomb))
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
+    /// Number of live elements.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.iter().count()
     }
 }
 
@@ -124,6 +145,7 @@ impl Clone for PhpArray {
                 .map(|(k, c)| (k.clone(), Rc::new(RefCell::new(c.borrow().clone()))))
                 .collect(),
             next: self.next,
+            is_ref: false,
         }
     }
 }
@@ -146,6 +168,64 @@ pub fn to_key(v: &Value) -> ArrKey {
         Value::Array(_) | Value::Object(_) | Value::Callable(_) | Value::Resource(_) => {
             ArrKey::Str("".into()) // illegal key — caller warns
         }
+    }
+}
+
+/// PHP's stack-trace argument printer: `'str'`, `Object(C)`, `Array`,
+/// scalars as their plain value (tests/lang/type_hints_001.phpt).
+/// Render Zend-style stack frames innermost-first, `#N {main}` last:
+/// `#0 file(7): fn('a', 2)` / `#0 [internal function]: cb('x')`.
+/// Internal callees hide their args (PHP: no arg info for builtins).
+pub fn format_trace(frames: &[TraceFrame]) -> String {
+    let rev: Vec<TraceFrame> = frames.iter().rev().cloned().collect();
+    let mut t = format_backtrace_frames(&rev);
+    t.push_str(&format!("#{} {{main}}", frames.len()));
+    t
+}
+
+/// debug_print_backtrace() output: innermost-first frames already ordered
+/// by the caller, no `{main}` trailer.
+pub fn format_backtrace_frames(frames: &[TraceFrame]) -> String {
+    let mut t = String::new();
+    for (i, fr) in frames.iter().enumerate() {
+        let site = if fr.file == "[internal function]" {
+            fr.file.clone()
+        } else {
+            format!("{}({})", fr.file, fr.line)
+        };
+        let callee = match &fr.class {
+            Some(c) => format!("{}{}{}", c, fr.ty, fr.function),
+            None => fr.function.clone(),
+        };
+        let args = if fr.internal {
+            String::new()
+        } else {
+            fr.args
+                .iter()
+                .map(|c| trace_arg(&c.borrow()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        t.push_str(&format!("#{} {}: {}({})\n", i, site, callee, args));
+    }
+    t
+}
+
+pub fn trace_arg(v: &Value) -> String {
+    match v {
+        Value::Object(o) => format!("Object({})", o.borrow().class.name()),
+        Value::Str(s) => {
+            if s.chars().count() > 15 {
+                format!("'{}...'", s.chars().take(15).collect::<String>())
+            } else {
+                format!("'{}'", s)
+            }
+        }
+        Value::Array(_) => "Array".into(),
+        Value::Null => "NULL".into(),
+        Value::Callable(_) => "Object(Closure)".into(),
+        Value::Resource(_) => "Resource id #1".into(),
+        other => other.to_php_string(),
     }
 }
 
@@ -216,6 +296,22 @@ impl Value {
             Value::Array(_) => "array",
             Value::Object(_) | Value::Callable(_) => "object",
             Value::Resource(_) => "resource",
+        }
+    }
+
+    /// PHP 8's `get_debug_type` — used in engine diagnostics ("int given",
+    /// "true given", class name for objects).
+    pub fn debug_type(&self) -> String {
+        match self {
+            Value::Null => "null".to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Int(_) => "int".to_string(),
+            Value::Float(_) => "float".to_string(),
+            Value::Str(_) => "string".to_string(),
+            Value::Array(_) => "array".to_string(),
+            Value::Object(o) => o.borrow().class.name().to_string(),
+            Value::Callable(_) => "Closure".to_string(),
+            Value::Resource(_) => "resource".to_string(),
         }
     }
 
@@ -389,11 +485,33 @@ pub fn format_float_repr(f: f64) -> String {
     php_gcvt(f, 17)
 }
 
+/// Float → string honoring an explicit INI precision (`precision=N` for
+/// echo/casts, `serialize_precision=N` for var_dump/var_export/print_r):
+/// forced %G formatting — always `n` significant digits (bug24640). A
+/// negative `prec` selects the shortest round-trip form (`-1`).
+pub fn format_float_prec(f: f64, prec: i64) -> String {
+    if prec < 0 {
+        format_float_repr(f)
+    } else {
+        php_gcvt_fixed(f, prec as usize)
+    }
+}
+
+/// PHP zend_gcvt-style float formatting with a forced significant-digit
+/// count (%.Ng): digits come from `{:.*e}` rounding, trailing zeros trimmed.
+fn php_gcvt_fixed(f: f64, precision: usize) -> String {
+    php_gcvt_impl(f, precision, true)
+}
+
 /// PHP zend_gcvt-style float formatting: significant digits come from the
 /// shortest round-trip representation (rounded to `precision` digits only
 /// when the shortest form is longer); scientific notation when the decimal
 /// exponent is < -4 or >= precision.
 fn php_gcvt(f: f64, precision: usize) -> String {
+    php_gcvt_impl(f, precision, false)
+}
+
+fn php_gcvt_impl(f: f64, precision: usize, force: bool) -> String {
     if f.is_nan() {
         return "NAN".to_string();
     }
@@ -408,7 +526,7 @@ fn php_gcvt(f: f64, precision: usize) -> String {
         };
     }
     let neg = f < 0.0;
-    let (digits, exp) = gcvt_digits(f.abs(), precision);
+    let (digits, exp) = gcvt_digits(f.abs(), precision, force);
     let nd = digits.len() as i64;
     let sign = if neg { "-" } else { "" };
     if exp < -4 || exp >= precision as i64 {
@@ -441,7 +559,7 @@ fn php_gcvt(f: f64, precision: usize) -> String {
 /// Significant digits (no decimal point) + decimal exponent of |v|.
 /// Uses the shortest round-trip repr; if that exceeds `precision` digits
 /// the value is re-rounded to `precision` digits.
-fn gcvt_digits(v: f64, precision: usize) -> (String, i64) {
+fn gcvt_digits(v: f64, precision: usize, force: bool) -> (String, i64) {
     let split = |s: String| -> (String, i64) {
         let (mant, e) = s.split_once('e').unwrap();
         let exp: i64 = e.parse().unwrap_or(0);
@@ -454,6 +572,9 @@ fn gcvt_digits(v: f64, precision: usize) -> (String, i64) {
         };
         (digits, exp)
     };
+    if force {
+        return split(format!("{:.*e}", precision - 1, v));
+    }
     let (d, e) = split(format!("{:e}", v));
     if d.len() > precision {
         split(format!("{:.*e}", precision - 1, v))
@@ -496,7 +617,13 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
         (Bool(_), _) | (_, Bool(_)) | (Null, _) | (_, Null) => a.is_truthy().cmp(&b.is_truthy()),
         (Int(_) | Float(_), Str(s)) => {
             match numeric(s) {
-                Numeric::Int(_) | Numeric::Float(_) => num_cmp(a.to_float(), b.to_float()),
+                // Int strings compare exactly — f64 would lose low bits on
+                // 64-bit ints (operators/operator_equals_variation_64bit).
+                Numeric::Int(si) => match a {
+                    Int(ai) => ai.cmp(&si),
+                    _ => num_cmp(a.to_float(), si as f64),
+                },
+                Numeric::Float(_) => num_cmp(a.to_float(), b.to_float()),
                 // PHP 8: non-numeric (incl. leading-numeric) string →
                 // the number is cast to string and compared as strings.
                 Numeric::Leading(_, _) | Numeric::NonNumeric => {
@@ -505,10 +632,12 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
             }
         }
         (Str(_), Int(_) | Float(_)) => compare(b, a).reverse(),
+        (Int(x), Int(y)) => x.cmp(y),
         (Int(_) | Float(_), Int(_) | Float(_)) => num_cmp(a.to_float(), b.to_float()),
         (Str(x), Str(y)) => {
             // Both numeric strings → numeric compare, else string compare.
             match (numeric(x), numeric(y)) {
+                (Numeric::Int(xi), Numeric::Int(yi)) => xi.cmp(&yi),
                 (Numeric::Int(_) | Numeric::Float(_), Numeric::Int(_) | Numeric::Float(_)) => {
                     num_cmp(numeric(x).to_float(), numeric(y).to_float())
                 }
@@ -633,13 +762,46 @@ pub struct PhpObject {
     pub internal: Option<ObjectInternal>,
 }
 
+/// One recorded call for exception backtraces (getTrace()).
+#[derive(Debug, Clone)]
+pub struct TraceFrame {
+    /// Callee name (`fopen`, `Error2Exception`, `Cls::m`/`{closure}`-ish).
+    pub function: String,
+    /// Class name for method calls (None for plain/builtin functions).
+    pub class: Option<String>,
+    /// `->` for object methods, `::` for static — empty for functions.
+    pub ty: String,
+    /// Call-site file and line; `"[internal function]"`/0 when the caller
+    /// is a builtin (e.g. a userland callback invoked from ob_end_clean).
+    pub file: String,
+    pub line: u32,
+    /// Call args (rendered with trace_arg; hidden for internal callees).
+    pub args: Vec<Cell>,
+    /// Callee is an internal/builtin function — PHP omits its args.
+    pub internal: bool,
+}
+
 #[derive(Debug)]
 pub enum ObjectInternal {
     /// Throwable fields (message/code/file/line/trace string).
     Exception {
         file: String,
         line: u32,
+        /// Fully formatted trace body (`#0 f(1): g()\n#1 {main}`); empty →
+        /// callers fall back to `#0 {main}`.
         trace: String,
+        /// `thrown in` footer line — usually `line`; param TypeErrors
+        /// attribute to the callee's declaration line.
+        thrown: u32,
+        /// Uncaught-display message when it differs from `message`
+        /// (param TypeErrors show "... and defined in FILE:M").
+        full_msg: String,
+        /// ParseError raised inside eval()'d code: the inner source line.
+        /// Uncaught display uses the plain `Parse error:` form
+        /// (`in FILE(N) : eval()'d code on line M` — tests/lang/019).
+        eval_ctx: u32,
+        /// Call stack snapshot at construction → getTrace() (tests/lang/038).
+        frames: Rc<Vec<TraceFrame>>,
     },
     /// DateTime, closures-as-objects, etc. — opaque marker.
     None,

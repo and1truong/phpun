@@ -1,20 +1,121 @@
 use crate::ast::*;
 use crate::error::PhpError;
-use crate::lexer::{lex, Lexed, Token};
+use crate::lexer::{lex, lex_with, Lexed, Token};
 use std::rc::Rc;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NsKind {
+    Class,
+    Func,
+    Const,
+}
 
 pub struct Parser<'a> {
     toks: &'a [Lexed],
     pos: usize,
+    /// Compile-time deprecation diagnostics (msg, line) — PHP emits them
+    /// before execution; `parse_with` prepends them as `Stmt::Deprecated`.
+    deprecations: Vec<(String, usize)>,
+    /// Enclosing class name while parsing members (hook error text).
+    cur_class: String,
+    /// (prop name, is_get) while inside a hook body — gates
+    /// `parent::$p::get()/set()` syntax.
+    hook_ctx: Option<(String, bool)>,
+    /// `#[Attr]` names consumed at the statement level, pending the
+    /// following class declaration.
+    pending_class_attrs: Vec<String>,
+    /// Current `namespace` name ("" = global scope).
+    cur_ns: String,
+    /// `use` import maps for the current namespace block, keyed by
+    /// alias — lowercase for classes/functions, exact for constants.
+    use_map: std::collections::HashMap<String, String>,
+    use_fn_map: std::collections::HashMap<String, String>,
+    use_const_map: std::collections::HashMap<String, String>,
+    /// Short names (lowercase) of classes/interfaces/traits/enums
+    /// declared in this file — a `use` alias colliding with one is a
+    /// compile-time fatal (namespaces/ns_030).
+    declared_types: std::collections::HashSet<String>,
+    /// Inside a `namespace X { ... }` body — nested `namespace`
+    /// declarations are a compile error (namespaces/ns_079).
+    in_braced_ns: bool,
+    /// Braced vs unbraced namespace declarations in this file —
+    /// 0 none, 1 unbraced, 2 braced (mixing is a compile fatal,
+    /// namespaces/ns_081/ns_084).
+    ns_style: u8,
 }
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
-    let toks = lex(src)?;
+    parse_with(src, false)
+}
+
+/// `parse` honoring `short_open_tag` (INI `short_open_tag=On`).
+pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
+    let toks = lex_with(src, short_open)?;
+    bracket_check(&toks)?;
     let mut p = Parser {
         toks: &toks,
         pos: 0,
+        deprecations: Vec::new(),
+        cur_class: String::new(),
+        hook_ctx: None,
+        pending_class_attrs: Vec::new(),
+        cur_ns: String::new(),
+        use_map: std::collections::HashMap::new(),
+        use_fn_map: std::collections::HashMap::new(),
+        use_const_map: std::collections::HashMap::new(),
+        declared_types: std::collections::HashSet::new(),
+        in_braced_ns: false,
+        ns_style: 0,
     };
-    p.program()
+    let mut stmts = p.program()?;
+    for (i, (msg, line)) in std::mem::take(&mut p.deprecations).into_iter().enumerate() {
+        stmts.insert(i, Stmt::Deprecated { msg, line });
+    }
+    Ok(stmts)
+}
+
+/// Zend-style bracket-balance pre-pass: mismatched/unclosed/mismatched
+/// closers report as `Unclosed 'X'`, `Unmatched 'Y'`,
+/// `Unclosed 'X' does not match 'Y'` (syntax_errors).
+fn bracket_check(toks: &[crate::lexer::Lexed]) -> Result<(), PhpError> {
+    let mut stack: Vec<(&'static str, usize)> = Vec::new();
+    let last_line = toks.last().map(|t| t.line).unwrap_or(1);
+    for t in toks {
+        let Token::Op(op) = &t.token else { continue };
+        match *op {
+            "(" | "[" | "{" | "#[" => stack.push((if *op == "#[" { "[" } else { op }, t.line)),
+            ")" | "]" | "}" => {
+                let open = match *op {
+                    ")" => "(",
+                    "]" => "[",
+                    _ => "{",
+                };
+                match stack.pop() {
+                    Some((o, _)) if o == open => {}
+                    Some((o, ol)) => {
+                        // Multi-line spans name the opener's line.
+                        let msg = if ol != t.line {
+                            format!("Unclosed '{}' on line {} does not match '{}'", o, ol, op)
+                        } else {
+                            format!("Unclosed '{}' does not match '{}'", o, op)
+                        };
+                        return Err(PhpError::parse(msg, t.line));
+                    }
+                    None => return Err(PhpError::parse(format!("Unmatched '{}'", op), t.line)),
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((o, ol)) = stack.pop() {
+        let msg = if ol != last_line {
+            format!("Unclosed '{}' on line {}", o, ol)
+        } else {
+            format!("Unclosed '{}'", o)
+        };
+        return Err(PhpError::parse(msg, last_line));
+    }
+    Ok(())
 }
 
 /// Parse a standalone PHP expression source (used for string interpolation).
@@ -24,6 +125,17 @@ pub fn parse_expr_src(src: &str) -> Result<Expr, PhpError> {
     let mut p = Parser {
         toks: &toks,
         pos: 0,
+        deprecations: Vec::new(),
+        cur_class: String::new(),
+        hook_ctx: None,
+        pending_class_attrs: Vec::new(),
+        cur_ns: String::new(),
+        use_map: std::collections::HashMap::new(),
+        use_fn_map: std::collections::HashMap::new(),
+        use_const_map: std::collections::HashMap::new(),
+        declared_types: std::collections::HashSet::new(),
+        in_braced_ns: false,
+        ns_style: 0,
     };
     let e = p.expr()?;
     Ok(e)
@@ -70,14 +182,18 @@ impl<'a> Parser<'a> {
         if self.eat_op(op) {
             Ok(())
         } else {
-            Err(PhpError::parse(
+            // Zend reports a lone unexpected `\` name separator without an
+            // "expecting" clause (namespaced_name_whitespace).
+            let msg = if op == ";" && matches!(self.peek(), Some(Token::Op("\\"))) {
+                format!("syntax error, unexpected {}", self.describe())
+            } else {
                 format!(
                     "syntax error, unexpected {}, expecting \"{}\"",
                     self.describe(),
                     op
-                ),
-                self.line(),
-            ))
+                )
+            };
+            Err(PhpError::parse(msg, self.line()))
         }
     }
 
@@ -118,9 +234,64 @@ impl<'a> Parser<'a> {
 
     pub fn program(&mut self) -> Result<Vec<Stmt>, PhpError> {
         let mut stmts = Vec::new();
+        let mut saw_code = false;
+        let mut saw_ns = false;
+        // Everything after `__HALT_COMPILER()` is ignored entirely —
+        // the lexer stops there (namespaces/ns_080).
+        let mut halted = false;
         while self.peek().is_some() {
-            stmts.push(Stmt::Line(self.line()));
-            stmts.push(self.stmt()?);
+            let stmt_line = self.line();
+            stmts.push(Stmt::Line(stmt_line));
+            let s = self.stmt()?;
+            let is_ns = matches!(&s, Stmt::Namespace(_))
+                || matches!(&s, Stmt::Block(v) if matches!(v.first(), Some(Stmt::Namespace(_))));
+            // The first `namespace` declaration must precede all code
+            // (only `declare` may come earlier); later `namespace`
+            // declarations may follow code (namespaces/ns_068).
+            if halted {
+                // unreachable (guarded above); keeps the flow explicit.
+            }
+            if is_ns && !saw_ns && saw_code {
+                return Err(PhpError::fatal(
+                    "Namespace declaration statement has to be the very first statement or after any declare call in the script".to_string(),
+                    self.line(),
+                ));
+            }
+            // Once a braced `namespace {}` is used, every later stmt
+            // must itself be inside a namespace block (ns_087).
+            // `__HALT_COMPILER()` is allowed outside even in braced-ns
+            // files (namespaces/ns_080).
+            let is_halt = matches!(&s,
+                Stmt::Expr(Expr::Call { name, .. })
+                    if matches!(&**name, Expr::Str(n) if n.trim_start_matches('\u{1}').eq_ignore_ascii_case("__halt_compiler")));
+            if halted {
+                stmts.push(s);
+                continue;
+            }
+            if is_halt {
+                halted = true;
+            }
+            if !is_ns
+                && self.ns_style == 2
+                && !is_halt
+                && !matches!(&s, Stmt::Declare { .. })
+                && !matches!(&s, Stmt::Expr(Expr::Null))
+            {
+                return Err(PhpError::fatal(
+                    "No code may exist outside of namespace {}".to_string(),
+                    stmt_line,
+                ));
+            }
+            saw_ns = saw_ns || is_ns;
+            // A lone `;` (Stmt::Expr(Expr::Null)) is not "code" either
+            // (namespaces/namespace_first_stmt_nop).
+            if !is_ns
+                && !matches!(&s, Stmt::Declare { .. })
+                && !matches!(&s, Stmt::Expr(Expr::Null))
+            {
+                saw_code = true;
+            }
+            stmts.push(s);
         }
         Ok(stmts)
     }
@@ -140,19 +311,49 @@ impl<'a> Parser<'a> {
                 v.push(self.stmt()?);
             }
             Ok(v)
-        } else if self.eat_op(":") {
-            // Alternative syntax: if: ... endif; etc. — not yet supported.
-            Err(PhpError::parse(
-                "syntax error, alternative syntax (endif/endwhile/...) not supported",
-                self.line(),
-            ))
         } else {
             let l = self.line();
             Ok(vec![Stmt::Line(l), self.stmt()?])
         }
     }
 
+    /// Like `body()` but also accepts PHP's `:` alternative syntax:
+    /// `: stmts end<kw>;` (tests/lang/008, 028, 033).
+    fn body_any(&mut self, end: &str) -> Result<Vec<Stmt>, PhpError> {
+        if self.eat_op(":") {
+            let v = self.body_until(&[end])?;
+            self.pos += 1; // end<kw>
+            self.eat_op(";");
+            return Ok(v);
+        }
+        self.body()
+    }
+
+    /// Statements up to (not consuming) any terminator keyword — the
+    /// body of a `:` alternative-syntax block.
+    fn body_until(&mut self, stops: &[&str]) -> Result<Vec<Stmt>, PhpError> {
+        let mut v = Vec::new();
+        loop {
+            if stops.iter().any(|s| self.ident_is(s)) {
+                break;
+            }
+            if self.peek().is_none() {
+                return Err(PhpError::parse(
+                    "syntax error, unexpected end of file",
+                    self.line(),
+                ));
+            }
+            v.push(Stmt::Line(self.line()));
+            v.push(self.stmt()?);
+        }
+        Ok(v)
+    }
+
     fn stmt(&mut self) -> Result<Stmt, PhpError> {
+        // `#[Attr]` may precede any declaration statement.
+        if self.at_op("#[") {
+            self.pending_class_attrs = self.parse_attrs();
+        }
         match self.peek().cloned() {
             Some(Token::Inline(s)) => {
                 self.pos += 1;
@@ -177,7 +378,7 @@ impl<'a> Parser<'a> {
                     self.expect_op("(")?;
                     let cond = self.expr()?;
                     self.expect_op(")")?;
-                    let body = self.body()?;
+                    let body = self.body_any("endwhile")?;
                     Ok(Stmt::While { cond, body })
                 } else if self.ident_is("do") {
                     self.pos += 1;
@@ -223,17 +424,25 @@ impl<'a> Parser<'a> {
                     })
                 } else if self.ident_is("global") {
                     self.pos += 1;
-                    let name = match self.next() {
-                        Some(Token::Variable(n)) => n,
-                        _ => {
-                            return Err(PhpError::parse(
-                                "syntax error, unexpected token, expecting variable",
-                                self.line(),
-                            ))
+                    let mut names = Vec::new();
+                    loop {
+                        match self.peek().cloned() {
+                            Some(Token::Variable(_)) | Some(Token::Op("$")) => {
+                                names.push(self.expr()?);
+                            }
+                            _ => {
+                                return Err(PhpError::parse(
+                                    "syntax error, unexpected token, expecting variable",
+                                    self.line(),
+                                ))
+                            }
                         }
-                    };
+                        if !self.eat_op(",") {
+                            break;
+                        }
+                    }
                     self.expect_op(";")?;
-                    Ok(Stmt::Global(name))
+                    Ok(Stmt::Global(names))
                 } else if self.ident_is("static")
                     && matches!(self.peek2(), Some(Token::Variable(_)))
                 {
@@ -266,10 +475,64 @@ impl<'a> Parser<'a> {
                     self.declare_stmt()
                 } else if self.ident_is("namespace") {
                     self.pos += 1;
-                    let name = self.name_path().unwrap_or_default();
+                    let name = self
+                        .name_path()
+                        .unwrap_or_default()
+                        .trim_start_matches('\\')
+                        .to_string();
+                    // `namespace` is reserved as a name: bare
+                    // `namespace namespace;` is a fatal, while
+                    // `namespace namespace\x` reads as a stray
+                    // ns-relative name (namespace_name_namespace*).
+                    if name
+                        .split('\\')
+                        .next()
+                        .is_some_and(|seg| seg.eq_ignore_ascii_case("namespace"))
+                    {
+                        if name.contains('\\') {
+                            return Err(PhpError::parse(
+                                format!(
+                                    "syntax error, unexpected namespace-relative name \"{}\", expecting \"{{\"",
+                                    name
+                                ),
+                                self.line(),
+                            ));
+                        }
+                        return Err(PhpError::fatal(
+                            format!("Cannot use '{}' as namespace name", name),
+                            self.line(),
+                        ));
+                    }
+                    self.cur_ns = name.clone();
+                    self.use_map.clear();
+                    self.use_fn_map.clear();
+                    self.use_const_map.clear();
+                    self.declared_types.clear();
+                    let braced = self.at_op("{");
+                    if self.in_braced_ns {
+                        return Err(PhpError::fatal(
+                            if braced {
+                                "Namespace declarations cannot be nested".to_string()
+                            } else {
+                                "Cannot mix bracketed namespace declarations with unbracketed namespace declarations".to_string()
+                            },
+                            self.line(),
+                        ));
+                    }
+                    let style = if braced { 2 } else { 1 };
+                    if self.ns_style != 0 && self.ns_style != style {
+                        return Err(PhpError::fatal(
+                            "Cannot mix bracketed namespace declarations with unbracketed namespace declarations".to_string(),
+                            self.line(),
+                        ));
+                    }
+                    self.ns_style = style;
                     if self.eat_op("{") {
-                        // `namespace Foo { ... }` — body parsed inline.
+                        // `namespace Foo { ... }` — body parsed inline
+                        // while cur_ns is set, then the enclosing scope
+                        // is restored.
                         let mut v = Vec::new();
+                        self.in_braced_ns = true;
                         while !self.eat_op("}") {
                             if self.peek().is_none() {
                                 return Err(PhpError::parse(
@@ -277,8 +540,15 @@ impl<'a> Parser<'a> {
                                     self.line(),
                                 ));
                             }
+                            v.push(Stmt::Line(self.line()));
                             v.push(self.stmt()?);
                         }
+                        self.in_braced_ns = false;
+                        self.cur_ns.clear();
+                        self.use_map.clear();
+                        self.use_fn_map.clear();
+                        self.use_const_map.clear();
+                        self.declared_types.clear();
                         return Ok(Stmt::Block(vec![Stmt::Namespace(name), Stmt::Block(v)]));
                     }
                     self.expect_op(";")?;
@@ -293,6 +563,28 @@ impl<'a> Parser<'a> {
                         && matches!(self.peek2(), Some(Token::Ident(k)) if k.eq_ignore_ascii_case("class")))
                 {
                     self.class_decl()
+                } else if self.ident_is("const")
+                    && !matches!(self.peek2(), Some(Token::Ident(k)) if k.eq_ignore_ascii_case("function"))
+                {
+                    // `const FOO = v, ...;` — declares namespaced global
+                    // constants (namespaces/ns_042).
+                    self.pos += 1;
+                    let mut defs = Vec::new();
+                    loop {
+                        let n = self
+                            .name_path()
+                            .unwrap_or_default()
+                            .trim_start_matches('\\')
+                            .to_string();
+                        let n = self.ns_qualify(&n);
+                        self.expect_op("=")?;
+                        defs.push((n, self.expr()?));
+                        if !self.eat_op(",") {
+                            break;
+                        }
+                    }
+                    self.expect_op(";")?;
+                    Ok(Stmt::ConstDecl(defs))
                 } else if self.ident_is("use")
                     && matches!(self.peek2(), Some(Token::Ident(_)) | Some(Token::Op("\\")))
                 {
@@ -335,6 +627,7 @@ impl<'a> Parser<'a> {
 
     /// `static $a = 1, $b;` — persistent function-local vars.
     fn static_stmt(&mut self) -> Result<Stmt, PhpError> {
+        let line = self.line();
         self.pos += 1; // static
         let mut vars = Vec::new();
         loop {
@@ -361,7 +654,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op(";")?;
-        Ok(Stmt::Static(vars))
+        Ok(Stmt::Static { vars, line })
     }
 
     fn switch_stmt(&mut self) -> Result<Stmt, PhpError> {
@@ -369,11 +662,19 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let cond = self.expr()?;
         self.expect_op(")")?;
-        self.expect_op("{")?;
+        let alt = self.eat_op(":");
+        if !alt {
+            self.expect_op("{")?;
+        }
         let mut cases: Vec<(Option<Expr>, Vec<Stmt>)> = Vec::new();
         let mut cur: Option<Vec<Stmt>> = None;
         loop {
-            if self.eat_op("}") {
+            if alt && self.ident_is("endswitch") {
+                self.pos += 1;
+                self.eat_op(";");
+                break;
+            }
+            if !alt && self.eat_op("}") {
                 break;
             }
             if self.peek().is_none() {
@@ -386,10 +687,15 @@ impl<'a> Parser<'a> {
                 if let Some(b) = cur.take() {
                     cases.last_mut().unwrap().1 = b;
                 }
+                let cl = self.line();
                 self.pos += 1;
                 let e = self.expr()?;
                 if !self.eat_op(":") {
                     self.expect_op(";")?;
+                    self.deprecations.push((
+                        "Case statements followed by a semicolon (;) are deprecated, use a colon (:) instead".into(),
+                        cl,
+                    ));
                 }
                 cases.push((Some(e), Vec::new()));
                 cur = Some(Vec::new());
@@ -397,9 +703,14 @@ impl<'a> Parser<'a> {
                 if let Some(b) = cur.take() {
                     cases.last_mut().unwrap().1 = b;
                 }
+                let cl = self.line();
                 self.pos += 1;
                 if !self.eat_op(":") {
                     self.expect_op(";")?;
+                    self.deprecations.push((
+                        "Case statements followed by a semicolon (;) are deprecated, use a colon (:) instead".into(),
+                        cl,
+                    ));
                 }
                 cases.push((None, Vec::new()));
                 cur = Some(Vec::new());
@@ -434,9 +745,10 @@ impl<'a> Parser<'a> {
             (None, first)
         };
         self.expect_op(")")?;
-        let body = self.body()?;
+        let body = self.body_any("endforeach")?;
         let key = key.map(|t| match t {
             ForeachTarget::Var(n) => ForeachKey::Var(n),
+            ForeachTarget::ByRef(_) => ForeachKey::ByRef,
             _ => ForeachKey::Var(String::new()), // list keys unsupported
         });
         Ok(Stmt::Foreach {
@@ -495,7 +807,28 @@ impl<'a> Parser<'a> {
             return Ok(ForeachTarget::List(items));
         }
         match self.next() {
-            Some(Token::Variable(n)) => Ok(ForeachTarget::Var(n)),
+            Some(Token::Variable(n)) => {
+                // Lvalue targets: `$b[0]`, `$o->p`, ...
+                let mut e = Expr::Var(n);
+                while self.at_op("[") {
+                    self.pos += 1;
+                    let i = if self.at_op("]") {
+                        None
+                    } else {
+                        Some(Box::new(self.expr()?))
+                    };
+                    self.expect_op("]")?;
+                    e = Expr::Index { e: Box::new(e), i };
+                }
+                if let Expr::Var(_) = e {
+                    Ok(ForeachTarget::Var(match e {
+                        Expr::Var(n) => n,
+                        _ => unreachable!(),
+                    }))
+                } else {
+                    Ok(ForeachTarget::Lvalue(Box::new(e)))
+                }
+            }
             t => Err(PhpError::parse(
                 format!(
                     "syntax error, unexpected {}, expecting variable",
@@ -516,7 +849,7 @@ impl<'a> Parser<'a> {
             let mut types = Vec::new();
             loop {
                 if let Some(n) = self.name_path() {
-                    types.push(n);
+                    types.push(self.ns_resolve(&n, NsKind::Class));
                 }
                 if !self.eat_op("|") {
                     break;
@@ -564,26 +897,106 @@ impl<'a> Parser<'a> {
             Ok(decl)
         } else {
             // `declare(...) { }` / `declare(...):` block forms.
-            let body = self.body()?;
+            let body = self.body_any("enddeclare")?;
             Ok(Stmt::Block(vec![decl, Stmt::Block(body)]))
         }
     }
 
-    /// Top-level `use A\B, C as D;` (namespace import). Names collected but
-    /// aliasing is not applied yet (no namespace support).
+    /// Top-level `use` import: `use A\B, C as D, function f\g, const H\I;`
+    /// and group form `use A\{B, C as D}`. Aliases populate the
+    /// per-namespace maps `ns_resolve` consults (Zend/tests/namespaces);
+    /// the raw paths ride along in `Stmt::Use` so the interpreter can
+    /// warn on non-compound imports (`use A;` — ns_033).
     fn use_stmt(&mut self) -> Result<Stmt, PhpError> {
         self.pos += 1; // use
-        if self.ident_is("function") || self.ident_is("const") {
+        let mut kind = NsKind::Class;
+        if self.ident_is("function") {
             self.pos += 1;
+            kind = NsKind::Func;
+        } else if self.ident_is("const") {
+            self.pos += 1;
+            kind = NsKind::Const;
         }
         let mut names = Vec::new();
-        loop {
-            if let Some(n) = self.name_path() {
-                names.push(n);
-            }
-            if self.ident_is("as") {
-                self.pos += 1;
-                self.ident();
+        while let Some(n) = self.name_path() {
+            let path = n.trim_start_matches('\\').to_string();
+            if self.eat_op("{") {
+                // Group use: `use A\{B, C as D}` — prefix applies to
+                // every entry and does not itself warn.
+                loop {
+                    let mut ekind = kind;
+                    if self.ident_is("function") || self.ident_is("const") {
+                        // A typed `use const|function` outer forbids
+                        // re-typing items inside the braces (ns_094).
+                        if kind != NsKind::Class {
+                            let kw = if self.ident_is("function") {
+                                "function"
+                            } else {
+                                "const"
+                            };
+                            return Err(PhpError::parse(
+                                format!(
+                                    "syntax error, unexpected token \"{}\", expecting \"}}\"",
+                                    kw
+                                ),
+                                self.line(),
+                            ));
+                        }
+                        ekind = if self.ident_is("function") {
+                            NsKind::Func
+                        } else {
+                            NsKind::Const
+                        };
+                        self.pos += 1;
+                    }
+                    // `use A\{\B}` — leading separator illegal (ns_096).
+                    if self.at_op("\\") {
+                        let lead = self.name_path().unwrap_or_default();
+                        return Err(PhpError::parse(
+                            format!(
+                                "syntax error, unexpected fully qualified name \"{}\", expecting identifier or namespaced name or \"function\" or \"const\"",
+                                lead
+                            ),
+                            self.line(),
+                        ));
+                    }
+                    if let Some(sub) = self.name_path() {
+                        let sub = sub.trim_start_matches('\\');
+                        let fq = format!("{}\\{}", path, sub);
+                        let alias = if self.ident_is("as") {
+                            self.pos += 1;
+                            self.ident().unwrap_or_default()
+                        } else {
+                            sub.rsplit('\\').next().unwrap_or(sub).to_string()
+                        };
+                        self.insert_use_alias(ekind, &alias, &fq)?;
+                        names.push(fq);
+                    }
+                    if self.eat_op("}") {
+                        break;
+                    }
+                    // `use A\{B\{C}}` — nested group use is a syntax
+                    // error naming `}` (namespaces/ns_088).
+                    if self.at_op("{") {
+                        return Err(PhpError::parse(
+                            "syntax error, unexpected token \"{\", expecting \"}\"",
+                            self.line(),
+                        ));
+                    }
+                    self.expect_op(",")?;
+                }
+            } else {
+                let aliased = self.ident_is("as");
+                let alias = if aliased {
+                    self.pos += 1;
+                    self.ident().unwrap_or_default()
+                } else {
+                    path.rsplit('\\').next().unwrap_or(&path).to_string()
+                };
+                self.insert_use_alias(kind, &alias, &path)?;
+                if !path.contains('\\') && !aliased && self.cur_ns.is_empty() {
+                    names.push(path);
+                }
             }
             if !self.eat_op(",") {
                 break;
@@ -593,14 +1006,69 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Use(names))
     }
 
+    /// A `use` with no `function`/`const` prefix imports the alias for
+    /// every symbol kind (Zend/tests/namespaces/ns_012).
+    fn insert_use_alias(&mut self, kind: NsKind, alias: &str, fq: &str) -> Result<(), PhpError> {
+        // Re-importing the same alias to the same target is a no-op
+        // (namespaces/ns_078).
+        if kind == NsKind::Class && self.use_map.get(&alias.to_lowercase()) == Some(&fq.to_string())
+        {
+            return Ok(());
+        }
+        if kind == NsKind::Class && self.declared_types.contains(&alias.to_lowercase()) {
+            return Err(PhpError::fatal(
+                format!(
+                    "Cannot use {} as {} because the name is already in use",
+                    fq, alias
+                ),
+                self.line(),
+            ));
+        }
+        match kind {
+            NsKind::Class => {
+                self.use_map.insert(alias.to_lowercase(), fq.to_string());
+                self.use_fn_map.insert(alias.to_lowercase(), fq.to_string());
+                self.use_const_map.insert(alias.to_string(), fq.to_string());
+            }
+            NsKind::Func => {
+                self.use_fn_map.insert(alias.to_lowercase(), fq.to_string());
+            }
+            NsKind::Const => {
+                self.use_const_map.insert(alias.to_string(), fq.to_string());
+            }
+        };
+        Ok(())
+    }
+
     /// `Foo\Bar\Baz` — backslash-joined qualified name.
+    /// `\` inside or before a qualified name must have no surrounding
+    /// whitespace in source (namespaced_name_whitespace). A leading `\`
+    /// may have whitespace before it (`= \foo()`), mid-name may not.
+    fn backslash_adj_ok(&self) -> bool {
+        matches!(self.toks.get(self.pos), Some(t) if t.ws_adj & 2 == 0)
+    }
+
+    /// Mid-name `\`: continues the path only when tight on the left and
+    /// directly followed by an identifier (`Foo\Bar`); also serves as a
+    /// group-use terminator before `{` (`use A\B\{C}` — ns_093).
+    fn eat_mid_name_sep(&mut self) -> bool {
+        let ok = match (self.toks.get(self.pos), self.peek2()) {
+            // Group-use terminator `A\B\{C}` / `A\B \ { C }` — spacing
+            // around the final separator is free (ns_093).
+            (Some(_), Some(Token::Op("{"))) => true,
+            (Some(t), Some(Token::Ident(_))) => t.ws_adj == 0,
+            _ => false,
+        };
+        ok && self.eat_op("\\")
+    }
+
     fn name_path(&mut self) -> Option<String> {
         let mut parts = Vec::new();
         // leading \ for FQ names
-        let lead = self.eat_op("\\");
+        let lead = self.at_op("\\") && self.backslash_adj_ok() && self.eat_op("\\");
         while matches!(self.peek(), Some(Token::Ident(_))) {
             parts.push(self.ident().unwrap());
-            if !self.eat_op("\\") {
+            if !self.eat_mid_name_sep() {
                 break;
             }
         }
@@ -614,22 +1082,127 @@ impl<'a> Parser<'a> {
         Some(s)
     }
 
-    /// Skip `#[Attr(...)]` groups (attributes are parsed but discarded).
-    fn skip_attrs(&mut self) {
-        while self.eat_op("#[") {
-            let mut depth = 1i32;
-            while depth > 0 {
-                match self.next() {
-                    Some(Token::Op("[")) | Some(Token::Op("#[")) => depth += 1,
-                    Some(Token::Op("]")) => depth -= 1,
-                    Some(_) => {}
-                    None => return,
-                }
-            }
+    /// Name of a declared symbol inside the current namespace:
+    /// `Foo` in `namespace A` -> `A\Foo` (Zend/tests/namespaces).
+    fn ns_qualify(&self, name: &str) -> String {
+        let name = name.trim_start_matches('\\');
+        if self.cur_ns.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}\\{}", self.cur_ns, name)
         }
     }
 
+    /// Compile-time name resolution matching Zend's rules:
+    /// `\A\B` is used verbatim; `namespace\A` expands to `A\<cur>`;
+    /// qualified `a\b` checks `a` against the alias table then prepends
+    /// the namespace; an unqualified `a` checks aliases then — for
+    /// classes only — prepends the namespace (function/const names fall
+    /// back to global at runtime instead).
+    fn ns_resolve(&self, raw: &str, kind: NsKind) -> String {
+        if raw.starts_with('\\') {
+            return raw.trim_start_matches('\\').to_string();
+        }
+        let lower = raw.to_lowercase();
+        if matches!(lower.as_str(), "self" | "static" | "parent") {
+            return raw.to_string();
+        }
+        let segs: Vec<&str> = raw.split('\\').collect();
+        let mut from_ns = false;
+        let segs: Vec<&str> = if segs[0].eq_ignore_ascii_case("namespace") {
+            from_ns = true;
+            segs[1..].to_vec()
+        } else {
+            segs
+        };
+        if segs.is_empty() {
+            return self.cur_ns.clone();
+        }
+
+        let map = match kind {
+            NsKind::Class => &self.use_map,
+            NsKind::Func => &self.use_fn_map,
+            NsKind::Const => &self.use_const_map,
+        };
+        let key = if kind == NsKind::Const {
+            segs[0].to_string()
+        } else {
+            segs[0].to_lowercase()
+        };
+        if !from_ns {
+            if let Some(target) = map.get(&key) {
+                if segs.len() == 1 {
+                    return target.clone();
+                }
+                return format!("{}\\{}", target, segs[1..].join("\\"));
+            }
+        }
+        if segs.len() == 1 && kind != NsKind::Class && !from_ns {
+            // Unqualified function/const: resolved at runtime with a
+            // global fallback, so keep the bare name.
+            return segs[0].to_string();
+        }
+        if self.cur_ns.is_empty() {
+            segs.join("\\")
+        } else {
+            format!("{}\\{}", self.cur_ns, segs.join("\\"))
+        }
+    }
+
+    /// Skip `#[Attr(...)]` groups (attributes are parsed but discarded).
+    fn skip_attrs(&mut self) {
+        let _ = self.parse_attrs();
+    }
+
+    /// Parse `#[Attr(...)]` groups and return the top-level attribute
+    /// names (possibly `\Qualified`; args are discarded).
+    fn parse_attrs(&mut self) -> Vec<String> {
+        let mut names = Vec::new();
+        while self.eat_op("#[") {
+            let mut depth = 1i32;
+            let mut cur = String::new();
+            let mut in_name = true;
+            while depth > 0 {
+                match self.next() {
+                    Some(Token::Op("[")) | Some(Token::Op("#[")) => {
+                        depth += 1;
+                        in_name = false;
+                    }
+                    Some(Token::Op("]")) => {
+                        depth -= 1;
+                        if depth == 0 && !cur.is_empty() {
+                            names.push(cur.clone());
+                        }
+                    }
+                    Some(Token::Op(",")) if depth == 1 => {
+                        if !cur.is_empty() {
+                            names.push(cur.clone());
+                        }
+                        cur = String::new();
+                        in_name = true;
+                    }
+                    Some(Token::Op("(")) if depth == 1 => {
+                        in_name = false;
+                    }
+                    Some(Token::Ident(n)) if in_name => cur.push_str(&n),
+                    Some(Token::Op("\\")) if in_name => cur.push('\\'),
+                    Some(_) => {}
+                    None => return names,
+                }
+            }
+        }
+        names
+    }
+
     fn class_decl(&mut self) -> Result<Stmt, PhpError> {
+        // `#[Attr]` groups may precede the class modifiers (or were
+        // already consumed at the statement level).
+        let attrs = if self.pending_class_attrs.is_empty() {
+            self.parse_attrs()
+        } else {
+            std::mem::take(&mut self.pending_class_attrs)
+        };
+        let mut is_readonly = false;
         let mut is_abstract = false;
         let mut is_final = false;
         loop {
@@ -640,6 +1213,7 @@ impl<'a> Parser<'a> {
                 is_final = true;
                 self.pos += 1;
             } else if self.ident_is("readonly") {
+                is_readonly = true;
                 self.pos += 1;
             } else {
                 break;
@@ -662,18 +1236,47 @@ impl<'a> Parser<'a> {
         let name = self
             .ident()
             .unwrap_or_else(|| "class@anonymous".to_string());
+        let name = self.ns_qualify(&name);
+        // `use A\B as Foo; class Foo {}` — the alias already occupies
+        // the short name (namespaces/ns_029).
+        if self
+            .use_map
+            .contains_key(&name.rsplit('\\').next().unwrap_or(&name).to_lowercase())
+        {
+            return Err(PhpError::fatal(
+                format!(
+                    "Cannot redeclare class {} (previously declared as local import)",
+                    name
+                ),
+                self.line(),
+            ));
+        }
+        self.declared_types
+            .insert(name.rsplit('\\').next().unwrap_or(&name).to_lowercase());
+        self.cur_class = name.clone();
         // enum backing type `enum X: int`
         if self.eat_op(":") {
             self.skip_type()?;
         }
         let mut parent = None;
-        if self.eat_ident("extends") {
-            parent = self.name_path();
-        }
         let mut implements = Vec::new();
+        if self.eat_ident("extends") {
+            if kind == ClassKind::Interface {
+                // `interface Y extends X, Z` — multiple interface parents
+                // recorded in `implements` (what instanceof/iface walks use).
+                while let Some(n) = self.name_path() {
+                    implements.push(self.ns_resolve(&n, NsKind::Class));
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+            } else {
+                parent = self.name_path().map(|n| self.ns_resolve(&n, NsKind::Class));
+            }
+        }
         if self.eat_ident("implements") {
             while let Some(n) = self.name_path() {
-                implements.push(n);
+                implements.push(self.ns_resolve(&n, NsKind::Class));
                 if !self.eat_op(",") {
                     break;
                 }
@@ -697,16 +1300,25 @@ impl<'a> Parser<'a> {
             let mut m_abstract = false;
             let mut m_final = false;
             let mut m_readonly = false;
+            let mut m_set_vis = None;
             loop {
                 if self.ident_is("public") {
                     vis = Visibility::Public;
                     self.pos += 1;
                 } else if self.ident_is("protected") {
-                    vis = Visibility::Protected;
-                    self.pos += 1;
+                    if self.at_asym_set() {
+                        m_set_vis = Some(Visibility::Protected);
+                    } else {
+                        vis = Visibility::Protected;
+                        self.pos += 1;
+                    }
                 } else if self.ident_is("private") {
-                    vis = Visibility::Private;
-                    self.pos += 1;
+                    if self.at_asym_set() {
+                        m_set_vis = Some(Visibility::Private);
+                    } else {
+                        vis = Visibility::Private;
+                        self.pos += 1;
+                    }
                 } else if self.ident_is("static") {
                     is_static = true;
                     self.pos += 1;
@@ -747,7 +1359,7 @@ impl<'a> Parser<'a> {
             if self.ident_is("use") {
                 self.pos += 1;
                 while let Some(n) = self.name_path() {
-                    traits.push(n);
+                    traits.push(self.ns_resolve(&n, NsKind::Class));
                     if !self.eat_op(",") {
                         break;
                     }
@@ -782,11 +1394,14 @@ impl<'a> Parser<'a> {
                 continue;
             }
             // Typed or untyped property: [type] $name [= default], ...;
-            if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
+            let pline = self.line();
+            let pty = if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
                 && !matches!(self.peek2(), Some(Token::Op("(")))
             {
-                self.skip_type()?;
-            }
+                self.take_type()
+            } else {
+                None
+            };
             loop {
                 let pname = match self.next() {
                     Some(Token::Variable(n)) => n,
@@ -811,19 +1426,38 @@ impl<'a> Parser<'a> {
                     is_static,
                     visibility: vis,
                     readonly: m_readonly,
+                    ty: pty.clone(),
+                    is_abstract: m_abstract,
+                    is_final: m_final,
+                    set_vis: m_set_vis,
+                    decl_in: None,
+                    hooks: None,
+                    line: pline,
                 });
                 if !self.eat_op(",") {
                     break;
                 }
             }
-            self.expect_op(";")?;
+            // PHP 8.4 property hooks attach to the LAST declarator
+            // (`public $p { get => ..; }`) — no trailing `;` after `}`.
+            if self.at_op("{") {
+                let hn = props.last().map(|p| p.name.clone()).unwrap_or_default();
+                let hs = self.prop_hooks(&hn)?;
+                if let Some(p) = props.last_mut() {
+                    p.hooks = hs;
+                }
+            } else {
+                self.expect_op(";")?;
+            }
         }
         self.expect_op("}")?;
         Ok(Stmt::Class(Rc::new(ClassDecl {
             name,
+            attrs,
             kind,
             is_abstract,
             is_final,
+            readonly: is_readonly,
             parent,
             implements,
             traits,
@@ -840,9 +1474,11 @@ impl<'a> Parser<'a> {
         is_final: bool,
         vis: Visibility,
     ) -> Result<MethodDecl, PhpError> {
+        let line = self.line();
         self.pos += 1; // function
         let by_ref = self.eat_op("&");
         let name = self.ident().unwrap_or_default();
+        let prev_hook = self.hook_ctx.take();
         let params = self.params()?;
         if self.eat_op(":") {
             self.skip_type()?;
@@ -852,12 +1488,16 @@ impl<'a> Parser<'a> {
         } else {
             self.body()?
         };
+        self.hook_ctx = prev_hook;
         Ok(MethodDecl {
             decl: FunctionDecl {
                 name,
                 params,
                 body,
                 by_ref,
+                line,
+                file: String::new(),
+                ns: self.cur_ns.clone(),
             },
             is_static,
             is_abstract,
@@ -866,39 +1506,214 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `{ get => e; set { .. }; set(T $v) { .. }; get; }` — PHP 8.4
+    /// property hooks (Zend/tests/property_hooks). Called with the `{`
+    /// already detected; consumes through the closing `}`.
+    fn prop_hooks(&mut self, pname: &str) -> Result<Option<Vec<PropHook>>, PhpError> {
+        self.expect_op("{")?;
+        if self.at_op("}") {
+            return Err(PhpError::fatal(
+                "Property hook list must not be empty",
+                self.line(),
+            ));
+        }
+        let mut hs: Vec<PropHook> = Vec::new();
+        while !self.at_op("}") {
+            if self.peek().is_none() {
+                return Err(PhpError::parse(
+                    "syntax error, unexpected end of file",
+                    self.line(),
+                ));
+            }
+            self.skip_attrs();
+            let mut hvis = None;
+            let mut hfinal = false;
+            loop {
+                if self.ident_is("public") {
+                    hvis = Some(Visibility::Public);
+                    self.pos += 1;
+                } else if self.ident_is("protected") {
+                    hvis = Some(Visibility::Protected);
+                    self.pos += 1;
+                } else if self.ident_is("private") {
+                    hvis = Some(Visibility::Private);
+                    self.pos += 1;
+                } else if self.ident_is("final") {
+                    hfinal = true;
+                    self.pos += 1;
+                } else if self.ident_is("static") {
+                    return Err(PhpError::fatal(
+                        "Cannot use the static modifier on a property hook",
+                        self.line(),
+                    ));
+                } else {
+                    break;
+                }
+            }
+            let by_ref = self.eat_op("&");
+            // Any identifier is consumed here — an unknown one is a
+            // compile-fatal naming the class+prop (unknown_hook).
+            let hname = match self.next() {
+                Some(Token::Ident(n)) => n,
+                t => {
+                    return Err(PhpError::parse(
+                        format!(
+                            "syntax error, unexpected {}, expecting \"get\" or \"set\"",
+                            desc_t(t.as_ref())
+                        ),
+                        self.line(),
+                    ))
+                }
+            };
+            if hname != "get" && hname != "set" {
+                return Err(PhpError::fatal(
+                    format!(
+                        "Unknown hook \"{}\" for property {}::${}, expected \"get\" or \"set\"",
+                        hname, self.cur_class, pname
+                    ),
+                    self.line(),
+                ));
+            }
+            let is_get = hname == "get";
+            if hs.iter().any(|h| h.is_get == is_get) {
+                return Err(PhpError::fatal(
+                    format!("Cannot redeclare property hook \"{}\"", hname),
+                    self.line(),
+                ));
+            }
+            let has_plist = self.at_op("(");
+            let params = if has_plist {
+                self.params()?
+            } else {
+                Vec::new()
+            };
+            let line = self.line();
+            let prev_hook = self.hook_ctx.replace((pname.to_string(), is_get));
+            let body = if self.eat_op("=>") {
+                let e = self.expr()?;
+                self.expect_op(";")?;
+                if is_get {
+                    Some(vec![Stmt::Line(line), Stmt::Return(Some(e))])
+                } else {
+                    // `set => e` ≡ `set { $this->prop = e; }` (hooks short form).
+                    Some(vec![
+                        Stmt::Line(line),
+                        Stmt::Expr(Expr::Assign {
+                            target: Box::new(Expr::Prop {
+                                obj: Box::new(Expr::Var("this".into())),
+                                name: PropName::Name(pname.to_string()),
+                                nullsafe: false,
+                            }),
+                            op: "=",
+                            value: Box::new(e),
+                        }),
+                    ])
+                }
+            } else if self.at_op("{") {
+                Some(self.body()?)
+            } else if self.eat_op(";") {
+                None
+            } else {
+                return Err(PhpError::parse(
+                    format!(
+                        "syntax error, unexpected {}, expecting \"=>\" or \"{{\" or \";\"",
+                        desc_t(self.peek())
+                    ),
+                    self.line(),
+                ));
+            };
+            self.hook_ctx = prev_hook;
+            hs.push(PropHook {
+                name: hname,
+                is_get,
+                params,
+                has_plist,
+                body,
+                by_ref,
+                is_final: hfinal,
+                visibility: hvis,
+            });
+        }
+        self.expect_op("}")?;
+        // `}` ends the prop; a `;` is tolerated but not required.
+        self.eat_op(";");
+        Ok(Some(hs))
+    }
+
+    /// `private(set)` / `protected(set)` asymmetric write visibility —
+    /// at `ident (`, consume `( set )` when that's what follows.
+    fn at_asym_set(&mut self) -> bool {
+        if matches!(self.peek2(), Some(Token::Op("(")))
+            && matches!(self.toks.get(self.pos + 2).map(|l| &l.token), Some(Token::Ident(n)) if n == "set")
+            && matches!(
+                self.toks.get(self.pos + 3).map(|l| &l.token),
+                Some(Token::Op(")"))
+            )
+        {
+            self.pos += 4; // `private` `(` `set` `)`
+            true
+        } else {
+            false
+        }
+    }
+
     fn params(&mut self) -> Result<Vec<Param>, PhpError> {
         self.expect_op("(")?;
         let mut params = Vec::new();
         while !self.at_op(")") {
             self.skip_attrs();
-            // skip type declaration before the variable
-            if matches!(
-                self.peek(),
-                Some(Token::Ident(_)) | Some(Token::Op("?")) | Some(Token::Op("\\"))
-            ) && !matches!(self.peek2(), Some(Token::Op(",")) | Some(Token::Op(")")))
-            {
-                self.skip_type()?;
-            }
-            let by_ref = self.eat_op("&");
-            let variadic = self.eat_op("...");
-            // promoted constructor params may carry visibility
-            for _ in 0..3 {
-                if self.ident_is("public")
-                    || self.ident_is("private")
-                    || self.ident_is("protected")
-                    || self.ident_is("readonly")
-                {
+            // promoted ctor params: visibility/readonly precede the type
+            // (`public int $x`, `public $errno` — error_2_exception_001).
+            let mut promoted = false;
+            let mut pvis = None;
+            let mut preadonly = false;
+            let mut pfinal = false;
+            let mut psetv = None;
+            for _ in 0..4 {
+                if self.ident_is("public") {
+                    pvis = Some(Visibility::Public);
                     self.pos += 1;
+                    promoted = true;
+                } else if self.ident_is("private") {
+                    if self.at_asym_set() {
+                        psetv = Some(Visibility::Private);
+                    } else {
+                        pvis = Some(Visibility::Private);
+                        self.pos += 1;
+                    }
+                    promoted = true;
+                } else if self.ident_is("protected") {
+                    if self.at_asym_set() {
+                        psetv = Some(Visibility::Protected);
+                    } else {
+                        pvis = Some(Visibility::Protected);
+                        self.pos += 1;
+                    }
+                    promoted = true;
+                } else if self.ident_is("readonly") {
+                    preadonly = true;
+                    self.pos += 1;
+                    promoted = true;
+                } else if self.ident_is("final") {
+                    pfinal = true;
+                    self.pos += 1;
+                    promoted = true;
                 } else {
                     break;
                 }
             }
-            if matches!(self.peek(), Some(Token::Ident(_)))
-                && !matches!(self.peek2(), Some(Token::Variable(_)))
+            // skip type declaration before the variable
+            let ty = if matches!(
+                self.peek(),
+                Some(Token::Ident(_)) | Some(Token::Op("?")) | Some(Token::Op("\\"))
+            ) && !matches!(self.peek2(), Some(Token::Op(",")) | Some(Token::Op(")")))
             {
-                // trailing type after visibility (e.g. `private int $x`)
-                self.skip_type()?;
-            }
+                self.take_type()
+            } else {
+                None
+            };
+            let by_ref = self.eat_op("&");
+            let variadic = self.eat_op("...");
             let pname = match self.next() {
                 Some(Token::Variable(n)) => n,
                 t => {
@@ -916,11 +1731,27 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            // Promoted hooked props: `public $p { get {} }` (8.4). Hooks
+            // imply promotion even without a visibility modifier
+            // (gh15438_1: `__construct($p { set => ... })`).
+            let phooks = if self.at_op("{") {
+                promoted = true;
+                self.prop_hooks(&pname)?
+            } else {
+                None
+            };
             params.push(Param {
                 name: pname,
                 default,
                 by_ref,
                 variadic,
+                ty,
+                promoted,
+                vis: pvis,
+                readonly: preadonly,
+                is_final: pfinal,
+                set_vis: psetv,
+                hooks: phooks,
             });
             if !self.eat_op(",") {
                 break;
@@ -935,49 +1766,55 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let cond = self.expr()?;
         self.expect_op(")")?;
-        let then = self.body()?;
+        let alt = self.at_op(":");
+        let arm_body = |p: &mut Self, stops: &[&str]| -> Result<Vec<Stmt>, PhpError> {
+            if alt {
+                p.expect_op(":")?;
+                p.body_until(stops)
+            } else {
+                p.body()
+            }
+        };
+        let then = if alt {
+            self.pos += 1;
+            self.body_until(&["elseif", "else", "endif"])?
+        } else {
+            self.body()?
+        };
+        let mut arms: Vec<(Expr, Vec<Stmt>)> = vec![(cond, then)];
         let mut else_ = Vec::new();
-        {
+        loop {
             if self.ident_is("elseif") {
                 self.pos += 1;
                 self.expect_op("(")?;
                 let c = self.expr()?;
                 self.expect_op(")")?;
-                let b = self.body()?;
-                else_ = vec![Stmt::If {
-                    cond: c,
-                    then: b,
-                    else_: Vec::new(),
-                }];
-                // chain deeper elseif/else inside this nested If
-                let mut tail = match else_.last_mut() {
-                    Some(Stmt::If { else_, .. }) => else_,
-                    _ => unreachable!(),
-                };
-                while self.ident_is("elseif") {
-                    self.pos += 1;
-                    self.expect_op("(")?;
-                    let c = self.expr()?;
-                    self.expect_op(")")?;
-                    let b = self.body()?;
-                    *tail = vec![Stmt::If {
-                        cond: c,
-                        then: b,
-                        else_: Vec::new(),
-                    }];
-                    tail = match tail.last_mut() {
-                        Some(Stmt::If { else_, .. }) => else_,
-                        _ => unreachable!(),
-                    };
-                }
-                if self.ident_is("else") {
-                    self.pos += 1;
-                    *tail = self.body()?;
-                }
-            } else if self.ident_is("else") {
-                self.pos += 1;
-                else_ = self.body()?;
+                let b = arm_body(self, &["elseif", "else", "endif"])?;
+                arms.push((c, b));
+                continue;
             }
+            if self.ident_is("else") {
+                self.pos += 1;
+                else_ = arm_body(self, &["endif"])?;
+            }
+            break;
+        }
+        if alt {
+            if !self.eat_ident("endif") {
+                return Err(PhpError::parse(
+                    "syntax error, unexpected end of file, expecting \"endif\"",
+                    self.line(),
+                ));
+            }
+            self.eat_op(";");
+        }
+        let (cond, then) = arms.remove(0);
+        for (c, b) in arms.into_iter().rev() {
+            else_ = vec![Stmt::If {
+                cond: c,
+                then: b,
+                else_,
+            }];
         }
         Ok(Stmt::If { cond, then, else_ })
     }
@@ -1001,7 +1838,7 @@ impl<'a> Parser<'a> {
         }
         self.expect_op(")")?;
         // foreach is a different keyword; plain for body here.
-        let body = self.body()?;
+        let body = self.body_any("endfor")?;
         Ok(Stmt::For {
             init,
             cond,
@@ -1011,6 +1848,7 @@ impl<'a> Parser<'a> {
     }
 
     fn function_decl(&mut self) -> Result<Stmt, PhpError> {
+        let line = self.line();
         self.pos += 1; // function
         let by_ref = self.eat_op("&");
         let name = self.ident().ok_or_else(|| {
@@ -1019,23 +1857,30 @@ impl<'a> Parser<'a> {
                 self.line(),
             )
         })?;
+        let prev_hook = self.hook_ctx.take();
         let params = self.params()?;
         // Return type declarations (: int) — parse & ignore for now.
         if self.eat_op(":") {
             self.skip_type()?;
         }
         let body = self.body()?;
+        self.hook_ctx = prev_hook;
+        let name = self.ns_qualify(&name);
         Ok(Stmt::Function(FunctionDecl {
             name,
             params,
             body,
             by_ref,
+            line,
+            file: String::new(),
+            ns: self.cur_ns.clone(),
         }))
     }
 
     /// `function (&$a) use ($x, &$y) { }`, `static function () {}`,
     /// `fn($x) => $x + 1`.
     fn closure_expr(&mut self) -> Result<Expr, PhpError> {
+        let line = self.line();
         let mut arrow = false;
         let mut uses = Vec::new();
         if self.ident_is("static") {
@@ -1047,6 +1892,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("function")?;
         }
         let by_ref = self.eat_op("&");
+        let prev_hook = self.hook_ctx.take();
         let params = self.params()?;
         if !arrow && self.ident_is("use") {
             self.pos += 1;
@@ -1081,12 +1927,16 @@ impl<'a> Parser<'a> {
             }
             self.body()?
         };
+        self.hook_ctx = prev_hook;
         Ok(Expr::Closure(ClosureExpr {
             decl: FunctionDecl {
                 name: String::new(),
                 params,
                 body,
                 by_ref,
+                line,
+                file: String::new(),
+                ns: self.cur_ns.clone(),
             },
             uses,
             arrow,
@@ -1108,6 +1958,7 @@ impl<'a> Parser<'a> {
                 Vec::new()
             };
             // delegate: parse `extends`/`implements`/body by simulating
+            self.cur_class = "class@anonymous".into();
             self.skip_attrs();
             let mut parent = None;
             if self.eat_ident("extends") {
@@ -1141,16 +1992,25 @@ impl<'a> Parser<'a> {
                 let mut m_abstract = false;
                 let mut m_final = false;
                 let mut m_readonly = false;
+                let mut m_set_vis = None;
                 loop {
                     if self.ident_is("public") {
                         vis = Visibility::Public;
                         self.pos += 1;
                     } else if self.ident_is("protected") {
-                        vis = Visibility::Protected;
-                        self.pos += 1;
+                        if self.at_asym_set() {
+                            m_set_vis = Some(Visibility::Protected);
+                        } else {
+                            vis = Visibility::Protected;
+                            self.pos += 1;
+                        }
                     } else if self.ident_is("private") {
-                        vis = Visibility::Private;
-                        self.pos += 1;
+                        if self.at_asym_set() {
+                            m_set_vis = Some(Visibility::Private);
+                        } else {
+                            vis = Visibility::Private;
+                            self.pos += 1;
+                        }
                     } else if self.ident_is("static") {
                         is_static = true;
                         self.pos += 1;
@@ -1223,11 +2083,14 @@ impl<'a> Parser<'a> {
                     self.expect_op(";")?;
                     continue;
                 }
-                if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
+                let pline = self.line();
+                let pty = if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Op("?")))
                     && !matches!(self.peek2(), Some(Token::Op("(")))
                 {
-                    self.skip_type()?;
-                }
+                    self.take_type()
+                } else {
+                    None
+                };
                 loop {
                     let pname = match self.next() {
                         Some(Token::Variable(n)) => n,
@@ -1252,20 +2115,37 @@ impl<'a> Parser<'a> {
                         is_static,
                         visibility: vis,
                         readonly: m_readonly,
+                        ty: pty.clone(),
+                        is_abstract: m_abstract,
+                        is_final: m_final,
+                        set_vis: m_set_vis,
+                        decl_in: None,
+                        hooks: None,
+                        line: pline,
                     });
                     if !self.eat_op(",") {
                         break;
                     }
                 }
-                self.expect_op(";")?;
+                if self.at_op("{") {
+                    let hn = props.last().map(|p| p.name.clone()).unwrap_or_default();
+                    let hs = self.prop_hooks(&hn)?;
+                    if let Some(p) = props.last_mut() {
+                        p.hooks = hs;
+                    }
+                } else {
+                    self.expect_op(";")?;
+                }
             }
             self.expect_op("}")?;
             return Ok((
                 Expr::AnonClass(Rc::new(ClassDecl {
+                    attrs: vec![],
                     name: format!("class@anonymous${}", self.line()),
                     kind: ClassKind::Class,
                     is_abstract: false,
                     is_final: false,
+                    readonly: false,
                     parent,
                     implements,
                     traits,
@@ -1283,11 +2163,44 @@ impl<'a> Parser<'a> {
         match self.peek().cloned() {
             Some(Token::Ident(_)) | Some(Token::Op("\\")) => {
                 let n = self.name_path().unwrap_or_default();
-                Ok((Expr::Const(n), Vec::new()))
+                Ok((Expr::Const(self.ns_resolve(&n, NsKind::Class)), Vec::new()))
             }
             Some(Token::Variable(n)) => {
                 self.pos += 1;
-                Ok((Expr::Var(n), Vec::new()))
+                // `new $a[i][j]` — dims belong to the class-name expr
+                // (engine_assignExecutionOrder_007), not the new object.
+                let mut e = Expr::Var(n);
+                loop {
+                    if self.eat_op("[") {
+                        let i = if self.at_op("]") {
+                            None
+                        } else {
+                            Some(Box::new(self.expr()?))
+                        };
+                        self.expect_op("]")?;
+                        e = Expr::Index { e: Box::new(e), i };
+                    } else if self.eat_op("->") {
+                        // `new $this->prop` (bug21669); `->m()` stays ctor args.
+                        match self.next() {
+                            Some(Token::Ident(pn)) => {
+                                e = Expr::Prop {
+                                    obj: Box::new(e),
+                                    name: PropName::Name(pn),
+                                    nullsafe: false,
+                                };
+                            }
+                            _ => {
+                                return Err(PhpError::parse(
+                                    "syntax error, unexpected token, expecting property name",
+                                    self.line(),
+                                ))
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                Ok((e, Vec::new()))
             }
             Some(Token::Op("{")) => {
                 self.pos += 1;
@@ -1364,14 +2277,40 @@ impl<'a> Parser<'a> {
 
     /// Skip a type declaration (names, |, &, ?, parenthesized DNF).
     fn skip_type(&mut self) -> Result<(), PhpError> {
+        let _ = self.take_type();
+        Ok(())
+    }
+
+    /// Consume a type expression, returning its member names in source
+    /// order. `?T`/`T|null` append a "null" member; parentheses flatten.
+    fn take_type(&mut self) -> Option<Vec<String>> {
+        let mut members: Vec<String> = Vec::new();
+        let mut nullable = false;
         let mut depth = 0i32;
+        let mut name = String::new();
         loop {
             match self.peek() {
-                Some(Token::Ident(_)) | Some(Token::Op("\\")) => {
+                Some(Token::Ident(n)) => {
+                    if !name.is_empty() && !name.ends_with('\\') {
+                        name.push('\\');
+                    }
+                    name.push_str(n);
                     self.pos += 1;
                 }
-                Some(Token::Op("?")) if depth == 0 => self.pos += 1,
-                Some(Token::Op("|")) | Some(Token::Op("&")) => self.pos += 1,
+                Some(Token::Op("\\")) => {
+                    name.push('\\');
+                    self.pos += 1;
+                }
+                Some(Token::Op("?")) if depth == 0 => {
+                    nullable = true;
+                    self.pos += 1;
+                }
+                Some(Token::Op("|")) | Some(Token::Op("&")) => {
+                    if !name.is_empty() {
+                        members.push(std::mem::take(&mut name));
+                    }
+                    self.pos += 1;
+                }
                 Some(Token::Op("(")) => {
                     depth += 1;
                     self.pos += 1;
@@ -1380,8 +2319,38 @@ impl<'a> Parser<'a> {
                     depth -= 1;
                     self.pos += 1;
                 }
-                _ => return Ok(()),
+                _ => break,
             }
+        }
+        if !name.is_empty() {
+            members.push(name);
+        }
+        if nullable && !members.iter().any(|m| m.eq_ignore_ascii_case("null")) {
+            members.push("null".into());
+        }
+        if members.is_empty() {
+            None
+        } else {
+            // Class-type members resolve against the current namespace /
+            // use-aliases at compile time; builtin scalar types do not
+            // (namespaces/ns_055).
+            const BUILTIN_TYS: &[&str] = &[
+                "int", "float", "string", "bool", "array", "callable", "iterable", "object",
+                "mixed", "void", "never", "null", "false", "true", "numeric", "resource", "self",
+                "static", "parent",
+            ];
+            Some(
+                members
+                    .into_iter()
+                    .map(|m| {
+                        if m.is_empty() || BUILTIN_TYS.contains(&m.to_lowercase().as_str()) {
+                            m
+                        } else {
+                            self.ns_resolve(&m, NsKind::Class)
+                        }
+                    })
+                    .collect(),
+            )
         }
     }
 
@@ -1729,10 +2698,34 @@ impl<'a> Parser<'a> {
         }
         if self.eat_op("++") {
             let e = self.unary()?;
+            if matches!(
+                e,
+                Expr::Call { .. }
+                    | Expr::MethodCall { .. }
+                    | Expr::StaticCall { .. }
+                    | Expr::StaticCallDyn { .. }
+            ) {
+                return Err(PhpError::fatal(
+                    "Can't use method return value in write context",
+                    self.line(),
+                ));
+            }
             return Ok(Expr::PreInc(Box::new(e)));
         }
         if self.eat_op("--") {
             let e = self.unary()?;
+            if matches!(
+                e,
+                Expr::Call { .. }
+                    | Expr::MethodCall { .. }
+                    | Expr::StaticCall { .. }
+                    | Expr::StaticCallDyn { .. }
+            ) {
+                return Err(PhpError::fatal(
+                    "Can't use method return value in write context",
+                    self.line(),
+                ));
+            }
             return Ok(Expr::PreDec(Box::new(e)));
         }
         if self.eat_op("@") {
@@ -1781,7 +2774,10 @@ impl<'a> Parser<'a> {
         // `instanceof` binds between unary and relational ops.
         while self.ident_is("instanceof") {
             self.pos += 1;
-            let c = self.unary()?;
+            let mut c = self.unary()?;
+            if let Expr::Const(n) = &c {
+                c = Expr::Const(self.ns_resolve(n, NsKind::Class));
+            }
             e = Expr::Instanceof {
                 obj: Box::new(e),
                 class: Box::new(c),
@@ -1794,8 +2790,32 @@ impl<'a> Parser<'a> {
         let mut e = self.primary()?;
         loop {
             if self.eat_op("++") {
+                if matches!(
+                    e,
+                    Expr::Call { .. }
+                        | Expr::MethodCall { .. }
+                        | Expr::StaticCall { .. }
+                        | Expr::StaticCallDyn { .. }
+                ) {
+                    return Err(PhpError::fatal(
+                        "Can't use method return value in write context",
+                        self.line(),
+                    ));
+                }
                 e = Expr::PostInc(Box::new(e));
             } else if self.eat_op("--") {
+                if matches!(
+                    e,
+                    Expr::Call { .. }
+                        | Expr::MethodCall { .. }
+                        | Expr::StaticCall { .. }
+                        | Expr::StaticCallDyn { .. }
+                ) {
+                    return Err(PhpError::fatal(
+                        "Can't use method return value in write context",
+                        self.line(),
+                    ));
+                }
                 e = Expr::PostDec(Box::new(e));
             } else if self.eat_op("[") {
                 let i = if self.at_op("]") {
@@ -1845,6 +2865,76 @@ impl<'a> Parser<'a> {
                             };
                         } else if self.at_op("(") {
                             self.pos += 1;
+                            // `parent::$p::get()/set()` — PHP checks the
+                            // hook context at compile time.
+                            if let Expr::StaticProp {
+                                class: pc,
+                                name: pname_expr,
+                            } = &e
+                            {
+                                // Static prop name: literal name or a
+                                // compile-time scalar `${0}`/`{'p'}` —
+                                // Zend applies the same hook-context
+                                // checks to both (gh17234).
+                                let literal_pn = match pname_expr {
+                                    PropName::Name(pn) => Some(pn.clone()),
+                                    PropName::Expr(inner) => match inner.as_ref() {
+                                        Expr::Int(i) => Some(i.to_string()),
+                                        Expr::Float(f) => Some(f.to_string()),
+                                        Expr::Str(s) => Some(s.clone()),
+                                        _ => None,
+                                    },
+                                    PropName::Var(_) => None,
+                                };
+                                if let Expr::Const(cn) = pc.as_ref() {
+                                    if let Some(pn) = &literal_pn {
+                                        if cn.eq_ignore_ascii_case("parent")
+                                            && (n.eq_ignore_ascii_case("get")
+                                                || n.eq_ignore_ascii_case("set"))
+                                        {
+                                            if self.cur_class.is_empty() {
+                                                return Err(PhpError::fatal(
+                                                "Cannot use \"parent\" when no class scope is active",
+                                                self.line(),
+                                            ));
+                                            }
+                                            match &self.hook_ctx {
+                                            None => {
+                                                return Err(PhpError::fatal(
+                                                    format!(
+                                                        "Must not use parent::${}::{}() outside a property hook",
+                                                        pn, n
+                                                    ),
+                                                    self.line(),
+                                                ))
+                                            }
+                                            Some((hp, hg)) => {
+                                                if hp != pn {
+                                                    return Err(PhpError::fatal(
+                                                        format!(
+                                                            "Must not use parent::${}::{}() in a different property (${})",
+                                                            pn, n, hp
+                                                        ),
+                                                        self.line(),
+                                                    ));
+                                                }
+                                                if *hg != n.eq_ignore_ascii_case("get") {
+                                                    return Err(PhpError::fatal(
+                                                        format!(
+                                                            "Must not use parent::${}::{}() in a different property hook ({})",
+                                                            pn,
+                                                            n,
+                                                            if *hg { "get" } else { "set" }
+                                                        ),
+                                                        self.line(),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        }
+                                    }
+                                }
+                            }
                             let args = self.args()?;
                             e = Expr::StaticCall {
                                 class: Box::new(e),
@@ -1859,11 +2949,27 @@ impl<'a> Parser<'a> {
                         }
                     }
                     Some(Token::Variable(n)) => {
-                        e = Expr::StaticProp {
-                            class: Box::new(e),
-                            name: n,
-                        };
+                        if self.at_op("(") {
+                            // `C::$method()` — dynamic static call; the
+                            // name comes from the variable's value
+                            // (tests/lang/044).
+                            self.pos += 1;
+                            let args = self.args()?;
+                            e = Expr::StaticCallDyn {
+                                class: Box::new(e),
+                                name: Box::new(Expr::Var(n)),
+                                args,
+                            };
+                        } else {
+                            // `C::$name` — a literal static prop name
+                            // (unlike `$o->$name`, which reads the var).
+                            e = Expr::StaticProp {
+                                class: Box::new(e),
+                                name: PropName::Name(n),
+                            };
+                        }
                     }
+                    // `Cls::{expr}` / `Cls::${expr}` — dynamic name or call.
                     Some(Token::Op("{")) => {
                         let inner = self.expr()?;
                         self.expect_op("}")?;
@@ -1877,10 +2983,45 @@ impl<'a> Parser<'a> {
                                 nullsafe: false,
                             };
                         } else {
-                            return Err(PhpError::parse(
-                                "syntax error, unsupported ::{...} property",
-                                self.line(),
-                            ));
+                            e = Expr::StaticProp {
+                                class: Box::new(e),
+                                name: PropName::Expr(Box::new(inner)),
+                            };
+                        }
+                    }
+                    Some(Token::Op("$")) => {
+                        // `C::$${x}` / `C::${expr}` — name by expression.
+                        let inner = if self.at_op("{") {
+                            self.pos += 1;
+                            let inner = self.expr()?;
+                            self.expect_op("}")?;
+                            inner
+                        } else {
+                            // `C::$$x` — name read from variable $x.
+                            match self.next() {
+                                Some(Token::Variable(n)) => Expr::Var(n),
+                                t => {
+                                    return Err(PhpError::parse(
+                                        format!("syntax error, unexpected {}", desc_t(t.as_ref())),
+                                        self.line(),
+                                    ))
+                                }
+                            }
+                        };
+                        if self.at_op("(") {
+                            self.pos += 1;
+                            let args = self.args()?;
+                            e = Expr::MethodCall {
+                                obj: Box::new(e),
+                                name: PropName::Expr(Box::new(inner)),
+                                args,
+                                nullsafe: false,
+                            };
+                        } else {
+                            e = Expr::StaticProp {
+                                class: Box::new(e),
+                                name: PropName::Expr(Box::new(inner)),
+                            };
                         }
                     }
                     t => {
@@ -1931,6 +3072,30 @@ impl<'a> Parser<'a> {
                 self.expect_op("}")?;
                 Ok(PropName::Expr(Box::new(e)))
             }
+            // `$obj->${expr}` / `$obj->$$var` — variable-variable: the prop
+            // name is the VALUE of the variable named by the expr
+            // (engine_assignExecutionOrder_001).
+            Some(Token::Op("$")) => {
+                if self.at_op("{") {
+                    self.pos += 1;
+                    let e = self.expr()?;
+                    self.expect_op("}")?;
+                    Ok(PropName::Expr(Box::new(Expr::VarVar(Box::new(e)))))
+                } else {
+                    match self.next() {
+                        Some(Token::Variable(n)) => Ok(PropName::Expr(Box::new(Expr::VarVar(
+                            Box::new(Expr::Var(n)),
+                        )))),
+                        t => Err(PhpError::parse(
+                            format!(
+                                "syntax error, unexpected {}, expecting identifier",
+                                desc_t(t.as_ref())
+                            ),
+                            self.line(),
+                        )),
+                    }
+                }
+            }
             t => Err(PhpError::parse(
                 format!(
                     "syntax error, unexpected {}, expecting identifier",
@@ -1967,7 +3132,13 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 let e = self.expr()?;
                 self.expect_op(")")?;
-                Ok(e)
+                // Mark parenthesized class-prop refs so `(X::$p)::m()`
+                // is not confused with the `X::$p::m()` hook syntax.
+                Ok(if matches!(e, Expr::StaticProp { .. }) {
+                    Expr::Paren(Box::new(e))
+                } else {
+                    e
+                })
             }
             Some(Token::Op("[")) => {
                 // Short array literal.
@@ -1976,7 +3147,8 @@ impl<'a> Parser<'a> {
                 Ok(Expr::ArrayLit(items))
             }
             Some(Token::Op("$")) => {
-                // Variable variable: `$$name` or `${expr}`.
+                // Variable variable: `$$name`, `${expr}`, or chained
+                // `$$$a` (023).
                 self.pos += 1;
                 match self.peek().cloned() {
                     Some(Token::Variable(n)) => {
@@ -1987,6 +3159,10 @@ impl<'a> Parser<'a> {
                         self.pos += 1;
                         let e = self.expr()?;
                         self.expect_op("}")?;
+                        Ok(Expr::VarVar(Box::new(e)))
+                    }
+                    Some(Token::Op("$")) => {
+                        let e = self.primary()?;
                         Ok(Expr::VarVar(Box::new(e)))
                     }
                     t => Err(PhpError::parse(
@@ -2049,8 +3225,10 @@ impl<'a> Parser<'a> {
                     || (self.ident_is("static")
                         && matches!(self.peek2(), Some(Token::Ident(f)) if f.eq_ignore_ascii_case("function")
                             || f.eq_ignore_ascii_case("fn")))
-                    || self.ident_is("fn")
+                    || (self.ident_is("fn") && !matches!(self.peek2(), Some(Token::Op("\\"))))
                 {
+                    // `fn` is soft-reserved: `fn\test()` is a namespaced
+                    // call, not an arrow fn (ns_name_reserved_keywords).
                     self.closure_expr()
                 } else if self.ident_is("new") {
                     self.pos += 1;
@@ -2127,7 +3305,13 @@ impl<'a> Parser<'a> {
                     Ok(Expr::MagicConst(MagicConst::Class))
                 } else if self.ident_is("__namespace__") {
                     self.pos += 1;
-                    Ok(Expr::MagicConst(MagicConst::Namespace))
+                    // __NAMESPACE__ is compile-time per the file the
+                    // literal sits in — an include's top level is global
+                    // even inside a namespaced caller (ns_069).
+                    Ok(Expr::Str(self.cur_ns.clone()))
+                } else if self.ident_is("__property__") {
+                    self.pos += 1;
+                    Ok(Expr::MagicConst(MagicConst::Property))
                 } else if self.ident_is("static") {
                     // `static::` — static class ref
                     self.pos += 1;
@@ -2140,39 +3324,44 @@ impl<'a> Parser<'a> {
                     Ok(Expr::Const("parent".into()))
                 } else {
                     // Bare identifier: constant or function name target. Qualified
-                    // names (\A\B) and function call args go through here.
-                    let start = self.pos;
-                    let name = if self.at_op("\\") {
-                        self.name_path().unwrap_or_default()
-                    } else {
-                        self.ident().unwrap()
-                    };
-                    let name = name.trim_start_matches('\\').to_string();
+                    // names (A\B) and function call args go through here.
+                    let name = self.name_path().unwrap_or_default();
                     if self.at_op("(") {
                         self.pos += 1;
                         let args = self.args()?;
+                        let resolved = self.ns_resolve(&name, NsKind::Func);
+                        // Unqualified literal names carry a \u{1} marker:
+                        // call_named then applies the ns\f -> f fallback.
+                        // Qualified/FQ-resolved names are exact already.
+                        let resolved = if resolved.contains('\\') {
+                            resolved
+                        } else {
+                            format!("{}{}", '\u{1}', resolved)
+                        };
                         Ok(Expr::Call {
-                            name: Box::new(Expr::Str(name)),
+                            name: Box::new(Expr::Str(resolved)),
                             args,
                         })
                     } else if self.at_op("::") {
-                        // reset: `X::` handled by postfix on Const
-                        self.pos = start;
-                        let name = self.ident().unwrap();
-                        Ok(Expr::Const(name))
+                        // `X::…` — a class name in every form.
+                        Ok(Expr::Const(self.ns_resolve(&name, NsKind::Class)))
                     } else {
-                        // Unqualified constant (e.g. PHP_EOL) or undefined constant.
-                        Ok(Expr::Const(name))
+                        // Constant read: resolve now so a `use` alias
+                        // applies; an unqualified miss keeps the bare
+                        // name for the runtime ns\name -> name fallback.
+                        if name.starts_with('\\') {
+                            Ok(Expr::Const(name))
+                        } else {
+                            Ok(Expr::Const(self.ns_resolve(&name, NsKind::Const)))
+                        }
                     }
                 }
             }
             Some(Token::Op("\\")) => {
                 // Fully-qualified name: \PHP_EOL, \Foo\Bar::baz, \func().
-                let name = self
-                    .name_path()
-                    .unwrap_or_default()
-                    .trim_start_matches('\\')
-                    .to_string();
+                // The `\` marker is kept — downstream lookups treat a
+                // backslash-prefixed name as exact (no ns fallback).
+                let name = self.name_path().unwrap_or_default();
                 if name.is_empty() {
                     return Err(PhpError::parse(
                         "syntax error, unexpected token \"\\\"",
@@ -2204,9 +3393,9 @@ impl<'a> Parser<'a> {
     fn array_items(&mut self, close: &str) -> Result<Vec<(Option<Expr>, Expr)>, PhpError> {
         let mut items = Vec::new();
         while !self.at_op(close) {
-            let first = self.expr()?;
+            let first = self.array_elem()?;
             if self.eat_op("=>") {
-                let v = self.expr()?;
+                let v = self.array_elem()?;
                 items.push((Some(first), v));
             } else {
                 items.push((None, first));
@@ -2217,6 +3406,15 @@ impl<'a> Parser<'a> {
         }
         self.expect_op(close)?;
         Ok(items)
+    }
+
+    /// One array-literal element — may be `&expr` (bound by reference).
+    fn array_elem(&mut self) -> Result<Expr, PhpError> {
+        if self.eat_op("&") {
+            Ok(Expr::ByRef(Box::new(self.expr()?)))
+        } else {
+            self.expr()
+        }
     }
 }
 

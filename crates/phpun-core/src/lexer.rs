@@ -34,6 +34,10 @@ pub enum StringPart {
 pub struct Lexed {
     pub token: Token,
     pub line: usize,
+    /// For `\` name separators: bit 1 = whitespace on the left in source,
+    /// bit 2 = whitespace on the right. Qualified names forbid whitespace
+    /// inside them (namespaced_name_whitespace).
+    pub ws_adj: u8,
 }
 
 const KEYWORDS: &[&str] = &[
@@ -108,10 +112,24 @@ const KEYWORDS: &[&str] = &[
 
 /// Two-mode PHP lexer: outside `<?php`/`<?=`/`<?` everything is inline HTML.
 pub fn lex(src: &str) -> Result<Vec<Lexed>, PhpError> {
+    lex_with(src, false)
+}
+
+/// `lex` with `short_open_tag` — when on, `<?` opens PHP like `<?php`.
+pub fn lex_with(src: &str, short_open: bool) -> Result<Vec<Lexed>, PhpError> {
+    // CLI PHP skips a leading `#!...` shebang line (tests/lang/bug23584).
+    let (src, shebang) = match src.strip_prefix("#!") {
+        Some(rest) => match rest.find('\n') {
+            Some(nl) => (&rest[nl + 1..], true),
+            None => ("", true),
+        },
+        None => (src, false),
+    };
     let mut out = Vec::new();
     let bytes = src.as_bytes();
     let mut pos = 0usize;
-    let mut line = 1usize;
+    // The shebang occupies line 1; real numbering starts at line 2.
+    let mut line = if shebang { 2 } else { 1 };
 
     while pos < bytes.len() {
         // Inline HTML until an open tag.
@@ -129,7 +147,10 @@ pub fn lex(src: &str) -> Result<Vec<Lexed>, PhpError> {
                 }
                 let tag_at = pos + off;
                 let after = &src[tag_at..];
-                if after.starts_with("<?php") && boundary(after, 5) {
+                if after.len() >= 5
+                    && after[..5].eq_ignore_ascii_case("<?php")
+                    && boundary(after, 5)
+                {
                     pos = tag_at + 5;
                     pos += skip_ws_and_newline(&src[pos..], &mut line);
                     pos = lex_php(src, pos, &mut line, &mut out)?;
@@ -137,15 +158,16 @@ pub fn lex(src: &str) -> Result<Vec<Lexed>, PhpError> {
                     pos = tag_at + 3;
                     push(&mut out, Token::Echo, line);
                     pos = lex_php(src, pos, &mut line, &mut out)?;
-                } else if rest[off..].starts_with("<?\n")
-                    || rest[off..].starts_with("<?\r")
-                    || rest[off..].starts_with("<?\t")
-                    || rest[off..].starts_with("<? ")
+                } else if short_open
+                    && (rest[off..].starts_with("<?\n")
+                        || rest[off..].starts_with("<?\r")
+                        || rest[off..].starts_with("<?\t")
+                        || rest[off..].starts_with("<? "))
                 {
-                    // Short open tag — only honored when short_open_tag is on;
-                    // our default matches run-tests (off) → treat as inline text.
-                    push(&mut out, Token::Inline("<?".to_string()), line);
+                    // `<?` with short_open_tag=on opens PHP mode.
                     pos = tag_at + 2;
+                    pos += skip_ws_and_newline(&src[pos..], &mut line);
+                    pos = lex_php(src, pos, &mut line, &mut out)?;
                 } else {
                     push(&mut out, Token::Inline("<?".to_string()), line);
                     pos = tag_at + 2;
@@ -180,7 +202,11 @@ fn skip_ws_and_newline(s: &str, line: &mut usize) -> usize {
 }
 
 fn push(out: &mut Vec<Lexed>, token: Token, line: usize) {
-    out.push(Lexed { token, line });
+    out.push(Lexed {
+        token,
+        line,
+        ws_adj: 0,
+    });
 }
 
 /// Lex PHP code mode starting at `pos`; returns the offset where PHP mode
@@ -266,6 +292,7 @@ fn lex_php(
             b'0'..=b'9' => {
                 let (tok, n) = number(src, pos, *line)?;
                 out.push(Lexed {
+                    ws_adj: 0,
                     token: tok,
                     line: *line,
                 });
@@ -274,6 +301,7 @@ fn lex_php(
             b'.' if matches!(b.get(pos + 1), Some(&x) if x.is_ascii_digit()) => {
                 let (tok, n) = number(src, pos, *line)?;
                 out.push(Lexed {
+                    ws_adj: 0,
                     token: tok,
                     line: *line,
                 });
@@ -304,9 +332,25 @@ fn lex_php(
                     pos += n;
                 } else {
                     let (op, n) = operator(src, pos).ok_or_else(|| {
-                        PhpError::parse(format!("syntax error, unexpected '{}'", c as char), *line)
+                        // Non-printable bytes report as
+                        // `unexpected character 0x7F` (bug71897).
+                        let msg = if !(0x20..0x7f).contains(&c) {
+                            format!("syntax error, unexpected character 0x{:02X}", c)
+                        } else {
+                            format!("syntax error, unexpected '{}'", c as char)
+                        };
+                        PhpError::parse(msg, *line)
                     })?;
                     push(out, Token::Op(op), *line);
+                    if op == "\\" {
+                        let lt = out.last_mut().unwrap();
+                        if pos > 0 && b[pos - 1].is_ascii_whitespace() {
+                            lt.ws_adj |= 1;
+                        }
+                        if b.get(pos + n).is_some_and(|c| c.is_ascii_whitespace()) {
+                            lt.ws_adj |= 2;
+                        }
+                    }
                     pos += n;
                 }
             }
@@ -335,33 +379,45 @@ fn number(src: &str, pos: usize, line: usize) -> Result<(Token, usize), PhpError
     let b = src.as_bytes();
     let s = &src[pos..];
     // Hex / binary / octal literals.
+    // Base-prefixed literals allow `_` separators and overflow to float
+    // (tests/lang/integer_literals/*_64bit.phpt).
+    fn radix_lit(digits: &str, radix: u32, line: usize) -> Result<Token, PhpError> {
+        let clean: String = digits.chars().filter(|c| *c != '_').collect();
+        match i64::from_str_radix(&clean, radix) {
+            Ok(v) => Ok(Token::Int(v)),
+            Err(_) if !clean.is_empty() && clean.chars().all(|c| c.is_digit(radix)) => {
+                let v = clean.chars().fold(0.0f64, |a, c| {
+                    a * radix as f64 + c.to_digit(radix).unwrap_or(0) as f64
+                });
+                Ok(Token::Float(v))
+            }
+            Err(_) => Err(PhpError::parse(
+                "syntax error, invalid numeric literal",
+                line,
+            )),
+        }
+    }
     if s.starts_with("0x") || s.starts_with("0X") {
         let mut n = 2;
-        while matches!(b.get(pos + n), Some(&c) if c.is_ascii_hexdigit()) {
+        while matches!(b.get(pos + n), Some(&c) if c.is_ascii_hexdigit() || c == b'_') {
             n += 1;
         }
-        let v = i64::from_str_radix(&s[2..n], 16)
-            .map_err(|_| PhpError::parse("syntax error, invalid hexadecimal literal", line))?;
-        return Ok((Token::Int(v), n));
+        return radix_lit(&s[2..n], 16, line).map(|t| (t, n));
     }
     if s.starts_with("0b") || s.starts_with("0B") {
         let mut n = 2;
-        while matches!(b.get(pos + n), Some(&c) if c == b'0' || c == b'1') {
+        while matches!(b.get(pos + n), Some(&c) if c == b'0' || c == b'1' || c == b'_') {
             n += 1;
         }
-        let v = i64::from_str_radix(&s[2..n], 2)
-            .map_err(|_| PhpError::parse("syntax error, invalid binary literal", line))?;
-        return Ok((Token::Int(v), n));
+        return radix_lit(&s[2..n], 2, line).map(|t| (t, n));
     }
     // Legacy octal `0o`/implicit `0...` — PHP 8.1+ also has explicit `0o`.
     if (s.starts_with("0o") || s.starts_with("0O")) && s.len() > 2 {
         let mut n = 2;
-        while matches!(b.get(pos + n), Some(&c) if (b'0'..=b'7').contains(&c)) {
+        while matches!(b.get(pos + n), Some(&c) if (b'0'..=b'7').contains(&c) || c == b'_') {
             n += 1;
         }
-        let v = i64::from_str_radix(&s[2..n], 8)
-            .map_err(|_| PhpError::parse("syntax error, invalid octal literal", line))?;
-        return Ok((Token::Int(v), n));
+        return radix_lit(&s[2..n], 8, line).map(|t| (t, n));
     }
     let mut n = 0;
     let mut is_float = false;
@@ -399,13 +455,21 @@ fn number(src: &str, pos: usize, line: usize) -> Result<(Token, usize), PhpError
             .parse()
             .map_err(|_| PhpError::parse("syntax error, invalid float literal", line))?;
         Ok((Token::Float(v), n))
-    } else if text.starts_with('0')
-        && text.len() > 1
-        && text.chars().all(|c| ('0'..='7').contains(&c))
-    {
-        let v = i64::from_str_radix(&text[1..], 8)
-            .map_err(|_| PhpError::parse("syntax error, invalid octal literal", line))?;
-        Ok((Token::Int(v), n))
+    } else if text.starts_with('0') && text.len() > 1 && !is_float {
+        // Leading-0 decimal literal is an implicit octal — a non-octal
+        // digit is PHP's "Invalid numeric literal" (invalid_octal.phpt).
+        if !text.chars().all(|c| ('0'..='7').contains(&c)) {
+            return Err(PhpError::parse("Invalid numeric literal", line));
+        }
+        match i64::from_str_radix(&text[1..], 8) {
+            Ok(v) => Ok((Token::Int(v), n)),
+            Err(_) => {
+                let v = text[1..]
+                    .chars()
+                    .fold(0.0f64, |a, c| a * 8.0 + c.to_digit(8).unwrap_or(0) as f64);
+                Ok((Token::Float(v), n))
+            }
+        }
     } else {
         match text.parse::<i64>() {
             Ok(v) => Ok((Token::Int(v), n)),
@@ -519,18 +583,49 @@ fn double_string(src: &str, pos: usize, line: usize) -> Result<(Vec<StringPart>,
                         }
                     }
                     Some(b'u') if b.get(pos + n + 2) == Some(&b'{') => {
+                        // \u{HEX}: only 1+ hex digits then '}', else PHP's
+                        // "Invalid UTF-8 codepoint escape sequence" parse
+                        // error (tests/lang/string/unicode_escape_*.phpt).
                         let mut k = 3;
                         let mut v = 0u32;
+                        let mut digits = 0usize;
+                        let mut closed = false;
                         while let Some(&d) = b.get(pos + n + k) {
-                            if d == b'}' {
-                                k += 1;
-                                break;
+                            match d {
+                                b'}' if digits > 0 => {
+                                    closed = true;
+                                    k += 1;
+                                    break;
+                                }
+                                _ if d.is_ascii_hexdigit() => {
+                                    v = v
+                                        .saturating_mul(16)
+                                        .saturating_add((d as char).to_digit(16).unwrap_or(0));
+                                    digits += 1;
+                                    k += 1;
+                                }
+                                _ => {
+                                    return Err(PhpError::parse(
+                                        "Invalid UTF-8 codepoint escape sequence",
+                                        line,
+                                    ))
+                                }
                             }
-                            if d.is_ascii_hexdigit() {
-                                v = v * 16 + (d as char).to_digit(16).unwrap_or(0);
-                            }
-                            k += 1;
                         }
+                        if !closed {
+                            return Err(PhpError::parse(
+                                "Invalid UTF-8 codepoint escape sequence",
+                                line,
+                            ));
+                        }
+                        if v > 0x10ffff {
+                            return Err(PhpError::parse(
+                                "Invalid UTF-8 codepoint escape sequence: Codepoint too large",
+                                line,
+                            ));
+                        }
+                        // PHP emits raw UTF-8 even for surrogate halves
+                        // (CESU-8); our UTF-8 String can't hold them.
                         (char::from_u32(v).unwrap_or('\u{fffd}'), k)
                     }
                     _ => ('\\', 1),
@@ -608,6 +703,15 @@ fn double_string(src: &str, pos: usize, line: usize) -> Result<(Vec<StringPart>,
                                 n += 1 + len;
                             }
                         } else if src[rest..].starts_with('[') {
+                            // Quoted keys are illegal in simple
+                            // interpolation — `$arr['x']` is E_PARSE
+                            // (bug21820).
+                            if matches!(b.get(rest + 1), Some(b'\'') | Some(b'"')) {
+                                return Err(PhpError::parse(
+                                    "syntax error, unexpected string content \"\", expecting \"-\" or identifier or variable or number",
+                                    line,
+                                ));
+                            }
                             // One-dimensional index (unquoted ident/number/quoted).
                             let mut k = rest + 1;
                             while let Some(&d) = b.get(k) {

@@ -119,7 +119,7 @@ pub fn parse_str(path: PathBuf, content: &str) -> PhptTest {
 }
 
 fn section_header(line: &str) -> Option<&str> {
-    if !line.starts_with("--") || !line.ends_with("--") {
+    if line.len() < 5 || !line.starts_with("--") || !line.ends_with("--") {
         return None;
     }
     let inner = &line[2..line.len() - 2];

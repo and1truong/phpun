@@ -9,6 +9,16 @@ pub struct PhpError {
     pub kind: ErrorKind,
     pub message: String,
     pub line: usize,
+    /// Formatted `#N` stack frames for uncaught-throwable printing
+    /// (e.g. `file.php(12): f(Object(A))`). None → bare `#0 {main}`.
+    pub trace: Option<Vec<String>>,
+    /// Line the `thrown in` footer attributes to (defaults to `line`).
+    /// Param-type TypeErrors attribute to the declaration line.
+    pub thrown_line: Option<usize>,
+    /// Uncaught-display variant of `message` (param TypeErrors display the
+    /// longer "... and defined in FILE:M" form while getMessage() stays
+    /// short).
+    pub display_msg: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +46,9 @@ impl PhpError {
             kind: ErrorKind::Parse,
             message: message.into(),
             line,
+            trace: None,
+            thrown_line: None,
+            display_msg: None,
         }
     }
 
@@ -44,6 +57,9 @@ impl PhpError {
             kind: ErrorKind::Fatal,
             message: message.into(),
             line,
+            trace: None,
+            thrown_line: None,
+            display_msg: None,
         }
     }
 
@@ -52,6 +68,9 @@ impl PhpError {
             kind: ErrorKind::Uncaught { class },
             message: message.into(),
             line,
+            trace: None,
+            thrown_line: None,
+            display_msg: None,
         }
     }
 
@@ -60,6 +79,9 @@ impl PhpError {
             kind: ErrorKind::Warning,
             message: message.into(),
             line,
+            trace: None,
+            thrown_line: None,
+            display_msg: None,
         }
     }
 }

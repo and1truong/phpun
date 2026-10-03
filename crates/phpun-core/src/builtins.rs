@@ -3,8 +3,11 @@
 
 use crate::error::PhpError;
 use crate::interp::Interp;
-use crate::value::{compare, numeric, to_key, ArrKey, Cell, Numeric, PhpArray, PhpResource, Value};
+use crate::value::{
+    compare, numeric, to_key, ArrKey, Cell, Numeric, PhpArray, PhpObject, PhpResource, Value,
+};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 fn cell(v: Value) -> Cell {
@@ -58,7 +61,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "var_export" => {
             let v = arg(args, 0);
             let ret = arg(args, 1).is_truthy();
-            let s = var_export(&v);
+            let s = var_export(it, &v);
             if ret {
                 Value::str(s)
             } else {
@@ -582,10 +585,11 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_keys" => match arg(args, 0) {
             Value::Array(a) => {
                 let mut out = PhpArray::new();
-                for (k, _) in a.borrow().entries.iter() {
+                for (k, _) in a.borrow().iter() {
                     out.push(match k {
                         ArrKey::Int(i) => Value::Int(*i),
                         ArrKey::Str(s) => Value::str(s.to_string()),
+                        ArrKey::Tomb => continue,
                     });
                 }
                 Value::Array(Rc::new(RefCell::new(out)))
@@ -595,7 +599,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_values" => match arg(args, 0) {
             Value::Array(a) => {
                 let mut out = PhpArray::new();
-                for (_, c) in a.borrow().entries.iter() {
+                for (_, c) in a.borrow().iter() {
                     out.push(c.borrow().clone());
                 }
                 Value::Array(Rc::new(RefCell::new(out)))
@@ -613,7 +617,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let needle = arg(args, 0);
             let strict = arg(args, 2).is_truthy();
             match arg(args, 1) {
-                Value::Array(a) => Value::Bool(a.borrow().entries.iter().any(|(_, c)| {
+                Value::Array(a) => Value::Bool(a.borrow().iter().any(|(_, c)| {
                     let v = c.borrow();
                     if strict {
                         crate::value::identical(&v, &needle)
@@ -629,7 +633,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let strict = arg(args, 2).is_truthy();
             match arg(args, 1) {
                 Value::Array(a) => {
-                    for (k, c) in a.borrow().entries.iter() {
+                    for (k, c) in a.borrow().iter() {
                         let v = c.borrow().clone();
                         let hit = if strict {
                             crate::value::identical(&v, &needle)
@@ -640,6 +644,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                             return Ok(Some(match k {
                                 ArrKey::Int(i) => Value::Int(*i),
                                 ArrKey::Str(s) => Value::str(s.to_string()),
+                                ArrKey::Tomb => continue,
                             }));
                         }
                     }
@@ -652,7 +657,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let mut out = PhpArray::new();
             for a in args {
                 if let Value::Array(m) = &*a.borrow() {
-                    for (k, c) in m.borrow().entries.iter() {
+                    for (k, c) in m.borrow().iter() {
                         match k {
                             ArrKey::Int(_) => out.push(c.borrow().clone()),
                             _ => out.set(k.clone(), c.borrow().clone()),
@@ -666,7 +671,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let mut out = PhpArray::new();
             for a in args {
                 if let Value::Array(m) = &*a.borrow() {
-                    for (k, c) in m.borrow().entries.iter() {
+                    for (k, c) in m.borrow().iter() {
                         out.set(k.clone(), c.borrow().clone());
                     }
                 }
@@ -680,7 +685,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             if let (Value::Array(k), Value::Array(v)) = (keys, vals) {
                 let kb = k.borrow();
                 let vb = v.borrow();
-                for (i, (kk, _)) in kb.entries.iter().enumerate() {
+                for (i, (kk, _)) in kb.iter().enumerate() {
                     let vv = vb
                         .entries
                         .get(i)
@@ -705,7 +710,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let mut out = PhpArray::new();
             let v = arg(args, 1);
             if let Value::Array(keys) = arg(args, 0) {
-                for (_, c) in keys.borrow().entries.iter() {
+                for (_, c) in keys.borrow().iter() {
                     out.set(to_key(&c.borrow()), v.clone());
                 }
             }
@@ -779,7 +784,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 arr.entries = head.to_vec();
                 if let Some(repl) = args.get(3) {
                     if let Value::Array(r) = &*repl.borrow() {
-                        for (_, c) in r.borrow().entries.iter() {
+                        for (_, c) in r.borrow().iter() {
                             arr.push(c.borrow().clone());
                         }
                     }
@@ -805,8 +810,19 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_pop" => {
             if let Value::Array(rc) = &mut *args[0].borrow_mut() {
                 let mut arr = rc.borrow_mut();
-                match arr.entries.pop() {
-                    Some((_, c)) => return Ok(Some(c.borrow().clone())),
+                // Tombstone the last live bucket — a live foreach anchored
+                // on it still finds it and ends instead of restarting
+                // (foreachLoop.009/.013).
+                let last = arr
+                    .entries
+                    .iter()
+                    .rposition(|(k, _)| !matches!(k, ArrKey::Tomb));
+                match last {
+                    Some(f) => {
+                        let c = arr.entries[f].1.clone();
+                        arr.entries[f].0 = ArrKey::Tomb;
+                        return Ok(Some(c.borrow().clone()));
+                    }
                     None => return Ok(Some(Value::Null)),
                 }
             }
@@ -815,20 +831,29 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_shift" => {
             if let Value::Array(rc) = &mut *args[0].borrow_mut() {
                 let mut arr = rc.borrow_mut();
-                if arr.entries.is_empty() {
-                    return Ok(Some(Value::Null));
-                }
-                let (_, c) = arr.entries.remove(0);
-                // renumber int keys
-                let mut ni = 0i64;
-                for (k, _) in arr.entries.iter_mut() {
-                    if let ArrKey::Int(i) = k {
-                        *i = ni;
-                        ni += 1;
+                // Shift the first LIVE element: tombstone its bucket (a live
+                // foreach keeps positions — foreachLoop.013) and renumber
+                // integer keys over the remaining live elements.
+                let first = arr
+                    .entries
+                    .iter()
+                    .position(|(k, _)| !matches!(k, ArrKey::Tomb));
+                match first {
+                    Some(f) => {
+                        let c = arr.entries[f].1.clone();
+                        arr.entries[f].0 = ArrKey::Tomb;
+                        let mut ni = 0i64;
+                        for (k, _) in arr.entries.iter_mut() {
+                            if let ArrKey::Int(i) = k {
+                                *i = ni;
+                                ni += 1;
+                            }
+                        }
+                        arr.next = ni;
+                        return Ok(Some(c.borrow().clone()));
                     }
+                    None => return Ok(Some(Value::Null)),
                 }
-                arr.next = ni;
-                return Ok(Some(c.borrow().clone()));
             }
             Value::Null
         }
@@ -857,7 +882,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             Value::Array(a) => {
                 let preserve = arg(args, 1).is_truthy();
                 let mut out = PhpArray::new();
-                for (k, c) in a.borrow().entries.iter().rev() {
+                for (k, c) in a.borrow().iter().rev() {
                     if preserve || matches!(k, ArrKey::Str(_)) {
                         out.set(k.clone(), c.borrow().clone());
                     } else {
@@ -872,7 +897,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             Value::Array(a) => {
                 let mut seen: Vec<String> = Vec::new();
                 let mut out = PhpArray::new();
-                for (k, c) in a.borrow().entries.iter() {
+                for (k, c) in a.borrow().iter() {
                     let v = c.borrow().to_php_string();
                     if !seen.contains(&v) {
                         seen.push(v);
@@ -886,13 +911,14 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_flip" => match arg(args, 0) {
             Value::Array(a) => {
                 let mut out = PhpArray::new();
-                for (k, c) in a.borrow().entries.iter() {
+                for (k, c) in a.borrow().iter() {
                     let v = c.borrow().clone();
                     out.set(
                         to_key(&v),
                         match k {
                             ArrKey::Int(i) => Value::Int(*i),
                             ArrKey::Str(s) => Value::str(s.to_string()),
+                            ArrKey::Tomb => continue,
                         },
                     );
                 }
@@ -905,7 +931,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 let mut is_f = false;
                 let mut i: i64 = 0;
                 let mut f: f64 = 0.0;
-                for (_, c) in a.borrow().entries.iter() {
+                for (_, c) in a.borrow().iter() {
                     match &*c.borrow() {
                         Value::Int(x) => i += x,
                         v => {
@@ -927,7 +953,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 let mut is_f = false;
                 let mut i: i64 = 1;
                 let mut f: f64 = 1.0;
-                for (_, c) in a.borrow().entries.iter() {
+                for (_, c) in a.borrow().iter() {
                     match &*c.borrow() {
                         Value::Int(x) => i *= x,
                         v => {
@@ -947,7 +973,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_count_values" => match arg(args, 0) {
             Value::Array(a) => {
                 let mut out = PhpArray::new();
-                for (_, c) in a.borrow().entries.iter() {
+                for (_, c) in a.borrow().iter() {
                     let k = to_key(&c.borrow());
                     let cur = out.get(&k).unwrap_or(Value::Int(0)).to_int();
                     out.set(k, Value::Int(cur + 1));
@@ -959,11 +985,11 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_diff" => {
             let mut out = PhpArray::new();
             if let Value::Array(a) = arg(args, 0) {
-                'outer: for (k, c) in a.borrow().entries.iter() {
+                'outer: for (k, c) in a.borrow().iter() {
                     let v = c.borrow().clone();
                     for other in &args[1..] {
                         if let Value::Array(o) = &*other.borrow() {
-                            for (_, oc) in o.borrow().entries.iter() {
+                            for (_, oc) in o.borrow().iter() {
                                 if compare(&v, &oc.borrow()) == std::cmp::Ordering::Equal {
                                     continue 'outer;
                                 }
@@ -978,7 +1004,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_diff_key" => {
             let mut out = PhpArray::new();
             if let Value::Array(a) = arg(args, 0) {
-                'outer: for (k, c) in a.borrow().entries.iter() {
+                'outer: for (k, c) in a.borrow().iter() {
                     for other in &args[1..] {
                         if let Value::Array(o) = &*other.borrow() {
                             if o.borrow().get_cell(k).is_some() {
@@ -994,12 +1020,12 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_intersect" => {
             let mut out = PhpArray::new();
             if let Value::Array(a) = arg(args, 0) {
-                'outer: for (k, c) in a.borrow().entries.iter() {
+                'outer: for (k, c) in a.borrow().iter() {
                     let v = c.borrow().clone();
                     for other in &args[1..] {
                         if let Value::Array(o) = &*other.borrow() {
                             let mut found = false;
-                            for (_, oc) in o.borrow().entries.iter() {
+                            for (_, oc) in o.borrow().iter() {
                                 if compare(&v, &oc.borrow()) == std::cmp::Ordering::Equal {
                                     found = true;
                                     break;
@@ -1018,7 +1044,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_intersect_key" => {
             let mut out = PhpArray::new();
             if let Value::Array(a) = arg(args, 0) {
-                'outer: for (k, c) in a.borrow().entries.iter() {
+                'outer: for (k, c) in a.borrow().iter() {
                     for other in &args[1..] {
                         if let Value::Array(o) = &*other.borrow() {
                             if o.borrow().get_cell(k).is_none() {
@@ -1035,7 +1061,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let mut out = PhpArray::new();
             let cb = args.get(1).map(|c| c.borrow().clone());
             if let Value::Array(a) = arg(args, 0) {
-                for (k, c) in a.borrow().entries.iter() {
+                for (k, c) in a.borrow().iter() {
                     let v = c.borrow().clone();
                     let keep = match &cb {
                         Some(cb) => {
@@ -1056,7 +1082,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let mut out = PhpArray::new();
             if args.len() == 2 {
                 if let Value::Array(a) = arg(args, 1) {
-                    for (_, c) in a.borrow().entries.iter() {
+                    for (_, c) in a.borrow().iter() {
                         let v = it.call_value(&cb, vec![cell(c.borrow().clone())])?;
                         out.push(v);
                     }
@@ -1092,7 +1118,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let cb = arg(args, 1);
             let mut acc = arg(args, 2);
             if let Value::Array(a) = arg(args, 0) {
-                for (_, c) in a.borrow().entries.iter() {
+                for (_, c) in a.borrow().iter() {
                     acc = it.call_value(&cb, vec![cell(acc), cell(c.borrow().clone())])?;
                 }
             }
@@ -1101,8 +1127,44 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_walk" => {
             let cb = arg(args, 1);
             let extra = arg(args, 2);
+            // array_walk on an object iterates its property entries
+            // (gh18268: hooked props yield their serialized value).
+            let obj = match &*args[0].borrow() {
+                Value::Object(o) => Some(o.clone()),
+                _ => None,
+            };
+            if let Some(o) = obj {
+                let mut walked = false;
+                for (n, slot, decl) in it.object_serial_entries(&o) {
+                    walked = true;
+                    let v = match &decl {
+                        Some((p, dcls)) => it
+                            .serial_entry_value(&o, p, dcls, &slot)
+                            .unwrap_or(Value::Null),
+                        None => o
+                            .borrow()
+                            .props
+                            .get(&slot)
+                            .map(|c| c.borrow().clone())
+                            .unwrap_or(Value::Null),
+                    };
+                    let plain = n
+                        .trim_start_matches('\0')
+                        .split('\0')
+                        .next_back()
+                        .unwrap_or(&n)
+                        .to_string();
+                    it.call_value(
+                        &cb,
+                        vec![cell(v), cell(Value::str(plain)), cell(extra.clone())],
+                    )?;
+                }
+                if walked {
+                    return Ok(Some(Value::Bool(true)));
+                }
+            }
             if let Value::Array(rc) = &mut *args[0].borrow_mut() {
-                let cells: Vec<(ArrKey, Cell)> = rc.borrow().entries.clone();
+                let cells: Vec<(ArrKey, Cell)> = rc.borrow().iter().cloned().collect();
                 for (k, c) in cells {
                     it.call_value(
                         &cb,
@@ -1111,6 +1173,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                             cell(match k {
                                 ArrKey::Int(i) => Value::Int(i),
                                 ArrKey::Str(s) => Value::str(s.to_string()),
+                                ArrKey::Tomb => Value::Null,
                             }),
                             cell(extra.clone()),
                         ],
@@ -1126,7 +1189,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 let colkey = to_key(&col);
                 let idx = arg(args, 2);
                 let has_idx = !matches!(idx, Value::Null);
-                for (_, c) in a.borrow().entries.iter() {
+                for (_, c) in a.borrow().iter() {
                     if let Value::Array(row) = &*c.borrow() {
                         let row = row.borrow();
                         if let Some(v) = row.get(&colkey) {
@@ -1147,7 +1210,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let v = arg(args, 2);
             let mut out = PhpArray::new();
             if let Value::Array(a) = arg(args, 0) {
-                for (k, c) in a.borrow().entries.iter() {
+                for (k, c) in a.borrow().iter() {
                     out.set(k.clone(), c.borrow().clone());
                 }
                 while (out.len() as i64) < n.abs() {
@@ -1182,11 +1245,12 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_first" | "array_key_first" => match arg(args, 0) {
             Value::Array(a) => a
                 .borrow()
-                .entries
-                .first()
+                .iter()
+                .next()
                 .map(|(k, _)| match k {
                     ArrKey::Int(i) => Value::Int(*i),
                     ArrKey::Str(s) => Value::str(s.to_string()),
+                    ArrKey::Tomb => Value::Null,
                 })
                 .unwrap_or(Value::Null),
             _ => Value::Null,
@@ -1194,11 +1258,12 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_key_last" => match arg(args, 0) {
             Value::Array(a) => a
                 .borrow()
-                .entries
-                .last()
+                .iter()
+                .next_back()
                 .map(|(k, _)| match k {
                     ArrKey::Int(i) => Value::Int(*i),
                     ArrKey::Str(s) => Value::str(s.to_string()),
+                    ArrKey::Tomb => Value::Null,
                 })
                 .unwrap_or(Value::Null),
             _ => Value::Null,
@@ -1206,13 +1271,16 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "array_rand" => match arg(args, 0) {
             Value::Array(a) => {
                 let b = a.borrow();
-                match b.entries.first() {
-                    Some((k, _)) => match k {
+                let first = b
+                    .iter()
+                    .next()
+                    .map(|(k, _)| match k {
                         ArrKey::Int(i) => Value::Int(*i),
                         ArrKey::Str(s) => Value::str(s.to_string()),
-                    },
-                    None => Value::Null,
-                }
+                        ArrKey::Tomb => Value::Null,
+                    })
+                    .unwrap_or(Value::Null);
+                first
             }
             _ => Value::Null,
         },
@@ -1277,7 +1345,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "extract" => {
             if let Value::Array(a) = arg(args, 0) {
-                for (k, c) in a.borrow().entries.iter() {
+                for (k, c) in a.borrow().iter() {
                     if let ArrKey::Str(s) = k {
                         if is_varname(s) {
                             it.var_name_set(s, c.borrow().clone());
@@ -1290,8 +1358,8 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "current" | "pos" => match arg(args, 0) {
             Value::Array(a) => a
                 .borrow()
-                .entries
-                .first()
+                .iter()
+                .next()
                 .map(|(_, c)| c.borrow().clone())
                 .unwrap_or(Value::Bool(false)),
             _ => Value::Bool(false),
@@ -1299,8 +1367,8 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "end" => match arg(args, 0) {
             Value::Array(a) => a
                 .borrow()
-                .entries
-                .last()
+                .iter()
+                .next_back()
                 .map(|(_, c)| c.borrow().clone())
                 .unwrap_or(Value::Bool(false)),
             _ => Value::Bool(false),
@@ -1308,8 +1376,8 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "reset" => match arg(args, 0) {
             Value::Array(a) => a
                 .borrow()
-                .entries
-                .first()
+                .iter()
+                .next()
                 .map(|(_, c)| c.borrow().clone())
                 .unwrap_or(Value::Bool(false)),
             _ => Value::Bool(false),
@@ -1317,11 +1385,12 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "key" => match arg(args, 0) {
             Value::Array(a) => a
                 .borrow()
-                .entries
-                .first()
+                .iter()
+                .next()
                 .map(|(k, _)| match k {
                     ArrKey::Int(i) => Value::Int(*i),
                     ArrKey::Str(s) => Value::str(s.to_string()),
+                    ArrKey::Tomb => Value::Null,
                 })
                 .unwrap_or(Value::Null),
             _ => Value::Null,
@@ -1357,7 +1426,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             for a in args {
                 let v = a.borrow().clone();
                 if let Value::Array(arr) = &v {
-                    for (_, c) in arr.borrow().entries.iter() {
+                    for (_, c) in arr.borrow().iter() {
                         vals.push(c.borrow().clone());
                     }
                 } else {
@@ -1553,6 +1622,12 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         // ----- constants / functions -----
         "define" => {
             let n = arg_str(it, args, 0);
+            if n.contains("::") {
+                return err(
+                    "ValueError",
+                    "define(): Argument #1 ($constant_name) cannot be a class constant",
+                );
+            }
             let v = arg(args, 1);
             it.define_const(&n, v);
             Value::Bool(true)
@@ -1563,21 +1638,37 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "constant" => {
             let n = arg_str(it, args, 0);
+            if n.contains("::") {
+                let cls = n.split_once("::").map(|(c, _)| c).unwrap_or_default();
+                return err("Error", format!("Class \"{}\" not found", cls));
+            }
             match it.const_get(&n) {
                 Some(v) => v,
                 None => return err("Error", format!("Undefined constant {}", n)),
             }
         }
         "function_exists" => {
-            let n = arg_str(it, args, 0).to_lowercase();
+            let n = arg_str(it, args, 0).trim_start_matches('\\').to_lowercase();
             Value::Bool(it.functions.contains_key(&n) || is_builtin(&n))
         }
         "class_exists" => {
             let n = arg_str(it, args, 0);
             Value::Bool(it.lookup_class(&n).is_some())
         }
-        "interface_exists" => Value::Bool(false),
-        "trait_exists" => Value::Bool(false),
+        "interface_exists" => {
+            let n = arg_str(it, args, 0);
+            Value::Bool(
+                it.interfaces
+                    .contains_key(&n.trim_start_matches('\\').to_lowercase()),
+            )
+        }
+        "trait_exists" => {
+            let n = arg_str(it, args, 0);
+            Value::Bool(
+                it.traits
+                    .contains_key(&n.trim_start_matches('\\').to_lowercase()),
+            )
+        }
         "enum_exists" => Value::Bool(false),
         "method_exists" => match arg(args, 0) {
             Value::Object(o) => {
@@ -1615,13 +1706,49 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             },
             _ => Value::Bool(false),
         },
-        "get_object_vars" => match arg(args, 0) {
+        "get_object_vars" | "get_mangled_object_vars" => match arg(args, 0) {
             Value::Object(o) => {
                 let mut a = PhpArray::new();
-                let ob = o.borrow();
-                for n in &ob.prop_order {
-                    if let Some(c) = ob.props.get(n) {
-                        a.set(ArrKey::Str(n.clone().into()), c.borrow().clone());
+                if name == "get_mangled_object_vars" {
+                    // Raw slots with mangled keys — no hooks
+                    // (property_hooks/dump).
+                    let ob = o.borrow();
+                    for n in &ob.prop_order {
+                        if let Some(c) = ob.props.get(n) {
+                            a.set(ArrKey::Str(n.clone().into()), c.borrow().clone());
+                        }
+                    }
+                } else {
+                    // Scope-visible decl entries; hooked props run `get`,
+                    // write-only and uninitialized props are skipped.
+                    let scope = it.caller_scope_name();
+                    let entries = it.object_serial_entries(&o);
+                    for (out, slot, decl) in entries {
+                        let ok = match &decl {
+                            None => true, // dynamic props are public
+                            Some((p, dcls)) => match p.visibility {
+                                crate::ast::Visibility::Public => true,
+                                crate::ast::Visibility::Protected => {
+                                    let oc = o.borrow().class.name().to_string();
+                                    scope.as_ref().is_some_and(|sc| {
+                                        it.obj_is_a_str(sc, &oc) || it.obj_is_a_str(&oc, sc)
+                                    })
+                                }
+                                crate::ast::Visibility::Private => {
+                                    scope.as_ref() == Some(&dcls.name().to_string())
+                                }
+                            },
+                        };
+                        if !ok {
+                            continue;
+                        }
+                        let v = match &decl {
+                            Some((p, dcls)) => it.serial_entry_value(&o, p, dcls, &slot),
+                            None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
+                        };
+                        if let Some(v) = v {
+                            a.set(ArrKey::Str(out.into()), v);
+                        }
                     }
                 }
                 Value::Array(Rc::new(RefCell::new(a)))
@@ -1648,10 +1775,79 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             },
             _ => Value::Null,
         },
-        "get_class_vars"
-        | "get_declared_classes"
-        | "get_declared_interfaces"
-        | "get_declared_traits" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+        "get_class_vars" => {
+            let cls = match arg(args, 0) {
+                Value::Object(o) => Some(o.borrow().class.clone()),
+                Value::Str(cn) => it.lookup_class(&cn),
+                _ => None,
+            };
+            match cls {
+                Some(c) => {
+                    let mut a = PhpArray::new();
+                    for (n, v) in it.class_default_props(&c) {
+                        a.set(ArrKey::Str(n.into()), v);
+                    }
+                    Value::Array(Rc::new(RefCell::new(a)))
+                }
+                None => Value::Bool(false),
+            }
+        }
+        "get_declared_classes" => {
+            let mut a = PhpArray::new();
+            for n in it.declared_names(crate::ast::ClassKind::Class) {
+                a.push(Value::str(n));
+            }
+            for n in it.declared_names(crate::ast::ClassKind::Enum) {
+                a.push(Value::str(n));
+            }
+            Value::Array(Rc::new(RefCell::new(a)))
+        }
+        "get_declared_interfaces" => {
+            let mut a = PhpArray::new();
+            for n in it.declared_names(crate::ast::ClassKind::Interface) {
+                a.push(Value::str(n));
+            }
+            Value::Array(Rc::new(RefCell::new(a)))
+        }
+        "get_declared_traits" => {
+            let mut a = PhpArray::new();
+            for n in it.declared_names(crate::ast::ClassKind::Trait) {
+                a.push(Value::str(n));
+            }
+            Value::Array(Rc::new(RefCell::new(a)))
+        }
+        "debug_print_backtrace" => {
+            it.emit(&it.format_backtrace());
+            Value::Null
+        }
+        "debug_backtrace" => {
+            let mut arr = PhpArray::new();
+            for fr in it.backtrace() {
+                let mut f = PhpArray::new();
+                if fr.file != "[internal function]" {
+                    f.set(ArrKey::Str("file".into()), Value::str(fr.file.clone()));
+                    f.set(ArrKey::Str("line".into()), Value::Int(fr.line as i64));
+                }
+                f.set(
+                    ArrKey::Str("function".into()),
+                    Value::str(fr.function.clone()),
+                );
+                if let Some(c) = &fr.class {
+                    f.set(ArrKey::Str("class".into()), Value::str(c.clone()));
+                    f.set(ArrKey::Str("type".into()), Value::str(fr.ty.clone()));
+                }
+                let mut a = PhpArray::new();
+                for av in &fr.args {
+                    a.push(av.borrow().clone());
+                }
+                f.set(
+                    ArrKey::Str("args".into()),
+                    Value::Array(Rc::new(RefCell::new(a))),
+                );
+                arr.push(Value::Array(Rc::new(RefCell::new(f))));
+            }
+            Value::Array(Rc::new(RefCell::new(arr)))
+        }
         "is_a" => match arg(args, 0) {
             Value::Object(o) => {
                 let n = arg_str(it, args, 1);
@@ -1687,12 +1883,35 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             _ => Value::Null,
         },
         "func_get_args" | "func_num_args" | "func_get_arg" => {
+            if !it.in_call() {
+                let msg = match name {
+                    "func_num_args" => "func_num_args() must be called from a function context",
+                    _ => &format!("{}() cannot be called from the global scope", name),
+                };
+                return Err(PhpError::uncaught("Error", msg, it.cur_line));
+            }
             let fa = it.frame_args();
             match name {
                 "func_num_args" => Value::Int(fa.len() as i64),
                 "func_get_arg" => {
-                    let i = arg(args, 0).to_int() as usize;
-                    fa.get(i).map(|c| c.borrow().clone()).unwrap_or(Value::Null)
+                    let i = arg(args, 0).to_int();
+                    if i < 0 {
+                        return Err(PhpError::uncaught(
+                            "Error",
+                            "func_get_arg(): Argument #1 ($position) must be greater than or equal to 0",
+                            it.cur_line,
+                        ));
+                    }
+                    match fa.get(i as usize) {
+                        Some(c) => c.borrow().clone(),
+                        None => {
+                            return Err(PhpError::uncaught(
+                                "Error",
+                                "func_get_arg(): Argument #1 ($position) must be less than the number of the arguments passed to the currently executed function",
+                                it.cur_line,
+                            ));
+                        }
+                    }
                 }
                 _ => {
                     let mut a = PhpArray::new();
@@ -1710,7 +1929,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let cb = arg(args, 0);
             let call_args: Vec<Cell> = if name.ends_with("_array") {
                 match arg(args, 1) {
-                    Value::Array(a) => a.borrow().entries.iter().map(|(_, c)| c.clone()).collect(),
+                    Value::Array(a) => a.borrow().iter().map(|(_, c)| c.clone()).collect(),
                     _ => vec![],
                 }
             } else {
@@ -1745,7 +1964,11 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "restore_error_handler" | "restore_exception_handler" => Value::Bool(true),
         "trigger_error" | "user_error" => {
             let msg = arg_str(it, args, 0);
-            it.warn_pub(&msg);
+            // E_USER_WARNING=512 / E_USER_NOTICE=1024 / E_USER_DEPRECATED=
+            // 16384 select the diagnostic label + errno seen by the handler
+            // (error_2_exception_001, bug21094). Default is E_USER_NOTICE.
+            let level = args.get(1).map(|c| c.borrow().to_int()).unwrap_or(1024);
+            it.emit_diag_pub(level, &msg)?;
             Value::Bool(true)
         }
         "error_reporting" => {
@@ -1753,38 +1976,73 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             Value::Int(it.error_reporting(lv))
         }
         "ini_set" => {
-            // return previous value as string|false
-            Value::str(arg_str(it, args, 1))
+            // Stores into the INI table and returns the previous
+            // value (false when unset) — memory_limit, html_errors,
+            // docref_* etc. all read back through ini_get (bug45392).
+            let k = arg_str(it, args, 0);
+            let prev = it.ini.get(&k).cloned();
+            let v = arg_str(it, args, 1);
+            // Shrinking the limit under current usage refuses with a
+            // warning and leaves the old value (bug45392).
+            if k == "memory_limit" {
+                it.ini.insert(k.clone(), v);
+                let lim = it.ini_bytes(&k);
+                if lim > 0 && (it.mem_used as i64) > lim {
+                    let _ = it
+                        .ini
+                        .insert(k.clone(), prev.clone().unwrap_or_else(|| "-1".into()));
+                    it.warn_pub(&format!(
+                        "Failed to set memory limit to {} bytes (Current memory usage is {} bytes)",
+                        lim, it.mem_used
+                    ))?;
+                    return Ok(Some(match prev {
+                        Some(p) => Value::str(p),
+                        None => Value::Bool(false),
+                    }));
+                }
+            } else {
+                it.ini.insert(k, v);
+            }
+            match prev {
+                Some(p) => Value::str(p),
+                None => Value::Bool(false),
+            }
         }
-        "ini_get" => Value::Bool(false),
+        "ini_get" => {
+            let k = arg_str(it, args, 0);
+            match it.ini.get(&k) {
+                Some(v) => Value::str(v.clone()),
+                None => Value::Bool(false),
+            }
+        }
         "ini_get_all" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
         "ini_restore" => Value::Null,
         "ini_parse_quantity" => Value::Int(arg(args, 0).to_int()),
         "error_get_last" | "error_clear_last" => Value::Null,
-        "set_time_limit" => Value::Bool(true),
+        "set_time_limit" => {
+            // Restarts the seconds counter (045).
+            it.set_deadline(arg(args, 0).to_int());
+            Value::Bool(true)
+        }
         "ignore_user_abort" => Value::Int(0),
         "register_tick_function" | "unregister_tick_function" => Value::Bool(true),
 
         // ----- output buffering -----
         "ob_start" => {
-            it.ob_push();
+            let h = args.first().map(|c| c.borrow().clone());
+            it.ob_push(h);
             Value::Bool(true)
         }
         "ob_end_clean" => {
-            it.ob_pop();
+            it.ob_end_clean()?;
             Value::Bool(true)
         }
         "ob_end_flush" => {
-            if let Some(buf) = it.ob_pop() {
-                let s = buf.clone();
-                it.emit(&s);
-            }
+            it.ob_end_flush()?;
             Value::Bool(true)
         }
-        "ob_get_clean" => match it.ob_pop() {
-            Some(b) => Value::str(b),
-            None => Value::Bool(false),
-        },
+        "ob_get_clean" => it.ob_get_clean(),
+        "ob_get_flush" => it.ob_get_flush()?,
         "ob_get_contents" => match it.ob_top() {
             Some(b) => Value::str(b.clone()),
             None => Value::Bool(false),
@@ -1795,12 +2053,13 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         },
         "ob_get_level" => Value::Int(it.ob_len() as i64),
         "ob_clean" => {
-            if it.ob_pop().is_some() {
-                it.ob_push();
-            }
+            it.ob_clean()?;
             Value::Bool(true)
         }
-        "ob_flush" | "flush" => Value::Null,
+        "ob_flush" | "flush" => {
+            it.ob_flush()?;
+            Value::Null
+        }
         "ob_implicit_flush" | "ob_list_handlers" => Value::Null,
         "ob_get_status" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
         "output_reset_rewrite_vars" => Value::Bool(true),
@@ -1810,7 +2069,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "unserialize" => {
             let s = arg_str(it, args, 0);
             let mut pos = 0;
-            match unserialize(&s, &mut pos) {
+            match unserialize(it, &s, &mut pos) {
                 Ok(v) => v,
                 Err(_) => Value::Bool(false),
             }
@@ -1825,12 +2084,15 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "json_decode" => {
             let s = arg_str(it, args, 0);
             let assoc = arg(args, 1).is_truthy();
-            match json_decode(&s, assoc) {
+            match json_decode(it, &s, assoc) {
                 Ok(v) => v,
                 Err(_) => Value::Null,
             }
         }
-        "json_validate" => Value::Bool(json_decode(&arg_str(it, args, 0), true).is_ok()),
+        "json_validate" => {
+            let s = arg_str(it, args, 0);
+            Value::Bool(json_decode(it, &s, true).is_ok())
+        }
 
         // ----- hashing -----
         "md5" => Value::str(md5_hex(arg_str(it, args, 0).as_bytes())),
@@ -1862,7 +2124,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "http_build_query" => {
             let mut parts = Vec::new();
             if let Value::Array(a) = arg(args, 0) {
-                for (k, c) in a.borrow().entries.iter() {
+                for (k, c) in a.borrow().iter() {
                     let ks = key_str(k);
                     let vs = c.borrow().to_php_string();
                     parts.push(format!("{}={}", urlencode(&ks, true), urlencode(&vs, true)));
@@ -1941,7 +2203,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     it.warn_pub(&format!(
                         "file_get_contents({}): Failed to open stream: {}",
                         path, e
-                    ));
+                    ))?;
                     Value::Bool(false)
                 }
             }
@@ -1966,7 +2228,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     it.warn_pub(&format!(
                         "file_put_contents({}): Failed to open stream: {}",
                         path, e
-                    ));
+                    ))?;
                     Value::Bool(false)
                 }
             }
@@ -2134,7 +2396,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     })))
                 }
                 Err(e) => {
-                    it.warn_pub(&format!("fopen({}): Failed to open stream: {}", path, e));
+                    it.warn_pub(&format!("fopen({}): Failed to open stream: {}", path, e))?;
                     Value::Bool(false)
                 }
             }
@@ -2244,7 +2506,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     Value::Array(Rc::new(RefCell::new(a)))
                 }
                 Err(_) => {
-                    it.warn_pub(&format!("file({}): Failed to open stream", path));
+                    it.warn_pub(&format!("file({}): Failed to open stream", path))?;
                     Value::Bool(false)
                 }
             }
@@ -2258,7 +2520,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     Value::Int(b.len() as i64)
                 }
                 Err(_) => {
-                    it.warn_pub(&format!("readfile({}): Failed to open stream", path));
+                    it.warn_pub(&format!("readfile({}): Failed to open stream", path))?;
                     Value::Bool(false)
                 }
             }
@@ -2357,7 +2619,24 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "get_extension_funcs" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
         "dl" => Value::Bool(false),
-        "assert" | "assert_options" => Value::Bool(true),
+        "assert" => {
+            let v = arg(args, 0);
+            if v.is_truthy() {
+                Value::Bool(true)
+            } else {
+                return err("AssertionError", "assert(false)");
+            }
+        }
+        "assert_options" => Value::Bool(true),
+        "setlocale" => {
+            // No real locale switching — echo the first locale string.
+            let loc = arg_str(it, args, 1);
+            if loc.is_empty() {
+                Value::str("C")
+            } else {
+                Value::str(loc)
+            }
+        }
         "cli_set_process_title" | "cli_get_process_title" => Value::Bool(true),
         "sleep" => {
             let n = arg(args, 0).to_int().clamp(0, 60);
@@ -2424,7 +2703,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let upper = arg(args, 1).to_int() == 1; // CASE_UPPER=1
             let mut out = PhpArray::new();
             if let Value::Array(a) = arg(args, 0) {
-                for (k, c) in a.borrow().entries.iter() {
+                for (k, c) in a.borrow().iter() {
                     let k2 = match k {
                         ArrKey::Str(s) => ArrKey::Str(
                             if upper {
@@ -2573,7 +2852,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "iterator_to_array" | "iterator_count" | "iterator_apply" => match arg(args, 0) {
             Value::Array(a) => {
                 let mut out = PhpArray::new();
-                for (k, c) in a.borrow().entries.iter() {
+                for (k, c) in a.borrow().iter() {
                     out.set(k.clone(), c.borrow().clone());
                 }
                 Value::Array(Rc::new(RefCell::new(out)))
@@ -2738,6 +3017,7 @@ fn key_str(k: &ArrKey) -> String {
     match k {
         ArrKey::Int(i) => i.to_string(),
         ArrKey::Str(s) => s.to_string(),
+        ArrKey::Tomb => String::new(),
     }
 }
 
@@ -2753,22 +3033,23 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
         Value::Bool(b) => it.emit(&format!("{}{}bool({})\n", pad, r, b)),
         Value::Int(i) => it.emit(&format!("{}{}int({})\n", pad, r, i)),
         Value::Float(f) => {
-            // var_dump uses serialize_precision=-1 → shortest repr.
+            let prec = it.ini_int("serialize_precision", -1);
             it.emit(&format!(
                 "{}{}float({})\n",
                 pad,
                 r,
-                crate::value::format_float_repr(*f)
+                crate::value::format_float_prec(*f, prec)
             ))
         }
         Value::Str(s) => it.emit(&format!("{}{}string({}) \"{}\"\n", pad, r, s.len(), s)),
         Value::Array(a) => {
             let a = a.borrow();
             it.emit(&format!("{}{}array({}) {{\n", pad, r, a.len()));
-            for (k, c) in a.entries.iter() {
+            for (k, c) in a.iter() {
                 match k {
                     ArrKey::Int(i) => it.emit(&format!("{}  [{}]=>\n", pad, i)),
                     ArrKey::Str(s) => it.emit(&format!("{}  [\"{}\"]=>\n", pad, s)),
+                    ArrKey::Tomb => continue,
                 }
                 var_dump(it, &c.borrow(), indent + 1, zval, Rc::strong_count(c) > 1);
             }
@@ -2776,16 +3057,69 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
         }
         Value::Object(o) => {
             let ob = o.borrow();
+            // Count live props only — unset() tombstones prop_order slots.
+            let live = ob
+                .prop_order
+                .iter()
+                .filter(|n| ob.props.contains_key(*n))
+                .count();
             it.emit(&format!(
                 "{}object({})#{} ({}) {{\n",
                 pad,
                 ob.class.name(),
                 ob.id,
-                ob.prop_order.len()
+                live
             ));
             for n in &ob.prop_order {
+                // Reserved-but-cellless slots are uninitialized typed
+                // props — zend prints `uninitialized(T)` (recursion).
+                if !ob.props.contains_key(n) {
+                    if let Some(pd) = it.decl_for_slot(o, n) {
+                        if let Some(tys) = &pd.ty {
+                            let ty = if tys.len() == 2 && tys.iter().any(|t| t == "null") {
+                                format!("?{}", tys.iter().find(|t| *t != "null").unwrap())
+                            } else {
+                                tys.join("|")
+                            };
+                            let (vis, dcls) = it.prop_visibility(&ob.class, n);
+                            let disp = n
+                                .strip_prefix('\0')
+                                .and_then(|r| r.split('\0').nth(1))
+                                .unwrap_or(n.as_str());
+                            let key = match vis {
+                                crate::ast::Visibility::Private => {
+                                    format!("\"{}\":\"{}\":private", disp, dcls)
+                                }
+                                crate::ast::Visibility::Protected => {
+                                    format!("\"{}\":protected", disp)
+                                }
+                                crate::ast::Visibility::Public => {
+                                    format!("\"{}\"", disp)
+                                }
+                            };
+                            it.emit(&format!("{}  [{}]=>\n", pad, key));
+                            it.emit(&format!("{}  uninitialized({})\n", pad, ty));
+                        }
+                    }
+                    continue;
+                }
                 if let Some(c) = ob.props.get(n) {
-                    it.emit(&format!("{}  [\"{}\"]=>\n", pad, n));
+                    let (vis, dcls) = it.prop_visibility(&ob.class, n);
+                    // Mangled private keys "\0Cls\0name" display only `name`.
+                    let disp = n
+                        .strip_prefix('\0')
+                        .and_then(|r| r.split('\0').nth(1))
+                        .unwrap_or(n.as_str());
+                    let key = match vis {
+                        crate::ast::Visibility::Private => {
+                            format!("\"{}\":\"{}\":private", disp, dcls)
+                        }
+                        crate::ast::Visibility::Protected => {
+                            format!("\"{}\":protected", disp)
+                        }
+                        crate::ast::Visibility::Public => format!("\"{}\"", disp),
+                    };
+                    it.emit(&format!("{}  [{}]=>\n", pad, key));
                     var_dump(it, &c.borrow(), indent + 1, zval, Rc::strong_count(c) > 1);
                 }
             }
@@ -2807,12 +3141,15 @@ fn print_r(_it: &mut Interp, v: &Value, indent: usize) -> String {
             let mut s = String::from("Array\n");
             s.push_str(&"    ".repeat(indent));
             s.push_str("(\n");
-            for (k, c) in a.entries.iter() {
+            for (k, c) in a.iter() {
                 s.push_str(&"    ".repeat(indent + 1));
                 s.push_str(&format!("[{}] => ", key_str(k)));
-                let inner = print_r(_it, &c.borrow(), indent + 1);
+                let inner = print_r(_it, &c.borrow(), indent + 2);
                 s.push_str(&inner);
                 s.push('\n');
+                if matches!(*c.borrow(), Value::Array(_) | Value::Object(_)) {
+                    s.push('\n');
+                }
             }
             s.push_str(&"    ".repeat(indent));
             s.push(')');
@@ -2827,50 +3164,72 @@ fn print_r(_it: &mut Interp, v: &Value, indent: usize) -> String {
                 if let Some(c) = ob.props.get(n) {
                     s.push_str(&"    ".repeat(indent + 1));
                     s.push_str(&format!("[{}] => ", n));
-                    s.push_str(&print_r(_it, &c.borrow(), indent + 1));
+                    s.push_str(&print_r(_it, &c.borrow(), indent + 2));
                     s.push('\n');
+                    if matches!(*c.borrow(), Value::Array(_) | Value::Object(_)) {
+                        s.push('\n');
+                    }
                 }
             }
             s.push_str(&"    ".repeat(indent));
             s.push(')');
             s
         }
+        Value::Float(f) => {
+            let prec = _it.ini_int("precision", 14);
+            crate::value::format_float_prec(*f, prec)
+        }
         other => other.to_php_string(),
     }
 }
 
-fn var_export(v: &Value) -> String {
+fn var_export(it: &mut Interp, v: &Value) -> String {
     match v {
         Value::Null => "NULL".into(),
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
-        Value::Float(f) => crate::value::format_float_repr(*f),
+        Value::Float(f) => {
+            let prec = it.ini_int("serialize_precision", -1);
+            let s = crate::value::format_float_prec(*f, prec);
+            // var_export always renders a decimal point: 0.0, 100.0.
+            if s.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+                format!("{}.0", s)
+            } else {
+                s
+            }
+        }
         Value::Str(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")),
         Value::Array(a) => {
             let a = a.borrow();
             let mut s = String::from("array (\n");
-            for (k, c) in a.entries.iter() {
+            for (k, c) in a.iter() {
                 s.push_str("  ");
                 s.push_str(&match k {
                     ArrKey::Int(i) => i.to_string(),
                     ArrKey::Str(st) => {
                         format!("'{}'", st.replace('\\', "\\\\").replace('\'', "\\'"))
                     }
+                    ArrKey::Tomb => continue,
                 });
                 s.push_str(" => ");
-                s.push_str(&var_export(&c.borrow()));
+                s.push_str(&var_export(it, &c.borrow()));
                 s.push_str(",\n");
             }
             s.push(')');
             s
         }
         Value::Object(o) => {
-            let ob = o.borrow();
-            let mut s = format!("\\{}::__set_state(array(\n", ob.class.name());
-            for n in &ob.prop_order {
-                if let Some(c) = ob.props.get(n) {
-                    s.push_str(&format!("   '{}' => ", n));
-                    s.push_str(&var_export(&c.borrow()));
+            // All decl entries (both private `changed`s), hooked props
+            // via `get`, plain emitted names (property_hooks/dump).
+            let mut s = format!("\\{}::__set_state(array(\n", o.borrow().class.name());
+            for (out, slot, decl) in it.object_serial_entries(o) {
+                let v = match &decl {
+                    Some((p, dcls)) => it.serial_entry_value(o, p, dcls, &slot),
+                    None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
+                };
+                if let Some(v) = v {
+                    s.push_str(&format!("   '{}' => ", out));
+                    s.push_str(&var_export(it, &v));
                     s.push_str(",\n");
                 }
             }
@@ -3430,11 +3789,13 @@ fn sort_array(
             }
         }
         "ksort" | "krsort" => {
+            arr.entries.retain(|(k, _)| !matches!(k, ArrKey::Tomb));
             arr.entries.sort_by(|(a, _), (b, _)| match (a, b) {
                 (ArrKey::Int(x), ArrKey::Int(y)) => x.cmp(y),
                 (ArrKey::Str(x), ArrKey::Str(y)) => x.cmp(y),
                 (ArrKey::Int(_), ArrKey::Str(_)) => std::cmp::Ordering::Less,
                 (ArrKey::Str(_), ArrKey::Int(_)) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
             });
             if name == "krsort" {
                 arr.entries.reverse();
@@ -3457,10 +3818,12 @@ fn sort_array(
                                 cell(match ka {
                                     ArrKey::Int(i) => Value::Int(i),
                                     ArrKey::Str(s) => Value::str(s.to_string()),
+                                    ArrKey::Tomb => Value::Null,
                                 }),
                                 cell(match kb {
                                     ArrKey::Int(i) => Value::Int(i),
                                     ArrKey::Str(s) => Value::str(s.to_string()),
+                                    ArrKey::Tomb => Value::Null,
                                 }),
                             ],
                             _ => vec![ca.clone(), cbb.clone()],
@@ -3520,10 +3883,11 @@ fn serialize(v: &Value) -> String {
         Value::Array(a) => {
             let a = a.borrow();
             let mut s = format!("a:{}:{{", a.len());
-            for (k, c) in a.entries.iter() {
+            for (k, c) in a.iter() {
                 s.push_str(&serialize(&match k {
                     ArrKey::Int(i) => Value::Int(*i),
                     ArrKey::Str(st) => Value::str(st.to_string()),
+                    ArrKey::Tomb => Value::Null,
                 }));
                 s.push_str(&serialize(&c.borrow()));
             }
@@ -3532,27 +3896,28 @@ fn serialize(v: &Value) -> String {
         }
         Value::Object(o) => {
             let ob = o.borrow();
-            let n = ob.prop_order.len();
-            let mut s = format!(
-                "O:{}:\"{}\":{}:{{",
-                ob.class.name().len(),
-                ob.class.name(),
-                n
-            );
+            let mut body = String::new();
+            let mut n = 0;
             for name in &ob.prop_order {
                 if let Some(c) = ob.props.get(name) {
-                    s.push_str(&serialize(&Value::str(name.clone())));
-                    s.push_str(&serialize(&c.borrow()));
+                    body.push_str(&serialize(&Value::str(name.clone())));
+                    body.push_str(&serialize(&c.borrow()));
+                    n += 1;
                 }
             }
-            s.push('}');
-            s
+            format!(
+                "O:{}:\"{}\":{}:{{{}}}",
+                ob.class.name().len(),
+                ob.class.name(),
+                n,
+                body
+            )
         }
         _ => "N;".into(),
     }
 }
 
-fn unserialize(s: &str, pos: &mut usize) -> Result<Value, ()> {
+fn unserialize(it: &mut Interp, s: &str, pos: &mut usize) -> Result<Value, ()> {
     let b = s.as_bytes();
     let take_until = |pos: &mut usize, ch: u8| -> Result<String, ()> {
         let start = *pos;
@@ -3605,12 +3970,63 @@ fn unserialize(s: &str, pos: &mut usize) -> Result<Value, ()> {
             *pos += 1; // {
             let mut arr = PhpArray::new();
             for _ in 0..n {
-                let k = unserialize(s, pos)?;
-                let v = unserialize(s, pos)?;
+                let k = unserialize(it, s, pos)?;
+                let v = unserialize(it, s, pos)?;
                 arr.set(to_key(&k), v);
             }
             *pos += 1; // }
             Ok(Value::Array(Rc::new(RefCell::new(arr))))
+        }
+        Some(b'O') => {
+            // O:<clen>:"<class>":<n>:{<pairs>}
+            *pos += 2;
+            let clen: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
+            *pos += 1; // opening quote
+            if *pos + clen > b.len() {
+                return Err(());
+            }
+            let cname = String::from_utf8_lossy(&b[*pos..*pos + clen]).into_owned();
+            *pos += clen;
+            *pos += 1; // closing quote
+            *pos += 1; // :
+            let n: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
+            *pos += 1; // {
+            let obj = match it.instantiate(&cname.to_lowercase(), &[]) {
+                Value::Object(o) => o,
+                _ => return Err(()),
+            };
+            for _ in 0..n {
+                let k = unserialize(it, s, pos)?;
+                let Value::Str(ks) = k else { return Err(()) };
+                let plain = ks
+                    .strip_prefix('\0')
+                    .and_then(|r| r.split('\0').nth(1))
+                    .unwrap_or(ks.as_ref());
+                // Virtual hooked props have no backing to fill — zend
+                // aborts the whole unserialize, reporting the offset
+                // right after the property name (unserialize.phpt).
+                if it.unserial_prop_virtual(&obj, plain) {
+                    let _ = it.warn_pub(&format!(
+                        "unserialize(): Cannot unserialize value for virtual property {}::${}",
+                        cname, plain
+                    ));
+                    let _ = it.warn_pub(&format!(
+                        "unserialize(): Error at offset {} of {} bytes",
+                        pos,
+                        s.len()
+                    ));
+                    return Err(());
+                }
+                let v = unserialize(it, s, pos)?;
+                let mut ob = obj.borrow_mut();
+                let key = ks.to_string();
+                if !ob.prop_order.contains(&key) {
+                    ob.prop_order.push(key.clone());
+                }
+                ob.props.insert(key, cell(v));
+            }
+            *pos += 1; // }
+            Ok(Value::Object(obj))
         }
         _ => Err(()),
     }
@@ -3659,20 +4075,41 @@ fn json_encode(_it: &mut Interp, v: &Value) -> Result<String, ()> {
             }
         }
         Value::Object(o) => {
-            let ob = o.borrow();
-            let parts: Vec<String> = ob
-                .prop_order
-                .iter()
-                .filter_map(|n| {
-                    ob.props.get(n).map(|c| {
-                        format!(
-                            "{}:{}",
-                            json_str(n),
-                            json_encode(_it, &c.borrow()).unwrap_or("null".into())
-                        )
-                    })
-                })
-                .collect();
+            // JsonSerializable::jsonSerialize() wins over the raw
+            // public-property view (gh16725).
+            if _it
+                .find_method_in(&o.borrow().class, "jsonserialize")
+                .is_some()
+            {
+                let v = _it
+                    .method_invoke(o.clone(), "jsonSerialize", Vec::new())
+                    .unwrap_or(Value::Null);
+                return json_encode(_it, &v);
+            }
+            // Public props only; hooked props serialize their `get`
+            // value (property_hooks/dump, oss-fuzz-382922236).
+            let entries = _it.object_serial_entries(o);
+            let mut parts: Vec<String> = Vec::new();
+            for (out, slot, decl) in entries {
+                let public = decl
+                    .as_ref()
+                    .map(|(p, _)| p.visibility == crate::ast::Visibility::Public)
+                    .unwrap_or(true);
+                if !public {
+                    continue;
+                }
+                let v = match &decl {
+                    Some((p, dcls)) => _it.serial_entry_value(o, p, dcls, &slot),
+                    None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
+                };
+                if let Some(v) = v {
+                    parts.push(format!(
+                        "{}:{}",
+                        json_str(&out),
+                        json_encode(_it, &v).unwrap_or("null".into())
+                    ));
+                }
+            }
             format!("{{{}}}", parts.join(","))
         }
         _ => "null".into(),
@@ -3696,10 +4133,10 @@ fn json_str(s: &str) -> String {
     out
 }
 
-fn json_decode(s: &str, assoc: bool) -> Result<Value, ()> {
+fn json_decode(it: &mut Interp, s: &str, assoc: bool) -> Result<Value, ()> {
     let b = s.as_bytes();
     let mut pos = 0;
-    let v = json_value(b, &mut pos, assoc)?;
+    let v = json_value(it, b, &mut pos, assoc)?;
     Ok(v)
 }
 
@@ -3709,7 +4146,7 @@ fn json_ws(b: &[u8], pos: &mut usize) {
     }
 }
 
-fn json_value(b: &[u8], pos: &mut usize, assoc: bool) -> Result<Value, ()> {
+fn json_value(it: &mut Interp, b: &[u8], pos: &mut usize, assoc: bool) -> Result<Value, ()> {
     json_ws(b, pos);
     match b.get(*pos) {
         Some(b'n') => {
@@ -3764,7 +4201,7 @@ fn json_value(b: &[u8], pos: &mut usize, assoc: bool) -> Result<Value, ()> {
                 return Ok(Value::Array(Rc::new(RefCell::new(a))));
             }
             loop {
-                let v = json_value(b, pos, assoc)?;
+                let v = json_value(it, b, pos, assoc)?;
                 a.push(v);
                 json_ws(b, pos);
                 match b.get(*pos) {
@@ -3789,12 +4226,21 @@ fn json_value(b: &[u8], pos: &mut usize, assoc: bool) -> Result<Value, ()> {
                 return Ok(if assoc {
                     Value::Array(Rc::new(RefCell::new(a)))
                 } else {
-                    empty_object()
+                    let Some(cls) = it.lookup_class("stdclass") else {
+                        return Ok(Value::Null);
+                    };
+                    Value::Object(it.alloc_obj(PhpObject {
+                        class: cls,
+                        props: HashMap::new(),
+                        prop_order: Vec::new(),
+                        id: 0,
+                        internal: None,
+                    }))
                 });
             }
             loop {
                 json_ws(b, pos);
-                let k = match json_value(b, pos, true)? {
+                let k = match json_value(it, b, pos, true)? {
                     Value::Str(s) => s.to_string(),
                     _ => return Err(()),
                 };
@@ -3803,7 +4249,7 @@ fn json_value(b: &[u8], pos: &mut usize, assoc: bool) -> Result<Value, ()> {
                     return Err(());
                 }
                 *pos += 1;
-                let v = json_value(b, pos, assoc)?;
+                let v = json_value(it, b, pos, assoc)?;
                 a.set(ArrKey::Str(k.into()), v);
                 json_ws(b, pos);
                 match b.get(*pos) {
@@ -3820,8 +4266,28 @@ fn json_value(b: &[u8], pos: &mut usize, assoc: bool) -> Result<Value, ()> {
             Ok(if assoc {
                 Value::Array(Rc::new(RefCell::new(a)))
             } else {
-                // non-assoc → stdClass-ish object (approximate with array)
-                Value::Array(Rc::new(RefCell::new(a)))
+                // non-assoc decodes to stdClass
+                let mut props = HashMap::new();
+                let mut order = Vec::new();
+                for (k, c) in a.iter() {
+                    let ks = match k {
+                        ArrKey::Str(st) => st.to_string(),
+                        ArrKey::Int(i) => i.to_string(),
+                        ArrKey::Tomb => continue,
+                    };
+                    order.push(ks.clone());
+                    props.insert(ks, c.clone());
+                }
+                let Some(cls) = it.lookup_class("stdclass") else {
+                    return Ok(Value::Null);
+                };
+                Value::Object(it.alloc_obj(PhpObject {
+                    class: cls,
+                    props,
+                    prop_order: order,
+                    id: 0,
+                    internal: None,
+                }))
             })
         }
         Some(&c) if c == b'-' || c.is_ascii_digit() => {
@@ -3852,10 +4318,6 @@ fn utf8_len(b: u8) -> usize {
     } else {
         4
     }
-}
-
-fn empty_object() -> Value {
-    Value::Null // placeholder until stdClass lands
 }
 
 // ---------- hashing ----------
@@ -3999,7 +4461,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
             let re = match php_regex(&pat) {
                 Some(r) => r,
                 None => {
-                    it.warn_pub(&format!("preg_match(): Invalid regex '{}'", pat));
+                    it.warn_pub(&format!("preg_match(): Invalid regex '{}'", pat))?;
                     return Ok(Value::Bool(false));
                 }
             };
@@ -4123,7 +4585,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
             };
             let mut out = PhpArray::new();
             if let Value::Array(a) = arg(args, 1) {
-                for (k, c) in a.borrow().entries.iter() {
+                for (k, c) in a.borrow().iter() {
                     let v = c.borrow().to_php_string();
                     if re.is_match(&v) {
                         out.set(k.clone(), Value::str(v));
