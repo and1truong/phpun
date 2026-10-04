@@ -1,0 +1,17 @@
+TypeError: ArrayObject::exchangeArray(): Argument #1 ($array) must be of type array, int given
+TypeError: ArrayObject::exchangeArray(): Argument #1 ($array) must be of type array, string given
+ArgumentCountError: ArrayObject::exchangeArray() expects exactly 1 argument, 0 given
+ArgumentCountError: ArrayObject::append() expects exactly 1 argument, 0 given
+
+Deprecated: ArrayObject::exchangeArray(): Using an object as a backing array for ArrayObject is deprecated, as it allows violating class constraints and invariants in /home/ubuntu/repos/phpun/crates/phpun-core/tests/fixtures/f5_exchange.php on line 9
+array(0) {
+}
+array(1) {
+  ["x"]=>
+  int(7)
+}
+
+Deprecated: ArrayObject::__construct(): Using an object as a backing array for ArrayObject is deprecated, as it allows violating class constraints and invariants in /home/ubuntu/repos/phpun/crates/phpun-core/tests/fixtures/f5_exchange.php on line 14
+int(9)
+int(2)
+int(3)

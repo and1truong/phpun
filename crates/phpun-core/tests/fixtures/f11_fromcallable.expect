@@ -1,0 +1,1 @@
+TypeError: Failed to create closure from callable: cannot access "self" when no class scope is active
