@@ -1288,7 +1288,7 @@ impl<'a> Interp<'a> {
         fwd: bool,
     ) -> Result<Value, PhpError> {
         if let Some((m, sc)) = self.scope_private_method(name) {
-            let this_obj = if m.is_static {
+            let this_obj = if m.is_static || !fwd {
                 None
             } else {
                 self.stack
@@ -1322,14 +1322,17 @@ impl<'a> Interp<'a> {
                 // Inaccessible found-method: same magic preference as
                 // the missing path — __call first in object context,
                 // else __callStatic (bug53826, bug48533).
-                let this_obj = self
-                    .stack
-                    .last()
-                    .and_then(|f| f.this_obj.clone())
-                    .filter(|o| {
-                        let cname = o.borrow().class.name().to_string();
-                        self.is_a_str(&cname, cls.name())
-                    });
+                let this_obj = if !fwd {
+                    None
+                } else {
+                    self.stack
+                        .last()
+                        .and_then(|f| f.this_obj.clone())
+                        .filter(|o| {
+                            let cname = o.borrow().class.name().to_string();
+                            self.is_a_str(&cname, cls.name())
+                        })
+                };
                 if let Some(o) = this_obj {
                     if let Some((cm, cdc)) = self.find_method_in(&cls, "__call") {
                         return self.call_via_magic(o, &cm, cdc, name, args);

@@ -102,7 +102,9 @@ pub(crate) fn dispatch(
         "is_callable" => {
             let v = arg(args, 0);
             let syntax_only = arg(args, 1).is_truthy();
-            let ok = it.is_callable_value(&v);
+            // A throwing autoloader's exception propagates through
+            // is_callable — it is not swallowed into a false.
+            let ok = it.try_is_callable_value(&v)?;
             // $callable_name writes back through the arg cell —
             // syntax_only gives the canonical `Class::m` /
             // `{closure:fn():L}` form (closure_016).
