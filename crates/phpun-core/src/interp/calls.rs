@@ -3628,6 +3628,7 @@ impl<'a> Interp<'a> {
                     for v in &args.cells[i.min(args.cells.len())..] {
                         if p.by_ref {
                             arr.is_ref = true;
+                            self.ref_cells.insert(Rc::as_ptr(v) as usize);
                             arr.push_cell(v.clone());
                         } else {
                             arr.push(v.borrow().clone());
@@ -3636,6 +3637,7 @@ impl<'a> Interp<'a> {
                     for (n, c) in &variadic_named {
                         if p.by_ref {
                             arr.is_ref = true;
+                            self.ref_cells.insert(Rc::as_ptr(c) as usize);
                             arr.set_cell(ArrKey::Str(n.clone().into()), c.clone());
                         } else {
                             arr.set(ArrKey::Str(n.clone().into()), c.borrow().clone());

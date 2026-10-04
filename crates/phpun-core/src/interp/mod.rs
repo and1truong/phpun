@@ -1550,10 +1550,12 @@ impl<'a> Interp<'a> {
         }
         {
             let mut a = arr.borrow_mut();
-            // Entries alias globals.vars cells — writes must never CoW-split.
+            // Entries alias globals.vars cells — writes must never
+            // CoW-split, so the bound cells ride the ref-mark set too.
             a.is_ref = true;
             for n in names {
                 if let Some(c) = self.globals.vars.get(&n) {
+                    self.ref_cells.insert(Rc::as_ptr(c) as usize);
                     a.set_cell(ArrKey::Str(n.into()), c.clone());
                 }
             }

@@ -272,17 +272,23 @@ impl<'a> Interp<'a> {
                 };
                 // zend returns a copy of the old hash — bound refs stay.
                 let old = old.borrow();
-                Value::Array(Rc::new(RefCell::new(ao_copy(&old))))
+                Value::Array(Rc::new(RefCell::new(self.dup_array(&old))))
             }
-            "getarraycopy" => Value::Array(Rc::new(RefCell::new(ao_copy(&arr.borrow())))),
+            "getarraycopy" => Value::Array(Rc::new(RefCell::new(self.dup_array(&arr.borrow())))),
             "offsetget" => {
                 let k = args
                     .cells
                     .first()
                     .map(|c| to_key(&c.borrow()))
                     .unwrap_or(ArrKey::Int(0));
-                match arr.borrow().get(&k) {
-                    Some(v) => v,
+                match arr.borrow().get_cell(&k) {
+                    Some(c) => {
+                        // zend read_dimension returns the bucket zval —
+                        // ++/-- and `=&` binds reach it through
+                        // last_ret_cell and write through the cell.
+                        self.last_ret_cell = Some(c.clone());
+                        c.borrow().clone()
+                    }
                     None => {
                         let kn = match &k {
                             ArrKey::Int(i) => format!("{}", i),
@@ -310,7 +316,24 @@ impl<'a> Interp<'a> {
                     .unwrap_or(Value::Null);
                 match args.cells.first().map(|c| c.borrow().clone()) {
                     Some(Value::Null) | None => arr.borrow_mut().push(v),
-                    Some(kv) => arr.borrow_mut().set(to_key(&kv), v),
+                    Some(kv) => {
+                        let k = to_key(&kv);
+                        // zend writes a fresh zval into the bucket: an
+                        // &-reference element is severed (the alias
+                        // keeps its old value), while a prop-bound
+                        // cell (object backing / ARRAY_AS_PROPS)
+                        // writes through so both views stay in sync.
+                        let sever = arr
+                            .borrow()
+                            .get_cell(&k)
+                            .map(|c| self.ref_cells.contains(&(Rc::as_ptr(&c) as usize)))
+                            .unwrap_or(false);
+                        if sever {
+                            arr.borrow_mut().bind_cell(k, cell(v));
+                        } else {
+                            arr.borrow_mut().set(k, v);
+                        }
+                    }
                 }
                 Value::Null
             }
@@ -907,7 +930,7 @@ impl<'a> Interp<'a> {
         mname: &str,
     ) -> Result<(Rc<RefCell<PhpArray>>, Option<i64>), PhpError> {
         match v {
-            Value::Array(a) => Ok((Rc::new(RefCell::new(ao_copy(&a.borrow()))), None)),
+            Value::Array(a) => Ok((Rc::new(RefCell::new(self.dup_array(&a.borrow()))), None)),
             Value::Object(o) => {
                 self.deprecated(&format!(
                     "{}::{}(): Using an object as a backing array for {} is deprecated, as it allows violating class constraints and invariants",
@@ -924,7 +947,7 @@ impl<'a> Interp<'a> {
                 };
                 if let Some((src, src_flags)) = src {
                     return Ok((
-                        Rc::new(RefCell::new(ao_copy(&src.borrow()))),
+                        Rc::new(RefCell::new(self.dup_array(&src.borrow()))),
                         Some(src_flags),
                     ));
                 }
@@ -1950,27 +1973,4 @@ impl<'a> Interp<'a> {
             None => false,
         }
     }
-}
-
-/// zend_hash copy for spl storage copies: plain cells copy by value,
-/// shared php-reference cells stay bound (`new ArrayObject` /
-/// `exchangeArray` / `getArrayCopy` all behave this way in zend).
-fn ao_copy(a: &PhpArray) -> PhpArray {
-    let mut copy = PhpArray::new();
-    for (k, c) in &a.entries {
-        if matches!(k, ArrKey::Tomb) {
-            continue;
-        }
-        // zend array_dup keeps IS_REFERENCE elements bound — our is_ref
-        // flag marks arrays that gained &-aliases, so a shared cell
-        // alone (e.g. prop cells bound for object-backing) isn't a
-        // reference and copies by value.
-        if a.is_ref && Rc::strong_count(c) > 1 {
-            copy.is_ref = true;
-            copy.bind_cell(k.clone(), c.clone());
-        } else {
-            copy.set(k.clone(), c.borrow().clone());
-        }
-    }
-    copy
 }
