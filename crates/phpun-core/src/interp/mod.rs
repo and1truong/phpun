@@ -230,6 +230,10 @@ pub struct Interp<'a> {
     /// Top-level parentless classes registered by hoisting (early
     /// binding); their decl stmt then no-ops (namespaces/ns_060).
     early_bound_classes: HashSet<String>,
+    /// Functions registered by hoisting; their decl stmt no-ops like
+    /// PHP's early binding (the redeclare fatal only fires when a
+    /// DIFFERENT decl claims an existing name).
+    early_bound_funcs: HashSet<String>,
     constants: HashMap<String, Value>,
     /// Accumulated program output (display_errors prints to stdout under
     /// CLI, and the PHPT harness merges streams via 2>&1).
@@ -748,6 +752,7 @@ impl<'a> Interp<'a> {
             consts_linked: std::collections::HashSet::new(),
             decl_aliases: Vec::new(),
             early_bound_classes: HashSet::new(),
+            early_bound_funcs: HashSet::new(),
             constants,
             out: Vec::new(),
             err_buf: String::new(),
@@ -940,7 +945,8 @@ impl<'a> Interp<'a> {
                     }
                     let mut d = d.clone();
                     d.file = self.cur_file.clone();
-                    self.functions.insert(key, Rc::new(d));
+                    self.functions.insert(key.clone(), Rc::new(d));
+                    self.early_bound_funcs.insert(key);
                 }
                 // `namespace X { stmts }` parses as
                 // Block[Namespace, Block[stmts]] — decls inside are still

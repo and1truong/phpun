@@ -2685,7 +2685,14 @@ impl<'a> Interp<'a> {
                     .map(|(mm, _)| mm.is_static || !need_static)
                     .unwrap_or(false)
                     || self
-                        .find_method_in(&c, if need_static { "__callstatic" } else { "__call" })
+                        .find_method_in(
+                            &c,
+                            if need_static {
+                                "__callstatic"
+                            } else {
+                                "__call"
+                            },
+                        )
                         .is_some()
             }
             _ => false,

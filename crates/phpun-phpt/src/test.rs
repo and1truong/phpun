@@ -52,8 +52,25 @@ pub const ALLOWED_SECTIONS: &[&str] = &[
     "FLAKY",
 ];
 
+/// Byte-preserving decode: phpt files are byte strings (EXPECT bodies
+/// can contain raw bytes like \xff; FILE sources can be Latin-1), so
+/// map byte n to codepoint n. Everything downstream compares and
+/// re-encodes in this same space (run-tests.php treats them as bytes).
+pub fn latin1_to_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// Inverse of latin1_to_string — chars > 0xff cannot appear in a
+/// latin1-decoded section, but map defensively to '?'.
+pub fn string_to_latin1(s: &str) -> Vec<u8> {
+    s.chars()
+        .map(|c| if (c as u32) <= 0xff { c as u8 } else { b'?' })
+        .collect()
+}
+
 pub fn parse_file(path: &Path) -> std::io::Result<PhptTest> {
-    let content = std::fs::read_to_string(path)?;
+    let raw = std::fs::read(path)?;
+    let content = latin1_to_string(&raw);
     Ok(parse_str(path.to_path_buf(), &content))
 }
 

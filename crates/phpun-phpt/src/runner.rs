@@ -286,8 +286,10 @@ fn exec(
     let stdout = out_t.join().unwrap_or_default();
     let stderr = err_t.join().unwrap_or_default();
     ExecOut {
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        // Byte-space decode so program output compares against the
+        // byte-level EXPECT sections (see test::latin1_to_string).
+        stdout: crate::test::latin1_to_string(&stdout),
+        stderr: crate::test::latin1_to_string(&stderr),
         code: status.and_then(|s| s.code()),
         signaled: false,
         timed_out,
@@ -362,7 +364,7 @@ fn shell_split(s: &str) -> Vec<String> {
 fn write_php(dir: &Path, stem: &str, contents: &str) -> Option<PathBuf> {
     let p = dir.join(format!("{}.php", stem));
     std::fs::File::create(&p)
-        .and_then(|mut f| f.write_all(contents.as_bytes()))
+        .and_then(|mut f| f.write_all(&crate::test::string_to_latin1(contents)))
         .ok()
         .map(|_| p)
 }

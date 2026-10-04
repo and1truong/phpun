@@ -172,9 +172,9 @@ fn apply_cb_pattern(
         }
         let r = match it.call_value(
             cb,
-            crate::interp::CallArgs::positional(vec![cell(Value::Array(Rc::new(
-                RefCell::new(group_arr),
-            )))]),
+            crate::interp::CallArgs::positional(vec![cell(Value::Array(Rc::new(RefCell::new(
+                group_arr,
+            ))))]),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -236,8 +236,6 @@ fn preg_callable_ok(it: &mut Interp, v: &Value) -> bool {
     it.is_callable_value(v)
 }
 
-/// Does a `/pat/flags` pattern carry the `u` (UTF-8) modifier?
-
 fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, PhpError> {
     if !matches!(
         name,
@@ -282,17 +280,8 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
             .to_string(),
         )),
         "preg_match" | "preg_match_all" => {
-            if std::env::var_os("PREG_DEBUG").is_some() {
-                static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                let t0 = *T0.get_or_init(std::time::Instant::now);
-                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                eprintln!("preg#{} @{:.3}s", n, t0.elapsed().as_secs_f64());
-            }
             let pat = preg_pattern_str(it, name, args)?;
-            let _dbg = std::env::var_os("PREG_DEBUG").is_some().then(std::time::Instant::now);
             let subj = arg_bs(it, args, 1);
-            if let Some(t) = _dbg { eprintln!("  arg_bs: {:?}", t.elapsed()); }
             let subj_rc = match arg(args, 1) {
                 Value::Str(s) => Some(s),
                 _ => None,
@@ -342,21 +331,9 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                 it.last_preg_error = 1;
                 return Ok(Value::Bool(false));
             }
-            if let Some(t) = _dbg { eprintln!("  compile+validate: {:?}", t.elapsed()); }
             let mut matches_arr = PhpArray::new();
             let mut count = 0i64;
-            let _dbg_rc_len = subj_rc.as_ref().map(|r| r.len());
             let (caps, rc) = re.caps(&subj, offset, all, subj_rc, it);
-            if _dbg.is_some() {
-                eprintln!(
-                    "  caps off={} len={} utf8rc={:?} -> n={} rc={}",
-                    offset,
-                    subj.len(),
-                    _dbg_rc_len,
-                    caps.len(),
-                    rc
-                );
-            }
             if rc != 0 {
                 it.last_preg_error = preg_rc_err(rc);
                 return Ok(Value::Bool(false));
@@ -696,9 +673,9 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                             // every element dropped.
                             return Ok(match &subject {
                                 Subj::Scalar(_) => Value::Null,
-                                Subj::Arr(_) => Value::Array(Rc::new(RefCell::new(
-                                    PhpArray::new(),
-                                ))),
+                                Subj::Arr(_) => {
+                                    Value::Array(Rc::new(RefCell::new(PhpArray::new())))
+                                }
                             });
                         }
                     };
@@ -731,7 +708,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                                 // Subject conversion failure aborts
                                 // the whole call.
                                 let cur = subj_elem_str(it, &cell(v.clone()))?;
-                                match apply_cb_pattern(
+                                if let Some((o, n)) = apply_cb_pattern(
                                     it,
                                     name,
                                     &re,
@@ -741,11 +718,8 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                                     limit,
                                     &mut pending_err,
                                 )? {
-                                    Some((o, n)) => {
-                                        total += n;
-                                        kept.push((k.clone(), Value::bytes(o)));
-                                    }
-                                    None => {}
+                                    total += n;
+                                    kept.push((k.clone(), Value::bytes(o)));
                                 }
                             }
                             *elems = kept;
@@ -1227,11 +1201,10 @@ impl PhpRe {
                 // itself — its BADUTFOFFSET / UTF8_ERRn map straight
                 // to preg error codes.
                 let known_valid = r.utf8
-                    && subj_rc
-                        .as_ref()
-                        .is_some_and(|rc| {
-                            it.valid_utf8.contains_key(&(Rc::as_ptr(rc) as *const u8 as usize))
-                        })
+                    && subj_rc.as_ref().is_some_and(|rc| {
+                        it.valid_utf8
+                            .contains_key(&(Rc::as_ptr(rc) as *const u8 as usize))
+                    })
                     && (offset == s.len() || (s[offset] & 0xC0) != 0x80);
                 let (v, e) = r.match_all(
                     s,
@@ -1252,7 +1225,8 @@ impl PhpRe {
                 // valid — later calls skip re-validation entirely.
                 if r.utf8 && e == 0 && offset == 0 && !known_valid {
                     if let Some(rc) = subj_rc {
-                        it.valid_utf8.insert(Rc::as_ptr(&rc) as *const u8 as usize, rc);
+                        it.valid_utf8
+                            .insert(Rc::as_ptr(&rc) as *const u8 as usize, rc);
                     }
                 }
                 (

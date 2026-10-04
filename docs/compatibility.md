@@ -124,3 +124,30 @@ HTTP request→response path, and one real framework component running.
   `[internal function]` while eval-position callbacks show their real site
 - Non-static method called statically receives `$this` when the caller's
   `$this` is-an-instance-of the callee class (bug21961)
+
+## ext/pcre — 153/158 (96.8%)
+
+Suite: `vendor/php-tests/ext/pcre` against PHP 8.5.11 (oracle PCRE2
+10.49; phpun vendors vivacity-pcre2-sys 10.45 — depth counting differs
+by one frame, so `pcre.recursion_limit` is passed to PCRE2 as ini+1).
+
+preg_* implemented on real PCRE2: match/match_all/replace/filter/
+callback/callback_array/split/grep/quote/last_error{,_msg}. Loop
+structure mirrors php_pcre.c: replace-family iterates subjects outer ×
+patterns inner with lazy per-element coercion and pending-exception
+chaining; callback_array iterates patterns outer (whole subject chains
+through each pattern, callbacks validated lazily when reached).
+
+Deferred (PHP-internal regressions, not phpun bugs):
+- check_jit_enabled — phpinfo JIT status row; phpun has no JIT
+- errors05, preg_match_error3 — JIT-stack-limit error paths (err 6)
+- gh15205_1/_2 — UAF reproducers needing RegexIterator /
+  stream_wrapper_register internals
+- locales (SKIP): needs pt_PT locale on the host
+- bug70345_old, bug72463_2 (SKIP): platform guards
+- bug77193, bug78272, gh11374, pcre_reentrancy (UNSUPPORTED):
+  EXTENSIONS-section requirements
+
+Harness note: .phpt files are parsed byte-faithfully (latin-1
+codepoint space) — EXPECT bodies with raw bytes (007.phpt) and
+non-UTF-8 FILE sources now load instead of BORKing.

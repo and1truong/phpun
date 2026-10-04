@@ -249,13 +249,20 @@ impl<'a> Interp<'a> {
                 }
                 let key = d.name.to_lowercase();
                 if let Some(prev) = self.functions.get(&key) {
-                    return self.err_flow(PhpError::fatal(
-                        format!(
-                            "Cannot redeclare function {}() (previously declared in {}:{})",
-                            d.name, prev.file, prev.line
-                        ),
-                        self.cur_line,
-                    ));
+                    // Early-bound decls are compile-time registered —
+                    // reaching their own stmt is a no-op, not a collision.
+                    let self_decl = prev.line == d.line
+                        && prev.file == self.cur_file
+                        && self.early_bound_funcs.contains(&key);
+                    if !self_decl {
+                        return self.err_flow(PhpError::fatal(
+                            format!(
+                                "Cannot redeclare function {}() (previously declared in {}:{})",
+                                d.name, prev.file, prev.line
+                            ),
+                            self.cur_line,
+                        ));
+                    }
                 }
                 let mut d = d.clone();
                 d.file = self.cur_file.clone();
