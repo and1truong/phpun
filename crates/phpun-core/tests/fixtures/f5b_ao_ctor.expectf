@@ -1,0 +1,31 @@
+
+Deprecated: ArrayObject::__construct(): Using an object as a backing array for ArrayObject is deprecated, as it allows violating class constraints and invariants in %s/crates/phpun-core/tests/fixtures/f5b_ao_ctor.php on line 3
+int(3)
+array(3) {
+  [0]=>
+  int(1)
+  [1]=>
+  int(2)
+  [2]=>
+  int(3)
+}
+0=>1 1=>2 2=>3 
+
+Deprecated: ArrayObject::__construct(): Using an object as a backing array for ArrayObject is deprecated, as it allows violating class constraints and invariants in %s/crates/phpun-core/tests/fixtures/f5b_ao_ctor.php on line 9
+int(2)
+array(2) {
+  [0]=>
+  int(4)
+  [1]=>
+  int(5)
+}
+
+Deprecated: ArrayObject::__construct(): Using an object as a backing array for ArrayObject is deprecated, as it allows violating class constraints and invariants in %s/crates/phpun-core/tests/fixtures/f5b_ao_ctor.php on line 13
+int(2)
+array(2) {
+  ["p"]=>
+  int(1)
+  ["q"]=>
+  int(2)
+}
+int(1)

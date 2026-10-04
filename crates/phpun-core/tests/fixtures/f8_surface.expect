@@ -1,0 +1,18 @@
+bool(true)
+bool(true)
+bool(true)
+bool(true)
+bool(true)
+bool(true)
+string(13) "ArrayIterator"
+string(22) "RecursiveArrayIterator"
+string(81) "O:11:"ArrayObject":4:{i:0;i:0;i:1;a:2:{s:1:"b";i:2;s:1:"a";i:1;}i:2;a:0:{}i:3;N;}"
+object(ArrayObject)#3 (1) {
+  ["storage":"ArrayObject":private]=>
+  array(2) {
+    ["b"]=>
+    int(2)
+    ["a"]=>
+    int(1)
+  }
+}

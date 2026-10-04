@@ -193,7 +193,56 @@ pub(crate) fn dispatch(
             Value::Bool(true)
         }
         "error_reporting" => {
-            let lv = args.first().map(|c| c.borrow().to_int());
+            // arginfo `?int` — weak coercion: scalars coerce, numeric
+            // strings coerce, everything else throws TypeError.
+            let lv = match args.first() {
+                None => None,
+                Some(c) => {
+                    let v = c.borrow().clone();
+                    match &v {
+                        Value::Null => None,
+                        Value::Int(i) => Some(*i),
+                        Value::Float(f)
+                            if f.is_finite()
+                                && *f < 9.223372036854776e18
+                                && *f >= -9.223372036854776e18 =>
+                        {
+                            Some(*f as i64)
+                        }
+                        Value::Bool(b) => Some(*b as i64),
+                        Value::Str(s) => match crate::value::numeric(s) {
+                            crate::value::Numeric::Int(i) => Some(i),
+                            crate::value::Numeric::Float(f) => {
+                                if f != f.trunc() {
+                                    it.deprecated_pub(&format!(
+                                        "Implicit conversion from float-string \"{}\" to int loses precision",
+                                        crate::value::lossy(s)
+                                    ))?;
+                                }
+                                Some(f as i64)
+                            }
+                            _ => {
+                                return err(
+                                    "TypeError",
+                                    format!(
+                                        "error_reporting(): Argument #1 ($error_level) must be of type ?int, {} given",
+                                        zval_word(&v)
+                                    ),
+                                );
+                            }
+                        },
+                        _ => {
+                            return err(
+                                "TypeError",
+                                format!(
+                                    "error_reporting(): Argument #1 ($error_level) must be of type ?int, {} given",
+                                    zval_word(&v)
+                                ),
+                            );
+                        }
+                    }
+                }
+            };
             Value::Int(it.error_reporting(lv))
         }
         "ini_set" => {
@@ -225,9 +274,10 @@ pub(crate) fn dispatch(
                 it.ini.insert(k.clone(), v);
             }
             // ini_set('error_reporting', …) also updates the live
-            // level like error_reporting() (zend ini handler).
+            // level — zend's ini handler is atoi() only, expressions
+            // like "E_ALL" are NOT evaluated here (unlike -d).
             if k == "error_reporting" {
-                it.error_reporting(Some(it.ini_error_level()));
+                it.error_level = arg(args, 1).to_int();
             }
             match prev {
                 Some(p) => Value::str(p),

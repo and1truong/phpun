@@ -2339,4 +2339,27 @@ impl<'a> Interp<'a> {
         }
         None
     }
+
+    /// get_class_methods: the class's own methods first, then each
+    /// ancestor's, skipping names already seen (child overrides win).
+    /// Follows the builtin `parent` link like find_method_in so e.g.
+    /// RecursiveArrayIterator lists ArrayIterator's methods too.
+    pub fn class_method_names(&self, cls: &Rc<PhpClass>) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut cur = Some(cls.clone());
+        while let Some(c) = cur {
+            for m in &c.decl.methods {
+                if seen.insert(m.decl.name.to_lowercase()) {
+                    out.push(m.decl.name.clone());
+                }
+            }
+            cur = c
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        out
+    }
 }

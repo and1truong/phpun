@@ -662,23 +662,13 @@ impl<'a> Interp<'a> {
                 // removals during the loop are observed (foreachLoop.009).
                 let live = by_ref;
                 if live {
-                    // PHP separates a shared (non-reference) array when the
-                    // loop takes references to its elements, so &-writes
-                    // don't leak into other copies (foreachLoop.016). An
-                    // is_ref array is iterated live as-is.
-                    let rc = if Rc::strong_count(&rc) > 1 && !rc.borrow().is_ref {
-                        let sep: Vec<(ArrKey, Cell)> = rc
-                            .borrow()
-                            .entries
-                            .iter()
-                            .map(|(k, c)| (k.clone(), cell(c.borrow().clone())))
-                            .collect();
-                        let nr = Rc::new(RefCell::new(PhpArray {
-                            entries: sep,
-                            next: rc.borrow().next,
-                            is_ref: false,
-                            iter_pos: rc.borrow().iter_pos,
-                        }));
+                    // PHP separates a shared array when the loop takes
+                    // references to its elements — ref-marked cells stay
+                    // bound, everything else copies, so &-writes don't
+                    // leak into non-ref elements of other copies.
+                    let rc = if Rc::strong_count(&rc) > 1 {
+                        let fresh = self.dup_array(&rc.borrow());
+                        let nr = Rc::new(RefCell::new(fresh));
                         if let Ok(c) = self.eval_cell(arr) {
                             *c.borrow_mut() = Value::Array(nr.clone());
                         }

@@ -1,0 +1,3 @@
+bool(false)
+TypeError: call_user_func(): Argument #1 ($callback) must be a valid callback, cannot access private method F::priv()
+bool(true)

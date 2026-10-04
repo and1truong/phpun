@@ -310,7 +310,7 @@ pub struct Interp<'a> {
     error_handler_stack: Vec<Value>,
     exception_handler_stack: Vec<Value>,
     /// error_reporting() level mask (E_* bits).
-    error_level: i64,
+    pub(crate) error_level: i64,
     /// putenv() overrides read back by getenv() (no real process-env mutation).
     env_overrides: HashMap<String, String>,
     /// Raw argv entries after the script path, for `getopt()`.
@@ -587,7 +587,7 @@ impl<'a> Interp<'a> {
         constants.insert("E_PARSE".into(), Value::Int(4));
         constants.insert("E_NOTICE".into(), Value::Int(8));
         constants.insert("E_DEPRECATED".into(), Value::Int(8192));
-        constants.insert("E_ALL".into(), Value::Int(32767));
+        constants.insert("E_ALL".into(), Value::Int(30719));
         constants.insert("E_STRICT".into(), Value::Int(2048));
         constants.insert("E_USER_ERROR".into(), Value::Int(256));
         constants.insert("E_USER_WARNING".into(), Value::Int(512));
@@ -784,7 +784,7 @@ impl<'a> Interp<'a> {
             error_handler: None,
             error_handler_stack: Vec::new(),
             exception_handler_stack: Vec::new(),
-            error_level: 32767,
+            error_level: 30719,
             env_overrides: HashMap::new(),
             script_args: Vec::new(),
             exception_handler: None,
@@ -828,7 +828,7 @@ impl<'a> Interp<'a> {
             mem_exceeded: false,
             deadline: None,
             deadline_secs: 0,
-            ini: HashMap::new(),
+            ini: HashMap::from([("error_reporting".to_string(), "30719".to_string())]),
         };
         // Auto-globals. PHP's $_SERVER carries env + script metadata;
         // the request arrays start empty (bug24908 counts on non-empty
@@ -1275,7 +1275,7 @@ impl<'a> Interp<'a> {
                 "E_RECOVERABLE_ERROR" => 4096,
                 "E_DEPRECATED" => 8192,
                 "E_USER_DEPRECATED" => 16384,
-                "E_ALL" => 32767,
+                "E_ALL" => 30719,
                 _ => return None,
             })
         }
@@ -1550,10 +1550,12 @@ impl<'a> Interp<'a> {
         }
         {
             let mut a = arr.borrow_mut();
-            // Entries alias globals.vars cells — writes must never CoW-split.
+            // Entries alias globals.vars cells — writes must never
+            // CoW-split, so the bound cells ride the ref-mark set too.
             a.is_ref = true;
             for n in names {
                 if let Some(c) = self.globals.vars.get(&n) {
+                    self.ref_cells.insert(Rc::as_ptr(c) as usize);
                     a.set_cell(ArrKey::Str(n.into()), c.clone());
                 }
             }

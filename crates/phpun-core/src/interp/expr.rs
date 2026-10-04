@@ -1065,8 +1065,14 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        if let Some(v) = self.constants.get(key) {
-            return Ok(v.clone());
+        if let Some(v) = self.constants.get(key).cloned() {
+            // PHP 8.4+ keeps E_STRICT defined but deprecated on use.
+            if key.eq_ignore_ascii_case("E_STRICT") {
+                self.deprecated(
+                    "Constant E_STRICT is deprecated since 8.4, the error level was removed",
+                )?;
+            }
+            return Ok(v);
         }
         if let Some(v) = self.constants.get(name) {
             return Ok(v.clone());
@@ -1302,7 +1308,7 @@ impl<'a> Interp<'a> {
         } else {
             Value::Null
         };
-        let mut newv = match op {
+        let newv = match op {
             "=" => rhs,
             "+=" => self.arith("+", cur, rhs)?,
             "-=" => self.arith("-", cur, rhs)?,
@@ -1331,6 +1337,31 @@ impl<'a> Interp<'a> {
                     0,
                 ))
             }
+        };
+        // `$t = $GLOBALS` gets a private table: zend materializes
+        // $GLOBALS reads into a zval that CoWs away on write, so the
+        // copy must not keep the bound global cells or `$t['k']`
+        // writes would reach the live globals.
+        let mut newv = match newv {
+            Value::Array(rc)
+                if self
+                    .globals_arr
+                    .as_ref()
+                    .is_some_and(|g| Rc::ptr_eq(&rc, g)) =>
+            {
+                let a = rc.borrow();
+                Value::Array(Rc::new(RefCell::new(PhpArray {
+                    entries: a
+                        .entries
+                        .iter()
+                        .map(|(k, c)| (k.clone(), cell(c.borrow().clone())))
+                        .collect(),
+                    next: a.next,
+                    is_ref: false,
+                    iter_pos: a.iter_pos,
+                })))
+            }
+            v => v,
         };
         match late {
             Late::Prop { ov, name } => {
@@ -1375,15 +1406,12 @@ impl<'a> Interp<'a> {
                 }
                 {
                     let mut b = base.borrow_mut();
-                    if let Value::Array(rc) = &mut *b {
+                    if let Value::Array(_) = &mut *b {
                         // Shared zend_array: CoW-separate before the
                         // write — an overloaded prop's fetched temp
                         // must not write through into the getter's
                         // backing store (bug32660).
-                        if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
-                            let fresh = rc.borrow().clone();
-                            *b = Value::Array(Rc::new(RefCell::new(fresh)));
-                        }
+                        self.cow_split(&mut b);
                         let rc = match &*b {
                             Value::Array(rc) => rc.clone(),
                             _ => unreachable!(),
@@ -1963,7 +1991,14 @@ impl<'a> Interp<'a> {
                     && !o.borrow().props.contains_key(pn)
                 {
                     let arr = self.ao_state(&o).0;
-                    arr.borrow_mut().set(ArrKey::Str(Rc::from(pn)), v.clone());
+                    let k = ArrKey::Str(Rc::from(pn));
+                    // Object-backed: storage IS the prop table — the
+                    // write lands a dynamic prop on the backing object.
+                    if let Some(src) = self.ao_src_obj(&o) {
+                        self.ao_obj_dim_write(&src, &arr, k, v.clone());
+                    } else {
+                        arr.borrow_mut().set(k, v.clone());
+                    }
                     return Ok(v);
                 }
                 if let Some(k) = k {
@@ -2276,25 +2311,14 @@ impl<'a> Interp<'a> {
                         }
                         *b = Value::Array(Rc::new(RefCell::new(arr)));
                     }
-                    Value::Array(rc) => {
+                    Value::Array(_) => {
                         // CoW: shared arrays get replaced wholesale by callers
                         // through the cell, so mutate in place via borrow_mut —
                         // PHP semantics: write through to all aliases... PHP
                         // separates unreferenced copies; our Rc aliases share.
                         // For `$a = $b; $a[0]=1` PHP copies. Handle via split.
-                        // A referenced array (is_ref — elements aliased) is
-                        // written through, never split.
-                        if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
-                            let fresh = rc.borrow().clone();
-                            *b = Value::Array(Rc::new(RefCell::new(fresh)));
-                            if let Value::Array(rc) = &mut *b {
-                                let mut arr = rc.borrow_mut();
-                                match key {
-                                    Some(k) => arr.set(to_key(&k), v),
-                                    None => arr.push(v),
-                                }
-                            }
-                        } else {
+                        self.cow_split(&mut b);
+                        if let Value::Array(rc) = &mut *b {
                             let mut arr = rc.borrow_mut();
                             match key {
                                 Some(k) => arr.set(to_key(&k), v),
@@ -2437,8 +2461,8 @@ impl<'a> Interp<'a> {
     pub fn arr_mut(&self, c: &Cell) -> Option<Rc<RefCell<PhpArray>>> {
         let mut b = c.borrow_mut();
         if let Value::Array(rc) = &mut *b {
-            if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
-                let fresh = rc.borrow().clone();
+            if Rc::strong_count(rc) > 1 {
+                let fresh = self.dup_array(&rc.borrow());
                 *b = Value::Array(Rc::new(RefCell::new(fresh)));
             }
             if let Value::Array(rc) = &*b {
@@ -2446,6 +2470,39 @@ impl<'a> Interp<'a> {
             }
         }
         None
+    }
+
+    /// PHP copy-on-write separation: a shared zend_array is replaced
+    /// by a fresh table on write. IS_REFERENCE elements (cells bound
+    /// by `=&`/by-ref constructs, tracked in `ref_cells`) stay shared
+    /// with the source — everything else copies by value.
+    pub(in crate::interp) fn cow_split(&self, v: &mut Value) {
+        if let Value::Array(rc) = v {
+            if Rc::strong_count(rc) > 1 {
+                let fresh = self.dup_array(&rc.borrow());
+                *v = Value::Array(Rc::new(RefCell::new(fresh)));
+            }
+        }
+    }
+
+    /// The separated copy for CoW / array-copy contexts (`=`, exchange
+    /// values): ref-marked cells are re-bound, the rest duplicated.
+    pub(in crate::interp) fn dup_array(&self, a: &PhpArray) -> PhpArray {
+        let mut copy = PhpArray {
+            entries: Vec::with_capacity(a.entries.len()),
+            next: a.next,
+            is_ref: a.is_ref,
+            iter_pos: a.iter_pos,
+        };
+        for (k, c) in &a.entries {
+            let nc = if self.ref_cells.contains(&(Rc::as_ptr(c) as usize)) {
+                c.clone()
+            } else {
+                cell(c.borrow().clone())
+            };
+            copy.entries.push((k.clone(), nc));
+        }
+        copy
     }
 
     /// Index into `c`'s array value, taking a cell for `key`/`[]`.
@@ -2457,14 +2514,12 @@ impl<'a> Interp<'a> {
         if matches!(*b, Value::Null) {
             *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
         }
-        if let Value::Array(rc) = &mut *b {
+        if let Value::Array(_) = &mut *b {
             // Deliberately-shared arrays ($GLOBALS, &-bound storage)
-            // are exempted from CoW via is_ref; an ordinary shared
-            // zend_array still separates on write (bug32660).
-            if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
-                let fresh = rc.borrow().clone();
-                *b = Value::Array(Rc::new(RefCell::new(fresh)));
-            }
+            // keep their bound cells through the split (ref_cells);
+            // an ordinary shared zend_array still separates on write
+            // (bug32660).
+            self.cow_split(&mut b);
             let rc = match &*b {
                 Value::Array(rc) => rc.clone(),
                 _ => unreachable!(),
@@ -2489,9 +2544,36 @@ impl<'a> Interp<'a> {
                     Ok(c)
                 }
             }
+        } else if matches!(*b, Value::Object(_)) {
+            drop(b);
+            self.index_cell_object(&c, key)
         } else {
             drop(b);
             self.fail(PhpError::fatal("Cannot use scalar value as an array", 0))
+        }
+    }
+
+    /// Write-context cell fetch on an ArrayAccess object (`$x =&
+    /// $o['k']`, `foreach (&$o['k'])`): zend's spl read_dimension is
+    /// by-ref, so `&offsetGet` hands back the storage cell through
+    /// last_ret_cell. A value-returning offsetGet yields a throwaway
+    /// cell — plain `=` writes route through offsetSet elsewhere.
+    fn index_cell_object(&mut self, c: &Cell, key: Option<Value>) -> Result<Cell, PhpError> {
+        let Value::Object(o) = c.borrow().clone() else {
+            unreachable!()
+        };
+        self.last_ret_cell = None;
+        let rv = self.method_invoke(
+            o,
+            "offsetGet",
+            CallArgs::positional(vec![cell(key.unwrap_or(Value::Null))]),
+        )?;
+        match self.last_ret_cell.take() {
+            Some(rc) => {
+                self.ref_cells.insert(Rc::as_ptr(&rc) as usize);
+                Ok(rc)
+            }
+            None => Ok(cell(rv)),
         }
     }
 
@@ -2760,16 +2842,13 @@ impl<'a> Interp<'a> {
             Expr::Var(name) => {
                 if let Some(c) = self.var_cell_opt(name) {
                     let mut b = c.borrow_mut();
-                    if let Value::Array(rc) = &mut *b {
+                    if let Value::Array(_) = &mut *b {
                         // `unset($copy[$k])` must cow-separate a shared
                         // array like a write does — PHP copies `$a = $b`
                         // lazily; mutating the shared table would corrupt
                         // the source (InputDefinition::parseArgument
                         // unsets on its own copy of getArguments()).
-                        if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
-                            let fresh = rc.borrow().clone();
-                            *b = Value::Array(Rc::new(RefCell::new(fresh)));
-                        }
+                        self.cow_split(&mut b);
                         if let Value::Array(rc) = &*b {
                             if let Some(k) = key {
                                 rc.borrow_mut().unset(&to_key(&k));
@@ -2795,11 +2874,8 @@ impl<'a> Interp<'a> {
                 }
                 if let Ok(c) = self.index_cell(inner, ii.as_deref()) {
                     let mut b = c.borrow_mut();
-                    if let Value::Array(rc) = &mut *b {
-                        if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
-                            let fresh = rc.borrow().clone();
-                            *b = Value::Array(Rc::new(RefCell::new(fresh)));
-                        }
+                    if let Value::Array(_) = &mut *b {
+                        self.cow_split(&mut b);
                         if let Value::Array(rc) = &*b {
                             if let Some(k) = key {
                                 rc.borrow_mut().unset(&to_key(&k));

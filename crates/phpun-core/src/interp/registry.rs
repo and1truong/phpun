@@ -270,6 +270,16 @@ impl<'a> Interp<'a> {
                 trait_alias_of: None,
             })
         };
+        // stub with typed params per the Zend SPL arginfo — userland
+        // overrides declaring the same types stay signature-compatible.
+        let stub_method_typed = |name: &str, params: &[(&str, &str)]| {
+            let names: Vec<&str> = params.iter().map(|(n, _)| *n).collect();
+            let mut m = (*stub_method(name, &names)).clone();
+            for (p, (_, t)) in m.decl.params.iter_mut().zip(params.iter()) {
+                p.ty = Some(vec![t.to_string()]);
+            }
+            Rc::new(m)
+        };
 
         reg(
             ClassDecl {
@@ -288,33 +298,35 @@ impl<'a> Interp<'a> {
                 attrs: vec![],
                 traits: vec![],
                 adaptations: vec![],
+                // Decl order mirrors zend's arginfo/function_table order
+                // — get_class_methods() lists it verbatim.
                 methods: vec![
                     stub_method("__construct", &["array", "flags"]),
-                    stub_method("rewind", &[]),
-                    stub_method("valid", &[]),
-                    stub_method("current", &[]),
-                    stub_method("key", &[]),
-                    stub_method("next", &[]),
-                    stub_method("count", &[]),
-                    stub_method("offsetGet", &["key"]),
                     stub_method("offsetExists", &["key"]),
+                    stub_method("offsetGet", &["key"]),
                     stub_method("offsetSet", &["key", "value"]),
                     stub_method("offsetUnset", &["key"]),
                     stub_method("append", &["value"]),
                     stub_method("getArrayCopy", &[]),
-                    stub_method("seek", &["offset"]),
+                    stub_method("count", &[]),
                     stub_method("getFlags", &[]),
                     stub_method("setFlags", &["flags"]),
                     stub_method("asort", &["flags"]),
                     stub_method("ksort", &["flags"]),
                     stub_method("uasort", &["callback"]),
                     stub_method("uksort", &["callback"]),
-                    stub_method("natcasesort", &[]),
                     stub_method("natsort", &[]),
+                    stub_method("natcasesort", &[]),
+                    stub_method_typed("unserialize", &[("data", "string")]),
                     stub_method("serialize", &[]),
-                    stub_method("unserialize", &["data"]),
                     stub_method("__serialize", &[]),
-                    stub_method("__unserialize", &["data"]),
+                    stub_method_typed("__unserialize", &[("data", "array")]),
+                    stub_method("rewind", &[]),
+                    stub_method("current", &[]),
+                    stub_method("key", &[]),
+                    stub_method("next", &[]),
+                    stub_method("valid", &[]),
+                    stub_method("seek", &["offset"]),
                     stub_method("__debugInfo", &[]),
                 ],
                 props: vec![],
@@ -825,9 +837,9 @@ impl<'a> Interp<'a> {
                     stub_method("uasort", &["callback"]),
                     stub_method("uksort", &["callback"]),
                     stub_method("serialize", &[]),
-                    stub_method("unserialize", &["data"]),
+                    stub_method_typed("unserialize", &[("data", "string")]),
                     stub_method("__serialize", &[]),
-                    stub_method("__unserialize", &["data"]),
+                    stub_method_typed("__unserialize", &[("data", "array")]),
                     stub_method("__debugInfo", &[]),
                     stub_method("getIteratorClass", &[]),
                     stub_method("setIteratorClass", &["iteratorClass"]),

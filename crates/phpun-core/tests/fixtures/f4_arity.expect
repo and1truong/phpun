@@ -1,0 +1,7 @@
+TypeError: call_user_func(): Argument #1 ($callback) must be a valid callback, array callback must have exactly two members
+TypeError: call_user_func(): Argument #1 ($callback) must be a valid callback, array callback must have exactly two members
+TypeError: call_user_func(): Argument #1 ($callback) must be a valid callback, array callback must have exactly two members
+TypeError: call_user_func(): Argument #1 ($callback) must be a valid callback, array callback has to contain indices 0 and 1
+TypeError: call_user_func(): Argument #1 ($callback) must be a valid callback, array callback has to contain indices 0 and 1
+bool(false)
+bool(false)

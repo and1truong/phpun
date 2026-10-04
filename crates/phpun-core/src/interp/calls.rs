@@ -18,6 +18,15 @@ pub(in crate::interp) struct CallableSite {
     pub strict: bool,
 }
 
+/// A callback-resolution failure: `Msg` is a zpp diagnostic detail
+/// (`must be a valid callback, <detail>`), `Thrown` is the
+/// autoloader's own exception, which propagates instead of becoming a
+/// validation error.
+pub(in crate::interp) enum SiteErr {
+    Msg(String),
+    Thrown(PhpError),
+}
+
 impl<'a> Interp<'a> {
     // ----- calls -----
 
@@ -59,7 +68,29 @@ impl<'a> Interp<'a> {
     ) -> Result<Value, PhpError> {
         // Resolve callee name/value.
         let fname = match name {
-            Expr::Str(s) => s.to_string(),
+            Expr::Str(s) => {
+                // `('Cls::m')()` — a source-literal static call: the
+                // class name is verbatim (keywords stay unbound) and
+                // $this forwards when the caller is-a Cls.
+                let lit = s.trim_start_matches('\u{1}').trim_start_matches('\\');
+                if let Some((cn, mn)) = lit.rsplit_once("::") {
+                    let Some(cls) = self.str_callable_class(cn)? else {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!("Class \"{}\" not found", cn),
+                            0,
+                        ));
+                    };
+                    let params = self
+                        .find_method_in(&cls, mn)
+                        .map(|(m, _)| m.decl.params.clone())
+                        .unwrap_or_default();
+                    let vals =
+                        self.arg_cells(args, &params, &format!("{}::{}()", cls.name(), mn), false)?;
+                    return self.static_invoke_vis(cls, mn, vals, None, true);
+                }
+                s.to_string()
+            }
             Expr::Var(_) | Expr::VarVar(_) => {
                 let v = self.eval(name)?;
                 match v {
@@ -97,6 +128,12 @@ impl<'a> Interp<'a> {
             }
             Expr::Prop { .. } | Expr::MethodCall { .. } | Expr::Index { .. } => {
                 let v = self.eval(name)?;
+                if let Value::Str(s) = &v {
+                    // `($this->cb)()` — a dynamic string callable like
+                    // `$f()`: literal class, $this never forwards.
+                    let n = crate::value::lossy(s).to_string();
+                    return self.call_named(&n, args);
+                }
                 let params = self.callable_params(&v);
                 let ctx = format!("{}()", self.callable_ctx_name(&v));
                 let vals = self.arg_cells(args, &params, &ctx, false)?;
@@ -456,18 +493,13 @@ impl<'a> Interp<'a> {
                 line: 0,
             });
         }
-        // `('Cls::m')()` and `$f='Cls::m'; $f()` — the string-callable
-        // call path: the class part resolves by literal name (the scope
-        // keywords bind to the calling scope), misses are
-        // `Class "X" not found` / `Call to undefined method` Errors
-        // rather than the undefined-function error.
+        // `$f='Cls::m'; $f()` — the dynamic string-callable path: the
+        // class part is a LITERAL name (no scope keywords — 'self::x'
+        // reports `Class "self" not found`), and $this is never
+        // forwarded even when the caller is-a Cls.
         let raw_name = fname.trim_start_matches('\u{1}').trim_start_matches('\\');
         if let Some((cn, mn)) = raw_name.rsplit_once("::") {
-            let resolved_name = self.resolve_class_name(cn);
-            let resolved = self
-                .resolve_class(&resolved_name)
-                .and_then(|r| self.classes.get(&r.to_lowercase()).cloned());
-            let Some(cls) = resolved else {
+            let Some(cls) = self.str_callable_class(cn)? else {
                 return self.fail(PhpError::uncaught(
                     "Error",
                     format!("Class \"{}\" not found", cn),
@@ -480,7 +512,7 @@ impl<'a> Interp<'a> {
                 .unwrap_or_default();
             let vals =
                 self.arg_cells(args, &params, &format!("{}::{}()", cls.name(), mn), false)?;
-            return self.static_invoke_vis(cls, mn, vals, None, true);
+            return self.static_invoke_vis(cls, mn, vals, None, false);
         }
         let mut decl = self.functions.get(&lname).cloned();
         // A namespaced user function outranks the global/builtin one for
@@ -663,7 +695,8 @@ impl<'a> Interp<'a> {
                                 Ok((ce, mn)) => {
                                     return self.callable_invoke(ce, &mn, args, site.bound.clone());
                                 }
-                                Err(_) => {
+                                Err(SiteErr::Thrown(e)) => return Err(e),
+                                Err(SiteErr::Msg(_)) => {
                                     // Only unvalidated callers land
                                     // here — zend's direct-call error
                                     // on the written form.
@@ -671,7 +704,8 @@ impl<'a> Interp<'a> {
                                 }
                             }
                         }
-                        Err(detail) => {
+                        Err(SiteErr::Thrown(e)) => return Err(e),
+                        Err(SiteErr::Msg(detail)) => {
                             if let Some(c) = self.resolve_class(cls) {
                                 if let Some(cls) = self.classes.get(&c.to_lowercase()).cloned() {
                                     return self.static_invoke_vis(cls, m, args, None, true);
@@ -732,7 +766,10 @@ impl<'a> Interp<'a> {
                                     Ok((ce2, mn)) => {
                                         self.callable_invoke(ce2, &mn, args, Some(o.clone()))
                                     }
-                                    Err(_) => self.method_invoke_vis(o.clone(), &mname, args),
+                                    Err(SiteErr::Thrown(e)) => Err(e),
+                                    Err(SiteErr::Msg(_)) => {
+                                        self.method_invoke_vis(o.clone(), &mname, args)
+                                    }
                                 }
                             }
                             Value::Str(cn) => {
@@ -762,12 +799,14 @@ impl<'a> Interp<'a> {
                                                 args,
                                                 site.bound.clone(),
                                             ),
-                                            Err(_) => self.static_invoke_vis(
+                                            Err(SiteErr::Thrown(e)) => Err(e),
+                                            Err(SiteErr::Msg(_)) => self.static_invoke_vis(
                                                 ce_org, &mname, args, None, true,
                                             ),
                                         }
                                     }
-                                    Err(detail) => {
+                                    Err(SiteErr::Thrown(e)) => Err(e),
+                                    Err(SiteErr::Msg(detail)) => {
                                         let cls =
                                             self.resolve_class(&crate::value::lossy(&cn)).and_then(
                                                 |c| self.classes.get(&c.to_lowercase()).cloned(),
@@ -1182,7 +1221,8 @@ impl<'a> Interp<'a> {
             },
             None => match self.callable_site(&cn, None, true, true) {
                 Ok(s) => s,
-                Err(detail) => {
+                Err(SiteErr::Thrown(e)) => return Err(e),
+                Err(SiteErr::Msg(detail)) => {
                     return self.fail(PhpError::uncaught("Error", detail, 0));
                 }
             },
@@ -1197,7 +1237,8 @@ impl<'a> Interp<'a> {
                     cls = ce2;
                     mn = m2;
                 }
-                Err(detail) => {
+                Err(SiteErr::Thrown(e)) => return Err(e),
+                Err(SiteErr::Msg(detail)) => {
                     return self.fail(PhpError::uncaught("Error", detail, 0));
                 }
             }
@@ -2757,13 +2798,31 @@ impl<'a> Interp<'a> {
     /// Missing class names run the autoload chain (bug45186_2's
     /// `call_user_func(['Lazy','sm'])` regression — the class must
     /// autoload just like resolve_class does).
+    /// Class lookup for `'Cls::m'` string callables: the name is taken
+    /// verbatim (no scope keywords, no namespace resolution) and a
+    /// throwing autoloader's exception propagates.
+    pub(in crate::interp) fn str_callable_class(
+        &mut self,
+        cn: &str,
+    ) -> Result<Option<Rc<PhpClass>>, PhpError> {
+        let raw = cn.trim_start_matches('\\');
+        let lw = raw.to_lowercase();
+        if let Some(c) = self.classes.get(&lw) {
+            return Ok(Some(c.clone()));
+        }
+        if !raw.is_empty() {
+            self.run_autoload(raw)?;
+        }
+        Ok(self.classes.get(&lw).cloned())
+    }
+
     pub(in crate::interp) fn callable_site(
         &mut self,
         cn: &str,
         scope_of: Option<&Rc<PhpClass>>,
         emit_dep: bool,
         autoload: bool,
-    ) -> Result<CallableSite, String> {
+    ) -> Result<CallableSite, SiteErr> {
         let raw = cn.trim_start_matches('\\');
         let lw = raw.to_lowercase();
         let this = self.stack.last().and_then(|f| f.this_obj.clone());
@@ -2771,7 +2830,9 @@ impl<'a> Interp<'a> {
         let scope = scope_of.cloned().or_else(|| frame_scope.clone());
         match lw.as_str() {
             "self" => match scope {
-                None => Err("cannot access \"self\" when no class scope is active".to_string()),
+                None => Err(SiteErr::Msg(
+                    "cannot access \"self\" when no class scope is active".to_string(),
+                )),
                 Some(s) => {
                     if emit_dep {
                         let _ = self.deprecated("Use of \"self\" in callables is deprecated");
@@ -2784,17 +2845,19 @@ impl<'a> Interp<'a> {
                 }
             },
             "parent" => match scope {
-                None => Err("cannot access \"parent\" when no class scope is active".to_string()),
+                None => Err(SiteErr::Msg(
+                    "cannot access \"parent\" when no class scope is active".to_string(),
+                )),
                 Some(s) => match s
                     .decl
                     .parent
                     .as_deref()
                     .and_then(|p| self.classes.get(&p.to_lowercase()).cloned())
                 {
-                    None => Err(
+                    None => Err(SiteErr::Msg(
                         "cannot access \"parent\" when current class scope has no parent"
                             .to_string(),
-                    ),
+                    )),
                     Some(p) => {
                         if emit_dep {
                             let _ = self.deprecated("Use of \"parent\" in callables is deprecated");
@@ -2814,9 +2877,9 @@ impl<'a> Interp<'a> {
                     .and_then(|f| f.called_class.clone())
                     .or(scope);
                 match called {
-                    None => {
-                        Err("cannot access \"static\" when no class scope is active".to_string())
-                    }
+                    None => Err(SiteErr::Msg(
+                        "cannot access \"static\" when no class scope is active".to_string(),
+                    )),
                     Some(s) => {
                         if emit_dep {
                             let _ = self.deprecated("Use of \"static\" in callables is deprecated");
@@ -2833,15 +2896,19 @@ impl<'a> Interp<'a> {
                 let found = match self.classes.get(&lw).cloned() {
                     Some(c) => Some(c),
                     // zend_lookup_class bails on empty names without
-                    // invoking autoloaders.
+                    // invoking autoloaders; a throwing autoloader's
+                    // exception propagates (it is not a validation
+                    // failure).
                     None if autoload && !raw.is_empty() => {
-                        let _ = self.run_autoload(raw);
+                        if let Err(e) = self.run_autoload(raw) {
+                            return Err(SiteErr::Thrown(e));
+                        }
                         self.classes.get(&lw).cloned()
                     }
                     None => None,
                 };
                 match found {
-                    None => Err(format!("class \"{}\" not found", raw)),
+                    None => Err(SiteErr::Msg(format!("class \"{}\" not found", raw))),
                     Some(ce) => {
                         // fcc->object binds $this only when $this's class
                         // is-a the calling scope AND the scope is-a ce
@@ -2886,18 +2953,18 @@ impl<'a> Interp<'a> {
         mn: &str,
         emit_dep: bool,
         autoload: bool,
-    ) -> Result<(Rc<PhpClass>, String), String> {
+    ) -> Result<(Rc<PhpClass>, String), SiteErr> {
         let mut ce = site.ce.clone();
         let mut mname = mn.to_string();
         if let Some((q, m2)) = mn.rsplit_once("::") {
             let qs = self.callable_site(q, ce_org, false, autoload)?;
             if let Some(orig) = ce_org {
                 if !self.is_a_str(orig.name(), qs.ce.name()) {
-                    return Err(format!(
+                    return Err(SiteErr::Msg(format!(
                         "class {} is not a subclass of {}",
                         orig.name(),
                         qs.ce.name()
-                    ));
+                    )));
                 }
                 if emit_dep {
                     let _ = self.deprecated(&format!(
@@ -2936,25 +3003,25 @@ impl<'a> Interp<'a> {
             if self.find_method_in(&ce, magic).is_some() {
                 return Ok((ce, mname));
             }
-            return Err(format!(
+            return Err(SiteErr::Msg(format!(
                 "class {} does not have a method \"{}\"",
                 ce.name(),
                 mname
-            ));
+            )));
         };
         if m.is_abstract {
-            return Err(format!(
+            return Err(SiteErr::Msg(format!(
                 "cannot call abstract method {}::{}()",
                 ce.name(),
                 m.decl.name
-            ));
+            )));
         }
         if site.bound.is_none() && !m.is_static {
-            return Err(format!(
+            return Err(SiteErr::Msg(format!(
                 "non-static method {}::{}() cannot be called statically",
                 ce.name(),
                 m.decl.name
-            ));
+            )));
         }
         if m.visibility != crate::ast::Visibility::Public && !self.method_access_ok(&m, &dc) {
             let vis = match m.visibility {
@@ -2962,12 +3029,12 @@ impl<'a> Interp<'a> {
                 crate::ast::Visibility::Private => "private",
                 _ => "public",
             };
-            return Err(format!(
+            return Err(SiteErr::Msg(format!(
                 "cannot access {} method {}::{}()",
                 vis,
                 ce.name(),
                 m.decl.name
-            ));
+            )));
         }
         Ok((ce, mname))
     }
@@ -3007,83 +3074,111 @@ impl<'a> Interp<'a> {
     }
 
     /// Shared class+method check for `['Cls','m']` array callables.
-    fn callable_pair_ok(&mut self, cn: &str, mn: &str) -> bool {
+    fn callable_pair_ok(&mut self, cn: &str, mn: &str) -> Result<bool, PhpError> {
         match self.callable_site(cn, None, true, true) {
             Ok(site) => {
                 let ce_org = site.ce.clone();
-                self.callable_leg(&site, Some(&ce_org), mn, true, true)
-                    .is_ok()
+                match self.callable_leg(&site, Some(&ce_org), mn, true, true) {
+                    Ok(_) => Ok(true),
+                    Err(SiteErr::Thrown(e)) => Err(e),
+                    Err(SiteErr::Msg(_)) => Ok(false),
+                }
             }
-            Err(_) => false,
+            Err(SiteErr::Thrown(e)) => Err(e),
+            Err(SiteErr::Msg(_)) => Ok(false),
         }
     }
 
     /// `[$obj, 'm']` — the object is the bound context (fcc->object).
-    fn callable_obj_ok(&mut self, o: &Rc<RefCell<PhpObject>>, mn: &str) -> bool {
+    fn callable_obj_ok(&mut self, o: &Rc<RefCell<PhpObject>>, mn: &str) -> Result<bool, PhpError> {
         let ce = o.borrow().class.clone();
         let site = CallableSite {
             ce: ce.clone(),
             bound: Some(o.clone()),
             strict: false,
         };
-        self.callable_leg(&site, Some(&ce), mn, true, true).is_ok()
+        match self.callable_leg(&site, Some(&ce), mn, true, true) {
+            Ok(_) => Ok(true),
+            Err(SiteErr::Thrown(e)) => Err(e),
+            Err(SiteErr::Msg(_)) => Ok(false),
+        }
     }
 
-    pub fn is_callable_value(&mut self, v: &Value) -> bool {
+    /// `is_callable`-family validation where a throwing autoloader's
+    /// exception propagates (`is_callable('Nope::sm')` with a loader
+    /// that throws — zend's exception, not a false).
+    pub fn try_is_callable_value(&mut self, v: &Value) -> Result<bool, PhpError> {
         match v {
-            Value::Callable(_) => true,
+            Value::Callable(_) => Ok(true),
             Value::Str(s) => {
                 let s = String::from_utf8_lossy(s).to_string();
                 if self.functions.contains_key(&s.to_lowercase())
                     || builtins::is_builtin(&s.to_lowercase())
                     || builtins::builtin_params(&s.to_lowercase()).is_some()
                 {
-                    return true;
+                    return Ok(true);
                 }
                 // 'Cls::m' splits at the LAST '::' (zend_memrchr).
                 let Some((cn, mn)) = s.rsplit_once("::") else {
-                    return false;
+                    return Ok(false);
                 };
                 match self.callable_site(cn, None, true, true) {
                     Ok(site) => {
                         let ce_org = site.ce.clone();
-                        self.callable_leg(&site, Some(&ce_org), mn, true, true)
-                            .is_ok()
+                        match self.callable_leg(&site, Some(&ce_org), mn, true, true) {
+                            Ok(_) => Ok(true),
+                            Err(SiteErr::Thrown(e)) => Err(e),
+                            Err(SiteErr::Msg(_)) => Ok(false),
+                        }
                     }
-                    Err(_) => false,
+                    Err(SiteErr::Thrown(e)) => Err(e),
+                    Err(SiteErr::Msg(_)) => Ok(false),
                 }
             }
             Value::Object(o) => {
                 let cn = o.borrow().class.decl.name.clone();
                 let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() else {
-                    return false;
+                    return Ok(false);
                 };
-                self.find_method_in(&c, "__invoke").is_some()
+                Ok(self.find_method_in(&c, "__invoke").is_some())
             }
             Value::Array(a) => {
                 let arr = a.borrow();
                 // zend: num_elements must be exactly 2 AND live at
                 // indices 0/1 (`[9=>'K',10=>'m']` fails the index check).
                 if arr.len() != 2 {
-                    return false;
+                    return Ok(false);
                 }
                 let first = arr.get(&crate::value::ArrKey::Int(0));
                 let second = arr.get(&crate::value::ArrKey::Int(1));
                 let (Some(first), Some(second)) = (first, second) else {
-                    return false;
+                    return Ok(false);
                 };
                 let Value::Str(mn) = &second else {
-                    return false;
+                    return Ok(false);
                 };
                 let mn = String::from_utf8_lossy(mn).to_string();
                 match &first {
                     Value::Str(cn) => self.callable_pair_ok(&String::from_utf8_lossy(cn), &mn),
-                    Value::Callable(_) => mn.eq_ignore_ascii_case("__invoke"),
+                    Value::Callable(_) => Ok(mn.eq_ignore_ascii_case("__invoke")),
                     Value::Object(o) => self.callable_obj_ok(o, &mn),
-                    _ => false,
+                    _ => Ok(false),
                 }
             }
-            _ => false,
+            _ => Ok(false),
+        }
+    }
+
+    /// Validation-style callable check: a throwing autoloader's
+    /// exception is abandoned — the value simply is not callable
+    /// (zend turns it into a zpp TypeError upstream).
+    pub fn is_callable_value(&mut self, v: &Value) -> bool {
+        match self.try_is_callable_value(v) {
+            Ok(b) => b,
+            Err(_) => {
+                self.pending_exception = None;
+                false
+            }
         }
     }
 
@@ -3138,11 +3233,17 @@ impl<'a> Interp<'a> {
     /// found), then the method leg's ordered ladder (bug45186).
     fn callable_pair_detail(&mut self, cn: &str, mn: &str) -> String {
         match self.callable_site(cn, None, false, false) {
-            Err(d) => d,
+            Err(SiteErr::Msg(d)) => d,
+            // autoload=false — Thrown cannot happen; keep the detail
+            // shape zend would have reported anyway.
+            Err(SiteErr::Thrown(_)) => format!("class \"{}\" not found", cn),
             Ok(site) => {
                 let ce_org = site.ce.clone();
                 match self.callable_leg(&site, Some(&ce_org), mn, false, false) {
-                    Err(d) => d,
+                    Err(SiteErr::Msg(d)) => d,
+                    Err(SiteErr::Thrown(_)) => {
+                        format!("class {} does not have a method \"{}\"", ce_org.name(), mn)
+                    }
                     Ok(_) => format!("class {} does not have a method \"{}\"", ce_org.name(), mn),
                 }
             }
@@ -3158,8 +3259,10 @@ impl<'a> Interp<'a> {
             strict: false,
         };
         match self.callable_leg(&site, Some(&ce), mn, false, false) {
-            Err(d) => d,
-            Ok(_) => format!("class {} does not have a method \"{}\"", ce.name(), mn),
+            Err(SiteErr::Msg(d)) => d,
+            Err(SiteErr::Thrown(_)) | Ok(_) => {
+                format!("class {} does not have a method \"{}\"", ce.name(), mn)
+            }
         }
     }
 
@@ -3207,12 +3310,13 @@ impl<'a> Interp<'a> {
                     // like the array form (bug45186_2's
                     // `class bar does not have a method "www"`).
                     Some((cn, mn)) => match self.callable_site(cn, None, false, false) {
-                        Err(d) => d,
+                        Err(SiteErr::Msg(d)) => d,
+                        Err(SiteErr::Thrown(_)) => format!("class \"{}\" not found", cn),
                         Ok(site) => {
                             let ce_org = site.ce.clone();
                             match self.callable_leg(&site, Some(&ce_org), mn, false, false) {
-                                Err(d) => d,
-                                Ok(_) => format!(
+                                Err(SiteErr::Msg(d)) => d,
+                                Err(SiteErr::Thrown(_)) | Ok(_) => format!(
                                     "class {} does not have a method \"{}\"",
                                     site.ce.name(),
                                     mn
@@ -3524,6 +3628,7 @@ impl<'a> Interp<'a> {
                     for v in &args.cells[i.min(args.cells.len())..] {
                         if p.by_ref {
                             arr.is_ref = true;
+                            self.ref_cells.insert(Rc::as_ptr(v) as usize);
                             arr.push_cell(v.clone());
                         } else {
                             arr.push(v.borrow().clone());
@@ -3532,6 +3637,7 @@ impl<'a> Interp<'a> {
                     for (n, c) in &variadic_named {
                         if p.by_ref {
                             arr.is_ref = true;
+                            self.ref_cells.insert(Rc::as_ptr(c) as usize);
                             arr.set_cell(ArrKey::Str(n.clone().into()), c.clone());
                         } else {
                             arr.set(ArrKey::Str(n.clone().into()), c.borrow().clone());
