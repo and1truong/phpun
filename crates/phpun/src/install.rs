@@ -1,0 +1,1215 @@
+//! `phpun install` — minimal composer-install equivalent (#29).
+//! composer.json → packagist p2 metadata → semver-lite resolution →
+//! dist-zip into vendor/ → composer-format autoload files → phpun.lock.
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use crate::semver_lite::{self, Ver};
+
+const CLASS_LOADER: &str = include_str!("../templates/ClassLoader.php");
+const INSTALLED_VERSIONS: &str = include_str!("../templates/InstalledVersions.php");
+
+fn fail(msg: impl std::fmt::Display) -> ! {
+    eprintln!("phpun install: {}", msg);
+    std::process::exit(1);
+}
+
+pub fn cli(args: &[String]) -> ExitCode {
+    let mut dir = PathBuf::from(".");
+    let mut no_dev = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--no-dev" => no_dev = true,
+            "-d" | "--working-dir" => {
+                i += 1;
+                dir = PathBuf::from(args.get(i).unwrap_or_else(|| fail("missing -d value")));
+            }
+            "-h" | "--help" => {
+                println!("Usage: phpun install [-d DIR] [--no-dev]");
+                println!("\nResolve composer.json deps from packagist into vendor/ (dist-zip),");
+                println!("emit composer-format autoload files and phpun.lock.");
+                return ExitCode::SUCCESS;
+            }
+            other => fail(format!("unknown option '{}'", other)),
+        }
+        i += 1;
+    }
+    match install(&dir, no_dev) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(e),
+    }
+}
+
+/// Platform/virtual requirement — never resolved against packagist.
+fn is_platform_req(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n == "php"
+        || n.starts_with("php-")
+        || n.starts_with("ext-")
+        || n.starts_with("lib-")
+        || n == "hhvm"
+        || n == "composer"
+        || n == "composer-plugin-api"
+        || n == "composer-runtime-api"
+        || n == "composer/package-versions-deprecated"
+}
+
+#[derive(Clone, Debug)]
+struct Pkg {
+    name: String,
+    version: String, // as published, e.g. "3.0.2"
+    norm: Ver,       // parsed version_normalized
+    dist_url: String,
+    dist_ref: String,
+    dist_shasum: String,
+    require: HashMap<String, String>,
+    require_dev: HashMap<String, String>,
+}
+
+fn install(dir: &Path, no_dev: bool) -> Result<(), String> {
+    let composer_path = dir.join("composer.json");
+    let raw = fs::read_to_string(&composer_path)
+        .map_err(|e| format!("cannot read {}: {}", composer_path.display(), e))?;
+    let composer: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("composer.json: {}", e))?;
+    let content_hash = format!("{:x}", md5_str(raw.as_bytes()));
+
+    let lock_path = dir.join("phpun.lock");
+    let locked: Option<Vec<Pkg>> = read_lock(&lock_path, &content_hash);
+
+    let mut reqs: HashMap<String, String> = HashMap::new();
+    for (k, v) in obj_map(&composer["require"]) {
+        if !is_platform_req(&k) {
+            merge_req(&mut reqs, &k, v);
+        }
+    }
+    let mut dev_reqs: HashMap<String, String> = HashMap::new();
+    if !no_dev {
+        for (k, v) in obj_map(&composer["require-dev"]) {
+            if !is_platform_req(&k) {
+                merge_req(&mut dev_reqs, &k, v);
+            }
+        }
+    }
+    let minimum = composer["minimum-stability"]
+        .as_str()
+        .map(semver_lite::min_stab)
+        .unwrap_or(semver_lite::Stab::Stable);
+
+    let packages = match locked {
+        Some(pkgs) => {
+            eprintln!("phpun.lock is up to date — installing pinned versions");
+            pkgs
+        }
+        None => resolve(&reqs, &dev_reqs, minimum)?,
+    };
+
+    let vendor = dir.join("vendor");
+    fs::create_dir_all(vendor.join("composer")).map_err(|e| format!("mkdir vendor: {}", e))?;
+
+    for p in &packages {
+        install_pkg(&vendor, p)?;
+        eprintln!("  installed {} {}", p.name, p.version);
+    }
+
+    // Read each package's own composer.json for autoload metadata.
+    let mut metas = Vec::new();
+    for p in &packages {
+        let pj = vendor.join(&p.name).join("composer.json");
+        let meta: serde_json::Value = fs::read_to_string(&pj)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::Value::Null);
+        metas.push((p, meta, vendor.join(&p.name)));
+    }
+    let root_pkg = Pkg {
+        name: String::new(),
+        version: String::new(),
+        norm: Ver::parse("0.0.0").unwrap(),
+        dist_url: String::new(),
+        dist_ref: String::new(),
+        dist_shasum: String::new(),
+        require: HashMap::new(),
+        require_dev: HashMap::new(),
+    };
+    metas.push((&root_pkg, composer.clone(), dir.to_path_buf()));
+
+    emit_autoload(&vendor, &metas, &packages, &composer)?;
+
+    let lock = serde_json::json!({
+        "_readme": ["This file locks the dependencies of your project to a known state",
+                    "Generated by `phpun install` — see https://github.com/and1truong/phpun"],
+        "content-hash": content_hash,
+        "packages": packages.iter().map(lock_pkg).collect::<Vec<_>>(),
+        "packages-dev": [],
+        "aliases": [],
+        "minimum-stability": composer["minimum-stability"].as_str().unwrap_or("stable"),
+        "stability-flags": {},
+        "prefer-stable": composer["prefer-stable"].as_bool().unwrap_or(false),
+        "prefer-lowest": false,
+        "platform": {},
+        "platform-dev": {},
+        "plugin-api-version": "2.6.0"
+    });
+    fs::write(&lock_path, serde_json::to_string_pretty(&lock).unwrap())
+        .map_err(|e| format!("write phpun.lock: {}", e))?;
+    eprintln!("wrote {}", lock_path.display());
+    Ok(())
+}
+
+fn lock_pkg(p: &Pkg) -> serde_json::Value {
+    serde_json::json!({
+        "name": p.name,
+        "version": p.version,
+        "dist": {
+            "type": "zip",
+            "url": p.dist_url,
+            "reference": p.dist_ref,
+            "shasum": p.dist_shasum,
+        },
+        "require": p.require,
+        "require-dev": p.require_dev,
+    })
+}
+
+fn read_lock(path: &Path, hash: &str) -> Option<Vec<Pkg>> {
+    let s = fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    if v["content-hash"].as_str()? != hash {
+        return None;
+    }
+    let mut out = Vec::new();
+    for p in v["packages"].as_array()? {
+        out.push(Pkg {
+            name: p["name"].as_str()?.to_string(),
+            version: p["version"].as_str()?.to_string(),
+            norm: Ver::parse(p["version"].as_str()?)
+                .unwrap_or_else(|| Ver::parse("0.0.0").unwrap()),
+            dist_url: p["dist"]["url"].as_str()?.to_string(),
+            dist_ref: p["dist"]["reference"].as_str().unwrap_or("").to_string(),
+            dist_shasum: p["dist"]["shasum"].as_str().unwrap_or("").to_string(),
+            require: obj_map(&p["require"]).collect(),
+            require_dev: obj_map(&p["require-dev"]).collect(),
+        });
+    }
+    Some(out)
+}
+
+fn obj_map(v: &serde_json::Value) -> impl Iterator<Item = (String, String)> + '_ {
+    v.as_object()
+        .into_iter()
+        .flat_map(|m| m.iter())
+        .map(|(k, v)| (k.to_lowercase(), v.as_str().unwrap_or("*").to_string()))
+}
+
+fn merge_req(map: &mut HashMap<String, String>, name: &str, cons: String) {
+    map.entry(name.to_string())
+        .and_modify(|e| {
+            *e = format!("{} {}", e, cons);
+        })
+        .or_insert(cons);
+}
+
+/// BFS resolve: pick the highest version satisfying the merged
+/// constraint under the stability policy.
+fn resolve(
+    reqs: &HashMap<String, String>,
+    dev_reqs: &HashMap<String, String>,
+    minimum: semver_lite::Stab,
+) -> Result<Vec<Pkg>, String> {
+    let mut merged: HashMap<String, String> = reqs.clone();
+    for (k, v) in dev_reqs {
+        merge_req(&mut merged, k, v.clone());
+    }
+    let mut wanted: Vec<String> = merged.keys().cloned().collect();
+    wanted.sort();
+    let mut queue: Vec<String> = wanted.clone();
+    let mut picked: HashMap<String, Pkg> = HashMap::new();
+    let mut meta_cache: HashMap<String, serde_json::Value> = HashMap::new();
+
+    while let Some(name) = queue.pop() {
+        if picked.contains_key(&name) {
+            continue;
+        }
+        let cons = merged.get(&name).cloned().unwrap_or_else(|| "*".into());
+        let meta = match meta_cache.get(&name) {
+            Some(m) => m.clone(),
+            None => {
+                let m = fetch_meta(&name)?;
+                meta_cache.insert(name.clone(), m.clone());
+                m
+            }
+        };
+        let allowed = semver_lite::wants_dev(&cons).unwrap_or(minimum);
+        let pkgs = meta["packages"][&name]
+            .as_array()
+            .ok_or_else(|| format!("packagist metadata for {} is malformed", name))?;
+        let mut best: Option<Pkg> = None;
+        for pv in pkgs {
+            let Some(ver_s) = pv["version_normalized"].as_str().or(pv["version"].as_str()) else {
+                continue;
+            };
+            let Some(ver) = Ver::parse(ver_s) else {
+                continue;
+            };
+            if ver.stab < allowed {
+                continue;
+            }
+            if !semver_lite::satisfies(&ver, &cons) {
+                continue;
+            }
+            let p = Pkg {
+                name: name.clone(),
+                version: pv["version"].as_str().unwrap_or(ver_s).to_string(),
+                norm: ver,
+                dist_url: pv["dist"]["url"].as_str().unwrap_or("").to_string(),
+                dist_ref: pv["dist"]["reference"].as_str().unwrap_or("").to_string(),
+                dist_shasum: pv["dist"]["shasum"].as_str().unwrap_or("").to_string(),
+                require: obj_map(&pv["require"])
+                    .filter(|(k, _)| !is_platform_req(k))
+                    .collect(),
+                require_dev: obj_map(&pv["require-dev"])
+                    .filter(|(k, _)| !is_platform_req(k))
+                    .collect(),
+            };
+            if p.dist_url.is_empty() {
+                continue; // source-only package — dist required
+            }
+            match &best {
+                Some(b) if b.norm.cmp_ver(&p.norm) != std::cmp::Ordering::Less => {}
+                _ => best = Some(p),
+            }
+        }
+        let p = best.ok_or_else(|| {
+            format!(
+                "no version of {} satisfies '{}' (minimum-stability {:?})",
+                name, cons, minimum
+            )
+        })?;
+        let deps: Vec<(String, String)> = p
+            .require
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (dep, dc) in deps {
+            merge_req(&mut merged, &dep, dc);
+            if !picked.contains_key(&dep) {
+                queue.push(dep);
+            }
+        }
+        picked.insert(name, p);
+    }
+    let mut out: Vec<Pkg> = picked.into_values().collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+fn fetch_meta(name: &str) -> Result<serde_json::Value, String> {
+    let url = format!("https://repo.packagist.org/p2/{}.json", name);
+    let resp = ureq::get(&url)
+        .header("Accept", "application/json")
+        .call()
+        .map_err(|e| format!("{}: {}", url, e))?;
+    let mut buf = Vec::new();
+    let mut body = resp.into_body();
+    body.as_reader()
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read {}: {}", url, e))?;
+    serde_json::from_slice(&buf).map_err(|e| format!("{}: {}", url, e))
+}
+
+/// Download the dist zip and unpack into vendor/<name> (composer
+/// layout: vendor dir holds the package root contents).
+fn install_pkg(vendor: &Path, p: &Pkg) -> Result<(), String> {
+    let dest = vendor.join(&p.name);
+    if dest.join("composer.json").exists() {
+        return Ok(()); // already installed
+    }
+    let resp = ureq::get(&p.dist_url)
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| format!("download {}: {}", p.dist_url, e))?;
+    let mut zip_bytes = Vec::new();
+    let mut body = resp.into_body();
+    body.as_reader()
+        .read_to_end(&mut zip_bytes)
+        .map_err(|e| format!("download {}: {}", p.dist_url, e))?;
+
+    let tmp = vendor.join(format!(".tmp-{}", p.name.replace('/', "-")));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
+        .map_err(|e| format!("{}: unzip: {}", p.name, e))?;
+    // GitHub zipballs nest everything under a single "<repo>-<sha>/"
+    // dir — strip it so package files land at vendor/<name>/…
+    let prefix = (0..archive.len())
+        .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+        .find_map(|n| n.split('/').next().map(|s| s.to_string()))
+        .unwrap_or_default();
+    for i in 0..archive.len() {
+        let mut f = archive
+            .by_index(i)
+            .map_err(|e| format!("{}: unzip: {}", p.name, e))?;
+        let mut rel = f.name().to_string();
+        let is_dir = rel.ends_with('/');
+        if !prefix.is_empty() && rel.starts_with(&format!("{}/", prefix)) {
+            rel = rel[prefix.len() + 1..].to_string();
+        } else if rel.trim_end_matches('/') == prefix {
+            continue;
+        }
+        if rel.is_empty() {
+            continue;
+        }
+        let out = tmp.join(&rel);
+        // zip-slip guard
+        if !out.starts_with(&tmp) {
+            continue;
+        }
+        if is_dir {
+            fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+        } else {
+            if let Some(par) = out.parent() {
+                fs::create_dir_all(par).map_err(|e| e.to_string())?;
+            }
+            let mut w = fs::File::create(&out).map_err(|e| e.to_string())?;
+            std::io::copy(&mut f, &mut w).map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            if let Some(mode) = f.unix_mode() {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&out, fs::Permissions::from_mode(mode));
+            }
+        }
+    }
+    if dest.exists() {
+        fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
+    }
+    if let Some(par) = dest.parent() {
+        fs::create_dir_all(par).map_err(|e| e.to_string())?;
+    }
+    fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// --------------------------------------------------------------------
+// Autoload emission — composer 2.x output format.
+
+struct AutoloadMeta<'a> {
+    psr4: Vec<(String, Vec<String>)>,
+    psr0: Vec<(String, Vec<String>)>,
+    classmap: Vec<String>, // scan paths relative to package dir
+    files: Vec<String>,
+    exclude: Vec<String>, // exclude-from-classmap
+    dir: PathBuf,         // package root on disk
+    name: &'a str,
+}
+
+fn collect_autoload<'a>(
+    metas: &'a [(&'a Pkg, serde_json::Value, PathBuf)],
+) -> Vec<AutoloadMeta<'a>> {
+    let mut out = Vec::new();
+    for (pkg, meta, dir) in metas {
+        let autoload = &meta["autoload"];
+        let autoload_dev = &meta["autoload-dev"];
+        let mut a = AutoloadMeta {
+            psr4: vec![],
+            psr0: vec![],
+            classmap: vec![],
+            files: vec![],
+            exclude: vec![],
+            dir: dir.clone(),
+            name: if pkg.name.is_empty() {
+                "__root__"
+            } else {
+                &pkg.name
+            },
+        };
+        for src in [autoload, autoload_dev] {
+            for (ns, paths) in src["psr-4"].as_object().into_iter().flatten() {
+                let paths = str_list(paths);
+                if let Some(e) = a.psr4.iter_mut().find(|(k, _)| *k == *ns) {
+                    e.1.extend(paths);
+                } else {
+                    a.psr4.push((ns.clone(), paths));
+                }
+            }
+            for (ns, paths) in src["psr-0"].as_object().into_iter().flatten() {
+                let paths = str_list(paths);
+                if let Some(e) = a.psr0.iter_mut().find(|(k, _)| *k == *ns) {
+                    e.1.extend(paths);
+                } else {
+                    a.psr0.push((ns.clone(), paths));
+                }
+            }
+            a.classmap.extend(str_list(&src["classmap"]));
+            a.files.extend(str_list(&src["files"]));
+            a.exclude.extend(str_list(&src["exclude-from-classmap"]));
+        }
+        out.push(a);
+    }
+    out
+}
+
+fn str_list(v: &serde_json::Value) -> Vec<String> {
+    match v {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// Scan a directory/file for `class/interface/trait/enum` declarations
+/// (composer's classmap generation, regex-lite version).
+fn scan_classmap(pkg_dir: &Path, rel: &str, excludes: &[String], out: &mut Vec<(String, String)>) {
+    let base = pkg_dir.join(rel);
+    let mut stack = vec![base.clone()];
+    while let Some(p) = stack.pop() {
+        if p.is_dir() {
+            let rel_to_pkg = p
+                .strip_prefix(pkg_dir)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string();
+            if excludes.iter().any(|e| {
+                let e = e.trim_start_matches("./").trim_end_matches('/');
+                rel_to_pkg == e || rel_to_pkg.starts_with(&format!("{}/", e))
+            }) {
+                continue;
+            }
+            if let Ok(rd) = fs::read_dir(&p) {
+                for e in rd.flatten() {
+                    stack.push(e.path());
+                }
+            }
+        } else if p.extension().map(|e| e == "php").unwrap_or(false) {
+            let rel_p = p
+                .strip_prefix(pkg_dir)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string();
+            if excludes.iter().any(|e| {
+                let e = e.trim_start_matches("./").trim_end_matches('/');
+                rel_p.starts_with(e)
+            }) {
+                continue;
+            }
+            if let Ok(src) = fs::read_to_string(&p) {
+                for fqcn in find_declared(&src) {
+                    out.push((fqcn, p.to_string_lossy().to_string()));
+                }
+            }
+        }
+    }
+}
+
+/// Extract declared FQCNs from a PHP source file — regex-lite scan for
+/// `namespace` + `class|interface|trait|enum` names.
+fn find_declared(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut ns = String::new();
+    // crude tokenizer: strip comments/strings would be ideal; for the
+    // classmap this approximation is what composer effectively does.
+    let cleaned = strip_comments_strings(src);
+    let bytes = cleaned.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'\\')
+            {
+                i += 1;
+            }
+            let word = &cleaned[start..i];
+            match word {
+                "namespace" => {
+                    // read until ';' or '{'
+                    let mut name = String::new();
+                    while i < bytes.len()
+                        && bytes[i] != b';'
+                        && bytes[i] != b'{'
+                        && bytes[i] != b'\n'
+                    {
+                        name.push(bytes[i] as char);
+                        i += 1;
+                    }
+                    ns = name.trim().to_string();
+                }
+                "class" | "interface" | "trait" | "enum" => {
+                    // skip 'enum : type' backing-type colon, '::class' constants,
+                    // anonymous 'new class' — check preceding token.
+                    let prev_word = prev_token(&cleaned, start);
+                    if prev_word == "new" || prev_word == ":" || prev_word.ends_with("::") {
+                        continue;
+                    }
+                    if word == "class" && prev_word == "::" {
+                        continue;
+                    }
+                    let mut j = i;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    // enum/readonly modifiers land before the keyword;
+                    // anonymous classes have '(' or 'extends' right after
+                    let mut name = String::new();
+                    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                    {
+                        name.push(bytes[j] as char);
+                        j += 1;
+                    }
+                    if !name.is_empty() {
+                        out.push(if ns.is_empty() {
+                            name
+                        } else {
+                            format!("{}\\{}", ns.trim_matches('\\'), name)
+                        });
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn prev_token(src: &str, pos: usize) -> &str {
+    let bytes = src.as_bytes();
+    let mut end = pos;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0
+        && (bytes[start - 1].is_ascii_alphanumeric()
+            || bytes[start - 1] == b'_'
+            || bytes[start - 1] == b':')
+    {
+        start -= 1;
+    }
+    &src[start..end]
+}
+
+fn strip_comments_strings(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    out.push(' ');
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                out.push(' ');
+                out.push(' ');
+                i += 2;
+                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                    out.push(if b[i] == b'\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+                if i < b.len() {
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                }
+            }
+            b'#' => {
+                while i < b.len() && b[i] != b'\n' {
+                    out.push(' ');
+                    i += 1;
+                }
+            }
+            c @ (b'\'' | b'"') => {
+                out.push(c as char);
+                i += 1;
+                while i < b.len() && b[i] != c {
+                    out.push(if b[i] == b'\n' { '\n' } else { ' ' });
+                    if b[i] == b'\\' {
+                        i += 1;
+                        if i < b.len() {
+                            out.push(' ');
+                        }
+                    }
+                    i += 1;
+                }
+                if i < b.len() {
+                    out.push(c as char);
+                    i += 1;
+                }
+            }
+            c => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn php_str(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// Path as composer emits it inside vendor/composer/*.php files:
+/// `__DIR__ . '/..' . '/name/…'` for vendor pkgs,
+/// `__DIR__ . '/../..' . '/…'` for project-root paths.
+fn autoload_path_code(vendor_dir: &Path, abs: &Path) -> String {
+    let composer_dir = vendor_dir.join("composer");
+    if let Ok(rel) = abs.strip_prefix(&composer_dir) {
+        return format!("__DIR__ . '/{}'", rel.to_string_lossy());
+    }
+    if let Ok(rel) = abs.strip_prefix(vendor_dir) {
+        return format!("__DIR__ . '/..' . '/{}'", rel.to_string_lossy());
+    }
+    // project-root relative (base dir = vendor/..)
+    let base = vendor_dir.parent().unwrap_or(vendor_dir);
+    if let Ok(rel) = abs.strip_prefix(base) {
+        return format!("__DIR__ . '/../..' . '/{}'", rel.to_string_lossy());
+    }
+    format!("'{}'", abs.to_string_lossy())
+}
+
+/// non-static files variant: `$vendorDir . '/…'` / `$baseDir . '/…'`
+fn dyn_path_code(vendor_dir: &Path, abs: &Path) -> String {
+    let composer_dir = vendor_dir.join("composer");
+    if let Ok(rel) = abs.strip_prefix(&composer_dir) {
+        return format!("$vendorDir . '/composer/{}'", rel.to_string_lossy());
+    }
+    if let Ok(rel) = abs.strip_prefix(vendor_dir) {
+        return format!("$vendorDir . '/{}'", rel.to_string_lossy());
+    }
+    let base = vendor_dir.parent().unwrap_or(vendor_dir);
+    if let Ok(rel) = abs.strip_prefix(base) {
+        return format!("$baseDir . '/{}'", rel.to_string_lossy());
+    }
+    format!("'{}'", abs.to_string_lossy())
+}
+
+fn emit_autoload(
+    vendor: &Path,
+    metas: &[(&Pkg, serde_json::Value, PathBuf)],
+    packages: &[Pkg],
+    root: &serde_json::Value,
+) -> Result<(), String> {
+    let cdir = vendor.join("composer");
+    let autoloads = collect_autoload(metas);
+    let suffix = format!(
+        "{:x}",
+        md5_str(
+            format!(
+                "{}{:?}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                packages.len()
+            )
+            .as_bytes()
+        )
+    );
+
+    // Merge maps: later packages override? composer aggregates all
+    // dirs per prefix (dirs from all packages appended).
+    let mut psr4: Vec<(String, Vec<PathBuf>)> = vec![];
+    let mut psr0: Vec<(String, Vec<PathBuf>)> = vec![];
+    let mut files: Vec<(String, PathBuf)> = vec![]; // (md5 id, path)
+    let mut classmap: Vec<(String, String)> = vec![]; // (fqcn, abs path)
+    for a in &autoloads {
+        for (ns, paths) in &a.psr4 {
+            let dirs: Vec<PathBuf> = paths.iter().map(|p| a.dir.join(p)).collect();
+            if let Some(e) = psr4.iter_mut().find(|(k, _)| k == ns) {
+                e.1.extend(dirs);
+            } else {
+                psr4.push((ns.clone(), dirs));
+            }
+        }
+        for (ns, paths) in &a.psr0 {
+            let dirs: Vec<PathBuf> = paths.iter().map(|p| a.dir.join(p)).collect();
+            if let Some(e) = psr0.iter_mut().find(|(k, _)| k == ns) {
+                e.1.extend(dirs);
+            } else {
+                psr0.push((ns.clone(), dirs));
+            }
+        }
+        for rel in &a.files {
+            let id = format!("{:x}", md5_str(format!("{}:{}", a.name, rel).as_bytes()));
+            files.push((id, a.dir.join(rel)));
+        }
+        for rel in &a.classmap {
+            let mut found = vec![];
+            scan_classmap(&a.dir, rel, &a.exclude, &mut found);
+            classmap.extend(found);
+        }
+    }
+    classmap.push((
+        "Composer\\InstalledVersions".into(),
+        cdir.join("InstalledVersions.php")
+            .to_string_lossy()
+            .to_string(),
+    ));
+    classmap.sort_by(|a, b| a.0.cmp(&b.0));
+    classmap.dedup_by(|a, b| a.0 == b.0);
+    psr4.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.0.cmp(&b.0)));
+    files.dedup_by(|a, b| a.1 == b.1);
+
+    // dependencies' files first: order files by package dep depth — the
+    // package requiring others loads later. Simple topo over requires.
+    let order = topo_order(packages);
+    let rank: HashMap<&str, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
+    files.sort_by_key(|(_, p)| {
+        // figure which package dir this file lives under
+        metas
+            .iter()
+            .find(|(_, _, d)| p.starts_with(d))
+            .and_then(|(pkg, _, _)| rank.get(pkg.name.as_str()).copied())
+            .unwrap_or(usize::MAX)
+    });
+
+    let init_class = format!("ComposerAutoloaderInit{}", suffix);
+    let static_class = format!("Composer\\Autoload\\ComposerStaticInit{}", suffix);
+    let static_short = format!("ComposerStaticInit{}", suffix);
+
+    // --- autoload.php (composer 2.x template verbatim)
+    fs::write(
+        vendor.join("autoload.php"),
+        format!(
+            r#"<?php
+
+// autoload.php @generated by phpun
+
+if (PHP_VERSION_ID < 50600) {{
+    if (!headers_sent()) {{
+        header('HTTP/1.1 500 Internal Server Error');
+    }}
+    $err = 'Composer 2.3.0 dropped support for autoloading on PHP <5.6 and you are running '.PHP_VERSION.', please upgrade PHP or use Composer 2.2 LTS via "composer self-update --2.2". Aborting.'.PHP_EOL;
+    if (!ini_get('display_errors')) {{
+        if (PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg') {{
+            fwrite(STDERR, $err);
+        }} elseif (!headers_sent()) {{
+            echo $err;
+        }}
+    }}
+    throw new RuntimeException($err);
+}}
+
+require_once __DIR__ . '/composer/autoload_real.php';
+
+return {init}::getLoader();
+"#,
+            init = init_class
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // --- autoload_real.php (composer 2.x template)
+    let real = format!(
+        r#"<?php
+
+// autoload_real.php @generated by phpun
+
+class {init}
+{{
+    private static $loader;
+
+    public static function loadClassLoader($class)
+    {{
+        if ('Composer\Autoload\ClassLoader' === $class) {{
+            require __DIR__ . '/ClassLoader.php';
+        }}
+    }}
+
+    /**
+     * @return \Composer\Autoload\ClassLoader
+     */
+    public static function getLoader()
+    {{
+        if (null !== self::$loader) {{
+            return self::$loader;
+        }}
+
+        spl_autoload_register(array('{init}', 'loadClassLoader'), true, true);
+        self::$loader = $loader = new \Composer\Autoload\ClassLoader(\dirname(__DIR__));
+        spl_autoload_unregister(array('{init}', 'loadClassLoader'));
+
+        require __DIR__ . '/autoload_static.php';
+        call_user_func(\{staticc}::getInitializer($loader));
+
+        $loader->register(true);
+
+        $filesToLoad = \{staticc}::$files;
+        $requireFile = \Closure::bind(static function ($fileIdentifier, $file) {{
+            if (empty($GLOBALS['__composer_autoload_files'][$fileIdentifier])) {{
+                $GLOBALS['__composer_autoload_files'][$fileIdentifier] = true;
+
+                require $file;
+            }}
+        }}, null, null);
+        foreach ($filesToLoad as $fileIdentifier => $file) {{
+            $requireFile($fileIdentifier, $file);
+        }}
+
+        return $loader;
+    }}
+}}
+"#,
+        init = init_class,
+        staticc = static_class
+    );
+    fs::write(cdir.join("autoload_real.php"), real).map_err(|e| e.to_string())?;
+
+    // --- autoload_psr4.php
+    let mut body = String::new();
+    for (ns, dirs) in &psr4 {
+        let dirlist = dirs
+            .iter()
+            .map(|d| dyn_path_code(vendor, d))
+            .collect::<Vec<_>>()
+            .join(", ");
+        body.push_str(&format!("    {} => array({}),\n", php_str(ns), dirlist));
+    }
+    fs::write(
+        cdir.join("autoload_psr4.php"),
+        format!(
+            "<?php\n\n// autoload_psr4.php @generated by phpun\n\n$vendorDir = dirname(__DIR__);\n$baseDir = dirname($vendorDir);\n\nreturn array(\n{});\n",
+            body
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // --- autoload_namespaces.php (psr-0)
+    let mut body = String::new();
+    for (ns, dirs) in &psr0 {
+        let dirlist = dirs
+            .iter()
+            .map(|d| dyn_path_code(vendor, d))
+            .collect::<Vec<_>>()
+            .join(", ");
+        body.push_str(&format!("    {} => array({}),\n", php_str(ns), dirlist));
+    }
+    fs::write(
+        cdir.join("autoload_namespaces.php"),
+        format!(
+            "<?php\n\n// autoload_namespaces.php @generated by phpun\n\n$vendorDir = dirname(__DIR__);\n$baseDir = dirname($vendorDir);\n\nreturn array(\n{});\n",
+            body
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // --- autoload_classmap.php
+    let mut body = String::new();
+    for (fqcn, path) in &classmap {
+        body.push_str(&format!(
+            "    {} => {},\n",
+            php_str(fqcn),
+            dyn_path_code(vendor, Path::new(path))
+        ));
+    }
+    fs::write(
+        cdir.join("autoload_classmap.php"),
+        format!(
+            "<?php\n\n// autoload_classmap.php @generated by phpun\n\n$vendorDir = dirname(__DIR__);\n$baseDir = dirname($vendorDir);\n\nreturn array(\n{});\n",
+            body
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // --- autoload_files.php
+    let mut body = String::new();
+    for (id, path) in &files {
+        body.push_str(&format!(
+            "    {} => {},\n",
+            php_str(id),
+            dyn_path_code(vendor, path)
+        ));
+    }
+    fs::write(
+        cdir.join("autoload_files.php"),
+        format!(
+            "<?php\n\n// autoload_files.php @generated by phpun\n\n$vendorDir = dirname(__DIR__);\n$baseDir = dirname($vendorDir);\n\nreturn array(\n{});\n",
+            body
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // --- autoload_static.php
+    let mut files_static = String::new();
+    for (id, path) in &files {
+        files_static.push_str(&format!(
+            "        {} => {},\n",
+            php_str(id),
+            autoload_path_code(vendor, path)
+        ));
+    }
+    let mut plen = String::new();
+    let mut pdirs = String::new();
+    let mut by_first: HashMap<char, Vec<(String, u32)>> = HashMap::new();
+    for (ns, _) in &psr4 {
+        let first = ns.chars().next().unwrap_or('_');
+        by_first
+            .entry(first)
+            .or_default()
+            .push((ns.clone(), ns.len() as u32));
+    }
+    let mut keys: Vec<char> = by_first.keys().copied().collect();
+    keys.sort();
+    for k in keys {
+        plen.push_str(&format!(
+            "        {} =>\n        array (\n",
+            php_str(&k.to_string())
+        ));
+        let mut list = by_first[&k].clone();
+        list.sort_by_key(|x| std::cmp::Reverse(x.1));
+        for (ns, len) in list {
+            plen.push_str(&format!("            {} => {},\n", php_str(&ns), len));
+        }
+        plen.push_str("        ),\n");
+    }
+    for (ns, dirs) in &psr4 {
+        let dirlist = dirs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| format!("            {} => {},\n", i, autoload_path_code(vendor, d)))
+            .collect::<String>();
+        pdirs.push_str(&format!(
+            "        {} =>\n        array (\n{}        ),\n",
+            php_str(ns),
+            dirlist
+        ));
+    }
+    let mut p0 = String::new();
+    let mut by_first0: HashMap<char, Vec<(String, Vec<PathBuf>)>> = HashMap::new();
+    for (ns, dirs) in &psr0 {
+        let first = ns.chars().next().unwrap_or('_');
+        by_first0
+            .entry(first)
+            .or_default()
+            .push((ns.clone(), dirs.clone()));
+    }
+    let mut keys0: Vec<char> = by_first0.keys().copied().collect();
+    keys0.sort();
+    for k in keys0 {
+        p0.push_str(&format!(
+            "        {} =>\n        array (\n",
+            php_str(&k.to_string())
+        ));
+        let mut list = by_first0[&k].clone();
+        list.sort();
+        for (ns, dirs) in list {
+            let dirlist = dirs
+                .iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    format!(
+                        "                {} => {},\n",
+                        i,
+                        autoload_path_code(vendor, d)
+                    )
+                })
+                .collect::<String>();
+            p0.push_str(&format!(
+                "            {} =>\n            array (\n{}            ),\n",
+                php_str(&ns),
+                dirlist
+            ));
+        }
+        p0.push_str("        ),\n");
+    }
+    let mut cmap = String::new();
+    for (fqcn, path) in &classmap {
+        cmap.push_str(&format!(
+            "        {} => {},\n",
+            php_str(fqcn),
+            autoload_path_code(vendor, Path::new(path))
+        ));
+    }
+    fs::write(
+        cdir.join("autoload_static.php"),
+        format!(
+            "<?php\n\n// autoload_static.php @generated by phpun\n\nnamespace Composer\\Autoload;\n\nclass {sc}\n{{\n    public static $files = array (\n{fe}    );\n\n    public static $prefixLengthsPsr4 = array (\n{pl}    );\n\n    public static $prefixDirsPsr4 = array (\n{pd}    );\n\n    public static $prefixesPsr0 = array (\n{p0}    );\n\n    public static $classMap = array (\n{cm}    );\n\n    public static function getInitializer(ClassLoader $loader)\n    {{\n        return \\Closure::bind(function () use ($loader) {{\n            $loader->prefixLengthsPsr4 = {sc}::$prefixLengthsPsr4;\n            $loader->prefixDirsPsr4 = {sc}::$prefixDirsPsr4;\n            $loader->prefixesPsr0 = {sc}::$prefixesPsr0;\n            $loader->classMap = {sc}::$classMap;\n\n        }}, null, ClassLoader::class);\n    }}\n}}\n",
+            sc = static_short,
+            fe = files_static,
+            pl = plen,
+            pd = pdirs,
+            p0 = p0,
+            cm = cmap
+        ),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // --- verbatim composer runtime files
+    fs::write(cdir.join("ClassLoader.php"), CLASS_LOADER).map_err(|e| e.to_string())?;
+    fs::write(cdir.join("InstalledVersions.php"), INSTALLED_VERSIONS).map_err(|e| e.to_string())?;
+    fs::write(cdir.join("LICENSE"), COMPOSER_LICENSE).map_err(|e| e.to_string())?;
+
+    // --- installed.php / installed.json
+    let mut ip = String::from(
+        "<?php return array(\n    'root' => array(\n        'pretty_version' => 'dev-main',\n        'version' => 'dev-main',\n        'reference' => null,\n        'type' => 'library',\n        'install_path' => __DIR__ . '/../../',\n        'aliases' => array(),\n        'dev' => true,\n        'name' => ",
+    );
+    ip.push_str(&php_str(root["name"].as_str().unwrap_or("__root__")));
+    ip.push_str(",\n    ),\n    'versions' => array(\n");
+    for p in packages {
+        ip.push_str(&format!(
+            "        {} => array(\n            'pretty_version' => {},\n            'version' => {},\n            'reference' => {},\n            'type' => 'library',\n            'install_path' => __DIR__ . '/../{}',\n            'aliases' => array(),\n            'dev_requirement' => false,\n        ),\n",
+            php_str(&p.name),
+            php_str(&p.version),
+            php_str(&Ver::parse(&p.version).map(|v| v.display()).unwrap_or(p.version.clone())),
+            if p.dist_ref.is_empty() { "null".into() } else { php_str(&p.dist_ref) },
+            p.name,
+        ));
+    }
+    ip.push_str("    ),\n);\n");
+    fs::write(cdir.join("installed.php"), ip).map_err(|e| e.to_string())?;
+
+    let ij = serde_json::json!({
+        "packages": packages.iter().map(|p| serde_json::json!({
+            "name": p.name,
+            "version": p.version,
+            "version_normalized": Ver::parse(&p.version).map(|v| v.display()).unwrap_or(p.version.clone()),
+            "dist": {"type": "zip", "url": p.dist_url, "reference": p.dist_ref, "shasum": p.dist_shasum},
+            "require": p.require,
+            "install-path": format!("../{}", p.name),
+        })).collect::<Vec<_>>(),
+        "dev": true,
+        "dev-package-names": []
+    });
+    fs::write(
+        cdir.join("installed.json"),
+        serde_json::to_string_pretty(&ij).unwrap(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Kahn topo: deps before dependents over the installed set.
+fn topo_order(packages: &[Pkg]) -> Vec<String> {
+    let names: std::collections::HashSet<&str> = packages.iter().map(|p| p.name.as_str()).collect();
+    let mut indeg: HashMap<&str, usize> = HashMap::new();
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new(); // dep -> dependents
+    for p in packages {
+        indeg.entry(p.name.as_str()).or_insert(0);
+        for dep in p.require.keys() {
+            if names.contains(dep.as_str()) {
+                edges.entry(dep.as_str()).or_default().push(p.name.as_str());
+                *indeg.entry(p.name.as_str()).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut queue: Vec<&str> = indeg
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(&n, _)| n)
+        .collect();
+    queue.sort();
+    let mut out = Vec::new();
+    while let Some(n) = queue.pop() {
+        out.push(n.to_string());
+        if let Some(deps) = edges.get(n) {
+            for d in deps {
+                let e = indeg.get_mut(d).unwrap();
+                *e -= 1;
+                if *e == 0 {
+                    queue.push(d);
+                }
+            }
+        }
+    }
+    for p in packages {
+        if !out.contains(&p.name) {
+            out.push(p.name.clone());
+        }
+    }
+    out
+}
+
+const COMPOSER_LICENSE: &str = include_str!("../templates/LICENSE");
+
+/// md5 hex of bytes — tiny implementation, avoids a hash dep for one call.
+fn md5_str(data: &[u8]) -> u128 {
+    // Return u128 for compactness of hex formatting; MD5 value.
+    let h = md5(data);
+    u128::from_be_bytes(h)
+}
+
+fn md5(input: &[u8]) -> [u8; 16] {
+    // RFC 1321
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
+    ];
+    let mut a0: u32 = 0x67452301;
+    let mut b0: u32 = 0xefcdab89;
+    let mut c0: u32 = 0x98badcfe;
+    let mut d0: u32 = 0x10325476;
+    let mut msg = input.to_vec();
+    let bitlen = (input.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bitlen.to_le_bytes());
+    for chunk in msg.chunks(64) {
+        let mut m = [0u32; 16];
+        for (i, w) in m.iter_mut().enumerate() {
+            *w = u32::from_le_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+        for i in 0..64 {
+            let (mut f, g) = match i {
+                0..=15 => ((b & c) | (!b & d), i),
+                16..=31 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(f.rotate_left(S[i]));
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+    let mut out = [0u8; 16];
+    out[..4].copy_from_slice(&a0.to_le_bytes());
+    out[4..8].copy_from_slice(&b0.to_le_bytes());
+    out[8..12].copy_from_slice(&c0.to_le_bytes());
+    out[12..].copy_from_slice(&d0.to_le_bytes());
+    out
+}

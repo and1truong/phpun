@@ -539,6 +539,14 @@ impl<'a> Interp<'a> {
             Stmt::Namespace(n) => {
                 // Top-level scope follows `namespace` declarations —
                 // unqualified calls/consts resolve relative to it.
+                // Inside an include running in a function frame the
+                // file's ns goes on its own include slot instead.
+                if let Some((depth, slot)) = self.include_ns.last_mut() {
+                    if *depth == self.stack.len() {
+                        *slot = n.clone();
+                        return Flow::Normal;
+                    }
+                }
                 self.globals.ns = n.clone();
                 Flow::Normal
             }

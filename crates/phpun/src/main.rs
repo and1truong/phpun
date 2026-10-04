@@ -1,3 +1,6 @@
+mod install;
+mod semver_lite;
+
 use phpun_core::Interp;
 use std::process::ExitCode;
 
@@ -5,6 +8,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
         Some("phpt") => phpun_phpt::cli(args[1..].to_vec()),
+        Some("install") => install::cli(&args[1..]),
         Some("serve") => serve(&args[1..]),
         Some("test") => run_tests(&args[1..]),
         Some("--version") | Some("-v") => {
@@ -16,6 +20,9 @@ fn main() -> ExitCode {
             eprintln!("  phpun <file.php> [args...]   run a PHP script");
             eprintln!("  phpun serve <file.php>       dev HTTP server (default :8000)");
             eprintln!("  phpun phpt <paths> [flags]   run PHPT tests");
+            eprintln!(
+                "  phpun install [-d DIR]        resolve composer.json deps into vendor/ (#29)"
+            );
             eprintln!("  phpun test [path] [flags]    run userland *_test.php / *Test.php files");
             ExitCode::SUCCESS
         }

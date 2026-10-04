@@ -234,6 +234,11 @@ pub struct Interp<'a> {
     /// PHP's early binding (the redeclare fatal only fires when a
     /// DIFFERENT decl claims an existing name).
     early_bound_funcs: HashSet<String>,
+    /// Per-include top-level namespace: `(stack depth at include,
+    /// file's current ns)`. An included file's `namespace` decl governs
+    /// ITS top-level code, not the calling frame's (php-parser's
+    /// conditional-decl inside a function-context require).
+    pub(crate) include_ns: Vec<(usize, String)>,
     constants: HashMap<String, Value>,
     /// Accumulated program output (display_errors prints to stdout under
     /// CLI, and the PHPT harness merges streams via 2>&1).
@@ -753,6 +758,7 @@ impl<'a> Interp<'a> {
             decl_aliases: Vec::new(),
             early_bound_classes: HashSet::new(),
             early_bound_funcs: HashSet::new(),
+            include_ns: Vec::new(),
             constants,
             out: Vec::new(),
             err_buf: String::new(),

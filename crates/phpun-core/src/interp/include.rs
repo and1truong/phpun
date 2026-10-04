@@ -167,6 +167,9 @@ impl<'a> Interp<'a> {
             .last_mut()
             .map(|f| std::mem::replace(&mut f.file, self.cur_file.clone()));
         let saved_ns = std::mem::take(&mut self.globals.ns);
+        // Inside a function frame the file's `namespace` decl writes this
+        // slot (not globals.ns) so caller_ns() sees the file's own ns.
+        self.include_ns.push((self.stack.len(), String::new()));
         // The included file's Stmt::Line markers move cur_line into its own
         // line space; restore the includer's line so a later call in the same
         // statement still reports the call-site line (gh19653_2).
@@ -175,6 +178,7 @@ impl<'a> Interp<'a> {
             Err(e) => self.err_flow(e),
             Ok(()) => self.exec_block(&stmts),
         };
+        self.include_ns.pop();
         inc_pop(self);
         self.cur_line = saved_line;
         self.cur_file = saved_file;
