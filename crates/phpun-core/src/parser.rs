@@ -2406,7 +2406,9 @@ impl<'a> Parser<'a> {
             self.expect_op("=>")?;
             let e = self.expr()?;
             let el = self.prev_line();
-            (vec![Stmt::Return(Some(e))], el)
+            // A call inside the arrow expr needs a line marker — the
+            // body has no statements to set cur_line (closure_064).
+            (vec![Stmt::Line(line), Stmt::Return(Some(e))], el)
         } else {
             let b = self.body()?;
             let el = self.prev_line();
