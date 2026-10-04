@@ -43,12 +43,23 @@ impl PcreRe {
         self.names.get(g).cloned().flatten()
     }
 
-    /// All leftmost matches, PHP `preg_match_all` order. Returns the
-    /// matches plus 0, or the negative PCRE2 error code (backtrack /
-    /// depth limit, bad UTF-8, ...) that ended the scan.
+    /// All leftmost matches starting at `start_offset`, PHP
+    /// `preg_match_all` order. Returns the matches plus 0, or the
+    /// negative PCRE2 error code (backtrack / depth limit, bad UTF-8,
+    /// ...) that ended the scan. The full subject is passed (not a
+    /// slice) so lookbehind / `\b` see the context before the offset.
+    /// `global` mirrors PHP's preg_match vs preg_match_all: when
+    /// false the scan stops after the first recorded match.
+    /// `first_opts` are the match options for the FIRST `pcre2_match`
+    /// call only (PHP passes `PCRE2_NO_UTF_CHECK` when the subject is
+    /// already known-valid UTF-8); every later call in the global
+    /// loop uses `PCRE2_NO_UTF_CHECK` unconditionally.
     pub fn match_all(
         &self,
         subject: &[u8],
+        start_offset: usize,
+        global: bool,
+        first_opts: u32,
         match_limit: u32,
         depth_limit: u32,
     ) -> (Vec<PcreMatch>, i32) {
@@ -65,17 +76,8 @@ impl PcreRe {
             let ovc = pcre2_get_ovector_count_8(md) as usize;
             let mut out = Vec::new();
             let mut err = 0i32;
-            let mut offset = 0usize;
             let len = subject.len();
-            while offset <= len {
-                let rc = pcre2_match_8(self.code, subject.as_ptr(), len, offset, 0, md, mctx);
-                if rc == 0 || rc == PCRE2_ERROR_NOMATCH {
-                    break;
-                }
-                if rc < 0 {
-                    err = rc;
-                    break;
-                }
+            let read = |md| {
                 let ov = pcre2_get_ovector_pointer_8(md);
                 let mut spans = vec![None; self.names.len().max(ovc)];
                 for (i, s) in spans.iter_mut().enumerate().take(ovc) {
@@ -96,43 +98,93 @@ impl PcreRe {
                         )
                     }
                 };
-                let (s0, e0) = spans.first().copied().flatten().unwrap_or((offset, offset));
-                if e0 > s0 {
-                    out.push(PcreMatch { spans, mark });
-                    offset = e0;
-                    continue;
-                }
-                // Empty match — PHP's global-scan rule: record it, then
-                // retry anchored+notempty at the same offset; on no match
-                // move past one character (UTF-8-aware under /u).
-                out.push(PcreMatch { spans, mark });
-                let rc2 = pcre2_match_8(
-                    self.code,
-                    subject.as_ptr(),
-                    len,
-                    offset,
-                    PCRE2_NOTEMPTY_ATSTART | PCRE2_ANCHORED,
-                    md,
-                    mctx,
-                );
-                if rc2 > 0 {
-                    let ov = pcre2_get_ovector_pointer_8(md);
-                    let (a1, b1) = (*ov, *ov.add(1));
-                    offset = if a1 != usize::MAX { b1 } else { e0 + 1 };
-                } else if rc2 == 0 || rc2 == PCRE2_ERROR_NOMATCH {
-                    offset = e0
-                        + if self.utf8 && e0 < len {
-                            let mut n = 1usize;
-                            while e0 + n < len && (subject[e0 + n] & 0xC0) == 0x80 {
-                                n += 1;
-                            }
-                            n
-                        } else {
-                            1
-                        };
-                } else {
-                    err = rc2;
+                (spans, mark)
+            };
+            // PHP's global-scan loop (php_pcre_match_impl): a match is
+            // recorded, then the scan resumes at offsets[1] — the match
+            // END. An empty match additionally retries anchored+notempty
+            // at the same point, and THAT retry match is recorded too
+            // (`goto matched`); only a NOMATCH retry bumps past one
+            // character (bug70232: dropping the retry match loses hits
+            // like `\K`-adjacent alternations).
+            let mut start_offset2 = start_offset;
+            let mut count = pcre2_match_8(
+                self.code,
+                subject.as_ptr(),
+                len,
+                start_offset2,
+                first_opts,
+                md,
+                mctx,
+            );
+            'scan: loop {
+                if count < 0 {
+                    if count == PCRE2_ERROR_NOMATCH {
+                        break;
+                    }
+                    err = count;
                     break;
+                }
+                // `matched:` — the empty-match retry lands here with a
+                // fresh count that must be recorded, not re-validated.
+                loop {
+                    let (spans, mark) = read(md);
+                    out.push(PcreMatch { spans, mark });
+                    if !global {
+                        break 'scan;
+                    }
+                    let (m0, m1) = {
+                        let ov = pcre2_get_ovector_pointer_8(md);
+                        (*ov, *ov.add(1))
+                    };
+                    start_offset2 = m1;
+                    if start_offset2 == m0 {
+                        // Empty match — retry anchored+notempty at the
+                        // same position.
+                        count = pcre2_match_8(
+                            self.code,
+                            subject.as_ptr(),
+                            len,
+                            start_offset2,
+                            PCRE2_NO_UTF_CHECK | PCRE2_NOTEMPTY_ATSTART | PCRE2_ANCHORED,
+                            md,
+                            mctx,
+                        );
+                        if count >= 0 {
+                            // Record the retry match (goto matched).
+                            continue;
+                        }
+                        if count == PCRE2_ERROR_NOMATCH {
+                            if start_offset2 >= len {
+                                break 'scan;
+                            }
+                            // Bump one character — UTF-8 aware under /u.
+                            start_offset2 += if self.utf8 {
+                                let mut n = 1usize;
+                                while start_offset2 + n < len
+                                    && (subject[start_offset2 + n] & 0xC0) == 0x80
+                                {
+                                    n += 1;
+                                }
+                                n
+                            } else {
+                                1
+                            };
+                        } else {
+                            err = count;
+                            break 'scan;
+                        }
+                    }
+                    count = pcre2_match_8(
+                        self.code,
+                        subject.as_ptr(),
+                        len,
+                        start_offset2,
+                        PCRE2_NO_UTF_CHECK,
+                        md,
+                        mctx,
+                    );
+                    continue 'scan;
                 }
             }
             if !mctx.is_null() {
@@ -170,6 +222,14 @@ pub fn compile(src: &[u8], options: u32, extra_options: u32) -> Result<PcreRe, S
             pcre2_compile_context_free_8(cctx);
         }
         if code.is_null() {
+            // PHP maps the \C rejection to its own wording
+            // (php_pcre.c): it is always a /u-incompatibility error.
+            if errcode as u32 == PCRE2_ERROR_BACKSLASH_C_CALLER_DISABLED {
+                return Err(format!(
+                    "using \\C is incompatible with the 'u' modifier at offset {}",
+                    erroff
+                ));
+            }
             let mut buf = [0u8; 256];
             let n = pcre2_get_error_message_8(errcode, buf.as_mut_ptr().cast(), buf.len());
             let msg = if n > 0 {

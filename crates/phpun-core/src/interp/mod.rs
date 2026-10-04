@@ -230,6 +230,10 @@ pub struct Interp<'a> {
     /// Top-level parentless classes registered by hoisting (early
     /// binding); their decl stmt then no-ops (namespaces/ns_060).
     early_bound_classes: HashSet<String>,
+    /// Functions registered by hoisting; their decl stmt no-ops like
+    /// PHP's early binding (the redeclare fatal only fires when a
+    /// DIFFERENT decl claims an existing name).
+    early_bound_funcs: HashSet<String>,
     constants: HashMap<String, Value>,
     /// Accumulated program output (display_errors prints to stdout under
     /// CLI, and the PHPT harness merges streams via 2>&1).
@@ -255,6 +259,11 @@ pub struct Interp<'a> {
     pub last_json_error: i64,
     /// Set by the preg_* builtins for preg_last_error().
     pub last_preg_error: i64,
+    /// Zend's IS_STR_VALID_UTF8 flag: string storage (keyed by Rc
+    /// pointer) proven fully valid UTF-8 — /u preg calls skip
+    /// re-validating it (bug72685). The Rcs stay in the map so the
+    /// pointer keys can't be recycled.
+    pub valid_utf8: std::collections::HashMap<usize, std::rc::Rc<[u8]>>,
     /// Raw request body for php://input — serve mode fills it.
     pub php_input: std::rc::Rc<Vec<u8>>,
     /// Real upload tmp paths created this request — is_uploaded_file()
@@ -743,6 +752,7 @@ impl<'a> Interp<'a> {
             consts_linked: std::collections::HashSet::new(),
             decl_aliases: Vec::new(),
             early_bound_classes: HashSet::new(),
+            early_bound_funcs: HashSet::new(),
             constants,
             out: Vec::new(),
             err_buf: String::new(),
@@ -752,6 +762,7 @@ impl<'a> Interp<'a> {
             resp_code: 200,
             last_json_error: 0,
             last_preg_error: 0,
+            valid_utf8: std::collections::HashMap::new(),
             php_input: std::rc::Rc::new(Vec::new()),
             uploads: Vec::new(),
             ob_stack: Vec::new(),
@@ -916,14 +927,26 @@ impl<'a> Interp<'a> {
 
     /// PHP binds a compilation unit's unconditional top-level function
     /// decls before executing it (bug23279's later-declared handler).
-    fn hoist_funcs(&mut self, stmts: &[Stmt]) {
+    /// A name collision is PHP's compile-time "Cannot redeclare" fatal.
+    fn hoist_funcs(&mut self, stmts: &[Stmt]) -> Result<(), PhpError> {
         for s in stmts {
             match s {
                 Stmt::Function(d) => {
                     let _ = self.decl_type_checks(&d.name, d, None);
+                    let key = d.name.to_lowercase();
+                    if let Some(prev) = self.functions.get(&key) {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Cannot redeclare function {}() (previously declared in {}:{})",
+                                d.name, prev.file, prev.line
+                            ),
+                            d.line,
+                        ));
+                    }
                     let mut d = d.clone();
                     d.file = self.cur_file.clone();
-                    self.functions.insert(d.name.to_lowercase(), Rc::new(d));
+                    self.functions.insert(key.clone(), Rc::new(d));
+                    self.early_bound_funcs.insert(key);
                 }
                 // `namespace X { stmts }` parses as
                 // Block[Namespace, Block[stmts]] — decls inside are still
@@ -931,7 +954,7 @@ impl<'a> Interp<'a> {
                 Stmt::Block(v) if matches!(v.first(), Some(Stmt::Namespace(_))) => {
                     for s in &v[1..] {
                         if let Stmt::Block(inner) = s {
-                            self.hoist_funcs(inner);
+                            self.hoist_funcs(inner)?;
                         }
                     }
                 }
@@ -958,6 +981,7 @@ impl<'a> Interp<'a> {
                 _ => {}
             }
         }
+        Ok(())
     }
 
     pub fn run(&mut self, stmts: &[Stmt]) -> RunResult {
@@ -968,7 +992,12 @@ impl<'a> Interp<'a> {
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(ht as u64));
             self.deadline_secs = ht;
         }
-        self.hoist_funcs(stmts);
+        if let Err(e) = self.hoist_funcs(stmts) {
+            let flow = self.err_flow(e);
+            let result = self.finish(flow);
+            self.run_shutdown();
+            return result;
+        }
         let flow = self.exec_block(stmts);
         let result = self.finish(flow);
         self.run_shutdown();
@@ -1262,7 +1291,12 @@ impl<'a> Interp<'a> {
     pub fn run_source_ret(&mut self, src: &str) -> (RunResult, Option<Value>) {
         match parser::parse_source(src, self.ini_on("short_open_tag")) {
             Ok(stmts) => {
-                self.hoist_funcs(&stmts);
+                if let Err(e) = self.hoist_funcs(&stmts) {
+                    let flow = self.err_flow(e);
+                    let res = self.finish(flow);
+                    self.run_shutdown();
+                    return (res, None);
+                }
                 let flow = self.exec_block(&stmts);
                 let rv = match &flow {
                     Flow::Return(v) => Some(v.clone()),

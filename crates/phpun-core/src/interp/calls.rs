@@ -268,24 +268,34 @@ impl<'a> Interp<'a> {
                             pos += 1;
                         }
                     }
-                    _ => {
-                        // The reported number is the PARAM slot, not the
-                        // call position (cannot_pass_by_ref: `test(e: 42)`
-                        // reports #2 for `function test($a, &$e)`).
-                        if internal {
-                            // Internal functions silently materialize
-                            // temporaries for by-ref params —
-                            // `current(array())` is legal (bug55754).
-                            let c = cell(self.eval(expr)?);
-                            if let Some(n) = name {
-                                out.named.push((n, c, true, false));
-                                seen_named = true;
-                            } else {
-                                out.cells.push(c);
-                                pos += 1;
-                            }
-                            continue;
+                    Expr::New { .. } => {
+                        // `new` produces a reference-able object → PHP
+                        // warns "Only variables should be passed by
+                        // reference" and binds a temp (internal and
+                        // user functions alike).
+                        self.notice("Only variables should be passed by reference")?;
+                        let c = cell(self.eval(expr)?);
+                        if let Some(n) = name {
+                            out.named.push((n, c, true, false));
+                            seen_named = true;
+                        } else {
+                            out.cells.push(c);
+                            pos += 1;
                         }
+                    }
+                    _ if internal && matches!(ctx, "current()" | "pos()") => {
+                        // current()/pos() declare pass-by-value in zend
+                        // arginfo — literals are legal (bug55754).
+                        let c = cell(self.eval(expr)?);
+                        if let Some(n) = name {
+                            out.named.push((n, c, true, false));
+                            seen_named = true;
+                        } else {
+                            out.cells.push(c);
+                            pos += 1;
+                        }
+                    }
+                    _ => {
                         let argno = match &name {
                             Some(n) => decl
                                 .iter()
@@ -2632,10 +2642,12 @@ impl<'a> Interp<'a> {
                     return false;
                 };
                 // "Class::method" strings only call statics
-                // (callable_001).
+                // (callable_001) — or anything when __callStatic
+                // trampolines them.
                 self.find_method_in(&c, mn)
                     .map(|(mm, _)| mm.is_static)
                     .unwrap_or(false)
+                    || self.find_method_in(&c, "__callstatic").is_some()
             }
             Value::Object(o) => {
                 let cn = o.borrow().class.decl.name.clone();
@@ -2667,10 +2679,21 @@ impl<'a> Interp<'a> {
                     return false;
                 };
                 // [class-string, method] only calls statics; [obj, m]
-                // calls any (callable_001).
+                // calls any (callable_001). __call/__callStatic make
+                // any name callable (zend_is_callable's trampoline).
                 self.find_method_in(&c, &mn)
                     .map(|(mm, _)| mm.is_static || !need_static)
                     .unwrap_or(false)
+                    || self
+                        .find_method_in(
+                            &c,
+                            if need_static {
+                                "__callstatic"
+                            } else {
+                                "__call"
+                            },
+                        )
+                        .is_some()
             }
             _ => false,
         }

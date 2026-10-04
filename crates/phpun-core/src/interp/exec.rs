@@ -247,9 +247,26 @@ impl<'a> Interp<'a> {
                 if let Err(e) = self.decl_type_checks(&d.name, d, None) {
                     return self.err_flow(e);
                 }
+                let key = d.name.to_lowercase();
+                if let Some(prev) = self.functions.get(&key) {
+                    // Early-bound decls are compile-time registered —
+                    // reaching their own stmt is a no-op, not a collision.
+                    let self_decl = prev.line == d.line
+                        && prev.file == self.cur_file
+                        && self.early_bound_funcs.contains(&key);
+                    if !self_decl {
+                        return self.err_flow(PhpError::fatal(
+                            format!(
+                                "Cannot redeclare function {}() (previously declared in {}:{})",
+                                d.name, prev.file, prev.line
+                            ),
+                            self.cur_line,
+                        ));
+                    }
+                }
                 let mut d = d.clone();
                 d.file = self.cur_file.clone();
-                self.functions.insert(d.name.to_lowercase(), Rc::new(d));
+                self.functions.insert(key, Rc::new(d));
                 Flow::Normal
             }
             Stmt::Class(d) => {

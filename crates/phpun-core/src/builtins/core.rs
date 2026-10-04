@@ -705,6 +705,72 @@ pub(crate) fn dispatch(
         "phpinfo" | "phpcredits" | "php_logo_guid" | "php_real_logo_guid" | "zend_logo_guid" => {
             Value::Null
         }
+        "mail" => {
+            if args.len() < 3 {
+                return Err(PhpError::fatal(
+                    "mail() expects at least 3 arguments",
+                    it.cur_line,
+                ));
+            }
+            let to = arg_str(it, args, 0);
+            let subject = arg_str(it, args, 1);
+            let message = arg_str(it, args, 2);
+            let mut headers = String::new();
+            if let Some(h) = args.get(3) {
+                match &*h.borrow() {
+                    Value::Null => {
+                        it.deprecated_pub(
+                            "mail(): Passing null to parameter #4 ($additional_headers) of type array|string is deprecated",
+                        )?;
+                    }
+                    Value::Array(a) => {
+                        for (k, v) in a.borrow().iter() {
+                            headers.push_str(&format!(
+                                "{}: {}\r\n",
+                                key_str(k),
+                                v.borrow().to_php_string()
+                            ));
+                        }
+                    }
+                    v => headers.push_str(&v.to_php_string()),
+                }
+            }
+            let cmd = it
+                .ini
+                .get("sendmail_path")
+                .cloned()
+                .unwrap_or_else(|| "/usr/sbin/sendmail -t -i".into());
+            // PHP popen()s sendmail_path and writes the composed message.
+            let body = format!("To: {}\nSubject: {}\n{}\n{}", to, subject, headers, message);
+            let st = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&cmd)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .and_then(|mut p| {
+                    use std::io::Write;
+                    if let Some(mut s) = p.stdin.take() {
+                        let _ = s.write_all(body.as_bytes());
+                    }
+                    p.wait()
+                });
+            match st {
+                Ok(s) if s.success() => Value::Bool(true),
+                Ok(s) => {
+                    it.warn_pub(&format!(
+                        "Sendmail exited with non-zero exit code {}",
+                        s.code().unwrap_or(-1)
+                    ))?;
+                    Value::Bool(false)
+                }
+                Err(e) => {
+                    it.warn_pub(&format!("Unable to fork sendmail: {}", e))?;
+                    Value::Bool(false)
+                }
+            }
+        }
         "version_compare" => {
             let a = arg_str(it, args, 0);
             let b = arg_str(it, args, 1);

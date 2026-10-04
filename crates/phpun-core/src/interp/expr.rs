@@ -1298,9 +1298,10 @@ impl<'a> Interp<'a> {
             "/=" => self.arith("/", cur, rhs)?,
             "%=" => self.arith("%", cur, rhs)?,
             ".=" => {
-                let l = self.conv_str(&cur)?;
-                let r = self.conv_str(&rhs)?;
-                Value::str(format!("{}{}", l, r))
+                let mut l = self.conv_bytes(&cur)?;
+                let mut r = self.conv_bytes(&rhs)?;
+                l.append(&mut r);
+                Value::bytes(l)
             }
             "??=" => {
                 if matches!(cur, Value::Null) {
@@ -2161,8 +2162,10 @@ impl<'a> Interp<'a> {
                             _ => Vec::new(),
                         };
                         if matches!(*b, Value::Str(_)) {
-                            let vs = self.conv_str(&v).unwrap_or_default();
-                            let byte = vs.as_bytes().first().copied().unwrap_or(b' ');
+                            // Raw bytes, not conv_str — a byte like \xff
+                            // must not round through UTF-8 lossiness.
+                            let vs = self.conv_bytes(&v).unwrap_or_default();
+                            let byte = vs.first().copied().unwrap_or(b' ');
                             // PHP 8: negative offsets index from the end;
                             // beyond -len stays illegal (bug22592).
                             let idx_i =
@@ -2293,12 +2296,11 @@ impl<'a> Interp<'a> {
                                     return Ok(());
                                 }
                                 let idx = idx as usize;
-                                let vs = self.conv_str(&v).unwrap_or_default();
-                                let vb = vs.as_bytes();
+                                let vs = self.conv_bytes(&v).unwrap_or_default();
                                 if idx >= bytes.len() {
                                     bytes.resize(idx + 1, b' ');
                                 }
-                                bytes[idx] = vb.first().copied().unwrap_or(b' ');
+                                bytes[idx] = vs.first().copied().unwrap_or(b' ');
                                 if vs.len() > 1 {
                                     drop(b);
                                     self.warn(
@@ -2336,7 +2338,7 @@ impl<'a> Interp<'a> {
                         Ok(bc) if matches!(*bc.borrow(), Value::Str(_)) => {
                             let mut b = bc.borrow_mut();
                             if let Value::Str(s) = &mut *b {
-                                let vs = self.conv_str(&v).unwrap_or_default();
+                                let vs = self.conv_bytes(&v).unwrap_or_default();
                                 let mut bytes = s.to_vec();
                                 let orig = key
                                     .as_ref()
@@ -2356,7 +2358,7 @@ impl<'a> Interp<'a> {
                                 if idx >= bytes.len() {
                                     bytes.resize(idx + 1, b' ');
                                 }
-                                bytes[idx] = vs.as_bytes().first().copied().unwrap_or(b' ');
+                                bytes[idx] = vs.first().copied().unwrap_or(b' ');
                                 let multi = vs.len() > 1;
                                 *s = bytes.clone().into();
                                 if multi {
