@@ -1,0 +1,3 @@
+
+Deprecated: Callables of the form ["A2", "parent::who"] are deprecated in %s/crates/phpun-core/tests/fixtures/f2_parent_slot.php on line 4
+string(6) "A::who"
