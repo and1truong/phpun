@@ -260,10 +260,10 @@ impl<'a> Interp<'a> {
                             flags: f,
                             ..
                         }) => {
-                            // An spl-array source carries its flags over
-                            // (zend USE_OTHER); plain inputs keep ours.
+                            // An spl-array source merges its flags in
+                            // (zend USE_OTHER |= ); plain inputs keep ours.
                             if let Some(sf) = src_flags {
-                                *f = sf;
+                                *f |= sf;
                             }
                             std::mem::replace(slot, new)
                         }
