@@ -353,7 +353,7 @@ impl<'a> Interp<'a> {
                     // `fn` captures whole scope by value.
                     let f = self.stack.last().unwrap_or(&self.globals);
                     for (n, cellv) in f.vars.iter() {
-                        captures.push((n.clone(), cell(cellv.borrow().clone()), false));
+                        captures.push((n.clone(), cell(capture_copy(&cellv.borrow())), false));
                     }
                 } else {
                     for (n, by_ref) in &c.uses {
@@ -361,7 +361,7 @@ impl<'a> Interp<'a> {
                             self.var_cell(n)
                         } else {
                             match self.var_cell_opt(n) {
-                                Some(c) => cell(c.borrow().clone()),
+                                Some(c) => cell(capture_copy(&c.borrow())),
                                 // `use ($x)` on an undefined var warns
                                 // and captures null; `use (&$x)` binds
                                 // silently (closure_027).
@@ -3978,4 +3978,14 @@ fn bitwise_str(op: &str, a: &[u8], b: &[u8]) -> Vec<u8> {
         });
     }
     out
+}
+
+/// By-value capture copy: PHP's copy-on-write means a captured array is
+/// independent of the outer variable (our Rc aliases share, so separate
+/// eagerly). Objects stay shared (handle semantics).
+fn capture_copy(v: &Value) -> Value {
+    match v {
+        Value::Array(rc) => Value::Array(Rc::new(RefCell::new(rc.borrow().clone()))),
+        other => other.clone(),
+    }
 }

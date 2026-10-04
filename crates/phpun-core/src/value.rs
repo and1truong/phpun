@@ -296,6 +296,7 @@ pub fn trace_arg(v: &Value) -> String {
         }
         Value::Array(_) => "Array".into(),
         Value::Null => "NULL".into(),
+        Value::Bool(b) => if *b { "true" } else { "false" }.into(),
         Value::Callable(_) => "Object(Closure)".into(),
         Value::Resource(_) => "Resource id #1".into(),
         Value::Float(f) => {
