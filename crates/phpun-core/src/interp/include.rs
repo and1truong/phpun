@@ -171,8 +171,10 @@ impl<'a> Interp<'a> {
         // line space; restore the includer's line so a later call in the same
         // statement still reports the call-site line (gh19653_2).
         let saved_line = self.cur_line;
-        self.hoist_funcs(&stmts);
-        let flow = self.exec_block(&stmts);
+        let flow = match self.hoist_funcs(&stmts) {
+            Err(e) => self.err_flow(e),
+            Ok(()) => self.exec_block(&stmts),
+        };
         inc_pop(self);
         self.cur_line = saved_line;
         self.cur_file = saved_file;
