@@ -167,9 +167,14 @@ impl<'a> Interp<'a> {
             .last_mut()
             .map(|f| std::mem::replace(&mut f.file, self.cur_file.clone()));
         let saved_ns = std::mem::take(&mut self.globals.ns);
+        // The included file's Stmt::Line markers move cur_line into its own
+        // line space; restore the includer's line so a later call in the same
+        // statement still reports the call-site line (gh19653_2).
+        let saved_line = self.cur_line;
         self.hoist_funcs(&stmts);
         let flow = self.exec_block(&stmts);
         inc_pop(self);
+        self.cur_line = saved_line;
         self.cur_file = saved_file;
         if let Some(old) = saved_frame_file {
             if let Some(f) = self.stack.last_mut() {
@@ -221,7 +226,11 @@ impl<'a> Interp<'a> {
         let src = code.strip_prefix("<?php").unwrap_or(code).to_string();
         match parser::parse_pure(&src, self.ini_on("short_open_tag")) {
             Ok(stmts) => {
+                // Same cur_line clobber as include(): `f(eval(...))` must keep
+                // the call-site line for later calls in the statement.
+                let saved_line = self.cur_line;
                 let flow = self.exec_block(&stmts);
+                self.cur_line = saved_line;
                 match flow {
                     Flow::Return(v) => Ok(v),
                     Flow::Normal => Ok(Value::Null),
