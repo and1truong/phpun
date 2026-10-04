@@ -1029,6 +1029,10 @@ pub struct GenState {
     /// Every send() value ever passed, in call order — the k-th send
     /// feeds the k-th yield expression when the body (re)runs.
     pub sends: Vec<Value>,
+    /// Output produced after a yield suspends mid-expression — Zend
+    /// defers it to resume; buffered per yield index and emitted when
+    /// the consumer advances `pos` past it (closure_call_leak).
+    pub pending_out: Vec<(usize, Vec<u8>)>,
 }
 
 pub enum GenSetup {

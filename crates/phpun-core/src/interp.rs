@@ -288,6 +288,11 @@ pub struct Interp<'a> {
     /// Auto-key counter for keyless `yield $v` — counts keyless yields
     /// only (explicit keys and `yield from` items don't advance it).
     gen_auto: i64,
+    /// The generator whose body is currently running — output produced
+    /// after a yield suspends is tagged with that yield's item index
+    /// and buffered on the GenState until the consumer resumes past
+    /// it (closure_call_leak_with_exception).
+    gen_run_state: Option<Rc<RefCell<crate::value::GenState>>>,
     /// Declaring class of the method about to be invoked (set by
     /// invoke_method, consumed by invoke_fn to fill Frame::decl_class).
     pending_decl_class: Option<Rc<PhpClass>>,
@@ -673,6 +678,7 @@ impl<'a> Interp<'a> {
             pending_gen_captures: Vec::new(),
             gen_sends: std::collections::VecDeque::new(),
             gen_auto: 0,
+            gen_run_state: None,
             pending_decl_class: None,
             pending_called_class: None,
             pending_hook_prop: None,
@@ -2885,10 +2891,44 @@ impl<'a> Interp<'a> {
         // writes pass it (bug45392); checked at the next statement.
         self.mem_used += b.len() as u64;
         self.mem_last = b.len() as u64;
+        // Inside a generator run, output after a yield is deferred to
+        // resume — `f(yield)` must not observe the call (nor its echo)
+        // until the consumer advances past that yield.
+        if let Some(run) = &self.gen_run_state {
+            let done = self
+                .gen_sink
+                .as_ref()
+                .map(|s| s.borrow().len())
+                .unwrap_or(0);
+            if done > 0 {
+                run.borrow_mut().pending_out.push((done - 1, b.to_vec()));
+                return;
+            }
+        }
         if let Some(buf) = self.ob_stack.last_mut() {
             buf.buf.extend_from_slice(b);
         } else {
             self.out.extend_from_slice(b);
+        }
+    }
+
+    /// Emit generator-deferred output whose suspending yield the
+    /// consumer has now advanced past (`pos > tag`). Pass
+    /// `usize::MAX` to flush everything (getReturn runs to the end).
+    fn gen_flush_out(&mut self, state: &Rc<RefCell<crate::value::GenState>>, pos: usize) {
+        let ready = {
+            let mut st = state.borrow_mut();
+            let split = st
+                .pending_out
+                .iter()
+                .position(|(t, _)| *t >= pos)
+                .unwrap_or(st.pending_out.len());
+            let mut rest = st.pending_out.split_off(split);
+            std::mem::swap(&mut st.pending_out, &mut rest);
+            rest
+        };
+        for (_, b) in ready {
+            self.emit_bytes(&b);
         }
     }
 
@@ -12463,6 +12503,7 @@ impl<'a> Interp<'a> {
             by_ref,
             auto_key: 0,
             sends: Vec::new(),
+            pending_out: Vec::new(),
         }));
         let cls = self
             .classes
@@ -12523,6 +12564,7 @@ impl<'a> Interp<'a> {
         let saved_sink = self.gen_sink.replace(items.clone());
         let saved_sends = std::mem::replace(&mut self.gen_sends, sends.into_iter().collect());
         let saved_auto = std::mem::replace(&mut self.gen_auto, 0);
+        let saved_run = self.gen_run_state.replace(state.clone());
         // Closure-generator captures bind as extra frame vars.
         if !captures.is_empty() {
             self.pending_gen_captures = captures;
@@ -12531,6 +12573,7 @@ impl<'a> Interp<'a> {
         self.gen_sink = saved_sink;
         self.gen_sends = saved_sends;
         self.gen_auto = saved_auto;
+        self.gen_run_state = saved_run;
         let collected = std::mem::take(&mut *items.borrow_mut());
         let mut st = state.borrow_mut();
         st.items = collected;
@@ -12774,6 +12817,8 @@ impl<'a> Interp<'a> {
             "next" => {
                 self.gen_start(&state)?;
                 state.borrow_mut().pos += 1;
+                let pos = state.borrow().pos;
+                self.gen_flush_out(&state, pos);
                 Ok(Some(Value::Null))
             }
             "send" => {
@@ -12789,12 +12834,18 @@ impl<'a> Interp<'a> {
                         st.finished = false;
                         st.items.clear();
                         st.pos = 0;
+                        st.pending_out.clear();
                     }
                 }
                 self.gen_start(&state)?;
                 // The k-th send resumes at item k.
-                let mut st = state.borrow_mut();
-                st.pos = st.sends.len();
+                {
+                    let mut st = state.borrow_mut();
+                    st.pos = st.sends.len();
+                }
+                let pos = state.borrow().pos;
+                self.gen_flush_out(&state, pos);
+                let st = state.borrow();
                 Ok(Some(
                     st.items
                         .get(st.pos)
@@ -12808,6 +12859,10 @@ impl<'a> Interp<'a> {
                 Err(self.throw(e))
             }
             "getreturn" => {
+                // getReturn() runs the generator to completion —
+                // everything still deferred past yields belongs to
+                // that final resume.
+                self.gen_flush_out(&state, usize::MAX);
                 let st = state.borrow();
                 Ok(Some(st.return_val.clone()))
             }
@@ -18942,8 +18997,7 @@ impl<'a> Interp<'a> {
                         let rc = self.instantiate("reflectionclass", &[])?;
                         if let Value::Object(o) = &rc {
                             let mut ob = o.borrow_mut();
-                            ob.props
-                                .insert("\0rc\0class".into(), cell(Value::str(&n)));
+                            ob.props.insert("\0rc\0class".into(), cell(Value::str(&n)));
                             ob.props.insert("name".into(), cell(Value::str(&n)));
                             if !ob.prop_order.contains(&"name".into()) {
                                 ob.prop_order.push("name".into());
