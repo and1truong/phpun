@@ -3589,7 +3589,7 @@ fn builtin_byref(name: &str) -> Option<&'static [bool]> {
         "array_pop" | "array_shift" | "array_walk" | "sort" | "rsort" | "asort" | "arsort"
         | "ksort" | "krsort" | "usort" | "uasort" | "uksort" | "natsort" | "natcasesort"
         | "shuffle" | "reset" | "end" | "next" | "prev" | "current" | "pos" | "each"
-        | "array_push" | "array_unshift" | "array_splice" | "array_multisort" => &[true],
+        | "array_push" | "array_unshift" | "array_splice" => &[true],
         "preg_match" | "preg_match_all" => &[false, false, true],
         "preg_replace"
         | "preg_replace_callback"

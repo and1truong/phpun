@@ -915,7 +915,135 @@ pub(crate) fn dispatch(
             }
             Value::Bool(true)
         }
-        "array_multisort" => Value::Bool(true), // stub — tracked in #62
+        "array_multisort" => {
+            if args.is_empty() {
+                return err(
+                    "ArgumentCountError",
+                    "array_multisort() expects at least 1 argument, 0 given",
+                );
+            }
+            // Columns are arrays; scalar Int args are flags on the last
+            // column (one order flag + one type flag each).
+            struct Col {
+                arr: Rc<RefCell<PhpArray>>,
+                desc: bool,
+                flag: u8,
+            }
+            let mut cols: Vec<Col> = Vec::new();
+            let mut order_set = false;
+            let mut type_set = false;
+            for (i, a) in args.iter().enumerate() {
+                let n = i + 1;
+                match &*a.borrow() {
+                    Value::Array(rc) => {
+                        cols.push(Col {
+                            arr: rc.clone(),
+                            desc: false,
+                            flag: 0,
+                        });
+                        order_set = false;
+                        type_set = false;
+                    }
+                    Value::Int(flag) => {
+                        if cols.is_empty() {
+                            let msg = if n == 1 {
+                                "array_multisort(): Argument #1 ($array) must be an array or a sort flag that has not already been specified".to_string()
+                            } else {
+                                format!("array_multisort(): Argument #{} must be an array or a sort flag that has not already been specified", n)
+                            };
+                            return err("TypeError", msg);
+                        }
+                        let base = flag & !8; // strip SORT_FLAG_CASE
+                        let is_order = matches!(base, 3 | 4);
+                        let is_type = *flag == 8 || matches!(base, 0 | 1 | 2 | 5 | 6);
+                        if !is_order && !is_type {
+                            return err(
+                                "ValueError",
+                                format!(
+                                    "array_multisort(): Argument #{} must be a valid sort flag",
+                                    n
+                                ),
+                            );
+                        }
+                        if is_order {
+                            if order_set {
+                                return err(
+                                    "TypeError",
+                                    format!("array_multisort(): Argument #{} must be an array or a sort flag that has not already been specified", n),
+                                );
+                            }
+                            cols.last_mut().unwrap().desc = base == 3;
+                            order_set = true;
+                        } else {
+                            if type_set {
+                                return err(
+                                    "TypeError",
+                                    format!("array_multisort(): Argument #{} must be an array or a sort flag that has not already been specified", n),
+                                );
+                            }
+                            cols.last_mut().unwrap().flag = *flag as u8;
+                            type_set = true;
+                        }
+                    }
+                    _ => {
+                        let msg = if n == 1 {
+                            "array_multisort(): Argument #1 ($array) must be an array or a sort flag".to_string()
+                        } else {
+                            format!(
+                                "array_multisort(): Argument #{} must be an array or a sort flag",
+                                n
+                            )
+                        };
+                        return err("TypeError", msg);
+                    }
+                }
+            }
+            // Snapshot all columns' rows and check sizes.
+            let mut col_entries: Vec<Vec<(ArrKey, Cell)>> = Vec::new();
+            let mut n_rows = 0usize;
+            for (i, col) in cols.iter().enumerate() {
+                let entries = col.arr.borrow().entries.clone();
+                if i == 0 {
+                    n_rows = entries.len();
+                } else if entries.len() != n_rows {
+                    return err("ValueError", "Array sizes are inconsistent");
+                }
+                col_entries.push(entries);
+            }
+            let mut perm: Vec<usize> = (0..n_rows).collect();
+            perm.sort_by(|&x, &y| {
+                for (ci, col) in cols.iter().enumerate() {
+                    let va = col_entries[ci][x].1.borrow();
+                    let vb = col_entries[ci][y].1.borrow();
+                    let c = ms_cmp(&va, &vb, col.flag);
+                    let c = if col.desc { c.reverse() } else { c };
+                    if c != std::cmp::Ordering::Equal {
+                        return c;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            // Write each column back: numeric keys renumber, others preserved.
+            for (ci, col) in cols.iter().enumerate() {
+                let mut arr = col.arr.borrow_mut();
+                let entries = &col_entries[ci];
+                arr.entries.clear();
+                arr.next = 0;
+                for (k, &pi) in perm.iter().enumerate() {
+                    let (key, val) = &entries[pi];
+                    let new_key = match key {
+                        ArrKey::Int(_) => ArrKey::Int(k as i64),
+                        other => other.clone(),
+                    };
+                    if let ArrKey::Int(x) = new_key {
+                        arr.next = arr.next.max(x + 1);
+                    }
+                    arr.entries.push((new_key, val.clone()));
+                }
+                arr.iter_pos = arr.entries.len();
+            }
+            Value::Bool(true)
+        }
         "compact" => {
             let mut out = PhpArray::new();
             for a in args {
@@ -1081,7 +1209,7 @@ fn sort_array(
     cb_arg: Option<&Cell>,
 ) -> Result<(), PhpError> {
     match name {
-        "sort" | "rsort" | "natsort" | "natcasesort" => {
+        "sort" | "rsort" => {
             arr.entries
                 .sort_by(|(_, a), (_, b)| compare(&a.borrow(), &b.borrow()));
             if name == "rsort" {
@@ -1094,6 +1222,13 @@ fn sort_array(
                 i += 1;
             }
             arr.next = i;
+        }
+        // natsort/natcasesort compare naturally and keep keys (like asort).
+        "natsort" | "natcasesort" => {
+            let ci = name == "natcasesort";
+            arr.entries.sort_by(|(_, a), (_, b)| {
+                natcmp(&a.borrow().to_php_bytes(), &b.borrow().to_php_bytes(), ci)
+            });
         }
         "asort" | "arsort" => {
             arr.entries
@@ -1201,5 +1336,159 @@ fn num_val(x: f64, orig: Value, _step: f64) -> Value {
         Value::Int(x as i64)
     } else {
         Value::Float(x)
+    }
+}
+
+/// Column comparator for array_multisort: flag = sort-type|sort-flag-case.
+fn ms_cmp(a: &Value, b: &Value, flag: u8) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let base = flag & !8;
+    let ci = flag & 8 != 0;
+    match base {
+        1 => a
+            .to_float()
+            .partial_cmp(&b.to_float())
+            .unwrap_or(Ordering::Equal),
+        2 | 5 => {
+            // SORT_STRING / SORT_LOCALE_STRING (C locale → plain bytes)
+            let x = a.to_php_bytes();
+            let y = b.to_php_bytes();
+            if ci {
+                fold_case(&x).cmp(&fold_case(&y))
+            } else {
+                x.cmp(&y)
+            }
+        }
+        6 => natcmp(&a.to_php_bytes(), &b.to_php_bytes(), ci),
+        _ => compare(a, b), // SORT_REGULAR (and bare SORT_FLAG_CASE)
+    }
+}
+
+fn fold_case(b: &[u8]) -> Vec<u8> {
+    b.iter().map(|c| c.to_ascii_uppercase()).collect()
+}
+
+/// Port of PHP's strnatcmp_ex (ext/standard/strnatcmp.c).
+fn natcmp(a: &[u8], b: &[u8], ci: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    fn digit(c: u8) -> bool {
+        c.is_ascii_digit()
+    }
+    fn space(c: u8) -> bool {
+        c.is_ascii_whitespace()
+    }
+    fn compare_right(
+        a: &[u8],
+        mut i: usize,
+        b: &[u8],
+        mut j: usize,
+    ) -> (std::cmp::Ordering, usize, usize) {
+        let mut bias = Equal;
+        loop {
+            let da = i < a.len() && digit(a[i]);
+            let db = j < b.len() && digit(b[j]);
+            match (da, db) {
+                (false, false) => return (bias, i, j),
+                (false, true) => return (Less, i, j),
+                (true, false) => return (Greater, i, j),
+                (true, true) => {
+                    if bias == Equal {
+                        if a[i] < b[j] {
+                            bias = Less;
+                        } else if a[i] > b[j] {
+                            bias = Greater;
+                        }
+                    }
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+    }
+    fn compare_left(
+        a: &[u8],
+        mut i: usize,
+        b: &[u8],
+        mut j: usize,
+    ) -> (std::cmp::Ordering, usize, usize) {
+        loop {
+            let da = i < a.len() && digit(a[i]);
+            let db = j < b.len() && digit(b[j]);
+            match (da, db) {
+                (false, false) => return (Equal, i, j),
+                (false, true) => return (Less, i, j),
+                (true, false) => return (Greater, i, j),
+                (true, true) => {
+                    if a[i] != b[j] {
+                        return (a[i].cmp(&b[j]), i, j);
+                    }
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+    }
+    if a.is_empty() || b.is_empty() {
+        return a.len().cmp(&b.len());
+    }
+    let (mut i, mut j) = (0usize, 0usize);
+    // skip over leading zeros
+    while a[i] == b'0' && i + 1 < a.len() && digit(a[i + 1]) {
+        i += 1;
+    }
+    while b[j] == b'0' && j + 1 < b.len() && digit(b[j + 1]) {
+        j += 1;
+    }
+    let (mut ca, mut cb) = (a[i], b[j]);
+    loop {
+        while i < a.len() && space(ca) {
+            i += 1;
+            ca = a[i];
+        }
+        while j < b.len() && space(cb) {
+            j += 1;
+            cb = b[j];
+        }
+        if digit(ca) && digit(cb) {
+            let (r, ni, nj) = if ca == b'0' || cb == b'0' {
+                compare_left(a, i, b, j)
+            } else {
+                compare_right(a, i, b, j)
+            };
+            if r != Equal {
+                return r;
+            }
+            i = ni;
+            j = nj;
+            if i >= a.len() && j >= b.len() {
+                return Equal;
+            } else if i >= a.len() {
+                return Less;
+            } else if j >= b.len() {
+                return Greater;
+            }
+            ca = a[i];
+            cb = b[j];
+        }
+        let (xa, xb) = if ci {
+            (ca.to_ascii_uppercase(), cb.to_ascii_uppercase())
+        } else {
+            (ca, cb)
+        };
+        match xa.cmp(&xb) {
+            Equal => {}
+            r => return r,
+        }
+        i += 1;
+        j += 1;
+        if i >= a.len() && j >= b.len() {
+            return Equal;
+        } else if i >= a.len() {
+            return Less;
+        } else if j >= b.len() {
+            return Greater;
+        }
+        ca = a[i];
+        cb = b[j];
     }
 }

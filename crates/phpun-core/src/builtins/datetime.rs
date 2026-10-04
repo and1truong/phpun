@@ -297,9 +297,7 @@ fn strto_toks(b: &[u8]) -> Vec<STok> {
             while i < b.len() && b[i].is_ascii_alphabetic() {
                 i += 1;
             }
-            v.push(STok::W(
-                String::from_utf8_lossy(&b[s..i]).to_lowercase(),
-            ));
+            v.push(STok::W(String::from_utf8_lossy(&b[s..i]).to_lowercase()));
         } else if c >= 0x80 {
             i += 1; // skip multibyte bytes
         } else {
@@ -350,13 +348,11 @@ impl Dt {
     }
     /// Business-day step (skip Sat/Sun).
     fn add_weekdays(&mut self, n: i64) {
-        let step = |d: &mut Dt, fwd: bool| {
-            loop {
-                d.days += if fwd { 1 } else { -1 };
-                let dow = d.dow();
-                if dow >= 1 && dow <= 5 {
-                    break;
-                }
+        let step = |d: &mut Dt, fwd: bool| loop {
+            d.days += if fwd { 1 } else { -1 };
+            let dow = d.dow();
+            if (1..=5).contains(&dow) {
+                break;
             }
         };
         for _ in 0..n.abs() {
@@ -614,7 +610,11 @@ impl StrtoP {
         match &t[self.i] {
             STok::C(b'@') => {
                 // @epoch, optionally negative
-                let (neg, k) = if self.at_c(t, 1, b'-') { (-1, 2) } else { (1, 1) };
+                let (neg, k) = if self.at_c(t, 1, b'-') {
+                    (-1, 2)
+                } else {
+                    (1, 1)
+                };
                 if let Some((n, _)) = self.at_i(t, k) {
                     self.dt = Dt::from_ts(neg * n);
                     self.tz_off = Some(0);
@@ -808,8 +808,7 @@ impl StrtoP {
                     return false;
                 };
                 // d.m.Y / d.m.y when the middle reads as a month
-                if (1..=12).contains(&m) && (1..=31).contains(&n) && (yw == 4 || yw <= 2)
-                {
+                if (1..=12).contains(&m) && (1..=31).contains(&n) && (yw == 4 || yw <= 2) {
                     let y = if yw <= 2 { year_2dig(y) } else { y };
                     self.set_date(y, m, n);
                     self.i += 5;
@@ -1038,9 +1037,7 @@ impl StrtoP {
                 self.bag.negate();
                 for op in &mut self.post {
                     match op {
-                        PostOp::SeekDow(n, _) | PostOp::Biz(n) | PostOp::WeekBound(n) => {
-                            *n = -*n
-                        }
+                        PostOp::SeekDow(n, _) | PostOp::Biz(n) | PostOp::WeekBound(n) => *n = -*n,
                     }
                 }
                 if let Some(s) = &mut self.slot {
@@ -1378,9 +1375,9 @@ impl StrtoP {
                 PostOp::WeekBound(d) => {
                     let iso = dt.iso_dow();
                     match d {
-                        1 => dt.days += 7 - iso,   // next Monday
-                        0 => dt.days -= iso,       // this week's Monday
-                        _ => dt.days -= iso + 7,   // previous Monday
+                        1 => dt.days += 7 - iso, // next Monday
+                        0 => dt.days -= iso,     // this week's Monday
+                        _ => dt.days -= iso + 7, // previous Monday
                     }
                 }
             }

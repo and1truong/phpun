@@ -587,14 +587,19 @@ pub(crate) fn dispatch(
             if args.len() < 2 {
                 return err(
                     "ArgumentCountError",
-                    format!("unpack() expects at least 2 arguments, {} given", args.len()),
+                    format!(
+                        "unpack() expects at least 2 arguments, {} given",
+                        args.len()
+                    ),
                 );
             }
             pack_check_string(it, name, &args[0], 1, "format")?;
             pack_check_string(it, name, &args[1], 2, "string")?;
             if args.len() > 2 {
                 match &*args[2].borrow() {
-                    Value::Array(_) | Value::Object(_) | Value::Resource(_)
+                    Value::Array(_)
+                    | Value::Object(_)
+                    | Value::Resource(_)
                     | Value::Callable(_) => {
                         return err(
                             "TypeError",
@@ -908,8 +913,27 @@ fn pack_str_code(c: u8) -> bool {
 fn pack_num_code(c: u8) -> bool {
     matches!(
         c,
-        b'c' | b'C' | b's' | b'S' | b'i' | b'I' | b'l' | b'L' | b'q' | b'Q' | b'J' | b'P' | b'n'
-            | b'N' | b'v' | b'V' | b'f' | b'g' | b'G' | b'd' | b'e' | b'E'
+        b'c' | b'C'
+            | b's'
+            | b'S'
+            | b'i'
+            | b'I'
+            | b'l'
+            | b'L'
+            | b'q'
+            | b'Q'
+            | b'J'
+            | b'P'
+            | b'n'
+            | b'N'
+            | b'v'
+            | b'V'
+            | b'f'
+            | b'g'
+            | b'G'
+            | b'd'
+            | b'e'
+            | b'E'
     )
 }
 /// Byte size of one numeric pack/unpack element.
@@ -1029,7 +1053,11 @@ fn pack_run(it: &mut Interp, fmt: &[u8], args: &[Cell]) -> Result<Value, PhpErro
                 for j in 0..count as usize {
                     out[(pos as usize) + j] = pad;
                 }
-                let cp = if code == b'Z' { (count - 1).max(0) } else { count };
+                let cp = if code == b'Z' {
+                    (count - 1).max(0)
+                } else {
+                    count
+                };
                 let n = (s.len() as i64).min(cp) as usize;
                 out[pos as usize..pos as usize + n].copy_from_slice(&s[..n]);
                 pos += count;
@@ -1182,12 +1210,7 @@ fn unpack_key(name: &[u8], i: i64, reps: i64) -> ArrKey {
     }
 }
 
-fn unpack_run(
-    it: &mut Interp,
-    fmt: &[u8],
-    data: &[u8],
-    offset: i64,
-) -> Result<Value, PhpError> {
+fn unpack_run(it: &mut Interp, fmt: &[u8], data: &[u8], offset: i64) -> Result<Value, PhpError> {
     let inputlen = data.len() as i64;
     if offset < 0 || offset > inputlen {
         return err(
@@ -1250,10 +1273,7 @@ fn unpack_run(
             b'f' | b'g' | b'G' => size = 4,
             b'd' | b'e' | b'E' => size = 8,
             _ => {
-                return err(
-                    "ValueError",
-                    format!("Invalid format type {}", t as char),
-                );
+                return err("ValueError", format!("Invalid format type {}", t as char));
             }
         }
         let mut idx: i64 = 0;
@@ -1277,10 +1297,7 @@ fn unpack_run(
                             b'A' => {
                                 let mut l = len as usize;
                                 while l > 0
-                                    && matches!(
-                                        bytes[l - 1],
-                                        0 | b' ' | b'\t' | b'\r' | b'\n'
-                                    )
+                                    && matches!(bytes[l - 1], 0 | b' ' | b'\t' | b'\r' | b'\n')
                                 {
                                     l -= 1;
                                 }
@@ -1373,8 +1390,7 @@ fn unpack_run(
                         let mut b = [0u8; 8];
                         // BE codes put their bytes in the high end.
                         if pack_be(t) {
-                            b[8 - sz..]
-                                .copy_from_slice(&data[pos as usize..pos as usize + sz]);
+                            b[8 - sz..].copy_from_slice(&data[pos as usize..pos as usize + sz]);
                         } else {
                             b[..sz].copy_from_slice(&data[pos as usize..pos as usize + sz]);
                         }
