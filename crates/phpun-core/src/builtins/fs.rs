@@ -509,7 +509,7 @@ pub(crate) fn dispatch(
             it.emit(&s);
             Value::Int(out.len() as i64)
         }
-        "fgetcsv" => Value::Bool(false), // TODO
+        "fgetcsv" => Value::Bool(false), // stub — tracked in #62
         "file" => {
             let path = arg_str(it, args, 0);
             match std::fs::read_to_string(&path) {

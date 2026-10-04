@@ -20,6 +20,9 @@ pub type MergedHooks = Vec<(PropHook, Rc<PhpClass>)>;
 /// `(emitted key, slot key, decl+decl class)` — `None` decl means a
 /// dynamic property (property-hooks serialization views).
 pub type SerialEntry = (String, String, Option<(PropDecl, Rc<PhpClass>)>);
+/// `(name, cell)` entries a `...$v` unpack yields — `None` name is
+/// positional.
+pub type SpreadItems = Vec<(Option<Rc<str>>, Cell)>;
 
 /// Zend-style render for the `assert(<args>)` AssertionError message.
 pub(in crate::interp) fn assert_arg_repr(v: &Value) -> String {

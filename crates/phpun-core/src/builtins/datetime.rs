@@ -90,7 +90,7 @@ pub(crate) fn dispatch(
             );
             Value::Bool((1..=12).contains(&m) && (1..=31).contains(&d) && (1..=32767).contains(&y))
         }
-        "strtotime" => Value::Int(0), // TODO real parsing
+        "strtotime" => Value::Int(0), // stub — tracked in #62
         "date_parse" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
         "microtime_float" => Value::Float(0.0),
         "date_sunrise" | "date_sunset" | "date_sun_info" => Value::Bool(false),
