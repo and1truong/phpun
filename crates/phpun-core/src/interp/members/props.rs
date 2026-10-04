@@ -19,7 +19,7 @@ impl<'a> Interp<'a> {
     /// A private prop of the caller's scope class: it is a *distinct*
     /// property from same-name decls elsewhere in the chain and wins
     /// outright when the caller's scope declares it (private_override).
-    pub(in crate::interp) fn scope_private_prop(
+    fn scope_private_prop(
         &self,
         o: &Rc<RefCell<PhpObject>>,
         pn: &str,
@@ -242,11 +242,11 @@ impl<'a> Interp<'a> {
         })
     }
 
-    pub(in crate::interp) fn stmts_use_this_prop(v: &[Stmt], pn: &str) -> bool {
+    fn stmts_use_this_prop(v: &[Stmt], pn: &str) -> bool {
         v.iter().any(|s| Self::stmt_uses_this_prop(s, pn))
     }
 
-    pub(in crate::interp) fn stmt_uses_this_prop(s: &Stmt, pn: &str) -> bool {
+    fn stmt_uses_this_prop(s: &Stmt, pn: &str) -> bool {
         match s {
             Stmt::Echo(v) | Stmt::Unset(v) | Stmt::Global(v) => {
                 v.iter().any(|e| Self::expr_uses_this_prop(e, pn))
@@ -315,7 +315,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    pub(in crate::interp) fn expr_uses_this_prop(e: &Expr, pn: &str) -> bool {
+    fn expr_uses_this_prop(e: &Expr, pn: &str) -> bool {
         match e {
             Expr::Prop { obj, name, .. } => {
                 (matches!(obj.as_ref(), Expr::Var(v) if v == "this")
@@ -427,11 +427,7 @@ impl<'a> Interp<'a> {
     /// ancestor in the object's chain declaring it (GH-19044: the check
     /// uses the prototype's scope, so sibling subclasses descending
     /// from that ancestor can access each other's instances).
-    pub(in crate::interp) fn prop_scope_class(
-        &self,
-        o: &Rc<RefCell<PhpObject>>,
-        pn: &str,
-    ) -> Option<Rc<PhpClass>> {
+    fn prop_scope_class(&self, o: &Rc<RefCell<PhpObject>>, pn: &str) -> Option<Rc<PhpClass>> {
         let mut found = None;
         let mut cur = Some(o.borrow().class.clone());
         while let Some(c) = cur {
@@ -472,7 +468,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    pub(in crate::interp) fn hook_visibility_error<T>(
+    fn hook_visibility_error<T>(
         &mut self,
         dcls: &Rc<PhpClass>,
         pname: &str,
@@ -702,7 +698,7 @@ impl<'a> Interp<'a> {
 
     /// Resolve `self`/`parent`/`static` members of a declared type to
     /// concrete class names for the declaring class.
-    pub(in crate::interp) fn resolved_ty(&self, tys: &[String], dcls: &PhpClass) -> Vec<String> {
+    fn resolved_ty(&self, tys: &[String], dcls: &PhpClass) -> Vec<String> {
         tys.iter()
             .map(|m| {
                 let l = m.to_lowercase();
@@ -723,7 +719,7 @@ impl<'a> Interp<'a> {
     /// name → itself; class types narrow by hierarchy; `object` accepts
     /// any class; `iterable` accepts array/Traversable. Disjoint atoms
     /// (`int` ∩ `float`) return None (typed_properties_076).
-    pub(in crate::interp) fn ty_member_intersect(&mut self, a: &str, b: &str) -> Option<String> {
+    fn ty_member_intersect(&mut self, a: &str, b: &str) -> Option<String> {
         let al = a.to_lowercase();
         let bl = b.to_lowercase();
         if al == bl {
@@ -1006,7 +1002,7 @@ impl<'a> Interp<'a> {
     /// The value passed to a `set` hook is checked against the hook's
     /// `$value` parameter type — the declared prop type for the `set =>
     /// expr` shorthand — under weak coercion (gh17988's `string(2) "42"`).
-    pub(in crate::interp) fn hook_set_arg_check(
+    fn hook_set_arg_check(
         &mut self,
         p: &PropDecl,
         dcls: &Rc<PhpClass>,
@@ -1918,4 +1914,15 @@ impl<'a> Interp<'a> {
             _ => false,
         }
     }
+}
+
+/// `__METHOD__` scope name for a hook on `dcls`: a trait-origin hook
+/// keeps its trait name via `decl_in`, else the declaring class.
+fn decl_owner(dcls: &Rc<PhpClass>, pname: &str) -> String {
+    dcls.decl
+        .props
+        .iter()
+        .find(|p| p.name == pname)
+        .and_then(|p| p.decl_in.clone())
+        .unwrap_or_else(|| dcls.name().to_string())
 }

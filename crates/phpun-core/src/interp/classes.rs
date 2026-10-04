@@ -22,10 +22,7 @@ impl<'a> Interp<'a> {
         res
     }
 
-    pub(in crate::interp) fn register_class_inner(
-        &mut self,
-        decl: Rc<ClassDecl>,
-    ) -> Result<(), PhpError> {
+    fn register_class_inner(&mut self, decl: Rc<ClassDecl>) -> Result<(), PhpError> {
         // Reserved scalar names can't name a class/interface/trait/enum
         // (scalar_reserved*): `class int {}` is a compile fatal.
         let short = decl.name.rsplit('\\').next().unwrap_or(&decl.name);
@@ -376,7 +373,7 @@ impl<'a> Interp<'a> {
     /// clone-prevention idiom); wrong static-ness, arity or by-ref
     /// params are fatals. Checked after trait merge so merged methods
     /// validate too; interfaces and traits get the same rules.
-    pub(in crate::interp) fn magic_method_checks(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
+    fn magic_method_checks(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
         for m in &d.methods {
             let n = m.decl.name.to_lowercase();
             let (arity, want_static, vis_exempt): (Option<usize>, bool, bool) = match n.as_str() {
@@ -548,10 +545,7 @@ impl<'a> Interp<'a> {
     /// parent whose own variance is still unverified, so linking it
     /// forces the parent's obligations first (class_order_autoload*).
     /// Obligations on unrelated classes stay pending (error8).
-    pub(in crate::interp) fn process_variance_obligations(
-        &mut self,
-        decl: &Rc<ClassDecl>,
-    ) -> Result<(), PhpError> {
+    fn process_variance_obligations(&mut self, decl: &Rc<ClassDecl>) -> Result<(), PhpError> {
         let mut anc: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut work: Vec<String> = decl
             .parent
@@ -611,7 +605,7 @@ impl<'a> Interp<'a> {
 
     /// `self`/`static`/`parent` members in method/prop types bind to
     /// the declaring class name at registration (anonymous_class).
-    pub(in crate::interp) fn resolve_scope_tys(d: &mut ClassDecl) {
+    fn resolve_scope_tys(d: &mut ClassDecl) {
         let (dn, dp) = (d.name.clone(), d.parent.clone());
         let resolve = |ms: &mut Vec<String>| {
             for m in ms.iter_mut() {
@@ -650,10 +644,7 @@ impl<'a> Interp<'a> {
     /// exclusions, `as` aliases/visibility changes, and collision
     /// detection. Trait origin is preserved on each merged method as
     /// `decl.decl_in` (drives `__METHOD__`/`__TRAIT__`).
-    pub(in crate::interp) fn merge_trait_adaptations(
-        &mut self,
-        d: &mut ClassDecl,
-    ) -> Result<(), PhpError> {
+    fn merge_trait_adaptations(&mut self, d: &mut ClassDecl) -> Result<(), PhpError> {
         let used: Vec<(String, Rc<ClassDecl>)> = d
             .traits
             .iter()
@@ -1214,7 +1205,7 @@ impl<'a> Interp<'a> {
     /// textual compare when either side won't eval (both-None is fine).
     /// Each side evals in its declaring trait's namespace so an
     /// unqualified `FOO` in `Bug74922\T1` means `Bug74922\FOO`.
-    pub(in crate::interp) fn const_exprs_eq(
+    fn const_exprs_eq(
         &mut self,
         a: &Option<Expr>,
         a_owner: &str,
@@ -1236,11 +1227,7 @@ impl<'a> Interp<'a> {
     /// Const-eval an expr as if inside `owner`'s namespace (trait prop/
     /// const defaults resolve unqualified names against their declaring
     /// namespace — bug74922b).
-    pub(in crate::interp) fn eval_in_ns(
-        &mut self,
-        e: &Expr,
-        owner: &str,
-    ) -> Result<Value, PhpError> {
+    fn eval_in_ns(&mut self, e: &Expr, owner: &str) -> Result<Value, PhpError> {
         let ns = owner
             .rsplit_once('\\')
             .map(|(p, _)| p.to_string())
@@ -1257,7 +1244,7 @@ impl<'a> Interp<'a> {
     /// Render one type member for signature messages: `self` resolves
     /// against the composing class (abstract_method_10), other members
     /// stay verbatim.
-    pub(in crate::interp) fn sig_ty(ty: &[String], ctx: &str) -> String {
+    fn sig_ty(ty: &[String], ctx: &str) -> String {
         // `X|null` renders as `?X` in Zend signatures (internal_parent).
         if ty.len() == 2 {
             if let Some(other) = ty.iter().find(|t| !t.eq_ignore_ascii_case("null")) {
@@ -1291,7 +1278,7 @@ impl<'a> Interp<'a> {
             .join("|")
     }
 
-    pub(in crate::interp) fn sig_str(f: &crate::ast::FunctionDecl, ctx: &str) -> String {
+    fn sig_str(f: &crate::ast::FunctionDecl, ctx: &str) -> String {
         f.params
             .iter()
             .map(|p| {
@@ -1327,7 +1314,7 @@ impl<'a> Interp<'a> {
 
     /// `sig_str` variant that appends `: ret` OUTSIDE the paren — used
     /// inside `({})` placeholders, so the signature is `(params): ret`.
-    pub(in crate::interp) fn sig_str_full(f: &crate::ast::FunctionDecl, ctx: &str) -> String {
+    fn sig_str_full(f: &crate::ast::FunctionDecl, ctx: &str) -> String {
         let ps = Self::sig_str(f, ctx);
         match &f.ret {
             Some(r) => format!("({}): {}", ps, Self::sig_ty(r, ctx)),
@@ -1337,11 +1324,7 @@ impl<'a> Interp<'a> {
 
     /// The (declaring-class name, method) pair for `lname` provided by
     /// a concrete method in `d`'s ancestor chain — nearest wins.
-    pub(in crate::interp) fn ancestor_concrete(
-        &self,
-        d: &ClassDecl,
-        lname: &str,
-    ) -> Option<(String, Rc<MethodDecl>)> {
+    fn ancestor_concrete(&self, d: &ClassDecl, lname: &str) -> Option<(String, Rc<MethodDecl>)> {
         let mut pn = d.parent.clone();
         while let Some(p) = pn {
             let Some(pc) = self.classes.get(&p.to_lowercase()).cloned() else {
@@ -1364,7 +1347,7 @@ impl<'a> Interp<'a> {
     /// abstract requirement (abstract_method_*). `both_abs` marks the
     /// two-traits-both-abstract case where Zend cites trait names for
     /// both sides.
-    pub(in crate::interp) fn trait_sig_error(
+    fn trait_sig_error(
         &mut self,
         impl_m: &Rc<MethodDecl>,
         abs_m: &Rc<MethodDecl>,
@@ -1555,10 +1538,7 @@ impl<'a> Interp<'a> {
 
     /// Interface method signatures must be compatible with the class's
     /// implementation (bug60153): same rules as trait abstracts.
-    pub(in crate::interp) fn check_interface_sigs(
-        &mut self,
-        d: &ClassDecl,
-    ) -> Result<(), PhpError> {
+    fn check_interface_sigs(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
         // (iface, display-for-errors): own `implements` cites the
         // interface; an ancestor's requirement cites the ancestor
         // (bug62358).
@@ -1630,10 +1610,7 @@ impl<'a> Interp<'a> {
     /// Non-abstract classes must implement every abstract method: own/
     /// trait-merged abstracts (labelled `C::m`), plus abstracts from
     /// ancestor classes and interfaces (labelled `Src::m`).
-    pub(in crate::interp) fn check_abstract_methods(
-        &mut self,
-        d: &ClassDecl,
-    ) -> Result<(), PhpError> {
+    fn check_abstract_methods(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
         if d.kind != crate::ast::ClassKind::Class {
             return Ok(());
         }
@@ -1796,12 +1773,7 @@ impl<'a> Interp<'a> {
     /// Resolve `self`/`static`/`parent` members against a declaring
     /// class given only its name + parent name (variance checks run
     /// while the child class is still mid-registration).
-    pub(in crate::interp) fn ty_scope_resolve(
-        &self,
-        ty: &[String],
-        name: &str,
-        parent: &Option<String>,
-    ) -> Vec<String> {
+    fn ty_scope_resolve(&self, ty: &[String], name: &str, parent: &Option<String>) -> Vec<String> {
         ty.iter()
             .map(|m| match m.to_lowercase().as_str() {
                 "self" | "static" => name.to_string(),
@@ -1812,7 +1784,7 @@ impl<'a> Interp<'a> {
     }
 
     /// `iterable` ≡ `Traversable|array` for type-set comparisons.
-    pub(in crate::interp) fn ty_expand_iterable(ty: &[String]) -> Vec<String> {
+    fn ty_expand_iterable(ty: &[String]) -> Vec<String> {
         let mut out = Vec::with_capacity(ty.len() + 1);
         for m in ty {
             if m.eq_ignore_ascii_case("iterable") {
@@ -1828,7 +1800,7 @@ impl<'a> Interp<'a> {
     /// Member coverage: `covers(big, small)` — every value matching
     /// `small` also matches `big`. Drives semantic type equality for
     /// prop variance (union_types/variance/valid).
-    pub(in crate::interp) fn ty_covers(&mut self, big: &str, small: &str) -> bool {
+    fn ty_covers(&mut self, big: &str, small: &str) -> bool {
         let bl = big.to_lowercase();
         let sl = small.to_lowercase();
         if bl == sl {
@@ -1869,10 +1841,7 @@ impl<'a> Interp<'a> {
     }
 
     /// `final` props/hooks may not be overridden by a subclass.
-    pub(in crate::interp) fn check_final_override(
-        &mut self,
-        d: &ClassDecl,
-    ) -> Result<(), PhpError> {
+    fn check_final_override(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
         let mut an = d.parent.clone();
         while let Some(pname) = an {
             let Some(pc) = self.classes.get(&pname.to_lowercase()).cloned() else {
@@ -2112,7 +2081,7 @@ impl<'a> Interp<'a> {
     /// are forbidden on static/readonly props; a default requires a
     /// *backed* prop; `set(T)` must be type-compatible; `final`/`abstract`
     /// and interface restrictions produce link-time fatals.
-    pub(in crate::interp) fn check_hooked_props(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
+    fn check_hooked_props(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
         let in_iface = d.kind == ClassKind::Interface;
         for p in &d.props {
             if in_iface && p.is_abstract {
@@ -2348,7 +2317,7 @@ impl<'a> Interp<'a> {
     /// registered classes/interfaces, and names on the linking stack
     /// all count as resolvable (variance/mixed_return_type: members
     /// covered without resolution never reach here).
-    pub(in crate::interp) fn first_unres(&mut self, tys: &[String]) -> Option<String> {
+    fn first_unres(&mut self, tys: &[String]) -> Option<String> {
         const BUILTIN_T: &[&str] = &[
             "int", "float", "string", "bool", "array", "object", "callable", "iterable", "mixed",
             "void", "never", "false", "true", "null", "resource", "self", "parent", "static",
@@ -2384,7 +2353,7 @@ impl<'a> Interp<'a> {
     /// `sup` is a supertype of `sub` when every `sub` member is admitted
     /// by some `sup` member — equal names, `mixed`, or a class/interface
     /// the member is-a (set_value_parameter_type_variance_006).
-    pub(in crate::interp) fn ty_sup(&mut self, sup: &[String], sub: &[String]) -> bool {
+    fn ty_sup(&mut self, sup: &[String], sub: &[String]) -> bool {
         sub.iter()
             .all(|t| sup.iter().any(|s| self.ty_member_is_a(t, s)))
     }
@@ -2392,7 +2361,7 @@ impl<'a> Interp<'a> {
     /// Whether a single type conjunct resolves to a registered (or
     /// mid-linking / autoloadable) class-like name or builtin. Used
     /// to gate `&`-member coverage of `object`/`iterable`/`callable`.
-    pub(in crate::interp) fn ty_conj_resolvable(&mut self, c: &str) -> bool {
+    fn ty_conj_resolvable(&mut self, c: &str) -> bool {
         let cl = c.to_lowercase();
         const BUILTIN: &[&str] = &[
             "int",
@@ -2461,12 +2430,7 @@ impl<'a> Interp<'a> {
         self.ty_member_is_a_impl(t, s, true)
     }
 
-    pub(in crate::interp) fn ty_member_is_a_impl(
-        &mut self,
-        t: &str,
-        s: &str,
-        strict: bool,
-    ) -> bool {
+    fn ty_member_is_a_impl(&mut self, t: &str, s: &str, strict: bool) -> bool {
         let tl0 = t.to_lowercase();
         let sl0 = s.to_lowercase();
         // `never` is the bottom type (subtype of everything). `void`
@@ -2578,7 +2542,7 @@ impl<'a> Interp<'a> {
     /// declared-value check (strict — no coercion), and the
     /// inheritance variance rule (child ⊆ parent when the parent side
     /// declares a type; private consts exempt).
-    pub(in crate::interp) fn check_const_types(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
+    fn check_const_types(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
         for cd in &d.consts {
             let Some(ty) = &cd.ty else { continue };
             for m in ty {
@@ -2749,12 +2713,7 @@ impl<'a> Interp<'a> {
     /// are flattened to union members by take_type — DNF types in const
     /// positions behave the same for the tests at hand). `self`/`static`
     ////`parent` resolve against the declaring class.
-    pub(in crate::interp) fn const_ty_accepts(
-        &mut self,
-        ty: &[String],
-        v: &Value,
-        dname: &str,
-    ) -> bool {
+    fn const_ty_accepts(&mut self, ty: &[String], v: &Value, dname: &str) -> bool {
         ty.iter().any(|m| {
             if m.contains('&') {
                 return m
@@ -2806,10 +2765,7 @@ impl<'a> Interp<'a> {
     /// Zend link semantics: at a class's first use, every const
     /// initializer is evaluated — eval errors (undefined constant)
     /// propagate as Errors, then typed checks raise TypeErrors.
-    pub(in crate::interp) fn link_const_inits(
-        &mut self,
-        cls: &Rc<PhpClass>,
-    ) -> Result<(), PhpError> {
+    fn link_const_inits(&mut self, cls: &Rc<PhpClass>) -> Result<(), PhpError> {
         let lname = cls.decl.name.to_lowercase();
         if !self.consts_linked.insert(lname) {
             return Ok(());
@@ -2918,7 +2874,7 @@ impl<'a> Interp<'a> {
     /// nearest ancestor method of the same name — not just abstracts;
     /// this also covers trait-merged methods vs concrete ancestors
     /// (bug81192). `__construct` is exempt from LSP rules in PHP.
-    pub(in crate::interp) fn check_override_sigs(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
+    fn check_override_sigs(&mut self, d: &ClassDecl) -> Result<(), PhpError> {
         let mut chain: Vec<(String, Rc<ClassDecl>)> = Vec::new();
         let mut pn = d.parent.clone();
         while let Some(p) = pn {
@@ -3028,7 +2984,7 @@ impl<'a> Interp<'a> {
     /// (`A::$p::get`) at class-decl link time. Inherited but
     /// unimplemented hooks still fault subclasses (v3-style:
     /// `abstract A implements I` leaves `I::$p::get` for `B extends A`).
-    pub(in crate::interp) fn check_abstract_hooks(&self, d: &ClassDecl) -> Result<(), PhpError> {
+    fn check_abstract_hooks(&self, d: &ClassDecl) -> Result<(), PhpError> {
         if d.is_abstract {
             return Ok(());
         }
@@ -3224,16 +3180,16 @@ impl<'a> Interp<'a> {
     /// Allocate a PHP object/closure handle id: reuse the lowest dead
     /// slot, like Zend's object store recycling freed handles (closures
     /// share the store — `object(Closure)#N` interleaves with objects).
-    pub(in crate::interp) fn next_obj_id(&mut self, rc: &Rc<RefCell<PhpObject>>) -> u64 {
+    fn next_obj_id(&mut self, rc: &Rc<RefCell<PhpObject>>) -> u64 {
         let w = ObjHandle::Obj(Rc::downgrade(rc));
         self.push_handle(w)
     }
 
-    pub(in crate::interp) fn next_callable_id(&mut self, c: &Rc<PhpCallable>) -> u64 {
+    fn next_callable_id(&mut self, c: &Rc<PhpCallable>) -> u64 {
         self.push_handle(ObjHandle::Callable(Rc::downgrade(c)))
     }
 
-    pub(in crate::interp) fn push_handle(&mut self, w: ObjHandle) -> u64 {
+    fn push_handle(&mut self, w: ObjHandle) -> u64 {
         // Zend reuses the most recently freed handle first (its free
         // list is a LIFO stack), so scan dead slots back-to-front
         // (namespace_004: call2's $c reuses call1's $d handle, then
@@ -3546,5 +3502,20 @@ impl<'a> Interp<'a> {
     /// name (`"\0"` invokes `""`; bug46238).
     pub(in crate::interp) fn nul_trunc(s: &str) -> String {
         s.split('\0').next().unwrap_or_default().to_string()
+    }
+}
+
+/// Typed-const compat in trait composition: same member list
+/// (case-insensitive; both `None` is compatible).
+fn ty_list_eq(a: &Option<Vec<String>>, b: &Option<Vec<String>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|(m, n)| m.eq_ignore_ascii_case(n))
+        }
+        _ => false,
     }
 }

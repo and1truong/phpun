@@ -10,7 +10,7 @@ impl<'a> Interp<'a> {
 
     /// Param decls a callable Value will bind against — needed so
     /// arg_cells aliases by-ref params (first_class_callable_refs).
-    pub(in crate::interp) fn callable_params(&mut self, v: &Value) -> Vec<Param> {
+    fn callable_params(&mut self, v: &Value) -> Vec<Param> {
         match v {
             Value::Callable(c) => match &c.kind {
                 CallableKind::Closure(d) => d.params.clone(),
@@ -753,7 +753,7 @@ impl<'a> Interp<'a> {
     /// `C::m(...)` class resolution — traits resolve too (calling a
     /// static trait method directly is deprecated, not undefined;
     /// constexpr/error_static_call_trait_method).
-    pub(in crate::interp) fn fcc_class_of(&mut self, e: &Expr) -> Result<Rc<PhpClass>, PhpError> {
+    fn fcc_class_of(&mut self, e: &Expr) -> Result<Rc<PhpClass>, PhpError> {
         if let Expr::Const(n) | Expr::Str(n) = e {
             let rn = self.resolve_class_name(n);
             if let Some(t) = self.traits.get(&rn.to_lowercase()).cloned() {
@@ -772,7 +772,7 @@ impl<'a> Interp<'a> {
 
     /// `name(...)` — fn-name FCC with the same resolution as call_named
     /// (ns fallback for unqualified literals, \u{1} marker).
-    pub(in crate::interp) fn fcc_named(&mut self, fname: &str) -> Result<Value, PhpError> {
+    fn fcc_named(&mut self, fname: &str) -> Result<Value, PhpError> {
         let (unqualified, lname) = match fname.strip_prefix('\u{1}') {
             Some(n) => (true, n.to_lowercase()),
             None => (false, fname.trim_start_matches('\\').to_lowercase()),
@@ -825,11 +825,7 @@ impl<'a> Interp<'a> {
         self.fcc_named_emit(resolved, &miss)
     }
 
-    pub(in crate::interp) fn fcc_named_emit(
-        &mut self,
-        resolved: Option<String>,
-        miss: &str,
-    ) -> Result<Value, PhpError> {
+    fn fcc_named_emit(&mut self, resolved: Option<String>, miss: &str) -> Result<Value, PhpError> {
         match resolved {
             // Function names resolve case-insensitively but display in
             // declared case (ReflectionFunction::getNamespaceName,
@@ -1013,10 +1009,7 @@ impl<'a> Interp<'a> {
 
     /// Scope comparison for rebind warnings: None-vs-Some counts as
     /// a change (dummy scope is a different scope, closure_061).
-    pub(in crate::interp) fn scope_changed(
-        a: &Option<Rc<PhpClass>>,
-        b: &Option<Rc<PhpClass>>,
-    ) -> bool {
+    fn scope_changed(a: &Option<Rc<PhpClass>>, b: &Option<Rc<PhpClass>>) -> bool {
         match (a, b) {
             (Some(x), Some(y)) => !x.name().eq_ignore_ascii_case(y.name()),
             (Some(_), None) | (None, Some(_)) => true,
@@ -1146,7 +1139,7 @@ impl<'a> Interp<'a> {
 
     /// Any value → callable coercion for FCC (`$fn(...)`, `($c)(...)`,
     /// `[$o,'m'](...)`). Non-callables throw `Error` (Zend "not callable").
-    pub(in crate::interp) fn fcc_val(&mut self, v: &Value) -> Result<Value, PhpError> {
+    fn fcc_val(&mut self, v: &Value) -> Result<Value, PhpError> {
         match v {
             Value::Callable(_) => Ok(v.clone()),
             Value::Str(s) => {
@@ -1268,11 +1261,7 @@ impl<'a> Interp<'a> {
 
     /// `$obj->method(...)` — bound method closure. Visibility is checked
     /// at creation from the calling scope (zend_closures).
-    pub(in crate::interp) fn fcc_method(
-        &mut self,
-        ov: &Value,
-        mn: &str,
-    ) -> Result<Value, PhpError> {
+    fn fcc_method(&mut self, ov: &Value, mn: &str) -> Result<Value, PhpError> {
         let o = match ov {
             Value::Object(o) => o.clone(),
             Value::Callable(_) if mn.eq_ignore_ascii_case("__invoke") => {
@@ -1346,11 +1335,7 @@ impl<'a> Interp<'a> {
 
     /// `C::method(...)` — static method closure; non-static methods fail
     /// "cannot be called statically" at creation (Error, catchable).
-    pub(in crate::interp) fn fcc_static(
-        &mut self,
-        cls: Rc<PhpClass>,
-        mn: &str,
-    ) -> Result<Value, PhpError> {
+    fn fcc_static(&mut self, cls: Rc<PhpClass>, mn: &str) -> Result<Value, PhpError> {
         match self.find_method_in(&cls, mn) {
             Some((m, dc)) => {
                 if m.is_abstract {
@@ -1434,11 +1419,7 @@ impl<'a> Interp<'a> {
 
     /// FCC visibility gate (zend_closures): checked at creation from the
     /// calling scope; `const_self` covers class-const initializers.
-    pub(in crate::interp) fn fcc_vis_check(
-        &mut self,
-        m: &MethodDecl,
-        dc: &Rc<PhpClass>,
-    ) -> Result<(), PhpError> {
+    fn fcc_vis_check(&mut self, m: &MethodDecl, dc: &Rc<PhpClass>) -> Result<(), PhpError> {
         let scope = self
             .stack
             .last()
@@ -1498,11 +1479,7 @@ impl<'a> Interp<'a> {
 
     /// Scalar-literal callees (`(0)(...)`, `(1.5)(...)`) fail "Illegal
     /// function name"; everything else non-literal is `msg`.
-    pub(in crate::interp) fn const_scalar_callee(
-        &self,
-        e: &Expr,
-        msg: &str,
-    ) -> Result<(), PhpError> {
+    fn const_scalar_callee(&self, e: &Expr, msg: &str) -> Result<(), PhpError> {
         match e {
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null => {
                 Err(PhpError::fatal("Illegal function name", self.cur_line))
@@ -1514,7 +1491,7 @@ impl<'a> Interp<'a> {
     /// FCC-in-constant-expression shape rules (zend_compile): the callee
     /// must be a literal function name or `LiteralClass::literalMethod`.
     /// Recursed so FCCs nested in const exprs get the same check.
-    pub(in crate::interp) fn const_fcc_check(&self, e: &Expr) -> Result<(), PhpError> {
+    fn const_fcc_check(&self, e: &Expr) -> Result<(), PhpError> {
         match e {
             Expr::Fcc(inner) => match inner.as_ref() {
                 Expr::Call { name, .. } => match name.as_ref() {
@@ -1703,7 +1680,7 @@ impl<'a> Interp<'a> {
         res
     }
     /// Params binding + body run for a pushed frame context (closures).
-    pub(in crate::interp) fn bind_and_run(
+    fn bind_and_run(
         &mut self,
         decl: &FunctionDecl,
         args: CallArgs,
@@ -2025,11 +2002,7 @@ impl<'a> Interp<'a> {
     /// First `return`'s line within a body — `bare_only` restricts to
     /// value-less `return;`. Nested function/closure/class bodies are
     /// their own scope and skipped (typed_return_without_value).
-    pub(in crate::interp) fn first_return_line(
-        stmts: &[Stmt],
-        mut cur: usize,
-        bare_only: bool,
-    ) -> Option<usize> {
+    fn first_return_line(stmts: &[Stmt], mut cur: usize, bare_only: bool) -> Option<usize> {
         for s in stmts {
             match s {
                 Stmt::Line(l) => cur = *l,
@@ -2313,7 +2286,7 @@ impl<'a> Interp<'a> {
     /// `static` members resolve to the called class for checks and
     /// messages; unbound (unscoped closure) stays literal `static`
     /// (static_type_return).
-    pub(in crate::interp) fn resolve_static(&self, ty: &[String]) -> Vec<String> {
+    fn resolve_static(&self, ty: &[String]) -> Vec<String> {
         if !ty.iter().any(|m| m.eq_ignore_ascii_case("static")) {
             return ty.to_vec();
         }
@@ -2426,7 +2399,7 @@ impl<'a> Interp<'a> {
     /// Weak-mode scalar coercion for typed params/returns: returns the
     /// coerced value, or None when no scalar member applies (objects
     /// pass through unchanged).
-    pub(in crate::interp) fn coerce_scalar(&mut self, ty: &[String], v: &Value) -> Option<Value> {
+    fn coerce_scalar(&mut self, ty: &[String], v: &Value) -> Option<Value> {
         // A null value is never coerced to a scalar — `?T` params keep
         // null (scalar_null). The caller's `ok` check gates the member.
         if matches!(v, Value::Null) {
@@ -2532,7 +2505,7 @@ impl<'a> Interp<'a> {
     /// int(1) (union_types/type_checking_weak, legal_default_values).
     /// Unlike `ty_exact` (strict boundary), an int is NOT exact for
     /// `float` — it still widens through coercion.
-    pub(in crate::interp) fn ty_weak_exact(&mut self, ty: &[String], v: &Value) -> bool {
+    fn ty_weak_exact(&mut self, ty: &[String], v: &Value) -> bool {
         ty.iter().any(|m| {
             let l = m.to_lowercase();
             match l.as_str() {
@@ -2794,7 +2767,7 @@ impl<'a> Interp<'a> {
 
     /// ZPP-style type display: `iterable` expands to `Traversable|array`
     /// in param/return TypeErrors and default-value fatals (iterable_*).
-    pub(in crate::interp) fn zpp_ty_disp(ty: &[String]) -> Vec<String> {
+    fn zpp_ty_disp(ty: &[String]) -> Vec<String> {
         ty.iter()
             .flat_map(|m| {
                 if m.eq_ignore_ascii_case("iterable") {
@@ -2814,7 +2787,7 @@ impl<'a> Interp<'a> {
 
     /// Display name for a decl in diagnostics — closures are named
     /// `{closure:FILE:LINE}` like Zend (named_params/call_user_func).
-    pub(in crate::interp) fn decl_fname(&self, decl: &FunctionDecl) -> String {
+    fn decl_fname(&self, decl: &FunctionDecl) -> String {
         let base = if decl.name.is_empty() {
             format!("{{closure:{}:{}}}", decl.file, decl.line)
         } else {
@@ -2827,7 +2800,7 @@ impl<'a> Interp<'a> {
             .unwrap_or(base)
     }
 
-    pub(in crate::interp) fn bind_and_run_inner(
+    fn bind_and_run_inner(
         &mut self,
         decl: &FunctionDecl,
         args: CallArgs,
@@ -3583,4 +3556,88 @@ impl<'a> Interp<'a> {
         }
         self.bind_and_run(decl, args, Vec::new())
     }
+}
+
+/// By-ref flags for builtin parameters (only slots that accept references are
+/// `true`). Used to warn on non-variable args in by-ref positions and to alias
+/// real cells for mutating builtins like array_pop/sort/preg_match.
+fn builtin_byref(name: &str) -> Option<&'static [bool]> {
+    Some(match name {
+        "array_pop" | "array_shift" | "array_walk" | "sort" | "rsort" | "asort" | "arsort"
+        | "ksort" | "krsort" | "usort" | "uasort" | "uksort" | "natsort" | "natcasesort"
+        | "shuffle" | "reset" | "end" | "next" | "prev" | "current" | "pos" | "each"
+        | "array_push" | "array_unshift" | "array_splice" | "array_multisort" => &[true],
+        "preg_match" | "preg_match_all" => &[false, false, true],
+        "preg_replace"
+        | "preg_replace_callback"
+        | "preg_filter"
+        | "str_replace"
+        | "str_ireplace" => &[false, false, false, false, true],
+        "preg_replace_callback_array" => &[false, false, false, true],
+        "parse_str" => &[false, true],
+        "is_callable" => &[false, false, true],
+        "sscanf" | "fscanf" => &[false, false],
+        "exec" => &[false, true, true],
+        "passthru" | "system" => &[false, true],
+        "preg_grep" => &[false],
+        _ => return None,
+    })
+}
+
+/// Zend's normalized union display for redundancy errors: iterable
+/// expands to its members, class names first (written order), then
+/// `object`, then `array`, then remaining builtins, `null` last.
+fn ty_norm_disp(ty: &[String]) -> String {
+    let mut classes: Vec<String> = Vec::new();
+    let mut scalars: Vec<String> = Vec::new();
+    let mut obj = false;
+    let mut arr = false;
+    let mut nul = false;
+    for m in ty {
+        let mut members: Vec<String> = if m.eq_ignore_ascii_case("iterable") {
+            vec!["Traversable".into(), "array".into()]
+        } else {
+            vec![m.clone()]
+        };
+        for e in members.drain(..) {
+            let el = e.to_lowercase();
+            match el.as_str() {
+                "null" => nul = true,
+                "object" => obj = true,
+                "array" => arr = true,
+                "self" | "static" | "parent" => {
+                    if !classes.iter().any(|c| c.eq_ignore_ascii_case(&e)) {
+                        classes.push(e);
+                    }
+                }
+                "int" | "float" | "string" | "bool" | "callable" | "iterable" | "mixed"
+                | "void" | "never" | "false" | "true" => {
+                    if !scalars.iter().any(|c| c == &el) {
+                        scalars.push(el);
+                    }
+                }
+                _ => {
+                    if !classes.iter().any(|c| c.eq_ignore_ascii_case(&e)) {
+                        if e.contains('&') {
+                            classes.push(format!("({})", e));
+                        } else {
+                            classes.push(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = classes;
+    if obj {
+        out.push("object".into());
+    }
+    if arr {
+        out.push("array".into());
+    }
+    out.extend(scalars);
+    if nul {
+        out.push("null".into());
+    }
+    out.join("|")
 }

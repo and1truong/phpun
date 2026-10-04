@@ -8,7 +8,7 @@ impl<'a> Interp<'a> {
     /// Native bodies for the ArrayIterator stub. Iteration state lives in
     /// the `ArrayIter` object internal; unknown methods return None so
     /// the generic dispatch can report `Call to undefined method`.
-    pub(in crate::interp) fn array_iter_method(
+    fn array_iter_method(
         &mut self,
         obj: &Rc<RefCell<PhpObject>>,
         name: &str,
@@ -378,7 +378,7 @@ impl<'a> Interp<'a> {
 
     /// `$obj->method()` dispatch to a resolved decl.
     /// `dc` is the declaring class — used as the private-prop scope.
-    pub(in crate::interp) fn invoke_method(
+    fn invoke_method(
         &mut self,
         obj: Rc<RefCell<PhpObject>>,
         m: &Rc<MethodDecl>,
@@ -415,7 +415,7 @@ impl<'a> Interp<'a> {
     /// references in the caller's send array stay shared (bug50394);
     /// plain zvals are copied so var_dump shows no `&`
     /// (trampoline_closure_named_arguments).
-    pub(in crate::interp) fn magic_args_array(&self, args: &CallArgs) -> PhpArray {
+    fn magic_args_array(&self, args: &CallArgs) -> PhpArray {
         let mut arr = PhpArray::new();
         let share = |a: &Cell| {
             if self.ref_cells.contains(&(Rc::as_ptr(a) as usize)) {
@@ -433,7 +433,7 @@ impl<'a> Interp<'a> {
         arr
     }
 
-    pub(in crate::interp) fn call_via_magic(
+    fn call_via_magic(
         &mut self,
         obj: Rc<RefCell<PhpObject>>,
         m: &Rc<MethodDecl>,
@@ -456,10 +456,7 @@ impl<'a> Interp<'a> {
     /// A private method owned by the calling scope binds statically:
     /// `$this->m()` inside `S::x` always resolves to `S::m`, bypassing
     /// the object's override (zend private methods are not virtual).
-    pub(in crate::interp) fn scope_private_method(
-        &mut self,
-        name: &str,
-    ) -> Option<(Rc<MethodDecl>, Rc<PhpClass>)> {
+    fn scope_private_method(&mut self, name: &str) -> Option<(Rc<MethodDecl>, Rc<PhpClass>)> {
         let scope = self
             .stack
             .last()
@@ -595,11 +592,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Method-call visibility against the current calling scope.
-    pub(in crate::interp) fn method_access_ok(
-        &mut self,
-        m: &MethodDecl,
-        dc: &Rc<PhpClass>,
-    ) -> bool {
+    fn method_access_ok(&mut self, m: &MethodDecl, dc: &Rc<PhpClass>) -> bool {
         let scope = self
             .stack
             .last()
@@ -653,11 +646,7 @@ impl<'a> Interp<'a> {
     }
 
     /// `Call to private/protected method X::m() from scope Y` — catchable.
-    pub(in crate::interp) fn method_vis_error(
-        &mut self,
-        m: &MethodDecl,
-        dc: &Rc<PhpClass>,
-    ) -> PhpError {
+    fn method_vis_error(&mut self, m: &MethodDecl, dc: &Rc<PhpClass>) -> PhpError {
         let vis = match m.visibility {
             crate::ast::Visibility::Public => "public",
             crate::ast::Visibility::Protected => "protected",

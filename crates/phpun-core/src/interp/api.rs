@@ -22,7 +22,7 @@ impl<'a> Interp<'a> {
     /// clearing the buffer first (bug24951 flag semantics:
     /// START=1, CLEAN=2, FLUSH=4, FINAL=8). Returns the handler's output
     /// — or the raw buffer when there is no handler.
-    pub(in crate::interp) fn ob_invoke(&mut self, mode: i64) -> Result<Option<Vec<u8>>, PhpError> {
+    fn ob_invoke(&mut self, mode: i64) -> Result<Option<Vec<u8>>, PhpError> {
         let (handler, buf, already) = match self.ob_stack.last_mut() {
             Some(l) => {
                 let buf = std::mem::take(&mut l.buf);
