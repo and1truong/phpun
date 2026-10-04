@@ -1097,21 +1097,6 @@ fn read_line_resource(c: Option<&Cell>) -> Result<Vec<u8>, PhpError> {
     }
 }
 
-/// PHP zval type word used in TypeError "…, X given" messages.
-fn zval_word(v: &Value) -> String {
-    match v {
-        Value::Null => "null".into(),
-        Value::Bool(b) => if *b { "true" } else { "false" }.into(),
-        Value::Int(_) => "int".into(),
-        Value::Float(_) => "float".into(),
-        Value::Str(_) => "string".into(),
-        Value::Array(_) => "array".into(),
-        Value::Object(o) => o.borrow().class.name().to_string(),
-        Value::Callable(_) => "Closure".into(),
-        Value::Resource(_) => "resource".into(),
-    }
-}
-
 /// php_stream_gets: read up to `limit` bytes, stopping after '\n'.
 /// Returns an empty vec at EOF (or on a non-readable stream).
 fn csv_gets(c: &Cell, limit: usize) -> Result<Vec<u8>, PhpError> {

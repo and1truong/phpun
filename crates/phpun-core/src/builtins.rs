@@ -4,7 +4,8 @@
 use crate::error::PhpError;
 use crate::interp::Interp;
 pub(in crate::builtins) use crate::value::{
-    compare, numeric, to_key, ArrKey, Cell, Numeric, PhpArray, PhpObject, PhpResource, Value,
+    compare, format_float_repr, numeric, to_key, ArrKey, Cell, Numeric, PhpArray, PhpObject,
+    PhpResource, Value,
 };
 pub(in crate::builtins) use std::cell::RefCell;
 pub(in crate::builtins) use std::collections::HashMap;
@@ -46,6 +47,21 @@ fn arg_str(it: &mut Interp, args: &[Cell], i: usize) -> String {
 
 fn arg_bs(it: &mut Interp, args: &[Cell], i: usize) -> Vec<u8> {
     it.to_bytes_of(&arg(args, i))
+}
+
+/// PHP's name for a zval's type, used in TypeError messages.
+pub(crate) fn zval_word(v: &Value) -> String {
+    match v {
+        Value::Null => "null".into(),
+        Value::Bool(b) => if *b { "true" } else { "false" }.into(),
+        Value::Int(_) => "int".into(),
+        Value::Float(_) => "float".into(),
+        Value::Str(_) => "string".into(),
+        Value::Array(_) => "array".into(),
+        Value::Object(o) => o.borrow().class.name().to_string(),
+        Value::Callable(_) => "Closure".into(),
+        Value::Resource(_) => "resource".into(),
+    }
 }
 
 fn key_str(k: &ArrKey) -> String {
