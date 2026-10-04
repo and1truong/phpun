@@ -295,6 +295,11 @@ pub struct Interp<'a> {
     /// Auto-key counter for keyless `yield $v` — counts keyless yields
     /// only (explicit keys and `yield from` items don't advance it).
     gen_auto: i64,
+    /// The generator whose body is currently running — output produced
+    /// after a yield suspends is tagged with that yield's item index
+    /// and buffered on the GenState until the consumer resumes past
+    /// it (closure_call_leak_with_exception).
+    gen_run_state: Option<Rc<RefCell<crate::value::GenState>>>,
     /// Declaring class of the method about to be invoked (set by
     /// invoke_method, consumed by invoke_fn to fill Frame::decl_class).
     pending_decl_class: Option<Rc<PhpClass>>,
@@ -733,6 +738,7 @@ impl<'a> Interp<'a> {
             pending_gen_captures: Vec::new(),
             gen_sends: std::collections::VecDeque::new(),
             gen_auto: 0,
+            gen_run_state: None,
             pending_decl_class: None,
             pending_called_class: None,
             pending_hook_prop: None,
@@ -2095,6 +2101,7 @@ impl<'a> Interp<'a> {
                     mk_method("hasType", vec![]),
                     mk_method("getType", vec![]),
                     mk_method("getName", vec![]),
+                    mk_method("getClass", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -3047,6 +3054,20 @@ impl<'a> Interp<'a> {
         // writes pass it (bug45392); checked at the next statement.
         self.mem_used += b.len() as u64;
         self.mem_last = b.len() as u64;
+        // Inside a generator run, output after a yield is deferred to
+        // resume — `f(yield)` must not observe the call (nor its echo)
+        // until the consumer advances past that yield.
+        if let Some(run) = &self.gen_run_state {
+            let done = self
+                .gen_sink
+                .as_ref()
+                .map(|s| s.borrow().len())
+                .unwrap_or(0);
+            if done > 0 {
+                run.borrow_mut().pending_out.push((done - 1, b.to_vec()));
+                return;
+            }
+        }
         if let Some(buf) = self.ob_stack.last_mut() {
             buf.buf.extend_from_slice(b);
         } else if self.live_io {
@@ -3056,6 +3077,26 @@ impl<'a> Interp<'a> {
             let _ = so.flush();
         } else {
             self.out.extend_from_slice(b);
+        }
+    }
+
+    /// Emit generator-deferred output whose suspending yield the
+    /// consumer has now advanced past (`pos > tag`). Pass
+    /// `usize::MAX` to flush everything (getReturn runs to the end).
+    fn gen_flush_out(&mut self, state: &Rc<RefCell<crate::value::GenState>>, pos: usize) {
+        let ready = {
+            let mut st = state.borrow_mut();
+            let split = st
+                .pending_out
+                .iter()
+                .position(|(t, _)| *t >= pos)
+                .unwrap_or(st.pending_out.len());
+            let mut rest = st.pending_out.split_off(split);
+            std::mem::swap(&mut st.pending_out, &mut rest);
+            rest
+        };
+        for (_, b) in ready {
+            self.emit_bytes(&b);
         }
     }
 
@@ -8132,6 +8173,94 @@ impl<'a> Interp<'a> {
         })
     }
 
+    /// Decl for the function a callable value points at — builtins
+    /// synthesize one from builtin_sig. Shared by the function and
+    /// method (Closure::__invoke) reflector paths.
+    fn callable_decl(&mut self, v: &Value) -> Option<Rc<crate::ast::FunctionDecl>> {
+        match v {
+            Value::Str(s) => {
+                let n = String::from_utf8_lossy(s).to_lowercase();
+                self.functions
+                    .get(&n)
+                    .cloned()
+                    .or_else(|| Self::builtin_decl(&n))
+            }
+            Value::Callable(c) => match &c.kind {
+                crate::value::CallableKind::Closure(d) => Some(d.clone()),
+                crate::value::CallableKind::Named(n) => self
+                    .functions
+                    .get(&n.to_lowercase())
+                    .cloned()
+                    .or_else(|| Self::builtin_decl(&n.to_lowercase())),
+                crate::value::CallableKind::Method { name, obj, class } => {
+                    let c = class
+                        .clone()
+                        .or_else(|| obj.as_ref().map(|o| o.borrow().class.clone()));
+                    match c {
+                        Some(c) => self
+                            .find_method_in(&c, name)
+                            .map(|(m, _)| Rc::new(m.decl.clone()))
+                            // A magic-method trampoline (`C::undef(...)`
+                            // on __callStatic / `$o->undef(...)` on
+                            // __call) reflects as `mixed ...$arguments`
+                            // (trampoline_closure_named_arguments).
+                            .or_else(|| {
+                                let magic = if obj.is_some() {
+                                    "__call"
+                                } else {
+                                    "__callstatic"
+                                };
+                                self.find_method_in(&c, magic)
+                                    .is_some()
+                                    .then(Self::trampoline_decl)
+                            }),
+                        None => None,
+                    }
+                }
+            },
+            _ => None,
+        }
+    }
+
+    /// Synthetic decl for an internal function, from builtin_sig +
+    /// builtin_param_ty — lets reflectors report param names,
+    /// required flags and declared types for builtins (bug69802_2).
+    fn builtin_decl(lname: &str) -> Option<Rc<crate::ast::FunctionDecl>> {
+        let sig = crate::builtins::builtin_sig(lname)?;
+        Some(Rc::new(crate::ast::FunctionDecl {
+            name: lname.into(),
+            params: sig
+                .into_iter()
+                .map(|(name, req)| crate::ast::Param {
+                    default: if req {
+                        None
+                    } else {
+                        Some(crate::ast::Expr::Null)
+                    },
+                    ty: crate::builtins::builtin_param_ty(lname, &name),
+                    name,
+                    by_ref: false,
+                    variadic: false,
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                })
+                .collect(),
+            ret: None,
+            body: vec![],
+            attrs: vec![],
+            by_ref: false,
+            line: 0,
+            end_line: 0,
+            file: String::new(),
+            ns: String::new(),
+            decl_in: None,
+        }))
+    }
+
     /// Same-type same-value — owners must agree on the *exact* result
     /// (int(42) vs float(42.0) is inconsistent).
     fn value_identical(a: &Value, b: &Value) -> bool {
@@ -9726,13 +9855,18 @@ impl<'a> Interp<'a> {
     }
 
     /// Shared `Closure::bind`/`bindTo`/`call` rebinding model
-    /// (closure_036-044, zend_closures):
+    /// (closure_036-044/061/063, zend_closures, bug70685):
     /// - binding an instance to a static closure warns → NULL
-    /// - unbinding $this from a closure that has one warns → NULL
+    /// - unbinding $this warns — "of method" for method-created
+    ///   closures, "of closure using $this" otherwise
     /// - explicit scope arg: null → unscoped ("dummy"), object → its
     ///   class, string → resolved class; omitted or 'static' keeps
     ///   the previous scope — an unscoped closure stays unscoped
     ///   ("dummy scope", closure_046)
+    /// - internal-class scopes are rejected for everything but
+    ///   method-created closures (their scope already is internal)
+    /// - fake closures (Named/Method kinds) can't change scope, but
+    ///   CAN rebind $this freely (closure_063: silent success)
     ///
     /// Returns Ok(None) after emitting a warning → caller returns NULL.
     fn rebind_closure(
@@ -9741,55 +9875,34 @@ impl<'a> Interp<'a> {
         new_this: Option<Rc<RefCell<PhpObject>>>,
         scope_arg: Option<Value>,
     ) -> Result<Option<PhpCallable>, PhpError> {
-        // "uses $this" is the compile-time body flag, not merely a
-        // bound instance — a static-scope closure that references
-        // $this but never captured one unbinds quietly (closure_062).
-        let uses_this = c.this_obj.is_some()
-            && match &c.kind {
-                CallableKind::Closure(d) => Self::body_uses_this(&d.body),
-                _ => true,
-            };
         if new_this.is_some() && c.is_static {
             self.warn(
                 "Cannot bind an instance to a static closure, this will be an error in PHP 9",
             )?;
             return Ok(None);
         }
-        if new_this.is_none() && uses_this && !c.is_static {
-            self.warn(
-                "Cannot unbind $this of closure using $this, this will be an error in PHP 9",
-            )?;
-            return Ok(None);
-        }
-        // A closure created from a function has no scope/$this to
-        // rebind — any attempt warns (bug70630).
-        if matches!(c.kind, CallableKind::Named(_)) {
-            self.warn(
-                "Cannot rebind scope of closure created from function, this will be an error in PHP 9",
-            )?;
-            return Ok(None);
-        }
-        // A method callable's new instance must be instanceof the
-        // method's class (closure_from_callable_rebinding).
-        if let (
-            Some(t),
-            CallableKind::Method {
-                obj: Some(o),
-                name: mname,
-                ..
-            },
-        ) = (&new_this, &c.kind)
-        {
-            let mcls = o.borrow().class.clone();
-            let tc = t.borrow().class.clone();
-            if !self.is_a(&tc, mcls.name()) {
-                self.warn(&format!(
-                    "Cannot bind method {}::{}() to object of class {}, this will be an error in PHP 9",
-                    mcls.name(),
-                    mname,
-                    tc.name()
-                ))?;
-                return Ok(None);
+        if new_this.is_none() {
+            match &c.kind {
+                // Method-created closures carry their target in
+                // `kind.obj` — dropping it is the "of method" unbind
+                // (closure_061).
+                CallableKind::Method { obj: Some(_), .. } => {
+                    self.warn("Cannot unbind $this of method, this will be an error in PHP 9")?;
+                    return Ok(None);
+                }
+                // "uses $this" is the compile-time body flag, not
+                // merely a bound instance — a static-scope closure
+                // that references $this but never captured one
+                // unbinds quietly (closure_062).
+                CallableKind::Closure(d)
+                    if c.this_obj.is_some() && Self::body_uses_this(&d.body) && !c.is_static =>
+                {
+                    self.warn(
+                        "Cannot unbind $this of closure using $this, this will be an error in PHP 9",
+                    )?;
+                    return Ok(None);
+                }
+                _ => {}
             }
         }
         let scope: Option<Rc<PhpClass>> = match &scope_arg {
@@ -9824,35 +9937,65 @@ impl<'a> Interp<'a> {
             // Other arg types were rejected by the caller's TypeError.
             Some(_) => None,
         };
-        if matches!(c.kind, CallableKind::Method { .. }) {
-            // A method-created closure keeps the declaring scope —
-            // resolving to a different class is a rebind (bug70685).
-            let changed = match (&scope, &c.scope_class) {
-                (Some(a), Some(b)) => a.name() != b.name(),
-                (Some(_), None) | (None, Some(_)) => true,
-                (None, None) => false,
-            };
-            if changed {
+        // Internal classes (decl.file empty) can't be closure scopes —
+        // `call()` always resolves scope to the new instance's class,
+        // so $x->call($std) hits this (closure_call). Method-kind
+        // callables are exempt: their declaring scope is the internal
+        // class already (closure_call_internal). This check precedes
+        // the per-kind scope warnings — a fake-function closure bound
+        // to stdClass reports the internal class (closure_061).
+        if !matches!(c.kind, CallableKind::Method { .. }) {
+            if let Some(sc) = &scope {
+                if sc.decl.file.is_empty() && !sc.name().eq_ignore_ascii_case("closure") {
+                    self.warn(&format!(
+                        "Cannot bind closure to scope of internal class {}, this will be an error in PHP 9",
+                        sc.name()
+                    ))?;
+                    return Ok(None);
+                }
+            }
+        }
+        match &c.kind {
+            // A closure created from a function has no scope — only an
+            // actual scope change warns; binding $this is silent
+            // (bug70630 vs closure_063).
+            CallableKind::Named(_) if Self::scope_changed(&scope, &c.scope_class) => {
                 self.warn(
-                    "Cannot rebind scope of closure created from method, this will be an error in PHP 9",
+                    "Cannot rebind scope of closure created from function, this will be an error in PHP 9",
                 )?;
                 return Ok(None);
             }
-        }
-        if let (Some(sc), CallableKind::Closure(_)) = (&scope, &c.kind) {
-            // Internal classes (decl.file empty) can't be closure
-            // scopes — `call()` always resolves scope to the new
-            // instance's class, so $x->call($std) hits this
-            // (closure_call). Method-kind callables are exempt:
-            // their declaring scope is the internal class already
-            // (closure_call_internal).
-            if sc.decl.file.is_empty() && !sc.name().eq_ignore_ascii_case("closure") {
-                self.warn(&format!(
-                    "Cannot bind closure to scope of internal class {}, this will be an error in PHP 9",
-                    sc.name()
-                ))?;
-                return Ok(None);
+            CallableKind::Method { name, .. } => {
+                // The new instance must be instanceof the method's
+                // DECLARING class — `scope_class` already holds it
+                // (SplStack::count → SplDoublyLinkedList, bug70685).
+                // Checked before the scope warning: call(new B) rebinds
+                // scope AND target yet reports the target
+                // (closure_from_callable_rebinding).
+                if let Some(t) = &new_this {
+                    let tc = t.borrow().class.clone();
+                    let dc = c.scope_class.clone().unwrap_or_else(|| tc.clone());
+                    if !self.is_a(&tc, dc.name()) {
+                        self.warn(&format!(
+                            "Cannot bind method {}::{}() to object of class {}, this will be an error in PHP 9",
+                            dc.name(),
+                            name,
+                            tc.name()
+                        ))?;
+                        return Ok(None);
+                    }
+                }
+                // A method-created closure keeps the declaring scope —
+                // resolving to a different class is a rebind
+                // (bug70685).
+                if Self::scope_changed(&scope, &c.scope_class) {
+                    self.warn(
+                        "Cannot rebind scope of closure created from method, this will be an error in PHP 9",
+                    )?;
+                    return Ok(None);
+                }
             }
+            _ => {}
         }
         let mut nc = (*c).clone();
         nc.this_obj = new_this;
@@ -9867,6 +10010,16 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(Some(nc))
+    }
+
+    /// Scope comparison for rebind warnings: None-vs-Some counts as
+    /// a change (dummy scope is a different scope, closure_061).
+    fn scope_changed(a: &Option<Rc<PhpClass>>, b: &Option<Rc<PhpClass>>) -> bool {
+        match (a, b) {
+            (Some(x), Some(y)) => !x.name().eq_ignore_ascii_case(y.name()),
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => false,
+        }
     }
 
     /// `Closure::fromCallable($v)` — like fcc_val but: failures throw
@@ -12607,6 +12760,7 @@ impl<'a> Interp<'a> {
             by_ref,
             auto_key: 0,
             sends: Vec::new(),
+            pending_out: Vec::new(),
         }));
         let cls = self
             .classes
@@ -12667,6 +12821,7 @@ impl<'a> Interp<'a> {
         let saved_sink = self.gen_sink.replace(items.clone());
         let saved_sends = std::mem::replace(&mut self.gen_sends, sends.into_iter().collect());
         let saved_auto = std::mem::replace(&mut self.gen_auto, 0);
+        let saved_run = self.gen_run_state.replace(state.clone());
         // Closure-generator captures bind as extra frame vars.
         if !captures.is_empty() {
             self.pending_gen_captures = captures;
@@ -12675,6 +12830,7 @@ impl<'a> Interp<'a> {
         self.gen_sink = saved_sink;
         self.gen_sends = saved_sends;
         self.gen_auto = saved_auto;
+        self.gen_run_state = saved_run;
         let collected = std::mem::take(&mut *items.borrow_mut());
         let mut st = state.borrow_mut();
         st.items = collected;
@@ -13049,6 +13205,8 @@ impl<'a> Interp<'a> {
             "next" => {
                 self.gen_start(&state)?;
                 state.borrow_mut().pos += 1;
+                let pos = state.borrow().pos;
+                self.gen_flush_out(&state, pos);
                 Ok(Some(Value::Null))
             }
             "send" => {
@@ -13064,12 +13222,18 @@ impl<'a> Interp<'a> {
                         st.finished = false;
                         st.items.clear();
                         st.pos = 0;
+                        st.pending_out.clear();
                     }
                 }
                 self.gen_start(&state)?;
                 // The k-th send resumes at item k.
-                let mut st = state.borrow_mut();
-                st.pos = st.sends.len();
+                {
+                    let mut st = state.borrow_mut();
+                    st.pos = st.sends.len();
+                }
+                let pos = state.borrow().pos;
+                self.gen_flush_out(&state, pos);
+                let st = state.borrow();
                 Ok(Some(
                     st.items
                         .get(st.pos)
@@ -13083,6 +13247,10 @@ impl<'a> Interp<'a> {
                 Err(self.throw(e))
             }
             "getreturn" => {
+                // getReturn() runs the generator to completion —
+                // everything still deferred past yields belongs to
+                // that final resume.
+                self.gen_flush_out(&state, usize::MAX);
                 let st = state.borrow();
                 Ok(Some(st.return_val.clone()))
             }
@@ -18549,12 +18717,22 @@ impl<'a> Interp<'a> {
                             .map(|c| c.decl.name.clone())
                             .unwrap_or(resolved)
                     }
+                    // A closure first arg is a Closure object to Zend
+                    // (bug69802_2).
+                    Value::Callable(_) => "Closure".into(),
                     _ => String::new(),
                 };
                 match ob.class.name().to_lowercase().as_str() {
                     "reflectionproperty" | "reflectionmethod" | "reflectionclassconstant" => {
                         ob.props.insert("name".into(), cell(prop));
                         ob.props.insert("class".into(), cell(Value::str(&cname)));
+                        // Public metadata props render in var_dump in
+                        // declaration order: name, then class.
+                        for k in ["name", "class"] {
+                            if !ob.prop_order.contains(&k.into()) {
+                                ob.prop_order.push(k.into());
+                            }
+                        }
                     }
                     "reflectionclass" | "reflectionfunction" => {
                         // A closure reflector's `name` is its Zend name
@@ -18568,6 +18746,9 @@ impl<'a> Interp<'a> {
                             _ => cls,
                         };
                         ob.props.insert("name".into(), cell(nm));
+                        if !ob.prop_order.contains(&"name".into()) {
+                            ob.prop_order.push("name".into());
+                        }
                     }
                     _ => {}
                 }
@@ -18773,10 +18954,10 @@ impl<'a> Interp<'a> {
                                 None,
                             ),
                         };
-                        let decl_cls = self
+                        let (mdecl, decl_cls) = self
                             .find_method_in(&mc, &mn)
-                            .map(|(_, dc)| dc)
-                            .unwrap_or_else(|| mc.clone());
+                            .map(|(m, dc)| (Some(m), dc))
+                            .unwrap_or_else(|| (None, mc.clone()));
                         return Ok(Some(Value::Callable(self.new_callable(PhpCallable {
                             id: std::cell::Cell::new(0),
                             kind: CallableKind::Method {
@@ -18788,7 +18969,9 @@ impl<'a> Interp<'a> {
                             this_obj: None,
                             scope_class: Some(decl_cls.clone()),
                             called_class: Some(mc),
-                            is_static: false,
+                            // Static methods produce static closures —
+                            // rebinding an instance warns (closure_061).
+                            is_static: mdecl.map(|m| m.is_static).unwrap_or(false),
                         }))));
                     }
                     // A function reflector's getClosure is a named
@@ -19088,7 +19271,6 @@ impl<'a> Interp<'a> {
                         .get("\0rc\0class")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
-                    let cn = self.conv_str(&cn)?.to_string();
                     let mn = obj
                         .borrow()
                         .props
@@ -19096,12 +19278,24 @@ impl<'a> Interp<'a> {
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let mn = self.conv_str(&mn)?.to_string();
-                    let c = self.classes.get(&cn.to_lowercase()).cloned();
-                    match c {
-                        Some(c) => self
-                            .find_method_in(&c, &mn)
-                            .map(|(m, _)| Rc::new(m.decl.clone())),
-                        None => None,
+                    if matches!(&cn, Value::Callable(_)) {
+                        // new ReflectionMethod($closure, '__invoke') —
+                        // Closure::__invoke carries the wrapped
+                        // function's signature (bug69802_2).
+                        if mn.eq_ignore_ascii_case("__invoke") {
+                            self.callable_decl(&cn)
+                        } else {
+                            None
+                        }
+                    } else {
+                        let cn = self.conv_str(&cn)?.to_string();
+                        let c = self.classes.get(&cn.to_lowercase()).cloned();
+                        match c {
+                            Some(c) => self
+                                .find_method_in(&c, &mn)
+                                .map(|(m, _)| Rc::new(m.decl.clone())),
+                            None => None,
+                        }
                     }
                 } else {
                     let cb = obj
@@ -19110,46 +19304,7 @@ impl<'a> Interp<'a> {
                         .get("\0rc\0class")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
-                    match &cb {
-                        Value::Str(s) => self
-                            .functions
-                            .get(&String::from_utf8_lossy(s).to_lowercase())
-                            .cloned(),
-                        Value::Callable(c) => match &c.kind {
-                            crate::value::CallableKind::Closure(d) => Some(d.clone()),
-                            crate::value::CallableKind::Named(n) => {
-                                self.functions.get(&n.to_lowercase()).cloned()
-                            }
-                            crate::value::CallableKind::Method { name, obj, class } => {
-                                let c = class
-                                    .clone()
-                                    .or_else(|| obj.as_ref().map(|o| o.borrow().class.clone()));
-                                match c {
-                                    Some(c) => self
-                                        .find_method_in(&c, name)
-                                        .map(|(m, _)| Rc::new(m.decl.clone()))
-                                        // A magic-method trampoline
-                                        // (`C::undef(...)` on
-                                        // __callStatic / `$o->undef(...)`
-                                        // on __call) reflects as
-                                        // `mixed ...$arguments`
-                                        // (trampoline_closure_named_arguments).
-                                        .or_else(|| {
-                                            let magic = if obj.is_some() {
-                                                "__call"
-                                            } else {
-                                                "__callstatic"
-                                            };
-                                            self.find_method_in(&c, magic)
-                                                .is_some()
-                                                .then(Self::trampoline_decl)
-                                        }),
-                                    None => None,
-                                }
-                            }
-                        },
-                        _ => None,
-                    }
+                    self.callable_decl(&cb)
                 };
                 let mut arr = PhpArray::default();
                 if let Some(d) = decl {
@@ -19206,6 +19361,51 @@ impl<'a> Interp<'a> {
                     })
                     .unwrap_or(false);
                 Ok(Some(Value::Bool(has)))
+            }
+            "getclass" => {
+                // Deprecated since 8.0 — returns a ReflectionClass for
+                // the first class/interface member of the declared
+                // type (a union picks the class part — bug69802_2).
+                self.deprecated(
+                    "Method ReflectionParameter::getClass() is deprecated since 8.0, use ReflectionParameter::getType() instead",
+                )?;
+                let ty = obj
+                    .borrow()
+                    .props
+                    .get("\0rp\0ty")
+                    .map(|c| c.borrow().clone())
+                    .and_then(|v| match v {
+                        Value::Array(a) => Some(a),
+                        _ => None,
+                    });
+                let class_ty = ty.and_then(|ta| {
+                    ta.borrow().entries.iter().find_map(|(_, c)| {
+                        let n = c.borrow().to_php_string();
+                        self.classes
+                            .get(&n.to_lowercase())
+                            .map(|cl| cl.decl.name.clone())
+                            .or_else(|| {
+                                self.interfaces
+                                    .get(&n.to_lowercase())
+                                    .map(|d| d.name.clone())
+                            })
+                    })
+                });
+                match class_ty {
+                    Some(n) => {
+                        let rc = self.instantiate("reflectionclass", &[])?;
+                        if let Value::Object(o) = &rc {
+                            let mut ob = o.borrow_mut();
+                            ob.props.insert("\0rc\0class".into(), cell(Value::str(&n)));
+                            ob.props.insert("name".into(), cell(Value::str(&n)));
+                            if !ob.prop_order.contains(&"name".into()) {
+                                ob.prop_order.push("name".into());
+                            }
+                        }
+                        Ok(Some(rc))
+                    }
+                    None => Ok(Some(Value::Null)),
+                }
             }
             "iscallable" => {
                 self.deprecated(
@@ -19564,27 +19764,9 @@ impl<'a> Interp<'a> {
                     None => Ok(Some(Value::Bool(false))),
                 }
             }
-            "getshortname" | "getnamespacename" => {
-                let cn = obj
-                    .borrow()
-                    .props
-                    .get("\0rc\0class")
-                    .map(|c| c.borrow().clone())
-                    .unwrap_or(Value::Null);
-                let cn = self.conv_str(&cn)?.to_string();
-                let (ns, short) = match cn.rsplit('\\').next() {
-                    Some(s) => {
-                        let idx = cn.len() - s.len();
-                        (cn[..idx].trim_end_matches('\\').to_string(), s.to_string())
-                    }
-                    None => (String::new(), cn.clone()),
-                };
-                Ok(Some(Value::str(if lname == "getshortname" {
-                    short
-                } else {
-                    ns
-                })))
-            }
+            // getshortname/getnamespacename are handled by the earlier
+            // combined name-introspection arm (a second arm here would be
+            // unreachable — clippy failure surfaced by the #50 merge).
             "newinstancewithoutconstructor" => {
                 let cn = obj
                     .borrow()
