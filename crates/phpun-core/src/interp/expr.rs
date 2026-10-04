@@ -1411,7 +1411,7 @@ impl<'a> Interp<'a> {
                         // write — an overloaded prop's fetched temp
                         // must not write through into the getter's
                         // backing store (bug32660).
-                        self.cow_split(&mut *b);
+                        self.cow_split(&mut b);
                         let rc = match &*b {
                             Value::Array(rc) => rc.clone(),
                             _ => unreachable!(),
@@ -2310,7 +2310,7 @@ impl<'a> Interp<'a> {
                         // PHP semantics: write through to all aliases... PHP
                         // separates unreferenced copies; our Rc aliases share.
                         // For `$a = $b; $a[0]=1` PHP copies. Handle via split.
-                        self.cow_split(&mut *b);
+                        self.cow_split(&mut b);
                         if let Value::Array(rc) = &mut *b {
                             let mut arr = rc.borrow_mut();
                             match key {
@@ -2512,7 +2512,7 @@ impl<'a> Interp<'a> {
             // keep their bound cells through the split (ref_cells);
             // an ordinary shared zend_array still separates on write
             // (bug32660).
-            self.cow_split(&mut *b);
+            self.cow_split(&mut b);
             let rc = match &*b {
                 Value::Array(rc) => rc.clone(),
                 _ => unreachable!(),
@@ -2841,7 +2841,7 @@ impl<'a> Interp<'a> {
                         // lazily; mutating the shared table would corrupt
                         // the source (InputDefinition::parseArgument
                         // unsets on its own copy of getArguments()).
-                        self.cow_split(&mut *b);
+                        self.cow_split(&mut b);
                         if let Value::Array(rc) = &*b {
                             if let Some(k) = key {
                                 rc.borrow_mut().unset(&to_key(&k));
@@ -2868,7 +2868,7 @@ impl<'a> Interp<'a> {
                 if let Ok(c) = self.index_cell(inner, ii.as_deref()) {
                     let mut b = c.borrow_mut();
                     if let Value::Array(_) = &mut *b {
-                        self.cow_split(&mut *b);
+                        self.cow_split(&mut b);
                         if let Value::Array(rc) = &*b {
                             if let Some(k) = key {
                                 rc.borrow_mut().unset(&to_key(&k));

@@ -805,7 +805,7 @@ impl<'a> Interp<'a> {
                                             ),
                                         }
                                     }
-                                    Err(SiteErr::Thrown(e)) => return Err(e),
+                                    Err(SiteErr::Thrown(e)) => Err(e),
                                     Err(SiteErr::Msg(detail)) => {
                                         let cls =
                                             self.resolve_class(&crate::value::lossy(&cn)).and_then(

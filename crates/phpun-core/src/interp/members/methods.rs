@@ -318,6 +318,29 @@ impl<'a> Interp<'a> {
                     Some(Value::Null) | None => arr.borrow_mut().push(v),
                     Some(kv) => {
                         let k = to_key(&kv);
+                        // A missing key on an object-backed iterator
+                        // creates a dynamic prop on the backing object
+                        // and binds its cell into storage (both views
+                        // stay in sync) instead of dropping the write.
+                        if arr.borrow().get_cell(&k).is_none() {
+                            if let Some(src) = self.ao_src_obj(obj) {
+                                let pname = match &k {
+                                    ArrKey::Str(s) => s.to_string(),
+                                    ArrKey::Int(i) => i.to_string(),
+                                    ArrKey::Tomb => "0".to_string(),
+                                };
+                                let pc = cell(v);
+                                {
+                                    let mut so = src.borrow_mut();
+                                    if !so.props.contains_key(&pname) {
+                                        so.prop_order.push(pname.clone());
+                                    }
+                                    so.props.insert(pname, pc.clone());
+                                }
+                                arr.borrow_mut().bind_cell(k, pc);
+                                return Ok(Some(Value::Null));
+                            }
+                        }
                         // zend writes a fresh zval into the bucket: an
                         // &-reference element is severed (the alias
                         // keeps its old value), while a prop-bound
@@ -344,6 +367,18 @@ impl<'a> Interp<'a> {
                     .map(|c| to_key(&c.borrow()))
                     .unwrap_or(ArrKey::Int(0));
                 arr.borrow_mut().unset(&k);
+                // Object-backed storage mirrors props — the unset
+                // removes the backing prop as well.
+                if let Some(src) = self.ao_src_obj(obj) {
+                    let pname = match &k {
+                        ArrKey::Str(s) => Some(s.to_string()),
+                        ArrKey::Int(i) => Some(i.to_string()),
+                        ArrKey::Tomb => None,
+                    };
+                    if let Some(pname) = pname {
+                        src.borrow_mut().props.remove(&pname);
+                    }
+                }
                 // pos pointing past the end stays clamped at reads.
                 Value::Null
             }
@@ -813,6 +848,17 @@ impl<'a> Interp<'a> {
                 arr, pos, flags, ..
             }) => (arr.clone(), *pos, *flags),
             _ => unreachable!(),
+        }
+    }
+
+    /// The backing object when storage came from an object input.
+    pub(in crate::interp) fn ao_src_obj(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+    ) -> Option<Rc<RefCell<PhpObject>>> {
+        match &obj.borrow().internal {
+            Some(ObjectInternal::ArrayIter { src, .. }) => src.clone(),
+            _ => None,
         }
     }
 
