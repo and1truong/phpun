@@ -45,6 +45,10 @@ pub enum Stmt {
     Return(Option<Expr>),
     Break(Option<Expr>),
     Continue(Option<Expr>),
+    /// `goto name;` — jumps to `name:` at function/file statement scope.
+    Goto(String),
+    /// `name:` — goto target marker; executes as a no-op.
+    Label(String),
     /// `global $a, $$b;` — each item is normally `Expr::Var`; `Expr::VarVar`
     /// resolves the global name dynamically (tests/lang/bug24396).
     Global(Vec<Expr>),

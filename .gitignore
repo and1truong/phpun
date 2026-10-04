@@ -6,3 +6,5 @@ target/
 !examples/doctrine-inflector/vendor/
 !crates/phpun-core/tests/fixtures/composer_autoload/vendor/
 !examples/symfony-console/vendor/
+examples/composer/composer-src/
+examples/composer/composer-*.phar

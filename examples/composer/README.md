@@ -26,3 +26,24 @@ This also covers the runtime pieces real autoloaders need:
 `Closure::bind` scope isolation (`composerRequire`),
 `spl_autoload_register` order, `__DIR__`/`__FILE__` lexical binding
 inside included files and class const-exprs, and `PHP_VERSION_ID`.
+## Composer itself on phpun
+
+phpun also runs Composer 2.10's own source checkout — `bin/composer`
+plus its full vendored dependency tree (symfony-console, json-schema,
+semver, ...). Bootstrap it once (extraction needs any php binary —
+phpun can't read phar archives yet):
+
+```console
+$ cd examples/composer
+$ ./fetch-composer.sh        # writes ./composer-src/
+$ phpun composer-src/bin/composer --version
+Composer version 2.10.3 2026-08-27 13:34:23
+$ phpun composer-src/bin/composer dump-autoload -o -d .
+Generating optimized autoload files
+Generated optimized autoload files containing 4 classes
+```
+
+`--version`, `help`, `list` and `dump-autoload` (plain and `-o`) all
+match reference PHP 8.5.11 byte-for-byte; the only expected delta is
+the `ComposerAutoloaderInit<32-hex>` suffix, which is
+`bin2hex(random_bytes(16))` — random under reference PHP too.
