@@ -1158,7 +1158,6 @@ impl<'a> Interp<'a> {
         // effects but Zend's temp register is then overwritten by the
         // assignment value — so the ACTUAL name/key becomes the RHS value
         // (engine_assignExecutionOrder_001).
-        #[allow(clippy::large_enum_variant)]
         enum Late {
             Prop {
                 ov: Value,
@@ -1178,7 +1177,7 @@ impl<'a> Interp<'a> {
                 pn: String,
             },
             Keyed {
-                e: Expr,
+                e: Box<Expr>,
                 keys: Vec<Option<Value>>,
             },
             None,
@@ -1256,7 +1255,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 late = Late::Keyed {
-                    e: base.clone(),
+                    e: Box::new(base.clone()),
                     keys,
                 };
                 None

@@ -1753,7 +1753,6 @@ impl<'a> Interp<'a> {
         )
     }
 
-    #[allow(dead_code)]
     fn notice(&mut self, msg: &str) -> Result<(), PhpError> {
         if self.silence > 0 || self.error_level & 8 == 0 {
             return Ok(());

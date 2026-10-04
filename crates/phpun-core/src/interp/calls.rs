@@ -325,11 +325,7 @@ impl<'a> Interp<'a> {
     /// Spreadable items of `...$v`: arrays yield entries, Traversables
     /// iterate via the rewind/valid/current/key/next protocol
     /// (IteratorAggregate chains resolve first). `None` key = positional.
-    #[allow(clippy::type_complexity)]
-    pub(in crate::interp) fn unpack_items(
-        &mut self,
-        v: &Value,
-    ) -> Result<Vec<(Option<Rc<str>>, Cell)>, PhpError> {
+    pub(in crate::interp) fn unpack_items(&mut self, v: &Value) -> Result<SpreadItems, PhpError> {
         match v {
             Value::Array(a) => {
                 // Element cells are handed to the call as potential
@@ -522,15 +518,15 @@ impl<'a> Interp<'a> {
                         // returns a Generator like any other function
                         // (iterable_003).
                         if Self::decl_contains_yield(&decl.body) {
-                            return Ok(Value::Object(self.make_generator(
-                                decl.clone(),
+                            return Ok(Value::Object(self.make_generator(GenSetup::Invoke {
+                                decl: decl.clone(),
                                 args,
-                                c.this_obj.clone(),
-                                c.scope_class.clone(),
-                                None,
-                                c.called_class.clone(),
-                                c.captures.clone(),
-                            )));
+                                this_obj: c.this_obj.clone(),
+                                scope_class: c.scope_class.clone(),
+                                decl_class: None,
+                                called_class: c.called_class.clone(),
+                                captures: c.captures.clone(),
+                            })));
                         }
                         let mut frame_args = Vec::new();
                         // fn_name is the closure's Zend name
@@ -3530,15 +3526,15 @@ impl<'a> Interp<'a> {
         if Self::decl_contains_yield(&decl.body) {
             let dc = self.pending_decl_class.take();
             let cc = self.pending_called_class.take();
-            return Ok(Value::Object(self.make_generator(
-                decl.clone(),
+            return Ok(Value::Object(self.make_generator(GenSetup::Invoke {
+                decl: decl.clone(),
                 args,
                 this_obj,
                 scope_class,
-                dc,
-                cc,
-                Vec::new(),
-            )));
+                decl_class: dc,
+                called_class: cc,
+                captures: Vec::new(),
+            })));
         }
         let dc = self.pending_decl_class.take();
         let cc = self.pending_called_class.take();

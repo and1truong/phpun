@@ -173,28 +173,11 @@ impl<'a> Interp<'a> {
     }
 
     /// Build the deferred Generator object for a yielding call.
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::interp) fn make_generator(
-        &mut self,
-        decl: Rc<FunctionDecl>,
-        args: CallArgs,
-        this_obj: Option<Rc<RefCell<PhpObject>>>,
-        scope_class: Option<Rc<PhpClass>>,
-        decl_class: Option<Rc<PhpClass>>,
-        called_class: Option<Rc<PhpClass>>,
-        captures: Vec<(String, Cell, bool)>,
-    ) -> Rc<RefCell<PhpObject>> {
+    pub(in crate::interp) fn make_generator(&mut self, setup: GenSetup) -> Rc<RefCell<PhpObject>> {
+        let GenSetup::Invoke { decl, .. } = &setup;
         let by_ref = decl.by_ref;
         let state = Rc::new(RefCell::new(GenState {
-            setup: GenSetup::Invoke {
-                decl,
-                args,
-                this_obj,
-                scope_class,
-                decl_class,
-                called_class,
-                captures,
-            },
+            setup,
             items: Vec::new(),
             pos: 0,
             started: false,

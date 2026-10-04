@@ -394,7 +394,7 @@ fn find_seq(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// Map the request path under docroot: existing regular files are
 /// served directly — `.php` ones run as scripts, everything else is a
 /// static response. Missing paths route to the front script.
-fn resolve_script<'a>(cfg: &'a Cfg, req: &Req) -> Resolved<'a> {
+fn resolve_script(cfg: &Cfg, req: &Req) -> Resolved {
     let rel = req.path.trim_start_matches('/');
     if rel.is_empty() || rel.split('/').any(|s| s == "..") {
         return Resolved::Front;
@@ -412,12 +412,10 @@ fn resolve_script<'a>(cfg: &'a Cfg, req: &Req) -> Resolved<'a> {
     }
 }
 
-enum Resolved<'a> {
+enum Resolved {
     Front,
     Script(String),
     Static(std::path::PathBuf),
-    #[allow(dead_code)]
-    Phantom(&'a ()),
 }
 
 fn mime_of(path: &std::path::Path) -> &'static str {
@@ -463,7 +461,6 @@ fn respond(mut stream: TcpStream, cfg: &Cfg, req: &Req) {
         }
         Resolved::Script(s) => s,
         Resolved::Front => cfg.front.clone(),
-        Resolved::Phantom(_) => unreachable!(),
     };
     let file = script.as_str();
     let src = match std::fs::read_to_string(file) {

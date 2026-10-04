@@ -572,7 +572,7 @@ pub(crate) fn dispatch(
                 Err(_) => Value::str(""),
             }
         }
-        "pack" | "unpack" => Value::Bool(false), // TODO
+        "pack" | "unpack" => Value::Bool(false), // stub — tracked in #62
         "header" => {
             let h = arg_str(it, args, 0);
             let replace = args.get(1).map(|c| c.borrow().is_truthy()).unwrap_or(true);

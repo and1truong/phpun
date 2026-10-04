@@ -915,7 +915,7 @@ pub(crate) fn dispatch(
             }
             Value::Bool(true)
         }
-        "array_multisort" => Value::Bool(true), // TODO
+        "array_multisort" => Value::Bool(true), // stub — tracked in #62
         "compact" => {
             let mut out = PhpArray::new();
             for a in args {
