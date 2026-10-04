@@ -1,0 +1,31 @@
+41
+1234
+12345678
+78563412
+616263
+6162202020
+103204
+deadbe
+0000c03f
+00000000000002c0
+ffffffffffffffff
+0000000000000001
+01
+ff0201
+array (
+  'x' => 65,
+)
+array (
+  'val' => 305419896,
+)
+array (
+  'x' => 'abc',
+)
+array (
+  'n1' => -1,
+  'n2' => 127,
+  'd' => 513,
+)
+ValueError: Type Q: too few arguments
+
+Warning: unpack(): Type N: not enough input values, need 4 values but only 2 were provided in /home/ubuntu/repos/phpun/crates/phpun-core/tests/fixtures/pack.php on line 25

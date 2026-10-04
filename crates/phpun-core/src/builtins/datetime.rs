@@ -752,8 +752,22 @@ impl StrtoP {
             }
             return false;
         }
-        // d-m-Y / d-m-y
+        // d-M-Y: 15-Jun-2025 (day - monthname - year)
         if self.at_c(t, 1, b'-') {
+            if let Some(mn) = self.at_w(t, 2).as_deref().and_then(strto_month) {
+                if self.at_c(t, 3, b'-') {
+                    if let Some((y, yw)) = self.at_i(t, 4) {
+                        if (yw == 4 || yw <= 2) && (1..=31).contains(&n) {
+                            let y = if yw <= 2 { year_2dig(y) } else { y };
+                            self.set_date(y, mn, n);
+                            self.i += 5;
+                            return true;
+                        }
+                        return false;
+                    }
+                    return false;
+                }
+            }
             if let Some((m, _)) = self.at_i(t, 2) {
                 if self.at_c(t, 3, b'-') {
                     if let Some((y, yw)) = self.at_i(t, 4) {
