@@ -9654,13 +9654,18 @@ impl<'a> Interp<'a> {
     }
 
     /// Shared `Closure::bind`/`bindTo`/`call` rebinding model
-    /// (closure_036-044, zend_closures):
+    /// (closure_036-044/061/063, zend_closures, bug70685):
     /// - binding an instance to a static closure warns → NULL
-    /// - unbinding $this from a closure that has one warns → NULL
+    /// - unbinding $this warns — "of method" for method-created
+    ///   closures, "of closure using $this" otherwise
     /// - explicit scope arg: null → unscoped ("dummy"), object → its
     ///   class, string → resolved class; omitted or 'static' keeps
     ///   the previous scope — an unscoped closure stays unscoped
     ///   ("dummy scope", closure_046)
+    /// - internal-class scopes are rejected for everything but
+    ///   method-created closures (their scope already is internal)
+    /// - fake closures (Named/Method kinds) can't change scope, but
+    ///   CAN rebind $this freely (closure_063: silent success)
     ///
     /// Returns Ok(None) after emitting a warning → caller returns NULL.
     fn rebind_closure(
@@ -9669,55 +9674,38 @@ impl<'a> Interp<'a> {
         new_this: Option<Rc<RefCell<PhpObject>>>,
         scope_arg: Option<Value>,
     ) -> Result<Option<PhpCallable>, PhpError> {
-        // "uses $this" is the compile-time body flag, not merely a
-        // bound instance — a static-scope closure that references
-        // $this but never captured one unbinds quietly (closure_062).
-        let uses_this = c.this_obj.is_some()
-            && match &c.kind {
-                CallableKind::Closure(d) => Self::body_uses_this(&d.body),
-                _ => true,
-            };
         if new_this.is_some() && c.is_static {
             self.warn(
                 "Cannot bind an instance to a static closure, this will be an error in PHP 9",
             )?;
             return Ok(None);
         }
-        if new_this.is_none() && uses_this && !c.is_static {
-            self.warn(
-                "Cannot unbind $this of closure using $this, this will be an error in PHP 9",
-            )?;
-            return Ok(None);
-        }
-        // A closure created from a function has no scope/$this to
-        // rebind — any attempt warns (bug70630).
-        if matches!(c.kind, CallableKind::Named(_)) {
-            self.warn(
-                "Cannot rebind scope of closure created from function, this will be an error in PHP 9",
-            )?;
-            return Ok(None);
-        }
-        // A method callable's new instance must be instanceof the
-        // method's class (closure_from_callable_rebinding).
-        if let (
-            Some(t),
-            CallableKind::Method {
-                obj: Some(o),
-                name: mname,
-                ..
-            },
-        ) = (&new_this, &c.kind)
-        {
-            let mcls = o.borrow().class.clone();
-            let tc = t.borrow().class.clone();
-            if !self.is_a(&tc, mcls.name()) {
-                self.warn(&format!(
-                    "Cannot bind method {}::{}() to object of class {}, this will be an error in PHP 9",
-                    mcls.name(),
-                    mname,
-                    tc.name()
-                ))?;
-                return Ok(None);
+        if new_this.is_none() {
+            match &c.kind {
+                // Method-created closures carry their target in
+                // `kind.obj` — dropping it is the "of method" unbind
+                // (closure_061).
+                CallableKind::Method { obj: Some(_), .. } => {
+                    self.warn(
+                        "Cannot unbind $this of method, this will be an error in PHP 9",
+                    )?;
+                    return Ok(None);
+                }
+                // "uses $this" is the compile-time body flag, not
+                // merely a bound instance — a static-scope closure
+                // that references $this but never captured one
+                // unbinds quietly (closure_062).
+                CallableKind::Closure(d)
+                    if c.this_obj.is_some()
+                        && Self::body_uses_this(&d.body)
+                        && !c.is_static =>
+                {
+                    self.warn(
+                        "Cannot unbind $this of closure using $this, this will be an error in PHP 9",
+                    )?;
+                    return Ok(None);
+                }
+                _ => {}
             }
         }
         let scope: Option<Rc<PhpClass>> = match &scope_arg {
@@ -9752,35 +9740,67 @@ impl<'a> Interp<'a> {
             // Other arg types were rejected by the caller's TypeError.
             Some(_) => None,
         };
-        if matches!(c.kind, CallableKind::Method { .. }) {
-            // A method-created closure keeps the declaring scope —
-            // resolving to a different class is a rebind (bug70685).
-            let changed = match (&scope, &c.scope_class) {
-                (Some(a), Some(b)) => a.name() != b.name(),
-                (Some(_), None) | (None, Some(_)) => true,
-                (None, None) => false,
-            };
-            if changed {
+        // Internal classes (decl.file empty) can't be closure scopes —
+        // `call()` always resolves scope to the new instance's class,
+        // so $x->call($std) hits this (closure_call). Method-kind
+        // callables are exempt: their declaring scope is the internal
+        // class already (closure_call_internal). This check precedes
+        // the per-kind scope warnings — a fake-function closure bound
+        // to stdClass reports the internal class (closure_061).
+        if !matches!(c.kind, CallableKind::Method { .. }) {
+            if let Some(sc) = &scope {
+                if sc.decl.file.is_empty() && !sc.name().eq_ignore_ascii_case("closure") {
+                    self.warn(&format!(
+                        "Cannot bind closure to scope of internal class {}, this will be an error in PHP 9",
+                        sc.name()
+                    ))?;
+                    return Ok(None);
+                }
+            }
+        }
+        match &c.kind {
+            // A closure created from a function has no scope — only an
+            // actual scope change warns; binding $this is silent
+            // (bug70630 vs closure_063).
+            CallableKind::Named(_)
+                if Self::scope_changed(&scope, &c.scope_class) =>
+            {
                 self.warn(
-                    "Cannot rebind scope of closure created from method, this will be an error in PHP 9",
+                    "Cannot rebind scope of closure created from function, this will be an error in PHP 9",
                 )?;
                 return Ok(None);
             }
-        }
-        if let (Some(sc), CallableKind::Closure(_)) = (&scope, &c.kind) {
-            // Internal classes (decl.file empty) can't be closure
-            // scopes — `call()` always resolves scope to the new
-            // instance's class, so $x->call($std) hits this
-            // (closure_call). Method-kind callables are exempt:
-            // their declaring scope is the internal class already
-            // (closure_call_internal).
-            if sc.decl.file.is_empty() && !sc.name().eq_ignore_ascii_case("closure") {
-                self.warn(&format!(
-                    "Cannot bind closure to scope of internal class {}, this will be an error in PHP 9",
-                    sc.name()
-                ))?;
-                return Ok(None);
+            CallableKind::Method { name, .. } => {
+                // The new instance must be instanceof the method's
+                // DECLARING class — `scope_class` already holds it
+                // (SplStack::count → SplDoublyLinkedList, bug70685).
+                // Checked before the scope warning: call(new B) rebinds
+                // scope AND target yet reports the target
+                // (closure_from_callable_rebinding).
+                if let Some(t) = &new_this {
+                    let tc = t.borrow().class.clone();
+                    let dc = c.scope_class.clone().unwrap_or_else(|| tc.clone());
+                    if !self.is_a(&tc, dc.name()) {
+                        self.warn(&format!(
+                            "Cannot bind method {}::{}() to object of class {}, this will be an error in PHP 9",
+                            dc.name(),
+                            name,
+                            tc.name()
+                        ))?;
+                        return Ok(None);
+                    }
+                }
+                // A method-created closure keeps the declaring scope —
+                // resolving to a different class is a rebind
+                // (bug70685).
+                if Self::scope_changed(&scope, &c.scope_class) {
+                    self.warn(
+                        "Cannot rebind scope of closure created from method, this will be an error in PHP 9",
+                    )?;
+                    return Ok(None);
+                }
             }
+            _ => {}
         }
         let mut nc = (*c).clone();
         nc.this_obj = new_this;
@@ -9795,6 +9815,16 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(Some(nc))
+    }
+
+    /// Scope comparison for rebind warnings: None-vs-Some counts as
+    /// a change (dummy scope is a different scope, closure_061).
+    fn scope_changed(a: &Option<Rc<PhpClass>>, b: &Option<Rc<PhpClass>>) -> bool {
+        match (a, b) {
+            (Some(x), Some(y)) => !x.name().eq_ignore_ascii_case(y.name()),
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => false,
+        }
     }
 
     /// `Closure::fromCallable($v)` — like fcc_val but: failures throw
@@ -18557,10 +18587,10 @@ impl<'a> Interp<'a> {
                                 None,
                             ),
                         };
-                        let decl_cls = self
+                        let (mdecl, decl_cls) = self
                             .find_method_in(&mc, &mn)
-                            .map(|(_, dc)| dc)
-                            .unwrap_or_else(|| mc.clone());
+                            .map(|(m, dc)| (Some(m), dc))
+                            .unwrap_or_else(|| (None, mc.clone()));
                         return Ok(Some(Value::Callable(self.new_callable(PhpCallable {
                             id: std::cell::Cell::new(0),
                             kind: CallableKind::Method {
@@ -18572,7 +18602,9 @@ impl<'a> Interp<'a> {
                             this_obj: None,
                             scope_class: Some(decl_cls.clone()),
                             called_class: Some(mc),
-                            is_static: false,
+                            // Static methods produce static closures —
+                            // rebinding an instance warns (closure_061).
+                            is_static: mdecl.map(|m| m.is_static).unwrap_or(false),
                         }))));
                     }
                     // A function reflector's getClosure is a named
