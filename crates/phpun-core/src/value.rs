@@ -998,7 +998,14 @@ pub enum ObjectInternal {
     /// yielded (key, value) lands in `items`.
     Generator(Rc<RefCell<GenState>>),
     /// DirectoryIterator state: the dir's entry paths + cursor.
-    DirIter { entries: Vec<String>, pos: usize },
+    DirIter {
+        entries: Vec<String>,
+        pos: usize,
+        flags: i64,
+        /// Path of the iterated dir relative to the root iterator's dir
+        /// (RecursiveDirectoryIterator::getSubPath).
+        sub_path: String,
+    },
     /// DateTime, closures-as-objects, etc. — opaque marker.
     None,
 }
@@ -1118,6 +1125,14 @@ pub enum PhpResource {
         body: std::rc::Rc<Vec<u8>>,
         pos: u64,
     },
+    /// php://memory / php://temp — an in-memory byte buffer that is
+    /// always read/write, seekable (Composer's BufferIO).
+    Mem {
+        id: u64,
+        buf: Vec<u8>,
+        pos: u64,
+        eof: bool,
+    },
     /// curl/db handles etc. — opaque placeholder.
     Other { id: u64, kind: &'static str },
 }
@@ -1128,6 +1143,7 @@ impl PhpResource {
             PhpResource::File { id, .. } => *id,
             PhpResource::Stdio { id, .. } => *id,
             PhpResource::Input { id, .. } => *id,
+            PhpResource::Mem { id, .. } => *id,
             PhpResource::Other { id, .. } => *id,
         }
     }

@@ -96,6 +96,9 @@ fn run_script(args: &[String]) -> ExitCode {
             it.ini.insert(kv, String::new());
         }
     }
+    // Stream output to the real fds so stderr notices interleave with
+    // stdout in PHP's order; `phpun test`/`serve` keep buffered capture.
+    it.live_io = true;
     let res = it.run_source(&src);
     let _ = std::io::Write::write_all(&mut std::io::stdout(), &it.out);
     eprint!("{}", it.err_buf);

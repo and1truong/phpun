@@ -28,6 +28,9 @@ pub enum Flow {
     /// `throw` propagating an exception object.
     Throw(Value),
     Exit(i32),
+    /// `goto name;` — binds when an enclosing statement list carries a
+    /// matching `name:` label; otherwise keeps propagating.
+    Goto(String),
 }
 
 /// Weak slot in the shared object-store handle space — objects and
@@ -220,6 +223,10 @@ pub struct Interp<'a> {
     /// PHP CLI logs every diagnostic to stderr as `PHP <Level>: msg` when
     /// log_errors is on (default); the harness merges stderr after stdout.
     pub err_buf: String,
+    /// CLI file runs stream stdout/stderr to the real fds as they're
+    /// written so merged output keeps PHP's interleaved order; harness
+    /// contexts (phpun test, serve) leave this off and capture instead.
+    pub live_io: bool,
     /// File a const-expr lexically belongs to while it's being evaluated
     /// (prop/const/param defaults, attr args): __FILE__/__DIR__ bind to
     /// the declaring file, not the accessing file.
@@ -462,6 +469,17 @@ impl<'a> Interp<'a> {
         constants.insert("PHP_OS".into(), Value::str("Linux"));
         constants.insert("PHP_OS_FAMILY".into(), Value::str("Linux"));
         constants.insert("PHP_SAPI".into(), Value::str("cli"));
+        {
+            let exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "phpun".to_string());
+            let bindir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
+                .unwrap_or_default();
+            constants.insert("PHP_BINARY".into(), Value::str(&*exe));
+            constants.insert("PHP_BINDIR".into(), Value::str(&*bindir));
+        }
         for (name, which) in [("STDIN", 0u8), ("STDOUT", 1u8), ("STDERR", 2u8)] {
             constants.insert(
                 name.into(),
@@ -472,6 +490,16 @@ impl<'a> Interp<'a> {
             );
         }
         constants.insert("DIRECTORY_SEPARATOR".into(), Value::str("/"));
+        constants.insert("PATH_SEPARATOR".into(), Value::str(":"));
+        constants.insert("SCANDIR_SORT_ASCENDING".into(), Value::Int(0));
+        constants.insert("SCANDIR_SORT_DESCENDING".into(), Value::Int(1));
+        constants.insert("SCANDIR_SORT_NONE".into(), Value::Int(2));
+        // pathinfo() component selectors.
+        constants.insert("PATHINFO_DIRNAME".into(), Value::Int(1));
+        constants.insert("PATHINFO_BASENAME".into(), Value::Int(2));
+        constants.insert("PATHINFO_EXTENSION".into(), Value::Int(4));
+        constants.insert("PATHINFO_FILENAME".into(), Value::Int(8));
+        constants.insert("PATHINFO_ALL".into(), Value::Int(15));
         // Reported as the engine's target PCRE2 level — feature checks
         // like symfony's `>= 10.39` gate on this, not the vendored lib.
         constants.insert("PCRE_VERSION".into(), Value::str("10.49 2026-09-28"));
@@ -563,21 +591,52 @@ impl<'a> Interp<'a> {
         constants.insert("SORT_FLAG_CASE".into(), Value::Int(8));
         // ext/filter.
         constants.insert("FILTER_VALIDATE_INT".into(), Value::Int(257));
+        constants.insert("FILTER_VALIDATE_BOOLEAN".into(), Value::Int(258));
         constants.insert("FILTER_VALIDATE_BOOL".into(), Value::Int(258));
         constants.insert("FILTER_VALIDATE_FLOAT".into(), Value::Int(259));
         constants.insert("FILTER_VALIDATE_REGEXP".into(), Value::Int(272));
         constants.insert("FILTER_VALIDATE_URL".into(), Value::Int(273));
         constants.insert("FILTER_VALIDATE_EMAIL".into(), Value::Int(274));
         constants.insert("FILTER_VALIDATE_IP".into(), Value::Int(275));
+        constants.insert("FILTER_VALIDATE_MAC".into(), Value::Int(276));
         constants.insert("FILTER_VALIDATE_DOMAIN".into(), Value::Int(277));
         constants.insert("FILTER_DEFAULT".into(), Value::Int(516));
+        constants.insert("FILTER_UNSAFE_RAW".into(), Value::Int(516));
+        constants.insert("FILTER_SANITIZE_ENCODED".into(), Value::Int(514));
+        constants.insert("FILTER_SANITIZE_SPECIAL_CHARS".into(), Value::Int(515));
+        constants.insert("FILTER_SANITIZE_EMAIL".into(), Value::Int(517));
+        constants.insert("FILTER_SANITIZE_URL".into(), Value::Int(518));
+        constants.insert("FILTER_SANITIZE_NUMBER_INT".into(), Value::Int(519));
+        constants.insert("FILTER_SANITIZE_NUMBER_FLOAT".into(), Value::Int(520));
+        constants.insert("FILTER_SANITIZE_FULL_SPECIAL_CHARS".into(), Value::Int(522));
+        constants.insert("FILTER_SANITIZE_ADD_SLASHES".into(), Value::Int(523));
         constants.insert("FILTER_CALLBACK".into(), Value::Int(1024));
         constants.insert("FILTER_REQUIRE_ARRAY".into(), Value::Int(16777216));
         constants.insert("FILTER_REQUIRE_SCALAR".into(), Value::Int(33554432));
         constants.insert("FILTER_FORCE_ARRAY".into(), Value::Int(67108864));
         constants.insert("FILTER_NULL_ON_FAILURE".into(), Value::Int(134217728));
+        constants.insert("FILTER_FLAG_ALLOW_OCTAL".into(), Value::Int(1));
+        constants.insert("FILTER_FLAG_ALLOW_HEX".into(), Value::Int(2));
+        constants.insert("FILTER_FLAG_STRIP_LOW".into(), Value::Int(4));
+        constants.insert("FILTER_FLAG_STRIP_HIGH".into(), Value::Int(8));
+        constants.insert("FILTER_FLAG_ENCODE_LOW".into(), Value::Int(16));
+        constants.insert("FILTER_FLAG_ENCODE_HIGH".into(), Value::Int(32));
+        constants.insert("FILTER_FLAG_ENCODE_AMP".into(), Value::Int(64));
+        constants.insert("FILTER_FLAG_NO_ENCODE_QUOTES".into(), Value::Int(128));
+        constants.insert("FILTER_FLAG_EMPTY_STRING_NULL".into(), Value::Int(256));
+        constants.insert("FILTER_FLAG_STRIP_BACKTICK".into(), Value::Int(512));
+        constants.insert("FILTER_FLAG_ALLOW_FRACTION".into(), Value::Int(4096));
+        constants.insert("FILTER_FLAG_ALLOW_THOUSAND".into(), Value::Int(8192));
+        constants.insert("FILTER_FLAG_ALLOW_SCIENTIFIC".into(), Value::Int(16384));
+        constants.insert("FILTER_FLAG_PATH_REQUIRED".into(), Value::Int(262144));
+        constants.insert("FILTER_FLAG_QUERY_REQUIRED".into(), Value::Int(524288));
         constants.insert("FILTER_FLAG_IPV4".into(), Value::Int(1048576));
         constants.insert("FILTER_FLAG_IPV6".into(), Value::Int(2097152));
+        constants.insert("FILTER_FLAG_HOSTNAME".into(), Value::Int(1048576));
+        constants.insert("FILTER_FLAG_EMAIL_UNICODE".into(), Value::Int(1048576));
+        constants.insert("FILTER_FLAG_NO_RES_RANGE".into(), Value::Int(4194304));
+        constants.insert("FILTER_FLAG_NO_PRIV_RANGE".into(), Value::Int(8388608));
+        constants.insert("FILTER_FLAG_GLOBAL_RANGE".into(), Value::Int(536870912));
         // ext-json.
         constants.insert("JSON_ERROR_NONE".into(), Value::Int(0));
         constants.insert("JSON_ERROR_DEPTH".into(), Value::Int(1));
@@ -651,6 +710,7 @@ impl<'a> Interp<'a> {
             constants,
             out: Vec::new(),
             err_buf: String::new(),
+            live_io: false,
             decl_file_ctx: None,
             out_headers: Vec::new(),
             resp_code: 200,
@@ -770,6 +830,11 @@ impl<'a> Interp<'a> {
         }
         it.globals.file = file.to_string();
         it.register_builtin_classes();
+        // SPL iterator wrappers in plain PHP — the delegation layer
+        // (OuterIterator, IteratorIterator, FilterIterator,
+        // RecursiveIteratorIterator, AppendIterator) needs only
+        // Iterator method calls, so a prelude keeps the engine small.
+        let _ = it.eval_code(SPL_ITERATOR_PRELUDE);
         it
     }
 
@@ -1193,6 +1258,86 @@ impl<'a> Interp<'a> {
             },
             false,
         );
+        // FilesystemIterator / RecursiveDirectoryIterator — flagged dir
+        // iteration + recursion (Composer's symfony/finder chain). Methods
+        // native-dispatch through spl_method on the DirIter internal.
+        let fsi_const = |n: &str, v: i64| crate::ast::ConstDecl {
+            name: n.into(),
+            value: Expr::Int(v),
+            visibility: crate::ast::Visibility::Public,
+            is_final: false,
+            ty: None,
+            attrs: vec![],
+            decl_in: None,
+            enum_case: false,
+        };
+        reg(
+            ClassDecl {
+                name: "FilesystemIterator".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: Some("DirectoryIterator".into()),
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    stub_method("__construct", &["directory", "flags"]),
+                    stub_method("rewind", &[]),
+                    stub_method("valid", &[]),
+                    stub_method("current", &[]),
+                    stub_method("key", &[]),
+                    stub_method("next", &[]),
+                    stub_method("isDot", &[]),
+                    stub_method("getFlags", &[]),
+                    stub_method("setFlags", &["flags"]),
+                ],
+                props: vec![],
+                consts: vec![
+                    fsi_const("CURRENT_MODE_MASK", 240),
+                    fsi_const("CURRENT_AS_PATHNAME", 32),
+                    fsi_const("CURRENT_AS_FILEINFO", 0),
+                    fsi_const("CURRENT_AS_SELF", 16),
+                    fsi_const("KEY_MODE_MASK", 3840),
+                    fsi_const("KEY_AS_PATHNAME", 0),
+                    fsi_const("KEY_AS_FILENAME", 256),
+                    fsi_const("NEW_CURRENT_AND_KEY", 256),
+                    fsi_const("OTHER_MODE_MASK", 28672),
+                    fsi_const("SKIP_DOTS", 4096),
+                    fsi_const("UNIX_PATHS", 8192),
+                    fsi_const("FOLLOW_SYMLINKS", 16384),
+                ],
+                file: String::new(),
+            },
+            false,
+        );
+        reg(
+            ClassDecl {
+                name: "RecursiveDirectoryIterator".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: Some("FilesystemIterator".into()),
+                implements: vec!["RecursiveIterator".into()],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    stub_method("__construct", &["directory", "flags"]),
+                    stub_method("hasChildren", &["allowLinks"]),
+                    stub_method("getChildren", &[]),
+                    stub_method("getSubPath", &[]),
+                    stub_method("getSubPathname", &[]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
         reg(
             iface(
                 "ArrayAccess",
@@ -1206,6 +1351,7 @@ impl<'a> Interp<'a> {
             true,
         );
         reg(iface("UnitEnum", &[], &["cases"]), true);
+        reg(iface("JsonSerializable", &[], &["jsonSerialize"]), true);
         // PDO + PDOStatement + PDOException — sqlite storage spike (#15).
         reg(
             ClassDecl {
@@ -1843,6 +1989,9 @@ impl<'a> Interp<'a> {
                     mk_method("getDefaultProperties", vec![]),
                     mk_method("getInterfaceNames", vec![]),
                     mk_method("getInterfaces", vec![]),
+                    mk_method("getParentClass", vec![]),
+                    mk_method("getShortName", vec![]),
+                    mk_method("getNamespaceName", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -1984,6 +2133,12 @@ impl<'a> Interp<'a> {
                     mk_method("getDocComment", vec![]),
                     mk_method("getAttributes", vec![]),
                     mk_method("getDeclaringClass", vec![]),
+                    mk_method("isPublic", vec![]),
+                    mk_method("isProtected", vec![]),
+                    mk_method("isPrivate", vec![]),
+                    mk_method("isFinal", vec![]),
+                    mk_method("isEnumCase", vec![]),
+                    mk_method("isDeprecated", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -2369,6 +2524,14 @@ impl<'a> Interp<'a> {
             Flow::Break(_) | Flow::Continue(_) => {
                 let e =
                     PhpError::fatal("'break' or 'continue' outside of loop or switch context", 0);
+                self.print_fatal(&e);
+                RunResult {
+                    exit_code: 255,
+                    fatal: Some(e),
+                }
+            }
+            Flow::Goto(l) => {
+                let e = PhpError::fatal(format!("'goto' to undefined label '{}'", l), 0);
                 self.print_fatal(&e);
                 RunResult {
                     exit_code: 255,
@@ -2907,6 +3070,11 @@ impl<'a> Interp<'a> {
         }
         if let Some(buf) = self.ob_stack.last_mut() {
             buf.buf.extend_from_slice(b);
+        } else if self.live_io {
+            use std::io::Write;
+            let mut so = std::io::stdout().lock();
+            let _ = so.write_all(b);
+            let _ = so.flush();
         } else {
             self.out.extend_from_slice(b);
         }
@@ -3020,6 +3188,10 @@ impl<'a> Interp<'a> {
     /// the merged PHPT stream.
     /// html_errors=1 switches to the `<b>` docref format (bug35176).
     fn diag(&mut self, level: &str, msg: &str) {
+        // PHP logs the `PHP <Level>:` line to stderr first, then writes
+        // the display line to stdout — the order is observable on a
+        // merged 2>&1 stream.
+        self.log_diag(level, msg);
         if self.ini_on("html_errors") {
             let msg = self.docref(msg);
             self.emit(&format!(
@@ -3038,7 +3210,6 @@ impl<'a> Interp<'a> {
                 self.cur_line
             ));
         }
-        self.log_diag(level, msg);
     }
 
     /// stderr copy of a diagnostic (`PHP Warning: ...`); log_errors
@@ -3052,13 +3223,23 @@ impl<'a> Interp<'a> {
         if !log_errors {
             return;
         }
-        self.err_buf.push_str(&format!(
+        self.diag_stderr(&format!(
             "PHP {}:  {} in {} on line {}\n",
             level,
             msg,
             self.diag_file(),
             self.cur_line
         ));
+    }
+
+    /// Route a diagnostic to stderr — streamed in live_io mode so it
+    /// interleaves with stdout like real PHP, captured otherwise.
+    pub fn diag_stderr(&mut self, s: &str) {
+        if self.live_io {
+            eprint!("{}", s);
+        } else {
+            self.err_buf.push_str(s);
+        }
     }
 
     /// html_errors docref: `fn(args): rest` becomes
@@ -3131,7 +3312,7 @@ impl<'a> Interp<'a> {
             .get("log_errors")
             .is_none_or(|v| matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes"));
         if log_errors {
-            self.err_buf.push_str(&format!(
+            self.diag_stderr(&format!(
                 "PHP Parse error:  {} in {} on line {}\n",
                 e.message, self.file, e.line
             ));
@@ -3153,21 +3334,13 @@ impl<'a> Interp<'a> {
                     self.last_err_file.clone()
                 };
                 let dmsg = e.display_msg.clone().unwrap_or_else(|| e.message.clone());
-                self.emit(&format!(
-                    "\nFatal error: Uncaught {}: {} in {}:{}\nStack trace:\n{}  thrown in {} on line {}\n",
-                    class,
-                    dmsg,
-                    ef,
-                    e.line,
-                    t,
-                    ef,
-                    e.thrown_line.unwrap_or(e.line)
-                ));
+                // stderr log line precedes the stdout display block (same
+                // ordering as PHP's error path — see diag()).
                 let log_errors = self.ini.get("log_errors").is_none_or(|v| {
                     matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
                 });
                 if log_errors {
-                    self.err_buf.push_str(&format!(
+                    self.diag_stderr(&format!(
                         "PHP Fatal error:  Uncaught {}: {} in {}:{}\nStack trace:\n{}  thrown in {} on line {}\n",
                         class,
                         dmsg,
@@ -3178,6 +3351,16 @@ impl<'a> Interp<'a> {
                         e.thrown_line.unwrap_or(e.line)
                     ));
                 }
+                self.emit(&format!(
+                    "\nFatal error: Uncaught {}: {} in {}:{}\nStack trace:\n{}  thrown in {} on line {}\n",
+                    class,
+                    dmsg,
+                    ef,
+                    e.line,
+                    t,
+                    ef,
+                    e.thrown_line.unwrap_or(e.line)
+                ));
             }
             // Plain fatals (E_ERROR) print no trace; compile fatals
             // (duplicate named args, positional-after-named, ...) carry a
@@ -3206,21 +3389,21 @@ impl<'a> Interp<'a> {
                     "\nFatal error: {} in {} on line {}\n{}",
                     e.message, ef, e.line, tr
                 );
+                let log_errors = self.ini.get("log_errors").is_none_or(|v| {
+                    matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
+                });
+                if log_errors {
+                    self.diag_stderr(&format!(
+                        "PHP Fatal error:  {} in {} on line {}\n{}",
+                        e.message, ef, e.line, tr
+                    ));
+                }
                 if self.mem_exceeded {
                     // Memory-exhausted: buffers are dropped, so the
                     // fatal goes straight to output (bug45392).
                     self.out.extend_from_slice(s.as_bytes());
                 } else {
                     self.emit(&s);
-                }
-                let log_errors = self.ini.get("log_errors").is_none_or(|v| {
-                    matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
-                });
-                if log_errors {
-                    self.err_buf.push_str(&format!(
-                        "PHP Fatal error:  {} in {} on line {}\n{}",
-                        e.message, ef, e.line, tr
-                    ));
                 }
             }
         }
@@ -3295,23 +3478,24 @@ impl<'a> Interp<'a> {
                         class, colon, msg, file, line, tr, file, thrown
                     ).as_bytes());
                 } else {
-                    self.out.extend_from_slice(format!(
-                        "\nFatal error: Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
-                        class, colon, msg, file, line, tr, file, thrown
-                    ).as_bytes());
-                    // The PHP CLI SAPI also logs the uncaught to stderr
-                    // when log_errors is on (its default); merged-output
-                    // PHPT runs see it as a `PHP Fatal error:` copy of
-                    // the same block.
+                    // The PHP CLI SAPI logs the uncaught to stderr first
+                    // (log_errors default on), then prints the display
+                    // block to stdout — same ordering as print_fatal.
                     let log_errors = self.ini.get("log_errors").is_none_or(|v| {
                         matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
                     });
                     if log_errors {
-                        self.err_buf.push_str(&format!(
+                        self.diag_stderr(&format!(
                             "PHP Fatal error:  Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
                             class, colon, msg, file, line, tr, file, thrown
                         ));
                     }
+                    // ob_stack is empty here (flushed above), so emit
+                    // reaches out-or-stdout like a direct write did.
+                    self.emit(&format!(
+                        "\nFatal error: Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
+                        class, colon, msg, file, line, tr, file, thrown
+                    ));
                 }
             }
         } else {
@@ -3788,7 +3972,18 @@ impl<'a> Interp<'a> {
     }
 
     pub fn exec_block(&mut self, stmts: &[Stmt]) -> Flow {
-        for s in stmts {
+        // goto labels bind at the statement-list scope they appear in —
+        // a goto bubbling up from nested control flow lands here.
+        let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (i, s) in stmts.iter().enumerate() {
+            if let Stmt::Label(n) = s {
+                labels.entry(n.as_str()).or_insert(i);
+            }
+        }
+        let mut i = 0;
+        while i < stmts.len() {
+            let s = &stmts[i];
+            i += 1;
             // memory_limit fires between statements (bug45392).
             let limit = self.ini_bytes("memory_limit");
             if limit > 0 && self.mem_used as i64 > limit {
@@ -3816,6 +4011,10 @@ impl<'a> Interp<'a> {
             }
             match self.exec(s) {
                 Flow::Normal => {}
+                Flow::Goto(l) => match labels.get(l.as_str()) {
+                    Some(&t) => i = t + 1,
+                    None => return Flow::Goto(l),
+                },
                 f => return f,
             }
         }
@@ -4169,6 +4368,8 @@ impl<'a> Interp<'a> {
                 };
                 Flow::Continue(n)
             }
+            Stmt::Goto(l) => Flow::Goto(l.clone()),
+            Stmt::Label(_) => Flow::Normal,
             Stmt::Global(names) => {
                 // Bind each local name to its global cell. `$$x` resolves
                 // the name dynamically (bug24396).
@@ -10403,6 +10604,19 @@ impl<'a> Interp<'a> {
             return Ok(());
         }
         let fns = self.autoload_fns.clone();
+        // A loader triggered while a constant expression is mid-eval
+        // (static-prop/const initializers) is ordinary user code: its
+        // `self`/`static`/`parent` must bind to ITS own frames, not to
+        // the class being initialized — otherwise `self::$x` inside the
+        // loader resolves against the initializing class (composer's
+        // ClassLoader reads self::$includeFile).
+        let saved_const = (
+            self.in_const_expr,
+            self.class_const_ctx,
+            self.const_self.take(),
+        );
+        self.in_const_expr = 0;
+        self.class_const_ctx = 0;
         let mut res = Ok(());
         for f in fns {
             if let Err(e) = self.call_value(&f, CallArgs::positional(vec![cell(Value::str(name))]))
@@ -10414,6 +10628,9 @@ impl<'a> Interp<'a> {
                 break;
             }
         }
+        self.in_const_expr = saved_const.0;
+        self.class_const_ctx = saved_const.1;
+        self.const_self = saved_const.2;
         self.autoloading.remove(&key);
         // A throwable escaping an autoloader while variance obligations
         // are pending leaves the in-progress class half-linked — Zend
@@ -12178,6 +12395,10 @@ impl<'a> Interp<'a> {
                 "'break' or 'continue' outside of loop or switch context",
                 0,
             )),
+            Flow::Goto(l) => self.fail(PhpError::fatal(
+                format!("'goto' to undefined label '{}'", l),
+                0,
+            )),
             Flow::Normal => {
                 // Falling off the end of a typed function still checks
                 // the return type: `none returned` TypeError for real
@@ -12245,6 +12466,18 @@ impl<'a> Interp<'a> {
         this_obj: Option<Rc<RefCell<PhpObject>>>,
         scope_class: Option<Rc<PhpClass>>,
     ) -> Result<Value, PhpError> {
+        // Native SPL stubs (empty body, line 0) hit spl_method even on
+        // paths that bypass method dispatch — parent:: calls reach here
+        // with the stub decl directly.
+        if decl.body.is_empty() && decl.line == 0 {
+            if let Some(o) = &this_obj {
+                if self.is_a_str(o.borrow().class.name(), "splfileinfo") {
+                    if let Some(v) = self.spl_method(o, &decl.name, &args)? {
+                        return Ok(v);
+                    }
+                }
+            }
+        }
         let required = decl
             .params
             .iter()
@@ -12628,10 +12861,8 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let path = self.conv_str(&path_v)?.to_string();
-                let is_iter = matches!(
-                    obj.borrow().class.name().to_lowercase().as_str(),
-                    "directoryiterator" | "filesystemiterator"
-                );
+                let flags = args.get(1).map(|c| c.borrow().to_int()).unwrap_or(0);
+                let is_iter = self.obj_is_a(obj, "directoryiterator");
                 if is_iter {
                     let mut entries: Vec<String> = Vec::new();
                     match std::fs::read_dir(&path) {
@@ -12659,7 +12890,12 @@ impl<'a> Interp<'a> {
                     let mut ob = obj.borrow_mut();
                     ob.props
                         .insert("\0fi\0path".into(), cell(Value::str(&path)));
-                    ob.internal = Some(ObjectInternal::DirIter { entries, pos: 0 });
+                    ob.internal = Some(ObjectInternal::DirIter {
+                        entries,
+                        pos: 0,
+                        flags,
+                        sub_path: String::new(),
+                    });
                 } else {
                     obj.borrow_mut()
                         .props
@@ -12674,19 +12910,28 @@ impl<'a> Interp<'a> {
                 Ok(Some(Value::Null))
             }
             "valid" => Ok(Some(Value::Bool(match &obj.borrow().internal {
-                Some(ObjectInternal::DirIter { entries, pos }) => *pos < entries.len(),
+                Some(ObjectInternal::DirIter { entries, pos, .. }) => *pos < entries.len(),
                 _ => false,
             }))),
             "current" => {
-                // PHP yields SplFileInfo instances for each entry.
-                let path = match &obj.borrow().internal {
-                    Some(ObjectInternal::DirIter { entries, pos }) if *pos < entries.len() => {
-                        Some(entries[*pos].clone())
-                    }
+                // PHP yields SplFileInfo instances for each entry;
+                // FilesystemIterator flags can switch that to the path
+                // string (CURRENT_AS_PATHNAME=32) or $this (CURRENT_AS_SELF=16).
+                let cur = match &obj.borrow().internal {
+                    Some(ObjectInternal::DirIter {
+                        entries,
+                        pos,
+                        flags,
+                        ..
+                    }) if *pos < entries.len() => Some((entries[*pos].clone(), *flags)),
                     _ => None,
                 };
-                match path {
-                    Some(p) => {
+                match cur {
+                    Some((p, flags)) if flags & 240 == 32 => Ok(Some(Value::str(&p))),
+                    Some((_, flags)) if flags & 240 == 16 => {
+                        Ok(Some(Value::Object(Rc::clone(obj))))
+                    }
+                    Some((p, _)) => {
                         let v = self.instantiate("splfileinfo", &[])?;
                         if let Value::Object(o) = &v {
                             o.borrow_mut()
@@ -12699,6 +12944,24 @@ impl<'a> Interp<'a> {
                 }
             }
             "key" => Ok(Some(match &obj.borrow().internal {
+                Some(ObjectInternal::DirIter {
+                    entries,
+                    pos,
+                    flags,
+                    ..
+                }) if *flags & 3840 == 256 && *pos < entries.len() => {
+                    // KEY_AS_FILENAME
+                    Value::str(entries[*pos].rsplit('/').next().unwrap_or("").to_string())
+                }
+                Some(ObjectInternal::DirIter {
+                    entries,
+                    pos,
+                    flags,
+                    ..
+                }) if *flags != 0 && *pos < entries.len() => {
+                    // KEY_AS_PATHNAME (flagged iterators carry real paths)
+                    Value::str(&entries[*pos])
+                }
                 Some(ObjectInternal::DirIter { pos, .. }) => Value::Int(*pos as i64),
                 _ => Value::Null,
             })),
@@ -12711,6 +12974,96 @@ impl<'a> Interp<'a> {
             // Dots are filtered out at construct time, so the current
             // entry is never `.`/`..`.
             "isdot" => Ok(Some(Value::Bool(false))),
+            "getflags" => Ok(Some(match &obj.borrow().internal {
+                Some(ObjectInternal::DirIter { flags, .. }) => Value::Int(*flags),
+                _ => Value::Int(0),
+            })),
+            "setflags" => {
+                let f = args.first().map(|c| c.borrow().to_int()).unwrap_or(0);
+                if let Some(ObjectInternal::DirIter { flags, .. }) = &mut obj.borrow_mut().internal
+                {
+                    *flags = f;
+                }
+                Ok(Some(Value::Null))
+            }
+            "haschildren" => {
+                let (entry, flags) = match &obj.borrow().internal {
+                    Some(ObjectInternal::DirIter {
+                        entries,
+                        pos,
+                        flags,
+                        ..
+                    }) if *pos < entries.len() => (entries[*pos].clone(), *flags),
+                    _ => (String::new(), 0),
+                };
+                if entry.is_empty() {
+                    return Ok(Some(Value::Bool(false)));
+                }
+                let allow_links = args
+                    .first()
+                    .map(|c| c.borrow().is_truthy())
+                    .unwrap_or(false);
+                let md = std::fs::metadata(&entry).ok();
+                let ld = std::fs::symlink_metadata(&entry).ok();
+                let is_link = ld.is_some_and(|m| m.file_type().is_symlink());
+                let r = md.is_some_and(|m| m.is_dir())
+                    && (allow_links || flags & 16384 != 0 || !is_link);
+                Ok(Some(Value::Bool(r)))
+            }
+            "getchildren" => {
+                let (entry, flags, sub, cls_name) = match &obj.borrow().internal {
+                    Some(ObjectInternal::DirIter {
+                        entries,
+                        pos,
+                        flags,
+                        sub_path,
+                    }) if *pos < entries.len() => (
+                        entries[*pos].clone(),
+                        *flags,
+                        sub_path.clone(),
+                        obj.borrow().class.name().to_string(),
+                    ),
+                    _ => {
+                        return Ok(Some(Value::Null));
+                    }
+                };
+                let fname = entry.rsplit('/').next().unwrap_or("").to_string();
+                let child_sub = if sub.is_empty() {
+                    fname.clone()
+                } else {
+                    format!("{}/{}", sub, fname)
+                };
+                let args = vec![cell(Value::str(&entry)), cell(Value::Int(flags))];
+                let v = self.instantiate_class(&cls_name, args)?;
+                if let Value::Object(o) = &v {
+                    if let Some(ObjectInternal::DirIter { sub_path, .. }) =
+                        &mut o.borrow_mut().internal
+                    {
+                        *sub_path = child_sub;
+                    }
+                }
+                Ok(Some(v))
+            }
+            "getsubpath" => Ok(Some(match &obj.borrow().internal {
+                Some(ObjectInternal::DirIter { sub_path, .. }) => Value::str(sub_path),
+                _ => Value::str(""),
+            })),
+            "getsubpathname" => Ok(Some(match &obj.borrow().internal {
+                Some(ObjectInternal::DirIter {
+                    entries,
+                    pos,
+                    sub_path,
+                    ..
+                }) if *pos < entries.len() => {
+                    let fname = entries[*pos].rsplit('/').next().unwrap_or("");
+                    if sub_path.is_empty() {
+                        Value::str(fname)
+                    } else {
+                        Value::str(format!("{}/{}", sub_path, fname))
+                    }
+                }
+                _ => Value::str(""),
+            })),
             _ => {
                 let path_v = obj
                     .borrow()
@@ -12718,7 +13071,18 @@ impl<'a> Interp<'a> {
                     .get("\0fi\0path")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
-                let path = self.conv_str(&path_v)?.to_string();
+                let mut path = self.conv_str(&path_v)?.to_string();
+                // DirectoryIterator accessors target the current entry,
+                // not the iterated root path.
+                let entry = match &obj.borrow().internal {
+                    Some(ObjectInternal::DirIter { entries, pos, .. }) if *pos < entries.len() => {
+                        Some(entries[*pos].clone())
+                    }
+                    _ => None,
+                };
+                if let Some(e) = entry {
+                    path = e;
+                }
                 let base = path.rsplit('/').next().unwrap_or(&path).to_string();
                 let md = std::fs::metadata(&path).ok();
                 let v = match lname.as_str() {
@@ -13255,6 +13619,11 @@ impl<'a> Interp<'a> {
                     m.is_final
                         && m.visibility == crate::ast::Visibility::Private
                         && m.trait_alias_of.is_none()
+                        // PHP exempts __construct: a private final
+                        // constructor can't collide with a child's own
+                        // ctor, so no warning (every other magic method
+                        // still warns — marc-mabe/php-enum relies on it).
+                        && !m.decl.name.eq_ignore_ascii_case("__construct")
                 }) {
                     self.warn("Private methods cannot be final as they are never overridden by other classes")?;
                 }
@@ -15727,9 +16096,13 @@ impl<'a> Interp<'a> {
                     continue;
                 }
                 let file = c.decl.file.clone();
+                // Bind the declaring class while evaluating so `self::X`
+                // inside the decl (Enum::MAPPING) resolves correctly.
+                let old = self.const_self.replace(c.clone());
                 self.class_const_ctx += 1;
                 let r = self.eval_decl_const(&cd.value, &file);
                 self.class_const_ctx -= 1;
+                self.const_self = old;
                 let v = r?;
                 self.const_apply_ty(cd, &c.decl.name, v)?;
             }
@@ -19357,6 +19730,61 @@ impl<'a> Interp<'a> {
                         .unwrap_or(Value::Null),
                 ))
             }
+            // ReflectionClass::getParentClass() -> a ReflectionClass of
+            // the parent, or false when there is none (php-enum walks
+            // ancestors this way).
+            "getparentclass" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let parent = self
+                    .classes
+                    .get(&cn.to_lowercase())
+                    .and_then(|c| c.decl.parent.clone());
+                match parent {
+                    Some(p) => {
+                        let pcn = self
+                            .classes
+                            .get(&p.to_lowercase())
+                            .map(|c| c.decl.name.clone())
+                            .unwrap_or(p);
+                        let rc = self.instantiate("reflectionclass", &[])?;
+                        if let Value::Object(o) = &rc {
+                            let mut ob = o.borrow_mut();
+                            ob.props
+                                .insert("\0rc\0class".into(), cell(Value::str(&pcn)));
+                            ob.props.insert("name".into(), cell(Value::str(&pcn)));
+                        }
+                        Ok(Some(rc))
+                    }
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "getshortname" | "getnamespacename" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let (ns, short) = match cn.rsplit('\\').next() {
+                    Some(s) => {
+                        let idx = cn.len() - s.len();
+                        (cn[..idx].trim_end_matches('\\').to_string(), s.to_string())
+                    }
+                    None => (String::new(), cn.clone()),
+                };
+                Ok(Some(Value::str(if lname == "getshortname" {
+                    short
+                } else {
+                    ns
+                })))
+            }
             "newinstancewithoutconstructor" => {
                 let cn = obj
                     .borrow()
@@ -19367,7 +19795,8 @@ impl<'a> Interp<'a> {
                 let cn = self.conv_str(&cn)?;
                 Ok(Some(self.instantiate(&cn.to_lowercase(), &[])?))
             }
-            "isfinal" | "isabstract" | "isstatic" | "ispublic" | "isprotected" | "isprivate" => {
+            "isfinal" | "isabstract" | "isstatic" | "ispublic" | "isprotected" | "isprivate"
+            | "isenumcase" | "isdeprecated" => {
                 let cn = obj
                     .borrow()
                     .props
@@ -19382,21 +19811,65 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let mn = self.conv_str(&mn)?.to_string();
-                let m = self
-                    .classes
-                    .get(&cn.to_lowercase())
-                    .cloned()
-                    .and_then(|c| self.find_method_in(&c, &mn).map(|(m, _)| m));
-                let b = match m {
-                    Some(m) => match lname.as_str() {
-                        "isfinal" => m.is_final,
-                        "isabstract" => m.is_abstract,
-                        "isstatic" => m.is_static,
-                        "ispublic" => m.visibility == crate::ast::Visibility::Public,
-                        "isprotected" => m.visibility == crate::ast::Visibility::Protected,
-                        _ => m.visibility == crate::ast::Visibility::Private,
-                    },
-                    None => false,
+                let refl_kind = obj.borrow().class.name().to_lowercase();
+                let b = match refl_kind.as_str() {
+                    // ReflectionClassConstant: visibility/final/enum_case
+                    // come off the ConstDecl (marc-mabe Enum::getConstants).
+                    "reflectionclassconstant" => {
+                        let cd = self.find_const_decl(&cn, &mn);
+                        match cd {
+                            Some(cd) => match lname.as_str() {
+                                "isfinal" => cd.0.is_final,
+                                "ispublic" => cd.0.visibility == crate::ast::Visibility::Public,
+                                "isprotected" => {
+                                    cd.0.visibility == crate::ast::Visibility::Protected
+                                }
+                                "isprivate" => cd.0.visibility == crate::ast::Visibility::Private,
+                                "isenumcase" => cd.0.enum_case,
+                                _ => false,
+                            },
+                            None => false,
+                        }
+                    }
+                    // ReflectionProperty: visibility/static/readonly off
+                    // the PropDecl.
+                    "reflectionproperty" => {
+                        let pd = self
+                            .classes
+                            .get(&cn.to_lowercase())
+                            .cloned()
+                            .and_then(|c| self.find_prop_decl(&c, &mn))
+                            .map(|(pd, _)| pd);
+                        match pd {
+                            Some(pd) => match lname.as_str() {
+                                "isstatic" => pd.is_static,
+                                "ispublic" => pd.visibility == crate::ast::Visibility::Public,
+                                "isprotected" => pd.visibility == crate::ast::Visibility::Protected,
+                                "isprivate" => pd.visibility == crate::ast::Visibility::Private,
+                                "isfinal" => pd.is_final,
+                                _ => false,
+                            },
+                            None => false,
+                        }
+                    }
+                    _ => {
+                        let m = self
+                            .classes
+                            .get(&cn.to_lowercase())
+                            .cloned()
+                            .and_then(|c| self.find_method_in(&c, &mn).map(|(m, _)| m));
+                        match m {
+                            Some(m) => match lname.as_str() {
+                                "isfinal" => m.is_final,
+                                "isabstract" => m.is_abstract,
+                                "isstatic" => m.is_static,
+                                "ispublic" => m.visibility == crate::ast::Visibility::Public,
+                                "isprotected" => m.visibility == crate::ast::Visibility::Protected,
+                                _ => m.visibility == crate::ast::Visibility::Private,
+                            },
+                            None => false,
+                        }
+                    }
                 };
                 Ok(Some(Value::Bool(b)))
             }
@@ -19466,9 +19939,11 @@ impl<'a> Interp<'a> {
                 let cn = self.conv_str(&cn)?.to_string();
                 if lname == "getconstants" {
                     let mut arr = PhpArray::default();
-                    for (n, cd) in self.all_const_decls(&cn) {
-                        let f = cd.1.clone();
-                        if let Ok(v) = self.eval_decl_const(&cd.0.value, &f) {
+                    for (n, _cd) in self.all_const_decls(&cn) {
+                        // Go through class_const_named: it binds the
+                        // declaring class so `self::X` inside const decls
+                        // (e.g. Enum::MAPPING) resolves correctly.
+                        if let Ok(v) = self.class_const_named(&cn, &n) {
                             arr.set(ArrKey::Str(n.into()), v);
                         }
                     }
@@ -19479,12 +19954,9 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let pn = self.conv_str(&pn)?.to_string();
-                match self.find_const_decl(&cn, &pn) {
-                    Some((cd, f)) => {
-                        let v = self.eval_decl_const(&cd.value, &f)?;
-                        Ok(Some(v))
-                    }
-                    None => Ok(Some(Value::Bool(false))),
+                match self.class_const_named(&cn, &pn) {
+                    Ok(v) => Ok(Some(v)),
+                    Err(_) => Ok(Some(Value::Bool(false))),
                 }
             }
             "getreflectionconstant" | "getreflectionconstants" => {
@@ -19546,7 +20018,21 @@ impl<'a> Interp<'a> {
                     .unwrap_or(Value::Null);
                 let pn = self.conv_str(&pn)?.to_string();
                 match self.find_const_decl(&cn, &pn) {
-                    Some((cd, f)) => Ok(Some(self.eval_decl_const(&cd.value, &f)?)),
+                    Some((cd, f)) => {
+                        // Const decls can reference self::X — bind the
+                        // declaring scope during eval (Enum::MAPPING).
+                        let old = self
+                            .classes
+                            .get(&cn.to_lowercase())
+                            .map(|c| self.const_self.replace(c.clone()));
+                        self.class_const_ctx += 1;
+                        let r = self.eval_decl_const(&cd.value, &f);
+                        self.class_const_ctx -= 1;
+                        if let Some(o) = old {
+                            self.const_self = o;
+                        }
+                        Ok(Some(r?))
+                    }
                     None => Ok(Some(Value::Null)),
                 }
             }
@@ -20222,6 +20708,18 @@ impl<'a> Interp<'a> {
         args: CallArgs,
         dc: Rc<PhpClass>,
     ) -> Result<Value, PhpError> {
+        // Native SPL stubs (empty body, line 0) dispatch through
+        // spl_method however the call resolved — direct, parent::,
+        // or late-bound — so subclass PHP methods stay authoritative
+        // while inherited engine behavior still fires.
+        if m.decl.body.is_empty()
+            && m.decl.line == 0
+            && self.is_a_str(obj.borrow().class.name(), "splfileinfo")
+        {
+            if let Some(v) = self.spl_method(&obj, &m.decl.name, &args)? {
+                return Ok(v);
+            }
+        }
         let called = obj.borrow().class.clone();
         self.pending_decl_class = Some(dc.clone());
         self.pending_called_class = Some(called);
@@ -20384,16 +20882,23 @@ impl<'a> Interp<'a> {
     ) -> Result<Value, PhpError> {
         let cls = obj.borrow().class.clone();
         // Scope-private binding takes precedence over the object's own
-        // method table (private methods are not virtual).
+        // method table (private methods are not virtual) — but only
+        // when the callee is an instance of the scope class. For
+        // unrelated objects the scope's same-named private method is
+        // invisible and normal dispatch applies (`$io->output->m()`
+        // must not find IO's private m()).
         if let Some((m, sc)) = self.scope_private_method(name) {
-            if m.is_abstract {
-                return self.fail(PhpError::uncaught(
-                    "Error",
-                    format!("Cannot call abstract method {}::{}()", sc.name(), name),
-                    0,
-                ));
+            let cname = cls.name().to_string();
+            if self.is_a_str(&cname, sc.name()) {
+                if m.is_abstract {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Cannot call abstract method {}::{}()", sc.name(), name),
+                        0,
+                    ));
+                }
+                return self.invoke_method(obj, &m, args, sc);
             }
-            return self.invoke_method(obj, &m, args, sc);
         }
         if let Some((m, dc)) = self.find_method_in(&cls, name) {
             if !self.method_access_ok(&m, &dc) {
@@ -20662,13 +21167,20 @@ impl<'a> Interp<'a> {
                 return Ok(v);
             }
         }
-        // SplFileInfo / DirectoryIterator: SPL filesystem objects.
-        if matches!(
-            cls.name().to_lowercase().as_str(),
-            "splfileinfo" | "directoryiterator" | "filesystemiterator"
-        ) {
-            if let Some(v) = self.spl_method(&obj, name, &args)? {
-                return Ok(v);
+        // SplFileInfo / DirectoryIterator family: SPL filesystem
+        // objects — is_a covers FilesystemIterator,
+        // RecursiveDirectoryIterator and userland subclasses. Only the
+        // native stubs dispatch here — a userland override (e.g.
+        // symfony/finder's current()) still wins.
+        if self.is_a_str(cls.name(), "splfileinfo") {
+            let stub = self
+                .find_method_in(&cls, name)
+                .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
+                .unwrap_or(false);
+            if stub {
+                if let Some(v) = self.spl_method(&obj, name, &args)? {
+                    return Ok(v);
+                }
             }
         }
         // PDO / PDOStatement: sqlite-backed storage surface (#15 spike).
@@ -21831,10 +22343,17 @@ impl<'a> Interp<'a> {
         }
         // `X::CONST` on an unloaded class runs the autoloaders (real
         // psr-4 code hits this constantly — e.g. `Language::ENGLISH`).
-        let ckey = self
-            .resolve_class(&cname)
-            .unwrap_or_else(|| cname.clone())
-            .to_lowercase();
+        let resolved = self.resolve_class(&cname).unwrap_or_else(|| cname.clone());
+        let ckey = resolved.to_lowercase();
+        if !self.classes.contains_key(&ckey)
+            && !self.traits.contains_key(&ckey)
+            && !self.interfaces.contains_key(&ckey)
+        {
+            // An autoloader's throwable propagates through the `::`
+            // lookup (PHP fatals the same way); on a clean miss it
+            // leaves no exception behind.
+            self.run_autoload(&resolved)?;
+        }
         if let Some(td) = self.traits.get(&ckey).cloned() {
             return self.fail(PhpError::uncaught(
                 "Error",
@@ -21950,6 +22469,77 @@ impl<'a> Interp<'a> {
             format!("Undefined constant {}", name),
             0,
         ))
+    }
+
+    /// `defined('Cls::CONST')` — declaration check only (no value
+    /// eval), mirroring class_const_named's walk. The class is
+    /// resolved (and autoloaded) first.
+    pub fn class_const_defined(&mut self, cname: &str, name: &str) -> bool {
+        if name == "class" {
+            return self.resolve_class(cname).is_some()
+                || self
+                    .classes
+                    .contains_key(&cname.trim_start_matches('\\').to_lowercase());
+        }
+        let ckey = self
+            .resolve_class(cname)
+            .unwrap_or_else(|| cname.to_string())
+            .to_lowercase();
+        if let Some(iface) = self.interfaces.get(&ckey).cloned() {
+            let mut seen = std::collections::HashSet::new();
+            let mut stack = vec![iface];
+            while let Some(c) = stack.pop() {
+                if !seen.insert(c.name.to_lowercase()) {
+                    continue;
+                }
+                if c.consts.iter().any(|cd| cd.name == name) {
+                    return true;
+                }
+                for i in &c.implements {
+                    if let Some(f) = self.interfaces.get(&i.to_lowercase()).cloned() {
+                        stack.push(f);
+                    }
+                }
+                if let Some(p) = &c.parent {
+                    if let Some(f) = self.interfaces.get(&p.to_lowercase()).cloned() {
+                        stack.push(f);
+                    }
+                }
+            }
+            return false;
+        }
+        let Some(cls) = self.classes.get(&ckey).cloned() else {
+            return false;
+        };
+        let mut cur = Some(cls);
+        let mut ifaces: Vec<String> = Vec::new();
+        while let Some(c) = cur {
+            if c.decl.consts.iter().any(|cd| cd.name == name) {
+                return true;
+            }
+            ifaces.extend(c.decl.implements.iter().cloned());
+            cur = c
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        let mut seen = std::collections::HashSet::new();
+        while let Some(iname) = ifaces.pop() {
+            if !seen.insert(iname.to_lowercase()) {
+                continue;
+            }
+            if let Some(c) = self.interfaces.get(&iname.to_lowercase()).cloned() {
+                if c.consts.iter().any(|cd| cd.name == name) {
+                    return true;
+                }
+                ifaces.extend(c.implements.iter().cloned());
+                if let Some(p) = &c.parent {
+                    ifaces.push(p.clone());
+                }
+            }
+        }
+        false
     }
 
     // ----- include / eval -----
@@ -22145,6 +22735,10 @@ impl<'a> Interp<'a> {
             Flow::Break(_) | Flow::Continue(_) => {
                 self.fail(PhpError::fatal("'break'/'continue' in included file", 0))
             }
+            Flow::Goto(l) => self.fail(PhpError::fatal(
+                format!("'goto' to undefined label '{}'", l),
+                0,
+            )),
         }
     }
 
@@ -22184,6 +22778,14 @@ impl<'a> Interp<'a> {
                         })
                     }
                     Flow::Break(_) | Flow::Continue(_) => Ok(Value::Null),
+                    Flow::Goto(l) => Err(PhpError {
+                        trace: None,
+                        thrown_line: None,
+                        display_msg: None,
+                        kind: ErrorKind::Fatal,
+                        message: format!("'goto' to undefined label '{}'", l),
+                        line: 0,
+                    }),
                 }
             }
             Err(e) => {
@@ -22842,3 +23444,200 @@ fn ty_norm_disp(ty: &[String]) -> String {
     }
     out.join("|")
 }
+
+/// SPL iterator-wrapper classes expressed in plain PHP and eval'd once
+/// per Interp (Interp::new). Written in PHP because they are pure
+/// delegation over Iterator methods; the engine supplies the leaves
+/// (DirectoryIterator/FilesystemIterator/RecursiveDirectoryIterator).
+const SPL_ITERATOR_PRELUDE: &str = r#"
+interface OuterIterator extends Iterator {
+    public function getInnerIterator();
+}
+interface RecursiveIterator extends Iterator {
+    public function hasChildren();
+    public function getChildren();
+}
+class IteratorIterator implements OuterIterator {
+    protected $inner;
+    public function __construct($iterator) {
+        $it = $iterator;
+        while ($it instanceof IteratorAggregate) {
+            $it = $it->getIterator();
+        }
+        $this->inner = $it;
+    }
+    public function getInnerIterator() { return $this->inner; }
+    public function __call($func, $params) { return $this->inner->$func(...$params); }
+    public function rewind() { $this->inner->rewind(); }
+    public function valid() { return $this->inner->valid(); }
+    public function current() { return $this->inner->current(); }
+    public function key() { return $this->inner->key(); }
+    public function next() { $this->inner->next(); }
+}
+abstract class FilterIterator extends IteratorIterator {
+    abstract public function accept();
+    public function rewind() { $this->inner->rewind(); $this->fetch(); }
+    public function next() { $this->inner->next(); $this->fetch(); }
+    private function fetch() {
+        while ($this->inner->valid() && !$this->accept()) {
+            $this->inner->next();
+        }
+    }
+}
+class CallbackFilterIterator extends FilterIterator {
+    private $callback;
+    public function __construct($iterator, $callback) {
+        parent::__construct($iterator);
+        $this->callback = $callback;
+    }
+    public function accept() {
+        return ($this->callback)($this->current(), $this->key(), $this->inner);
+    }
+}
+class RecursiveIteratorIterator implements OuterIterator {
+    const LEAVES_ONLY = 0;
+    const SELF_FIRST = 1;
+    const CHILD_FIRST = 2;
+    private $stack = [];
+    private $emitted = [];
+    private $mode;
+    private $yieldParent = false;
+    public function __construct($iterator, $mode = 0, $flags = 0) {
+        $it = $iterator;
+        while ($it instanceof IteratorAggregate) {
+            $it = $it->getIterator();
+        }
+        $this->mode = $mode;
+        $this->stack = [$it];
+        $this->emitted = [false];
+        $it->rewind();
+        $this->descend();
+    }
+    private function top() { return $this->stack[count($this->stack) - 1]; }
+    public function getDepth() { return count($this->stack) - 1; }
+    public function getSubIterator($level = null) {
+        $i = $level === null ? count($this->stack) - 1 : $level;
+        return $this->stack[$i] ?? null;
+    }
+    public function getInnerIterator() { return $this->top(); }
+    private function descend() {
+        while (count($this->stack) > 0) {
+            $top = $this->top();
+            if (!$top->valid()) {
+                array_pop($this->stack);
+                array_pop($this->emitted);
+                $this->yieldParent = false;
+                if (count($this->stack) === 0) {
+                    return;
+                }
+                $i = count($this->stack) - 1;
+                if ($this->mode === self::CHILD_FIRST && !$this->emitted[$i]) {
+                    $this->emitted[$i] = true;
+                    $this->yieldParent = true;
+                    return;
+                }
+                $this->top()->next();
+                continue;
+            }
+            if ($top instanceof RecursiveIterator && $top->hasChildren()) {
+                $i = count($this->stack) - 1;
+                if ($this->mode === self::SELF_FIRST && !$this->emitted[$i]) {
+                    $this->emitted[$i] = true;
+                    $this->yieldParent = true;
+                    return;
+                }
+                $child = $top->getChildren();
+                $child->rewind();
+                $this->stack[] = $child;
+                $this->emitted[] = false;
+                continue;
+            }
+            $this->yieldParent = false;
+            return;
+        }
+        $this->yieldParent = false;
+    }
+    public function valid() {
+        return count($this->stack) > 0 && $this->top()->valid();
+    }
+    public function current() {
+        return count($this->stack) > 0 ? $this->top()->current() : null;
+    }
+    public function key() {
+        return count($this->stack) > 0 ? $this->top()->key() : null;
+    }
+    public function next() {
+        if (count($this->stack) === 0) {
+            return;
+        }
+        if ($this->yieldParent && $this->mode === self::SELF_FIRST) {
+            $top = $this->top();
+            $child = $top->getChildren();
+            $child->rewind();
+            $i = count($this->stack) - 1;
+            $this->emitted[$i] = false;
+            $this->stack[] = $child;
+            $this->emitted[] = false;
+            $this->yieldParent = false;
+            $this->descend();
+            return;
+        }
+        if ($this->yieldParent) {
+            $i = count($this->stack) - 1;
+            $this->emitted[$i] = false;
+            $this->yieldParent = false;
+            $this->top()->next();
+            $this->descend();
+            return;
+        }
+        $this->top()->next();
+        $this->descend();
+    }
+    public function rewind() {
+        $this->stack = [$this->stack[0]];
+        $this->emitted = [false];
+        $this->stack[0]->rewind();
+        $this->yieldParent = false;
+        $this->descend();
+    }
+}
+class AppendIterator extends IteratorIterator {
+    private $its = [];
+    private $idx = 0;
+    public function __construct() {}
+    public function append($it) {
+        while ($it instanceof IteratorAggregate) {
+            $it = $it->getIterator();
+        }
+        $this->its[] = $it;
+        if ($this->idx === 0 && count($this->its) === 1) {
+            $this->inner = $it;
+        }
+    }
+    private function sync() {
+        while ($this->idx < count($this->its) && !$this->its[$this->idx]->valid()) {
+            $this->idx++;
+        }
+        $this->inner = $this->idx < count($this->its) ? $this->its[$this->idx] : null;
+    }
+    public function rewind() {
+        foreach ($this->its as $it) {
+            $it->rewind();
+        }
+        $this->idx = 0;
+        $this->sync();
+    }
+    public function valid() {
+        return $this->idx < count($this->its) && $this->its[$this->idx]->valid();
+    }
+    public function next() {
+        if ($this->idx < count($this->its)) {
+            $this->its[$this->idx]->next();
+        }
+        $this->sync();
+    }
+    public function getInnerIterator() {
+        return $this->idx < count($this->its) ? $this->its[$this->idx] : null;
+    }
+}
+"#;

@@ -722,6 +722,28 @@ impl<'a> Parser<'a> {
                     && matches!(self.peek2(), Some(Token::Ident(_)) | Some(Token::Op("\\")))
                 {
                     self.use_stmt()
+                } else if self.ident_is("goto") {
+                    self.pos += 1;
+                    let label = match self.peek() {
+                        Some(Token::Ident(s)) => s.clone(),
+                        _ => {
+                            return Err(PhpError::parse(
+                                "syntax error, unexpected token, expecting identifier",
+                                self.line(),
+                            ))
+                        }
+                    };
+                    self.pos += 1;
+                    self.expect_op(";")?;
+                    Ok(Stmt::Goto(label))
+                } else if matches!(self.peek2(), Some(Token::Op(":"))) {
+                    // `name:` — a goto label; can't start any expression.
+                    let label = match self.peek() {
+                        Some(Token::Ident(s)) => s.clone(),
+                        _ => unreachable!(),
+                    };
+                    self.pos += 2;
+                    Ok(Stmt::Label(label))
                 } else {
                     self.expr_stmt()
                 }

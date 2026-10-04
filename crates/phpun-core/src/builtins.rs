@@ -534,7 +534,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             // fprintf($fh, fmt, ...) — write to resource
             let fmt = arg_str(it, args, 1);
             let s = sprintf_args(it, &fmt, &args[2.min(args.len())..])?;
-            write_resource(it, args.first(), &s)?;
+            write_resource(it, args.first(), s.as_bytes())?;
             Value::Int(s.len() as i64)
         }
         "number_format" => {
@@ -1766,6 +1766,39 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             }
             Value::Array(Rc::new(RefCell::new(out)))
         }
+        "array_replace_recursive" => {
+            fn rec(base: &mut PhpArray, over: &PhpArray) {
+                for (k, c) in over.iter() {
+                    let v = c.borrow().clone();
+                    let sub = base.get(k).and_then(|b| match b {
+                        Value::Array(a) => Some(a.borrow().clone()),
+                        _ => None,
+                    });
+                    match (&v, sub) {
+                        (Value::Array(oa), Some(mut sub_arr)) => {
+                            rec(&mut sub_arr, &oa.borrow());
+                            base.set(k.clone(), Value::Array(Rc::new(RefCell::new(sub_arr))));
+                        }
+                        (Value::Array(oa), None) => {
+                            let mut fresh = PhpArray::new();
+                            rec(&mut fresh, &oa.borrow());
+                            base.set(k.clone(), Value::Array(Rc::new(RefCell::new(fresh))));
+                        }
+                        _ => base.set(k.clone(), v),
+                    }
+                }
+            }
+            let mut out = match args.first().map(|a| a.borrow().clone()) {
+                Some(Value::Array(a)) => a.borrow().clone(),
+                _ => PhpArray::new(),
+            };
+            for a in args.iter().skip(1) {
+                if let Value::Array(m) = &*a.borrow() {
+                    rec(&mut out, &m.borrow());
+                }
+            }
+            Value::Array(Rc::new(RefCell::new(out)))
+        }
         "array_combine" => {
             let keys = arg(args, 0);
             let vals = arg(args, 1);
@@ -1933,6 +1966,13 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 match last {
                     Some(f) => {
                         let c = arr.entries[f].1.clone();
+                        // Zend drops nNextFreeElement to the popped key
+                        // when it was the top int slot (holes keep it).
+                        if let ArrKey::Int(k) = arr.entries[f].0 {
+                            if k == arr.next - 1 {
+                                arr.next = k;
+                            }
+                        }
                         arr.entries[f].0 = ArrKey::Tomb;
                         return Ok(Some(c.borrow().clone()));
                     }
@@ -2198,12 +2238,15 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let mut out = PhpArray::new();
             if args.len() == 2 {
                 if let Value::Array(a) = arg(args, 1) {
-                    for (_, c) in a.borrow().iter() {
+                    // Single-array calls preserve keys (composer's
+                    // autoload_files.php fileIdentifiers rely on it);
+                    // multi-array zips renumber — PHP semantics.
+                    for (k, c) in a.borrow().iter() {
                         let v = it.call_value(
                             &cb,
                             crate::interp::CallArgs::positional(vec![cell(c.borrow().clone())]),
                         )?;
-                        out.push(v);
+                        out.set(k.clone(), v);
                     }
                 }
             } else {
@@ -2775,7 +2818,11 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "defined" => {
             let n = arg_str(it, args, 0);
-            Value::Bool(it.const_defined(&n))
+            if let Some((cls, cn)) = n.split_once("::") {
+                Value::Bool(it.class_const_defined(cls, cn))
+            } else {
+                Value::Bool(it.const_defined(&n))
+            }
         }
         "constant" => {
             let n = arg_str(it, args, 0);
@@ -2798,25 +2845,23 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 it.functions.contains_key(&n) || is_builtin(&n) || builtin_params(&n).is_some(),
             )
         }
-        "class_exists" => {
+        "class_exists" | "interface_exists" | "trait_exists" | "enum_exists" => {
             let n = arg_str(it, args, 0);
-            Value::Bool(it.lookup_class(&n).is_some())
+            // $autoload defaults to true; an explicit false skips it.
+            if args.len() <= 1 || arg(args, 1).is_truthy() {
+                let _ = it.run_autoload(&n);
+            }
+            let key = n.trim_start_matches('\\').to_lowercase();
+            match name {
+                "interface_exists" => Value::Bool(it.interfaces.contains_key(&key)),
+                "trait_exists" => Value::Bool(it.traits.contains_key(&key)),
+                "enum_exists" => Value::Bool(matches!(
+                    it.lookup_class(&n),
+                    Some(c) if c.decl.kind == crate::ast::ClassKind::Enum
+                )),
+                _ => Value::Bool(it.lookup_class(&n).is_some()),
+            }
         }
-        "interface_exists" => {
-            let n = arg_str(it, args, 0);
-            Value::Bool(
-                it.interfaces
-                    .contains_key(&n.trim_start_matches('\\').to_lowercase()),
-            )
-        }
-        "trait_exists" => {
-            let n = arg_str(it, args, 0);
-            Value::Bool(
-                it.traits
-                    .contains_key(&n.trim_start_matches('\\').to_lowercase()),
-            )
-        }
-        "enum_exists" => Value::Bool(false),
         "method_exists" => match arg(args, 0) {
             // Closures are objects of class Closure — __invoke exists
             // (bug52060, bug77627).
@@ -3414,38 +3459,42 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         | "preg_last_error_msg" => preg_dispatch(it, name, args)?,
 
         // ----- filesystem/process -----
-        "file_exists" => Value::Bool(std::path::Path::new(&arg_str(it, args, 0)).exists()),
-        "is_file" => Value::Bool(std::path::Path::new(&arg_str(it, args, 0)).is_file()),
-        "is_dir" => Value::Bool(std::path::Path::new(&arg_str(it, args, 0)).is_dir()),
+        "file_exists" => Value::Bool(std::path::Path::new(fs_path(&arg_str(it, args, 0))).exists()),
+        "is_file" => Value::Bool(std::path::Path::new(fs_path(&arg_str(it, args, 0))).is_file()),
+        "is_dir" => Value::Bool(std::path::Path::new(fs_path(&arg_str(it, args, 0))).is_dir()),
         "is_link" => Value::Bool(
-            std::path::Path::new(&arg_str(it, args, 0))
+            std::path::Path::new(fs_path(&arg_str(it, args, 0)))
                 .symlink_metadata()
                 .map(|m| m.file_type().is_symlink())
                 .unwrap_or(false),
         ),
-        "is_readable" => Value::Bool(std::path::Path::new(&arg_str(it, args, 0)).exists()),
+        "is_readable" => Value::Bool(std::path::Path::new(fs_path(&arg_str(it, args, 0))).exists()),
         "is_writable" | "is_writeable" => {
-            Value::Bool(std::path::Path::new(&arg_str(it, args, 0)).exists())
+            Value::Bool(std::path::Path::new(fs_path(&arg_str(it, args, 0))).exists())
         }
-        "is_executable" => Value::Bool(std::path::Path::new(&arg_str(it, args, 0)).exists()),
-        "filesize" => match std::fs::metadata(arg_str(it, args, 0)) {
+        "is_executable" => {
+            Value::Bool(std::path::Path::new(fs_path(&arg_str(it, args, 0))).exists())
+        }
+        "filesize" => match std::fs::metadata(fs_path(&arg_str(it, args, 0))) {
             Ok(m) => Value::Int(m.len() as i64),
             Err(_) => Value::Bool(false),
         },
-        "filemtime" | "fileatime" | "filectime" => match std::fs::metadata(arg_str(it, args, 0)) {
-            Ok(m) => match m.modified() {
-                Ok(t) => Value::Int(
-                    t.duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0),
-                ),
+        "filemtime" | "fileatime" | "filectime" => {
+            match std::fs::metadata(fs_path(&arg_str(it, args, 0))) {
+                Ok(m) => match m.modified() {
+                    Ok(t) => Value::Int(
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0),
+                    ),
+                    Err(_) => Value::Bool(false),
+                },
                 Err(_) => Value::Bool(false),
-            },
-            Err(_) => Value::Bool(false),
-        },
+            }
+        }
         "fileperms" => {
             use std::os::unix::fs::PermissionsExt;
-            match std::fs::metadata(arg_str(it, args, 0)) {
+            match std::fs::metadata(fs_path(&arg_str(it, args, 0))) {
                 Ok(m) => Value::Int(m.permissions().mode() as i64),
                 Err(_) => Value::Bool(false),
             }
@@ -3476,10 +3525,10 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(&path)
+                    .open(fs_path(&path))
                     .and_then(|mut f| f.write_all(data.as_bytes()))
             } else {
-                std::fs::write(&path, data.as_bytes())
+                std::fs::write(fs_path(&path), data.as_bytes())
             };
             match r {
                 Ok(_) => Value::Int(data.len() as i64),
@@ -3492,16 +3541,26 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 }
             }
         }
-        "unlink" => match std::fs::remove_file(arg_str(it, args, 0)) {
+        "unlink" => match std::fs::remove_file(fs_path(&arg_str(it, args, 0))) {
             Ok(_) => Value::Bool(true),
             Err(_) => Value::Bool(false),
         },
-        "rename" => {
-            Value::Bool(std::fs::rename(arg_str(it, args, 0), arg_str(it, args, 1)).is_ok())
-        }
-        "copy" => Value::Bool(std::fs::copy(arg_str(it, args, 0), arg_str(it, args, 1)).is_ok()),
-        "mkdir" => Value::Bool(std::fs::create_dir_all(arg_str(it, args, 0)).is_ok()),
-        "rmdir" => Value::Bool(std::fs::remove_dir(arg_str(it, args, 0)).is_ok()),
+        "rename" => Value::Bool(
+            std::fs::rename(
+                fs_path(&arg_str(it, args, 0)),
+                fs_path(&arg_str(it, args, 1)),
+            )
+            .is_ok(),
+        ),
+        "copy" => Value::Bool(
+            std::fs::copy(
+                fs_path(&arg_str(it, args, 0)),
+                fs_path(&arg_str(it, args, 1)),
+            )
+            .is_ok(),
+        ),
+        "mkdir" => Value::Bool(std::fs::create_dir_all(fs_path(&arg_str(it, args, 0))).is_ok()),
+        "rmdir" => Value::Bool(std::fs::remove_dir(fs_path(&arg_str(it, args, 0))).is_ok()),
         "basename" => {
             let p = arg_str(it, args, 0);
             let suffix = arg_str(it, args, 1);
@@ -3527,7 +3586,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     .unwrap_or_else(|| ".".into()),
             )
         }
-        "realpath" => match std::fs::canonicalize(arg_str(it, args, 0)) {
+        "realpath" => match std::fs::canonicalize(fs_path(&arg_str(it, args, 0))) {
             Ok(p) => Value::str(p.display().to_string()),
             Err(_) => Value::Bool(false),
         },
@@ -3560,6 +3619,29 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 out.set(ArrKey::Str("extension".into()), Value::str(ext));
             }
             out.set(ArrKey::Str("filename".into()), Value::str(stem));
+            if args.len() > 1 {
+                let flag = arg(args, 1).to_int();
+                // Bitflag selects one component; PATHINFO_ALL keeps the
+                // full array. Multiple bits return first match per PHP.
+                let v: Value = if flag == 15 {
+                    Value::Array(Rc::new(RefCell::new(out)))
+                } else if flag & 1 != 0 {
+                    out.get(&ArrKey::Str("dirname".into()))
+                        .unwrap_or(Value::str(""))
+                } else if flag & 2 != 0 {
+                    out.get(&ArrKey::Str("basename".into()))
+                        .unwrap_or(Value::str(""))
+                } else if flag & 4 != 0 {
+                    out.get(&ArrKey::Str("extension".into()))
+                        .unwrap_or(Value::str(""))
+                } else if flag & 8 != 0 {
+                    out.get(&ArrKey::Str("filename".into()))
+                        .unwrap_or(Value::str(""))
+                } else {
+                    Value::Array(Rc::new(RefCell::new(out)))
+                };
+                return Ok(Some(v));
+            }
             Value::Array(Rc::new(RefCell::new(out)))
         }
         // scheme://user:pass@host:port/path?query#fragment — component arg
@@ -3722,7 +3804,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "scandir" => {
             let mut out = PhpArray::new();
-            if let Ok(rd) = std::fs::read_dir(arg_str(it, args, 0)) {
+            if let Ok(rd) = std::fs::read_dir(fs_path(&arg_str(it, args, 0))) {
                 out.push(Value::str("."));
                 out.push(Value::str(".."));
                 for e in rd.flatten() {
@@ -3784,9 +3866,21 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     body: Rc::new(body),
                     pos: 0,
                 })))
+            } else if path == "php://memory"
+                || path == "php://temp"
+                || path.starts_with("php://temp/maxmemory:")
+            {
+                // php://memory and php://temp are always read/write.
+                let id = it.next_res_id();
+                Value::Resource(Rc::new(RefCell::new(PhpResource::Mem {
+                    id,
+                    buf: Vec::new(),
+                    pos: 0,
+                    eof: false,
+                })))
             } else if let Some(which) = match path.as_str() {
                 "php://stdin" => Some(0u8),
-                "php://stdout" => Some(1u8),
+                "php://stdout" | "php://output" => Some(1u8),
                 "php://stderr" => Some(2u8),
                 _ => None,
             } {
@@ -3821,7 +3915,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "fwrite" | "fputs" => {
             let data = arg(args, 1).to_php_string();
-            match write_resource(it, args.first(), &data) {
+            match write_resource(it, args.first(), data.as_bytes()) {
                 Ok(_) => Value::Int(data.len() as i64),
                 Err(_) => Value::Bool(false),
             }
@@ -3852,6 +3946,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             Some(c) => match &*c.borrow() {
                 Value::Resource(r) => match &*r.borrow() {
                     PhpResource::File { eof, .. } => Value::Bool(*eof),
+                    PhpResource::Mem { eof, .. } => Value::Bool(*eof),
                     _ => Value::Bool(true),
                 },
                 _ => Value::Bool(true),
@@ -3861,9 +3956,12 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "fseek" => {
             if let Some(c) = args.first() {
                 if let Value::Resource(r) = &*c.borrow() {
-                    if let PhpResource::File { pos, eof, .. } = &mut *r.borrow_mut() {
-                        *pos = arg(args, 1).to_int().max(0) as u64;
-                        *eof = false;
+                    match &mut *r.borrow_mut() {
+                        PhpResource::File { pos, eof, .. } | PhpResource::Mem { pos, eof, .. } => {
+                            *pos = arg(args, 1).to_int().max(0) as u64;
+                            *eof = false;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -3872,7 +3970,9 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "ftell" => match args.first() {
             Some(c) => match &*c.borrow() {
                 Value::Resource(r) => match &*r.borrow() {
-                    PhpResource::File { pos, .. } => Value::Int(*pos as i64),
+                    PhpResource::File { pos, .. } | PhpResource::Mem { pos, .. } => {
+                        Value::Int(*pos as i64)
+                    }
                     _ => Value::Int(0),
                 },
                 _ => Value::Int(0),
@@ -3882,15 +3982,39 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "rewind" => {
             if let Some(c) = args.first() {
                 if let Value::Resource(r) = &*c.borrow() {
-                    if let PhpResource::File { pos, eof, .. } = &mut *r.borrow_mut() {
-                        *pos = 0;
-                        *eof = false;
+                    match &mut *r.borrow_mut() {
+                        PhpResource::File { pos, eof, .. } | PhpResource::Mem { pos, eof, .. } => {
+                            *pos = 0;
+                            *eof = false;
+                        }
+                        _ => {}
                     }
                 }
             }
             Value::Bool(true)
         }
-        "ftruncate" => Value::Bool(true),
+        "ftruncate" => {
+            let size = arg(args, 1).to_int().max(0) as usize;
+            match args.first() {
+                Some(c) => match &*c.borrow() {
+                    Value::Resource(r) => match &mut *r.borrow_mut() {
+                        PhpResource::Mem { buf, pos, .. } => {
+                            buf.resize(size, 0);
+                            if (*pos as usize) > size {
+                                *pos = size as u64;
+                            }
+                            Value::Bool(true)
+                        }
+                        PhpResource::File { file, .. } => {
+                            Value::Bool(file.set_len(size as u64).is_ok())
+                        }
+                        _ => Value::Bool(false),
+                    },
+                    _ => Value::Bool(false),
+                },
+                None => Value::Bool(false),
+            }
+        }
         "fflush" => Value::Bool(true),
         "flock" => Value::Bool(true),
         "fpassthru" => {
@@ -3945,7 +4069,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         }
         "parse_ini_file" | "parse_ini_string" => {
             let s = if name == "parse_ini_file" {
-                std::fs::read_to_string(arg_str(it, args, 0)).unwrap_or_default()
+                std::fs::read_to_string(fs_path(&arg_str(it, args, 0))).unwrap_or_default()
             } else {
                 arg_str(it, args, 0)
             };
@@ -3972,7 +4096,15 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             }
             Value::Array(Rc::new(RefCell::new(out)))
         }
-        "stat" | "lstat" | "clearstatcache" => Value::Bool(false),
+        "stat" => match std::fs::metadata(fs_path(&arg_str(it, args, 0))) {
+            Ok(m) => Value::Array(Rc::new(RefCell::new(stat_array(&m)))),
+            Err(_) => Value::Bool(false),
+        },
+        "lstat" => match std::fs::symlink_metadata(fs_path(&arg_str(it, args, 0))) {
+            Ok(m) => Value::Array(Rc::new(RefCell::new(stat_array(&m)))),
+            Err(_) => Value::Bool(false),
+        },
+        "clearstatcache" => Value::Null,
         "umask" => Value::Int(0o022),
         "chmod" | "chown" | "chgrp" | "touch" => Value::Bool(true),
         "link" | "symlink" | "readlink" | "linkinfo" => Value::Bool(false),
@@ -4016,6 +4148,10 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 | "random"
                 | "date"
                 | "reflection"
+                | "mbstring"
+                // Advertised so Composer's TLS check passes; offline
+                // commands never invoke openssl_* functions.
+                | "openssl"
         )),
         "get_loaded_extensions" => {
             let mut a = PhpArray::new();
@@ -4030,6 +4166,8 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 "random",
                 "date",
                 "Reflection",
+                "mbstring",
+                "openssl",
             ] {
                 a.push(Value::str(e));
             }
@@ -4189,6 +4327,50 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             }
             Value::str(String::from_utf8_lossy(&out).into_owned())
         }
+        "stream_copy_to_stream" => {
+            let maxlen = args.get(2).map(|c| c.borrow().to_int()).unwrap_or(-1);
+            let offset = args.get(3).map(|c| c.borrow().to_int()).unwrap_or(0);
+            if offset > 0 {
+                if let Some(Value::Resource(r)) = args.first().map(|c| c.borrow().clone()) {
+                    match &mut *r.borrow_mut() {
+                        PhpResource::File { pos, eof, .. } | PhpResource::Mem { pos, eof, .. } => {
+                            *pos = offset as u64;
+                            *eof = false;
+                        }
+                        PhpResource::Input { pos, .. } => {
+                            *pos = offset as u64;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let mut total: i64 = 0;
+            let mut remaining = if maxlen < 0 { i64::MAX } else { maxlen };
+            let mut ok = true;
+            while remaining > 0 {
+                let want = remaining.min(8192) as usize;
+                match read_resource(args.first(), want) {
+                    Ok(b) if b.is_empty() => break,
+                    Ok(b) => {
+                        total += b.len() as i64;
+                        remaining -= b.len() as i64;
+                        if write_resource(it, args.get(1), &b).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                Value::Int(total)
+            } else {
+                Value::Bool(false)
+            }
+        }
         "stream_context_create" | "stream_context_get_default" => {
             Value::Resource(Rc::new(RefCell::new(PhpResource::Other {
                 id: it.next_res_id(),
@@ -4209,7 +4391,30 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "stream_filter_register" | "stream_filter_append" | "stream_filter_prepend" => {
             Value::Bool(false)
         }
-        "fstat" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+        "fstat" => match arg(args, 0) {
+            Value::Resource(r) => {
+                let meta = {
+                    let res = r.borrow();
+                    match &*res {
+                        crate::value::PhpResource::File { file, .. } => file.metadata().ok(),
+                        crate::value::PhpResource::Stdio { which, .. } => {
+                            std::fs::metadata(match which {
+                                0 => "/dev/stdin",
+                                1 => "/dev/stdout",
+                                _ => "/dev/stderr",
+                            })
+                            .ok()
+                        }
+                        _ => None,
+                    }
+                };
+                match meta {
+                    Some(m) => Value::Array(Rc::new(RefCell::new(stat_array(&m)))),
+                    None => Value::Bool(false),
+                }
+            }
+            _ => Value::Bool(false),
+        },
         "fdopen" | "popen" | "pclose" => Value::Bool(false),
         "proc_open" | "proc_close" | "proc_get_status" | "proc_terminate" => Value::Bool(false),
         "shell_exec" | "exec" | "system" | "passthru" => Value::Null,
@@ -4585,6 +4790,26 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "assert_options_now" => Value::Null,
         "zend_test_func" | "zend_test_array_return" => Value::Null,
         "iterator_from_array" => Value::Null,
+        "openssl_x509_parse" => {
+            // Not a real X.509 parser: returns a plausible array when the
+            // PEM input holds a certificate block — enough for offline
+            // CA-file validation (composer/ca-bundle checks truthiness).
+            let pem = arg_str(it, args, 0);
+            if pem.contains("BEGIN CERTIFICATE") {
+                let mut a = PhpArray::new();
+                let mut subj = PhpArray::new();
+                subj.set(ArrKey::Str("CN".into()), Value::str(""));
+                a.set(
+                    ArrKey::Str("subject".into()),
+                    Value::Array(Rc::new(RefCell::new(subj))),
+                );
+                a.set(ArrKey::Str("validFrom_time_t".into()), Value::Int(0));
+                a.set(ArrKey::Str("validTo_time_t".into()), Value::Int(i64::MAX));
+                Value::Array(Rc::new(RefCell::new(a)))
+            } else {
+                Value::Bool(false)
+            }
+        }
         "openssl_random_pseudo_bytes" | "random_bytes" => {
             let n = arg(args, 0).to_int().max(0) as usize;
             let mut b = vec![0u8; n];
@@ -4600,7 +4825,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 x ^= x << 17;
                 *byte = x as u8;
             }
-            Value::str(String::from_utf8_lossy(&b).into_owned())
+            Value::bytes(b)
         }
 
         // eval of last resort
@@ -4935,6 +5160,7 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "pathinfo"
             | "php_check_syntax"
             | "php_sapi_name"
+            | "php_strip_whitespace"
             | "php_uname"
             | "pi"
             | "pow"
@@ -4984,6 +5210,7 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "str_starts_with"
             | "str_word_count"
             | "stream_get_contents"
+            | "stream_copy_to_stream"
             | "strip_tags"
             | "stripslashes"
             | "strlen"
@@ -7896,7 +8123,16 @@ fn read_stream(path: &str) -> Result<Vec<u8>, std::io::Error> {
     if path.starts_with("php://stdin") {
         return Ok(Vec::new());
     }
-    std::fs::read(path)
+    std::fs::read(fs_path(path))
+}
+
+/// Strips the `file://` stream wrapper — PHP treats `file:///abs/path`
+/// (and `file://localhost/...`) as a plain local path.
+fn fs_path(p: &str) -> &str {
+    match p.strip_prefix("file://") {
+        Some(rest) => rest.strip_prefix("localhost").unwrap_or(rest),
+        None => p,
+    }
 }
 
 /// `data:[mediatype][;base64],payload` wrapper — returns the decoded
@@ -7947,6 +8183,7 @@ fn mode_flags(mode: &str) -> (bool, bool) {
 }
 
 fn fopen(path: &str, mode: &str) -> std::io::Result<std::fs::File> {
+    let path = fs_path(path);
     use std::fs::OpenOptions;
     let m = mode.chars().next().unwrap_or('r');
     let plus = mode.contains('+');
@@ -7989,7 +8226,7 @@ fn fopen(path: &str, mode: &str) -> std::io::Result<std::fs::File> {
     o.open(path)
 }
 
-fn write_resource(it: &mut Interp, c: Option<&Cell>, data: &str) -> Result<(), PhpError> {
+fn write_resource(it: &mut Interp, c: Option<&Cell>, data: &[u8]) -> Result<(), PhpError> {
     use std::io::{Seek, Write};
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
@@ -7997,11 +8234,21 @@ fn write_resource(it: &mut Interp, c: Option<&Cell>, data: &str) -> Result<(), P
             match &mut *rb {
                 PhpResource::Stdio { which, .. } => match *which {
                     1 => {
-                        it.out.extend_from_slice(data.as_bytes());
+                        if it.live_io {
+                            let mut so = std::io::stdout().lock();
+                            let _ = so.write_all(data);
+                            let _ = so.flush();
+                        } else {
+                            it.out.extend_from_slice(data);
+                        }
                         Ok(())
                     }
                     2 => {
-                        it.err_buf.push_str(data);
+                        if it.live_io {
+                            let _ = std::io::stderr().write_all(data);
+                        } else {
+                            it.err_buf.push_str(&String::from_utf8_lossy(data));
+                        }
                         Ok(())
                     }
                     _ => Err(PhpError::fatal("not writable", 0)),
@@ -8013,9 +8260,23 @@ fn write_resource(it: &mut Interp, c: Option<&Cell>, data: &str) -> Result<(), P
                         return Err(PhpError::fatal("not writable", 0));
                     }
                     let _ = file.seek(std::io::SeekFrom::Start(*pos));
-                    file.write_all(data.as_bytes())
+                    file.write_all(data)
                         .map_err(|e| PhpError::fatal(e.to_string(), 0))?;
                     *pos += data.len() as u64;
+                    Ok(())
+                }
+                PhpResource::Mem { buf, pos, eof, .. } => {
+                    let start = *pos as usize;
+                    if start > buf.len() {
+                        buf.resize(start, 0);
+                    }
+                    let end = (start + data.len()).min(buf.len());
+                    if start < end {
+                        buf[start..end].copy_from_slice(&data[..end - start]);
+                    }
+                    buf.extend_from_slice(&data[end - start..]);
+                    *pos += data.len() as u64;
+                    *eof = false;
                     Ok(())
                 }
                 _ => Err(PhpError::fatal("bad resource", 0)),
@@ -8037,6 +8298,16 @@ fn read_resource(c: Option<&Cell>, n: usize) -> Result<Vec<u8>, PhpError> {
                     let take = avail.min(n);
                     let out = body[*pos as usize..*pos as usize + take].to_vec();
                     *pos += take as u64;
+                    Ok(out)
+                }
+                PhpResource::Mem { buf, pos, eof, .. } => {
+                    let avail = buf.len().saturating_sub(*pos as usize);
+                    let take = avail.min(n);
+                    let out = buf[*pos as usize..*pos as usize + take].to_vec();
+                    *pos += take as u64;
+                    if take < n {
+                        *eof = true;
+                    }
                     Ok(out)
                 }
                 PhpResource::File {
@@ -8088,6 +8359,22 @@ fn read_line_resource(c: Option<&Cell>) -> Result<Vec<u8>, PhpError> {
                             .map(|o| start + o + 1)
                             .unwrap_or(body.len());
                         let out = body[start..nl].to_vec();
+                        *pos = nl as u64;
+                        Ok(out)
+                    }
+                }
+                PhpResource::Mem { buf, pos, eof, .. } => {
+                    let start = *pos as usize;
+                    if start >= buf.len() {
+                        *eof = true;
+                        Ok(Vec::new())
+                    } else {
+                        let nl = buf[start..]
+                            .iter()
+                            .position(|b| *b == b'\n')
+                            .map(|o| start + o + 1)
+                            .unwrap_or(buf.len());
+                        let out = buf[start..nl].to_vec();
                         *pos = nl as u64;
                         Ok(out)
                     }
@@ -8784,6 +9071,42 @@ fn filter_var_one(
     }
 }
 
+/// stat()/fstat() shape: numeric keys 0..=12 followed by the named keys —
+/// dev ino mode nlink uid gid rdev size atime mtime ctime blksize blocks.
+#[cfg(unix)]
+fn stat_array(m: &std::fs::Metadata) -> PhpArray {
+    use std::os::unix::fs::MetadataExt;
+    let vals = [
+        m.dev() as i64,
+        m.ino() as i64,
+        m.mode() as i64,
+        m.nlink() as i64,
+        m.uid() as i64,
+        m.gid() as i64,
+        m.rdev() as i64,
+        m.size() as i64,
+        m.atime(),
+        m.mtime(),
+        m.ctime(),
+        m.blksize() as i64,
+        m.blocks() as i64,
+    ];
+    let mut a = PhpArray::new();
+    for (i, v) in vals.iter().enumerate() {
+        a.set(ArrKey::Int(i as i64), Value::Int(*v));
+    }
+    for (name, v) in [
+        "dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "atime", "mtime", "ctime",
+        "blksize", "blocks",
+    ]
+    .iter()
+    .zip(vals.iter())
+    {
+        a.set(to_key(&Value::str(*name)), Value::Int(*v));
+    }
+    a
+}
+
 fn valid_ipv4(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
     parts.len() == 4
@@ -8952,7 +9275,7 @@ pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
             ("length", "?int"),
             ("replacement", "mixed"),
         ],
-        "array_merge" | "array_replace" | "array_merge_recursive" => {
+        "array_merge" | "array_replace" | "array_merge_recursive" | "array_replace_recursive" => {
             &[("array", "array"), ("arrays", "array")]
         }
         "array_reverse" => &[("array", "array"), ("preserve_keys", "bool")],
@@ -8965,9 +9288,20 @@ pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
         "sprintf" | "printf" | "vsprintf" | "vprintf" => &[("format", "string")],
         "number_format" => &[("num", "float"), ("decimals", "int")],
         "preg_match" | "preg_match_all" => &[("pattern", "string"), ("subject", "string")],
-        "preg_replace" | "preg_filter" | "preg_replace_callback" => &[
+        "preg_replace" | "preg_filter" => &[
             ("pattern", "string|array"),
-            ("replacement", "string|array|callable"),
+            ("replacement", "string|array"),
+            ("subject", "string|array"),
+            ("limit", "int"),
+        ],
+        "preg_replace_callback" => &[
+            ("pattern", "string|array"),
+            ("callback", "callable"),
+            ("subject", "string|array"),
+            ("limit", "int"),
+        ],
+        "preg_replace_callback_array" => &[
+            ("pattern", "array"),
             ("subject", "string|array"),
             ("limit", "int"),
         ],
