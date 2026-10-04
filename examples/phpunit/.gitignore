@@ -1,0 +1,4 @@
+phpunit-src/
+phpunit-run.php
+phpunit-*.phar
+.phpunit.result.cache

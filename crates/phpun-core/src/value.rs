@@ -29,6 +29,9 @@ pub struct PhpArray {
     /// Zend's is_ref: once elements are aliased (`foreach &$v`, `=&`),
     /// writes through a shared (copied) zval must NOT copy-on-write split.
     pub is_ref: bool,
+    /// Internal pointer for current/key/next/prev/reset/end/each — an index
+    /// into `entries` (may sit on a tombstone; live_* helpers skip it).
+    pub iter_pos: usize,
 }
 
 impl Default for PhpArray {
@@ -43,6 +46,7 @@ impl PhpArray {
             entries: Vec::new(),
             next: 0,
             is_ref: false,
+            iter_pos: 0,
         }
     }
 
@@ -124,6 +128,41 @@ impl PhpArray {
         }
     }
 
+    /// First live (non-tombstone) index at or after `i`.
+    fn live_at(&self, i: usize) -> Option<usize> {
+        self.entries[i..]
+            .iter()
+            .position(|(k, _)| !matches!(k, ArrKey::Tomb))
+            .map(|off| i + off)
+    }
+
+    /// Element under the internal pointer (skips tombstones).
+    pub fn ptr_entry(&self) -> Option<&(ArrKey, Cell)> {
+        self.live_at(self.iter_pos).map(|i| &self.entries[i])
+    }
+
+    /// Advance the internal pointer to the next live element.
+    pub fn ptr_advance(&mut self) {
+        if let Some(i) = self.live_at(self.iter_pos) {
+            self.iter_pos = i + 1;
+        } else {
+            self.iter_pos = self.entries.len();
+        }
+    }
+
+    /// Move the internal pointer to the previous live element.
+    pub fn ptr_retreat(&mut self) {
+        let mut i = self.iter_pos;
+        while i > 0 {
+            i -= 1;
+            if !matches!(self.entries[i].0, ArrKey::Tomb) {
+                self.iter_pos = i;
+                return;
+            }
+        }
+        self.iter_pos = self.entries.len();
+    }
+
     /// Live entries only (tombstones skipped).
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &(ArrKey, Cell)> {
         self.entries
@@ -152,6 +191,7 @@ impl Clone for PhpArray {
                 .collect(),
             next: self.next,
             is_ref: false,
+            iter_pos: self.iter_pos,
         }
     }
 }
