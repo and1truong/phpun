@@ -743,9 +743,10 @@ impl<'a> Interp<'a> {
             },
             false,
         );
-        // ArrayObject — SPL stub carrying its flags as class constants;
-        // the ns tests only need `ArrayObject::STD_PROP_LIST` to resolve
-        // (namespaces/ns_035, ns_036, bug42819).
+        // ArrayObject — SPL storage-backed object; methods are
+        // native-dispatched through array_iter_method on the shared
+        // ArrayIter internal (bug36214). Consts still cover
+        // namespaces/ns_035, ns_036, bug42819.
         reg(
             ClassDecl {
                 name: "ArrayObject".into(),
@@ -762,7 +763,24 @@ impl<'a> Interp<'a> {
                 attrs: vec![],
                 traits: vec![],
                 adaptations: vec![],
-                methods: vec![],
+                methods: vec![
+                    stub_method_mix("__construct", &[], &["array", "flags", "iteratorClass"]),
+                    stub_method("append", &["value"]),
+                    stub_method("asort", &["flags"]),
+                    stub_method("count", &[]),
+                    stub_method("exchangeArray", &["array"]),
+                    stub_method("getArrayCopy", &[]),
+                    stub_method("getFlags", &[]),
+                    stub_method("getIterator", &[]),
+                    stub_method("ksort", &["flags"]),
+                    stub_method("natcasesort", &[]),
+                    stub_method("natsort", &[]),
+                    stub_method("offsetExists", &["key"]),
+                    stub_method("offsetGet", &["key"]),
+                    stub_method("offsetSet", &["key", "value"]),
+                    stub_method("offsetUnset", &["key"]),
+                    stub_method("setFlags", &["flags"]),
+                ],
                 props: vec![],
                 consts: vec![
                     crate::ast::ConstDecl {
