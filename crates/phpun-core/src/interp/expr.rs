@@ -1991,7 +1991,14 @@ impl<'a> Interp<'a> {
                     && !o.borrow().props.contains_key(pn)
                 {
                     let arr = self.ao_state(&o).0;
-                    arr.borrow_mut().set(ArrKey::Str(Rc::from(pn)), v.clone());
+                    let k = ArrKey::Str(Rc::from(pn));
+                    // Object-backed: storage IS the prop table — the
+                    // write lands a dynamic prop on the backing object.
+                    if let Some(src) = self.ao_src_obj(&o) {
+                        self.ao_obj_dim_write(&src, &arr, k, v.clone());
+                    } else {
+                        arr.borrow_mut().set(k, v.clone());
+                    }
                     return Ok(v);
                 }
                 if let Some(k) = k {

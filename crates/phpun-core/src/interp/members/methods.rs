@@ -160,8 +160,14 @@ impl<'a> Interp<'a> {
                 Some(v) => Some(self.ao_backing(v, family, "__construct")?),
                 None => None,
             };
+            // Only plain objects become `src` — an spl-array source
+            // shares storage instead (prop-sync would misread it).
             let src_obj = match &first {
-                Some(Value::Object(o)) => Some(o.clone()),
+                Some(Value::Object(o))
+                    if !matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. })) =>
+                {
+                    Some(o.clone())
+                }
                 _ => None,
             };
             // No explicit flags arg → an spl-array source's flags carry
@@ -185,6 +191,7 @@ impl<'a> Interp<'a> {
         // Everything else needs storage — zend lazily creates it on
         // first access (newInstanceWithoutConstructor).
         let (arr, pos, flags) = self.ao_state(obj);
+        self.ao_sync_props(obj, &arr);
         let v = match lname.as_str() {
             "rewind" => {
                 self.ao_set_pos(obj, 0);
@@ -252,12 +259,26 @@ impl<'a> Interp<'a> {
                     return self.fail(e);
                 }
                 let (new, src_flags) = self.ao_backing(&v, family, canonical)?;
+                // The new backing object replaces `src` too — plain-object
+                // input binds prop cells live; array/spl input clears it.
+                let new_src = match &v {
+                    Value::Object(o)
+                        if !matches!(
+                            o.borrow().internal,
+                            Some(ObjectInternal::ArrayIter { .. })
+                        ) =>
+                    {
+                        Some(o.clone())
+                    }
+                    _ => None,
+                };
                 let old = {
                     let mut ob = obj.borrow_mut();
                     match &mut ob.internal {
                         Some(ObjectInternal::ArrayIter {
                             arr: slot,
                             flags: f,
+                            src: sp,
                             ..
                         }) => {
                             // An spl-array source merges its flags in
@@ -265,6 +286,7 @@ impl<'a> Interp<'a> {
                             if let Some(sf) = src_flags {
                                 *f |= sf;
                             }
+                            *sp = new_src;
                             std::mem::replace(slot, new)
                         }
                         _ => unreachable!(),
@@ -318,28 +340,12 @@ impl<'a> Interp<'a> {
                     Some(Value::Null) | None => arr.borrow_mut().push(v),
                     Some(kv) => {
                         let k = to_key(&kv);
-                        // A missing key on an object-backed iterator
-                        // creates a dynamic prop on the backing object
-                        // and binds its cell into storage (both views
-                        // stay in sync) instead of dropping the write.
-                        if arr.borrow().get_cell(&k).is_none() {
-                            if let Some(src) = self.ao_src_obj(obj) {
-                                let pname = match &k {
-                                    ArrKey::Str(s) => s.to_string(),
-                                    ArrKey::Int(i) => i.to_string(),
-                                    ArrKey::Tomb => "0".to_string(),
-                                };
-                                let pc = cell(v);
-                                {
-                                    let mut so = src.borrow_mut();
-                                    if !so.props.contains_key(&pname) {
-                                        so.prop_order.push(pname.clone());
-                                    }
-                                    so.props.insert(pname, pc.clone());
-                                }
-                                arr.borrow_mut().bind_cell(k, pc);
-                                return Ok(Some(Value::Null));
-                            }
+                        // Object-backed storage IS the prop table: a
+                        // dim write drops a fresh zval into the prop
+                        // bucket — even severing a referenced prop.
+                        if let Some(src) = self.ao_src_obj(obj) {
+                            self.ao_obj_dim_write(&src, &arr, k, v);
+                            return Ok(Some(Value::Null));
                         }
                         // zend writes a fresh zval into the bucket: an
                         // &-reference element is severed (the alias
@@ -853,12 +859,73 @@ impl<'a> Interp<'a> {
 
     /// The backing object when storage came from an object input.
     pub(in crate::interp) fn ao_src_obj(
-        &mut self,
+        &self,
         obj: &Rc<RefCell<PhpObject>>,
     ) -> Option<Rc<RefCell<PhpObject>>> {
         match &obj.borrow().internal {
             Some(ObjectInternal::ArrayIter { src, .. }) => src.clone(),
             _ => None,
+        }
+    }
+
+    /// Object-backed dim/prop write: a fresh zval lands on the backing
+    /// object's prop slot (a referenced prop is severed like zend's
+    /// write_dimension) and the new cell binds into storage so both
+    /// views stay in sync.
+    pub(in crate::interp) fn ao_obj_dim_write(
+        &mut self,
+        src: &Rc<RefCell<PhpObject>>,
+        arr: &Rc<RefCell<PhpArray>>,
+        k: ArrKey,
+        v: Value,
+    ) {
+        let pname = match &k {
+            ArrKey::Str(s) => s.to_string(),
+            ArrKey::Int(i) => i.to_string(),
+            ArrKey::Tomb => "0".to_string(),
+        };
+        let pc = cell(v);
+        {
+            let mut so = src.borrow_mut();
+            if !so.props.contains_key(&pname) {
+                so.prop_order.push(pname.clone());
+            }
+            so.props.insert(pname, pc.clone());
+        }
+        arr.borrow_mut().bind_cell(k, pc);
+    }
+
+    /// Object-backed storage mirrors the live prop table (zend keeps
+    /// the object's properties HT as storage): props added on the
+    /// object appear, props unset on the object disappear, and a
+    /// recreated prop rebinds its fresh cell.
+    fn ao_sync_props(&mut self, obj: &Rc<RefCell<PhpObject>>, arr: &Rc<RefCell<PhpArray>>) {
+        let Some(src) = self.ao_src_obj(obj) else {
+            return;
+        };
+        let so = src.borrow();
+        for pname in &so.prop_order {
+            if let Some(pc) = so.props.get(pname) {
+                let k = ArrKey::Str(pname.clone().into());
+                let mut a = arr.borrow_mut();
+                match a.get_cell(&k) {
+                    Some(c) if Rc::ptr_eq(&c, pc) => {}
+                    _ => a.bind_cell(k, pc.clone()),
+                }
+            }
+        }
+        let stale: Vec<ArrKey> = arr
+            .borrow()
+            .entries
+            .iter()
+            .filter_map(|(k, _)| match k {
+                ArrKey::Str(s) if !so.props.contains_key(s.as_ref()) => Some(k.clone()),
+                _ => None,
+            })
+            .collect();
+        drop(so);
+        for k in stale {
+            arr.borrow_mut().unset(&k);
         }
     }
 
@@ -976,6 +1043,8 @@ impl<'a> Interp<'a> {
         mname: &str,
     ) -> Result<(Rc<RefCell<PhpArray>>, Option<i64>), PhpError> {
         match v {
+            // A plain array input is CoW-separated: writes through the
+            // wrapper must not reach the caller's variable.
             Value::Array(a) => Ok((Rc::new(RefCell::new(self.dup_array(&a.borrow()))), None)),
             Value::Object(o) => {
                 self.deprecated(&format!(
@@ -992,22 +1061,32 @@ impl<'a> Interp<'a> {
                     }
                 };
                 if let Some((src, src_flags)) = src {
-                    return Ok((
-                        Rc::new(RefCell::new(self.dup_array(&src.borrow()))),
-                        Some(src_flags),
-                    ));
+                    // An spl-array source shares the storage hash — writes
+                    // through the new wrapper reach the source's storage
+                    // (zend spl_array_get_storage hands the same HT out).
+                    return Ok((src.clone(), Some(src_flags)));
                 }
                 // Objects iterate their prop cells BY REFERENCE —
                 // writes through $v update the prop (typed gate
                 // still applies); deprecated since 8.5
                 // (typed_properties_113/114/115).
                 let mut copy = PhpArray::new();
-                let pairs: Vec<(String, Cell)> = o
-                    .borrow()
-                    .props
-                    .iter()
-                    .map(|(k, c)| (k.clone(), c.clone()))
-                    .collect();
+                // prop_order mirrors zend's properties HT order —
+                // dumping/iterating the storage lists p before q.
+                let pairs: Vec<(String, Cell)> = {
+                    let ob = o.borrow();
+                    let mut seen: Vec<(String, Cell)> = ob
+                        .prop_order
+                        .iter()
+                        .filter_map(|n| ob.props.get(n).map(|c| (n.clone(), c.clone())))
+                        .collect();
+                    for (k, c) in &ob.props {
+                        if !seen.iter().any(|(n, _)| n == k) {
+                            seen.push((k.clone(), c.clone()));
+                        }
+                    }
+                    seen
+                };
                 for (k, c) in pairs {
                     let pn = k.rsplit('\0').next().unwrap_or(&k).to_string();
                     if let Some((pd, dcls)) = self.decl_prop(o, &pn) {

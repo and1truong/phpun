@@ -11,4 +11,6 @@ $ao3 = new ArrayObject;
 $ao3['x'] = 7;
 var_dump($ao3->getArrayCopy());
 $src = new ArrayObject([1,2,3]);
-var_dump(new ArrayObject($src));
+$nx = new ArrayObject($src);
+$nx[0] = 9;
+var_dump($src[0], $nx[1], count($nx));
