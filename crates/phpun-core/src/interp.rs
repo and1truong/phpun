@@ -19764,27 +19764,9 @@ impl<'a> Interp<'a> {
                     None => Ok(Some(Value::Bool(false))),
                 }
             }
-            "getshortname" | "getnamespacename" => {
-                let cn = obj
-                    .borrow()
-                    .props
-                    .get("\0rc\0class")
-                    .map(|c| c.borrow().clone())
-                    .unwrap_or(Value::Null);
-                let cn = self.conv_str(&cn)?.to_string();
-                let (ns, short) = match cn.rsplit('\\').next() {
-                    Some(s) => {
-                        let idx = cn.len() - s.len();
-                        (cn[..idx].trim_end_matches('\\').to_string(), s.to_string())
-                    }
-                    None => (String::new(), cn.clone()),
-                };
-                Ok(Some(Value::str(if lname == "getshortname" {
-                    short
-                } else {
-                    ns
-                })))
-            }
+            // getshortname/getnamespacename are handled by the earlier
+            // combined name-introspection arm (a second arm here would be
+            // unreachable — clippy failure surfaced by the #50 merge).
             "newinstancewithoutconstructor" => {
                 let cn = obj
                     .borrow()
