@@ -260,8 +260,16 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                     vec![("\"function\"".to_string(), Value::str(&fname))]
                 }
                 Some(crate::value::ObjectInternal::ArrayIter { arr, .. }) => {
+                    // The private `storage` prop prints under its
+                    // declaring class — ArrayObject or ArrayIterator
+                    // (bug36214).
+                    let dcl = if it.obj_is_a_str(ob.class.name(), "arrayobject") {
+                        "ArrayObject"
+                    } else {
+                        "ArrayIterator"
+                    };
                     vec![(
-                        "\"storage\":\"ArrayIterator\":private".to_string(),
+                        format!("\"storage\":\"{}\":private", dcl),
                         Value::Array(arr.clone()),
                     )]
                 }

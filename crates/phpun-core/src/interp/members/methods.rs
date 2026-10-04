@@ -5,16 +5,24 @@
 use super::*;
 
 impl<'a> Interp<'a> {
-    /// Native bodies for the ArrayIterator stub. Iteration state lives in
-    /// the `ArrayIter` object internal; unknown methods return None so
-    /// the generic dispatch can report `Call to undefined method`.
-    fn array_iter_method(
+    /// Native bodies for the ArrayIterator/ArrayObject stubs.
+    /// Iteration state lives in the `ArrayIter` object internal;
+    /// unknown methods return None so the generic dispatch can report
+    /// `Call to undefined method`.
+    pub(in crate::interp) fn array_iter_method(
         &mut self,
         obj: &Rc<RefCell<PhpObject>>,
         name: &str,
         args: &CallArgs,
     ) -> Result<Option<Value>, PhpError> {
         let lname = name.to_lowercase();
+        // Declaring class Zend reports in deprecation/ctor messages —
+        // the family base, not a userland subclass.
+        let family = if self.obj_is_a(obj, "arrayobject") {
+            "ArrayObject"
+        } else {
+            "ArrayIterator"
+        };
         let mk_arr = |ob: &mut PhpObject, a: Rc<RefCell<PhpArray>>, flags: i64| {
             ob.internal = Some(ObjectInternal::ArrayIter {
                 arr: a,
@@ -41,9 +49,10 @@ impl<'a> Interp<'a> {
                     // (typed_properties_113/114/115).
                     Some(Value::Object(o)) => {
                         drop(ob);
-                        self.deprecated(
-                            "ArrayIterator::__construct(): Using an object as a backing array for ArrayIterator is deprecated, as it allows violating class constraints and invariants",
-                        )?;
+                        self.deprecated(&format!(
+                            "{}::__construct(): Using an object as a backing array for {} is deprecated, as it allows violating class constraints and invariants",
+                            family, family
+                        ))?;
                         ob = obj.borrow_mut();
                         let mut copy = PhpArray::new();
                         copy.is_ref = true;
@@ -92,6 +101,31 @@ impl<'a> Interp<'a> {
                     _ => Rc::new(RefCell::new(PhpArray::new())),
                 };
                 Ok(Some(mk_arr(&mut ob, a, flags)))
+            }
+            "getiterator" if family == "ArrayObject" => {
+                // IteratorAggregate entry point — shares the storage Rc
+                // so iterator writes land in the object's storage.
+                let (arr, flags) = {
+                    let ob = obj.borrow();
+                    match &ob.internal {
+                        Some(ObjectInternal::ArrayIter { arr, flags, .. }) => (arr.clone(), *flags),
+                        _ => return Ok(None),
+                    }
+                };
+                match self.classes.get("arrayiterator").cloned() {
+                    Some(icls) => {
+                        let it = self.alloc_obj(PhpObject {
+                            class: icls,
+                            props: Default::default(),
+                            prop_order: Vec::new(),
+                            id: 0,
+                            internal: Some(ObjectInternal::ArrayIter { arr, pos: 0, flags }),
+                            unset_props: Default::default(),
+                        });
+                        Ok(Some(Value::Object(it)))
+                    }
+                    None => Ok(None),
+                }
             }
             _ => {
                 // All remaining methods need initialized state.
@@ -150,6 +184,53 @@ impl<'a> Interp<'a> {
                         Value::Null
                     }
                     "count" => Value::Int(arr.borrow().entries.len() as i64),
+                    "append" => {
+                        let v = args
+                            .cells
+                            .first()
+                            .map(|c| c.borrow().clone())
+                            .unwrap_or(Value::Null);
+                        arr.borrow_mut().push(v);
+                        Value::Null
+                    }
+                    "exchangearray" if family == "ArrayObject" => {
+                        // Returns the old storage; installs a fresh copy
+                        // of the input (object inputs bind prop cells
+                        // like the ctor, sans deprecation).
+                        let new = match args.cells.first().map(|c| c.borrow().clone()) {
+                            Some(Value::Array(a)) => {
+                                let mut copy = PhpArray::new();
+                                for (k, c) in &a.borrow().entries {
+                                    copy.set(k.clone(), c.borrow().clone());
+                                }
+                                copy
+                            }
+                            Some(Value::Object(o)) => {
+                                let mut copy = PhpArray::new();
+                                let pairs: Vec<(String, Cell)> = o
+                                    .borrow()
+                                    .props
+                                    .iter()
+                                    .map(|(k, c)| (k.clone(), c.clone()))
+                                    .collect();
+                                for (k, c) in pairs {
+                                    copy.bind_cell(ArrKey::Str(Rc::from(k.as_str())), c);
+                                }
+                                copy
+                            }
+                            _ => PhpArray::new(),
+                        };
+                        let old = {
+                            let mut ob = obj.borrow_mut();
+                            match &mut ob.internal {
+                                Some(ObjectInternal::ArrayIter { arr: slot, .. }) => {
+                                    std::mem::replace(slot, Rc::new(RefCell::new(new)))
+                                }
+                                _ => return Ok(None),
+                            }
+                        };
+                        Value::Array(old)
+                    }
                     "getarraycopy" => Value::Array(arr.clone()),
                     "offsetget" => {
                         let k = args
@@ -389,12 +470,20 @@ impl<'a> Interp<'a> {
         // spl_method however the call resolved — direct, parent::,
         // or late-bound — so subclass PHP methods stay authoritative
         // while inherited engine behavior still fires.
-        if m.decl.body.is_empty()
-            && m.decl.line == 0
-            && self.is_a_str(obj.borrow().class.name(), "splfileinfo")
-        {
-            if let Some(v) = self.spl_method(&obj, &m.decl.name, &args)? {
-                return Ok(v);
+        if m.decl.body.is_empty() && m.decl.line == 0 {
+            let cn = obj.borrow().class.name().to_string();
+            if self.is_a_str(&cn, "splfileinfo") {
+                if let Some(v) = self.spl_method(&obj, &m.decl.name, &args)? {
+                    return Ok(v);
+                }
+            }
+            // Same for the ArrayIterator/ArrayObject storage family —
+            // subclass methods that inherit the stubs still hit the
+            // native offset*/iteration behavior (bug36214).
+            if self.is_a_str(&cn, "arrayiterator") || self.is_a_str(&cn, "arrayobject") {
+                if let Some(v) = self.array_iter_method(&obj, &m.decl.name, &args)? {
+                    return Ok(v);
+                }
             }
         }
         let called = obj.borrow().class.clone();
@@ -836,8 +925,11 @@ impl<'a> Interp<'a> {
                 _ => {}
             }
         }
-        // ArrayIterator: native iteration state on the object internal.
-        if cls.name().eq_ignore_ascii_case("arrayiterator") {
+        // ArrayIterator / ArrayObject: native storage state on the
+        // object internal.
+        if cls.name().eq_ignore_ascii_case("arrayiterator")
+            || cls.name().eq_ignore_ascii_case("arrayobject")
+        {
             if let Some(v) = self.array_iter_method(&obj, name, &args)? {
                 return Ok(v);
             }

@@ -612,12 +612,20 @@ impl<'a> Interp<'a> {
                 // Fully-qualified dynamic names carry a leading `\`
                 // (namespaces/ns_032).
                 let name = crate::value::lossy(s).trim_start_matches('\\').to_string();
-                // "Class::method" string callables
+                // "Class::method" string callables — self/static/parent
+                // bind to the calling scope (bug45186).
                 if let Some((cls, m)) = name.split_once("::") {
-                    if let Some(c) = self.resolve_class(cls) {
-                        let cls = self.classes.get(&c.to_lowercase()).cloned();
-                        if let Some(cls) = cls {
-                            return self.static_invoke_vis(cls, m, args, None, true);
+                    match self.callable_class(cls) {
+                        Ok(cls) => return self.static_invoke_vis(cls, m, args, None, true),
+                        Err(detail) => {
+                            if let Some(c) = self.resolve_class(cls) {
+                                if let Some(cls) = self.classes.get(&c.to_lowercase()).cloned() {
+                                    return self.static_invoke_vis(cls, m, args, None, true);
+                                }
+                            }
+                            let e = self.exception("TypeError", &detail);
+                            let te = self.throw(e);
+                            return self.fail(te);
                         }
                     }
                 }
@@ -657,18 +665,25 @@ impl<'a> Interp<'a> {
                             }
                             Value::Object(o) => self.method_invoke_vis(o.clone(), &mname, args),
                             Value::Str(cn) => {
-                                let cls = self
-                                    .resolve_class(&crate::value::lossy(&cn))
-                                    .and_then(|c| self.classes.get(&c.to_lowercase()).cloned());
-                                match cls {
-                                    Some(cls) => {
+                                // ['Cls','m'] — self/static/parent bind
+                                // to the calling scope (bug45186).
+                                match self.callable_class(&crate::value::lossy(&cn)) {
+                                    Ok(cls) => {
                                         self.static_invoke_vis(cls, &mname, args, None, true)
                                     }
-                                    None => self.fail(PhpError::uncaught(
-                                        "Error",
-                                        format!("Class \"{}\" not found", crate::value::lossy(&cn)),
-                                        0,
-                                    )),
+                                    Err(detail) => {
+                                        let cls =
+                                            self.resolve_class(&crate::value::lossy(&cn)).and_then(
+                                                |c| self.classes.get(&c.to_lowercase()).cloned(),
+                                            );
+                                        if let Some(cls) = cls {
+                                            return self
+                                                .static_invoke_vis(cls, &mname, args, None, true);
+                                        }
+                                        let e = self.exception("TypeError", &detail);
+                                        let te = self.throw(e);
+                                        self.fail(te)
+                                    }
                                 }
                             }
                             _ => self.fail(PhpError::fatal("invalid callable array", 0)),
@@ -2624,6 +2639,82 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Class part of a callable (`Cls::m`, `['Cls','m']`): 'self' /
+    /// 'static' / 'parent' bind to the calling scope like Zend's
+    /// zend_is_callable resolution (bug45186). Err carries the failure
+    /// detail used after `must be a valid callback`.
+    pub(in crate::interp) fn callable_class(&mut self, cn: &str) -> Result<Rc<PhpClass>, String> {
+        let raw = cn.trim_start_matches('\\');
+        let lw = raw.to_lowercase();
+        if matches!(lw.as_str(), "self" | "static" | "parent") {
+            let r = self.resolve_class_name(&lw);
+            if r.to_lowercase() == lw {
+                // No binding — 'parent' in a parentless scope reports
+                // differently from missing scope entirely.
+                let detail = if lw == "parent" && self.caller_scope_name().is_some() {
+                    "cannot access \"parent\" when current class scope has no parent".to_string()
+                } else {
+                    format!("cannot access \"{}\" when no class scope is active", lw)
+                };
+                return Err(detail);
+            }
+            return match self.classes.get(&r.to_lowercase()).cloned() {
+                Some(c) => Ok(c),
+                None => Err(format!("class \"{}\" not found", r)),
+            };
+        }
+        match self.classes.get(&lw).cloned() {
+            Some(c) => Ok(c),
+            None => Err(format!("class \"{}\" not found", raw)),
+        }
+    }
+
+    /// zend_is_callable's method leg once the class resolved: statics
+    /// always qualify, a non-static method or __call qualifies when
+    /// the calling frame's $this is an instance (object-context
+    /// forwarding — bug45186), otherwise __callStatic trampolines.
+    fn class_method_callable(&mut self, c: &Rc<PhpClass>, mn: &str) -> bool {
+        let this_bound = self
+            .stack
+            .last()
+            .and_then(|f| f.this_obj.clone())
+            .is_some_and(|o| {
+                let n = o.borrow().class.name().to_string();
+                self.is_a_str(&n, c.name())
+            });
+        match self.find_method_in(c, mn) {
+            Some((mm, _)) => mm.is_static || this_bound,
+            None => {
+                if this_bound {
+                    self.find_method_in(c, "__call").is_some()
+                } else {
+                    self.find_method_in(c, "__callstatic").is_some()
+                }
+            }
+        }
+    }
+
+    /// Deprecated-callables notice for 'self'/'parent'/'static' class
+    /// parts — fires once the keyword resolves (even when the method
+    /// leg then fails, per zend_is_callable_check_func).
+    fn deprecate_relative_callable(&mut self, cn: &str) {
+        let lw = cn.trim_start_matches('\\').to_lowercase();
+        if matches!(lw.as_str(), "self" | "static" | "parent") {
+            let _ = self.deprecated(&format!("Use of \"{}\" in callables is deprecated", lw));
+        }
+    }
+
+    /// Shared class+method check for `'Cls::m'` and `['Cls','m']`.
+    fn callable_pair_ok(&mut self, cn: &str, mn: &str) -> bool {
+        match self.callable_class(cn) {
+            Ok(c) => {
+                self.deprecate_relative_callable(cn);
+                self.class_method_callable(&c, mn)
+            }
+            Err(_) => false,
+        }
+    }
+
     pub fn is_callable_value(&mut self, v: &Value) -> bool {
         match v {
             Value::Callable(_) => true,
@@ -2638,16 +2729,7 @@ impl<'a> Interp<'a> {
                 let Some((cn, mn)) = s.split_once("::") else {
                     return false;
                 };
-                let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() else {
-                    return false;
-                };
-                // "Class::method" strings only call statics
-                // (callable_001) — or anything when __callStatic
-                // trampolines them.
-                self.find_method_in(&c, mn)
-                    .map(|(mm, _)| mm.is_static)
-                    .unwrap_or(false)
-                    || self.find_method_in(&c, "__callstatic").is_some()
+                self.callable_pair_ok(cn, mn)
             }
             Value::Object(o) => {
                 let cn = o.borrow().class.decl.name.clone();
@@ -2667,33 +2749,18 @@ impl<'a> Interp<'a> {
                     return false;
                 };
                 let mn = String::from_utf8_lossy(mn).to_string();
-                let (cn, need_static) = match &first {
-                    Value::Str(cn) => (String::from_utf8_lossy(cn).to_string(), true),
-                    Value::Callable(_) => {
-                        return mn.eq_ignore_ascii_case("__invoke");
+                match &first {
+                    Value::Str(cn) => self.callable_pair_ok(&String::from_utf8_lossy(cn), &mn),
+                    Value::Callable(_) => mn.eq_ignore_ascii_case("__invoke"),
+                    Value::Object(o) => {
+                        let c = o.borrow().class.clone();
+                        // [obj, m] calls any method — __call trampolines
+                        // a miss (callable_001).
+                        self.find_method_in(&c, &mn).is_some()
+                            || self.find_method_in(&c, "__call").is_some()
                     }
-                    Value::Object(o) => (o.borrow().class.decl.name.clone(), false),
-                    _ => return false,
-                };
-                let Some(c) = self.classes.get(&cn.to_lowercase()).cloned() else {
-                    return false;
-                };
-                // [class-string, method] only calls statics; [obj, m]
-                // calls any (callable_001). __call/__callStatic make
-                // any name callable (zend_is_callable's trampoline).
-                self.find_method_in(&c, &mn)
-                    .map(|(mm, _)| mm.is_static || !need_static)
-                    .unwrap_or(false)
-                    || self
-                        .find_method_in(
-                            &c,
-                            if need_static {
-                                "__callstatic"
-                            } else {
-                                "__call"
-                            },
-                        )
-                        .is_some()
+                    _ => false,
+                }
             }
             _ => false,
         }
@@ -2745,9 +2812,36 @@ impl<'a> Interp<'a> {
         })
     }
 
+    /// Failure detail for a class+method callable pair once validation
+    /// already failed — scopes ('self' no-scope vs no-parent), class
+    /// presence, then the method leg (bug45186).
+    fn callable_pair_detail(&mut self, cn: &str, mn: &str) -> String {
+        match self.callable_class(cn) {
+            Err(d) => d,
+            Ok(c) => {
+                let canon = c.name().to_string();
+                let this_bound = self
+                    .stack
+                    .last()
+                    .and_then(|f| f.this_obj.clone())
+                    .is_some_and(|o| {
+                        let n = o.borrow().class.name().to_string();
+                        self.is_a_str(&n, &canon)
+                    });
+                match self.find_method_in(&c, mn) {
+                    Some((mm, _)) if !mm.is_static && !this_bound => format!(
+                        "non-static method {}::{}() cannot be called statically",
+                        canon, mn
+                    ),
+                    _ => format!("class {} does not have a method \"{}\"", canon, mn),
+                }
+            }
+        }
+    }
+
     /// Zend's callback-validation error detail for internal functions
     /// (the part after `must be a valid callback`/`or null,`).
-    pub(in crate::interp) fn zpp_callback_detail(&mut self, v: &Value) -> String {
+    pub fn zpp_callback_detail(&mut self, v: &Value) -> String {
         match v {
             Value::Array(a) => {
                 let a = a.borrow();
@@ -2765,11 +2859,9 @@ impl<'a> Interp<'a> {
                         };
                         let m = String::from_utf8_lossy(&m).to_string();
                         match c0 {
-                            Value::Str(cn) => format!(
-                                "class {} does not have a method \"{}\"",
-                                String::from_utf8_lossy(&cn),
-                                m
-                            ),
+                            Value::Str(cn) => {
+                                self.callable_pair_detail(&String::from_utf8_lossy(&cn), &m)
+                            }
                             Value::Object(o) => format!(
                                 "class {} does not have a method \"{}\"",
                                 o.borrow().class.name(),
@@ -2780,10 +2872,16 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
-            Value::Str(s) => format!(
-                "function \"{}\" not found or invalid function name",
-                String::from_utf8_lossy(s)
-            ),
+            Value::Str(s) => {
+                let s = String::from_utf8_lossy(s).to_string();
+                match s.split_once("::") {
+                    // "Cls::m" strings fail on the class+method ladder
+                    // like the array form (bug45186_2's
+                    // `class bar does not have a method "www"`).
+                    Some((cn, mn)) => self.callable_pair_detail(cn, mn),
+                    None => format!("function \"{}\" not found or invalid function name", s),
+                }
+            }
             _ => "no array or string given".into(),
         }
     }
@@ -3489,8 +3587,14 @@ impl<'a> Interp<'a> {
         // with the stub decl directly.
         if decl.body.is_empty() && decl.line == 0 {
             if let Some(o) = &this_obj {
-                if self.is_a_str(o.borrow().class.name(), "splfileinfo") {
+                let cn = o.borrow().class.name().to_string();
+                if self.is_a_str(&cn, "splfileinfo") {
                     if let Some(v) = self.spl_method(o, &decl.name, &args)? {
+                        return Ok(v);
+                    }
+                }
+                if self.is_a_str(&cn, "arrayiterator") || self.is_a_str(&cn, "arrayobject") {
+                    if let Some(v) = self.array_iter_method(o, &decl.name, &args)? {
                         return Ok(v);
                     }
                 }

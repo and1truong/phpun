@@ -92,6 +92,19 @@ pub(crate) fn dispatch(
         | "forward_static_call"
         | "forward_static_call_array" => {
             let cb = arg(args, 0);
+            // ZPP `f` flag: the callback validates eagerly — an
+            // invalid one throws TypeError naming the arg before any
+            // side effects (bug45186's `cannot access "self"`).
+            if !it.is_callable_value(&cb) {
+                return err(
+                    "TypeError",
+                    format!(
+                        "{}(): Argument #1 ($callback) must be a valid callback, {}",
+                        name,
+                        it.zpp_callback_detail(&cb)
+                    ),
+                );
+            }
             // `*_array` unpacks the args array: string keys become named
             // args (a later int key is the positional-after-named Error).
             if name.ends_with("_array") {
