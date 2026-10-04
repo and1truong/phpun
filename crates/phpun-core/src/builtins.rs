@@ -27,7 +27,7 @@ mod pcre;
 mod spl;
 mod string;
 mod url;
-mod var;
+pub(crate) mod var;
 
 pub(crate) use url::urldecode;
 

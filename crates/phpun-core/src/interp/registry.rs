@@ -203,6 +203,14 @@ impl<'a> Interp<'a> {
         }
         reg(ss, true);
         reg(iface("SeekableIterator", &["Iterator"], &["seek"]), true);
+        reg(
+            iface(
+                "RecursiveIterator",
+                &["Iterator"],
+                &["hasChildren", "getChildren"],
+            ),
+            true,
+        );
         // ArrayIterator — SPL iterator over an array; methods are
         // native-dispatched (array_iter_method) on the ArrayIter
         // internal. Named-arg params carry the Zend stub names.
@@ -275,6 +283,7 @@ impl<'a> Interp<'a> {
                     "SeekableIterator".into(),
                     "ArrayAccess".into(),
                     "Countable".into(),
+                    "Serializable".into(),
                 ],
                 attrs: vec![],
                 traits: vec![],
@@ -291,14 +300,46 @@ impl<'a> Interp<'a> {
                     stub_method("offsetExists", &["key"]),
                     stub_method("offsetSet", &["key", "value"]),
                     stub_method("offsetUnset", &["key"]),
+                    stub_method("append", &["value"]),
                     stub_method("getArrayCopy", &[]),
                     stub_method("seek", &["offset"]),
                     stub_method("getFlags", &[]),
                     stub_method("setFlags", &["flags"]),
                     stub_method("asort", &["flags"]),
                     stub_method("ksort", &["flags"]),
+                    stub_method("uasort", &["callback"]),
+                    stub_method("uksort", &["callback"]),
                     stub_method("natcasesort", &[]),
                     stub_method("natsort", &[]),
+                    stub_method("serialize", &[]),
+                    stub_method("unserialize", &["data"]),
+                    stub_method("__serialize", &[]),
+                    stub_method("__unserialize", &["data"]),
+                    stub_method("__debugInfo", &[]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            false,
+        );
+        // RecursiveArrayIterator — ArrayIterator + RecursiveIterator;
+        // hasChildren/getChildren native-dispatch on ArrayIter too.
+        reg(
+            ClassDecl {
+                name: "RecursiveArrayIterator".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: Some("ArrayIterator".into()),
+                implements: vec!["RecursiveIterator".into()],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    stub_method("hasChildren", &[]),
+                    stub_method("getChildren", &[]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -759,6 +800,7 @@ impl<'a> Interp<'a> {
                     "IteratorAggregate".into(),
                     "ArrayAccess".into(),
                     "Countable".into(),
+                    "Serializable".into(),
                 ],
                 attrs: vec![],
                 traits: vec![],
@@ -780,6 +822,15 @@ impl<'a> Interp<'a> {
                     stub_method("offsetSet", &["key", "value"]),
                     stub_method("offsetUnset", &["key"]),
                     stub_method("setFlags", &["flags"]),
+                    stub_method("uasort", &["callback"]),
+                    stub_method("uksort", &["callback"]),
+                    stub_method("serialize", &[]),
+                    stub_method("unserialize", &["data"]),
+                    stub_method("__serialize", &[]),
+                    stub_method("__unserialize", &["data"]),
+                    stub_method("__debugInfo", &[]),
+                    stub_method("getIteratorClass", &[]),
+                    stub_method("setIteratorClass", &["iteratorClass"]),
                 ],
                 props: vec![],
                 consts: vec![

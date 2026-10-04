@@ -1252,6 +1252,74 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `error_reporting` ini value → error_level mask: integer, or an
+    /// E_* constant expression (`E_ALL & ~E_DEPRECATED`).
+    pub fn ini_error_level(&self) -> i64 {
+        let Some(raw) = self.ini.get("error_reporting") else {
+            return self.error_level;
+        };
+        fn cst(name: &str) -> Option<i64> {
+            Some(match name.to_ascii_uppercase().as_str() {
+                "E_ERROR" => 1,
+                "E_WARNING" => 2,
+                "E_PARSE" => 4,
+                "E_NOTICE" => 8,
+                "E_CORE_ERROR" => 16,
+                "E_CORE_WARNING" => 32,
+                "E_COMPILE_ERROR" => 64,
+                "E_COMPILE_WARNING" => 128,
+                "E_USER_ERROR" => 256,
+                "E_USER_WARNING" => 512,
+                "E_USER_NOTICE" => 1024,
+                "E_STRICT" => 2048,
+                "E_RECOVERABLE_ERROR" => 4096,
+                "E_DEPRECATED" => 8192,
+                "E_USER_DEPRECATED" => 16384,
+                "E_ALL" => 32767,
+                _ => return None,
+            })
+        }
+        // Tiny ini-expression evaluator: ~ & | with literals and E_*.
+        fn eval(s: &str) -> Option<i64> {
+            let s = s.trim();
+            if let Ok(n) = s.parse::<i64>() {
+                return Some(n);
+            }
+            // split on the lowest-precedence op not inside parens
+            for (ops, f) in [
+                ('|', |a: i64, b: i64| a | b),
+                ('^', |a: i64, b: i64| a ^ b),
+                ('&', |a: i64, b: i64| a & b),
+            ] as [(char, fn(i64, i64) -> i64); 3]
+            {
+                let mut depth = 0i32;
+                for (i, ch) in s.char_indices().rev() {
+                    match ch {
+                        ')' => depth += 1,
+                        '(' => depth -= 1,
+                        _ if ch == ops && depth == 0 => {
+                            let (l, r) = s.split_at(i);
+                            return Some(f(eval(l)?, eval(&r[1..])?));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let t = s.trim();
+            if let Some(inner) = t.strip_prefix('~') {
+                return Some(!eval(inner)?);
+            }
+            if let Some(inner) = t.strip_prefix('!') {
+                return Some((eval(inner)? == 0) as i64);
+            }
+            if t.starts_with('(') && t.ends_with(')') {
+                return eval(&t[1..t.len() - 1]);
+            }
+            cst(t)
+        }
+        eval(raw).unwrap_or(self.error_level)
+    }
+
     /// phpun serve: replace a request superglobal ($_GET/$_POST/...).
     pub fn set_superglobal(&mut self, name: &str, arr: PhpArray) {
         self.globals.vars.insert(
@@ -1274,6 +1342,12 @@ impl<'a> Interp<'a> {
     }
 
     pub fn run_source(&mut self, src: &str) -> RunResult {
+        // A `-d error_reporting=` ini applies at startup like Zend's
+        // ini handler (the PHPT harness sets it per-test).
+        if self.ini.contains_key("error_reporting") {
+            let lv = self.ini_error_level();
+            self.error_level = lv;
+        }
         match parser::parse_source(src, self.ini_on("short_open_tag")) {
             Ok(stmts) => self.run(&stmts),
             Err(e) => {

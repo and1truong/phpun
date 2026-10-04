@@ -1008,6 +1008,14 @@ pub enum ObjectInternal {
         arr: Rc<RefCell<PhpArray>>,
         pos: usize,
         flags: i64,
+        /// ArrayObject's `iteratorClass` ctor arg / setIteratorClass —
+        /// a validated ArrayIterator-derived class name getIterator()
+        /// instantiates; None = "ArrayIterator".
+        iterator_class: Option<String>,
+        /// The backing OBJECT when storage came from an object input —
+        /// zend serializes it as `__serialize()` slot 1 instead of the
+        /// storage hash.
+        src: Option<Rc<RefCell<PhpObject>>>,
     },
     /// ReflectionAttribute payload: the attribute's name, unevaluated arg
     /// Exprs, and the TARGET_* bit of the declaration it was read from.

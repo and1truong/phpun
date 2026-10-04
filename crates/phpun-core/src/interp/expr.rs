@@ -824,6 +824,18 @@ impl<'a> Interp<'a> {
                         None => true,
                     } && !declared_live;
                     if missing {
+                        // ARRAY_AS_PROPS: undeclared props resolve
+                        // against storage — a non-null value ⇒ set.
+                        if self.aap_active(o) {
+                            let arr = self.ao_state(o).0;
+                            let v = arr.borrow().get(&ArrKey::Str(Rc::from(pn.as_str())));
+                            return match v {
+                                Some(v) if !matches!(v, Value::Null) => {
+                                    Ok(Some(if mode == 0 { Value::Bool(true) } else { v }))
+                                }
+                                _ => Ok(None),
+                            };
+                        }
                         if self.find_method_in(&cls, "__isset").is_some() {
                             let gkey = (Rc::as_ptr(o) as usize, 2u8, pn.clone());
                             if self.magic_guards.insert(gkey.clone()) {
@@ -1942,6 +1954,18 @@ impl<'a> Interp<'a> {
                     Some(k) if self.prop_visible(&cls, pn) => Some(k),
                     _ => None,
                 };
+                // ARRAY_AS_PROPS: undeclared prop writes go into the
+                // storage hash — spl write_property bypasses __set and
+                // the prop table for names std doesn't know.
+                if k.is_none()
+                    && self.aap_active(&o)
+                    && self.decl_prop(&o, pn).is_none()
+                    && !o.borrow().props.contains_key(pn)
+                {
+                    let arr = self.ao_state(&o).0;
+                    arr.borrow_mut().set(ArrKey::Str(Rc::from(pn)), v.clone());
+                    return Ok(v);
+                }
                 if let Some(k) = k {
                     let mut ob = o.borrow_mut();
                     // Write into the existing slot — a `&`-bound
@@ -2655,6 +2679,69 @@ impl<'a> Interp<'a> {
             Some(ie) => Some(self.eval(ie)?),
             None => None,
         };
+        // Nested-dim unset on an spl array-object — `unset($o[k][j])`:
+        // intermediate levels read live storage elements (zend's
+        // indirect modification); a missing level reports the
+        // "Indirect modification of overloaded element" notice instead
+        // of an undefined-key warning (bug66127).
+        if let Expr::Index { .. } = e {
+            let mut idxs: Vec<Option<&Expr>> = Vec::new();
+            let mut cur = e;
+            while let Expr::Index { e: b, i: ix } = cur {
+                idxs.push(ix.as_deref());
+                cur = b;
+            }
+            if let Ok(Value::Object(o)) = self.eval(cur) {
+                let ao = match &o.borrow().internal {
+                    Some(ObjectInternal::ArrayIter { arr, .. }) => Some(arr.clone()),
+                    _ => None,
+                };
+                if let Some(arr) = ao {
+                    let mut cur_arr = arr;
+                    let mut ok = true;
+                    for ix in idxs.iter().rev() {
+                        let kv = match ix {
+                            Some(ie) => self.eval(ie)?,
+                            None => Value::Null,
+                        };
+                        let next = match cur_arr.borrow().get_cell(&to_key(&kv)) {
+                            Some(cc) => match &*cc.borrow() {
+                                Value::Array(na) => Some(na.clone()),
+                                Value::Object(oo) => match &oo.borrow().internal {
+                                    Some(ObjectInternal::ArrayIter { arr: na, .. }) => {
+                                        Some(na.clone())
+                                    }
+                                    _ => None,
+                                },
+                                _ => None,
+                            },
+                            None => None,
+                        };
+                        match next {
+                            Some(na) => cur_arr = na,
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        if let Some(k) = &key {
+                            cur_arr.borrow_mut().unset(&to_key(k));
+                        }
+                        return Ok(());
+                    }
+                    if self.silence == 0 {
+                        let cn = o.borrow().class.name().to_string();
+                        self.notice(&format!(
+                            "Indirect modification of overloaded element of {} has no effect",
+                            cn
+                        ))?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
         // ArrayAccess object: `unset($o[k])` -> offsetUnset.
         if let Ok(Value::Object(o)) = self.eval(e) {
             if self.obj_is_a(&o, "ArrayAccess") {

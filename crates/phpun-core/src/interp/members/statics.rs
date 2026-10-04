@@ -684,7 +684,7 @@ impl<'a> Interp<'a> {
             }
             return self.fail(PhpError::uncaught(
                 "Error",
-                format!("Undefined constant {}", name),
+                format!("Undefined constant {}::{}", cname, name),
                 0,
             ));
         }
@@ -753,7 +753,7 @@ impl<'a> Interp<'a> {
         }
         self.fail(PhpError::uncaught(
             "Error",
-            format!("Undefined constant {}", name),
+            format!("Undefined constant {}::{}", cname, name),
             0,
         ))
     }

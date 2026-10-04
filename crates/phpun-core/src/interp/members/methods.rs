@@ -4,6 +4,9 @@
 
 use super::*;
 
+/// Parsed legacy spl `serialize()` payload: (flags, storage, props).
+type AoUnserData = (i64, Rc<RefCell<PhpArray>>, Rc<RefCell<PhpArray>>);
+
 impl<'a> Interp<'a> {
     /// Native bodies for the ArrayIterator/ArrayObject stubs.
     /// Iteration state lives in the `ArrayIter` object internal;
@@ -15,314 +18,1004 @@ impl<'a> Interp<'a> {
         name: &str,
         args: &CallArgs,
     ) -> Result<Option<Value>, PhpError> {
+        // Internal calls still get a backtrace frame — zend renders
+        // `ArrayObject->unserialize('O:11:"ArrayObje...')` in uncaught
+        // traces (arg repr truncates at 15 chars via trace_arg).
+        self.call_trace.push(TraceFrame {
+            file: self.diag_file(),
+            line: self.cur_line as u32,
+            function: name.to_string(),
+            class: Some(obj.borrow().class.name().to_string()),
+            ty: "->".into(),
+            args: args.cells.clone(),
+            named_args: args
+                .named
+                .iter()
+                .map(|(n, c, ..)| (n.clone(), c.clone()))
+                .collect(),
+            internal: true,
+        });
+        let r = self.array_iter_body(obj, name, args);
+        self.call_trace.pop();
+        r
+    }
+
+    fn array_iter_body(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        name: &str,
+        args: &CallArgs,
+    ) -> Result<Option<Value>, PhpError> {
         let lname = name.to_lowercase();
         // Declaring class Zend reports in deprecation/ctor messages —
         // the family base, not a userland subclass.
-        let family = if self.obj_is_a(obj, "arrayobject") {
+        let is_ao = self.obj_is_a(obj, "arrayobject");
+        let family = if is_ao {
             "ArrayObject"
         } else {
             "ArrayIterator"
         };
-        let mk_arr = |ob: &mut PhpObject, a: Rc<RefCell<PhpArray>>, flags: i64| {
+        let canonical = match lname.as_str() {
+            "exchangearray" => "exchangeArray",
+            "getarraycopy" => "getArrayCopy",
+            "getflags" => "getFlags",
+            "setflags" => "setFlags",
+            "getiterator" => "getIterator",
+            "getiteratorclass" => "getIteratorClass",
+            "setiteratorclass" => "setIteratorClass",
+            "offsetget" => "offsetGet",
+            "offsetexists" => "offsetExists",
+            "offsetset" => "offsetSet",
+            "offsetunset" => "offsetUnset",
+            "__serialize" => "__serialize",
+            "__unserialize" => "__unserialize",
+            "__debuginfo" => "__debugInfo",
+            "haschildren" => "hasChildren",
+            "getchildren" => "getChildren",
+            other => other,
+        };
+        // ArrayObject-only methods stay undefined on ArrayIterator.
+        if !is_ao
+            && matches!(
+                lname.as_str(),
+                "getiterator" | "exchangearray" | "getiteratorclass" | "setiteratorclass"
+            )
+        {
+            return Ok(None);
+        }
+        // (min, max) arg counts mirroring the Zend stubs.
+        let (amin, amax): (usize, usize) = match lname.as_str() {
+            "__construct" if is_ao => (0, 3),
+            "__construct" => (0, 2),
+            "offsetset" => (2, 2),
+            "offsetget" | "offsetexists" | "offsetunset" | "append" | "seek" | "setflags"
+            | "unserialize" | "__unserialize" | "exchangearray" | "uasort" | "uksort"
+            | "setiteratorclass" => (1, 1),
+            "asort" | "ksort" => (0, 1),
+            "rewind" | "valid" | "current" | "key" | "next" | "count" | "getarraycopy"
+            | "getflags" | "natsort" | "natcasesort" | "serialize" | "__serialize"
+            | "getiterator" | "getiteratorclass" | "__debuginfo" | "haschildren"
+            | "getchildren" => (0, 0),
+            _ => return Ok(None),
+        };
+        let given = args.cells.len();
+        if given < amin || given > amax {
+            let (word, n) = if amin == amax {
+                ("exactly", amin)
+            } else if given > amax {
+                ("at most", amax)
+            } else {
+                ("at least", amin)
+            };
+            let e = self.spl_throw(
+                "ArgumentCountError",
+                format!(
+                    "{}::{}() expects {} {} argument{}, {} given",
+                    family,
+                    canonical,
+                    word,
+                    n,
+                    if n == 1 { "" } else { "s" },
+                    given
+                ),
+            );
+            return self.fail(e);
+        }
+        if lname == "__construct" {
+            // zpp order: arg1 type, arg2 int, arg3 iterator class —
+            // then the storage assignment (object deprecation inside).
+            let first = args.cells.first().map(|c| c.borrow().clone());
+            if let Some(v) = &first {
+                if !matches!(v, Value::Array(_) | Value::Object(_)) {
+                    let tn = self.zval_type_name(v);
+                    let e = self.spl_throw(
+                        "TypeError",
+                        format!(
+                            "{}::{}(): Argument #1 ($array) must be of type array, {} given",
+                            family, canonical, tn
+                        ),
+                    );
+                    return self.fail(e);
+                }
+            }
+            let mut flags = 0i64;
+            if let Some(f) = args.cells.get(1) {
+                let fv = f.borrow().clone();
+                match self.spl_int_arg(&fv, family, canonical, 2, "flags") {
+                    Ok(i) => flags = i,
+                    Err(e) => return self.fail(e),
+                }
+            }
+            let mut iterator_class = None;
+            if is_ao {
+                if let Some(ic) = args.cells.get(2) {
+                    let icv = ic.borrow().clone();
+                    match self.ao_iterator_class(&icv, family, canonical, 3) {
+                        Ok(n) => iterator_class = Some(n),
+                        Err(e) => return self.fail(e),
+                    }
+                }
+            }
+            let backing = match &first {
+                Some(v) => Some(self.ao_backing(v, family, "__construct")?),
+                None => None,
+            };
+            let src_obj = match &first {
+                Some(Value::Object(o)) => Some(o.clone()),
+                _ => None,
+            };
+            // No explicit flags arg → an spl-array source's flags carry
+            // over (zend spl_array_object_new_ex); array/plain inputs
+            // default to 0.
+            if args.cells.len() < 2 {
+                if let Some((_, Some(sf))) = &backing {
+                    flags = *sf;
+                }
+            }
+            let mut ob = obj.borrow_mut();
             ob.internal = Some(ObjectInternal::ArrayIter {
-                arr: a,
+                arr: backing.map(|(a, _)| a).unwrap_or_default(),
                 pos: 0,
                 flags,
+                iterator_class,
+                src: src_obj,
             });
-            Value::Null
-        };
-        match lname.as_str() {
-            "__construct" => {
-                let flags = args.cells.get(1).map(|c| c.borrow().to_int()).unwrap_or(0);
-                let mut ob = obj.borrow_mut();
-                let a = match args.cells.first().map(|c| c.borrow().clone()) {
-                    Some(Value::Array(a)) => {
-                        let mut copy = PhpArray::new();
-                        for (k, c) in &a.borrow().entries {
-                            copy.set(k.clone(), c.borrow().clone());
-                        }
-                        Rc::new(RefCell::new(copy))
-                    }
-                    // Objects iterate their prop cells BY REFERENCE —
-                    // writes through $v update the prop (typed gate
-                    // still applies); deprecated since 8.5
-                    // (typed_properties_113/114/115).
-                    Some(Value::Object(o)) => {
-                        drop(ob);
-                        self.deprecated(&format!(
-                            "{}::__construct(): Using an object as a backing array for {} is deprecated, as it allows violating class constraints and invariants",
-                            family, family
-                        ))?;
-                        ob = obj.borrow_mut();
-                        let mut copy = PhpArray::new();
-                        copy.is_ref = true;
-                        let pairs: Vec<(String, Cell)> = o
-                            .borrow()
-                            .props
-                            .iter()
-                            .map(|(k, c)| (k.clone(), c.clone()))
-                            .collect();
-                        for (k, c) in pairs {
-                            let pn = k.rsplit('\0').next().unwrap_or(&k).to_string();
-                            if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
-                                let p = Rc::as_ptr(&c) as usize;
-                                if let Some(tys) = &pd.ty {
-                                    // Writes through the shared cell
-                                    // still hit the typed gate.
-                                    self.typed_slots.insert(
-                                        p,
-                                        (
-                                            c.clone(),
-                                            tys.clone(),
-                                            dcls.name().to_string(),
-                                            pn.clone(),
-                                        ),
-                                    );
-                                    self.slot_anchor
-                                        .insert(p, SlotAnchor::Obj(Rc::downgrade(&o), k.clone()));
-                                    self.slot_owners.entry(p).or_default().push((
-                                        tys.clone(),
-                                        dcls.name().to_string(),
-                                        pn.clone(),
-                                        SlotAnchor::Obj(Rc::downgrade(&o), k.clone()),
-                                    ));
-                                }
-                                // Remember readonly cells — by-ref
-                                // acquisition must fail (115).
-                                if pd.readonly {
-                                    self.readonly_cells
-                                        .insert(p, (dcls.name().to_string(), pn.clone()));
-                                }
-                            }
-                            copy.bind_cell(ArrKey::Str(Rc::from(k.as_str())), c);
-                        }
-                        Rc::new(RefCell::new(copy))
-                    }
-                    _ => Rc::new(RefCell::new(PhpArray::new())),
-                };
-                Ok(Some(mk_arr(&mut ob, a, flags)))
+            return Ok(Some(Value::Null));
+        }
+        // Everything else needs storage — zend lazily creates it on
+        // first access (newInstanceWithoutConstructor).
+        let (arr, pos, flags) = self.ao_state(obj);
+        let v = match lname.as_str() {
+            "rewind" => {
+                self.ao_set_pos(obj, 0);
+                Value::Null
             }
-            "getiterator" if family == "ArrayObject" => {
+            "valid" => Value::Bool(pos < arr.borrow().len()),
+            "current" => arr
+                .borrow()
+                .iter()
+                .nth(pos)
+                .map(|(_, c)| c.borrow().clone())
+                .unwrap_or(Value::Bool(false)),
+            "key" => arr
+                .borrow()
+                .iter()
+                .nth(pos)
+                .map(|(k, _)| key_value(k))
+                .unwrap_or(Value::Null),
+            "next" => {
+                self.ao_set_pos(obj, pos + 1);
+                Value::Null
+            }
+            "seek" => {
+                let i = args
+                    .cells
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let i = match self.spl_int_arg(&i, family, canonical, 1, "offset") {
+                    Ok(i) => i,
+                    Err(e) => return self.fail(e),
+                };
+                let len = arr.borrow().len() as i64;
+                if i < 0 || i >= len.max(1) && !(i == 0 && len == 0) {
+                    let e = self.spl_throw(
+                        "OutOfBoundsException",
+                        format!("Seek position {} is out of range", i),
+                    );
+                    return self.fail(e);
+                }
+                self.ao_set_pos(obj, i as usize);
+                Value::Null
+            }
+            "count" => Value::Int(arr.borrow().len() as i64),
+            "append" => {
+                let v = args
+                    .cells
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                arr.borrow_mut().push(v);
+                Value::Null
+            }
+            "exchangearray" => {
+                let v = args.cells.first().unwrap().borrow().clone();
+                if !matches!(v, Value::Array(_) | Value::Object(_)) {
+                    let tn = self.zval_type_name(&v);
+                    let e = self.spl_throw(
+                        "TypeError",
+                        format!(
+                            "{}::{}(): Argument #1 ($array) must be of type array, {} given",
+                            family, canonical, tn
+                        ),
+                    );
+                    return self.fail(e);
+                }
+                let (new, src_flags) = self.ao_backing(&v, family, canonical)?;
+                let old = {
+                    let mut ob = obj.borrow_mut();
+                    match &mut ob.internal {
+                        Some(ObjectInternal::ArrayIter {
+                            arr: slot,
+                            flags: f,
+                            ..
+                        }) => {
+                            // An spl-array source carries its flags over
+                            // (zend USE_OTHER); plain inputs keep ours.
+                            if let Some(sf) = src_flags {
+                                *f = sf;
+                            }
+                            std::mem::replace(slot, new)
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+                // zend returns a copy of the old hash — bound refs stay.
+                let old = old.borrow();
+                Value::Array(Rc::new(RefCell::new(ao_copy(&old))))
+            }
+            "getarraycopy" => Value::Array(Rc::new(RefCell::new(ao_copy(&arr.borrow())))),
+            "offsetget" => {
+                let k = args
+                    .cells
+                    .first()
+                    .map(|c| to_key(&c.borrow()))
+                    .unwrap_or(ArrKey::Int(0));
+                match arr.borrow().get(&k) {
+                    Some(v) => v,
+                    None => {
+                        let kn = match &k {
+                            ArrKey::Int(i) => format!("{}", i),
+                            ArrKey::Str(s) => format!("\"{}\"", s),
+                            ArrKey::Tomb => "0".into(),
+                        };
+                        let _ = self.warn(&format!("Undefined array key {}", kn));
+                        Value::Null
+                    }
+                }
+            }
+            "offsetexists" => {
+                let k = args
+                    .cells
+                    .first()
+                    .map(|c| to_key(&c.borrow()))
+                    .unwrap_or(ArrKey::Int(0));
+                Value::Bool(arr.borrow().get(&k).is_some())
+            }
+            "offsetset" => {
+                let v = args
+                    .cells
+                    .get(1)
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                match args.cells.first().map(|c| c.borrow().clone()) {
+                    Some(Value::Null) | None => arr.borrow_mut().push(v),
+                    Some(kv) => arr.borrow_mut().set(to_key(&kv), v),
+                }
+                Value::Null
+            }
+            "offsetunset" => {
+                let k = args
+                    .cells
+                    .first()
+                    .map(|c| to_key(&c.borrow()))
+                    .unwrap_or(ArrKey::Int(0));
+                arr.borrow_mut().unset(&k);
+                // pos pointing past the end stays clamped at reads.
+                Value::Null
+            }
+            "getflags" => Value::Int(flags),
+            "setflags" => {
+                let f = args
+                    .cells
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let f = match self.spl_int_arg(&f, family, canonical, 1, "flags") {
+                    Ok(f) => f,
+                    Err(e) => return self.fail(e),
+                };
+                if let Some(ObjectInternal::ArrayIter { flags: fp, .. }) =
+                    &mut obj.borrow_mut().internal
+                {
+                    *fp = f;
+                }
+                Value::Null
+            }
+            "getiterator" => {
                 // IteratorAggregate entry point — shares the storage Rc
                 // so iterator writes land in the object's storage.
-                let (arr, flags) = {
+                let icname = {
                     let ob = obj.borrow();
                     match &ob.internal {
-                        Some(ObjectInternal::ArrayIter { arr, flags, .. }) => (arr.clone(), *flags),
-                        _ => return Ok(None),
+                        Some(ObjectInternal::ArrayIter { iterator_class, .. }) => {
+                            iterator_class.clone()
+                        }
+                        _ => None,
                     }
-                };
-                match self.classes.get("arrayiterator").cloned() {
+                }
+                .unwrap_or_else(|| "ArrayIterator".into());
+                match self.classes.get(&icname.to_lowercase()).cloned() {
                     Some(icls) => {
                         let it = self.alloc_obj(PhpObject {
                             class: icls,
                             props: Default::default(),
                             prop_order: Vec::new(),
                             id: 0,
-                            internal: Some(ObjectInternal::ArrayIter { arr, pos: 0, flags }),
+                            internal: Some(ObjectInternal::ArrayIter {
+                                arr: arr.clone(),
+                                pos: 0,
+                                flags,
+                                iterator_class: None,
+                                src: None,
+                            }),
                             unset_props: Default::default(),
                         });
-                        Ok(Some(Value::Object(it)))
+                        Value::Object(it)
                     }
-                    None => Ok(None),
+                    None => return Ok(None),
                 }
             }
-            _ => {
-                // All remaining methods need initialized state.
-                let (arr, pos) = {
+            "getiteratorclass" => {
+                let ic = {
                     let ob = obj.borrow();
                     match &ob.internal {
-                        Some(ObjectInternal::ArrayIter { arr, pos, .. }) => (arr.clone(), *pos),
-                        _ => return Ok(None),
+                        Some(ObjectInternal::ArrayIter { iterator_class, .. }) => {
+                            iterator_class.clone()
+                        }
+                        _ => None,
                     }
                 };
-                let v = match lname.as_str() {
-                    "rewind" => {
-                        if let Some(ObjectInternal::ArrayIter { pos: p, .. }) =
+                match ic {
+                    Some(n) => match self.classes.get(&n.to_lowercase()) {
+                        Some(c) => Value::str(c.name()),
+                        None => Value::str(&n),
+                    },
+                    None => Value::str("ArrayIterator"),
+                }
+            }
+            "setiteratorclass" => {
+                let v = args.cells.first().unwrap().borrow().clone();
+                match self.ao_iterator_class(&v, family, canonical, 1) {
+                    Ok(n) => {
+                        if let Some(ObjectInternal::ArrayIter { iterator_class, .. }) =
                             &mut obj.borrow_mut().internal
                         {
-                            *p = 0;
+                            *iterator_class = Some(n);
                         }
                         Value::Null
                     }
-                    "valid" => Value::Bool(pos < arr.borrow().entries.len()),
-                    "current" => arr
-                        .borrow()
-                        .entries
-                        .get(pos)
-                        .map(|(_, c)| c.borrow().clone())
-                        .unwrap_or(Value::Bool(false)),
-                    "key" => arr
-                        .borrow()
-                        .entries
-                        .get(pos)
-                        .map(|(k, _)| key_value(k))
-                        .unwrap_or(Value::Null),
-                    "next" => {
-                        if let Some(ObjectInternal::ArrayIter { pos: p, .. }) =
-                            &mut obj.borrow_mut().internal
-                        {
-                            *p += 1;
-                        }
-                        Value::Null
+                    Err(e) => return self.fail(e),
+                }
+            }
+            "asort" | "ksort" => {
+                let flag = args.cells.first().map(|c| c.borrow().clone());
+                let flag = match flag {
+                    Some(v) => match self.spl_int_arg(&v, family, canonical, 1, "flags") {
+                        Ok(f) => f,
+                        Err(e) => return self.fail(e),
+                    },
+                    None => 0,
+                };
+                let mut a = arr.borrow_mut();
+                if lname == "asort" {
+                    match flag {
+                        // SORT_NUMERIC / SORT_STRING / plain regular.
+                        1 => a.entries.sort_by(|(_, x), (_, y)| {
+                            x.borrow()
+                                .to_float()
+                                .partial_cmp(&y.borrow().to_float())
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        }),
+                        2 | 5 | 3 => a.entries.sort_by(|(_, x), (_, y)| {
+                            x.borrow().to_php_string().cmp(&y.borrow().to_php_string())
+                        }),
+                        _ => a
+                            .entries
+                            .sort_by(|(_, x), (_, y)| compare(&x.borrow(), &y.borrow())),
                     }
-                    "seek" => {
-                        let i = args.cells.first().map(|c| c.borrow().to_int()).unwrap_or(0);
-                        let len = arr.borrow().entries.len() as i64;
-                        if i < 0 || i >= len.max(1) && !(i == 0 && len == 0) {
-                            return self.fail(PhpError::uncaught(
-                                "OutOfBoundsException",
-                                format!("Seek position {} is out of range", i),
-                                0,
-                            ));
-                        }
-                        if let Some(ObjectInternal::ArrayIter { pos: p, .. }) =
-                            &mut obj.borrow_mut().internal
-                        {
-                            *p = i as usize;
-                        }
-                        Value::Null
+                } else {
+                    match flag {
+                        1 => a.entries.sort_by(|(x, _), (y, _)| {
+                            key_value(x)
+                                .to_float()
+                                .partial_cmp(&key_value(y).to_float())
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        }),
+                        2 | 5 | 3 => a.entries.sort_by(|(x, _), (y, _)| {
+                            key_value(x)
+                                .to_php_string()
+                                .cmp(&key_value(y).to_php_string())
+                        }),
+                        _ => a
+                            .entries
+                            .sort_by(|(x, _), (y, _)| compare(&key_value(x), &key_value(y))),
                     }
-                    "count" => Value::Int(arr.borrow().entries.len() as i64),
-                    "append" => {
-                        let v = args
-                            .cells
-                            .first()
-                            .map(|c| c.borrow().clone())
-                            .unwrap_or(Value::Null);
-                        arr.borrow_mut().push(v);
-                        Value::Null
-                    }
-                    "exchangearray" if family == "ArrayObject" => {
-                        // Returns the old storage; installs a fresh copy
-                        // of the input (object inputs bind prop cells
-                        // like the ctor, sans deprecation).
-                        let new = match args.cells.first().map(|c| c.borrow().clone()) {
-                            Some(Value::Array(a)) => {
-                                let mut copy = PhpArray::new();
-                                for (k, c) in &a.borrow().entries {
-                                    copy.set(k.clone(), c.borrow().clone());
-                                }
-                                copy
-                            }
-                            Some(Value::Object(o)) => {
-                                let mut copy = PhpArray::new();
-                                let pairs: Vec<(String, Cell)> = o
-                                    .borrow()
-                                    .props
-                                    .iter()
-                                    .map(|(k, c)| (k.clone(), c.clone()))
-                                    .collect();
-                                for (k, c) in pairs {
-                                    copy.bind_cell(ArrKey::Str(Rc::from(k.as_str())), c);
-                                }
-                                copy
-                            }
-                            _ => PhpArray::new(),
-                        };
-                        let old = {
-                            let mut ob = obj.borrow_mut();
-                            match &mut ob.internal {
-                                Some(ObjectInternal::ArrayIter { arr: slot, .. }) => {
-                                    std::mem::replace(slot, Rc::new(RefCell::new(new)))
-                                }
-                                _ => return Ok(None),
-                            }
-                        };
-                        Value::Array(old)
-                    }
-                    "getarraycopy" => Value::Array(arr.clone()),
-                    "offsetget" => {
-                        let k = args
-                            .cells
-                            .first()
-                            .map(|c| to_key(&c.borrow()))
-                            .unwrap_or(ArrKey::Int(0));
-                        match arr.borrow().get(&k) {
-                            Some(v) => v,
-                            None => {
-                                let kn = key_value(&k).to_php_string();
-                                let _ = self.warn(&format!("Undefined array key {}", kn));
-                                Value::Null
-                            }
-                        }
-                    }
-                    "offsetexists" => {
-                        let k = args
-                            .cells
-                            .first()
-                            .map(|c| to_key(&c.borrow()))
-                            .unwrap_or(ArrKey::Int(0));
-                        Value::Bool(arr.borrow().get(&k).is_some())
-                    }
-                    "offsetset" => {
-                        let v = args
-                            .cells
-                            .get(1)
-                            .map(|c| c.borrow().clone())
-                            .unwrap_or(Value::Null);
-                        match args.cells.first().map(|c| c.borrow().clone()) {
-                            Some(Value::Null) | None => arr.borrow_mut().push(v),
-                            Some(kv) => arr.borrow_mut().set(to_key(&kv), v),
-                        }
-                        Value::Null
-                    }
-                    "offsetunset" => {
-                        let k = args
-                            .cells
-                            .first()
-                            .map(|c| to_key(&c.borrow()))
-                            .unwrap_or(ArrKey::Int(0));
-                        arr.borrow_mut().unset(&k);
-                        Value::Null
-                    }
-                    "getflags" => Value::Int({
-                        let ob = obj.borrow();
-                        match &ob.internal {
-                            Some(ObjectInternal::ArrayIter { flags, .. }) => *flags,
-                            _ => 0,
-                        }
-                    }),
-                    "setflags" => {
-                        let f = args.cells.first().map(|c| c.borrow().to_int()).unwrap_or(0);
-                        if let Some(ObjectInternal::ArrayIter { flags, .. }) =
-                            &mut obj.borrow_mut().internal
-                        {
-                            *flags = f;
-                        }
-                        Value::Null
-                    }
-                    "asort" | "ksort" => {
-                        let mut a = arr.borrow_mut();
-                        if lname == "asort" {
-                            a.entries
-                                .sort_by(|(_, x), (_, y)| compare(&x.borrow(), &y.borrow()));
+                }
+                Value::Bool(true)
+            }
+            "uasort" | "uksort" => {
+                let cb = args
+                    .cells
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                if !self.is_callable_value(&cb) {
+                    let detail = self.zpp_callback_detail(&cb);
+                    let e = self.spl_throw(
+                        "TypeError",
+                        format!(
+                            "{}(): Argument #2 ($callback) must be a valid callback, {}",
+                            lname, detail
+                        ),
+                    );
+                    return self.fail(e);
+                }
+                // Bubble-sort through the callback — zend uses a stable
+                // sort and the comparator sees (a, b) pairs of cells.
+                let mut sorted: Vec<(ArrKey, Cell)> = arr.borrow().iter().cloned().collect();
+                let mut swapped = true;
+                while swapped {
+                    swapped = false;
+                    for i in 0..sorted.len().saturating_sub(1) {
+                        let (ka, ca) = sorted[i].clone();
+                        let (kb, cbb) = sorted[i + 1].clone();
+                        let call_args = if lname == "uksort" {
+                            vec![cell(key_value(&ka)), cell(key_value(&kb))]
                         } else {
-                            a.entries.sort_by(|(x, _), (y, _)| match (x, y) {
-                                (ArrKey::Int(a), ArrKey::Int(b)) => a.cmp(b),
-                                _ => compare(&key_value(x), &key_value(y)),
-                            });
+                            vec![ca.clone(), cbb.clone()]
+                        };
+                        let r = self.call_value(&cb, CallArgs::positional(call_args))?;
+                        if r.to_int() > 0 {
+                            sorted.swap(i, i + 1);
+                            swapped = true;
                         }
-                        Value::Bool(true)
                     }
-                    "natsort" | "natcasesort" => {
-                        let ci = lname == "natcasesort";
-                        arr.borrow_mut().entries.sort_by(|(_, x), (_, y)| {
-                            let mut a = x.borrow().to_php_string();
-                            let mut b = y.borrow().to_php_string();
-                            if ci {
-                                a = a.to_lowercase();
-                                b = b.to_lowercase();
-                            }
-                            compare(&Value::str(a), &Value::str(b))
-                        });
-                        Value::Bool(true)
+                }
+                arr.borrow_mut().entries = sorted;
+                Value::Bool(true)
+            }
+            "natsort" | "natcasesort" => {
+                let ci = lname == "natcasesort";
+                arr.borrow_mut().entries.sort_by(|(_, x), (_, y)| {
+                    let mut a = x.borrow().to_php_string();
+                    let mut b = y.borrow().to_php_string();
+                    if ci {
+                        a = a.to_lowercase();
+                        b = b.to_lowercase();
                     }
-                    _ => return Ok(None),
+                    compare(&Value::str(a), &Value::str(b))
+                });
+                Value::Bool(true)
+            }
+            "serialize" => {
+                // Legacy spl payload: `x:i:<flags>;<ser-arr>;m:<ser-props>`
+                // (the storage slot holds the backing OBJECT when the
+                // source was one — zend writes it verbatim).
+                let props = self.ao_props_arr(obj);
+                let src = self.ao_src(obj);
+                let s1 = crate::builtins::var::php_serialize(self, &src)?;
+                let s2 = crate::builtins::var::php_serialize(
+                    self,
+                    &Value::Array(Rc::new(RefCell::new(props))),
+                )?;
+                Value::str(format!("x:i:{};{};m:{}", flags, s1, s2))
+            }
+            "unserialize" => {
+                let data = args
+                    .cells
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let data = match &data {
+                    Value::Str(s) => crate::value::lossy(s).into_owned(),
+                    other => {
+                        let tn = self.zval_type_name(other);
+                        let e = self.spl_throw(
+                            "TypeError",
+                            format!(
+                                "{}::{}(): Argument #1 ($data) must be of type string, {} given",
+                                family, canonical, tn
+                            ),
+                        );
+                        return self.fail(e);
+                    }
                 };
-                Ok(Some(v))
+                match self.ao_parse_payload(&data) {
+                    Ok((pflags, sarr, parr)) => {
+                        let mut ob = obj.borrow_mut();
+                        ob.internal = Some(ObjectInternal::ArrayIter {
+                            arr: sarr,
+                            pos: 0,
+                            flags: pflags,
+                            iterator_class: None,
+                            src: None,
+                        });
+                        drop(ob);
+                        let mut ob = obj.borrow_mut();
+                        for (k, c) in parr.borrow().iter() {
+                            let kn = match k {
+                                ArrKey::Str(s) => s.to_string(),
+                                ArrKey::Int(i) => i.to_string(),
+                                ArrKey::Tomb => continue,
+                            };
+                            if !ob.prop_order.contains(&kn) {
+                                ob.prop_order.push(kn.clone());
+                            }
+                            ob.props.insert(kn, c.clone());
+                        }
+                        Value::Null
+                    }
+                    Err(pos) => {
+                        let e = self.spl_throw(
+                            "UnexpectedValueException",
+                            format!("Error at offset {} of {} bytes", pos, data.len()),
+                        );
+                        return self.fail(e);
+                    }
+                }
+            }
+            "__serialize" => {
+                let props = self.ao_props_arr(obj);
+                let mut out = PhpArray::new();
+                out.push(Value::Int(flags));
+                out.push(self.ao_src(obj));
+                out.push(Value::Array(Rc::new(RefCell::new(props))));
+                out.push(Value::Null);
+                Value::Array(Rc::new(RefCell::new(out)))
+            }
+            "__unserialize" => {
+                let data = args.cells.first().unwrap().borrow().clone();
+                let arr_v = match &data {
+                    Value::Array(a) => a.clone(),
+                    other => {
+                        let tn = self.zval_type_name(other);
+                        let e = self.spl_throw(
+                            "TypeError",
+                            format!(
+                                "{}::{}(): Argument #1 ($data) must be of type array, {} given",
+                                family, canonical, tn
+                            ),
+                        );
+                        return self.fail(e);
+                    }
+                };
+                let bad = |it: &mut Self| -> PhpError {
+                    it.spl_throw(
+                        "UnexpectedValueException",
+                        "Incomplete or ill-typed serialization data".to_string(),
+                    )
+                };
+                // Slots: [0] flags int, [1] storage array|object,
+                // [2] props array, [3] NULL (optional).
+                let d = arr_v.borrow();
+                let f = d.get(&ArrKey::Int(0));
+                let st = d.get(&ArrKey::Int(1));
+                let pr = d.get(&ArrKey::Int(2));
+                let aux = d.get(&ArrKey::Int(3));
+                let (Some(f), Some(st), Some(pr)) = (f, st, pr) else {
+                    let e = bad(self);
+                    return self.fail(e);
+                };
+                let flags_i = match f {
+                    Value::Int(i) => i,
+                    _ => {
+                        let e = bad(self);
+                        return self.fail(e);
+                    }
+                };
+                if !matches!(st, Value::Array(_) | Value::Object(_)) {
+                    let e = self.spl_throw(
+                        "UnexpectedValueException",
+                        "Passed variable is not an array or object".to_string(),
+                    );
+                    return self.fail(e);
+                }
+                let Value::Array(props_arr) = &pr else {
+                    let e = bad(self);
+                    return self.fail(e);
+                };
+                if let Some(aux) = aux {
+                    if !matches!(aux, Value::Null) {
+                        let e = bad(self);
+                        return self.fail(e);
+                    }
+                }
+                let props_arr = props_arr.clone();
+                drop(d);
+                let (backing, _) = self.ao_backing(&st, family, canonical)?;
+                let src_obj = match &st {
+                    Value::Object(o) => Some(o.clone()),
+                    _ => None,
+                };
+                let mut ob = obj.borrow_mut();
+                ob.internal = Some(ObjectInternal::ArrayIter {
+                    arr: backing,
+                    pos: 0,
+                    flags: flags_i,
+                    iterator_class: None,
+                    src: src_obj,
+                });
+                for (k, c) in props_arr.borrow().iter() {
+                    let kn = match k {
+                        ArrKey::Str(s) => s.to_string(),
+                        ArrKey::Int(i) => i.to_string(),
+                        ArrKey::Tomb => continue,
+                    };
+                    if !ob.prop_order.contains(&kn) {
+                        ob.prop_order.push(kn.clone());
+                    }
+                    ob.props.insert(kn, c.clone());
+                }
+                Value::Null
+            }
+            "haschildren" => {
+                // RecursiveArrayIterator: current element is child-able
+                // when it's an array or object.
+                Value::Bool(match arr.borrow().iter().nth(pos) {
+                    Some((_, c)) => matches!(*c.borrow(), Value::Array(_) | Value::Object(_)),
+                    None => false,
+                })
+            }
+            "getchildren" => {
+                // `new static(element)` — same class, element storage.
+                let el = arr
+                    .borrow()
+                    .iter()
+                    .nth(pos)
+                    .map(|(_, c)| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let backing = match self.ao_backing(&el, family, canonical) {
+                    Ok((b, sf)) => (b, sf),
+                    Err(e) => return Err(e),
+                };
+                let cls_name = obj.borrow().class.name().to_string();
+                let icls = self.classes.get(&cls_name.to_lowercase()).cloned();
+                match icls {
+                    Some(icls) => {
+                        let src_obj = match &el {
+                            Value::Object(o) => Some(o.clone()),
+                            _ => None,
+                        };
+                        let it = self.alloc_obj(PhpObject {
+                            class: icls,
+                            props: Default::default(),
+                            prop_order: Vec::new(),
+                            id: 0,
+                            internal: Some(ObjectInternal::ArrayIter {
+                                arr: backing.0,
+                                pos: 0,
+                                flags: backing.1.unwrap_or(flags),
+                                iterator_class: None,
+                                src: src_obj,
+                            }),
+                            unset_props: Default::default(),
+                        });
+                        Value::Object(it)
+                    }
+                    None => Value::Null,
+                }
+            }
+            "__debuginfo" => {
+                let mut out = PhpArray::new();
+                out.set(ArrKey::Str("storage".into()), Value::Array(arr.clone()));
+                Value::Array(Rc::new(RefCell::new(out)))
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(v))
+    }
+
+    /// Raise a catchable engine exception for the spl array-object
+    /// methods (`self.exception` + `throw`).
+    fn spl_throw(&mut self, class: &str, msg: impl Into<String>) -> PhpError {
+        let e = self.exception(class, &msg.into());
+        self.throw(e)
+    }
+
+    /// ARRAY_AS_PROPS (flag bit 2): undeclared prop access on this spl
+    /// array-object routes to the storage hash.
+    pub(in crate::interp) fn aap_active(&mut self, o: &Rc<RefCell<PhpObject>>) -> bool {
+        match &o.borrow().internal {
+            Some(ObjectInternal::ArrayIter { flags, .. }) => *flags & 2 != 0,
+            _ => false,
+        }
+    }
+
+    /// (storage, pos, flags) of an spl array-object, lazily creating the
+    /// internal storage on first access — zend materializes it on demand
+    /// for `newInstanceWithoutConstructor` objects too.
+    pub(in crate::interp) fn ao_state(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+    ) -> (Rc<RefCell<PhpArray>>, usize, i64) {
+        let mut ob = obj.borrow_mut();
+        if !matches!(ob.internal, Some(ObjectInternal::ArrayIter { .. })) {
+            ob.internal = Some(ObjectInternal::ArrayIter {
+                arr: Rc::new(RefCell::new(PhpArray::new())),
+                pos: 0,
+                flags: 0,
+                iterator_class: None,
+                src: None,
+            });
+        }
+        match &ob.internal {
+            Some(ObjectInternal::ArrayIter {
+                arr, pos, flags, ..
+            }) => (arr.clone(), *pos, *flags),
+            _ => unreachable!(),
+        }
+    }
+
+    fn ao_set_pos(&mut self, obj: &Rc<RefCell<PhpObject>>, p: usize) {
+        if let Some(ObjectInternal::ArrayIter { pos, .. }) = &mut obj.borrow_mut().internal {
+            *pos = p;
+        }
+    }
+
+    /// Weak-mode int coercion for a zpp `int` arg; TypeError otherwise.
+    fn spl_int_arg(
+        &mut self,
+        v: &Value,
+        family: &str,
+        mname: &str,
+        n: usize,
+        pname: &str,
+    ) -> Result<i64, PhpError> {
+        let ok = match v {
+            Value::Int(i) => Some(*i),
+            Value::Bool(b) => Some(*b as i64),
+            Value::Float(f) => Some(*f as i64),
+            Value::Str(s) => {
+                let s = crate::value::lossy(s);
+                s.trim()
+                    .parse::<i64>()
+                    .ok()
+                    .or_else(|| s.trim().parse::<f64>().ok().map(|f| f as i64))
+            }
+            _ => None,
+        };
+        match ok {
+            Some(i) => Ok(i),
+            None => {
+                let tn = self.zval_type_name(v);
+                Err(self.spl_throw(
+                    "TypeError",
+                    format!(
+                        "{}::{}(): Argument #{} (${}) must be of type int, {} given",
+                        family, mname, n, pname, tn
+                    ),
+                ))
             }
         }
+    }
+
+    /// `iteratorClass` arg: coerced to a class name (like a `string`
+    /// zpp param — objects must __toString or Error), resolved with
+    /// autoload, and must derive from ArrayIterator; anything else is
+    /// a TypeError whose repr is the coerced name (NUL-truncated).
+    fn ao_iterator_class(
+        &mut self,
+        v: &Value,
+        family: &str,
+        mname: &str,
+        n: usize,
+    ) -> Result<String, PhpError> {
+        let name = match v {
+            Value::Str(s) => crate::value::lossy(s).into_owned(),
+            Value::Int(i) => format!("{}", i),
+            Value::Float(f) => crate::value::format_float_repr(*f),
+            Value::Bool(b) => if *b { "1" } else { "" }.to_string(),
+            Value::Null => String::new(),
+            Value::Array(_) => {
+                self.warn_pub("Array to string conversion")?;
+                "Array".to_string()
+            }
+            Value::Object(o) => {
+                if self
+                    .find_method_in(&o.borrow().class, "__tostring")
+                    .is_some()
+                {
+                    match self.method_invoke(o.clone(), "__toString", CallArgs::empty()) {
+                        Ok(Value::Str(s)) => crate::value::lossy(&s).into_owned(),
+                        Ok(_) => String::new(),
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    return Err(self.spl_throw(
+                        "Error",
+                        format!(
+                            "Object of class {} could not be converted to string",
+                            o.borrow().class.name()
+                        ),
+                    ));
+                }
+            }
+            other => self.zval_type_name(other),
+        };
+        // zend prints the name up to the first NUL byte.
+        let name = name.split('\0').next().unwrap_or("").to_string();
+        let resolved = self
+            .resolve_class(&name)
+            .filter(|c| self.is_a_str(c, "arrayiterator"));
+        match resolved {
+            Some(c) => Ok(c),
+            None => Err(self.spl_throw(
+                "TypeError",
+                format!(
+                    "{}::{}(): Argument #{} ($iteratorClass) must be a class name derived from ArrayIterator, {} given",
+                    family, mname, n, name
+                ),
+            )),
+        }
+    }
+
+    /// spl storage coercion for `array|object` inputs: arrays copy
+    /// (shared php-reference cells stay bound); objects emit the object
+    /// deprecation — spl-array sources hand over their storage cells
+    /// (+flags), plain objects bind their prop cells live.
+    fn ao_backing(
+        &mut self,
+        v: &Value,
+        family: &str,
+        mname: &str,
+    ) -> Result<(Rc<RefCell<PhpArray>>, Option<i64>), PhpError> {
+        match v {
+            Value::Array(a) => Ok((Rc::new(RefCell::new(ao_copy(&a.borrow()))), None)),
+            Value::Object(o) => {
+                self.deprecated(&format!(
+                    "{}::{}(): Using an object as a backing array for {} is deprecated, as it allows violating class constraints and invariants",
+                    family, mname, family
+                ))?;
+                let src = {
+                    let ob = o.borrow();
+                    match &ob.internal {
+                        Some(ObjectInternal::ArrayIter { arr, flags, .. }) => {
+                            Some((arr.clone(), *flags))
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some((src, src_flags)) = src {
+                    return Ok((
+                        Rc::new(RefCell::new(ao_copy(&src.borrow()))),
+                        Some(src_flags),
+                    ));
+                }
+                // Objects iterate their prop cells BY REFERENCE —
+                // writes through $v update the prop (typed gate
+                // still applies); deprecated since 8.5
+                // (typed_properties_113/114/115).
+                let mut copy = PhpArray::new();
+                let pairs: Vec<(String, Cell)> = o
+                    .borrow()
+                    .props
+                    .iter()
+                    .map(|(k, c)| (k.clone(), c.clone()))
+                    .collect();
+                for (k, c) in pairs {
+                    let pn = k.rsplit('\0').next().unwrap_or(&k).to_string();
+                    if let Some((pd, dcls)) = self.decl_prop(o, &pn) {
+                        let p = Rc::as_ptr(&c) as usize;
+                        if let Some(tys) = &pd.ty {
+                            self.typed_slots.insert(
+                                p,
+                                (c.clone(), tys.clone(), dcls.name().to_string(), pn.clone()),
+                            );
+                            self.slot_anchor
+                                .insert(p, SlotAnchor::Obj(Rc::downgrade(o), k.clone()));
+                            self.slot_owners.entry(p).or_default().push((
+                                tys.clone(),
+                                dcls.name().to_string(),
+                                pn.clone(),
+                                SlotAnchor::Obj(Rc::downgrade(o), k.clone()),
+                            ));
+                        }
+                        if pd.readonly {
+                            self.readonly_cells
+                                .insert(p, (dcls.name().to_string(), pn.clone()));
+                        }
+                    }
+                    copy.bind_cell(ArrKey::Str(Rc::from(k.as_str())), c);
+                }
+                Ok((Rc::new(RefCell::new(copy)), None))
+            }
+            _ => unreachable!("callers validate array|object before ao_backing"),
+        }
+    }
+
+    /// `__serialize` slot 1 / the legacy payload's storage slot: the
+    /// backing OBJECT when storage came from an object input, else the
+    /// storage array (zend serializes the object verbatim so
+    /// unserialize can re-bind it).
+    fn ao_src(&mut self, obj: &Rc<RefCell<PhpObject>>) -> Value {
+        match &obj.borrow().internal {
+            Some(ObjectInternal::ArrayIter { arr, src, .. }) => match src {
+                Some(o) => Value::Object(o.clone()),
+                None => Value::Array(arr.clone()),
+            },
+            _ => Value::Null,
+        }
+    }
+
+    /// The object's live prop table as a PhpArray (serialize payloads).
+    fn ao_props_arr(&mut self, obj: &Rc<RefCell<PhpObject>>) -> PhpArray {
+        let ob = obj.borrow();
+        let mut props = PhpArray::new();
+        for name in &ob.prop_order {
+            if let Some(c) = ob.props.get(name) {
+                props.set(ArrKey::Str(Rc::from(name.as_str())), c.borrow().clone());
+            }
+        }
+        props
+    }
+
+    /// Parse the legacy spl payload `x:i:<flags>;<a:…>;m:<props>` —
+    /// returns (storage, props) or Err(consumed-offset).
+    fn ao_parse_payload(&mut self, data: &str) -> Result<AoUnserData, usize> {
+        let b = data.as_bytes();
+        let mut pos = 0usize;
+        // x:i:<flags>; — flags are consumed but not restored by
+        // serialize()/unserialize() (zend stores them in the payload but
+        // a plain unserialize doesn't write ar_flags? — zend DOES read
+        // flags from x:; keep them).
+        if !data.starts_with("x:i:") {
+            return Err(0);
+        }
+        pos += 4;
+        let fstart = pos;
+        while pos < b.len() && b[pos] != b';' {
+            pos += 1;
+        }
+        if pos >= b.len() {
+            return Err(pos);
+        }
+        let fl: i64 = data[fstart..pos].parse().map_err(|_| pos)?;
+        pos += 1; // ;
+                  // storage: serialized array
+        let st = {
+            let mut ie = None;
+            crate::builtins::var::php_unserialize(self, data, &mut pos, &mut ie).map_err(|_| pos)?
+        };
+        let Value::Array(st) = st else {
+            return Err(pos);
+        };
+        // ;m:<props>
+        if pos + 2 >= b.len() || &data[pos..pos + 3] != ";m:" {
+            return Err(pos);
+        }
+        pos += 3;
+        let pr = {
+            let mut ie = None;
+            crate::builtins::var::php_unserialize(self, data, &mut pos, &mut ie).map_err(|_| pos)?
+        };
+        let Value::Array(pr) = pr else {
+            return Err(pos);
+        };
+        if pos != b.len() {
+            return Err(pos);
+        }
+        Ok((fl, st, pr))
     }
 
     /// Call-arg list for `invokeArgs`/`newInstanceArgs`: array entries
@@ -681,7 +1374,11 @@ impl<'a> Interp<'a> {
     }
 
     /// Method-call visibility against the current calling scope.
-    fn method_access_ok(&mut self, m: &MethodDecl, dc: &Rc<PhpClass>) -> bool {
+    pub(in crate::interp) fn method_access_ok(
+        &mut self,
+        m: &MethodDecl,
+        dc: &Rc<PhpClass>,
+    ) -> bool {
         let scope = self
             .stack
             .last()
@@ -926,12 +1623,18 @@ impl<'a> Interp<'a> {
             }
         }
         // ArrayIterator / ArrayObject: native storage state on the
-        // object internal.
-        if cls.name().eq_ignore_ascii_case("arrayiterator")
-            || cls.name().eq_ignore_ascii_case("arrayobject")
-        {
-            if let Some(v) = self.array_iter_method(&obj, name, &args)? {
-                return Ok(v);
+        // object internal. Only native stubs dispatch here — a userland
+        // override on a subclass (ArrayIteratorEx::rewind, myArray::
+        // offsetGet — array_020/021/024, bug32134) still wins.
+        if self.is_a_str(cls.name(), "arrayiterator") || self.is_a_str(cls.name(), "arrayobject") {
+            let stub = self
+                .find_method_in(&cls, name)
+                .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
+                .unwrap_or(true);
+            if stub {
+                if let Some(v) = self.array_iter_method(&obj, name, &args)? {
+                    return Ok(v);
+                }
             }
         }
         // Generator: same pattern — native iteration state.
@@ -1216,4 +1919,27 @@ impl<'a> Interp<'a> {
             None => false,
         }
     }
+}
+
+/// zend_hash copy for spl storage copies: plain cells copy by value,
+/// shared php-reference cells stay bound (`new ArrayObject` /
+/// `exchangeArray` / `getArrayCopy` all behave this way in zend).
+fn ao_copy(a: &PhpArray) -> PhpArray {
+    let mut copy = PhpArray::new();
+    for (k, c) in &a.entries {
+        if matches!(k, ArrKey::Tomb) {
+            continue;
+        }
+        // zend array_dup keeps IS_REFERENCE elements bound — our is_ref
+        // flag marks arrays that gained &-aliases, so a shared cell
+        // alone (e.g. prop cells bound for object-backing) isn't a
+        // reference and copies by value.
+        if a.is_ref && Rc::strong_count(c) > 1 {
+            copy.is_ref = true;
+            copy.bind_cell(k.clone(), c.clone());
+        } else {
+            copy.set(k.clone(), c.borrow().clone());
+        }
+    }
+    copy
 }
