@@ -153,11 +153,14 @@ impl<'a> Interp<'a> {
         self.emit_diag("Deprecated", 8192, msg)
     }
 
-    /// error_reporting([$level]) — returns previous level.
+    /// error_reporting([$level]) — returns previous level. Setting
+    /// through the function also writes the ini string back (zend's
+    /// ini handler keeps PG(error_reporting) in sync).
     pub fn error_reporting(&mut self, level: Option<i64>) -> i64 {
         let prev = self.error_level;
         if let Some(l) = level {
             self.error_level = l;
+            self.ini.insert("error_reporting".into(), l.to_string());
         }
         prev
     }
@@ -182,6 +185,12 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn print_fatal(&mut self, e: &PhpError) {
         match e.kind {
             ErrorKind::Uncaught { ref class } => {
+                // Zend's display path checks PG(error_reporting) &
+                // E_ERROR — error_reporting(0) (or a mask missing
+                // bit 0, like -42) silences even uncaught fatals.
+                if self.error_level & 1 == 0 {
+                    return;
+                }
                 let frames = e.trace.clone().unwrap_or_default();
                 let mut t = String::new();
                 for (i, fr) in frames.iter().enumerate() {
@@ -326,7 +335,9 @@ impl<'a> Interp<'a> {
                     "\nParse error: {} in {}({}) : eval()'d code on line {}\n",
                     msg, file, line, eval_ctx
                 ));
-            } else {
+            } else if self.error_level & 1 != 0 {
+                // error_reporting masks the uncaught display too
+                // (see print_fatal) — bit-0 masks silence it.
                 // Buffered output precedes the fatal, as PHP's output
                 // layer would emit it (bug32828's throwing handler).
                 self.flush_ob_all();

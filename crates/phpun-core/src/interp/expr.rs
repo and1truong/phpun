@@ -1065,8 +1065,14 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        if let Some(v) = self.constants.get(key) {
-            return Ok(v.clone());
+        if let Some(v) = self.constants.get(key).cloned() {
+            // PHP 8.4+ keeps E_STRICT defined but deprecated on use.
+            if key.eq_ignore_ascii_case("E_STRICT") {
+                self.deprecated(
+                    "Constant E_STRICT is deprecated since 8.4, the error level was removed",
+                )?;
+            }
+            return Ok(v);
         }
         if let Some(v) = self.constants.get(name) {
             return Ok(v.clone());
