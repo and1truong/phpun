@@ -619,9 +619,7 @@ impl<'a> Interp<'a> {
                         Ok(cls) => return self.static_invoke_vis(cls, m, args, None, true),
                         Err(detail) => {
                             if let Some(c) = self.resolve_class(cls) {
-                                if let Some(cls) =
-                                    self.classes.get(&c.to_lowercase()).cloned()
-                                {
+                                if let Some(cls) = self.classes.get(&c.to_lowercase()).cloned() {
                                     return self.static_invoke_vis(cls, m, args, None, true);
                                 }
                             }
@@ -674,15 +672,13 @@ impl<'a> Interp<'a> {
                                         self.static_invoke_vis(cls, &mname, args, None, true)
                                     }
                                     Err(detail) => {
-                                        let cls = self
-                                            .resolve_class(&crate::value::lossy(&cn))
-                                            .and_then(|c| {
-                                                self.classes.get(&c.to_lowercase()).cloned()
-                                            });
-                                        if let Some(cls) = cls {
-                                            return self.static_invoke_vis(
-                                                cls, &mname, args, None, true,
+                                        let cls =
+                                            self.resolve_class(&crate::value::lossy(&cn)).and_then(
+                                                |c| self.classes.get(&c.to_lowercase()).cloned(),
                                             );
+                                        if let Some(cls) = cls {
+                                            return self
+                                                .static_invoke_vis(cls, &mname, args, None, true);
                                         }
                                         let e = self.exception("TypeError", &detail);
                                         let te = self.throw(e);
@@ -2647,10 +2643,7 @@ impl<'a> Interp<'a> {
     /// 'static' / 'parent' bind to the calling scope like Zend's
     /// zend_is_callable resolution (bug45186). Err carries the failure
     /// detail used after `must be a valid callback`.
-    pub(in crate::interp) fn callable_class(
-        &mut self,
-        cn: &str,
-    ) -> Result<Rc<PhpClass>, String> {
+    pub(in crate::interp) fn callable_class(&mut self, cn: &str) -> Result<Rc<PhpClass>, String> {
         let raw = cn.trim_start_matches('\\');
         let lw = raw.to_lowercase();
         if matches!(lw.as_str(), "self" | "static" | "parent") {
@@ -2659,8 +2652,7 @@ impl<'a> Interp<'a> {
                 // No binding — 'parent' in a parentless scope reports
                 // differently from missing scope entirely.
                 let detail = if lw == "parent" && self.caller_scope_name().is_some() {
-                    "cannot access \"parent\" when current class scope has no parent"
-                        .to_string()
+                    "cannot access \"parent\" when current class scope has no parent".to_string()
                 } else {
                     format!("cannot access \"{}\" when no class scope is active", lw)
                 };
@@ -2708,10 +2700,7 @@ impl<'a> Interp<'a> {
     fn deprecate_relative_callable(&mut self, cn: &str) {
         let lw = cn.trim_start_matches('\\').to_lowercase();
         if matches!(lw.as_str(), "self" | "static" | "parent") {
-            let _ = self.deprecated(&format!(
-                "Use of \"{}\" in callables is deprecated",
-                lw
-            ));
+            let _ = self.deprecated(&format!("Use of \"{}\" in callables is deprecated", lw));
         }
     }
 
@@ -2761,9 +2750,7 @@ impl<'a> Interp<'a> {
                 };
                 let mn = String::from_utf8_lossy(mn).to_string();
                 match &first {
-                    Value::Str(cn) => {
-                        self.callable_pair_ok(&String::from_utf8_lossy(cn), &mn)
-                    }
+                    Value::Str(cn) => self.callable_pair_ok(&String::from_utf8_lossy(cn), &mn),
                     Value::Callable(_) => mn.eq_ignore_ascii_case("__invoke"),
                     Value::Object(o) => {
                         let c = o.borrow().class.clone();
@@ -2892,10 +2879,7 @@ impl<'a> Interp<'a> {
                     // like the array form (bug45186_2's
                     // `class bar does not have a method "www"`).
                     Some((cn, mn)) => self.callable_pair_detail(cn, mn),
-                    None => format!(
-                        "function \"{}\" not found or invalid function name",
-                        s
-                    ),
+                    None => format!("function \"{}\" not found or invalid function name", s),
                 }
             }
             _ => "no array or string given".into(),

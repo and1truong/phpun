@@ -108,9 +108,7 @@ impl<'a> Interp<'a> {
                 let (arr, flags) = {
                     let ob = obj.borrow();
                     match &ob.internal {
-                        Some(ObjectInternal::ArrayIter { arr, flags, .. }) => {
-                            (arr.clone(), *flags)
-                        }
+                        Some(ObjectInternal::ArrayIter { arr, flags, .. }) => (arr.clone(), *flags),
                         _ => return Ok(None),
                     }
                 };
@@ -121,11 +119,7 @@ impl<'a> Interp<'a> {
                             props: Default::default(),
                             prop_order: Vec::new(),
                             id: 0,
-                            internal: Some(ObjectInternal::ArrayIter {
-                                arr,
-                                pos: 0,
-                                flags,
-                            }),
+                            internal: Some(ObjectInternal::ArrayIter { arr, pos: 0, flags }),
                             unset_props: Default::default(),
                         });
                         Ok(Some(Value::Object(it)))
