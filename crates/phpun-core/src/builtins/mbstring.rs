@@ -326,7 +326,7 @@ pub(crate) fn dispatch(
                     return Ok(Some(Value::Bool(false)));
                 }
             };
-            let (caps, rc) = re.caps(&subj, it);
+            let (caps, rc) = re.caps(&subj, 0, true, None, it);
             if rc != 0 {
                 it.last_preg_error = preg_rc_err(rc);
                 return Ok(Some(Value::Bool(false)));

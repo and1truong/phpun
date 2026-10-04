@@ -1298,9 +1298,10 @@ impl<'a> Interp<'a> {
             "/=" => self.arith("/", cur, rhs)?,
             "%=" => self.arith("%", cur, rhs)?,
             ".=" => {
-                let l = self.conv_str(&cur)?;
-                let r = self.conv_str(&rhs)?;
-                Value::str(format!("{}{}", l, r))
+                let mut l = self.conv_bytes(&cur)?;
+                let mut r = self.conv_bytes(&rhs)?;
+                l.append(&mut r);
+                Value::bytes(l)
             }
             "??=" => {
                 if matches!(cur, Value::Null) {

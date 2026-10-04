@@ -33,9 +33,11 @@ pub(in crate::builtins) fn preg_rc_err(rc: i32) -> i64 {
     match rc {
         -47 => 2, // PCRE2_ERROR_MATCHLIMIT
         -53 => 3, // PCRE2_ERROR_DEPTHLIMIT
-        // UTF-8 subject/pattern errors (UTF8_ERR1..21 and
-        // UTF16-range) and BadNewline → PREG_BAD_UTF8_ERROR.
-        x if (-56..=-36).contains(&x) || (-200..=-169).contains(&x) => 4,
+        -36 => 5, // PCRE2_ERROR_BADUTFOFFSET
+        -46 => 6, // PCRE2_ERROR_JIT_STACKLIMIT
+        // UTF8_ERR1..21 (-3..=-23) → PREG_BAD_UTF8_ERROR
+        // (pcre_handle_exec_error's range check).
+        x if (-23..=-3).contains(&x) => 4,
         _ => 1,
     }
 }
@@ -79,6 +81,120 @@ fn subj_elem_str(it: &mut Interp, c: &Cell) -> Result<Vec<u8>, PhpError> {
     pat_elem_str(it, c)
 }
 
+/// Run one compiled pattern over one subject element for the callback
+/// family (php_pcre_replace_func_impl): every match builds the group
+/// array and invokes the callback. Returns the new element value and
+/// the match count, or `None` when the result is NULL (callback
+/// failure or an engine error — the element is dropped from the
+/// output). A pending exception skips the calls themselves.
+#[allow(clippy::too_many_arguments)]
+fn apply_cb_pattern(
+    it: &mut Interp,
+    _name: &str,
+    re: &PhpRe,
+    cb: &Value,
+    cur: &[u8],
+    flags: i64,
+    limit: i64,
+    pending_err: &mut Option<PhpError>,
+) -> Result<Option<(Vec<u8>, i64)>, PhpError> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut last = 0usize;
+    let mut n = 0i64;
+    let (caps, rc) = re.caps(cur, 0, true, None, it);
+    if rc != 0 {
+        it.last_preg_error = preg_rc_err(rc);
+        return Ok(None);
+    }
+    let mut cb_failed = false;
+    for cap in &caps {
+        if limit > 0 && n >= limit {
+            break;
+        }
+        let Some(Some((ms, me))) = cap.spans.first() else {
+            continue;
+        };
+        n += 1;
+        out.extend_from_slice(cur.get(last..*ms).unwrap_or(&[]));
+        let mut group_arr = PhpArray::new();
+        let glast = if flags & 512 != 0 {
+            cap.spans.len()
+        } else {
+            cap.spans
+                .iter()
+                .rposition(|sp| sp.is_some())
+                .map(|i| i + 1)
+                .unwrap_or(0)
+        };
+        for g in 0..glast {
+            let span = cap.spans.get(g).copied().flatten();
+            let v = match (span, flags & 256 != 0) {
+                (Some((a, b)), true) => {
+                    let mut pair = PhpArray::new();
+                    pair.push(
+                        cur.get(a..b)
+                            .map(|x| Value::bytes(x.to_vec()))
+                            .unwrap_or(Value::str("")),
+                    );
+                    pair.push(Value::Int(a as i64));
+                    Value::Array(Rc::new(RefCell::new(pair)))
+                }
+                (Some((a, b)), false) => cur
+                    .get(a..b)
+                    .map(|x| Value::bytes(x.to_vec()))
+                    .unwrap_or(Value::str("")),
+                (None, true) => {
+                    let mut pair = PhpArray::new();
+                    pair.push(if flags & 512 != 0 {
+                        Value::Null
+                    } else {
+                        Value::str("")
+                    });
+                    pair.push(Value::Int(-1));
+                    Value::Array(Rc::new(RefCell::new(pair)))
+                }
+                (None, false) if flags & 512 != 0 => Value::Null,
+                (None, false) => Value::str(""),
+            };
+            if let Some(n) = re.group_name(g) {
+                group_arr.set(ArrKey::Str(n.into()), v.clone());
+            }
+            group_arr.push(v);
+        }
+        if let Some(m) = &cap.mark {
+            group_arr.set(ArrKey::Str("MARK".into()), Value::str(m.clone()));
+        }
+        // A pending exception makes zend skip the call entirely; the
+        // element's NULL result drops it from the output.
+        if pending_err.is_some() {
+            cb_failed = true;
+            break;
+        }
+        let r = match it.call_value(
+            cb,
+            crate::interp::CallArgs::positional(vec![cell(Value::Array(Rc::new(
+                RefCell::new(group_arr),
+            )))]),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                if pending_err.is_none() {
+                    *pending_err = Some(e);
+                }
+                cb_failed = true;
+                break;
+            }
+        };
+        out.extend_from_slice(&r.to_php_bytes());
+        last = *me;
+    }
+    if cb_failed {
+        return Ok(None);
+    }
+    out.extend_from_slice(&cur[last..]);
+    Ok(Some((out, n)))
+}
+
 /// Pattern element to string: Array warns, Object without __toString is Error.
 fn pat_elem_str(it: &mut Interp, c: &Cell) -> Result<Vec<u8>, PhpError> {
     let v = c.borrow().clone();
@@ -109,61 +225,18 @@ fn pat_elem_str(it: &mut Interp, c: &Cell) -> Result<Vec<u8>, PhpError> {
     }
 }
 
-/// Is `v` callable-shaped enough for preg callback params?
-fn preg_callable_ok(it: &Interp, v: &Value) -> bool {
-    match v {
-        Value::Callable(_) => true,
-        Value::Str(s) => {
-            let n = crate::value::lossy(&s);
-            let n = n.trim_start_matches('\\');
-            if n.contains("::") {
-                true
-            } else {
-                it.functions.contains_key(&n.to_lowercase()) || is_builtin(&n.to_lowercase())
-            }
+/// Is `v` callable-shaped enough for preg callback params? Same
+/// rules as is_callable() — a leading `\` is stripped first.
+fn preg_callable_ok(it: &mut Interp, v: &Value) -> bool {
+    if let Value::Str(s) = v {
+        if s.first() == Some(&b'\\') {
+            return it.is_callable_value(&Value::Str(s[1..].to_vec().into()));
         }
-        Value::Array(a) => {
-            let a = a.borrow();
-            let o = a.get(&ArrKey::Int(0));
-            let m = a.get(&ArrKey::Int(1)).map(|v| v.to_php_string());
-            match (o, m) {
-                (Some(Value::Object(ob)), Some(m)) => {
-                    let d = &ob.borrow().class.decl;
-                    d.find_method(&m.to_lowercase()).is_some() || d.find_method("__call").is_some()
-                }
-                (Some(Value::Str(cn)), Some(m)) => it
-                    .lookup_class(&crate::value::lossy(&cn))
-                    .map(|cl| cl.decl.find_method(&m.to_lowercase()).is_some())
-                    .unwrap_or(false),
-                _ => false,
-            }
-        }
-        Value::Object(o) => {
-            let d = &o.borrow().class.decl;
-            d.find_method("__invoke").is_some() || d.find_method("__call").is_some()
-        }
-        _ => false,
     }
+    it.is_callable_value(v)
 }
 
 /// Does a `/pat/flags` pattern carry the `u` (UTF-8) modifier?
-fn pat_is_utf(pat: &[u8]) -> bool {
-    if pat.len() < 2 {
-        return false;
-    }
-    let delim = pat[0];
-    let close = match delim {
-        b'(' => b')',
-        b'{' => b'}',
-        b'[' => b']',
-        b'<' => b'>',
-        _ => delim,
-    };
-    match pat.iter().rposition(|&c| c == close) {
-        Some(end) if end > 0 => pat[end + 1..].contains(&b'u'),
-        _ => false,
-    }
-}
 
 fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, PhpError> {
     if !matches!(
@@ -209,8 +282,21 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
             .to_string(),
         )),
         "preg_match" | "preg_match_all" => {
+            if std::env::var_os("PREG_DEBUG").is_some() {
+                static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                let t0 = *T0.get_or_init(std::time::Instant::now);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("preg#{} @{:.3}s", n, t0.elapsed().as_secs_f64());
+            }
             let pat = preg_pattern_str(it, name, args)?;
+            let _dbg = std::env::var_os("PREG_DEBUG").is_some().then(std::time::Instant::now);
             let subj = arg_bs(it, args, 1);
+            if let Some(t) = _dbg { eprintln!("  arg_bs: {:?}", t.elapsed()); }
+            let subj_rc = match arg(args, 1) {
+                Value::Str(s) => Some(s),
+                _ => None,
+            };
             let re = match php_regex(&pat) {
                 Ok(r) => r,
                 Err(e) => {
@@ -218,6 +304,11 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                     return Ok(Value::Bool(false));
                 }
             };
+            // PHP array_init's $matches before validating flags and
+            // offsets — any post-compile failure still leaves array(0).
+            if let Some(c) = args.get(2) {
+                *c.borrow_mut() = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+            }
             let all = name == "preg_match_all";
             let flags = arg(args, 3).to_int();
             let valid: i64 = if all { 1 | 2 | 256 | 512 } else { 256 | 512 };
@@ -246,22 +337,26 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                 off as usize
             };
             if offset > subj.len() {
-                return err(
-                    "ValueError",
-                    format!(
-                        "{}(): Argument #5 ($offset) must be contained in subject",
-                        name
-                    ),
-                );
-            }
-            if pat_is_utf(&pat) && !utf8_boundary(&subj, offset) {
-                it.last_preg_error = 5;
+                // PHP: pcre_handle_exec_error(BADOFFSET) → internal
+                // error + silent false, NOT a ValueError (bug74873).
+                it.last_preg_error = 1;
                 return Ok(Value::Bool(false));
             }
-            let hay: &[u8] = subj.get(offset..).unwrap_or(&[]);
+            if let Some(t) = _dbg { eprintln!("  compile+validate: {:?}", t.elapsed()); }
             let mut matches_arr = PhpArray::new();
             let mut count = 0i64;
-            let (caps, rc) = re.caps(hay, it);
+            let _dbg_rc_len = subj_rc.as_ref().map(|r| r.len());
+            let (caps, rc) = re.caps(&subj, offset, all, subj_rc, it);
+            if _dbg.is_some() {
+                eprintln!(
+                    "  caps off={} len={} utf8rc={:?} -> n={} rc={}",
+                    offset,
+                    subj.len(),
+                    _dbg_rc_len,
+                    caps.len(),
+                    rc
+                );
+            }
             if rc != 0 {
                 it.last_preg_error = preg_rc_err(rc);
                 return Ok(Value::Bool(false));
@@ -273,14 +368,14 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                     (Some((a, b)), true) => {
                         let mut pair = PhpArray::new();
                         pair.push(
-                            hay.get(a..b)
+                            subj.get(a..b)
                                 .map(|x| Value::bytes(x.to_vec()))
                                 .unwrap_or(Value::str("")),
                         );
-                        pair.push(Value::Int((a + offset) as i64));
+                        pair.push(Value::Int(a as i64));
                         Value::Array(Rc::new(RefCell::new(pair)))
                     }
-                    (Some((a, b)), false) => hay
+                    (Some((a, b)), false) => subj
                         .get(a..b)
                         .map(|x| Value::bytes(x.to_vec()))
                         .unwrap_or(Value::str("")),
@@ -305,10 +400,11 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                     for cap in &caps {
                         count += 1;
                         let mut row = PhpArray::new();
-                        // trailing unmatched groups are omitted; interior
-                        // unmatched groups stay as "" / null.
+                        // PHP pads to num_subpats only under
+                        // UNMATCHED_AS_NULL; without it groups past the
+                        // match's group count are omitted (bug61780).
                         let last = if flags & 512 != 0 {
-                            ngroups - 1
+                            ngroups
                         } else {
                             cap.spans
                                 .iter()
@@ -319,9 +415,15 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                         for g in 0..last.min(cap.spans.len().max(ngroups)) {
                             let span = cap.spans.get(g).copied().flatten();
                             let v = entry(span);
-                            // named alias precedes its numeric key
+                            // named alias precedes its numeric key;
+                            // (?J) dup names: a participating group
+                            // overwrites, an unset one only fills an
+                            // absent slot (PHP add_named, bug79257).
                             if let Some(n) = re.group_name(g) {
-                                row.set(ArrKey::Str(n.into()), v.clone());
+                                let k = ArrKey::Str(n.into());
+                                if span.is_some() || row.get(&k).is_none() {
+                                    row.set(k, v.clone());
+                                }
                             }
                             row.set(ArrKey::Int(g as i64), v);
                         }
@@ -363,8 +465,9 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                 }
             } else if let Some(cap) = caps.into_iter().next() {
                 count = 1;
+                let ngroups = re.captures_len();
                 let last = if flags & 512 != 0 {
-                    cap.spans.len()
+                    ngroups
                 } else {
                     cap.spans
                         .iter()
@@ -372,11 +475,14 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                         .map(|i| i + 1)
                         .unwrap_or(0)
                 };
-                for g in 0..last.min(cap.spans.len()) {
+                for g in 0..last.min(cap.spans.len().max(ngroups)) {
                     let span = cap.spans.get(g).copied().flatten();
                     let v = entry(span);
                     if let Some(n) = re.group_name(g) {
-                        matches_arr.set(ArrKey::Str(n.into()), v.clone());
+                        let k = ArrKey::Str(n.into());
+                        if span.is_some() || matches_arr.get(&k).is_none() {
+                            matches_arr.set(k, v.clone());
+                        }
                     }
                     matches_arr.set(ArrKey::Int(g as i64), v);
                 }
@@ -409,8 +515,11 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                 },
             )
             .to_int();
-            // (pattern, callback-or-replacement) pairs
-            let pairs: Vec<(Vec<u8>, Value)> = if name == "preg_replace_callback" {
+            // (raw pattern element, callback-or-replacement) pairs.
+            // PHP converts pattern/subject elements lazily inside the
+            // replace loop (php_replace_in_subject_func), so keep raw
+            // Values here and convert per element below.
+            let pairs: Vec<(Value, Value)> = if name == "preg_replace_callback" {
                 // arg #2 is the single callback (may itself be an array
                 // like [$obj, 'method'] — not a replacement list)
                 let cb = arg(args, 1);
@@ -418,11 +527,11 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                     Value::Array(a) => {
                         let mut ps = Vec::new();
                         for (_, c) in a.borrow().iter() {
-                            ps.push((pat_elem_str(it, c)?, cb.clone()));
+                            ps.push((c.borrow().clone(), cb.clone()));
                         }
                         ps
                     }
-                    v => vec![(v.to_php_bytes(), cb)],
+                    v => vec![(v, cb)],
                 }
             } else if name == "preg_replace_callback_array" {
                 match arg(args, 0) {
@@ -440,7 +549,9 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                         a.borrow()
                             .entries
                             .iter()
-                            .map(|(k, c)| (key_str(k).into_bytes(), c.borrow().clone()))
+                            .map(|(k, c)| {
+                                (Value::bytes(key_str(k).into_bytes()), c.borrow().clone())
+                            })
                             .collect()
                     }
                     _ => Vec::new(),
@@ -487,7 +598,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                             // pattern; an array replacement is strictly
                             // positional (missing entries mean "").
                             ps.push((
-                                pat_elem_str(it, c)?,
+                                c.borrow().clone(),
                                 repls
                                     .get(i)
                                     .or(if repl_scalar { repls.first() } else { None })
@@ -497,15 +608,14 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                         }
                         ps
                     }
-                    v => vec![(
-                        v.to_php_bytes(),
-                        repls.into_iter().next().unwrap_or(Value::Null),
-                    )],
+                    v => vec![(v, repls.into_iter().next().unwrap_or(Value::Null))],
                 }
             };
             let subj_arg = if cb_arr { 1 } else { 2 };
             for (p, cb) in &pairs {
-                if cb_family && !preg_callable_ok(it, cb) {
+                // preg_replace_callback_array checks each callback
+                // lazily when its pattern is reached (below).
+                if cb_family && !cb_arr && !preg_callable_ok(it, cb) {
                     return err(
                         "TypeError",
                         format!(
@@ -546,117 +656,198 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                     );
                 }
             }
-            let mut subjects: Vec<(ArrKey, Vec<u8>)> = Vec::new();
-            match arg(args, subj_arg) {
-                Value::Array(a) => {
-                    for (k, c) in a.borrow().iter() {
-                        subjects.push((k.clone(), subj_elem_str(it, c)?));
-                    }
+            if cb_arr {
+                // preg_replace_callback_array is the opposite loop to
+                // preg_replace_callback: patterns outer, subjects
+                // inner. PHP runs the WHOLE subject through each
+                // pattern (result feeds the next one) and checks the
+                // pattern's callback only when it is reached.
+                enum Subj {
+                    Scalar(Vec<u8>),
+                    Arr(Vec<(ArrKey, Value)>),
                 }
-                v => subjects.push((ArrKey::Int(0), v.to_php_bytes())),
-            };
-            let mut total = 0i64;
-            let mut results: Vec<(ArrKey, Option<Vec<u8>>)> = Vec::new();
-            for (k, subj) in subjects {
-                let mut cur = subj;
-                let mut matched = false;
-                for (p, cb) in &pairs {
-                    let re = match php_regex(p) {
+                let mut subject = match arg(args, subj_arg) {
+                    Value::Array(a) => Subj::Arr(
+                        a.borrow()
+                            .iter()
+                            .map(|(k, c)| (k.clone(), c.borrow().clone()))
+                            .collect(),
+                    ),
+                    v => Subj::Scalar(v.to_php_bytes()),
+                };
+                let mut total = 0i64;
+                let mut pending_err: Option<PhpError> = None;
+                for (pv, cbv) in &pairs {
+                    if !preg_callable_ok(it, cbv) {
+                        return err(
+                            "TypeError",
+                            format!(
+                                "{}(): Argument #1 ($pattern) must contain only valid callbacks",
+                                name
+                            ),
+                        );
+                    }
+                    let p = pat_elem_str(it, &cell(pv.clone()))?;
+                    let re = match php_regex(&p) {
                         Ok(r) => r,
                         Err(e) => {
                             regex_err(it, name, &e)?;
-                            return Ok(Value::Null);
+                            // NULL result: scalar -> null, array ->
+                            // every element dropped.
+                            return Ok(match &subject {
+                                Subj::Scalar(_) => Value::Null,
+                                Subj::Arr(_) => Value::Array(Rc::new(RefCell::new(
+                                    PhpArray::new(),
+                                ))),
+                            });
                         }
                     };
-                    if name == "preg_replace_callback" || name == "preg_replace_callback_array" {
-                        let mut out: Vec<u8> = Vec::new();
-                        let mut last = 0usize;
-                        let mut n = 0i64;
-                        let (caps, rc) = re.caps(&cur, it);
-                        if rc != 0 {
-                            it.last_preg_error = preg_rc_err(rc);
-                            return Ok(Value::Null);
+                    match &mut subject {
+                        Subj::Scalar(cur) => {
+                            match apply_cb_pattern(
+                                it,
+                                name,
+                                &re,
+                                cbv,
+                                cur,
+                                flags,
+                                limit,
+                                &mut pending_err,
+                            )? {
+                                Some((o, n)) => {
+                                    *cur = o;
+                                    total += n;
+                                }
+                                None => {
+                                    if pending_err.is_none() {
+                                        return Ok(Value::Null);
+                                    }
+                                }
+                            }
                         }
-                        for cap in &caps {
-                            if limit > 0 && n >= limit {
+                        Subj::Arr(elems) => {
+                            let mut kept: Vec<(ArrKey, Value)> = Vec::new();
+                            for (k, v) in elems.iter() {
+                                // Subject conversion failure aborts
+                                // the whole call.
+                                let cur = subj_elem_str(it, &cell(v.clone()))?;
+                                match apply_cb_pattern(
+                                    it,
+                                    name,
+                                    &re,
+                                    cbv,
+                                    &cur,
+                                    flags,
+                                    limit,
+                                    &mut pending_err,
+                                )? {
+                                    Some((o, n)) => {
+                                        total += n;
+                                        kept.push((k.clone(), Value::bytes(o)));
+                                    }
+                                    None => {}
+                                }
+                            }
+                            *elems = kept;
+                        }
+                    }
+                    if pending_err.is_some() {
+                        break;
+                    }
+                }
+                if let Some(e) = pending_err {
+                    return Err(e);
+                }
+                if let Some(c) = args.get(3) {
+                    *c.borrow_mut() = Value::Int(total);
+                }
+                return Ok(match subject {
+                    Subj::Scalar(v) => Value::bytes(v),
+                    Subj::Arr(elems) => {
+                        let mut out = PhpArray::new();
+                        for (k, v) in elems {
+                            out.set(k, v);
+                        }
+                        Value::Array(Rc::new(RefCell::new(out)))
+                    }
+                });
+            }
+            let mut subjects: Vec<(ArrKey, Value)> = Vec::new();
+            match arg(args, subj_arg) {
+                Value::Array(a) => {
+                    for (k, c) in a.borrow().iter() {
+                        subjects.push((k.clone(), c.borrow().clone()));
+                    }
+                }
+                v => subjects.push((ArrKey::Int(0), v)),
+            };
+            let mut total = 0i64;
+            let mut results: Vec<(ArrKey, Option<Vec<u8>>)> = Vec::new();
+            // Callback-family pattern conversion failures are pending
+            // errors: they break only the current element's pattern
+            // loop and propagate after every subject was processed
+            // (PHP keeps running its C loop with the exception set, so
+            // later elements' warnings still fire).
+            let mut pending_err: Option<PhpError> = None;
+            for (k, subjv) in subjects {
+                let mut cur = subj_elem_str(it, &cell(subjv))?;
+                let mut matched = false;
+                let mut elem_ok = true;
+                for (pv, cb) in &pairs {
+                    let p = match pat_elem_str(it, &cell(pv.clone())) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            if pending_err.is_none() {
+                                pending_err = Some(e);
+                            }
+                            break;
+                        }
+                    };
+                    let re = match php_regex(&p) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            // Compile failure = NULL result for this
+                            // element (dropped from the array result),
+                            // not an abort of the whole call.
+                            regex_err(it, name, &e)?;
+                            elem_ok = false;
+                            break;
+                        }
+                    };
+                    if cb_family {
+                        match apply_cb_pattern(
+                            it,
+                            name,
+                            &re,
+                            cb,
+                            &cur,
+                            flags,
+                            limit,
+                            &mut pending_err,
+                        )? {
+                            Some((o, n)) => {
+                                cur = o;
+                                total += n;
+                                if n > 0 {
+                                    matched = true;
+                                }
+                            }
+                            None => {
+                                elem_ok = false;
                                 break;
                             }
-                            let Some(Some((ms, me))) = cap.spans.first() else {
-                                continue;
-                            };
-                            n += 1;
-                            matched = true;
-                            out.extend_from_slice(cur.get(last..*ms).unwrap_or(&[]));
-                            let mut group_arr = PhpArray::new();
-                            let glast = if flags & 512 != 0 {
-                                cap.spans.len()
-                            } else {
-                                cap.spans
-                                    .iter()
-                                    .rposition(|sp| sp.is_some())
-                                    .map(|i| i + 1)
-                                    .unwrap_or(0)
-                            };
-                            for g in 0..glast {
-                                let span = cap.spans.get(g).copied().flatten();
-                                let v = match (span, flags & 256 != 0) {
-                                    (Some((a, b)), true) => {
-                                        let mut pair = PhpArray::new();
-                                        pair.push(
-                                            cur.get(a..b)
-                                                .map(|x| Value::bytes(x.to_vec()))
-                                                .unwrap_or(Value::str("")),
-                                        );
-                                        pair.push(Value::Int(a as i64));
-                                        Value::Array(Rc::new(RefCell::new(pair)))
-                                    }
-                                    (Some((a, b)), false) => cur
-                                        .get(a..b)
-                                        .map(|x| Value::bytes(x.to_vec()))
-                                        .unwrap_or(Value::str("")),
-                                    (None, true) => {
-                                        let mut pair = PhpArray::new();
-                                        pair.push(if flags & 512 != 0 {
-                                            Value::Null
-                                        } else {
-                                            Value::str("")
-                                        });
-                                        pair.push(Value::Int(-1));
-                                        Value::Array(Rc::new(RefCell::new(pair)))
-                                    }
-                                    (None, false) if flags & 512 != 0 => Value::Null,
-                                    (None, false) => Value::str(""),
-                                };
-                                if let Some(n) = re.group_name(g) {
-                                    group_arr.set(ArrKey::Str(n.into()), v.clone());
-                                }
-                                group_arr.push(v);
-                            }
-                            if let Some(m) = &cap.mark {
-                                group_arr.set(ArrKey::Str("MARK".into()), Value::str(m.clone()));
-                            }
-                            let r = it.call_value(
-                                cb,
-                                crate::interp::CallArgs::positional(vec![cell(Value::Array(
-                                    Rc::new(RefCell::new(group_arr)),
-                                ))]),
-                            )?;
-                            out.extend_from_slice(&r.to_php_bytes());
-                            last = *me;
                         }
-                        out.extend_from_slice(&cur[last..]);
-                        total += n;
-                        cur = out;
                     } else {
                         let repl = cb.to_php_bytes();
                         let mut n = 0i64;
                         let src = cur.clone();
                         let mut out: Vec<u8> = Vec::new();
                         let mut last = 0usize;
-                        let (caps, rc) = re.caps(&src, it);
+                        let (caps, rc) = re.caps(&src, 0, true, None, it);
                         if rc != 0 {
                             it.last_preg_error = preg_rc_err(rc);
-                            return Ok(Value::Null);
+                            elem_ok = false;
+                            break;
                         }
                         for cap in &caps {
                             if limit > 0 && n >= limit {
@@ -730,8 +921,11 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                         cur = out;
                     }
                 }
-                let keep = name != "preg_filter" || matched;
+                let keep = elem_ok && (name != "preg_filter" || matched);
                 results.push((k, if keep { Some(cur) } else { None }));
+            }
+            if let Some(e) = pending_err {
+                return Err(e);
             }
             if let Some(c) = args.get(if cb_arr { 3 } else { 4 }) {
                 *c.borrow_mut() = Value::Int(total);
@@ -766,7 +960,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
             };
             let mut out = PhpArray::new();
             let mut last = 0usize;
-            let (caps, rc) = re.caps(&subj, it);
+            let (caps, rc) = re.caps(&subj, 0, true, None, it);
             if rc != 0 {
                 it.last_preg_error = preg_rc_err(rc);
                 return Ok(Value::Bool(false));
@@ -842,7 +1036,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                         }
                         _ => v.to_php_bytes(),
                     };
-                    let (caps, rc) = re.caps(&s, it);
+                    let (caps, rc) = re.caps(&s, 0, true, None, it);
                     if rc != 0 {
                         it.last_preg_error = preg_rc_err(rc);
                         return Ok(Value::Bool(false));
@@ -914,18 +1108,23 @@ pub(in crate::builtins) fn php_regex(pat: &[u8]) -> Result<PhpRe, String> {
     }
     let flags = &pat[end + 1..];
     let body = &pat[1..end];
-    let mut wrapped = String::new();
-    let mut anchor = false;
+    // PHP maps modifiers to PCRE2 compile options, NOT to `(?i)`
+    // prefixes — the pattern body must stay verbatim so leading
+    // `(*VERB)` specials (`(*NO_JIT)`, `(*UTF)`, `(*MARK)`) still sit
+    // at position 0 where PCRE2 requires them (bug76909).
     let mut opts: u32 = 0;
     let mut extra_opts: u32 = 0;
     let mut need_pcre = false;
     for f in flags.iter().map(|&b| b as char) {
         match f {
-            'i' => wrapped.push_str("(?i)"),
-            'm' => wrapped.push_str("(?m)"),
-            's' => wrapped.push_str("(?s)"),
-            'x' => wrapped.push_str("(?x)"),
-            'A' => anchor = true,
+            'i' => opts |= pcre2_sys::PCRE2_CASELESS,
+            'm' => opts |= pcre2_sys::PCRE2_MULTILINE,
+            's' => opts |= pcre2_sys::PCRE2_DOTALL,
+            'x' => opts |= pcre2_sys::PCRE2_EXTENDED,
+            // PCRE2_ANCHORED pins to the current start_offset — a
+            // `\A` prefix would wrongly pin to position 0 when an
+            // offset is passed.
+            'A' => opts |= pcre2_sys::PCRE2_ANCHORED,
             'D' => {
                 opts |= pcre2_sys::PCRE2_DOLLAR_ENDONLY;
                 need_pcre = true;
@@ -939,12 +1138,14 @@ pub(in crate::builtins) fn php_regex(pat: &[u8]) -> Result<PhpRe, String> {
                 need_pcre = true;
             }
             'u' => {
+                // PHP compiles /u with NEVER_BACKSLASH_C so `\C` is a
+                // compile error under /u (gh21134). Invalid-UTF8
+                // subjects are validated region-wise at match time,
+                // not via MATCH_INVALID_UTF (which would tolerate
+                // them silently).
                 opts |= pcre2_sys::PCRE2_UTF
                     | pcre2_sys::PCRE2_UCP
-                    // PHP compiles with MATCH_INVALID_UTF so bad-UTF8
-                    // subjects report PREG_BAD_UTF8_ERROR (10.34+ default
-                    // silently tolerates them otherwise).
-                    | pcre2_sys::PCRE2_MATCH_INVALID_UTF;
+                    | pcre2_sys::PCRE2_NEVER_BACKSLASH_C;
                 need_pcre = true;
             }
             'r' => {
@@ -982,13 +1183,7 @@ pub(in crate::builtins) fn php_regex(pat: &[u8]) -> Result<PhpRe, String> {
         }
     }
     let _ = (need_pcre, has_backref, pcre_only);
-    let mut src: Vec<u8> = Vec::new();
-    if anchor {
-        src.extend_from_slice(b"\\A");
-    }
-    src.extend_from_slice(wrapped.as_bytes());
-    src.extend_from_slice(body);
-    crate::pcre::compile(&src, opts, extra_opts)
+    crate::pcre::compile(body, opts, extra_opts)
         .map(PhpRe::Pcre)
         .map_err(|e| format!("Compilation failed: {}", e))
 }
@@ -1010,20 +1205,56 @@ impl PhpRe {
         }
     }
     /// All matches in order, normalized to group byte spans, plus the
-    /// PCRE2 error code that stopped the scan (0 = clean).
-    pub(in crate::builtins) fn caps(&self, s: &[u8], it: &Interp) -> (Vec<PhpCap>, i32) {
+    /// PCRE2 error code that stopped the scan (0 = clean). `s` is the
+    /// FULL subject with `offset` the scan start — spans come back
+    /// absolute. `subj_rc` pins the subject storage so a validated
+    /// string's UTF-8 validity can be cached across calls (PHP's
+    /// IS_STR_VALID_UTF8 flag — bug72685).
+    pub(in crate::builtins) fn caps(
+        &self,
+        s: &[u8],
+        offset: usize,
+        global: bool,
+        subj_rc: Option<Rc<[u8]>>,
+        it: &mut Interp,
+    ) -> (Vec<PhpCap>, i32) {
         match self {
             PhpRe::Pcre(r) => {
-                // PHP validates the subject under /u: a bad-UTF8 input
-                // reports PREG_BAD_UTF8_ERROR (-36 = UTF8_ERR1 class).
-                if r.utf8 && std::str::from_utf8(s).is_err() {
-                    return (Vec::new(), -36);
-                }
+                // PHP's options decision (is_known_valid_utf8): skip
+                // UTF-8 validation only when the storage was already
+                // proven valid AND the offset sits on a char boundary.
+                // Otherwise pcre2 validates the region [offset, len)
+                // itself — its BADUTFOFFSET / UTF8_ERRn map straight
+                // to preg error codes.
+                let known_valid = r.utf8
+                    && subj_rc
+                        .as_ref()
+                        .is_some_and(|rc| {
+                            it.valid_utf8.contains_key(&(Rc::as_ptr(rc) as *const u8 as usize))
+                        })
+                    && (offset == s.len() || (s[offset] & 0xC0) != 0x80);
                 let (v, e) = r.match_all(
                     s,
+                    offset,
+                    global,
+                    if known_valid {
+                        pcre2_sys::PCRE2_NO_UTF_CHECK
+                    } else {
+                        0
+                    },
                     it.ini_int("pcre.backtrack_limit", 1_000_000).max(0) as u32,
-                    it.ini_int("pcre.recursion_limit", 100_000).max(0) as u32,
+                    // Vendored pcre2 10.45 counts one more frame than
+                    // PHP's 10.49 for the same depth_limit (grep2 needs
+                    // recursion_limit=1 to still match a flat pattern).
+                    (it.ini_int("pcre.recursion_limit", 100_000).max(0) as u32) + 1,
                 );
+                // A clean offset-0 scan under /u marks the storage
+                // valid — later calls skip re-validation entirely.
+                if r.utf8 && e == 0 && offset == 0 && !known_valid {
+                    if let Some(rc) = subj_rc {
+                        it.valid_utf8.insert(Rc::as_ptr(&rc) as *const u8 as usize, rc);
+                    }
+                }
                 (
                     v.into_iter()
                         .map(|m| PhpCap {

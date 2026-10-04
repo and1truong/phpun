@@ -255,6 +255,11 @@ pub struct Interp<'a> {
     pub last_json_error: i64,
     /// Set by the preg_* builtins for preg_last_error().
     pub last_preg_error: i64,
+    /// Zend's IS_STR_VALID_UTF8 flag: string storage (keyed by Rc
+    /// pointer) proven fully valid UTF-8 — /u preg calls skip
+    /// re-validating it (bug72685). The Rcs stay in the map so the
+    /// pointer keys can't be recycled.
+    pub valid_utf8: std::collections::HashMap<usize, std::rc::Rc<[u8]>>,
     /// Raw request body for php://input — serve mode fills it.
     pub php_input: std::rc::Rc<Vec<u8>>,
     /// Real upload tmp paths created this request — is_uploaded_file()
@@ -752,6 +757,7 @@ impl<'a> Interp<'a> {
             resp_code: 200,
             last_json_error: 0,
             last_preg_error: 0,
+            valid_utf8: std::collections::HashMap::new(),
             php_input: std::rc::Rc::new(Vec::new()),
             uploads: Vec::new(),
             ob_stack: Vec::new(),
