@@ -7,6 +7,7 @@
 pub mod ast;
 pub mod builtins;
 pub mod error;
+pub mod fmt;
 pub mod highlight;
 pub mod interp;
 pub mod lexer;

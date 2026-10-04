@@ -47,6 +47,11 @@ pub struct Lexed {
     /// bit 2 = whitespace on the right. Qualified names forbid whitespace
     /// inside them (namespaced_name_whitespace).
     pub ws_adj: u8,
+    /// Byte offsets into the lexed source; `usize::MAX` for synthesized
+    /// tokens (compile-time diagnostics). `phpun fmt` uses them to
+    /// recover raw token text and the trivia between tokens.
+    pub start: usize,
+    pub end: usize,
 }
 
 const KEYWORDS: &[&str] = &[
@@ -178,14 +183,20 @@ fn scan_html(
         let rest = &src[pos..];
         match rest.find("<?") {
             None => {
-                push(out, Token::Inline(rest.to_string()), *line);
+                push(
+                    out,
+                    Token::Inline(rest.to_string()),
+                    *line,
+                    pos,
+                    bytes.len(),
+                );
                 pos = bytes.len();
             }
             Some(off) => {
                 if off > 0 {
                     let html = &rest[..off];
                     *line += html.matches('\n').count();
-                    push(out, Token::Inline(html.to_string()), *line);
+                    push(out, Token::Inline(html.to_string()), *line, pos, pos + off);
                 }
                 let tag_at = pos + off;
                 let after = &src[tag_at..];
@@ -198,7 +209,7 @@ fn scan_html(
                     pos = lex_php(src, pos, line, out)?;
                 } else if after.starts_with("<?=") {
                     pos = tag_at + 3;
-                    push(out, Token::Echo, *line);
+                    push(out, Token::Echo, *line, tag_at, tag_at + 3);
                     pos = lex_php(src, pos, line, out)?;
                 } else if short_open
                     && (rest[off..].starts_with("<?\n")
@@ -211,7 +222,13 @@ fn scan_html(
                     pos += skip_ws_and_newline(&src[pos..], line);
                     pos = lex_php(src, pos, line, out)?;
                 } else {
-                    push(out, Token::Inline("<?".to_string()), *line);
+                    push(
+                        out,
+                        Token::Inline("<?".to_string()),
+                        *line,
+                        tag_at,
+                        tag_at + 2,
+                    );
                     pos = tag_at + 2;
                 }
             }
@@ -243,11 +260,13 @@ fn skip_ws_and_newline(s: &str, line: &mut usize) -> usize {
     n
 }
 
-fn push(out: &mut Vec<Lexed>, token: Token, line: usize) {
+fn push(out: &mut Vec<Lexed>, token: Token, line: usize, start: usize, end: usize) {
     out.push(Lexed {
         token,
         line,
         ws_adj: 0,
+        start,
+        end,
     });
 }
 
@@ -270,7 +289,7 @@ fn lex_php(
             }
             b'#' if b.get(pos + 1) == Some(&b'[') => {
                 // PHP 8 attribute `#[...]` — a real token, not a comment.
-                push(out, Token::Op("#["), *line);
+                push(out, Token::Op("#["), *line, pos, pos + 2);
                 pos += 2;
             }
             b'#' => {
@@ -311,7 +330,7 @@ fn lex_php(
                 pos += 2;
                 // `?>` implies end of statement; a single following newline is
                 // swallowed by PHP (it is part of the close tag).
-                push(out, Token::Op(";"), *line);
+                push(out, Token::Op(";"), *line, pos - 2, pos);
                 if b.get(pos) == Some(&b'\n') {
                     pos += 1;
                     *line += 1;
@@ -324,10 +343,10 @@ fn lex_php(
             b'$' => {
                 let (name, n) = ident(src, pos + 1);
                 if name.is_empty() {
-                    push(out, Token::Op("$"), *line);
+                    push(out, Token::Op("$"), *line, pos, pos + 1);
                     pos += 1;
                 } else {
-                    push(out, Token::Variable(name), *line);
+                    push(out, Token::Variable(name), *line, pos, pos + 1 + n);
                     pos += 1 + n;
                 }
             }
@@ -337,6 +356,8 @@ fn lex_php(
                     ws_adj: 0,
                     token: tok,
                     line: *line,
+                    start: pos,
+                    end: pos + n,
                 });
                 pos += n;
             }
@@ -346,12 +367,14 @@ fn lex_php(
                     ws_adj: 0,
                     token: tok,
                     line: *line,
+                    start: pos,
+                    end: pos + n,
                 });
                 pos += n;
             }
             b'\'' => {
                 let (s, n) = single_string(src, pos, *line)?;
-                push(out, Token::SimpleString(s), *line);
+                push(out, Token::SimpleString(s), *line, pos, pos + n);
                 *line += s_matches(&src[pos..pos + n]);
                 pos += n;
             }
@@ -359,7 +382,7 @@ fn lex_php(
                 let start = *line;
                 let (parts, n) = double_string(src, pos, start, out)?;
                 *line += s_matches(&src[pos..pos + n]);
-                push(out, Token::InterpString(parts), start);
+                push(out, Token::InterpString(parts), start, pos, pos + n);
                 pos += n;
             }
             b'`' => {
@@ -372,7 +395,7 @@ fn lex_php(
                 let start = *line;
                 let (tok, n) = heredoc(src, pos, start, out)?;
                 *line += s_matches(&src[pos..pos + n]);
-                push(out, tok, start);
+                push(out, tok, start, pos, pos + n);
                 pos += n;
             }
             _ => {
@@ -382,13 +405,13 @@ fn lex_php(
                     let start = *line;
                     let (tok, n) = heredoc(src, pos + 1, start, out)?;
                     *line += s_matches(&src[pos..pos + n + 1]);
-                    push(out, tok, start);
+                    push(out, tok, start, pos, pos + n + 1);
                     pos += n + 1;
                     continue;
                 }
                 if c == b'_' || c.is_ascii_alphabetic() || c >= 0x80 {
                     let (name, n) = ident(src, pos);
-                    push(out, Token::Ident(name), *line);
+                    push(out, Token::Ident(name), *line, pos, pos + n);
                     pos += n;
                 } else {
                     let (op, n) = operator(src, pos).ok_or_else(|| {
@@ -401,7 +424,7 @@ fn lex_php(
                         };
                         PhpError::parse(msg, *line)
                     })?;
-                    push(out, Token::Op(op), *line);
+                    push(out, Token::Op(op), *line, pos, pos + n);
                     if op == "\\" {
                         let lt = out.last_mut().unwrap();
                         if pos > 0 && b[pos - 1].is_ascii_whitespace() {
@@ -681,6 +704,8 @@ fn interp_scan(
                                 ),
                                 line: line + s_matches(&src[pos..pos + n]),
                                 ws_adj: 0,
+                                start: usize::MAX,
+                                end: usize::MAX,
                             });
                             (vec![(v & 0xff) as u8], k)
                         } else {
@@ -805,6 +830,8 @@ fn interp_scan(
                                 token: Token::Diag(level, msg),
                                 line: line + s_matches(&src[pos..pos + n]),
                                 ws_adj: 0,
+                                start: usize::MAX,
+                                end: usize::MAX,
                             });
                         }
                     }
@@ -847,6 +874,8 @@ fn interp_scan(
                                     token: Token::Diag(level, msg),
                                     line: line + s_matches(&src[pos..pos + n]),
                                     ws_adj: 0,
+                                    start: usize::MAX,
+                                    end: usize::MAX,
                                 });
                             }
                         }
@@ -858,6 +887,8 @@ fn interp_scan(
                         ),
                         line: line + s_matches(&src[pos..pos + n]),
                         ws_adj: 0,
+                        start: usize::MAX,
+                        end: usize::MAX,
                     });
                     parts.push(StringPart::DollarBraceExpr(
                         src[pos + n + 2..pos + k].to_string(),

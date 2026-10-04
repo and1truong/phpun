@@ -29,7 +29,19 @@ cargo build --release
 # run the PHPT harness against phpun, with reference PHP for diffs
 ./target/release/phpun phpt vendor/php-tests/tests/lang \
     --sut ./target/release/phpun --php /path/to/php -j 8
+
+# format PHP source PSR-12-style (stdout, or check/diff/write)
+./target/release/phpun fmt src/ --diff
+./target/release/phpun fmt -w src/
 ```
+
+`phpun fmt` is a token-stream formatter built on phpun's own lexer
+(no tree-sitter): 4-space indent, braces, spacing, PSR-12-ish. It is
+idempotent and never invents or drops tokens — only whitespace and
+line breaks change. `--check` prints unformatted files and exits 1
+(for CI), `--diff` prints a unified diff, `-w` writes in place. With
+no flag the formatted source goes to stdout. Directory arguments are
+walked for `*.php` (skipping `vendor/` and dot-dirs).
 
 A reproducible PHP 8.5 reference binary is needed for SKIPIF evaluation
 and differential diffs (`--php`). Any `php` 8.5 on PATH works (e.g. via
@@ -49,7 +61,8 @@ PHP source → lexer → parser → AST → interpreter (Rust, no Zend Engine)
 | `phpun-core`   | lexer, parser, AST, values, interpreter, builtins   |
 | `phpun-phpt`   | PHPT parser, EXPECT/EXPECTF/EXPECTREGEX matcher,    |
 |                | runner (INI/ARGS/ENV/CLEAN/SKIPIF), diff, report    |
-| `phpun`        | CLI: `phpun <file.php>`, `phpun phpt <paths>`       |
+| `phpun`        | CLI: `phpun <file.php>`, `phpun phpt <paths>`,      |
+|                | `phpun fmt <paths>`                                 |
 
 The PHPT runner supports `FILE`, `EXPECT`, `EXPECTF`, `EXPECTREGEX`,
 `SKIPIF`, `INI`, `ARGS`, `ENV`, `CLEAN`, captures stdout/stderr/exit
@@ -69,8 +82,8 @@ machine-readable JSON report plus compact diffs for failures.
 - [ ] M8: Laravel/Symfony bootstrap
 - [ ] M9: WordPress executes
 
-Later CLI shape: `phpun run|test|serve|install|fmt` — only what tests
-require is implemented.
+Later CLI shape: `phpun run|test|serve|install` — `fmt` (#30) is
+implemented.
 
 ## Development
 

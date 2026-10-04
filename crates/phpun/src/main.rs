@@ -11,6 +11,7 @@ fn main() -> ExitCode {
         Some("install") => install::cli(&args[1..]),
         Some("serve") => serve(&args[1..]),
         Some("test") => run_tests(&args[1..]),
+        Some("fmt") => fmt(&args[1..]),
         Some("--version") | Some("-v") => {
             println!("phpun 0.0.1 (php compat target: 8.5)");
             ExitCode::SUCCESS
@@ -24,6 +25,7 @@ fn main() -> ExitCode {
                 "  phpun install [-d DIR]        resolve composer.json deps into vendor/ (#29)"
             );
             eprintln!("  phpun test [path] [flags]    run userland *_test.php / *Test.php files");
+            eprintln!("  phpun fmt [-w] [--check] [--diff] <path>...  PSR-12 formatter (#30)");
             ExitCode::SUCCESS
         }
         _ => run_script(&args),
@@ -302,6 +304,115 @@ fn run_tests(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// `phpun fmt [-w|--write] [--check] [--diff] <path>...` (#30)
+///
+/// Formats PHP sources PSR-12-style over our own lexer. Directories
+/// are walked for `*.php`. Without flags a single file is printed to
+/// stdout; `-w` rewrites in place, `--check` exits non-zero when any
+/// file differs (for CI), `--diff` shows a unified diff.
+fn fmt(args: &[String]) -> ExitCode {
+    let mut write = false;
+    let mut check = false;
+    let mut diff = false;
+    let mut paths: Vec<String> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "-w" | "--write" => write = true,
+            "--check" => check = true,
+            "--diff" => diff = true,
+            _ => paths.push(a.clone()),
+        }
+    }
+    if paths.is_empty() {
+        eprintln!("usage: phpun fmt [-w|--write] [--check] [--diff] <path>...");
+        return ExitCode::FAILURE;
+    }
+    let mut files = Vec::new();
+    for p in &paths {
+        let rp = std::path::Path::new(p);
+        if rp.is_dir() {
+            collect_php(rp, &mut files);
+        } else {
+            files.push(rp.to_path_buf());
+        }
+    }
+    files.sort();
+    if files.len() > 1 && !write && !check && !diff {
+        eprintln!("phpun fmt: multiple files need -w, --check or --diff");
+        return ExitCode::FAILURE;
+    }
+    let mut changed = 0usize;
+    let mut failed = false;
+    for file in &files {
+        let name = file.display().to_string();
+        let src = match std::fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("phpun fmt: {}: {}", name, e);
+                failed = true;
+                continue;
+            }
+        };
+        let out = match phpun_core::fmt::format(&src) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("phpun fmt: {}: {}", name, e);
+                failed = true;
+                continue;
+            }
+        };
+        if !write && !check && !diff {
+            // stdout mode — always emit the formatted text.
+            print!("{}", out);
+            continue;
+        }
+        if out == src {
+            continue;
+        }
+        changed += 1;
+        if diff {
+            println!("--- {}\n+++ {}", name, name);
+            print!("{}", phpun_core::fmt::unified_diff(&src, &out, 3));
+        } else if check {
+            println!("{}", name);
+        } else if write {
+            if let Err(e) = std::fs::write(file, &out) {
+                eprintln!("phpun fmt: {}: {}", name, e);
+                failed = true;
+            } else {
+                eprintln!("formatted {}", name);
+            }
+        } else {
+            print!("{}", out);
+        }
+    }
+    if check && changed > 0 {
+        eprintln!("phpun fmt: {} file(s) not formatted", changed);
+        return ExitCode::FAILURE;
+    }
+    if failed {
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+fn collect_php(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name != "vendor" && !name.starts_with('.') {
+                collect_php(&p, out);
+            }
+        } else if p.extension().and_then(|x| x.to_str()) == Some("php") {
+            out.push(p);
+        }
     }
 }
 
