@@ -922,14 +922,25 @@ impl<'a> Interp<'a> {
 
     /// PHP binds a compilation unit's unconditional top-level function
     /// decls before executing it (bug23279's later-declared handler).
-    fn hoist_funcs(&mut self, stmts: &[Stmt]) {
+    /// A name collision is PHP's compile-time "Cannot redeclare" fatal.
+    fn hoist_funcs(&mut self, stmts: &[Stmt]) -> Result<(), PhpError> {
         for s in stmts {
             match s {
                 Stmt::Function(d) => {
                     let _ = self.decl_type_checks(&d.name, d, None);
+                    let key = d.name.to_lowercase();
+                    if let Some(prev) = self.functions.get(&key) {
+                        return Err(PhpError::fatal(
+                            format!(
+                                "Cannot redeclare function {}() (previously declared in {}:{})",
+                                d.name, prev.file, prev.line
+                            ),
+                            d.line,
+                        ));
+                    }
                     let mut d = d.clone();
                     d.file = self.cur_file.clone();
-                    self.functions.insert(d.name.to_lowercase(), Rc::new(d));
+                    self.functions.insert(key, Rc::new(d));
                 }
                 // `namespace X { stmts }` parses as
                 // Block[Namespace, Block[stmts]] — decls inside are still
@@ -937,7 +948,7 @@ impl<'a> Interp<'a> {
                 Stmt::Block(v) if matches!(v.first(), Some(Stmt::Namespace(_))) => {
                     for s in &v[1..] {
                         if let Stmt::Block(inner) = s {
-                            self.hoist_funcs(inner);
+                            self.hoist_funcs(inner)?;
                         }
                     }
                 }
@@ -964,6 +975,7 @@ impl<'a> Interp<'a> {
                 _ => {}
             }
         }
+        Ok(())
     }
 
     pub fn run(&mut self, stmts: &[Stmt]) -> RunResult {
@@ -974,7 +986,12 @@ impl<'a> Interp<'a> {
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(ht as u64));
             self.deadline_secs = ht;
         }
-        self.hoist_funcs(stmts);
+        if let Err(e) = self.hoist_funcs(stmts) {
+            let flow = self.err_flow(e);
+            let result = self.finish(flow);
+            self.run_shutdown();
+            return result;
+        }
         let flow = self.exec_block(stmts);
         let result = self.finish(flow);
         self.run_shutdown();
@@ -1268,7 +1285,12 @@ impl<'a> Interp<'a> {
     pub fn run_source_ret(&mut self, src: &str) -> (RunResult, Option<Value>) {
         match parser::parse_source(src, self.ini_on("short_open_tag")) {
             Ok(stmts) => {
-                self.hoist_funcs(&stmts);
+                if let Err(e) = self.hoist_funcs(&stmts) {
+                    let flow = self.err_flow(e);
+                    let res = self.finish(flow);
+                    self.run_shutdown();
+                    return (res, None);
+                }
                 let flow = self.exec_block(&stmts);
                 let rv = match &flow {
                     Flow::Return(v) => Some(v.clone()),
