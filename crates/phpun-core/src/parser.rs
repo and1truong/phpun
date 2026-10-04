@@ -693,7 +693,25 @@ impl<'a> Parser<'a> {
                     || ((self.ident_is("abstract")
                         || self.ident_is("final")
                         || self.ident_is("readonly"))
-                        && matches!(self.peek2(), Some(Token::Ident(k)) if k.eq_ignore_ascii_case("class")))
+                        && {
+                            // `final readonly class` / `abstract final`
+                            // — skip a second modifier in the lookahead.
+                            let mut n = 1;
+                            while matches!(
+                                self.toks.get(self.pos + n).map(|l| &l.token),
+                                Some(Token::Ident(k))
+                                    if ["abstract", "final", "readonly"]
+                                        .iter()
+                                        .any(|m| k.eq_ignore_ascii_case(m))
+                            ) {
+                                n += 1;
+                            }
+                            matches!(
+                                self.toks.get(self.pos + n).map(|l| &l.token),
+                                Some(Token::Ident(k))
+                                    if k.eq_ignore_ascii_case("class")
+                            )
+                        })
                 {
                     self.class_decl()
                 } else if self.ident_is("const")
@@ -3088,6 +3106,27 @@ impl<'a> Parser<'a> {
                                     }
                                     Ok(t.to_string())
                                 } else {
+                                    // `const string X` greedy-merge
+                                    // artifact: a builtin first segment
+                                    // means the `\`-suffix is the const
+                                    // name, not a qualified type — keep
+                                    // it unresolved for the caller's
+                                    // name recovery.
+                                    let first_seg = t
+                                        .split('\\')
+                                        .next()
+                                        .unwrap_or("")
+                                        .to_lowercase();
+                                    const FIRST_T: &[&str] = &[
+                                        "int", "float", "string", "bool", "array", "callable",
+                                        "iterable", "object", "mixed", "void", "never", "null",
+                                        "false", "true", "numeric", "resource",
+                                    ];
+                                    if t.contains('\\')
+                                        && FIRST_T.contains(&first_seg.as_str())
+                                    {
+                                        return Ok(t.to_string());
+                                    }
                                     // Resolve the RAW part — a leading `\`
                                     // marks the name as fully qualified
                                     // (namespaces/ns_055).
@@ -4348,7 +4387,15 @@ impl<'a> Parser<'a> {
                         args,
                     })
                 } else {
-                    Ok(Expr::Const(name))
+                    // `\true`/`\false`/`\null` are literals, not const
+                    // lookups (PHPUnit uses `\true` in strict code).
+                    let bare = name.trim_start_matches('\\');
+                    match bare.to_lowercase().as_str() {
+                        "true" => Ok(Expr::Bool(true)),
+                        "false" => Ok(Expr::Bool(false)),
+                        "null" => Ok(Expr::Null),
+                        _ => Ok(Expr::Const(name)),
+                    }
                 }
             }
             Some(t) => Err(PhpError::parse(
@@ -4374,6 +4421,12 @@ impl<'a> Parser<'a> {
             }
             let first = self.array_elem()?;
             if self.eat_op("=>") {
+                if matches!(first, Expr::Unpack(_)) {
+                    return Err(PhpError::parse(
+                        "syntax error, unexpected token \"=>\"",
+                        self.line(),
+                    ));
+                }
                 let v = self.array_elem()?;
                 items.push((Some(first), v));
             } else {
@@ -4387,9 +4440,12 @@ impl<'a> Parser<'a> {
         Ok(items)
     }
 
-    /// One array-literal element — may be `&expr` (bound by reference).
+    /// One array-literal element — may be `&expr` (bound by reference)
+    /// or `...expr` (spread, PHP 7.4+).
     fn array_elem(&mut self) -> Result<Expr, PhpError> {
-        if self.eat_op("&") {
+        if self.eat_op("...") {
+            Ok(Expr::Unpack(Box::new(self.expr()?)))
+        } else if self.eat_op("&") {
             Ok(Expr::ByRef(Box::new(self.expr()?)))
         } else {
             self.expr()

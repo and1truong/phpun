@@ -279,10 +279,14 @@ pub struct Interp<'a> {
     res_counter: u64,
     shutdown_fns: Vec<(Value, Vec<Cell>)>,
     error_handler: Option<Value>,
+    error_handler_stack: Vec<Value>,
+    exception_handler_stack: Vec<Value>,
     /// error_reporting() level mask (E_* bits).
     error_level: i64,
     /// putenv() overrides read back by getenv() (no real process-env mutation).
     env_overrides: HashMap<String, String>,
+    /// Raw argv entries after the script path, for `getopt()`.
+    pub script_args: Vec<String>,
     exception_handler: Option<Value>,
     in_handler: bool,
     /// Current line estimate for error messages (best-effort).
@@ -500,6 +504,24 @@ impl<'a> Interp<'a> {
         constants.insert("PATHINFO_EXTENSION".into(), Value::Int(4));
         constants.insert("PATHINFO_FILENAME".into(), Value::Int(8));
         constants.insert("PATHINFO_ALL".into(), Value::Int(15));
+        // glob() flags (glibc values, as on Linux PHP builds).
+        constants.insert("GLOB_MARK".into(), Value::Int(8));
+        constants.insert("GLOB_NOSORT".into(), Value::Int(32));
+        constants.insert("GLOB_NOCHECK".into(), Value::Int(16));
+        constants.insert("GLOB_NOESCAPE".into(), Value::Int(4096));
+        constants.insert("GLOB_BRACE".into(), Value::Int(128));
+        constants.insert("GLOB_ONLYDIR".into(), Value::Int(1 << 30));
+        constants.insert("GLOB_ERR".into(), Value::Int(4));
+        // flock/file flags.
+        constants.insert("LOCK_SH".into(), Value::Int(1));
+        constants.insert("LOCK_EX".into(), Value::Int(2));
+        constants.insert("LOCK_NB".into(), Value::Int(4));
+        constants.insert("LOCK_UN".into(), Value::Int(3));
+        constants.insert("FILE_USE_INCLUDE_PATH".into(), Value::Int(1));
+        constants.insert("FILE_NO_DEFAULT_CONTEXT".into(), Value::Int(16));
+        constants.insert("FILE_APPEND".into(), Value::Int(8));
+        constants.insert("FILE_IGNORE_NEW_LINES".into(), Value::Int(4));
+        constants.insert("FILE_SKIP_EMPTY_LINES".into(), Value::Int(2));
         // Reported as the engine's target PCRE2 level — feature checks
         // like symfony's `>= 10.39` gate on this, not the vendored lib.
         constants.insert("PCRE_VERSION".into(), Value::str("10.49 2026-09-28"));
@@ -729,8 +751,11 @@ impl<'a> Interp<'a> {
             res_counter: 0,
             shutdown_fns: Vec::new(),
             error_handler: None,
+            error_handler_stack: Vec::new(),
+            exception_handler_stack: Vec::new(),
             error_level: 32767,
             env_overrides: HashMap::new(),
+            script_args: Vec::new(),
             exception_handler: None,
             in_handler: false,
             cur_line: 1,
@@ -841,6 +866,7 @@ impl<'a> Interp<'a> {
     /// `phpun file.php a b c` — CLI args after the script name land in
     /// `$argv`/`$argc`/`$_SERVER['argv']` like reference php.
     pub fn set_script_args(&mut self, script: &str, args: &[String]) {
+        self.script_args = args.to_vec();
         let mut argv = PhpArray::new();
         argv.push(Value::str(script));
         for a in args {
@@ -1002,6 +1028,7 @@ impl<'a> Interp<'a> {
             true,
         );
         reg(iface("Countable", &[], &["count"]), true);
+        reg(iface("Reflector", &[], &[]), true);
         // Serializable's unserialize takes `string $data` — the iface()
         // helper emits param-less methods, so patch the decl (the
         // interface-sig check compares against it).
@@ -1960,6 +1987,11 @@ impl<'a> Interp<'a> {
             set_vis: None,
             hooks: None,
         };
+        let mk_smethod = |name: &str, params: Vec<Param>| {
+            let mut m = (*mk_method(name, params)).clone();
+            m.is_static = true;
+            Rc::new(m)
+        };
         reg(
             ClassDecl {
                 name: "ReflectionClass".into(),
@@ -1968,7 +2000,7 @@ impl<'a> Interp<'a> {
                 is_final: false,
                 readonly: false,
                 parent: None,
-                implements: vec![],
+                implements: vec!["Reflector".into()],
                 attrs: vec![],
                 traits: vec![],
                 adaptations: vec![],
@@ -1992,6 +2024,25 @@ impl<'a> Interp<'a> {
                     mk_method("getParentClass", vec![]),
                     mk_method("getShortName", vec![]),
                     mk_method("getNamespaceName", vec![]),
+                    mk_method("getFileName", vec![]),
+                    mk_method("isInternal", vec![]),
+                    mk_method("isUserDefined", vec![]),
+                    mk_method("isAbstract", vec![]),
+                    mk_method("isFinal", vec![]),
+                    mk_method("isInterface", vec![]),
+                    mk_method("isTrait", vec![]),
+                    mk_method("isEnum", vec![]),
+                    mk_method("isAnonymous", vec![]),
+                    mk_method("isInstantiable", vec![]),
+                    mk_method("isCloneable", vec![]),
+                    mk_method("isReadOnly", vec![]),
+                    mk_method("isIterable", vec![]),
+                    mk_method("isSubclassOf", vec![any_param("class", false)]),
+                    mk_method("implementsInterface", vec![any_param("interface", false)]),
+                    mk_method("getMethods", vec![any_param("filter", false)]),
+                    mk_method("getMethod", vec![str_param("name")]),
+                    mk_method("hasMethod", vec![str_param("name")]),
+                    mk_method("getDocComment", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -2006,8 +2057,8 @@ impl<'a> Interp<'a> {
                 is_abstract: false,
                 is_final: false,
                 readonly: false,
-                parent: None,
-                implements: vec![],
+                parent: Some("ReflectionFunctionAbstract".into()),
+                implements: vec!["Reflector".into()],
                 attrs: vec![],
                 traits: vec![],
                 adaptations: vec![],
@@ -2041,8 +2092,8 @@ impl<'a> Interp<'a> {
                 is_abstract: false,
                 is_final: false,
                 readonly: false,
-                parent: None,
-                implements: vec![],
+                parent: Some("ReflectionFunctionAbstract".into()),
+                implements: vec!["Reflector".into()],
                 attrs: vec![],
                 traits: vec![],
                 adaptations: vec![],
@@ -2074,9 +2125,40 @@ impl<'a> Interp<'a> {
                     mk_method("getClosureScopeClass", vec![]),
                     mk_method("getClosureCalledClass", vec![]),
                     mk_method("getClosureThis", vec![]),
+                    mk_method("getDeclaringClass", vec![]),
+                    mk_method("getFileName", vec![]),
+                    mk_method("isConstructor", vec![]),
+                    mk_method("isDestructor", vec![]),
+                    mk_method("getAttributes", vec![]),
+                    mk_method("getDocComment", vec![]),
+                    mk_method("getStartLine", vec![]),
+                    mk_method("getEndLine", vec![]),
+                    mk_method("getDeclaringNamespace", vec![]),
+                    mk_method("hasReturnType", vec![]),
+                    mk_method("getReturnType", vec![]),
+                    mk_method("isDeprecated", vec![]),
                 ],
                 props: vec![],
-                consts: vec![],
+                consts: [
+                    ("IS_STATIC", 16),
+                    ("IS_PUBLIC", 1),
+                    ("IS_PROTECTED", 2),
+                    ("IS_PRIVATE", 4),
+                    ("IS_ABSTRACT", 64),
+                    ("IS_FINAL", 32),
+                ]
+                .iter()
+                .map(|(n, v)| crate::ast::ConstDecl {
+                    name: (*n).into(),
+                    value: Expr::Int(*v),
+                    visibility: crate::ast::Visibility::Public,
+                    is_final: false,
+                    ty: None,
+                    attrs: vec![],
+                    decl_in: None,
+                    enum_case: false,
+                })
+                .collect(),
                 file: String::new(),
             },
             false,
@@ -2091,7 +2173,7 @@ impl<'a> Interp<'a> {
                 is_final: false,
                 readonly: false,
                 parent: None,
-                implements: vec![],
+                implements: vec!["Reflector".into()],
                 attrs: vec![],
                 traits: vec![],
                 adaptations: vec![],
@@ -2119,7 +2201,7 @@ impl<'a> Interp<'a> {
                 is_final: false,
                 readonly: false,
                 parent: None,
-                implements: vec![],
+                implements: vec!["Reflector".into()],
                 attrs: vec![],
                 traits: vec![],
                 adaptations: vec![],
@@ -2156,7 +2238,7 @@ impl<'a> Interp<'a> {
                 is_final: false,
                 readonly: false,
                 parent: None,
-                implements: vec![],
+                implements: vec!["Reflector".into()],
                 attrs: vec![],
                 traits: vec![],
                 adaptations: vec![],
@@ -2280,7 +2362,7 @@ impl<'a> Interp<'a> {
                 is_final: false,
                 readonly: false,
                 parent: None,
-                implements: vec![],
+                implements: vec!["Reflector".into()],
                 attrs: vec![],
                 traits: vec![],
                 adaptations: vec![],
@@ -2348,7 +2430,7 @@ impl<'a> Interp<'a> {
                 is_abstract: false,
                 is_final: false,
                 readonly: false,
-                parent: None,
+                parent: Some("ReflectionType".into()),
                 implements: vec![],
                 attrs: vec![],
                 traits: vec![],
@@ -2364,6 +2446,280 @@ impl<'a> Interp<'a> {
             },
             false,
         );
+        // Remaining Reflection hierarchy — PHPUnit's bootstrap
+        // reflects over test classes and statics heavily.
+        for d in [
+            ClassDecl {
+                name: "ReflectionFunctionAbstract".into(),
+                kind: ClassKind::Class,
+                is_abstract: true,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec!["Reflector".into()],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method("getName", vec![]),
+                    mk_method("getParameters", vec![]),
+                    mk_method("getAttributes", vec![]),
+                    mk_method("getDocComment", vec![]),
+                    mk_method("getReturnType", vec![]),
+                    mk_method("getNamespaceName", vec![]),
+                    mk_method("getShortName", vec![]),
+                    mk_method("getNumberOfParameters", vec![]),
+                    mk_method("getNumberOfRequiredParameters", vec![]),
+                    mk_method("isStatic", vec![]),
+                    mk_method("isClosure", vec![]),
+                    mk_method("returnsReference", vec![]),
+                    mk_method("hasReturnType", vec![]),
+                    mk_method("getStaticVariables", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            ClassDecl {
+                name: "ReflectionObject".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: Some("ReflectionClass".into()),
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![mk_method("__construct", vec![any_param("object", false)])],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            ClassDecl {
+                name: "ReflectionEnum".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: Some("ReflectionClass".into()),
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method("__construct", vec![any_param("class", false)]),
+                    mk_method("getCases", vec![]),
+                    mk_method("getCase", vec![str_param("name")]),
+                    mk_method("hasCase", vec![str_param("name")]),
+                    mk_method("getBackingType", vec![]),
+                    mk_method("isBacked", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            ClassDecl {
+                name: "ReflectionEnumUnitCase".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: Some("ReflectionClassConstant".into()),
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![mk_method("getEnum", vec![]), mk_method("getValue", vec![])],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            ClassDecl {
+                name: "ReflectionEnumBackedCase".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: Some("ReflectionEnumUnitCase".into()),
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![mk_method("getBackingValue", vec![])],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            ClassDecl {
+                name: "ReflectionType".into(),
+                kind: ClassKind::Class,
+                is_abstract: true,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec!["Stringable".into()],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![mk_method("allowsNull", vec![])],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            ClassDecl {
+                name: "ReflectionUnionType".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: Some("ReflectionType".into()),
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method("getTypes", vec![]),
+                    mk_method("allowsNull", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            ClassDecl {
+                name: "ReflectionIntersectionType".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: Some("ReflectionType".into()),
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method("getTypes", vec![]),
+                    mk_method("allowsNull", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            ClassDecl {
+                name: "ReflectionExtension".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec!["Reflector".into()],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method("__construct", vec![str_param("name")]),
+                    mk_method("getName", vec![]),
+                    mk_method("getVersion", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            ClassDecl {
+                name: "ReflectionZendExtension".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: Some("ReflectionExtension".into()),
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method("__construct", vec![str_param("name")]),
+                    mk_method("getName", vec![]),
+                    mk_method("getVersion", vec![]),
+                    mk_method("getAuthor", vec![]),
+                    mk_method("getCopyright", vec![]),
+                    mk_method("getURL", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            ClassDecl {
+                name: "ReflectionGenerator".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method("__construct", vec![any_param("generator", false)]),
+                    mk_method("getFunction", vec![]),
+                    mk_method("getThis", vec![]),
+                    mk_method("getExecutingFile", vec![]),
+                    mk_method("getExecutingLine", vec![]),
+                    mk_method("getTrace", vec![]),
+                    mk_method("getExecutingGenerator", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            ClassDecl {
+                name: "ReflectionReference".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_smethod(
+                        "fromArrayElement",
+                        vec![any_param("array", false), any_param("key", false)],
+                    ),
+                    mk_method("getId", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+            ClassDecl {
+                name: "ReflectionConstant".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec!["Reflector".into()],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![
+                    mk_method("__construct", vec![str_param("name")]),
+                    mk_method("getName", vec![]),
+                    mk_method("getValue", vec![]),
+                    mk_method("getNamespaceName", vec![]),
+                    mk_method("getShortName", vec![]),
+                    mk_method("isDeprecated", vec![]),
+                ],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+            },
+        ] {
+            reg(d, false);
+        }
         reg(
             throwable_class("Exception", None, &["message", "code", "file", "line"]),
             false,
@@ -2403,6 +2759,8 @@ impl<'a> Interp<'a> {
             ("LengthException", "LogicException"),
             ("OutOfRangeException", "LogicException"),
             ("UnexpectedValueException", "RuntimeException"),
+            ("BadFunctionCallException", "LogicException"),
+            ("BadMethodCallException", "BadFunctionCallException"),
             ("OutOfBoundsException", "RuntimeException"),
             ("DomainException", "LogicException"),
             ("RangeException", "RuntimeException"),
@@ -2417,6 +2775,7 @@ impl<'a> Interp<'a> {
             ("ParseError", "CompileError"),
             ("AssertionError", "Error"),
             ("UnhandledMatchError", "Error"),
+            ("ReflectionException", "Exception"),
         ] {
             reg(
                 throwable_class(name, Some(parent), &["message", "code", "file", "line"]),
@@ -4676,6 +5035,7 @@ impl<'a> Interp<'a> {
                             entries: sep,
                             next: rc.borrow().next,
                             is_ref: false,
+                            iter_pos: rc.borrow().iter_pos,
                         }));
                         if let Ok(c) = self.eval_cell(arr) {
                             *c.borrow_mut() = Value::Array(nr.clone());
@@ -5273,6 +5633,18 @@ impl<'a> Interp<'a> {
                             arr.set(to_key(&kv), val);
                         }
                         None => {
+                            // `...$it` spread: int keys renumber
+                            // positionally, string keys set (PHP 8.1+).
+                            if let Expr::Unpack(e) = v {
+                                let sv = self.eval(e)?;
+                                for (sk, c) in self.unpack_items(&sv)? {
+                                    match sk {
+                                        Some(s) => arr.set(ArrKey::Str(s), c.borrow().clone()),
+                                        None => arr.push(c.borrow().clone()),
+                                    }
+                                }
+                                continue;
+                            }
                             let val = self.eval(v)?;
                             arr.push(val);
                         }
@@ -8853,7 +9225,16 @@ impl<'a> Interp<'a> {
                 // i64::MIN % -1 is 0 in PHP (no overflow panic).
                 Value::Int(a.wrapping_rem(b))
             }
-            "**" => Value::Float(ln.to_float().powf(rn.to_float())),
+            "**" => match (&ln, &rn) {
+                // int ** int (exp >= 0) stays int when it fits
+                // (sebastian/diff's footprint calc feeds an int return
+                // type under strict_types).
+                (Num::I(bi), Num::I(ei)) if *ei >= 0 => match bi.checked_pow(*ei as u32) {
+                    Some(v) => Value::Int(v),
+                    None => Value::Float(ln.to_float().powf(rn.to_float())),
+                },
+                _ => Value::Float(ln.to_float().powf(rn.to_float())),
+            },
             _ => return self.fail(PhpError::fatal(format!("unsupported operator {}", op), 0)),
         })
     }
@@ -13740,9 +14121,10 @@ impl<'a> Interp<'a> {
                     m.decl.line,
                 ));
             }
-            // `__invoke` is exempt — `function &__invoke(&$a)` is a
-            // legal signature (closure_014).
-            if n != "__invoke" && m.decl.params.iter().any(|p| p.by_ref) {
+            // `__invoke` and `__construct` are exempt — `function
+            // &__invoke(&$a)` and `__construct(&$x)` are legal
+            // signatures (closure_014; PHPUnit's Stub/ReturnReference).
+            if n != "__invoke" && n != "__construct" && m.decl.params.iter().any(|p| p.by_ref) {
                 return self.fail(PhpError::fatal(
                     format!("Method {}::{}() cannot take arguments by reference", cn, mn),
                     m.decl.line,
@@ -18868,7 +19250,19 @@ impl<'a> Interp<'a> {
                         self.callable_ctx_name(&stored),
                         matches!(c.kind, CallableKind::Closure(_)),
                     ),
-                    _ => (self.conv_str(&stored)?.to_string(), false),
+                    _ => {
+                        let n = self.conv_str(&stored)?.to_string();
+                        // A class reflector is anonymous when the CLASS
+                        // is — anon classes carry `class@anonymous` in
+                        // their generated name (the closure check below
+                        // only covers function reflectors).
+                        let anon_cls = self
+                            .classes
+                            .get(&n.to_lowercase())
+                            .map(|c| c.decl.name.contains("class@anonymous"))
+                            .unwrap_or(false);
+                        (n, anon_cls)
+                    }
                 };
                 // A closure's "short name" is its whole zend name —
                 // the `\` inside `{closure:Foo\Bar::baz():N}` is part
@@ -19488,6 +19882,56 @@ impl<'a> Interp<'a> {
                     }
                     return Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))));
                 }
+                let is_m = obj
+                    .borrow()
+                    .class
+                    .name()
+                    .eq_ignore_ascii_case("reflectionmethod");
+                if is_m {
+                    let cn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let cn = self.conv_str(&cn)?.to_string();
+                    let mn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0prop")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let mn = self.conv_str(&mn)?.to_string();
+                    let decls = self
+                        .classes
+                        .get(&cn.to_lowercase())
+                        .cloned()
+                        .and_then(|c| self.find_method_in(&c, &mn))
+                        .map(|(m, _)| m.decl.attrs.clone())
+                        .unwrap_or_default();
+                    let fname = args
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .map(|v| self.conv_str(&v).map(|s| s.to_string()))
+                        .transpose()?
+                        .unwrap_or_default();
+                    let mut arr = PhpArray::default();
+                    for a in decls {
+                        if !fname.is_empty() && !a.name.eq_ignore_ascii_case(&fname) {
+                            continue;
+                        }
+                        let v = self.instantiate("reflectionattribute", &[])?;
+                        if let Value::Object(o) = &v {
+                            o.borrow_mut().internal = Some(ObjectInternal::ReflectionAttribute {
+                                name: a.name.clone(),
+                                args: Rc::new(a.args.clone()),
+                                target: 4,
+                            });
+                        }
+                        arr.push(v);
+                    }
+                    return Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))));
+                }
                 let (decls, target): (Vec<crate::ast::AttrDecl>, i64) = if is_fn {
                     (
                         self.functions
@@ -19815,6 +20259,17 @@ impl<'a> Interp<'a> {
                     }
                     // ReflectionProperty: visibility/static/readonly off
                     // the PropDecl.
+                    "reflectionclass" | "reflectionobject" | "reflectionenum" => {
+                        match self.classes.get(&cn.to_lowercase()) {
+                            Some(c) => match lname.as_str() {
+                                "isfinal" => c.decl.is_final,
+                                "isabstract" => c.decl.is_abstract,
+                                "isinterface" => c.decl.kind == crate::ast::ClassKind::Interface,
+                                _ => false,
+                            },
+                            None => false,
+                        }
+                    }
                     "reflectionproperty" => {
                         let pd = self
                             .classes
@@ -19855,6 +20310,351 @@ impl<'a> Interp<'a> {
                 };
                 Ok(Some(Value::Bool(b)))
             }
+            // ReflectionClass file location — user classes carry
+            // decl.file; internal classes report false like Zend.
+            "getfilename" | "isinternal" | "isuserdefined" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let mn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0prop")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let mn = self.conv_str(&mn)?.to_string();
+                let file = if !mn.is_empty() {
+                    self.classes
+                        .get(&cn.to_lowercase())
+                        .cloned()
+                        .and_then(|c| self.find_method_in(&c, &mn).map(|(m, _)| m))
+                        .map(|m| m.decl.file.clone())
+                        .unwrap_or_default()
+                } else {
+                    self.classes
+                        .get(&cn.to_lowercase())
+                        .map(|c| c.decl.file.clone())
+                        .unwrap_or_default()
+                };
+                let internal = file.is_empty() || file == "builtin";
+                Ok(Some(match lname.as_str() {
+                    "getfilename" => {
+                        if internal {
+                            Value::Bool(false)
+                        } else {
+                            Value::str(file)
+                        }
+                    }
+                    "isinternal" => Value::Bool(internal),
+                    _ => Value::Bool(!internal),
+                }))
+            }
+            // Class-level kind predicates (the member-flag arm above
+            // only resolves Reflection{Method,Property,ClassConstant};
+            // isAnonymous lives in the name-introspection arm which
+            // covers both closure and class subjects).
+            "isinterface" | "istrait" | "isenum" | "isinstantiable" | "iscloneable"
+            | "isreadonly" | "isiterable" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let decl = self.classes.get(&cn.to_lowercase()).map(|c| c.decl.clone());
+                let b = decl
+                    .map(|d| match lname.as_str() {
+                        "isinterface" => d.kind == crate::ast::ClassKind::Interface,
+                        "istrait" => d.kind == crate::ast::ClassKind::Trait,
+                        "isenum" => d.kind == crate::ast::ClassKind::Enum,
+                        "isreadonly" => d.readonly,
+                        "isiterable" => d.implements.iter().any(|i| {
+                            i.eq_ignore_ascii_case("traversable")
+                                || i.eq_ignore_ascii_case("iterator")
+                                || i.eq_ignore_ascii_case("iteratoraggregate")
+                        }),
+                        _ => d.kind == crate::ast::ClassKind::Class && !d.is_abstract,
+                    })
+                    .unwrap_or(false);
+                Ok(Some(Value::Bool(b)))
+            }
+            // isSubclassOf/implementsInterface — walk the parent chain /
+            // transitive interface set. Arg: class-string or reflector.
+            "issubclassof" | "implementsinterface" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let target = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let tname = match &target {
+                    Value::Object(o) => o
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null),
+                    v => v.clone(),
+                };
+                let tname = self.conv_str(&tname)?.to_string().to_lowercase();
+                let mut hit = false;
+                let mut cur = self.classes.get(&cn.to_lowercase()).cloned();
+                let mut seen = std::collections::HashSet::new();
+                while let Some(c) = cur {
+                    if lname == "issubclassof" {
+                        cur = c
+                            .decl
+                            .parent
+                            .as_ref()
+                            .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                        if let Some(n) = cur.as_ref().map(|c| c.decl.name.to_lowercase()) {
+                            if n == tname {
+                                hit = true;
+                            }
+                        }
+                    } else {
+                        // transitive interface set incl. interface-extends
+                        let mut q: Vec<String> = c.decl.implements.clone();
+                        if c.decl.kind == crate::ast::ClassKind::Interface {
+                            q.extend(c.decl.parent.iter().cloned());
+                        }
+                        for i in q {
+                            if i.to_lowercase() == tname {
+                                hit = true;
+                            }
+                            if let Some(ic) = self.classes.get(&i.to_lowercase()).cloned() {
+                                for pp in ic.decl.parent.iter().chain(ic.decl.implements.iter()) {
+                                    if pp.to_lowercase() == tname {
+                                        hit = true;
+                                    }
+                                }
+                            }
+                        }
+                        cur = c
+                            .decl
+                            .parent
+                            .as_ref()
+                            .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                    }
+                    let k = cur.as_ref().map(|c| c.decl.name.to_lowercase());
+                    if k.is_none() || !seen.insert(k.unwrap()) {
+                        break;
+                    }
+                }
+                Ok(Some(Value::Bool(hit)))
+            }
+            // getMethods(filter) — own + inherited methods as
+            // ReflectionMethod objects; declaring class per PHP.
+            "getmethods" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let filter = args.first().map(|c| c.borrow().to_int()).unwrap_or(0);
+                let mut arr = PhpArray::default();
+                let mut seen = std::collections::HashSet::new();
+                let mut cur = self.classes.get(&cn.to_lowercase()).cloned();
+                while let Some(c) = cur {
+                    for m in &c.decl.methods {
+                        let key = m.decl.name.to_lowercase();
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        let ok = filter == 0
+                            || (filter & 1 != 0 && m.visibility == crate::ast::Visibility::Public)
+                            || (filter & 2 != 0
+                                && m.visibility == crate::ast::Visibility::Protected)
+                            || (filter & 4 != 0 && m.visibility == crate::ast::Visibility::Private)
+                            || (filter & 16 != 0 && m.is_static)
+                            || (filter & 32 != 0 && m.is_final)
+                            || (filter & 64 != 0 && m.is_abstract);
+                        if !ok {
+                            continue;
+                        }
+                        let rm = self.instantiate("reflectionmethod", &[])?;
+                        if let Value::Object(o) = &rm {
+                            let mut ob = o.borrow_mut();
+                            ob.props.insert(
+                                "\0rc\0class".into(),
+                                cell(Value::str(c.decl.name.clone())),
+                            );
+                            ob.props
+                                .insert("\0rc\0prop".into(), cell(Value::str(m.decl.name.clone())));
+                            ob.props
+                                .insert("name".into(), cell(Value::str(m.decl.name.clone())));
+                            ob.props
+                                .insert("class".into(), cell(Value::str(c.decl.name.clone())));
+                        }
+                        arr.push(rm);
+                    }
+                    cur = c
+                        .decl
+                        .parent
+                        .as_ref()
+                        .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                }
+                Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
+            }
+            "getmethod" | "hasmethod" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let mn = args
+                    .first()
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let mn = self.conv_str(&mn)?.to_string();
+                let cls = self.classes.get(&cn.to_lowercase()).cloned();
+                let found = cls.as_ref().and_then(|c| self.find_method_in(c, &mn));
+                match (lname.as_str(), found) {
+                    ("hasmethod", f) => Ok(Some(Value::Bool(f.is_some()))),
+                    (_, Some((m, dcls))) => {
+                        let rm = self.instantiate("reflectionmethod", &[])?;
+                        if let Value::Object(o) = &rm {
+                            let mut ob = o.borrow_mut();
+                            ob.props.insert(
+                                "\0rc\0class".into(),
+                                cell(Value::str(dcls.decl.name.clone())),
+                            );
+                            ob.props
+                                .insert("\0rc\0prop".into(), cell(Value::str(m.decl.name.clone())));
+                            ob.props
+                                .insert("name".into(), cell(Value::str(m.decl.name.clone())));
+                            ob.props
+                                .insert("class".into(), cell(Value::str(dcls.decl.name.clone())));
+                        }
+                        Ok(Some(rm))
+                    }
+                    _ => self.fail(PhpError::uncaught(
+                        "ReflectionException",
+                        format!("Method {}::{}() does not exist", cn, mn),
+                        0,
+                    )),
+                }
+            }
+            // ReflectionMethod identity/lines/return-type plumbing.
+            "isconstructor" | "isdestructor" => {
+                let mn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0prop")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let mn = self.conv_str(&mn)?.to_string();
+                Ok(Some(Value::Bool(mn.eq_ignore_ascii_case(
+                    if lname == "isconstructor" {
+                        "__construct"
+                    } else {
+                        "__destruct"
+                    },
+                ))))
+            }
+            "getstartline" | "getendline" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let mn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0prop")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let mn = self.conv_str(&mn)?.to_string();
+                let ln = self
+                    .classes
+                    .get(&cn.to_lowercase())
+                    .cloned()
+                    .and_then(|c| self.find_method_in(&c, &mn).map(|(m, _)| m))
+                    .map(|m| {
+                        if lname == "getstartline" {
+                            m.decl.line
+                        } else {
+                            m.decl.end_line
+                        }
+                    })
+                    .unwrap_or(0);
+                Ok(Some(Value::Int(ln as i64)))
+            }
+            "getdeclaringnamespace" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let ns = cn
+                    .rsplit_once('\\')
+                    .map(|(n, _)| n.to_string())
+                    .unwrap_or_default();
+                Ok(Some(Value::str(ns)))
+            }
+            "hasreturntype" | "getreturntype" => {
+                let cn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let cn = self.conv_str(&cn)?.to_string();
+                let mn = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0prop")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let mn = self.conv_str(&mn)?.to_string();
+                let tys = self
+                    .classes
+                    .get(&cn.to_lowercase())
+                    .cloned()
+                    .and_then(|c| self.find_method_in(&c, &mn).map(|(m, _)| m))
+                    .and_then(|m| m.decl.ret.clone());
+                match (lname.as_str(), tys) {
+                    ("hasreturntype", t) => Ok(Some(Value::Bool(t.is_some()))),
+                    (_, Some(tys)) => {
+                        let nt = self.instantiate("reflectionnamedtype", &[])?;
+                        if let Value::Object(o) = &nt {
+                            let mut ta = PhpArray::default();
+                            for m in &tys {
+                                ta.push(Value::str(m));
+                            }
+                            let mut ob = o.borrow_mut();
+                            ob.props.insert(
+                                "\0rp\0ty".into(),
+                                cell(Value::Array(Rc::new(RefCell::new(ta)))),
+                            );
+                            if let Some(first) = tys.first() {
+                                ob.props.insert("name".into(), cell(Value::str(first)));
+                            }
+                        }
+                        Ok(Some(nt))
+                    }
+                    _ => Ok(Some(Value::Null)),
+                }
+            }
+            "getdoccomment" => Ok(Some(Value::Bool(false))),
             "gettraitaliases" => {
                 let cn = obj
                     .borrow()
@@ -21719,6 +22519,25 @@ impl<'a> Interp<'a> {
                             self.is_a_str(&cname, cls.name())
                         })
                 };
+                // `parent::__construct()` on a throwable resolves to a
+                // builtin stub — run the native impl (message/code
+                // props, exception internals) exactly like the object
+                // dispatch in method_invoke (PHPUnit's Exception chain
+                // ctor-chains here).
+                if m.decl.body.is_empty() && m.decl.line == 0 {
+                    if let Some(o) = &this_obj {
+                        let is_throwable = {
+                            let ob = o.borrow();
+                            matches!(ob.internal, Some(ObjectInternal::Exception { .. }))
+                                || self.is_throwable_name(&ob.class.decl.name)
+                        };
+                        if is_throwable {
+                            if let Some(v) = self.throwable_method(o, name, &args.cells) {
+                                return Ok(v);
+                            }
+                        }
+                    }
+                }
                 if !m.is_static && this_obj.is_none() {
                     return self.fail(PhpError::uncaught(
                         "Error",
@@ -22935,10 +23754,25 @@ impl<'a> Interp<'a> {
         self.shutdown_fns.push((f, args));
     }
     pub fn set_error_handler(&mut self, f: Option<Value>) {
+        // Zend keeps a stack: set pushes; restore pops the previous top.
+        if let Some(cur) = self.error_handler.take() {
+            self.error_handler_stack.push(cur);
+        }
         self.error_handler = f;
     }
+
+    pub fn restore_error_handler(&mut self) {
+        self.error_handler = self.error_handler_stack.pop();
+    }
     pub fn set_exception_handler(&mut self, f: Option<Value>) {
+        if let Some(cur) = self.exception_handler.take() {
+            self.exception_handler_stack.push(cur);
+        }
         self.exception_handler = f;
+    }
+
+    pub fn restore_exception_handler(&mut self) {
+        self.exception_handler = self.exception_handler_stack.pop();
     }
     pub fn cur_frame(&mut self) -> Option<&Frame> {
         self.stack.last()
@@ -23466,6 +24300,14 @@ abstract class FilterIterator extends IteratorIterator {
         }
     }
 }
+abstract class RecursiveFilterIterator extends FilterIterator implements RecursiveIterator {
+    public function hasChildren() { return $this->inner->hasChildren(); }
+    // SPL: children come back wrapped in the same filter class.
+    public function getChildren() {
+        $cls = static::class;
+        return new $cls($this->inner->getChildren());
+    }
+}
 class CallbackFilterIterator extends FilterIterator {
     private $callback;
     public function __construct($iterator, $callback) {
@@ -23480,9 +24322,12 @@ class RecursiveIteratorIterator implements OuterIterator {
     const LEAVES_ONLY = 0;
     const SELF_FIRST = 1;
     const CHILD_FIRST = 2;
+    const CALL_TOSTRING = 4;
+    const CATCH_GET_CHILD = 8;
     private $stack = [];
     private $emitted = [];
     private $mode;
+    private $flags;
     private $yieldParent = false;
     public function __construct($iterator, $mode = 0, $flags = 0) {
         $it = $iterator;
@@ -23490,6 +24335,7 @@ class RecursiveIteratorIterator implements OuterIterator {
             $it = $it->getIterator();
         }
         $this->mode = $mode;
+        $this->flags = $flags;
         $this->stack = [$it];
         $this->emitted = [false];
         $it->rewind();
@@ -23528,7 +24374,15 @@ class RecursiveIteratorIterator implements OuterIterator {
                     $this->yieldParent = true;
                     return;
                 }
-                $child = $top->getChildren();
+                try {
+                    $child = $top->getChildren();
+                } catch (Throwable $e) {
+                    if (!($this->flags & self::CATCH_GET_CHILD)) {
+                        throw $e;
+                    }
+                    $top->next();
+                    continue;
+                }
                 $child->rewind();
                 $this->stack[] = $child;
                 $this->emitted[] = false;
@@ -23554,7 +24408,17 @@ class RecursiveIteratorIterator implements OuterIterator {
         }
         if ($this->yieldParent && $this->mode === self::SELF_FIRST) {
             $top = $this->top();
-            $child = $top->getChildren();
+            try {
+                $child = $top->getChildren();
+            } catch (Throwable $e) {
+                if (!($this->flags & self::CATCH_GET_CHILD)) {
+                    throw $e;
+                }
+                $top->next();
+                $this->yieldParent = false;
+                $this->descend();
+                return;
+            }
             $child->rewind();
             $i = count($this->stack) - 1;
             $this->emitted[$i] = false;
@@ -23621,5 +24485,143 @@ class AppendIterator extends IteratorIterator {
     public function getInnerIterator() {
         return $this->idx < count($this->its) ? $this->its[$this->idx] : null;
     }
+}
+class EmptyIterator implements Iterator {
+    public function current() { return null; }
+    public function key() { return null; }
+    public function next() {}
+    public function rewind() {}
+    public function valid() { return false; }
+}
+class SplObjectStorage implements Countable, Iterator, ArrayAccess {
+    private array $objs = [];
+    private array $data = [];
+    private int $pos = 0;
+    private int $idx = 0;
+    private $info;
+    private function hashOf($obj) {
+        if (!is_object($obj)) {
+            throw new TypeError('SplObjectStorage::offsetSet(): Argument #1 ($object) must be of type object');
+        }
+        return spl_object_id($obj);
+    }
+    public function attach($object, $data = null) { $this->offsetSet($object, $data); }
+    public function detach($object) { $this->offsetUnset($object); }
+    public function contains($object) { return $this->offsetExists($object); }
+    public function offsetExists($obj): bool { return isset($this->objs[$this->hashOf($obj)]); }
+    public function offsetSet($obj, $data = null): void {
+        $h = $this->hashOf($obj);
+        if (!isset($this->objs[$h])) {
+            $this->objs[$h] = $obj;
+        }
+        $this->data[$h] = $data;
+    }
+    public function offsetGet($obj) {
+        $h = $this->hashOf($obj);
+        if (!isset($this->objs[$h])) {
+            throw new UnexpectedValueException('Object not found');
+        }
+        return $this->data[$h];
+    }
+    public function offsetUnset($obj): void {
+        $h = $this->hashOf($obj);
+        unset($this->objs[$h], $this->data[$h]);
+    }
+    public function getHash($obj) { return (string) $this->hashOf($obj); }
+    public function count(): int { return count($this->objs); }
+    public function setInfo($data) { $this->info = $data; }
+    public function getInfo() { return $this->info; }
+    // Iteration: key() is a 0-based index, current() the stored object.
+    public function rewind(): void { $this->pos = 0; $this->idx = 0; }
+    public function valid(): bool { return $this->idx < count($this->objs); }
+    public function current() { return array_values($this->objs)[$this->idx]; }
+    public function key(): int { return $this->idx; }
+    public function next(): void { $this->idx++; }
+    public function addAll($storage) {
+        foreach ($storage as $obj) { $this->attach($obj, $storage->getInfo()); }
+    }
+    public function removeAll($storage) {
+        foreach ($storage as $obj) { $this->detach($obj); }
+    }
+    public function removeAllExcept($storage) {
+        foreach ($this->objs as $h => $obj) {
+            if (!$storage->contains($obj)) { unset($this->objs[$h], $this->data[$h]); }
+        }
+    }
+}
+class SplFixedArray implements ArrayAccess, Iterator, Countable {
+    private array $data;
+    private int $pos = 0;
+    public function __construct(int $size = 0) {
+        $this->data = array_fill(0, max(0, $size), null);
+    }
+    public static function fromArray(array $array, bool $preserveKeys = true) {
+        $a = new self($preserveKeys ? count($array) : 0);
+        if ($preserveKeys) {
+            $max = 0;
+            foreach ($array as $k => $v) {
+                if (!is_int($k) || $k < 0) {
+                    throw new InvalidArgumentException('array must contain only positive integer keys');
+                }
+                $max = max($max, $k + 1);
+            }
+            $a = new self($max);
+            foreach ($array as $k => $v) { $a->data[$k] = $v; }
+        } else {
+            $a = new self(count($array));
+            $i = 0;
+            foreach ($array as $v) { $a->data[$i++] = $v; }
+        }
+        return $a;
+    }
+    public function toArray(): array { return $this->data; }
+    public function getSize(): int { return count($this->data); }
+    public function setSize(int $size): bool {
+        $size = max(0, $size);
+        $cur = count($this->data);
+        if ($size > $cur) {
+            $this->data = array_merge($this->data, array_fill(0, $size - $cur, null));
+        } else {
+            $this->data = array_slice($this->data, 0, $size);
+        }
+        return true;
+    }
+    private function normKey($key): int {
+        if (is_object($key)) {
+            throw new TypeError('Illegal SplFixedArray index type');
+        }
+        return (int) $key;
+    }
+    public function offsetExists($key): bool {
+        $k = $this->normKey($key);
+        return $k >= 0 && $k < count($this->data) && $this->data[$k] !== null;
+    }
+    public function offsetGet($key) {
+        $k = $this->normKey($key);
+        if ($k < 0 || $k >= count($this->data)) {
+            throw new RuntimeException('Index invalid or out of range');
+        }
+        return $this->data[$k];
+    }
+    public function offsetSet($key, $value): void {
+        $k = $this->normKey($key);
+        if ($k < 0 || $k >= count($this->data)) {
+            throw new RuntimeException('Index invalid or out of range');
+        }
+        $this->data[$k] = $value;
+    }
+    public function offsetUnset($key): void {
+        $k = $this->normKey($key);
+        if ($k < 0 || $k >= count($this->data)) {
+            throw new RuntimeException('Index invalid or out of range');
+        }
+        $this->data[$k] = null;
+    }
+    public function count(): int { return count($this->data); }
+    public function rewind(): void { $this->pos = 0; }
+    public function valid(): bool { return $this->pos < count($this->data); }
+    public function current() { return $this->data[$this->pos]; }
+    public function key(): int { return $this->pos; }
+    public function next(): void { $this->pos++; }
 }
 "#;

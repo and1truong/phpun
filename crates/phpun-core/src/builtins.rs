@@ -1896,13 +1896,22 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     n - off
                 };
                 let tail: Vec<(ArrKey, Cell)> = std::mem::take(&mut arr.entries);
+                arr.next = 0;
                 let (head, rest) = tail.split_at(off as usize);
                 let (cut, tail2) = rest.split_at((len as usize).min(rest.len()));
                 for (k, c) in cut {
                     removed.push(c.borrow().clone());
                     let _ = k;
                 }
-                arr.entries = head.to_vec();
+                // PHP renumbers every integer key in the result (string
+                // keys are kept); replacement values always append.
+                let put = |arr: &mut PhpArray, k: &ArrKey, c: &Cell| match k {
+                    ArrKey::Str(s) => arr.set_cell(ArrKey::Str(s.clone()), c.clone()),
+                    _ => arr.push_cell(c.clone()),
+                };
+                for (k, c) in head {
+                    put(&mut arr, k, c);
+                }
                 if let Some(repl) = args.get(3) {
                     let rv = repl.borrow().clone();
                     match &rv {
@@ -1927,8 +1936,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     }
                 }
                 for (k, c) in tail2 {
-                    let _ = k;
-                    arr.push(c.borrow().clone());
+                    put(&mut arr, k, c);
                 }
                 // Splice renumbers integer keys (bug52193).
                 let mut i = 0i64;
@@ -1939,6 +1947,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                     }
                 }
                 arr.next = i;
+                arr.iter_pos = 0;
             }
             Value::Array(Rc::new(RefCell::new(removed)))
         }
@@ -2154,6 +2163,25 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             }
             Value::Array(Rc::new(RefCell::new(out)))
         }
+        "array_diff_assoc" => {
+            let mut out = PhpArray::new();
+            if let Value::Array(a) = arg(args, 0) {
+                'outer: for (k, c) in a.borrow().iter() {
+                    let v = c.borrow().clone();
+                    for other in &args[1..] {
+                        if let Value::Array(o) = &*other.borrow() {
+                            if let Some(oc) = o.borrow().get_cell(k) {
+                                if compare(&v, &oc.borrow()) == std::cmp::Ordering::Equal {
+                                    continue 'outer;
+                                }
+                            }
+                        }
+                    }
+                    out.set(k.clone(), v);
+                }
+            }
+            Value::Array(Rc::new(RefCell::new(out)))
+        }
         "array_diff_key" => {
             let mut out = PhpArray::new();
             if let Value::Array(a) = arg(args, 0) {
@@ -2185,6 +2213,26 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                                 }
                             }
                             if !found {
+                                continue 'outer;
+                            }
+                        }
+                    }
+                    out.set(k.clone(), v);
+                }
+            }
+            Value::Array(Rc::new(RefCell::new(out)))
+        }
+        "array_intersect_assoc" => {
+            let mut out = PhpArray::new();
+            if let Value::Array(a) = arg(args, 0) {
+                'outer: for (k, c) in a.borrow().iter() {
+                    let v = c.borrow().clone();
+                    for other in &args[1..] {
+                        if let Value::Array(o) = &*other.borrow() {
+                            let hit = o.borrow().get_cell(k).is_some_and(|oc| {
+                                compare(&v, &oc.borrow()) == std::cmp::Ordering::Equal
+                            });
+                            if !hit {
                                 continue 'outer;
                             }
                         }
@@ -2532,35 +2580,36 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "current" | "pos" => match arg(args, 0) {
             Value::Array(a) => a
                 .borrow()
-                .iter()
-                .next()
+                .ptr_entry()
                 .map(|(_, c)| c.borrow().clone())
                 .unwrap_or(Value::Bool(false)),
             _ => Value::Bool(false),
         },
         "end" => match arg(args, 0) {
-            Value::Array(a) => a
-                .borrow()
-                .iter()
-                .next_back()
-                .map(|(_, c)| c.borrow().clone())
-                .unwrap_or(Value::Bool(false)),
+            Value::Array(a) => {
+                let mut b = a.borrow_mut();
+                b.iter_pos = b.entries.len();
+                b.ptr_retreat();
+                b.ptr_entry()
+                    .map(|(_, c)| c.borrow().clone())
+                    .unwrap_or(Value::Bool(false))
+            }
             _ => Value::Bool(false),
         },
         "reset" => match arg(args, 0) {
-            Value::Array(a) => a
-                .borrow()
-                .iter()
-                .next()
-                .map(|(_, c)| c.borrow().clone())
-                .unwrap_or(Value::Bool(false)),
+            Value::Array(a) => {
+                let mut b = a.borrow_mut();
+                b.iter_pos = 0;
+                b.ptr_entry()
+                    .map(|(_, c)| c.borrow().clone())
+                    .unwrap_or(Value::Bool(false))
+            }
             _ => Value::Bool(false),
         },
         "key" => match arg(args, 0) {
             Value::Array(a) => a
                 .borrow()
-                .iter()
-                .next()
+                .ptr_entry()
                 .map(|(k, _)| match k {
                     ArrKey::Int(i) => Value::Int(*i),
                     ArrKey::Str(s) => Value::str(s.to_string()),
@@ -2569,8 +2618,50 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 .unwrap_or(Value::Null),
             _ => Value::Null,
         },
-        "next" | "prev" => Value::Bool(false), // no internal pointer yet
-        "each" => Value::Bool(false),
+        "next" => match arg(args, 0) {
+            Value::Array(a) => {
+                let mut b = a.borrow_mut();
+                b.ptr_advance();
+                b.ptr_entry()
+                    .map(|(_, c)| c.borrow().clone())
+                    .unwrap_or(Value::Bool(false))
+            }
+            _ => Value::Bool(false),
+        },
+        "prev" => match arg(args, 0) {
+            Value::Array(a) => {
+                let mut b = a.borrow_mut();
+                b.ptr_retreat();
+                b.ptr_entry()
+                    .map(|(_, c)| c.borrow().clone())
+                    .unwrap_or(Value::Bool(false))
+            }
+            _ => Value::Bool(false),
+        },
+        "each" => match arg(args, 0) {
+            Value::Array(a) => {
+                let mut b = a.borrow_mut();
+                match b.ptr_entry() {
+                    Some((k, c)) => {
+                        let mut r = PhpArray::new();
+                        let kv = match k {
+                            ArrKey::Int(i) => Value::Int(*i),
+                            ArrKey::Str(s) => Value::str(s.to_string()),
+                            ArrKey::Tomb => Value::Null,
+                        };
+                        let vv = c.borrow().clone();
+                        r.set(ArrKey::Int(1), vv.clone());
+                        r.set(ArrKey::Str("value".into()), vv);
+                        r.set(ArrKey::Int(0), kv.clone());
+                        r.set(ArrKey::Str("key".into()), kv);
+                        b.ptr_advance();
+                        Value::Array(Rc::new(RefCell::new(r)))
+                    }
+                    None => Value::Bool(false),
+                }
+            }
+            _ => Value::Bool(false),
+        },
 
         // ----- math -----
         "abs" => match arg(args, 0) {
@@ -2797,7 +2888,17 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             Value::Bool(ok)
         }
         "is_iterable" => Value::Bool(matches!(arg(args, 0), Value::Array(_))),
-        "is_countable" => Value::Bool(matches!(arg(args, 0), Value::Array(_))),
+        "is_countable" => Value::Bool(match arg(args, 0) {
+            Value::Array(_) => true,
+            Value::Object(o) => o
+                .borrow()
+                .class
+                .decl
+                .implements
+                .iter()
+                .any(|i| i.eq_ignore_ascii_case("countable")),
+            _ => false,
+        }),
         "is_resource" => Value::Bool(matches!(arg(args, 0), Value::Resource(_))),
         "is_nan" => Value::Bool(matches!(arg(args, 0), Value::Float(f) if f.is_nan())),
         "is_finite" => Value::Bool(matches!(arg(args, 0), Value::Float(f) if f.is_finite())),
@@ -3096,7 +3197,140 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             _ => Value::Bool(false),
         },
         "class_implements" | "class_uses" | "class_parents" => {
-            Value::Array(Rc::new(RefCell::new(PhpArray::new())))
+            let c0 = arg(args, 0);
+            let cn = match &c0 {
+                Value::Object(o) => o.borrow().class.name().to_string(),
+                Value::Str(s) => crate::value::lossy(s).into_owned(),
+                _ => {
+                    return Err(PhpError::uncaught(
+                        "TypeError",
+                        format!(
+                            "{}(): Argument #1 ($object_or_class) must be of type object|string, {} given",
+                            name,
+                            c0.debug_type()
+                        ),
+                        it.cur_line,
+                    ))
+                }
+            };
+            if args.len() <= 1 || arg(args, 1).is_truthy() {
+                let _ = it.run_autoload(&cn);
+            }
+            // `fn(class-or-iface-key) -> Option<(decl, is_iface)>`
+            let decl_of = |key: &str| -> Option<(Rc<crate::ast::ClassDecl>, bool)> {
+                if let Some(c) = it.lookup_class(key) {
+                    Some((c.decl.clone(), false))
+                } else {
+                    it.interfaces
+                        .get(&key.to_lowercase())
+                        .map(|d| (d.clone(), true))
+                }
+            };
+            let mut out = PhpArray::new();
+            match name {
+                "class_parents" => {
+                    match decl_of(&cn) {
+                        // Interfaces report no parents (oracle: empty
+                        // even when the iface extends another).
+                        Some((_, true)) => {}
+                        Some((mut d, _)) => {
+                            while let Some(p) = d.parent.clone() {
+                                let (pn, next) = match decl_of(&p) {
+                                    Some((pd, _)) => (pd.name.clone(), pd),
+                                    None => (p.clone(), {
+                                        let mut z = (*d).clone();
+                                        z.parent = None;
+                                        Rc::new(z)
+                                    }),
+                                };
+                                out.set(ArrKey::Str(pn.clone().into()), Value::str(pn));
+                                d = next;
+                            }
+                        }
+                        None => {
+                            it.warn_pub(&format!("class_parents(): Class \"{}\" not found", cn))?;
+                            return Ok(Some(Value::Bool(false)));
+                        }
+                    }
+                }
+                "class_implements" => match decl_of(&cn) {
+                    Some((d, _)) => {
+                        let mut seen = std::collections::HashSet::new();
+                        let mut stack: Vec<String> = Vec::new();
+                        let mut cur = Some(d.clone());
+                        while let Some(cd) = cur {
+                            for i in &cd.implements {
+                                stack.push(i.clone());
+                            }
+                            cur = cd
+                                .parent
+                                .as_ref()
+                                .and_then(|p| decl_of(p).map(|(pd, _)| pd));
+                        }
+                        while let Some(i) = stack.pop() {
+                            let il = i.to_lowercase();
+                            if seen.insert(il) {
+                                let disp = it
+                                    .interfaces
+                                    .get(&i.to_lowercase())
+                                    .map(|d| d.name.clone())
+                                    .unwrap_or_else(|| i.clone());
+                                out.set(ArrKey::Str(disp.clone().into()), Value::str(disp));
+                                if let Some(pd) = it.interfaces.get(&i.to_lowercase()) {
+                                    for p in &pd.implements {
+                                        stack.push(p.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        it.warn_pub(&format!("class_implements(): Class \"{}\" not found", cn))?;
+                        return Ok(Some(Value::Bool(false)));
+                    }
+                },
+                _ => {
+                    // class_uses — traits of the class + its parents +
+                    // traits-of-traits transitively.
+                    match decl_of(&cn) {
+                        Some((d, is_iface)) => {
+                            let mut seen = std::collections::HashSet::new();
+                            let mut stack: Vec<String> = Vec::new();
+                            if !is_iface {
+                                let mut cur = Some(d);
+                                while let Some(cd) = cur {
+                                    for t in &cd.traits {
+                                        stack.push(t.clone());
+                                    }
+                                    cur = cd
+                                        .parent
+                                        .as_ref()
+                                        .and_then(|p| decl_of(p).map(|(pd, _)| pd));
+                                }
+                            }
+                            // Oracle: traits-of-traits are NOT included —
+                            // only the traits each class in the chain
+                            // used directly.
+                            while let Some(t) = stack.pop() {
+                                let tl = t.to_lowercase();
+                                if seen.insert(tl) {
+                                    let disp = it
+                                        .traits
+                                        .get(&t.to_lowercase())
+                                        .map(|d| d.name.clone())
+                                        .unwrap_or_else(|| t.clone());
+                                    out.set(ArrKey::Str(disp.clone().into()), Value::str(disp));
+                                }
+                            }
+                        }
+                        None => {
+                            it.warn_pub(&format!("class_uses(): Class \"{}\" not found", cn))?;
+                            return Ok(Some(Value::Bool(false)));
+                        }
+                    }
+                }
+            }
+            Value::Array(Rc::new(RefCell::new(out)))
         }
         "spl_object_id" | "spl_object_hash" => match arg(args, 0) {
             Value::Object(o) => {
@@ -3215,7 +3449,14 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             });
             prev
         }
-        "restore_error_handler" | "restore_exception_handler" => Value::Bool(true),
+        "restore_error_handler" => {
+            it.restore_error_handler();
+            Value::Bool(true)
+        }
+        "restore_exception_handler" => {
+            it.restore_exception_handler();
+            Value::Bool(true)
+        }
         "trigger_error" | "user_error" => {
             let msg = arg_str(it, args, 0);
             // E_USER_WARNING=512 / E_USER_NOTICE=1024 / E_USER_DEPRECATED=
@@ -3770,6 +4011,10 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
         "chdir" => Value::Bool(std::env::set_current_dir(arg_str(it, args, 0)).is_ok()),
         "glob" => {
             let pat = arg_str(it, args, 0);
+            let flags = args.get(1).map(|c| c.borrow().to_int()).unwrap_or(0);
+            const GLOB_ONLYDIR: i64 = 1 << 30;
+            const GLOB_MARK: i64 = 8;
+            const GLOB_NOCHECK: i64 = 16;
             let mut out = PhpArray::new();
             // minimal glob: only '*' and '?' in filename segments
             let dir = std::path::Path::new(&pat)
@@ -3784,23 +4029,41 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             if let Ok(rd) = std::fs::read_dir(&dir) {
                 for e in rd.flatten() {
                     let n = e.file_name().to_string_lossy().into_owned();
-                    if re.is_match(&n) {
-                        let p = e.path();
-                        let s = if std::path::Path::new(&pat).is_absolute() {
-                            p.display().to_string()
-                        } else {
-                            let ds = dir.display().to_string();
-                            if ds == "." {
-                                n.clone()
-                            } else {
-                                format!("{}/{}", ds, n)
-                            }
-                        };
-                        out.push(Value::str(s));
+                    if !re.is_match(&n) {
+                        continue;
                     }
+                    if flags & GLOB_ONLYDIR != 0 && !e.path().is_dir() {
+                        continue;
+                    }
+                    let p = e.path();
+                    let s = if std::path::Path::new(&pat).is_absolute() {
+                        p.display().to_string()
+                    } else {
+                        let ds = dir.display().to_string();
+                        if ds == "." {
+                            n.clone()
+                        } else {
+                            format!("{}/{}", ds, n)
+                        }
+                    };
+                    out.push(Value::str(if flags & GLOB_MARK != 0 {
+                        format!("{}/", s)
+                    } else {
+                        s
+                    }));
                 }
             }
-            Value::Array(Rc::new(RefCell::new(out)))
+            // sorted like glob(3); empty -> pattern or false
+            let mut v: Vec<Value> = out.iter().map(|(_, c)| c.borrow().clone()).collect();
+            v.sort_by_key(|a| a.to_php_string());
+            let mut sorted = PhpArray::new();
+            for x in v {
+                sorted.push(x);
+            }
+            if sorted.is_empty() && flags & GLOB_NOCHECK != 0 {
+                sorted.push(Value::str(pat));
+            }
+            Value::Array(Rc::new(RefCell::new(sorted)))
         }
         "scandir" => {
             let mut out = PhpArray::new();
@@ -4123,6 +4386,148 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let s = arg_str(it, args, 0);
             Value::Bool(it.putenv_pub(&s))
         }
+        "getopt" => {
+            // spec: 0 = flag, 1 = required value, 2 = optional value
+            let mut short: HashMap<char, u8> = HashMap::new();
+            {
+                let spec = arg_str(it, args, 0);
+                let cs: Vec<char> = spec.chars().collect();
+                let mut i = 0;
+                while i < cs.len() {
+                    if cs[i] == ':' {
+                        i += 1;
+                        continue;
+                    }
+                    let kind = if cs.get(i + 1) == Some(&':') {
+                        if cs.get(i + 2) == Some(&':') {
+                            2
+                        } else {
+                            1
+                        }
+                    } else {
+                        0
+                    };
+                    short.insert(cs[i], kind);
+                    i += if kind == 0 { 1 } else { kind as usize };
+                }
+            }
+            let mut long: HashMap<String, u8> = HashMap::new();
+            if let Value::Array(a) = arg(args, 1) {
+                for (_, c) in a.borrow().iter() {
+                    let s = c.borrow().to_php_string();
+                    let name = s.trim_end_matches(':');
+                    let colons = s.len() - name.len();
+                    long.insert(name.to_string(), colons.min(2) as u8);
+                }
+            }
+            let argv = it.script_args.clone();
+            let mut vals: HashMap<String, Vec<Value>> = HashMap::new();
+            let mut order: Vec<String> = Vec::new();
+            let put = |name: String,
+                       v: Value,
+                       vals: &mut HashMap<String, Vec<Value>>,
+                       order: &mut Vec<String>| {
+                let e = vals.entry(name.clone()).or_default();
+                if e.is_empty() {
+                    order.push(name);
+                }
+                e.push(v);
+            };
+            let mut i = 0usize;
+            while i < argv.len() {
+                let a = &argv[i];
+                if a == "--" {
+                    break;
+                } else if let Some(body) = a.strip_prefix("--").filter(|b| !b.is_empty()) {
+                    let (name, inline) = match body.find('=') {
+                        Some(p) => (&body[..p], Some(body[p + 1..].to_string())),
+                        None => (body, None),
+                    };
+                    match long.get(name) {
+                        None => {}
+                        Some(0) => put(name.to_string(), Value::Bool(false), &mut vals, &mut order),
+                        Some(2) => put(
+                            name.to_string(),
+                            inline.map(Value::str).unwrap_or(Value::Bool(false)),
+                            &mut vals,
+                            &mut order,
+                        ),
+                        Some(_) => {
+                            if let Some(v) = inline {
+                                put(name.to_string(), Value::str(v), &mut vals, &mut order);
+                            } else if i + 1 < argv.len() {
+                                i += 1;
+                                put(
+                                    name.to_string(),
+                                    Value::str(argv[i].clone()),
+                                    &mut vals,
+                                    &mut order,
+                                );
+                            } else {
+                                put(name.to_string(), Value::Bool(false), &mut vals, &mut order);
+                            }
+                        }
+                    }
+                } else if a.starts_with('-') && a.len() > 1 {
+                    let cs: Vec<char> = a[1..].chars().collect();
+                    let mut j = 0;
+                    while j < cs.len() {
+                        match short.get(&cs[j]).copied() {
+                            None => j += 1,
+                            Some(0) => {
+                                put(cs[j].to_string(), Value::Bool(false), &mut vals, &mut order);
+                                j += 1;
+                            }
+                            Some(k) => {
+                                if j + 1 < cs.len() {
+                                    let v: String = cs[j + 1..].iter().collect();
+                                    let v = v.strip_prefix('=').unwrap_or(&v).to_string();
+                                    put(cs[j].to_string(), Value::str(v), &mut vals, &mut order);
+                                } else if k == 1 && i + 1 < argv.len() {
+                                    i += 1;
+                                    put(
+                                        cs[j].to_string(),
+                                        Value::str(argv[i].clone()),
+                                        &mut vals,
+                                        &mut order,
+                                    );
+                                } else {
+                                    put(
+                                        cs[j].to_string(),
+                                        Value::Bool(false),
+                                        &mut vals,
+                                        &mut order,
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    break; // first non-option arg ends parsing (no permutation)
+                }
+                i += 1;
+            }
+            if let Some(c) = args.get(2) {
+                *c.borrow_mut() = Value::Int(i as i64);
+            }
+            let mut out = PhpArray::new();
+            for name in order {
+                let vs = vals.remove(&name).unwrap_or_default();
+                let v = match vs.len() {
+                    1 => vs.into_iter().next().unwrap(),
+                    _ => {
+                        let mut inner = PhpArray::new();
+                        for v in vs {
+                            inner.push(v);
+                        }
+                        Value::Array(Rc::new(RefCell::new(inner)))
+                    }
+                };
+                out.set(ArrKey::Str(name.into()), v);
+            }
+            Value::Array(Rc::new(RefCell::new(out)))
+        }
         "php_sapi_name" => Value::str("cli"),
         "phpversion" | "phpversion_strict" => Value::str("8.5.11-phpun"),
         "php_uname" => Value::str("Linux"),
@@ -4242,13 +4647,14 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
+            // PHP: hrtime() -> [secs, nanos]; hrtime(true) -> int nanos.
             if arg(args, 0).is_truthy() {
+                Value::Int(now.as_nanos() as i64)
+            } else {
                 let mut a = PhpArray::new();
                 a.push(Value::Int(now.as_secs() as i64));
                 a.push(Value::Int(now.subsec_nanos() as i64));
                 Value::Array(Rc::new(RefCell::new(a)))
-            } else {
-                Value::Int(now.as_nanos() as i64)
             }
         }
         "uniqid" => Value::str(format!(
@@ -4260,7 +4666,26 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             std::process::id()
         )),
         "gc_collect_cycles" | "gc_enable" | "gc_disable" | "gc_mem_caches" => Value::Int(0),
-        "gc_status" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+        "gc_status" => {
+            let mut a = PhpArray::new();
+            for (k, v) in [
+                ("running", Value::Bool(false)),
+                ("protected", Value::Bool(false)),
+                ("full", Value::Bool(false)),
+                ("runs", Value::Int(0)),
+                ("collected", Value::Int(0)),
+                ("threshold", Value::Int(10001)),
+                ("buffer_size", Value::Int(16384)),
+                ("roots", Value::Int(0)),
+                ("application_time", Value::Float(0.0)),
+                ("collector_time", Value::Float(0.0)),
+                ("destructor_time", Value::Float(0.0)),
+                ("free_time", Value::Float(0.0)),
+            ] {
+                a.set(ArrKey::Str(k.into()), v);
+            }
+            Value::Array(Rc::new(RefCell::new(a)))
+        }
         "gc_enabled" => Value::Bool(false),
         "syslog" | "openlog" | "closelog" => Value::Bool(true),
         "array_change_key_case" => {
@@ -4317,11 +4742,41 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             _ => Value::Bool(false),
         },
         "stream_get_contents" => {
+            // (resource, ?length = null, offset = -1): an explicit
+            // offset seeks first — UnifiedDiffOutputBuilder writes a
+            // php://memory buffer then reads it back from 0.
+            if let Some(Value::Resource(r)) = args.first().map(|c| c.borrow().clone()) {
+                let offset = args.get(2).map(|c| c.borrow().to_int()).unwrap_or(-1);
+                if offset >= 0 {
+                    match &mut *r.borrow_mut() {
+                        PhpResource::File { pos, eof, .. } | PhpResource::Mem { pos, eof, .. } => {
+                            *pos = offset as u64;
+                            *eof = false;
+                        }
+                        PhpResource::Input { pos, .. } => {
+                            *pos = offset as u64;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let maxlen = match args.get(1).map(|c| c.borrow().clone()) {
+                Some(Value::Null) | None => -1,
+                Some(v) => v.to_int(),
+            };
+            let mut remaining = if maxlen < 0 {
+                usize::MAX
+            } else {
+                maxlen as usize
+            };
             let mut out = Vec::new();
-            loop {
-                match read_resource(args.first(), 8192) {
+            while remaining > 0 {
+                match read_resource(args.first(), remaining.min(8192)) {
                     Ok(b) if b.is_empty() => break,
-                    Ok(b) => out.extend_from_slice(&b),
+                    Ok(b) => {
+                        remaining = remaining.saturating_sub(b.len());
+                        out.extend_from_slice(&b);
+                    }
                     Err(_) => break,
                 }
             }
@@ -4911,12 +5366,14 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "array_combine"
             | "array_count_values"
             | "array_diff"
+            | "array_diff_assoc"
             | "array_diff_key"
             | "array_fill"
             | "array_fill_keys"
             | "array_filter"
             | "array_flip"
             | "array_intersect"
+            | "array_intersect_assoc"
             | "array_intersect_key"
             | "array_is_list"
             | "array_key_exists_slow"
@@ -5040,6 +5497,7 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "get_parent_class"
             | "getcwd"
             | "getenv"
+            | "getopt"
             | "getmypid"
             | "gettype"
             | "glob"
@@ -6461,6 +6919,7 @@ fn sort_array(
         }
         _ => {}
     }
+    arr.iter_pos = 0;
     Ok(())
 }
 

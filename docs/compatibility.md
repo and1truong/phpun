@@ -1,4 +1,4 @@
-# Compatibility notes — tests/lang @ 272/280 (97.1%)
+# Compatibility notes — tests/lang @ 274/280 (97.9%)
 
 Reference: PHP 8.5.11 (cli). Harness: `phpun phpt … -j 8`.
 
