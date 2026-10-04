@@ -2273,7 +2273,7 @@ impl<'a> Interp<'a> {
 
     /// Ancestry check by NAME for a class not (yet) in `self.classes`:
     /// walks parent/implements names through `classes` and `linking`.
-    pub(in crate::interp) fn is_a_unresolved(&mut self, a: &str, b: &str, depth: u8) -> bool {
+    fn is_a_unresolved(&mut self, a: &str, b: &str, depth: u8) -> bool {
         if a.trim_start_matches('\\').eq_ignore_ascii_case(b) {
             return true;
         }

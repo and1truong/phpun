@@ -13,7 +13,7 @@ impl<'a> Interp<'a> {
         stmts.iter().any(Self::stmt_contains_yield)
     }
 
-    pub(in crate::interp) fn stmt_contains_yield(s: &Stmt) -> bool {
+    fn stmt_contains_yield(s: &Stmt) -> bool {
         match s {
             Stmt::Expr(e) => Self::expr_contains_yield(e),
             Stmt::Echo(es) => es.iter().any(Self::expr_contains_yield),
@@ -75,7 +75,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    pub(in crate::interp) fn expr_contains_yield(e: &Expr) -> bool {
+    fn expr_contains_yield(e: &Expr) -> bool {
         match e {
             Expr::Yield { .. } | Expr::YieldFrom(_) => true,
             // Nested closures/arrow fns are their own generator context.
@@ -207,10 +207,7 @@ impl<'a> Interp<'a> {
     /// every yield into `state.items`. PHP defers body execution to the
     /// first iterator access, which this mirrors (eager collection on
     /// first use).
-    pub(in crate::interp) fn gen_start(
-        &mut self,
-        state: &Rc<RefCell<GenState>>,
-    ) -> Result<(), PhpError> {
+    fn gen_start(&mut self, state: &Rc<RefCell<GenState>>) -> Result<(), PhpError> {
         let (setup, sends) = {
             let mut st = state.borrow_mut();
             if st.started {

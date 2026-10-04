@@ -592,7 +592,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    pub(in crate::interp) fn magic(&mut self, m: MagicConst) -> Value {
+    fn magic(&mut self, m: MagicConst) -> Value {
         // __FILE__/__DIR__ resolve against the DECLARING file of the
         // code that runs them — a closure defined in vendor/autoload.php
         // sees that file's dir even when invoked from elsewhere
@@ -692,11 +692,7 @@ impl<'a> Interp<'a> {
     ///  2 = ?? / intermediate segment — __isset gates then __get
     ///                 fetches; without __isset the read runs __get
     ///                 directly (bug71359).
-    pub(in crate::interp) fn isset_val_mode(
-        &mut self,
-        e: &Expr,
-        mode: u8,
-    ) -> Result<Option<Value>, PhpError> {
+    fn isset_val_mode(&mut self, e: &Expr, mode: u8) -> Result<Option<Value>, PhpError> {
         match e {
             Expr::Var(n) => Ok(match self.var_cell_opt(n) {
                 Some(c) => match &*c.borrow() {
@@ -956,7 +952,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    pub(in crate::interp) fn prop_read_loose(&mut self, e: &Expr) -> Result<Value, PhpError> {
+    fn prop_read_loose(&mut self, e: &Expr) -> Result<Value, PhpError> {
         match e {
             Expr::Prop {
                 obj,
@@ -1031,7 +1027,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    pub(in crate::interp) fn const_read(&mut self, name: &str) -> Result<Value, PhpError> {
+    fn const_read(&mut self, name: &str) -> Result<Value, PhpError> {
         match name {
             "self" | "static" | "parent" => {
                 // Resolved as class names only in :: context; bare self is an error.
@@ -1075,12 +1071,7 @@ impl<'a> Interp<'a> {
         })
     }
 
-    pub(in crate::interp) fn assign(
-        &mut self,
-        target: &Expr,
-        op: &'static str,
-        value: &Expr,
-    ) -> Result<Value, PhpError> {
+    fn assign(&mut self, target: &Expr, op: &'static str, value: &Expr) -> Result<Value, PhpError> {
         // `$this` may never be an assignment target (compile fatal,
         // bug24573); plain and compound assigns both route here.
         if let Expr::Var(n) = target {
@@ -1458,10 +1449,7 @@ impl<'a> Interp<'a> {
         Ok((c, was_ref))
     }
 
-    pub(in crate::interp) fn eval_call_cell_inner(
-        &mut self,
-        e: &Expr,
-    ) -> Result<(Cell, bool), PhpError> {
+    fn eval_call_cell_inner(&mut self, e: &Expr) -> Result<(Cell, bool), PhpError> {
         self.last_ret_cell = None;
         self.last_call_by_ref = false;
         let v = self.eval(e)?;
@@ -1475,11 +1463,7 @@ impl<'a> Interp<'a> {
     }
 
     /// `$target =& $cell`
-    pub(in crate::interp) fn bind_cell(
-        &mut self,
-        target: &Expr,
-        src: Cell,
-    ) -> Result<(), PhpError> {
+    fn bind_cell(&mut self, target: &Expr, src: Cell) -> Result<(), PhpError> {
         // `=&` creates Zend's IS_REFERENCE — writes through it say
         // "a reference held by property", not "property" (034/078).
         self.ref_cells.insert(Rc::as_ptr(&src) as usize);
@@ -1802,7 +1786,7 @@ impl<'a> Interp<'a> {
     /// member type; otherwise `Cannot auto-initialize an array inside
     /// ...` TypeError and a just-materialized slot reverts to
     /// uninitialized (typed_properties_083).
-    pub(in crate::interp) fn auto_init_gate(&mut self, c: &Cell) -> Result<(), PhpError> {
+    fn auto_init_gate(&mut self, c: &Cell) -> Result<(), PhpError> {
         let ptr = Rc::as_ptr(c) as usize;
         self.prune_typed_slot(ptr);
         let gated = self
@@ -2085,12 +2069,7 @@ impl<'a> Interp<'a> {
     }
 
     /// `$arr[$k] = v` / `$arr[] = v`.
-    pub(in crate::interp) fn set_index(
-        &mut self,
-        e: &Expr,
-        i: Option<&Expr>,
-        v: Value,
-    ) -> Result<(), PhpError> {
+    fn set_index(&mut self, e: &Expr, i: Option<&Expr>, v: Value) -> Result<(), PhpError> {
         let key = match i {
             Some(ie) => Some(self.eval(ie)?),
             None => None,
@@ -2105,7 +2084,7 @@ impl<'a> Interp<'a> {
     /// Returns the effective stored value: string-offset writes return the
     /// byte actually stored, everything else echoes `v` (bug22592: chained
     /// `$a[i] = $a[j] = $s` only warns for the first write).
-    pub(in crate::interp) fn assign_index_path(
+    fn assign_index_path(
         &mut self,
         e: &Expr,
         keys: &[Option<Value>],
@@ -2236,7 +2215,7 @@ impl<'a> Interp<'a> {
 
     /// `$a[$k]` keys: object/closure keys are a catchable Error
     /// naming the class (closure_array_key_error/offset_error).
-    pub(in crate::interp) fn check_offset_key(&mut self, v: &Value) -> Result<(), PhpError> {
+    fn check_offset_key(&mut self, v: &Value) -> Result<(), PhpError> {
         let cn = match v {
             Value::Object(o) => Some(o.borrow().class.name().to_string()),
             Value::Callable(_) => Some("Closure".to_string()),
@@ -2253,12 +2232,7 @@ impl<'a> Interp<'a> {
     }
 
     /// `set_index` with an already-evaluated key.
-    pub(in crate::interp) fn set_index_val(
-        &mut self,
-        e: &Expr,
-        key: Option<Value>,
-        v: Value,
-    ) -> Result<(), PhpError> {
+    fn set_index_val(&mut self, e: &Expr, key: Option<Value>, v: Value) -> Result<(), PhpError> {
         if let Some(k) = &key {
             self.check_offset_key(k)?;
         }
@@ -2449,11 +2423,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Index into `c`'s array value, taking a cell for `key`/`[]`.
-    pub(in crate::interp) fn index_into_key(
-        &mut self,
-        c: Cell,
-        key: Option<Value>,
-    ) -> Result<Cell, PhpError> {
+    fn index_into_key(&mut self, c: Cell, key: Option<Value>) -> Result<Cell, PhpError> {
         if let Some(k) = &key {
             self.check_offset_key(k)?;
         }
@@ -2499,11 +2469,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    pub(in crate::interp) fn index_cell(
-        &mut self,
-        e: &Expr,
-        i: Option<&Expr>,
-    ) -> Result<Cell, PhpError> {
+    fn index_cell(&mut self, e: &Expr, i: Option<&Expr>) -> Result<Cell, PhpError> {
         let key = match i {
             Some(ie) => Some(self.eval(ie)?),
             None => None,
@@ -2512,11 +2478,7 @@ impl<'a> Interp<'a> {
     }
 
     /// `index_cell` with an already-evaluated key.
-    pub(in crate::interp) fn index_cell_key(
-        &mut self,
-        e: &Expr,
-        key: Option<Value>,
-    ) -> Result<Cell, PhpError> {
+    fn index_cell_key(&mut self, e: &Expr, key: Option<Value>) -> Result<Cell, PhpError> {
         match e {
             Expr::Var(name) => {
                 let c = self.var_cell(name);
@@ -2555,11 +2517,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    pub(in crate::interp) fn index_read(
-        &mut self,
-        e: &Expr,
-        i: Option<&Expr>,
-    ) -> Result<Value, PhpError> {
+    fn index_read(&mut self, e: &Expr, i: Option<&Expr>) -> Result<Value, PhpError> {
         // Base evaluates before the index expr (left-to-right).
         let base = self.eval(e)?;
         let key = match i {
@@ -2572,11 +2530,7 @@ impl<'a> Interp<'a> {
     }
 
     /// `index_read` for a caller that already evaluated `e` and the key.
-    pub(in crate::interp) fn index_read_val(
-        &mut self,
-        e: &Expr,
-        key: Option<Value>,
-    ) -> Result<Value, PhpError> {
+    fn index_read_val(&mut self, e: &Expr, key: Option<Value>) -> Result<Value, PhpError> {
         let base = self.eval(e)?;
         match key {
             Some(k) => self.index_read_base(base, k),
@@ -2584,11 +2538,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    pub(in crate::interp) fn index_read_base(
-        &mut self,
-        base: Value,
-        key: Value,
-    ) -> Result<Value, PhpError> {
+    fn index_read_base(&mut self, base: Value, key: Value) -> Result<Value, PhpError> {
         self.check_offset_key(&key)?;
         match base {
             Value::Array(rc) => {
@@ -2777,11 +2727,7 @@ impl<'a> Interp<'a> {
     /// Catch-bind checking: strict member fit only — no __toString or
     /// scalar coercion (int still widens to float)
     /// (typed_properties_108).
-    pub(in crate::interp) fn slot_write_strict(
-        &mut self,
-        tys: &[String],
-        v: &Value,
-    ) -> Option<Value> {
+    fn slot_write_strict(&mut self, tys: &[String], v: &Value) -> Option<Value> {
         if self.ty_exact(tys, v) {
             if tys.iter().any(|t| t.eq_ignore_ascii_case("float")) {
                 if let Value::Int(i) = v {
@@ -2796,11 +2742,7 @@ impl<'a> Interp<'a> {
     /// The write result one typed-slot owner would produce — exact
     /// match widens `int` into a `float` member, weak files coerce;
     /// `None` when the type can't be satisfied (union_types/prop_ref_assign).
-    pub(in crate::interp) fn slot_write_one(
-        &mut self,
-        tys: &[String],
-        v: &Value,
-    ) -> Result<Option<Value>, PhpError> {
+    fn slot_write_one(&mut self, tys: &[String], v: &Value) -> Result<Option<Value>, PhpError> {
         if self.ty_exact(tys, v) {
             if tys.iter().any(|t| t.eq_ignore_ascii_case("float")) {
                 if let Value::Int(i) = v {
@@ -2836,7 +2778,7 @@ impl<'a> Interp<'a> {
 
     /// An owner is stale when the prop it names no longer holds this
     /// cell — static rebinds (082), unsets, or a dead object (094).
-    pub(in crate::interp) fn slot_anchor_alive(&self, ptr: usize, anc: &SlotAnchor) -> bool {
+    fn slot_anchor_alive(&self, ptr: usize, anc: &SlotAnchor) -> bool {
         match anc {
             SlotAnchor::Obj(w, key) => w
                 .upgrade()
@@ -2924,11 +2866,7 @@ impl<'a> Interp<'a> {
         Some(self.err_flow(e))
     }
 
-    pub(in crate::interp) fn typed_slot_store(
-        &mut self,
-        c: &Cell,
-        v: Value,
-    ) -> Result<Value, PhpError> {
+    fn typed_slot_store(&mut self, c: &Cell, v: Value) -> Result<Value, PhpError> {
         self.typed_slot_store_mode(c, v, false)
     }
 
@@ -3039,7 +2977,7 @@ impl<'a> Interp<'a> {
 
     /// Synthesized signature of a magic-method trampoline FCC:
     /// `mixed ...$arguments` (trampoline_closure_named_arguments).
-    pub(in crate::interp) fn trampoline_decl() -> Rc<crate::ast::FunctionDecl> {
+    fn trampoline_decl() -> Rc<crate::ast::FunctionDecl> {
         Rc::new(crate::ast::FunctionDecl {
             name: "{trampoline}".into(),
             params: vec![crate::ast::Param {
@@ -3122,7 +3060,7 @@ impl<'a> Interp<'a> {
     /// Synthetic decl for an internal function, from builtin_sig +
     /// builtin_param_ty — lets reflectors report param names,
     /// required flags and declared types for builtins (bug69802_2).
-    pub(in crate::interp) fn builtin_decl(lname: &str) -> Option<Rc<crate::ast::FunctionDecl>> {
+    fn builtin_decl(lname: &str) -> Option<Rc<crate::ast::FunctionDecl>> {
         let sig = crate::builtins::builtin_sig(lname)?;
         Some(Rc::new(crate::ast::FunctionDecl {
             name: lname.into(),
@@ -3160,7 +3098,7 @@ impl<'a> Interp<'a> {
 
     /// Same-type same-value — owners must agree on the *exact* result
     /// (int(42) vs float(42.0) is inconsistent).
-    pub(in crate::interp) fn value_identical(a: &Value, b: &Value) -> bool {
+    fn value_identical(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Null, Value::Null) => true,
             (Value::Bool(x), Value::Bool(y)) => x == y,
@@ -3173,12 +3111,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    pub(in crate::interp) fn incdec(
-        &mut self,
-        target: &Expr,
-        delta: i64,
-        post: bool,
-    ) -> Result<Value, PhpError> {
+    fn incdec(&mut self, target: &Expr, delta: i64, post: bool) -> Result<Value, PhpError> {
         // PHP warns on undefined vars/props/keys during ++/-- (bug25547).
         let old = match target {
             Expr::Var(name) => self.var_get(name).unwrap_or(Value::Null),
@@ -3297,7 +3230,7 @@ impl<'a> Interp<'a> {
     /// backing cell and ++/-- writes through it (no offsetSet);
     /// a value-returning offsetGet falls back to offsetSet
     /// (typed_properties_065).
-    pub(in crate::interp) fn incdec_aa(
+    fn incdec_aa(
         &mut self,
         o: Rc<RefCell<PhpObject>>,
         key: Value,
@@ -3378,11 +3311,7 @@ impl<'a> Interp<'a> {
 
     /// PHP inc/dec semantics: null++ = 1, null-- = null, strings increment
     /// alphanumerically (Perl-style), numeric strings go numeric.
-    pub(in crate::interp) fn incdec_value(
-        &mut self,
-        v: &Value,
-        delta: i64,
-    ) -> Result<Value, PhpError> {
+    fn incdec_value(&mut self, v: &Value, delta: i64) -> Result<Value, PhpError> {
         Ok(match v {
             Value::Null => {
                 if delta > 0 {
@@ -3425,11 +3354,7 @@ impl<'a> Interp<'a> {
         })
     }
 
-    pub(in crate::interp) fn unary(
-        &mut self,
-        op: &'static str,
-        e: &Expr,
-    ) -> Result<Value, PhpError> {
+    fn unary(&mut self, op: &'static str, e: &Expr) -> Result<Value, PhpError> {
         match op {
             "!" => {
                 let v = self.eval(e)?;
@@ -3513,12 +3438,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    pub(in crate::interp) fn binary(
-        &mut self,
-        op: &'static str,
-        l: &Expr,
-        r: &Expr,
-    ) -> Result<Value, PhpError> {
+    fn binary(&mut self, op: &'static str, l: &Expr, r: &Expr) -> Result<Value, PhpError> {
         match op {
             "&&" => {
                 let lv = self.eval(l)?;
@@ -3574,11 +3494,7 @@ impl<'a> Interp<'a> {
     /// i.e. after the right operand has run — so `$a . ($a=$b)` sees the
     /// assigned value. Other left expressions evaluate normally first
     /// (execution_order).
-    pub(in crate::interp) fn binary_operands(
-        &mut self,
-        l: &Expr,
-        r: &Expr,
-    ) -> Result<(Value, Value), PhpError> {
+    fn binary_operands(&mut self, l: &Expr, r: &Expr) -> Result<(Value, Value), PhpError> {
         if let Expr::Var(n) = l {
             let c = self.var_cell_opt(n);
             let rv = self.eval(r)?;
@@ -3593,7 +3509,7 @@ impl<'a> Interp<'a> {
         Ok((lv, rv))
     }
 
-    pub(in crate::interp) fn compare_op(&self, op: &str, a: &Value, b: &Value) -> Value {
+    fn compare_op(&self, op: &str, a: &Value, b: &Value) -> Value {
         // NaN is unordered: every ordered comparison is false, <=> is -1.
         let nan = matches!((a, b), (Value::Float(f), _) | (_, Value::Float(f)) if f.is_nan());
         if nan {
@@ -3623,12 +3539,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Arithmetic / bitwise with PHP numeric-string coercion.
-    pub(in crate::interp) fn arith(
-        &mut self,
-        op: &str,
-        l: Value,
-        r: Value,
-    ) -> Result<Value, PhpError> {
+    fn arith(&mut self, op: &str, l: Value, r: Value) -> Result<Value, PhpError> {
         match op {
             "&" | "|" | "^" => {
                 if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
@@ -3793,7 +3704,7 @@ impl<'a> Interp<'a> {
 
     /// Coerce a value to a number per PHP rules.
     /// Returns (numeric, "leading-numeric warning needed").
-    pub(in crate::interp) fn num(&mut self, v: &Value) -> (Option<Num>, bool) {
+    fn num(&mut self, v: &Value) -> (Option<Num>, bool) {
         match v {
             Value::Int(i) => (Some(Num::I(*i)), false),
             Value::Float(f) => (Some(Num::F(*f)), false),
@@ -3818,12 +3729,7 @@ impl<'a> Interp<'a> {
     /// Operand coercion for integer-only binary ops (`& | ^ << >>`):
     /// leading-numeric strings warn "A non-numeric value encountered";
     /// non-numeric strings raise a catchable TypeError.
-    pub(in crate::interp) fn bit_operand(
-        &mut self,
-        op: &str,
-        v: &Value,
-        other: &Value,
-    ) -> Result<i64, PhpError> {
+    fn bit_operand(&mut self, op: &str, v: &Value, other: &Value) -> Result<i64, PhpError> {
         if let Value::Str(s) = v {
             match numeric(s) {
                 Numeric::Int(i) => return Ok(i),
@@ -3887,7 +3793,7 @@ impl<'a> Interp<'a> {
     }
 
     /// `(type)expr` cast.
-    pub(in crate::interp) fn cast(&mut self, kind: CastKind, v: Value) -> Result<Value, PhpError> {
+    fn cast(&mut self, kind: CastKind, v: Value) -> Result<Value, PhpError> {
         Ok(match kind {
             CastKind::Int => Value::Int(self.coerce_int(&v)),
             CastKind::Float => Value::Float(v.to_float()),
@@ -3955,4 +3861,119 @@ impl<'a> Interp<'a> {
             },
         })
     }
+}
+
+enum Num {
+    I(i64),
+    F(f64),
+}
+
+impl Num {
+    fn to_float(&self) -> f64 {
+        match self {
+            Num::I(i) => *i as f64,
+            Num::F(f) => *f,
+        }
+    }
+}
+
+fn num_bin(a: Num, b: Num, fi: fn(i64, i64) -> Option<i64>, ff: fn(f64, f64) -> f64) -> Value {
+    match (a, b) {
+        (Num::I(x), Num::I(y)) => match fi(x, y) {
+            // Integer overflow promotes to float (multiply_basiclong_64bit.phpt).
+            Some(r) => Value::Int(r),
+            None => Value::Float(ff(x as f64, y as f64)),
+        },
+        (x, y) => Value::Float(ff(x.to_float(), y.to_float())),
+    }
+}
+
+/// Perl-style string increment ("a"→"b", "z"→"aa", "A9"→"B0").
+fn perl_inc(s: &[u8]) -> Vec<u8> {
+    let mut bytes = s.to_vec();
+    let mut i = bytes.len();
+    let mut carry = true;
+    while carry && i > 0 {
+        i -= 1;
+        let c = bytes[i];
+        let next = match c {
+            b'a'..=b'y' | b'A'..=b'Y' => c + 1,
+            b'z' => {
+                bytes[i] = b'a';
+                continue;
+            }
+            b'Z' => {
+                bytes[i] = b'A';
+                continue;
+            }
+            b'0'..=b'8' => c + 1,
+            b'9' => {
+                bytes[i] = b'0';
+                continue;
+            }
+            _ => {
+                carry = false;
+                continue;
+            }
+        };
+        bytes[i] = next;
+        carry = false;
+    }
+    if carry {
+        // Determine the carried character class from the first char.
+        let first = bytes.first().copied().unwrap_or(b'a');
+        let c = if first.is_ascii_uppercase() {
+            b'A'
+        } else if first.is_ascii_lowercase() {
+            b'a'
+        } else {
+            b'1'
+        };
+        bytes.insert(0, c);
+    }
+    bytes
+}
+
+/// PHP float→int conversion (zend_dtoi64): warns on out-of-range,
+/// wraps modulo 2^64; NaN/INF → 0.
+fn coerce_float(f: f64, mut warn: impl FnMut(&str)) -> i64 {
+    const MOD: f64 = 18446744073709551616.0; // 2^64
+    if !f.is_finite() {
+        warn(&format!(
+            "The float {} is not representable as an int, cast occurred",
+            format_float_repr(f)
+        ));
+        return 0;
+    }
+    if f >= i64::MAX as f64 || f < i64::MIN as f64 {
+        warn(&format!(
+            "The float {} is not representable as an int, cast occurred",
+            format_float_repr(f)
+        ));
+        let m = f % MOD;
+        let u = if m < 0.0 { m + MOD } else { m };
+        return u as u64 as i64;
+    }
+    f as i64
+}
+
+fn bitwise_str(op: &str, a: &[u8], b: &[u8]) -> Vec<u8> {
+    // `|` pads the shorter operand with NUL; `&`/`^` truncate to min length.
+    let (x, y) = (a, b);
+    let n = if op == "|" {
+        x.len().max(y.len())
+    } else {
+        x.len().min(y.len())
+    };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let xi = x.get(i).copied().unwrap_or(0);
+        let yi = y.get(i).copied().unwrap_or(0);
+        out.push(match op {
+            "&" => xi & yi,
+            "|" => xi | yi,
+            _ => xi ^ yi,
+        });
+    }
+    out
 }

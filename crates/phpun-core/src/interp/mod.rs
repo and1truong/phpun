@@ -2129,3 +2129,383 @@ impl<'a> Interp<'a> {
         false
     }
 }
+
+/// Zend-style render for the `assert(<args>)` AssertionError message.
+fn assert_arg_repr(v: &Value) -> String {
+    match v {
+        Value::Bool(b) => if *b { "true" } else { "false" }.into(),
+        Value::Null => "NULL".into(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => crate::value::trace_arg(&Value::Float(*f)),
+        Value::Str(s) => format!("'{}'", crate::value::lossy(&s)),
+        Value::Array(_) => "Array".into(),
+        Value::Object(o) => format!("Object({})", o.borrow().class.name()),
+        Value::Callable(_) => "Object(Closure)".into(),
+        Value::Resource(_) => "Resource id #1".into(),
+    }
+}
+
+/// SPL iterator-wrapper classes expressed in plain PHP and eval'd once
+/// per Interp (Interp::new). Written in PHP because they are pure
+/// delegation over Iterator methods; the engine supplies the leaves
+/// (DirectoryIterator/FilesystemIterator/RecursiveDirectoryIterator).
+const SPL_ITERATOR_PRELUDE: &str = r#"
+interface OuterIterator extends Iterator {
+    public function getInnerIterator();
+}
+interface RecursiveIterator extends Iterator {
+    public function hasChildren();
+    public function getChildren();
+}
+class IteratorIterator implements OuterIterator {
+    protected $inner;
+    public function __construct($iterator) {
+        $it = $iterator;
+        while ($it instanceof IteratorAggregate) {
+            $it = $it->getIterator();
+        }
+        $this->inner = $it;
+    }
+    public function getInnerIterator() { return $this->inner; }
+    public function __call($func, $params) { return $this->inner->$func(...$params); }
+    public function rewind() { $this->inner->rewind(); }
+    public function valid() { return $this->inner->valid(); }
+    public function current() { return $this->inner->current(); }
+    public function key() { return $this->inner->key(); }
+    public function next() { $this->inner->next(); }
+}
+abstract class FilterIterator extends IteratorIterator {
+    abstract public function accept();
+    public function rewind() { $this->inner->rewind(); $this->fetch(); }
+    public function next() { $this->inner->next(); $this->fetch(); }
+    private function fetch() {
+        while ($this->inner->valid() && !$this->accept()) {
+            $this->inner->next();
+        }
+    }
+}
+abstract class RecursiveFilterIterator extends FilterIterator implements RecursiveIterator {
+    public function hasChildren() { return $this->inner->hasChildren(); }
+    // SPL: children come back wrapped in the same filter class.
+    public function getChildren() {
+        $cls = static::class;
+        return new $cls($this->inner->getChildren());
+    }
+}
+class CallbackFilterIterator extends FilterIterator {
+    private $callback;
+    public function __construct($iterator, $callback) {
+        parent::__construct($iterator);
+        $this->callback = $callback;
+    }
+    public function accept() {
+        return ($this->callback)($this->current(), $this->key(), $this->inner);
+    }
+}
+class RecursiveIteratorIterator implements OuterIterator {
+    const LEAVES_ONLY = 0;
+    const SELF_FIRST = 1;
+    const CHILD_FIRST = 2;
+    const CALL_TOSTRING = 4;
+    const CATCH_GET_CHILD = 8;
+    private $stack = [];
+    private $emitted = [];
+    private $mode;
+    private $flags;
+    private $yieldParent = false;
+    public function __construct($iterator, $mode = 0, $flags = 0) {
+        $it = $iterator;
+        while ($it instanceof IteratorAggregate) {
+            $it = $it->getIterator();
+        }
+        $this->mode = $mode;
+        $this->flags = $flags;
+        $this->stack = [$it];
+        $this->emitted = [false];
+        $it->rewind();
+        $this->descend();
+    }
+    private function top() { return $this->stack[count($this->stack) - 1]; }
+    public function getDepth() { return count($this->stack) - 1; }
+    public function getSubIterator($level = null) {
+        $i = $level === null ? count($this->stack) - 1 : $level;
+        return $this->stack[$i] ?? null;
+    }
+    public function getInnerIterator() { return $this->top(); }
+    private function descend() {
+        while (count($this->stack) > 0) {
+            $top = $this->top();
+            if (!$top->valid()) {
+                array_pop($this->stack);
+                array_pop($this->emitted);
+                $this->yieldParent = false;
+                if (count($this->stack) === 0) {
+                    return;
+                }
+                $i = count($this->stack) - 1;
+                if ($this->mode === self::CHILD_FIRST && !$this->emitted[$i]) {
+                    $this->emitted[$i] = true;
+                    $this->yieldParent = true;
+                    return;
+                }
+                $this->top()->next();
+                continue;
+            }
+            if ($top instanceof RecursiveIterator && $top->hasChildren()) {
+                $i = count($this->stack) - 1;
+                if ($this->mode === self::SELF_FIRST && !$this->emitted[$i]) {
+                    $this->emitted[$i] = true;
+                    $this->yieldParent = true;
+                    return;
+                }
+                try {
+                    $child = $top->getChildren();
+                } catch (Throwable $e) {
+                    if (!($this->flags & self::CATCH_GET_CHILD)) {
+                        throw $e;
+                    }
+                    $top->next();
+                    continue;
+                }
+                $child->rewind();
+                $this->stack[] = $child;
+                $this->emitted[] = false;
+                continue;
+            }
+            $this->yieldParent = false;
+            return;
+        }
+        $this->yieldParent = false;
+    }
+    public function valid() {
+        return count($this->stack) > 0 && $this->top()->valid();
+    }
+    public function current() {
+        return count($this->stack) > 0 ? $this->top()->current() : null;
+    }
+    public function key() {
+        return count($this->stack) > 0 ? $this->top()->key() : null;
+    }
+    public function next() {
+        if (count($this->stack) === 0) {
+            return;
+        }
+        if ($this->yieldParent && $this->mode === self::SELF_FIRST) {
+            $top = $this->top();
+            try {
+                $child = $top->getChildren();
+            } catch (Throwable $e) {
+                if (!($this->flags & self::CATCH_GET_CHILD)) {
+                    throw $e;
+                }
+                $top->next();
+                $this->yieldParent = false;
+                $this->descend();
+                return;
+            }
+            $child->rewind();
+            $i = count($this->stack) - 1;
+            $this->emitted[$i] = false;
+            $this->stack[] = $child;
+            $this->emitted[] = false;
+            $this->yieldParent = false;
+            $this->descend();
+            return;
+        }
+        if ($this->yieldParent) {
+            $i = count($this->stack) - 1;
+            $this->emitted[$i] = false;
+            $this->yieldParent = false;
+            $this->top()->next();
+            $this->descend();
+            return;
+        }
+        $this->top()->next();
+        $this->descend();
+    }
+    public function rewind() {
+        $this->stack = [$this->stack[0]];
+        $this->emitted = [false];
+        $this->stack[0]->rewind();
+        $this->yieldParent = false;
+        $this->descend();
+    }
+}
+class AppendIterator extends IteratorIterator {
+    private $its = [];
+    private $idx = 0;
+    public function __construct() {}
+    public function append($it) {
+        while ($it instanceof IteratorAggregate) {
+            $it = $it->getIterator();
+        }
+        $this->its[] = $it;
+        if ($this->idx === 0 && count($this->its) === 1) {
+            $this->inner = $it;
+        }
+    }
+    private function sync() {
+        while ($this->idx < count($this->its) && !$this->its[$this->idx]->valid()) {
+            $this->idx++;
+        }
+        $this->inner = $this->idx < count($this->its) ? $this->its[$this->idx] : null;
+    }
+    public function rewind() {
+        foreach ($this->its as $it) {
+            $it->rewind();
+        }
+        $this->idx = 0;
+        $this->sync();
+    }
+    public function valid() {
+        return $this->idx < count($this->its) && $this->its[$this->idx]->valid();
+    }
+    public function next() {
+        if ($this->idx < count($this->its)) {
+            $this->its[$this->idx]->next();
+        }
+        $this->sync();
+    }
+    public function getInnerIterator() {
+        return $this->idx < count($this->its) ? $this->its[$this->idx] : null;
+    }
+}
+class EmptyIterator implements Iterator {
+    public function current() { return null; }
+    public function key() { return null; }
+    public function next() {}
+    public function rewind() {}
+    public function valid() { return false; }
+}
+class SplObjectStorage implements Countable, Iterator, ArrayAccess {
+    private array $objs = [];
+    private array $data = [];
+    private int $pos = 0;
+    private int $idx = 0;
+    private $info;
+    private function hashOf($obj) {
+        if (!is_object($obj)) {
+            throw new TypeError('SplObjectStorage::offsetSet(): Argument #1 ($object) must be of type object');
+        }
+        return spl_object_id($obj);
+    }
+    public function attach($object, $data = null) { $this->offsetSet($object, $data); }
+    public function detach($object) { $this->offsetUnset($object); }
+    public function contains($object) { return $this->offsetExists($object); }
+    public function offsetExists($obj): bool { return isset($this->objs[$this->hashOf($obj)]); }
+    public function offsetSet($obj, $data = null): void {
+        $h = $this->hashOf($obj);
+        if (!isset($this->objs[$h])) {
+            $this->objs[$h] = $obj;
+        }
+        $this->data[$h] = $data;
+    }
+    public function offsetGet($obj) {
+        $h = $this->hashOf($obj);
+        if (!isset($this->objs[$h])) {
+            throw new UnexpectedValueException('Object not found');
+        }
+        return $this->data[$h];
+    }
+    public function offsetUnset($obj): void {
+        $h = $this->hashOf($obj);
+        unset($this->objs[$h], $this->data[$h]);
+    }
+    public function getHash($obj) { return (string) $this->hashOf($obj); }
+    public function count(): int { return count($this->objs); }
+    public function setInfo($data) { $this->info = $data; }
+    public function getInfo() { return $this->info; }
+    // Iteration: key() is a 0-based index, current() the stored object.
+    public function rewind(): void { $this->pos = 0; $this->idx = 0; }
+    public function valid(): bool { return $this->idx < count($this->objs); }
+    public function current() { return array_values($this->objs)[$this->idx]; }
+    public function key(): int { return $this->idx; }
+    public function next(): void { $this->idx++; }
+    public function addAll($storage) {
+        foreach ($storage as $obj) { $this->attach($obj, $storage->getInfo()); }
+    }
+    public function removeAll($storage) {
+        foreach ($storage as $obj) { $this->detach($obj); }
+    }
+    public function removeAllExcept($storage) {
+        foreach ($this->objs as $h => $obj) {
+            if (!$storage->contains($obj)) { unset($this->objs[$h], $this->data[$h]); }
+        }
+    }
+}
+class SplFixedArray implements ArrayAccess, Iterator, Countable {
+    private array $data;
+    private int $pos = 0;
+    public function __construct(int $size = 0) {
+        $this->data = array_fill(0, max(0, $size), null);
+    }
+    public static function fromArray(array $array, bool $preserveKeys = true) {
+        $a = new self($preserveKeys ? count($array) : 0);
+        if ($preserveKeys) {
+            $max = 0;
+            foreach ($array as $k => $v) {
+                if (!is_int($k) || $k < 0) {
+                    throw new InvalidArgumentException('array must contain only positive integer keys');
+                }
+                $max = max($max, $k + 1);
+            }
+            $a = new self($max);
+            foreach ($array as $k => $v) { $a->data[$k] = $v; }
+        } else {
+            $a = new self(count($array));
+            $i = 0;
+            foreach ($array as $v) { $a->data[$i++] = $v; }
+        }
+        return $a;
+    }
+    public function toArray(): array { return $this->data; }
+    public function getSize(): int { return count($this->data); }
+    public function setSize(int $size): bool {
+        $size = max(0, $size);
+        $cur = count($this->data);
+        if ($size > $cur) {
+            $this->data = array_merge($this->data, array_fill(0, $size - $cur, null));
+        } else {
+            $this->data = array_slice($this->data, 0, $size);
+        }
+        return true;
+    }
+    private function normKey($key): int {
+        if (is_object($key)) {
+            throw new TypeError('Illegal SplFixedArray index type');
+        }
+        return (int) $key;
+    }
+    public function offsetExists($key): bool {
+        $k = $this->normKey($key);
+        return $k >= 0 && $k < count($this->data) && $this->data[$k] !== null;
+    }
+    public function offsetGet($key) {
+        $k = $this->normKey($key);
+        if ($k < 0 || $k >= count($this->data)) {
+            throw new RuntimeException('Index invalid or out of range');
+        }
+        return $this->data[$k];
+    }
+    public function offsetSet($key, $value): void {
+        $k = $this->normKey($key);
+        if ($k < 0 || $k >= count($this->data)) {
+            throw new RuntimeException('Index invalid or out of range');
+        }
+        $this->data[$k] = $value;
+    }
+    public function offsetUnset($key): void {
+        $k = $this->normKey($key);
+        if ($k < 0 || $k >= count($this->data)) {
+            throw new RuntimeException('Index invalid or out of range');
+        }
+        $this->data[$k] = null;
+    }
+    public function count(): int { return count($this->data); }
+    public function rewind(): void { $this->pos = 0; }
+    public function valid(): bool { return $this->pos < count($this->data); }
+    public function current() { return $this->data[$this->pos]; }
+    public function key(): int { return $this->pos; }
+    public function next(): void { $this->pos++; }
+}
+"#;

@@ -209,7 +209,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    pub(in crate::interp) fn print_parse_at(&mut self, e: &PhpError, file: &str) {
+    fn print_parse_at(&mut self, e: &PhpError, file: &str) {
         self.emit(&format!(
             "\nParse error: {} in {} on line {}\n",
             e.message, file, e.line
