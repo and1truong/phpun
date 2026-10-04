@@ -9686,9 +9686,7 @@ impl<'a> Interp<'a> {
                 // `kind.obj` — dropping it is the "of method" unbind
                 // (closure_061).
                 CallableKind::Method { obj: Some(_), .. } => {
-                    self.warn(
-                        "Cannot unbind $this of method, this will be an error in PHP 9",
-                    )?;
+                    self.warn("Cannot unbind $this of method, this will be an error in PHP 9")?;
                     return Ok(None);
                 }
                 // "uses $this" is the compile-time body flag, not
@@ -9696,9 +9694,7 @@ impl<'a> Interp<'a> {
                 // that references $this but never captured one
                 // unbinds quietly (closure_062).
                 CallableKind::Closure(d)
-                    if c.this_obj.is_some()
-                        && Self::body_uses_this(&d.body)
-                        && !c.is_static =>
+                    if c.this_obj.is_some() && Self::body_uses_this(&d.body) && !c.is_static =>
                 {
                     self.warn(
                         "Cannot unbind $this of closure using $this, this will be an error in PHP 9",
@@ -9762,9 +9758,7 @@ impl<'a> Interp<'a> {
             // A closure created from a function has no scope — only an
             // actual scope change warns; binding $this is silent
             // (bug70630 vs closure_063).
-            CallableKind::Named(_)
-                if Self::scope_changed(&scope, &c.scope_class) =>
-            {
+            CallableKind::Named(_) if Self::scope_changed(&scope, &c.scope_class) => {
                 self.warn(
                     "Cannot rebind scope of closure created from function, this will be an error in PHP 9",
                 )?;
