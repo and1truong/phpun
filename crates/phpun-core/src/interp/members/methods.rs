@@ -5,7 +5,7 @@
 use super::*;
 
 /// Parsed legacy spl `serialize()` payload: (flags, storage, props).
-type AoUnserData = (i64, Rc<RefCell<PhpArray>>, Rc<RefCell<PhpArray>>);
+type AoUnserData = (i64, Value, Rc<RefCell<PhpArray>>);
 
 impl<'a> Interp<'a> {
     /// Native bodies for the ArrayIterator/ArrayObject stubs.
@@ -542,14 +542,25 @@ impl<'a> Interp<'a> {
                     }
                 };
                 match self.ao_parse_payload(&data) {
-                    Ok((pflags, sarr, parr)) => {
+                    Ok((pflags, sv, parr)) => {
+                        // Storage goes through ao_backing like
+                        // __unserialize — object payloads bind props and
+                        // emit the backing deprecation.
+                        let (backing, _) = match self.ao_backing(&sv, family, canonical) {
+                            Ok(b) => b,
+                            Err(e) => return self.fail(e),
+                        };
+                        let src_obj = match &sv {
+                            Value::Object(o) => Some(o.clone()),
+                            _ => None,
+                        };
                         let mut ob = obj.borrow_mut();
                         ob.internal = Some(ObjectInternal::ArrayIter {
-                            arr: sarr,
+                            arr: backing,
                             pos: 0,
                             flags: pflags,
                             iterator_class: None,
-                            src: None,
+                            src: src_obj,
                         });
                         drop(ob);
                         let mut ob = obj.borrow_mut();
@@ -626,7 +637,7 @@ impl<'a> Interp<'a> {
                 };
                 if !matches!(st, Value::Array(_) | Value::Object(_)) {
                     let e = self.spl_throw(
-                        "UnexpectedValueException",
+                        "InvalidArgumentException",
                         "Passed variable is not an array or object".to_string(),
                     );
                     return self.fail(e);
@@ -1007,14 +1018,17 @@ impl<'a> Interp<'a> {
         }
         let fl: i64 = data[fstart..pos].parse().map_err(|_| pos)?;
         pos += 1; // ;
-                  // storage: serialized array
-        let st = {
+                  // storage: serialized array|object — zend reports a
+                  // bad storage value at its start offset.
+        let st_start = pos;
+        let sv = {
             let mut ie = None;
-            crate::builtins::var::php_unserialize(self, data, &mut pos, &mut ie).map_err(|_| pos)?
+            crate::builtins::var::php_unserialize(self, data, &mut pos, &mut ie)
+                .map_err(|_| pos)?
         };
-        let Value::Array(st) = st else {
-            return Err(pos);
-        };
+        if !matches!(sv, Value::Array(_) | Value::Object(_)) {
+            return Err(st_start);
+        }
         // ;m:<props>
         if pos + 2 >= b.len() || &data[pos..pos + 3] != ";m:" {
             return Err(pos);
@@ -1030,7 +1044,7 @@ impl<'a> Interp<'a> {
         if pos != b.len() {
             return Err(pos);
         }
-        Ok((fl, st, pr))
+        Ok((fl, sv, pr))
     }
 
     /// Call-arg list for `invokeArgs`/`newInstanceArgs`: array entries

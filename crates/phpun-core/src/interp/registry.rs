@@ -270,6 +270,16 @@ impl<'a> Interp<'a> {
                 trait_alias_of: None,
             })
         };
+        // stub with typed params per the Zend SPL arginfo — userland
+        // overrides declaring the same types stay signature-compatible.
+        let stub_method_typed = |name: &str, params: &[(&str, &str)]| {
+            let names: Vec<&str> = params.iter().map(|(n, _)| *n).collect();
+            let mut m = (*stub_method(name, &names)).clone();
+            for (p, (_, t)) in m.decl.params.iter_mut().zip(params.iter()) {
+                p.ty = Some(vec![t.to_string()]);
+            }
+            Rc::new(m)
+        };
 
         reg(
             ClassDecl {
@@ -312,9 +322,9 @@ impl<'a> Interp<'a> {
                     stub_method("natcasesort", &[]),
                     stub_method("natsort", &[]),
                     stub_method("serialize", &[]),
-                    stub_method("unserialize", &["data"]),
+                    stub_method_typed("unserialize", &[("data", "string")]),
                     stub_method("__serialize", &[]),
-                    stub_method("__unserialize", &["data"]),
+                    stub_method_typed("__unserialize", &[("data", "array")]),
                     stub_method("__debugInfo", &[]),
                 ],
                 props: vec![],
@@ -825,9 +835,9 @@ impl<'a> Interp<'a> {
                     stub_method("uasort", &["callback"]),
                     stub_method("uksort", &["callback"]),
                     stub_method("serialize", &[]),
-                    stub_method("unserialize", &["data"]),
+                    stub_method_typed("unserialize", &[("data", "string")]),
                     stub_method("__serialize", &[]),
-                    stub_method("__unserialize", &["data"]),
+                    stub_method_typed("__unserialize", &[("data", "array")]),
                     stub_method("__debugInfo", &[]),
                     stub_method("getIteratorClass", &[]),
                     stub_method("setIteratorClass", &["iteratorClass"]),

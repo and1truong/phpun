@@ -997,12 +997,8 @@ pub(crate) fn php_unserialize(
                         RefCell::new(slots),
                     )))]),
                 ) {
-                    // spl's internal __unserialize surfaces as an
-                    // offset failure (warning + false); a userland
-                    // override's exception propagates like zend.
-                    if it.obj_is_a(&obj, "arrayobject") || it.obj_is_a(&obj, "arrayiterator") {
-                        return Err(());
-                    }
+                    // Exceptions from ANY __unserialize — userland or
+                    // spl-internal — propagate through unserialize().
                     *err = Some(e);
                     return Err(());
                 }
