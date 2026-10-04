@@ -1,0 +1,1172 @@
+//! Statement execution: `exec_block`/`exec` plus the loop and
+//! foreach drivers — the first seam a bytecode pipeline replaces.
+
+use super::util::*;
+use super::*;
+
+impl<'a> Interp<'a> {
+    pub fn exec_block(&mut self, stmts: &[Stmt]) -> Flow {
+        // goto labels bind at the statement-list scope they appear in —
+        // a goto bubbling up from nested control flow lands here.
+        let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (i, s) in stmts.iter().enumerate() {
+            if let Stmt::Label(n) = s {
+                labels.entry(n.as_str()).or_insert(i);
+            }
+        }
+        let mut i = 0;
+        while i < stmts.len() {
+            let s = &stmts[i];
+            i += 1;
+            // memory_limit fires between statements (bug45392).
+            let limit = self.ini_bytes("memory_limit");
+            if limit > 0 && self.mem_used as i64 > limit {
+                self.mem_exceeded = true;
+                return self.err_flow(PhpError::fatal(
+                    format!(
+                        "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
+                        limit, self.mem_last
+                    ),
+                    self.cur_line,
+                ));
+            }
+            if let Some(d) = self.deadline {
+                if std::time::Instant::now() > d {
+                    let secs = self.deadline_secs;
+                    return self.err_flow(PhpError::fatal(
+                        format!(
+                            "Maximum execution time of {} second{} exceeded",
+                            secs,
+                            if secs == 1 { "" } else { "s" }
+                        ),
+                        self.cur_line,
+                    ));
+                }
+            }
+            match self.exec(s) {
+                Flow::Normal => {}
+                Flow::Goto(l) => match labels.get(l.as_str()) {
+                    Some(&t) => i = t + 1,
+                    None => return Flow::Goto(l),
+                },
+                f => return f,
+            }
+        }
+        Flow::Normal
+    }
+
+    fn exec(&mut self, s: &Stmt) -> Flow {
+        match s {
+            Stmt::Line(l) => {
+                self.cur_line = *l;
+                Flow::Normal
+            }
+            Stmt::Diag { level, msg, line } => {
+                self.cur_line = *line;
+                let r = match *level {
+                    "Warning" => self.warn(msg),
+                    "Notice" => self.notice(msg),
+                    _ => self.deprecated(msg),
+                };
+                match r {
+                    Ok(()) => Flow::Normal,
+                    Err(e) => self.err_flow(e),
+                }
+            }
+            Stmt::Deprecated { msg, line } => {
+                self.cur_line = *line;
+                match self.deprecated(msg) {
+                    Ok(()) => Flow::Normal,
+                    Err(e) => self.err_flow(e),
+                }
+            }
+            Stmt::Inline(t) => {
+                self.emit(t);
+                Flow::Normal
+            }
+            Stmt::Echo(args) => {
+                for a in args {
+                    match self.eval(a) {
+                        Ok(v) => match self.conv_bytes(&v) {
+                            Ok(s) => self.emit_bytes(&s),
+                            Err(e) => return self.err_flow(e),
+                        },
+                        Err(e) => return self.err_flow(e),
+                    }
+                }
+                Flow::Normal
+            }
+            Stmt::Expr(e) => match e {
+                // A lone `$x;` compiles to a dead FREE op in Zend — no
+                // undefined-variable warning (first_class_callable_dynamic).
+                Expr::Var(n) if self.var_lookup(n).is_none() => Flow::Normal,
+                _ => {
+                    let base = self.expr_temps.len();
+                    // A previous statement's `return $lval` can leave a
+                    // stale last_ret_cell pinned to a real storage cell
+                    // (inflating its strong_count → `&` in var_dump);
+                    // only the current statement may consume it.
+                    self.last_ret_cell = None;
+                    let r = self.eval(e);
+                    match r {
+                        Ok(v) => {
+                            // A discarded temporary object reaches
+                            // refcount 0 here — Zend runs its
+                            // __destruct immediately (methods_003
+                            // `new bar;`). strong_count 2 = the
+                            // statement value + its expr_temps slot.
+                            if let Value::Object(o) = &v {
+                                if Rc::strong_count(o) == 2
+                                    && self
+                                        .find_method_in(&o.borrow().class, "__destruct")
+                                        .is_some()
+                                    && self.mark_destructed(o)
+                                {
+                                    if let Err(e) = self.method_invoke(
+                                        o.clone(),
+                                        "__destruct",
+                                        CallArgs::empty(),
+                                    ) {
+                                        self.expr_temps.truncate(base);
+                                        return self.err_flow(e);
+                                    }
+                                }
+                            }
+                            // Statement end frees expression
+                            // temporaries; a dtor exception propagates
+                            // through the statement (bug29368_2).
+                            match self.sweep_expr_temps(base) {
+                                Ok(()) => Flow::Normal,
+                                Err(e) => self.err_flow(e),
+                            }
+                        }
+                        // On unwind the live temporaries die in order
+                        // before the exception propagates
+                        // (bug29368_3).
+                        Err(e) => {
+                            let _ = self.sweep_expr_temps(base);
+                            self.err_flow(e)
+                        }
+                    }
+                }
+            },
+            Stmt::Block(b) => self.exec_block(b),
+            Stmt::If { cond, then, else_ } => match self.eval(cond) {
+                Ok(c) => {
+                    if c.is_truthy() {
+                        self.exec_block(then)
+                    } else {
+                        self.exec_block(else_)
+                    }
+                }
+                Err(e) => self.err_flow(e),
+            },
+            Stmt::While { cond, body } => self.exec_while(cond, body, false),
+            Stmt::DoWhile { body, cond } => self.exec_while(cond, body, true),
+            Stmt::For {
+                init,
+                cond,
+                inc,
+                body,
+            } => {
+                for e in init {
+                    if let Err(e) = self.eval(e) {
+                        return self.err_flow(e);
+                    }
+                }
+                loop {
+                    if !cond.is_empty() {
+                        match self.eval(&cond[0]) {
+                            Ok(c) if !c.is_truthy() => break,
+                            Err(e) => return self.err_flow(e),
+                            _ => {}
+                        }
+                    }
+                    match self.exec_block(body) {
+                        Flow::Break(0) | Flow::Break(1) => break,
+                        Flow::Break(n) => return Flow::Break(n - 1),
+                        Flow::Continue(0) | Flow::Continue(1) => {}
+                        Flow::Continue(n) => return Flow::Continue(n - 1),
+                        Flow::Normal => {}
+                        f => return f,
+                    }
+                    for e in inc {
+                        if let Err(e) = self.eval(e) {
+                            return self.err_flow(e);
+                        }
+                    }
+                }
+                Flow::Normal
+            }
+            Stmt::Foreach {
+                arr,
+                key,
+                val,
+                body,
+            } => self.exec_foreach(arr, key, val, body),
+            Stmt::Switch { cond, cases } => {
+                let cv = match self.eval(cond) {
+                    Ok(v) => v,
+                    Err(e) => return self.err_flow(e),
+                };
+                // Find first matching case (loose ==); default is fallback.
+                let mut start: Option<usize> = None;
+                let mut default_idx: Option<usize> = None;
+                for (i, (c, _)) in cases.iter().enumerate() {
+                    match c {
+                        Some(ce) => {
+                            if start.is_none() {
+                                match self.eval(ce) {
+                                    Ok(v) => {
+                                        if compare(&cv, &v) == Ordering::Equal {
+                                            start = Some(i);
+                                        }
+                                    }
+                                    Err(e) => return self.err_flow(e),
+                                }
+                            }
+                        }
+                        None => default_idx = Some(i),
+                    }
+                }
+                let start = start.or(default_idx);
+                if let Some(si) = start {
+                    // Run all cases from `start`, stopping at Break.
+                    for (_, body) in &cases[si..] {
+                        match self.exec_block(body) {
+                            Flow::Break(0) | Flow::Break(1) => return Flow::Normal,
+                            Flow::Break(n) => return Flow::Break(n - 1),
+                            Flow::Normal => {}
+                            f => return f,
+                        }
+                    }
+                }
+                Flow::Normal
+            }
+            Stmt::Function(d) => {
+                if let Err(e) = self.decl_type_checks(&d.name, d, None) {
+                    return self.err_flow(e);
+                }
+                let mut d = d.clone();
+                d.file = self.cur_file.clone();
+                self.functions.insert(d.name.to_lowercase(), Rc::new(d));
+                Flow::Normal
+            }
+            Stmt::Class(d) => {
+                for m in &d.methods {
+                    let fname = format!("{}::{}", d.name, m.decl.name);
+                    if let Err(e) =
+                        self.decl_type_checks(&fname, &m.decl, Some((&d.name, d.parent.clone())))
+                    {
+                        return self.err_flow(e);
+                    }
+                }
+                let mut d = (**d).clone();
+                for m in &mut d.methods {
+                    let mut mm = (**m).clone();
+                    mm.decl.file = self.cur_file.clone();
+                    *m = Rc::new(mm);
+                }
+                if self.early_bound_classes.contains(&d.name.to_lowercase()) {
+                    return Flow::Normal;
+                }
+                if let Err(e) = self.register_class(Rc::new(d)) {
+                    return self.err_flow(e);
+                }
+                Flow::Normal
+            }
+            Stmt::Static { vars, line } => {
+                let key = self.fn_statics_key();
+                for (name, default) in vars {
+                    // `static $a` redeclared at a different site in the same
+                    // scope is a compile fatal (tests/lang/static_basic_002).
+                    let prev = self
+                        .static_decls
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(name.clone(), *line);
+                    if prev.is_some_and(|l| l != *line) {
+                        return self.err_flow(PhpError::fatal(
+                            format!("Duplicate declaration of static variable ${}", name),
+                            self.cur_line,
+                        ));
+                    }
+                    // Statics live per-function-decl: inside a function
+                    // they never fall back to the top-level table
+                    // (static_variation_001).
+                    let exists = {
+                        let table = if self.stack.is_empty() {
+                            Some(&self.global_statics)
+                        } else {
+                            self.statics.get(&key)
+                        };
+                        table.and_then(|t| t.get(name).cloned())
+                    };
+                    let cellv = match exists {
+                        Some(c) => c,
+                        None => {
+                            let v = match default {
+                                // Runtime init: an unresolved const is a
+                                // catchable Error, not silent NULL
+                                // (bug79778).
+                                Some(d) => match self.eval_const(d) {
+                                    Ok(v) => v,
+                                    Err(e) => return self.err_flow(e),
+                                },
+                                None => Value::Null,
+                            };
+                            let c = cell(v);
+                            if self.stack.is_empty() {
+                                self.global_statics.insert(name.clone(), c.clone());
+                            } else {
+                                self.statics
+                                    .entry(key.clone())
+                                    .or_default()
+                                    .insert(name.clone(), c.clone());
+                            }
+                            c
+                        }
+                    };
+                    self.cur().vars.insert(name.clone(), cellv);
+                }
+                Flow::Normal
+            }
+            Stmt::Return(e) => {
+                let ret_by_ref = self.stack.last().map(|f| f.ret_by_ref).unwrap_or(false);
+                if ret_by_ref {
+                    if let Some(e) = e {
+                        // `function &f() { return $x; }` — the returned cell is
+                        // bound, not copied (returnByReference tests).
+                        let is_lval = matches!(
+                            e,
+                            Expr::Var(_)
+                                | Expr::Index { .. }
+                                | Expr::Prop { .. }
+                                | Expr::VarVar(_)
+                                | Expr::StaticProp { .. }
+                        );
+                        if is_lval {
+                            let c = match self.eval_cell(e) {
+                                Ok(c) => c,
+                                Err(e) => return self.err_flow(e),
+                            };
+                            self.last_ret_cell = Some(c.clone());
+                            return Flow::Return(c.borrow().clone());
+                        }
+                        if matches!(
+                            e,
+                            Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. }
+                        ) {
+                            // `return &f()` chains through when callee returns
+                            // by reference (returnByReference.006/009).
+                            let (c, was_ref) = match self.eval_call_cell(e) {
+                                Ok(t) => t,
+                                Err(e) => return self.err_flow(e),
+                            };
+                            if was_ref {
+                                self.last_ret_cell = Some(c.clone());
+                            } else if let Err(e) = self
+                                .notice("Only variable references should be returned by reference")
+                            {
+                                return self.err_flow(e);
+                            }
+                            return Flow::Return(c.borrow().clone());
+                        }
+                        if let Err(e) =
+                            self.notice("Only variable references should be returned by reference")
+                        {
+                            return self.err_flow(e);
+                        }
+                    }
+                }
+                let v = match e {
+                    Some(e) => match self.eval(e) {
+                        Ok(v) => v,
+                        Err(e) => return self.err_flow(e),
+                    },
+                    None => Value::Null,
+                };
+                Flow::Return(v)
+            }
+            Stmt::Break(e) => {
+                let n = match e {
+                    Some(e) => self.eval(e).map(|v| v.to_int()).unwrap_or(1).max(1) as u32,
+                    None => 1,
+                };
+                Flow::Break(n)
+            }
+            Stmt::Continue(e) => {
+                let n = match e {
+                    Some(e) => self.eval(e).map(|v| v.to_int()).unwrap_or(1).max(1) as u32,
+                    None => 1,
+                };
+                Flow::Continue(n)
+            }
+            Stmt::Goto(l) => Flow::Goto(l.clone()),
+            Stmt::Label(_) => Flow::Normal,
+            Stmt::Global(names) => {
+                // Bind each local name to its global cell. `$$x` resolves
+                // the name dynamically (bug24396).
+                for e in names {
+                    let name = match e {
+                        Expr::Var(n) => n.clone(),
+                        // `global $$b` — the global name is $b's value.
+                        Expr::VarVar(inner) => match self.eval(inner) {
+                            Ok(v) => match self.conv_str(&v) {
+                                Ok(s) => s,
+                                Err(e) => return self.err_flow(e),
+                            },
+                            Err(e) => return self.err_flow(e),
+                        },
+                        other => match self.eval(other) {
+                            Ok(v) => match self.conv_str(&v) {
+                                Ok(s) => s,
+                                Err(e) => return self.err_flow(e),
+                            },
+                            Err(e) => return self.err_flow(e),
+                        },
+                    };
+                    let gcell = self
+                        .globals
+                        .vars
+                        .entry(name.clone())
+                        .or_insert_with(|| cell(Value::Null))
+                        .clone();
+                    self.cur().vars.insert(name, gcell);
+                }
+                Flow::Normal
+            }
+            Stmt::Unset(xs) => {
+                for x in xs {
+                    match x {
+                        Expr::Var(n) => {
+                            if let Some(c) = self.cur().vars.remove(n) {
+                                // Removing the last handle runs
+                                // __destruct immediately — for a
+                                // Callable that also decrefs its bound
+                                // $this and captures (closure_005).
+                                let v = c.borrow().clone();
+                                drop(c);
+                                if let Err(e) = self.destruct_dying_value(&v) {
+                                    return self.err_flow(e);
+                                }
+                            }
+                        }
+                        Expr::VarVar(inner) => {
+                            if let Ok(n) = self.eval(inner) {
+                                if let Ok(name) = self.conv_str(&n) {
+                                    self.cur().vars.remove(&name);
+                                }
+                            }
+                        }
+                        Expr::Index { e, i } => {
+                            let _ = self.unset_index(e, i.as_deref());
+                        }
+                        Expr::Prop { .. } => {
+                            if let Err(e) = self.unset_prop(x) {
+                                return self.err_flow(e);
+                            }
+                        }
+                        Expr::StaticProp { class, name } => {
+                            if let Ok(pn) = self.prop_name(name) {
+                                if let Ok(cls) = self.class_of(class) {
+                                    cls.statics.borrow_mut().remove(&pn);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Flow::Normal
+            }
+            Stmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                let flow = self.exec_block(body);
+                let out = match flow {
+                    Flow::Throw(v) => {
+                        let mut result = Flow::Throw(v.clone());
+                        for c in catches {
+                            if self.catch_matches(&v, &c.types) {
+                                if let Some(var) = &c.var {
+                                    // Binding the catch var is a normal
+                                    // assign — a `&`-bound typed ref
+                                    // gates it and the TypeError
+                                    // propagates out of the try
+                                    // (typed_properties_108).
+                                    match self.var_set_gated(var, v.clone(), true) {
+                                        Ok(_) => result = self.exec_block(&c.body),
+                                        Err(e) => result = self.err_flow(e),
+                                    }
+                                } else {
+                                    result = self.exec_block(&c.body);
+                                }
+                                break;
+                            }
+                        }
+                        result
+                    }
+                    f => f,
+                };
+                if let Some(fb) = finally {
+                    match self.exec_block(fb) {
+                        Flow::Normal => out,
+                        f => f,
+                    }
+                } else {
+                    out
+                }
+            }
+            Stmt::Namespace(n) => {
+                // Top-level scope follows `namespace` declarations —
+                // unqualified calls/consts resolve relative to it.
+                self.globals.ns = n.clone();
+                Flow::Normal
+            }
+            Stmt::Use(names) => {
+                // `use A;` / `use \B;` with no compound name has no
+                // effect and warns (namespaces/ns_033).
+                for n in names {
+                    if !n.contains('\\') {
+                        if let Err(e) = self.warn(&format!(
+                            "The use statement with non-compound name '{}' has no effect",
+                            n
+                        )) {
+                            return self.err_flow(e);
+                        }
+                    }
+                }
+                Flow::Normal
+            }
+            Stmt::ConstDecl(defs) => {
+                for (n, e) in defs {
+                    // TRUE/FALSE/NULL are reserved — `const NULL` is a
+                    // compile-time fatal (namespaces/ns_075).
+                    let short = n.rsplit('\\').next().unwrap_or(n);
+                    if matches!(short.to_uppercase().as_str(), "TRUE" | "FALSE" | "NULL") {
+                        return self.err_flow(PhpError::fatal(
+                            format!("Cannot redeclare constant '{}'", short),
+                            self.cur_line,
+                        ));
+                    }
+                    match self.eval_const(e) {
+                        Ok(v) => self.define_const(n, v),
+                        Err(e) => return self.err_flow(e),
+                    }
+                }
+                Flow::Normal
+            }
+            Stmt::Declare { name, value } => {
+                if name.eq_ignore_ascii_case("strict_types")
+                    && matches!(self.eval(value), Ok(Value::Int(1)))
+                {
+                    self.strict_files.insert(self.cur_file.clone());
+                }
+                Flow::Normal
+            }
+        }
+    }
+
+    fn catch_matches(&mut self, v: &Value, types: &[String]) -> bool {
+        if types.is_empty() {
+            return false;
+        }
+        if let Value::Object(o) = v {
+            let cls = o.borrow().class.clone();
+            for t in types {
+                if self.is_a(&cls, t) {
+                    return true;
+                }
+            }
+            false
+        } else {
+            false
+        }
+    }
+
+    fn exec_while(&mut self, cond: &Expr, body: &[Stmt], do_first: bool) -> Flow {
+        if do_first {
+            match self.exec_block(body) {
+                Flow::Break(0) | Flow::Break(1) => return Flow::Normal,
+                Flow::Break(n) => return Flow::Break(n - 1),
+                Flow::Normal | Flow::Continue(_) => {}
+                f => return f,
+            }
+        }
+        loop {
+            match self.eval(cond) {
+                Ok(c) if !c.is_truthy() => break,
+                Err(e) => return self.err_flow(e),
+                _ => {}
+            }
+            match self.exec_block(body) {
+                Flow::Break(0) | Flow::Break(1) => break,
+                Flow::Break(n) => return Flow::Break(n - 1),
+                Flow::Continue(0) | Flow::Continue(1) => continue,
+                Flow::Continue(n) => return Flow::Continue(n - 1),
+                Flow::Normal => {}
+                f => return f,
+            }
+        }
+        Flow::Normal
+    }
+
+    fn exec_foreach(
+        &mut self,
+        arr: &Expr,
+        key: &Option<ForeachKey>,
+        val: &ForeachTarget,
+        body: &[Stmt],
+    ) -> Flow {
+        if matches!(key, Some(ForeachKey::ByRef)) {
+            return self.err_flow(PhpError::fatal(
+                "Key element cannot be a reference",
+                self.cur_line,
+            ));
+        }
+        let src = match self.eval(arr) {
+            Ok(v) => v,
+            Err(e) => return self.err_flow(e),
+        };
+        match src {
+            Value::Array(rc) => {
+                let by_ref = matches!(val, ForeachTarget::ByRef(_));
+                // `&$v` foreach iterates the live array — appends and
+                // removals during the loop are observed (foreachLoop.009).
+                let live = by_ref;
+                if live {
+                    // PHP separates a shared (non-reference) array when the
+                    // loop takes references to its elements, so &-writes
+                    // don't leak into other copies (foreachLoop.016). An
+                    // is_ref array is iterated live as-is.
+                    let rc = if Rc::strong_count(&rc) > 1 && !rc.borrow().is_ref {
+                        let sep: Vec<(ArrKey, Cell)> = rc
+                            .borrow()
+                            .entries
+                            .iter()
+                            .map(|(k, c)| (k.clone(), cell(c.borrow().clone())))
+                            .collect();
+                        let nr = Rc::new(RefCell::new(PhpArray {
+                            entries: sep,
+                            next: rc.borrow().next,
+                            is_ref: false,
+                            iter_pos: rc.borrow().iter_pos,
+                        }));
+                        if let Ok(c) = self.eval_cell(arr) {
+                            *c.borrow_mut() = Value::Array(nr.clone());
+                        }
+                        nr
+                    } else {
+                        rc
+                    };
+                    rc.borrow_mut().is_ref = true;
+                    // PHP's live iterator tracks "the element after the
+                    // current one in logical order" — prepends (unshift) and
+                    // renumbering (shift) don't move it, tombstoned current
+                    // elements still anchor it (foreachLoop.013/.015).
+                    let mut last: Option<Cell> = None;
+                    loop {
+                        let next = {
+                            let a = rc.borrow();
+                            let live_at = |from: usize| -> Option<(ArrKey, Cell)> {
+                                a.entries[from..]
+                                    .iter()
+                                    .find(|(k, _)| !matches!(k, ArrKey::Tomb))
+                                    .cloned()
+                            };
+                            match &last {
+                                None => live_at(0),
+                                Some(lc) => {
+                                    match a.entries.iter().position(|(_, c)| Rc::ptr_eq(c, lc)) {
+                                        Some(i) => live_at(i + 1),
+                                        // Current element gone entirely —
+                                        // restart at the first live element.
+                                        None => live_at(0),
+                                    }
+                                }
+                            }
+                        };
+                        let Some((k, c)) = next else { break };
+                        last = Some(c.clone());
+                        if let Some(ForeachKey::Var(kn)) = key {
+                            self.var_set(kn, key_value(&k));
+                        }
+                        match val {
+                            ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                            ForeachTarget::ByRef(n) => {
+                                if let Some(f) = self.readonly_ref_error(&c) {
+                                    return f;
+                                }
+                                self.cur().vars.insert(n.clone(), c);
+                            }
+                            ForeachTarget::Lvalue(e) => {
+                                let _ = self.store(e, c.borrow().clone());
+                            }
+                            ForeachTarget::List(items) => {
+                                if self.foreach_list(items, &c.borrow().clone()).is_err() {}
+                            }
+                        }
+                        match self.exec_block(body) {
+                            Flow::Break(0) | Flow::Break(1) => break,
+                            Flow::Break(n) => return Flow::Break(n - 1),
+                            Flow::Continue(0) | Flow::Continue(1) => continue,
+                            Flow::Continue(n) => return Flow::Continue(n - 1),
+                            Flow::Normal => {}
+                            f => return f,
+                        }
+                    }
+                    return Flow::Normal;
+                }
+                // Snapshot (key, cell) pairs — PHP iterates a copy for
+                // value-iteration but shares cells for &-iteration.
+                let snapshot: Vec<(ArrKey, Cell)> = if by_ref {
+                    rc.borrow().iter().cloned().collect()
+                } else {
+                    // .iter() skips tombstoned buckets — a value-foreach
+                    // never sees shifted/unset elements.
+                    rc.borrow()
+                        .iter()
+                        .map(|(k, c)| (k.clone(), cell(c.borrow().clone())))
+                        .collect()
+                };
+                for (idx, (k, c)) in snapshot.into_iter().enumerate() {
+                    self.cur_line = idx;
+                    if let Some(ForeachKey::Var(kn)) = key {
+                        self.var_set(kn, key_value(&k));
+                    }
+                    match val {
+                        ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                        ForeachTarget::ByRef(n) => {
+                            if let Some(f) = self.readonly_ref_error(&c) {
+                                return f;
+                            }
+                            self.cur().vars.insert(n.clone(), c);
+                        }
+                        ForeachTarget::Lvalue(e) => {
+                            let _ = self.store(e, c.borrow().clone());
+                        }
+                        ForeachTarget::List(items) => {
+                            if self.foreach_list(items, &c.borrow().clone()).is_err() {}
+                        }
+                    }
+                    match self.exec_block(body) {
+                        Flow::Break(0) | Flow::Break(1) => break,
+                        Flow::Break(n) => return Flow::Break(n - 1),
+                        Flow::Continue(0) | Flow::Continue(1) => continue,
+                        Flow::Continue(n) => return Flow::Continue(n - 1),
+                        Flow::Normal => {}
+                        f => return f,
+                    }
+                }
+                Flow::Normal
+            }
+            Value::Object(o) => {
+                // IteratorAggregate → getIterator() then iterate that
+                // (its result may itself be an IteratorAggregate — loop).
+                if self.obj_is_a(&o, "IteratorAggregate") {
+                    let mut cur = o.clone();
+                    loop {
+                        let it_obj =
+                            match self.method_invoke(cur.clone(), "getIterator", CallArgs::empty())
+                            {
+                                Ok(v) => v,
+                                Err(e) => return self.err_flow(e),
+                            };
+                        match it_obj {
+                            Value::Object(io) if self.obj_is_a(&io, "IteratorAggregate") => {
+                                cur = io;
+                            }
+                            // getIterator() must return a Traversable.
+                            Value::Object(io) if self.obj_is_a(&io, "Iterator") => {
+                                return self.exec_foreach_iter(io, key, val, body);
+                            }
+                            _ => {
+                                let cls_name = cur.borrow().class.name().to_string();
+                                let v = self.exception(
+                                    "Exception",
+                                    &format!(
+                                        "Objects returned by {}::getIterator() must be traversable or implement interface Iterator",
+                                        cls_name
+                                    ),
+                                );
+                                return Flow::Throw(v);
+                            }
+                        }
+                    }
+                }
+                if self.obj_is_a(&o, "Iterator") {
+                    // `function &gen()` generators DO support
+                    // `foreach .. as &$v` — their yields are cells
+                    // (typed_properties_033/034). An ArrayIterator's
+                    // entries are already cells too (113/115).
+                    let gen_byref = match &o.borrow().internal {
+                        Some(ObjectInternal::Generator(st)) => st.borrow().by_ref,
+                        Some(ObjectInternal::ArrayIter { .. }) => true,
+                        _ => false,
+                    };
+                    if matches!(val, ForeachTarget::ByRef(_)) && !gen_byref {
+                        let v = self.exception(
+                            "Error",
+                            "An iterator cannot be used with foreach by reference",
+                        );
+                        let e = self.throw(v);
+                        return self.err_flow(e);
+                    }
+                    return self.exec_foreach_iter(o.clone(), key, val, body);
+                }
+                // Plain object: iterate the property table in
+                // declaration order — backed slots plus *virtual* hooked
+                // props (which have no slot but still yield their get
+                // value), with dynamic props appended (property_hooks/
+                // foreach). unset() during the loop tombstones a slot
+                // (foreachLoopObjects.004/.005).
+                let cls = o.borrow().class.clone();
+                let (spec, decl_names) = self.object_foreach_spec(&o);
+                let mut pos = 0usize;
+                let mut dyn_pos = 0usize;
+                loop {
+                    // After the declared spec runs out, scan prop_order
+                    // live for dynamic props — ones added during the
+                    // loop are seen (foreach_002); declared names hide
+                    // same-named dynamics entirely.
+                    let (ent, resolved_decl) = if pos < spec.len() {
+                        (spec[pos].clone(), true)
+                    } else {
+                        let mut found = None;
+                        loop {
+                            let k = {
+                                let ob = o.borrow();
+                                ob.prop_order.get(dyn_pos).cloned()
+                            };
+                            let Some(k) = k else { break };
+                            dyn_pos += 1;
+                            let plain = k
+                                .strip_prefix('\0')
+                                .and_then(|r| r.split('\0').nth(1))
+                                .unwrap_or(k.as_str());
+                            if decl_names.contains(plain) {
+                                continue;
+                            }
+                            if !spec.iter().any(|(_, sk, _)| sk == &k) {
+                                found = Some((k.clone(), k.clone(), k.clone()));
+                                break;
+                            }
+                        }
+                        match found {
+                            Some(e) => (e, false),
+                            None => break,
+                        }
+                    };
+                    pos += 1;
+                    let (n, slot_key, dname) = ent;
+                    // Spec entries are already scope-resolved; dynamics
+                    // are runtime slots checked against the caller.
+                    if !resolved_decl && !self.prop_visible(&cls, &dname) {
+                        continue;
+                    }
+                    // Resolve this entry: hooked props (backed or
+                    // virtual) read/write through their hooks; plain
+                    // props read the live slot (unset() tombstones).
+                    let mut writeback: Option<(PropDecl, MergedHooks, Value)> = None;
+                    let c: Cell = if let Some((pd, hs)) = self.hooked_prop(&o, &dname) {
+                        // Write-only *virtual* hooked props aren't in the
+                        // readable property table — foreach skips them
+                        // (virtualSetOnly in property_hooks/foreach).
+                        // A set-only BACKED prop still has a table slot
+                        // and iterates as its raw value (gh15187).
+                        if !hs.iter().any(|(h, _)| h.is_get && h.body.is_some())
+                            && !self.backed_for(&o, &dname, &hs)
+                        {
+                            continue;
+                        }
+                        if !hs.iter().any(|(h, _)| h.is_get && h.body.is_some()) {
+                            // Set-only backed prop: iterate the raw
+                            // backing slot, no hook write-back. An
+                            // uninitialized typed slot isn't iterated
+                            // (gh15187_2).
+                            match o.borrow().props.get(&slot_key).cloned() {
+                                Some(c) => c,
+                                None if pd.ty.is_some() => continue,
+                                None => cell(Value::Null),
+                            }
+                        } else if matches!(val, ForeachTarget::ByRef(_)) {
+                            // By-ref binds a managed reference: virtual
+                            // props read via get and write back through
+                            // set; a backed prop is only bindable when a
+                            // `&get` hands back its real backing cell —
+                            // otherwise the reference can't be created
+                            // (foreach_val_to_ref, foreach_002).
+                            let backed = self.backed_for(&o, &dname, &hs);
+                            let by_ref_get = hs
+                                .iter()
+                                .find(|(h, _)| h.is_get && h.by_ref && h.body.is_some());
+                            if backed && by_ref_get.is_none() {
+                                let dc = self
+                                    .decl_prop(&o, &dname)
+                                    .map(|(_, c)| c.name().to_string())
+                                    .unwrap_or_else(|| cls.name().to_string());
+                                let v = self.exception(
+                                    "Error",
+                                    &format!(
+                                        "Cannot create reference to property {}::${}",
+                                        dc, dname
+                                    ),
+                                );
+                                let e = self.throw(v);
+                                return self.err_flow(e);
+                            }
+                            if let Some((h, hc)) = by_ref_get {
+                                self.last_ret_cell = None;
+                                match self.run_hook(&o, hc, &dname, h, None) {
+                                    Ok(_) => self
+                                        .last_ret_cell
+                                        .take()
+                                        .unwrap_or_else(|| cell(Value::Null)),
+                                    Err(e) => return self.err_flow(e),
+                                }
+                            } else if hs.iter().any(|(h, _)| !h.is_get && h.body.is_some()) {
+                                let v = match self.hook_read(&o, &pd, &hs) {
+                                    Ok(v) => v,
+                                    Err(e) => return self.err_flow(e),
+                                };
+                                writeback = Some((pd, hs, v.clone()));
+                                cell(v)
+                            } else {
+                                let dc = self
+                                    .decl_prop(&o, &dname)
+                                    .map(|(_, c)| c.name().to_string())
+                                    .unwrap_or_else(|| cls.name().to_string());
+                                let v = self.exception(
+                                    "Error",
+                                    &format!(
+                                        "Cannot create reference to property {}::${}",
+                                        dc, dname
+                                    ),
+                                );
+                                let e = self.throw(v);
+                                return self.err_flow(e);
+                            }
+                        } else {
+                            match self.hook_read(&o, &pd, &hs) {
+                                Ok(v) => cell(v),
+                                Err(e) => return self.err_flow(e),
+                            }
+                        }
+                    } else {
+                        let live = { o.borrow().props.get(&slot_key).cloned() };
+                        match live {
+                            Some(c) => c,
+                            None => continue, // tombstoned by unset()
+                        }
+                    };
+                    // `&$val` binds the prop cell — register it so
+                    // writes stay type-gated (typed_properties_045).
+                    if matches!(val, ForeachTarget::ByRef(_) | ForeachTarget::Lvalue(_)) {
+                        if let Some((pd, dcls)) = self.decl_prop(&o, &dname) {
+                            if let Some(tys) = &pd.ty {
+                                let p = Rc::as_ptr(&c) as usize;
+                                self.typed_slots.insert(
+                                    p,
+                                    (
+                                        c.clone(),
+                                        tys.clone(),
+                                        dcls.name().to_string(),
+                                        dname.clone(),
+                                    ),
+                                );
+                                let sk = self
+                                    .obj_prop_key(&o, &dname)
+                                    .unwrap_or_else(|| dname.clone());
+                                self.slot_anchor
+                                    .insert(p, SlotAnchor::Obj(Rc::downgrade(&o), sk));
+                                self.ref_cells.insert(p);
+                            }
+                        }
+                    }
+                    if let Some(ForeachKey::Var(kn)) = key {
+                        self.var_set(kn, Value::str(n.clone()));
+                    }
+                    match val {
+                        ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                        ForeachTarget::ByRef(n) => {
+                            self.ref_cells.insert(Rc::as_ptr(&c) as usize);
+                            self.cur().vars.insert(n.clone(), c.clone());
+                        }
+                        ForeachTarget::Lvalue(e) => {
+                            let _ = self.store(e, c.borrow().clone());
+                        }
+                        ForeachTarget::List(items) => {
+                            let _ = self.foreach_list(items, &c.borrow().clone());
+                        }
+                    }
+                    match self.exec_block(body) {
+                        Flow::Break(0) | Flow::Break(1) => break,
+                        Flow::Break(n) => return Flow::Break(n - 1),
+                        Flow::Normal | Flow::Continue(0) | Flow::Continue(1) => {}
+                        Flow::Continue(n) => return Flow::Continue(n - 1),
+                        f => return f,
+                    }
+                    // Managed reference: a changed bound value dispatches
+                    // to the set hook (property_hooks/foreach).
+                    if let Some((pd, hs, old)) = writeback.take() {
+                        let nv = c.borrow().clone();
+                        if !crate::value::identical(&nv, &old) {
+                            if let Err(e) = self.hook_write(&o, &pd, &hs, nv) {
+                                return self.err_flow(e);
+                            }
+                        }
+                    }
+                }
+                Flow::Normal
+            }
+            Value::Callable(_) => {
+                // A Closure is an object with no iterable props —
+                // foreach yields nothing (closure_028).
+                Flow::Normal
+            }
+            _ => {
+                if let Err(e) = self.warn(&format!(
+                    "foreach() argument must be of type array|object, {} given",
+                    src.debug_type()
+                )) {
+                    return self.err_flow(e);
+                }
+                Flow::Normal
+            }
+        }
+    }
+
+    /// foreach over an Iterator: rewind → valid → current/key → next.
+    fn exec_foreach_iter(
+        &mut self,
+        it: Rc<RefCell<PhpObject>>,
+        key: &Option<ForeachKey>,
+        val: &ForeachTarget,
+        body: &[Stmt],
+    ) -> Flow {
+        let f = self.exec_foreach_iter_loop(it.clone(), key, val, body);
+        // The iterator's temp dies with the foreach — a `new` captured
+        // only by the iteration frees here, not at statement end
+        // (typed_properties_115: its prop cells must unalias before a
+        // later var_dump counts holders).
+        if Rc::strong_count(&it) == 2 && self.expr_temps.iter().any(|o| Rc::ptr_eq(o, &it)) {
+            self.expr_temps.retain(|o| !Rc::ptr_eq(o, &it));
+            let key = Rc::as_ptr(&it) as usize;
+            if !self.destructed.contains_key(&key)
+                && self
+                    .find_method_in(&it.borrow().class, "__destruct")
+                    .is_some()
+            {
+                self.mark_destructed(&it);
+                if let Err(e) = self.method_invoke(it.clone(), "__destruct", CallArgs::empty()) {
+                    return self.err_flow(e);
+                }
+            }
+        }
+        f
+    }
+
+    fn exec_foreach_iter_loop(
+        &mut self,
+        it: Rc<RefCell<PhpObject>>,
+        key: &Option<ForeachKey>,
+        val: &ForeachTarget,
+        body: &[Stmt],
+    ) -> Flow {
+        if let Err(e) = self.method_invoke(it.clone(), "rewind", CallArgs::empty()) {
+            return self.err_flow(e);
+        }
+        loop {
+            let ok = self
+                .method_invoke(it.clone(), "valid", CallArgs::empty())
+                .map(|v| v.is_truthy())
+                .unwrap_or(false);
+            if !ok {
+                break;
+            }
+            // PHP calls current() before key() on each iteration.
+            let v = self
+                .method_invoke(it.clone(), "current", CallArgs::empty())
+                .unwrap_or(Value::Null);
+            if let Some(ForeachKey::Var(kn)) = key {
+                let k = self
+                    .method_invoke(it.clone(), "key", CallArgs::empty())
+                    .unwrap_or(Value::Null);
+                self.var_set(kn, k);
+            }
+            match val {
+                ForeachTarget::Var(n) => self.var_set(n, v),
+                ForeachTarget::ByRef(n) => {
+                    // A by-ref generator's current() is the yielded
+                    // cell itself — bind to it directly. An
+                    // ArrayIterator binds the backing entry cell —
+                    // prop cells write through the typed gate
+                    // (typed_properties_113/114).
+                    let c = match &it.borrow().internal {
+                        Some(ObjectInternal::Generator(st)) => {
+                            let st = st.borrow();
+                            st.items
+                                .get(st.pos)
+                                .map(|(_, c)| c.clone())
+                                .unwrap_or_else(|| cell(v.clone()))
+                        }
+                        Some(ObjectInternal::ArrayIter { arr, pos, .. }) => arr
+                            .borrow()
+                            .entries
+                            .get(*pos)
+                            .map(|(_, c)| c.clone())
+                            .unwrap_or_else(|| cell(v.clone())),
+                        _ => cell(v),
+                    };
+                    if let Some(f) = self.readonly_ref_error(&c) {
+                        return f;
+                    }
+                    self.ref_cells.insert(Rc::as_ptr(&c) as usize);
+                    self.cur().vars.insert(n.clone(), c);
+                }
+                ForeachTarget::Lvalue(e) => {
+                    let _ = self.store(e, v);
+                }
+                ForeachTarget::List(items) => {
+                    let _ = self.foreach_list(items, &v);
+                }
+            }
+            match self.exec_block(body) {
+                Flow::Break(0) | Flow::Break(1) => break,
+                Flow::Break(n) => return Flow::Break(n - 1),
+                Flow::Continue(0) | Flow::Continue(1) => {}
+                Flow::Continue(n) => return Flow::Continue(n - 1),
+                Flow::Normal => {}
+                f => return f,
+            }
+            if let Err(e) = self.method_invoke(it.clone(), "next", CallArgs::empty()) {
+                return self.err_flow(e);
+            }
+        }
+        Flow::Normal
+    }
+
+    fn foreach_list(&mut self, items: &[Option<ForeachTarget>], v: &Value) -> Result<(), PhpError> {
+        if let Value::Array(a) = v {
+            let a = a.borrow();
+            for (i, t) in items.iter().enumerate() {
+                if let Some(t) = t {
+                    let iv = a.get(&ArrKey::Int(i as i64)).unwrap_or(Value::Null);
+                    match t {
+                        ForeachTarget::Var(n) => self.var_set(n, iv),
+                        ForeachTarget::Lvalue(e) => {
+                            let _ = self.store(e, iv);
+                        }
+                        ForeachTarget::ByRef(n) => self.var_set(n, iv),
+                        ForeachTarget::List(sub) => {
+                            self.foreach_list(sub, &iv)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
