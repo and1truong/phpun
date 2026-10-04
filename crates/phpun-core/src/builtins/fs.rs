@@ -509,7 +509,77 @@ pub(crate) fn dispatch(
             it.emit(&s);
             Value::Int(out.len() as i64)
         }
-        "fgetcsv" => Value::Bool(false), // stub — tracked in #62
+        "fgetcsv" => {
+            if args.is_empty() {
+                return err(
+                    "ArgumentCountError",
+                    "fgetcsv() expects at least 1 argument, 0 given",
+                );
+            }
+            // arg1 must be a stream resource.
+            if !matches!(&*args[0].borrow(), Value::Resource(_)) {
+                return err(
+                    "TypeError",
+                    format!(
+                        "fgetcsv(): Argument #1 ($stream) must be of type resource, {} given",
+                        zval_word(&arg(args, 0))
+                    ),
+                );
+            }
+            // Omitting $escape is deprecated since PHP 8.4 (emitted per call).
+            if args.len() < 5 {
+                it.deprecated_pub(
+                    "fgetcsv(): the $escape parameter must be provided as its default value will change",
+                )?;
+            }
+            // $length: null or 0 → unlimited; range 0..=i64::MAX-1.
+            let length = if args.len() < 2 || matches!(arg(args, 1), Value::Null) {
+                0
+            } else {
+                arg(args, 1).to_int()
+            };
+            if !(0..=i64::MAX - 1).contains(&length) {
+                return err(
+                    "ValueError",
+                    "fgetcsv(): Argument #2 ($length) must be between 0 and 9223372036854775806",
+                );
+            }
+            let sep = if args.len() < 3 {
+                vec![b',']
+            } else {
+                arg_bs(it, args, 2)
+            };
+            if sep.len() != 1 {
+                return err(
+                    "ValueError",
+                    "fgetcsv(): Argument #3 ($separator) must be a single character",
+                );
+            }
+            let enc = if args.len() < 4 {
+                vec![b'"']
+            } else {
+                arg_bs(it, args, 3)
+            };
+            if enc.len() != 1 {
+                return err(
+                    "ValueError",
+                    "fgetcsv(): Argument #4 ($enclosure) must be a single character",
+                );
+            }
+            let esc: Option<u8> = if args.len() < 5 {
+                Some(b'\\')
+            } else {
+                let e = arg_bs(it, args, 4);
+                if e.len() > 1 {
+                    return err(
+                        "ValueError",
+                        "fgetcsv(): Argument #5 ($escape) must be empty or a single character",
+                    );
+                }
+                e.first().copied()
+            };
+            fgetcsv(&args[0], length as usize, sep[0], enc[0], esc)?
+        }
         "file" => {
             let path = arg_str(it, args, 0);
             match std::fs::read_to_string(&path) {
@@ -1025,6 +1095,280 @@ fn read_line_resource(c: Option<&Cell>) -> Result<Vec<u8>, PhpError> {
         }
         _ => Err(PhpError::fatal("not a resource", 0)),
     }
+}
+
+/// PHP zval type word used in TypeError "…, X given" messages.
+fn zval_word(v: &Value) -> String {
+    match v {
+        Value::Null => "null".into(),
+        Value::Bool(b) => if *b { "true" } else { "false" }.into(),
+        Value::Int(_) => "int".into(),
+        Value::Float(_) => "float".into(),
+        Value::Str(_) => "string".into(),
+        Value::Array(_) => "array".into(),
+        Value::Object(o) => o.borrow().class.name().to_string(),
+        Value::Callable(_) => "Closure".into(),
+        Value::Resource(_) => "resource".into(),
+    }
+}
+
+/// php_stream_gets: read up to `limit` bytes, stopping after '\n'.
+/// Returns an empty vec at EOF (or on a non-readable stream).
+fn csv_gets(c: &Cell, limit: usize) -> Result<Vec<u8>, PhpError> {
+    use std::io::{Read, Seek};
+    match c.borrow().clone() {
+        Value::Resource(r) => {
+            let mut rb = r.borrow_mut();
+            match &mut *rb {
+                PhpResource::File {
+                    file,
+                    pos,
+                    read,
+                    eof,
+                    ..
+                } => {
+                    if !*read || *eof {
+                        return Ok(Vec::new());
+                    }
+                    let _ = file.seek(std::io::SeekFrom::Start(*pos));
+                    let mut out = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while out.len() < limit {
+                        match file.read(&mut byte) {
+                            Ok(0) => {
+                                *eof = true;
+                                break;
+                            }
+                            Ok(_) => {
+                                out.push(byte[0]);
+                                *pos += 1;
+                                if byte[0] == b'\n' {
+                                    break;
+                                }
+                            }
+                            Err(e) => return Err(PhpError::fatal(e.to_string(), 0)),
+                        }
+                    }
+                    Ok(out)
+                }
+                PhpResource::Mem { buf, pos, eof, .. } => {
+                    let start = *pos as usize;
+                    if start >= buf.len() {
+                        *eof = true;
+                        Ok(Vec::new())
+                    } else {
+                        let mut end = start;
+                        while end < buf.len() && end - start < limit {
+                            let b = buf[end];
+                            end += 1;
+                            if b == b'\n' {
+                                break;
+                            }
+                        }
+                        *pos = end as u64;
+                        Ok(buf[start..end].to_vec())
+                    }
+                }
+                PhpResource::Input { body, pos, .. } => {
+                    let start = *pos as usize;
+                    if start >= body.len() {
+                        Ok(Vec::new())
+                    } else {
+                        let mut end = start;
+                        while end < body.len() && end - start < limit {
+                            let b = body[end];
+                            end += 1;
+                            if b == b'\n' {
+                                break;
+                            }
+                        }
+                        *pos = end as u64;
+                        Ok(body[start..end].to_vec())
+                    }
+                }
+                _ => Ok(Vec::new()),
+            }
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// php_stream_get_line equivalent: read the rest of the current line
+/// (through '\n' inclusive), unbounded. Returns None at EOF.
+fn csv_get_line(c: &Cell) -> Result<Option<Vec<u8>>, PhpError> {
+    let out = csv_gets(c, usize::MAX)?;
+    Ok(if out.is_empty() { None } else { Some(out) })
+}
+
+/// C isspace() for the byte domain (space, \t, \n, \v, \f, \r).
+fn c_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// Index of the first byte of the trailing-whitespace run (Zend's
+/// php_fgetcsv_lookup_trailing_spaces). buf[limit..] is the "line end"
+/// bytes that get embedded when an enclosure spans buffers.
+fn trailing_spaces_limit(buf: &[u8]) -> usize {
+    let mut i = buf.len();
+    while i > 0 && c_space(buf[i - 1]) {
+        i -= 1;
+    }
+    i
+}
+
+fn rtrim_len(field: &[u8]) -> usize {
+    let mut i = field.len();
+    while i > 0 && c_space(field[i - 1]) {
+        i -= 1;
+    }
+    i
+}
+
+/// fgetcsv: read one CSV record from a stream. Faithful port of Zend's
+/// php_fgetcsv (ext/standard/file.c): the first chunk is a `length`-bounded
+/// gets (0 = whole line); enclosed fields that stay open at buffer end pull
+/// in whole further lines, embedding each buffer's trailing whitespace.
+/// Escape only acts inside enclosures and is kept literally.
+fn fgetcsv(
+    stream: &Cell,
+    length: usize,
+    sep: u8,
+    enc: u8,
+    esc: Option<u8>,
+) -> Result<Value, PhpError> {
+    let limit = if length == 0 { usize::MAX } else { length };
+    let mut buf = csv_gets(stream, limit)?;
+    if buf.is_empty() {
+        return Ok(Value::Bool(false));
+    }
+    let mut limit_i = trailing_spaces_limit(&buf);
+    let mut fields: Vec<Vec<u8>> = Vec::new();
+    let mut bptr = 0usize;
+    let mut first_field = true;
+    let mut blank = false;
+
+    loop {
+        let inc = bptr < limit_i;
+        if inc {
+            // Skip a leading whitespace run when it leads to an enclosure
+            // (the whitespace is then dropped from the field).
+            let mut tmp = bptr;
+            while tmp < buf.len() && buf[tmp] != sep && c_space(buf[tmp]) {
+                tmp += 1;
+            }
+            if tmp < limit_i && buf[tmp] == enc {
+                bptr = tmp;
+            }
+        }
+        if first_field && bptr == limit_i {
+            // Whole buffer was trailing whitespace → NULL row → [null].
+            blank = true;
+            break;
+        }
+        first_field = false;
+
+        let mut tptr: Vec<u8> = Vec::new();
+        if inc && buf[bptr] == enc {
+            // Enclosure-delimited field.
+            bptr += 1;
+            let mut hunk = bptr;
+            // state: 0 normal, 1 just saw escape, 2 just saw enclosure
+            let mut st = 0u8;
+            'enc: loop {
+                if bptr >= limit_i {
+                    match st {
+                        2 => {
+                            // Buffer ended right after the closing quote.
+                            tptr.extend_from_slice(&buf[hunk..bptr - 1]);
+                            hunk = bptr;
+                            break 'enc;
+                        }
+                        _ => {
+                            tptr.extend_from_slice(&buf[hunk..bptr]);
+                            hunk = bptr;
+                            // Embed this buffer's trailing whitespace.
+                            tptr.extend_from_slice(&buf[limit_i..]);
+                            match csv_get_line(stream)? {
+                                None => break 'enc,
+                                Some(nb) => {
+                                    buf = nb;
+                                    bptr = 0;
+                                    hunk = 0;
+                                    limit_i = trailing_spaces_limit(&buf);
+                                    st = 0;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let c = buf[bptr];
+                    match st {
+                        1 => {
+                            // Escaped char: consumed literally (escape kept).
+                            bptr += 1;
+                            st = 0;
+                        }
+                        2 => {
+                            if c != enc {
+                                // Real closing quote.
+                                tptr.extend_from_slice(&buf[hunk..bptr - 1]);
+                                hunk = bptr;
+                                break 'enc;
+                            }
+                            // `""` pair → one literal quote.
+                            tptr.extend_from_slice(&buf[hunk..bptr]);
+                            bptr += 1;
+                            hunk = bptr;
+                            st = 0;
+                        }
+                        _ => {
+                            if c == enc {
+                                st = 2;
+                            } else if esc == Some(c) {
+                                st = 1;
+                            }
+                            bptr += 1;
+                        }
+                    }
+                }
+            }
+            // Post-enclosure: append junk up to the next delimiter.
+            while bptr < limit_i && buf[bptr] != sep {
+                bptr += 1;
+            }
+            tptr.extend_from_slice(&buf[hunk..bptr]);
+            if bptr < limit_i && buf[bptr] == sep {
+                bptr += 1;
+                fields.push(std::mem::take(&mut tptr));
+            } else {
+                fields.push(std::mem::take(&mut tptr));
+                break;
+            }
+        } else {
+            // Non-enclosure field: scan to delimiter/buffer end, rtrim.
+            let fstart = bptr;
+            while bptr < limit_i && buf[bptr] != sep {
+                bptr += 1;
+            }
+            let fend = fstart + rtrim_len(&buf[fstart..bptr]);
+            fields.push(buf[fstart..fend].to_vec());
+            if bptr < limit_i && buf[bptr] == sep {
+                bptr += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    let mut a = PhpArray::new();
+    if blank {
+        a.push(Value::Null);
+    } else {
+        for f in fields {
+            a.push(Value::bytes(f));
+        }
+    }
+    Ok(Value::Array(Rc::new(RefCell::new(a))))
 }
 
 fn glob_to_regex(pat: &str) -> regex::Regex {
