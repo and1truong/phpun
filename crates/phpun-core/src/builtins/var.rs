@@ -1,0 +1,920 @@
+//! Variable handling: var_dump/print_r/var_export, serialize, type predicates and casts.
+
+use super::*;
+
+pub(crate) fn dispatch(
+    it: &mut Interp,
+    name: &str,
+    args: &[Cell],
+) -> Result<Option<Value>, PhpError> {
+    Ok(Some(match name {
+        // ----- output/debug -----
+        "var_dump" => {
+            for a in args {
+                var_dump(it, &a.borrow(), 0, false, false);
+            }
+            Value::Null
+        }
+        "debug_zval_dump" => {
+            for a in args {
+                var_dump(it, &a.borrow(), 0, true, false);
+            }
+            Value::Null
+        }
+        "print_r" => {
+            let v = arg(args, 0);
+            let ret = arg(args, 1).is_truthy();
+            let s = print_r(it, &v, 0);
+            if ret {
+                Value::str(s)
+            } else {
+                it.emit(&s);
+                // print_r echoes a trailing newline only for arrays/objects.
+                if matches!(v, Value::Array(_) | Value::Object(_) | Value::Callable(_)) {
+                    it.emit("\n");
+                }
+                Value::Bool(true)
+            }
+        }
+        "var_export" => {
+            let v = arg(args, 0);
+            let ret = arg(args, 1).is_truthy();
+            let s = var_export(it, &v);
+            if ret {
+                Value::str(s)
+            } else {
+                it.emit(&s);
+                Value::Null
+            }
+        }
+
+        // ----- type introspection -----
+        "gettype" => Value::str(arg(args, 0).gettype()),
+        "get_debug_type" => Value::str(
+            match arg(args, 0) {
+                Value::Null => "null",
+                Value::Bool(_) => "bool",
+                Value::Int(_) => "int",
+                Value::Float(_) => "float",
+                Value::Str(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(o) => {
+                    return Ok(Some(Value::str(o.borrow().class.name().to_string())))
+                }
+                Value::Callable(_) => "Closure",
+                Value::Resource(_) => "resource",
+            }
+            .to_string(),
+        ),
+        "settype" => {
+            let t = arg_str(it, args, 1);
+            if let Some(c) = args.first() {
+                let nv = cast_to(&c.borrow(), &t);
+                *c.borrow_mut() = nv;
+            }
+            Value::Bool(true)
+        }
+        "intval" | "ip2long" => Value::Int(arg(args, 0).to_int()),
+        "floatval" | "doubleval" => Value::Float(arg(args, 0).to_float()),
+        "strval" => Value::str(it.to_string_of(&arg(args, 0))),
+        "boolval" => Value::Bool(arg(args, 0).is_truthy()),
+        "is_int" | "is_integer" | "is_long" => Value::Bool(matches!(arg(args, 0), Value::Int(_))),
+        "is_float" | "is_double" | "is_real" => {
+            Value::Bool(matches!(arg(args, 0), Value::Float(_)))
+        }
+        "is_string" => Value::Bool(matches!(arg(args, 0), Value::Str(_))),
+        "is_bool" => Value::Bool(matches!(arg(args, 0), Value::Bool(_))),
+        "is_null" => Value::Bool(matches!(arg(args, 0), Value::Null)),
+        "is_array" => Value::Bool(matches!(arg(args, 0), Value::Array(_))),
+        "is_object" => Value::Bool(matches!(
+            arg(args, 0),
+            Value::Object(_) | Value::Callable(_)
+        )),
+        "is_numeric" => match arg(args, 0) {
+            Value::Int(_) | Value::Float(_) => Value::Bool(true),
+            Value::Str(s) => Value::Bool(!matches!(numeric(&s), Numeric::NonNumeric)),
+            _ => Value::Bool(false),
+        },
+        "is_scalar" => Value::Bool(matches!(
+            arg(args, 0),
+            Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_)
+        )),
+        "is_callable" => {
+            let v = arg(args, 0);
+            let syntax_only = arg(args, 1).is_truthy();
+            let ok = it.is_callable_value(&v);
+            // $callable_name writes back through the arg cell —
+            // syntax_only gives the canonical `Class::m` /
+            // `{closure:fn():L}` form (closure_016).
+            if ok {
+                if let Some(nm) = it.callable_name_of(&v, syntax_only) {
+                    if let Some(c) = args.get(2) {
+                        *c.borrow_mut() = Value::str(nm);
+                    }
+                }
+            }
+            Value::Bool(ok)
+        }
+        "is_iterable" => Value::Bool(matches!(arg(args, 0), Value::Array(_))),
+        "is_countable" => Value::Bool(match arg(args, 0) {
+            Value::Array(_) => true,
+            Value::Object(o) => o
+                .borrow()
+                .class
+                .decl
+                .implements
+                .iter()
+                .any(|i| i.eq_ignore_ascii_case("countable")),
+            _ => false,
+        }),
+        "is_resource" => Value::Bool(matches!(arg(args, 0), Value::Resource(_))),
+        "is_nan" => Value::Bool(matches!(arg(args, 0), Value::Float(f) if f.is_nan())),
+        "is_finite" => Value::Bool(matches!(arg(args, 0), Value::Float(f) if f.is_finite())),
+        "is_infinite" => Value::Bool(matches!(arg(args, 0), Value::Float(f) if f.is_infinite())),
+
+        // ----- serialization -----
+        "serialize" => Value::str(serialize(it, &arg(args, 0))),
+        "unserialize" => {
+            let s = arg_str(it, args, 0);
+            let mut pos = 0;
+            match unserialize(it, &s, &mut pos) {
+                Ok(v) => v,
+                Err(_) => Value::Bool(false),
+            }
+        }
+        _ => return Ok(None),
+    }))
+}
+
+// ----- helpers -----
+
+/// var_dump one zval; `is_ref` prints PHP's `&` prefix for reference cells.
+fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool) {
+    let pad = "  ".repeat(indent);
+    // debug_zval_dump appends `refcount(N)` to every line/header.
+    let rc = |n: usize| -> String {
+        if zval {
+            format!(" refcount({})", n)
+        } else {
+            String::new()
+        }
+    };
+    let r = if is_ref { "&" } else { "" };
+    match v {
+        Value::Null => it.emit(&format!("{}{}NULL{}\n", pad, r, rc(1))),
+        Value::Bool(b) => it.emit(&format!("{}{}bool({}){}\n", pad, r, b, rc(1))),
+        Value::Int(i) => it.emit(&format!("{}{}int({}){}\n", pad, r, i, rc(1))),
+        Value::Float(f) => {
+            let prec = it.ini_int("serialize_precision", -1);
+            it.emit(&format!(
+                "{}{}float({}){}\n",
+                pad,
+                r,
+                crate::value::format_float_prec(*f, prec),
+                rc(1)
+            ))
+        }
+        Value::Str(s) => it.emit_bytes(
+            &[
+                format!("{}{}string({}) \"", pad, r, s.len()).into_bytes(),
+                s.to_vec(),
+                format!("\"{}\n", rc(1)).into_bytes(),
+            ]
+            .concat(),
+        ),
+        Value::Array(a) => {
+            let aptr = Rc::as_ptr(a) as usize;
+            if !it.dump_stack.insert(aptr) {
+                it.emit(&format!("{}*RECURSION*\n", pad));
+                return;
+            }
+            let rcn = Rc::strong_count(a);
+            let a = a.borrow();
+            // zval: `array(2) refcount(1){` — plain: `array(2) {`.
+            let tail = if zval { rc(rcn) } else { " ".to_string() };
+            it.emit(&format!("{}{}array({}){}{{\n", pad, r, a.len(), tail));
+            for (k, c) in a.iter() {
+                match k {
+                    ArrKey::Int(i) => it.emit(&format!("{}  [{}]=>\n", pad, i)),
+                    ArrKey::Str(s) => it.emit(&format!("{}  [\"{}\"]=>\n", pad, s)),
+                    ArrKey::Tomb => continue,
+                }
+                var_dump(
+                    it,
+                    &c.borrow(),
+                    indent + 1,
+                    zval,
+                    // typed_slots pins a clone of bound cells — exclude it
+                    // from the &-marker count (typed_properties_038).
+                    Rc::strong_count(c)
+                        > 1 + it.typed_slots.contains_key(&(Rc::as_ptr(c) as usize)) as usize,
+                );
+            }
+            it.emit(&format!("{}}}\n", pad));
+            it.dump_stack.remove(&aptr);
+        }
+        Value::Object(o) => {
+            let optr = Rc::as_ptr(o) as usize;
+            if !it.dump_stack.insert(optr) {
+                it.emit(&format!("{}*RECURSION*\n", pad));
+                return;
+            }
+            let ob = o.borrow();
+            // Enum cases print `enum(E::Case1)` (single line).
+            if ob.class.decl.kind == crate::ast::ClassKind::Enum {
+                if let Some(nm) = ob.props.get("name") {
+                    if let Value::Str(case) = &*nm.borrow() {
+                        it.emit(&format!(
+                            "{}enum({}::{})\n",
+                            pad,
+                            ob.class.name(),
+                            crate::value::lossy(case)
+                        ));
+                        it.dump_stack.remove(&optr);
+                        return;
+                    }
+                }
+            }
+            // Count live props only — unset() tombstones prop_order slots.
+            let mut live = ob
+                .prop_order
+                .iter()
+                .filter(|n| ob.props.contains_key(*n))
+                .count();
+            // Internal engine state Zend exposes in var_dump:
+            // Generator's creating function and ArrayIterator's
+            // private storage (iterable_001).
+            let internal_props: Vec<(String, Value)> = match &ob.internal {
+                Some(crate::value::ObjectInternal::Generator(st)) => {
+                    let st = st.borrow();
+                    let fname = match &st.setup {
+                        // Methods dump as `C::test` (generator_return_
+                        // containing_extra_types).
+                        crate::value::GenSetup::Invoke {
+                            decl, decl_class, ..
+                        } => match decl_class {
+                            Some(c) => format!("{}::{}", c.decl.name, decl.name),
+                            None => decl.name.clone(),
+                        },
+                    };
+                    vec![("\"function\"".to_string(), Value::str(&fname))]
+                }
+                Some(crate::value::ObjectInternal::ArrayIter { arr, .. }) => {
+                    vec![(
+                        "\"storage\":\"ArrayIterator\":private".to_string(),
+                        Value::Array(arr.clone()),
+                    )]
+                }
+                _ => Vec::new(),
+            };
+            live += internal_props.len();
+            let tail = if zval {
+                rc(Rc::strong_count(o))
+            } else {
+                " ".to_string()
+            };
+            it.emit(&format!(
+                "{}object({})#{} ({}){}{{\n",
+                pad,
+                ob.class.name(),
+                ob.id,
+                live,
+                tail
+            ));
+            for n in &ob.prop_order {
+                // Reserved-but-cellless slots are uninitialized typed
+                // props — zend prints `uninitialized(T)` (recursion).
+                if !ob.props.contains_key(n) {
+                    if let Some(pd) = it.decl_for_slot(o, n) {
+                        if let Some(tys) = &pd.ty {
+                            let ty = if tys.len() == 2 && tys.iter().any(|t| t == "null") {
+                                format!("?{}", tys.iter().find(|t| *t != "null").unwrap())
+                            } else {
+                                tys.join("|")
+                            };
+                            let (vis, dcls) = it.prop_visibility(&ob.class, n);
+                            let disp = n
+                                .strip_prefix('\0')
+                                .and_then(|r| r.split('\0').nth(1))
+                                .unwrap_or(n.as_str());
+                            let key = match vis {
+                                crate::ast::Visibility::Private => {
+                                    format!("\"{}\":\"{}\":private", disp, dcls)
+                                }
+                                crate::ast::Visibility::Protected => {
+                                    format!("\"{}\":protected", disp)
+                                }
+                                crate::ast::Visibility::Public => {
+                                    format!("\"{}\"", disp)
+                                }
+                            };
+                            it.emit(&format!("{}  [{}]=>\n", pad, key));
+                            it.emit(&format!("{}  uninitialized({})\n", pad, ty));
+                        }
+                    }
+                    continue;
+                }
+                if let Some(c) = ob.props.get(n) {
+                    let (vis, dcls) = it.prop_visibility(&ob.class, n);
+                    // Mangled private keys "\0Cls\0name" display only `name`.
+                    let disp = n
+                        .strip_prefix('\0')
+                        .and_then(|r| r.split('\0').nth(1))
+                        .unwrap_or(n.as_str());
+                    let key = match vis {
+                        crate::ast::Visibility::Private => {
+                            format!("\"{}\":\"{}\":private", disp, dcls)
+                        }
+                        crate::ast::Visibility::Protected => {
+                            format!("\"{}\":protected", disp)
+                        }
+                        crate::ast::Visibility::Public => format!("\"{}\"", disp),
+                    };
+                    it.emit(&format!("{}  [{}]=>\n", pad, key));
+                    var_dump(
+                        it,
+                        &c.borrow(),
+                        indent + 1,
+                        zval,
+                        // typed_slots pins a clone of bound cells — exclude it
+                        // from the &-marker count (typed_properties_038).
+                        Rc::strong_count(c)
+                            > 1 + it.typed_slots.contains_key(&(Rc::as_ptr(c) as usize)) as usize,
+                    );
+                }
+            }
+            for (k, v) in &internal_props {
+                it.emit(&format!("{}  [{}]=>\n", pad, k));
+                var_dump(it, v, indent + 1, zval, false);
+            }
+            it.emit(&format!("{}}}\n", pad));
+            it.dump_stack.remove(&optr);
+        }
+        Value::Callable(c) => {
+            let cptr = Rc::as_ptr(c) as usize;
+            if !it.dump_stack.insert(cptr) {
+                it.emit(&format!("{}*RECURSION*\n", pad));
+                return;
+            }
+            let props = closure_debug_props(it, c);
+            it.emit(&format!(
+                "{}object(Closure)#{} ({}) {{\n",
+                pad,
+                c.id.get(),
+                props.len()
+            ));
+            for (k, v) in &props {
+                it.emit(&format!("{}  [\"{}\"]=>\n", pad, k));
+                var_dump(it, v, indent + 1, zval, false);
+            }
+            it.emit(&format!("{}}}\n", pad));
+            it.dump_stack.remove(&cptr);
+        }
+        Value::Resource(r) => it.emit(&format!(
+            "{}resource({}) of type (stream)\n",
+            pad,
+            r.borrow().id()
+        )),
+    }
+}
+
+/// The props Zend reports for a Closure in var_dump/print_r
+/// (zend_closures.c get_debug_info): `function` for callables made
+/// from functions/methods, `name`/`file`/`line` for literals, then
+/// `static` (use-captures ∪ function static vars), bound `this`, and
+/// `parameter` — each only when present.
+fn closure_debug_props(it: &mut Interp, c: &crate::value::PhpCallable) -> Vec<(String, Value)> {
+    use crate::value::CallableKind;
+    let mut props: Vec<(String, Value)> = Vec::new();
+    let mut params: Vec<(String, bool)> = Vec::new();
+    let mut body_statics: Vec<String> = Vec::new();
+    let mut statics_key: Option<String> = None;
+    match &c.kind {
+        CallableKind::Named(n) => {
+            props.push(("function".into(), Value::str(n.clone())));
+            if let Some(d) = it.functions.get(&n.to_lowercase()) {
+                params = d
+                    .params
+                    .iter()
+                    .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
+                    .collect();
+                static_var_names(&d.body, &mut body_statics);
+                statics_key = Some(d.name.clone());
+            } else if let Some(sig) = builtin_sig(&n.to_lowercase()) {
+                params = sig;
+            }
+        }
+        CallableKind::Method { obj, class, name } => {
+            let cn = c
+                .scope_class
+                .as_ref()
+                .map(|sc| sc.name().to_string())
+                .or_else(|| {
+                    obj.as_ref()
+                        .map(|o| o.borrow().class.name().to_string())
+                        .or_else(|| class.as_ref().map(|cl| cl.name().to_string()))
+                })
+                .unwrap_or_default();
+            props.push(("function".into(), Value::str(format!("{}::{}", cn, name))));
+            let cls = obj
+                .as_ref()
+                .map(|o| o.borrow().class.clone())
+                .or_else(|| class.clone());
+            if let Some((m, dc)) = cls.and_then(|cl| it.find_method_in(&cl, name)) {
+                params = m
+                    .decl
+                    .params
+                    .iter()
+                    .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
+                    .collect();
+                static_var_names(&m.decl.body, &mut body_statics);
+                statics_key = Some(format!("{}\u{0}{}", dc.name(), name));
+            }
+        }
+        CallableKind::Closure(d) => {
+            props.push((
+                "name".into(),
+                Value::str(format!("{{closure:{}:{}}}", d.file, d.line)),
+            ));
+            props.push(("file".into(), Value::str(d.file.clone())));
+            props.push(("line".into(), Value::Int(d.line as i64)));
+            params = d
+                .params
+                .iter()
+                .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
+                .collect();
+            static_var_names(&d.body, &mut body_statics);
+            statics_key = Some(d.name.clone());
+        }
+    }
+    // `static` member: bound use-vars first, then function statics —
+    // declared-but-unrun statics report NULL (gh8083, bug79778).
+    let mut sa = PhpArray::new();
+    for (n, cap, _by_ref) in &c.captures {
+        sa.set_cell(ArrKey::Str(n.clone().into()), cap.clone());
+    }
+    if let Some(key) = &statics_key {
+        for n in body_statics {
+            if sa.get(&ArrKey::Str(n.clone().into())).is_none() {
+                let cv = it
+                    .statics
+                    .get(key)
+                    .and_then(|t| t.get(&n).map(|c| cell(c.borrow().clone())))
+                    .unwrap_or_else(|| cell(Value::Null));
+                sa.set_cell(ArrKey::Str(n.into()), cv);
+            }
+        }
+    }
+    if !sa.is_empty() {
+        props.push((
+            "static".into(),
+            Value::Array(std::rc::Rc::new(std::cell::RefCell::new(sa))),
+        ));
+    }
+    let this_obj = match &c.kind {
+        CallableKind::Method { obj, .. } => obj.clone().or_else(|| c.this_obj.clone()),
+        _ => c.this_obj.clone(),
+    };
+    if let Some(o) = this_obj {
+        props.push(("this".into(), Value::Object(o)));
+    }
+    if !params.is_empty() {
+        let mut pa = PhpArray::new();
+        for (pn, req) in &params {
+            let word = if *req { "<required>" } else { "<optional>" };
+            pa.set(ArrKey::Str(format!("${}", pn).into()), Value::str(word));
+        }
+        props.push((
+            "parameter".into(),
+            Value::Array(std::rc::Rc::new(std::cell::RefCell::new(pa))),
+        ));
+    }
+    props
+}
+
+/// Names of `static $x` declarations anywhere in a body — nested
+/// function/class bodies declare their own (bug79778).
+fn static_var_names(stmts: &[crate::ast::Stmt], out: &mut Vec<String>) {
+    use crate::ast::Stmt;
+    for st in stmts {
+        match st {
+            Stmt::Static { vars, .. } => {
+                for (n, _) in vars {
+                    if !out.iter().any(|x| x == n) {
+                        out.push(n.clone());
+                    }
+                }
+            }
+            Stmt::Block(b) => static_var_names(b, out),
+            Stmt::If { then, else_, .. } => {
+                static_var_names(then, out);
+                static_var_names(else_, out);
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::Foreach { body, .. } => static_var_names(body, out),
+            Stmt::Switch { cases, .. } => {
+                for (_, b) in cases {
+                    static_var_names(b, out);
+                }
+            }
+            Stmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                static_var_names(body, out);
+                for c in catches {
+                    static_var_names(&c.body, out);
+                }
+                if let Some(f) = finally {
+                    static_var_names(f, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn print_r(_it: &mut Interp, v: &Value, indent: usize) -> String {
+    match v {
+        Value::Array(a) => {
+            let a = a.borrow();
+            let mut s = String::from("Array\n");
+            s.push_str(&"    ".repeat(indent));
+            s.push_str("(\n");
+            for (k, c) in a.iter() {
+                s.push_str(&"    ".repeat(indent + 1));
+                s.push_str(&format!("[{}] => ", key_str(k)));
+                let inner = print_r(_it, &c.borrow(), indent + 2);
+                s.push_str(&inner);
+                s.push('\n');
+                if matches!(
+                    *c.borrow(),
+                    Value::Array(_) | Value::Object(_) | Value::Callable(_)
+                ) {
+                    s.push('\n');
+                }
+            }
+            s.push_str(&"    ".repeat(indent));
+            s.push(')');
+            s
+        }
+        Value::Callable(c) => {
+            let mut s = String::from("Closure Object\n");
+            s.push_str(&"    ".repeat(indent));
+            s.push_str("(\n");
+            for (k, v) in closure_debug_props(_it, c) {
+                s.push_str(&"    ".repeat(indent + 1));
+                s.push_str(&format!("[{}] => ", k));
+                s.push_str(&print_r(_it, &v, indent + 2));
+                s.push('\n');
+                if matches!(v, Value::Array(_) | Value::Object(_) | Value::Callable(_)) {
+                    s.push('\n');
+                }
+            }
+            s.push_str(&"    ".repeat(indent));
+            s.push(')');
+            s
+        }
+        Value::Object(o) => {
+            let ob = o.borrow();
+            let mut s = format!("{} Object\n", ob.class.name());
+            s.push_str(&"    ".repeat(indent));
+            s.push_str("(\n");
+            for n in &ob.prop_order {
+                if let Some(c) = ob.props.get(n) {
+                    s.push_str(&"    ".repeat(indent + 1));
+                    s.push_str(&format!("[{}] => ", n));
+                    s.push_str(&print_r(_it, &c.borrow(), indent + 2));
+                    s.push('\n');
+                    if matches!(
+                        *c.borrow(),
+                        Value::Array(_) | Value::Object(_) | Value::Callable(_)
+                    ) {
+                        s.push('\n');
+                    }
+                }
+            }
+            s.push_str(&"    ".repeat(indent));
+            s.push(')');
+            s
+        }
+        Value::Float(f) => {
+            let prec = _it.ini_int("precision", 14);
+            crate::value::format_float_prec(*f, prec)
+        }
+        other => other.to_php_string(),
+    }
+}
+
+fn var_export(it: &mut Interp, v: &Value) -> String {
+    var_export_depth(it, v, 0)
+}
+
+fn var_export_depth(it: &mut Interp, v: &Value, depth: usize) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => {
+            let prec = it.ini_int("serialize_precision", -1);
+            let s = crate::value::format_float_prec(*f, prec);
+            // var_export always renders a decimal point: 0.0, 100.0.
+            if s.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+                format!("{}.0", s)
+            } else {
+                s
+            }
+        }
+        Value::Str(s) => format!(
+            "'{}'",
+            crate::value::lossy(&s)
+                .replace('\\', "\\\\")
+                .replace('\'', "\\'")
+        ),
+        Value::Array(a) => {
+            let a = a.borrow();
+            let pad = "  ".repeat(depth + 1);
+            let mut s = String::from("array (\n");
+            for (k, c) in a.iter() {
+                s.push_str(&pad);
+                s.push_str(&match k {
+                    ArrKey::Int(i) => i.to_string(),
+                    ArrKey::Str(st) => {
+                        format!("'{}'", st.replace('\\', "\\\\").replace('\'', "\\'"))
+                    }
+                    ArrKey::Tomb => continue,
+                });
+                s.push_str(" => ");
+                // A nested array value renders on its own line at key depth
+                // ('key' => \n  array (...)) — matches zend var_export.
+                let inner = c.borrow();
+                if matches!(&*inner, Value::Array(_)) {
+                    s.push('\n');
+                    s.push_str(&pad);
+                }
+                s.push_str(&var_export_depth(it, &inner, depth + 1));
+                s.push_str(",\n");
+            }
+            s.push_str(&"  ".repeat(depth));
+            s.push(')');
+            s
+        }
+        Value::Object(o) => {
+            // All decl entries (both private `changed`s), hooked props
+            // via `get`, plain emitted names (property_hooks/dump).
+            let mut s = format!("\\{}::__set_state(array(\n", o.borrow().class.name());
+            for (out, slot, decl) in it.object_serial_entries(o) {
+                let v = match &decl {
+                    Some((p, dcls)) => it.serial_entry_value(o, p, dcls, &slot),
+                    None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
+                };
+                if let Some(v) = v {
+                    s.push_str(&format!("   '{}' => ", out));
+                    s.push_str(&var_export_depth(it, &v, depth + 1));
+                    s.push_str(",\n");
+                }
+            }
+            s.push_str("))");
+            s
+        }
+        _ => "NULL".into(),
+    }
+}
+
+fn serialize(it: &mut Interp, v: &Value) -> String {
+    match v {
+        Value::Null => "N;".into(),
+        Value::Bool(b) => format!("b:{};", *b as i32),
+        Value::Int(i) => format!("i:{};", i),
+        Value::Float(f) => format!("d:{};", crate::value::format_float_repr(*f)),
+        Value::Str(s) => format!("s:{}:\"{}\";", s.len(), crate::value::lossy(&s)),
+        Value::Array(a) => {
+            let a = a.borrow();
+            let mut s = format!("a:{}:{{", a.len());
+            for (k, c) in a.iter() {
+                s.push_str(&serialize(
+                    it,
+                    &match k {
+                        ArrKey::Int(i) => Value::Int(*i),
+                        ArrKey::Str(st) => Value::str(st.to_string()),
+                        ArrKey::Tomb => Value::Null,
+                    },
+                ));
+                s.push_str(&serialize(it, &c.borrow()));
+            }
+            s.push('}');
+            s
+        }
+        Value::Object(o) => {
+            // Serializable implementors serialize as C:...{payload}
+            // where the payload is whatever ->serialize() returns.
+            if it.obj_implements(o, "serializable") {
+                if let Ok(payload) =
+                    it.method_invoke(o.clone(), "serialize", crate::interp::CallArgs::empty())
+                {
+                    let Value::Str(pb) = &payload else {
+                        return "N;".into();
+                    };
+                    let p = crate::value::lossy(pb);
+                    return format!(
+                        "C:{}:\"{}\":{}:{{{}}}",
+                        o.borrow().class.name().len(),
+                        o.borrow().class.name(),
+                        p.len(),
+                        p
+                    );
+                }
+            }
+            let ob = o.borrow();
+            let mut body = String::new();
+            let mut n = 0;
+            for name in &ob.prop_order {
+                if let Some(c) = ob.props.get(name) {
+                    body.push_str(&serialize(it, &Value::str(name.clone())));
+                    body.push_str(&serialize(it, &c.borrow()));
+                    n += 1;
+                }
+            }
+            format!(
+                "O:{}:\"{}\":{}:{{{}}}",
+                ob.class.name().len(),
+                ob.class.name(),
+                n,
+                body
+            )
+        }
+        _ => "N;".into(),
+    }
+}
+
+fn unserialize(it: &mut Interp, s: &str, pos: &mut usize) -> Result<Value, ()> {
+    let b = s.as_bytes();
+    let take_until = |pos: &mut usize, ch: u8| -> Result<String, ()> {
+        let start = *pos;
+        while *pos < b.len() && b[*pos] != ch {
+            *pos += 1;
+        }
+        if *pos >= b.len() {
+            return Err(());
+        }
+        let s = String::from_utf8_lossy(&b[start..*pos]).into_owned();
+        *pos += 1;
+        Ok(s)
+    };
+    match b.get(*pos) {
+        Some(b'N') => {
+            *pos += 2;
+            Ok(Value::Null)
+        }
+        Some(b'b') => {
+            *pos += 2;
+            let n = take_until(pos, b';')?;
+            Ok(Value::Bool(n == "1"))
+        }
+        Some(b'i') => {
+            *pos += 2;
+            let n = take_until(pos, b';')?;
+            Ok(Value::Int(n.parse().map_err(|_| ())?))
+        }
+        Some(b'd') => {
+            *pos += 2;
+            let n = take_until(pos, b';')?;
+            match n.as_str() {
+                "NAN" => Ok(Value::Float(f64::NAN)),
+                "INF" => Ok(Value::Float(f64::INFINITY)),
+                "-INF" => Ok(Value::Float(f64::NEG_INFINITY)),
+                _ => Ok(Value::Float(n.parse().map_err(|_| ())?)),
+            }
+        }
+        Some(b's') => {
+            *pos += 2;
+            let len: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
+            *pos += 1; // opening quote
+            let st = String::from_utf8_lossy(&b[*pos..*pos + len]).into_owned();
+            *pos += len + 2; // closing quote + ;
+            Ok(Value::str(st))
+        }
+        Some(b'a') => {
+            *pos += 2;
+            let n: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
+            *pos += 1; // {
+            let mut arr = PhpArray::new();
+            for _ in 0..n {
+                let k = unserialize(it, s, pos)?;
+                let v = unserialize(it, s, pos)?;
+                arr.set(to_key(&k), v);
+            }
+            *pos += 1; // }
+            Ok(Value::Array(Rc::new(RefCell::new(arr))))
+        }
+        Some(b'C') => {
+            // C:<clen>:"<class>":<plen>:{<payload>} — a Serializable
+            // payload; instantiate without ctor and call ->unserialize().
+            *pos += 2;
+            let clen: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
+            *pos += 1; // opening quote
+            if *pos + clen > b.len() {
+                return Err(());
+            }
+            let cname = String::from_utf8_lossy(&b[*pos..*pos + clen]).into_owned();
+            *pos += clen;
+            *pos += 1; // closing quote
+            *pos += 1; // :
+            let plen: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
+            *pos += 1; // {
+            if *pos + plen > b.len() {
+                return Err(());
+            }
+            let payload = String::from_utf8_lossy(&b[*pos..*pos + plen]).into_owned();
+            *pos += plen;
+            *pos += 1; // }
+            let obj = match it.instantiate(&cname.to_lowercase(), &[]) {
+                Ok(Value::Object(o)) => o,
+                _ => return Err(()),
+            };
+            let _ = it.method_invoke(
+                obj.clone(),
+                "unserialize",
+                crate::interp::CallArgs::positional(vec![cell(Value::str(payload))]),
+            );
+            Ok(Value::Object(obj))
+        }
+        Some(b'O') => {
+            // O:<clen>:"<class>":<n>:{<pairs>}
+            *pos += 2;
+            let clen: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
+            *pos += 1; // opening quote
+            if *pos + clen > b.len() {
+                return Err(());
+            }
+            let cname = String::from_utf8_lossy(&b[*pos..*pos + clen]).into_owned();
+            *pos += clen;
+            *pos += 1; // closing quote
+            *pos += 1; // :
+            let n: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
+            *pos += 1; // {
+            let obj = match it.instantiate(&cname.to_lowercase(), &[]) {
+                Ok(Value::Object(o)) => o,
+                _ => return Err(()),
+            };
+            for _ in 0..n {
+                let k = unserialize(it, s, pos)?;
+                let Value::Str(ks) = k else { return Err(()) };
+                let plain = ks
+                    .strip_prefix(&[0u8][..])
+                    .and_then(|r| r.split(|b| *b == 0).nth(1))
+                    .unwrap_or(ks.as_ref());
+                // Virtual hooked props have no backing to fill — zend
+                // aborts the whole unserialize, reporting the offset
+                // right after the property name (unserialize.phpt).
+                if it.unserial_prop_virtual(&obj, &crate::value::lossy(&plain)) {
+                    let _ = it.warn_pub(&format!(
+                        "unserialize(): Cannot unserialize value for virtual property {}::${}",
+                        cname,
+                        crate::value::lossy(&plain)
+                    ));
+                    let _ = it.warn_pub(&format!(
+                        "unserialize(): Error at offset {} of {} bytes",
+                        pos,
+                        s.len()
+                    ));
+                    return Err(());
+                }
+                let v = unserialize(it, s, pos)?;
+                let mut ob = obj.borrow_mut();
+                let key = crate::value::lossy(&ks).into_owned();
+                if !ob.prop_order.contains(&key) {
+                    ob.prop_order.push(key.clone());
+                }
+                ob.props.insert(key, cell(v));
+            }
+            *pos += 1; // }
+            Ok(Value::Object(obj))
+        }
+        _ => Err(()),
+    }
+}
+
+fn cast_to(v: &Value, t: &str) -> Value {
+    match t {
+        "int" | "integer" => Value::Int(v.to_int()),
+        "float" | "double" | "real" => Value::Float(v.to_float()),
+        "string" => Value::str(v.to_php_string()),
+        "bool" | "boolean" => Value::Bool(v.is_truthy()),
+        "null" | "unset" => Value::Null,
+        "array" => match v {
+            Value::Array(_) => v.clone(),
+            Value::Null => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+            _ => {
+                let mut a = PhpArray::new();
+                a.push(v.clone());
+                Value::Array(Rc::new(RefCell::new(a)))
+            }
+        },
+        "object" => v.clone(),
+        _ => v.clone(),
+    }
+}
