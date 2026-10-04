@@ -1023,8 +1023,7 @@ impl<'a> Interp<'a> {
         let st_start = pos;
         let sv = {
             let mut ie = None;
-            crate::builtins::var::php_unserialize(self, data, &mut pos, &mut ie)
-                .map_err(|_| pos)?
+            crate::builtins::var::php_unserialize(self, data, &mut pos, &mut ie).map_err(|_| pos)?
         };
         if !matches!(sv, Value::Array(_) | Value::Object(_)) {
             return Err(st_start);

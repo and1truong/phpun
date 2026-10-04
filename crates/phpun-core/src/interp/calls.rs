@@ -72,9 +72,7 @@ impl<'a> Interp<'a> {
                 // `('Cls::m')()` — a source-literal static call: the
                 // class name is verbatim (keywords stay unbound) and
                 // $this forwards when the caller is-a Cls.
-                let lit = s
-                    .trim_start_matches('\u{1}')
-                    .trim_start_matches('\\');
+                let lit = s.trim_start_matches('\u{1}').trim_start_matches('\\');
                 if let Some((cn, mn)) = lit.rsplit_once("::") {
                     let Some(cls) = self.str_callable_class(cn)? else {
                         return self.fail(PhpError::uncaught(
@@ -87,12 +85,8 @@ impl<'a> Interp<'a> {
                         .find_method_in(&cls, mn)
                         .map(|(m, _)| m.decl.params.clone())
                         .unwrap_or_default();
-                    let vals = self.arg_cells(
-                        args,
-                        &params,
-                        &format!("{}::{}()", cls.name(), mn),
-                        false,
-                    )?;
+                    let vals =
+                        self.arg_cells(args, &params, &format!("{}::{}()", cls.name(), mn), false)?;
                     return self.static_invoke_vis(cls, mn, vals, None, true);
                 }
                 s.to_string()
@@ -3165,9 +3159,7 @@ impl<'a> Interp<'a> {
                 };
                 let mn = String::from_utf8_lossy(mn).to_string();
                 match &first {
-                    Value::Str(cn) => {
-                        self.callable_pair_ok(&String::from_utf8_lossy(cn), &mn)
-                    }
+                    Value::Str(cn) => self.callable_pair_ok(&String::from_utf8_lossy(cn), &mn),
                     Value::Callable(_) => Ok(mn.eq_ignore_ascii_case("__invoke")),
                     Value::Object(o) => self.callable_obj_ok(o, &mn),
                     _ => Ok(false),
