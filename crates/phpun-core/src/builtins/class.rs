@@ -39,7 +39,8 @@ pub(crate) fn dispatch(
             }
             Value::Object(o) => {
                 let m = arg_str(it, args, 1).to_lowercase();
-                Value::Bool(o.borrow().class.find_method(&m).is_some())
+                let cls = o.borrow().class.clone();
+                Value::Bool(it.find_method_in(&cls, &m).is_some())
             }
             Value::Str(cn) => {
                 if crate::value::lossy(&cn).eq_ignore_ascii_case("closure") {
@@ -48,10 +49,10 @@ pub(crate) fn dispatch(
                     )));
                 }
                 match it.lookup_class(&crate::value::lossy(&cn)) {
-                    Some(c) => Value::Bool(
-                        c.find_method(&arg_str(it, args, 1).to_lowercase())
-                            .is_some(),
-                    ),
+                    Some(c) => {
+                        let m = arg_str(it, args, 1).to_lowercase();
+                        Value::Bool(it.find_method_in(&c, &m).is_some())
+                    }
                     None => Value::Bool(false),
                 }
             }
@@ -142,17 +143,18 @@ pub(crate) fn dispatch(
         },
         "get_class_methods" => match arg(args, 0) {
             Value::Object(o) => {
+                let cls = o.borrow().class.clone();
                 let mut a = PhpArray::new();
-                for m in &o.borrow().class.decl.methods {
-                    a.push(Value::str(m.decl.name.clone()));
+                for m in it.class_method_names(&cls) {
+                    a.push(Value::str(m));
                 }
                 Value::Array(Rc::new(RefCell::new(a)))
             }
             Value::Str(cn) => match it.lookup_class(&crate::value::lossy(&cn)) {
                 Some(c) => {
                     let mut a = PhpArray::new();
-                    for m in &c.decl.methods {
-                        a.push(Value::str(m.decl.name.clone()));
+                    for m in it.class_method_names(&c) {
+                        a.push(Value::str(m));
                     }
                     Value::Array(Rc::new(RefCell::new(a)))
                 }
@@ -260,6 +262,19 @@ pub(crate) fn dispatch(
                         .map(|p| it.obj_is_a_str(p, &n))
                         .unwrap_or(false),
                 )
+            }
+            Value::Str(cn) => {
+                let n = arg_str(it, args, 1);
+                match it.lookup_class(&crate::value::lossy(&cn)) {
+                    Some(c) => Value::Bool(
+                        c.decl
+                            .parent
+                            .as_ref()
+                            .map(|p| it.obj_is_a_str(p, &n))
+                            .unwrap_or(false),
+                    ),
+                    None => Value::Bool(false),
+                }
             }
             _ => Value::Bool(false),
         },
