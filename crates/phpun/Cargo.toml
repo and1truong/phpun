@@ -13,3 +13,6 @@ path = "src/main.rs"
 [dependencies]
 phpun-core = { path = "../phpun-core" }
 phpun-phpt = { path = "../phpun-phpt" }
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }

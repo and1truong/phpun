@@ -151,3 +151,36 @@ Deferred (PHP-internal regressions, not phpun bugs):
 Harness note: .phpt files are parsed byte-faithfully (latin-1
 codepoint space) — EXPECT bodies with raw bytes (007.phpt) and
 non-UTF-8 FILE sources now load instead of BORKing.
+
+## phpun install (#29)
+
+`phpun install [-d DIR] [--no-dev]` — a minimal native composer-install
+equivalent (Rust, no composer.phar). composer.json → packagist p2
+metadata → semver-lite resolution → dist-zip into `vendor/` →
+composer-2.x-format autoload files → `phpun.lock` (content-hash +
+pinned versions; a matching lock reinstalls without re-resolving).
+
+- semver-lite covers `*`, exact, partial (`1.2` = `1.2.*`), wildcards,
+  `^`, `~`, `>=`/`<=`/`>`/`<`/`=`/`!=`, hyphen ranges, `||`/`|`
+  alternation, `&`-conjunction, `@stability` suffixes, and
+  `minimum-stability` filtering. `dev-*` branch constraints error
+  rather than silently resolve wrong.
+- Platform requirements (`php`, `ext-*`, `lib-*`, `composer*`) are
+  skipped, not resolved. `conflict`/`replace`/`provide` not modeled.
+- Autoload emission replicates `composer dump-autoload`: autoload.php,
+  autoload_real/static/psr4/namespaces/classmap/files plus verbatim
+  ClassLoader.php + InstalledVersions.php (MIT, from composer-src) and
+  installed.php/installed.json. `files` identifiers are
+  `md5(pkg:path)`, ordered dependencies-first.
+- Verified e2e on phpun: `psr/log` PSR-4 autoload, `symfony/console`
+  (9 transitive packages, polyfill `files` bootstrap defines mb_*),
+  real `Application::run(list --raw)`.
+
+Interp fix unblocked by the e2e: `caller_ns()` inside a function frame
+now honors the included file's own `namespace` (per-include ns slot
+keyed by stack depth) — php-parser's conditional-decl pattern
+(`if (!function_exists(...)) function f...` in namespaced code
+required by Lexer.php) works.
+
+Known install gap: no `phpun add/update/remove`, no repositories/auth
+overrides, no post-install script execution — see #70 (toolchain).

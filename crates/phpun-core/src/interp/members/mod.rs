@@ -17,8 +17,15 @@ impl<'a> Interp<'a> {
     /// private props are only visible to their own declaring class.
     /// Namespace of the currently executing code — the running
     /// function's declaring namespace, or the file-level `namespace`
-    /// for top-level statements (Zend/tests/namespaces).
+    /// for top-level statements (Zend/tests/namespaces). An included
+    /// file's own `namespace` governs its top-level code even when the
+    /// include ran inside a function frame.
     pub fn caller_ns(&self) -> String {
+        if let Some((depth, ns)) = self.include_ns.last() {
+            if *depth == self.stack.len() {
+                return ns.clone();
+            }
+        }
         self.stack
             .last()
             .map(|f| f.ns.clone())
