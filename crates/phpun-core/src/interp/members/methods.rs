@@ -685,7 +685,22 @@ impl<'a> Interp<'a> {
                     .nth(pos)
                     .map(|(_, c)| c.borrow().clone())
                     .unwrap_or(Value::Null);
-                let backing = match self.ao_backing(&el, family, canonical) {
+                if !matches!(el, Value::Array(_) | Value::Object(_)) {
+                    // zend type-checks against the parent ctor's arginfo:
+                    // "ArrayIterator::__construct()" regardless of class.
+                    let tn = self.zval_type_name(&el);
+                    let e = self.spl_throw(
+                        "TypeError",
+                        format!(
+                            "{}::__construct(): Argument #1 ($array) must be of type array, {} given",
+                            family, tn
+                        ),
+                    );
+                    return Err(e);
+                }
+                // zend reports the object-backing deprecation under
+                // the ctor's name here ("ArrayIterator::__construct").
+                let backing = match self.ao_backing(&el, family, "__construct") {
                     Ok((b, sf)) => (b, sf),
                     Err(e) => return Err(e),
                 };
