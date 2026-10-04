@@ -5448,7 +5448,10 @@ fn print_r(_it: &mut Interp, v: &Value, indent: usize) -> String {
                 let inner = print_r(_it, &c.borrow(), indent + 2);
                 s.push_str(&inner);
                 s.push('\n');
-                if matches!(*c.borrow(), Value::Array(_) | Value::Object(_)) {
+                if matches!(
+                    *c.borrow(),
+                    Value::Array(_) | Value::Object(_) | Value::Callable(_)
+                ) {
                     s.push('\n');
                 }
             }
@@ -5465,7 +5468,7 @@ fn print_r(_it: &mut Interp, v: &Value, indent: usize) -> String {
                 s.push_str(&format!("[{}] => ", k));
                 s.push_str(&print_r(_it, &v, indent + 2));
                 s.push('\n');
-                if matches!(v, Value::Array(_) | Value::Object(_)) {
+                if matches!(v, Value::Array(_) | Value::Object(_) | Value::Callable(_)) {
                     s.push('\n');
                 }
             }
@@ -5484,7 +5487,10 @@ fn print_r(_it: &mut Interp, v: &Value, indent: usize) -> String {
                     s.push_str(&format!("[{}] => ", n));
                     s.push_str(&print_r(_it, &c.borrow(), indent + 2));
                     s.push('\n');
-                    if matches!(*c.borrow(), Value::Array(_) | Value::Object(_)) {
+                    if matches!(
+                        *c.borrow(),
+                        Value::Array(_) | Value::Object(_) | Value::Callable(_)
+                    ) {
                         s.push('\n');
                     }
                 }
