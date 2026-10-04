@@ -105,6 +105,14 @@ pub(crate) fn dispatch(
                     ),
                 );
             }
+            // forward_static_call forwards the current called_scope —
+            // no scope, nothing to forward (zend_execute_API).
+            if name.starts_with("forward_static_call") && it.caller_scope_name().is_none() {
+                return err::<Option<Value>>(
+                    "Error",
+                    "Cannot call forward_static_call() when no class scope is active",
+                );
+            }
             // `*_array` unpacks the args array: string keys become named
             // args (a later int key is the positional-after-named Error).
             if name.ends_with("_array") {
@@ -214,7 +222,12 @@ pub(crate) fn dispatch(
                     }));
                 }
             } else {
-                it.ini.insert(k, v);
+                it.ini.insert(k.clone(), v);
+            }
+            // ini_set('error_reporting', …) also updates the live
+            // level like error_reporting() (zend ini handler).
+            if k == "error_reporting" {
+                it.error_reporting(Some(it.ini_error_level()));
             }
             match prev {
                 Some(p) => Value::str(p),

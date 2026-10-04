@@ -681,7 +681,11 @@ impl<'a> Interp<'a> {
     }
 
     /// Method-call visibility against the current calling scope.
-    fn method_access_ok(&mut self, m: &MethodDecl, dc: &Rc<PhpClass>) -> bool {
+    pub(in crate::interp) fn method_access_ok(
+        &mut self,
+        m: &MethodDecl,
+        dc: &Rc<PhpClass>,
+    ) -> bool {
         let scope = self
             .stack
             .last()
