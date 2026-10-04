@@ -1,0 +1,3671 @@
+//! Tree-walking interpreter. Correctness-first PHP 8.5 semantics.
+//!
+//! Variables and array elements live in shared cells (`Rc<RefCell<Value>>`)
+//! so `&$x` references, `global $x`, `static $x`, `foreach (&$v)` and
+//! by-ref params all alias the same storage, like PHP's zval references.
+
+use crate::ast::*;
+use crate::builtins;
+use crate::error::{ErrorKind, PhpError};
+use crate::lexer::StringPart;
+use crate::parser;
+use crate::value::{
+    compare, format_backtrace_frames, format_float_repr, format_trace, identical, numeric, to_key,
+    trace_arg, ArrKey, CallableKind, Cell, GenSetup, GenState, Numeric, ObjectInternal, PhpArray,
+    PhpCallable, PhpClass, PhpObject, PhpResource, TraceFrame, Value,
+};
+use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+mod api;
+mod calls;
+mod classes;
+mod expr;
+mod gen;
+mod include;
+mod members;
+mod registry;
+mod util;
+
+use util::*;
+
+/// Internal control-flow signals.
+pub enum Flow {
+    Normal,
+    Break(u32),
+    Continue(u32),
+    Return(Value),
+    /// `throw` propagating an exception object.
+    Throw(Value),
+    Exit(i32),
+    /// `goto name;` — binds when an enclosing statement list carries a
+    /// matching `name:` label; otherwise keeps propagating.
+    Goto(String),
+}
+
+/// Weak slot in the shared object-store handle space — objects and
+/// closures draw ids from the same vector, like Zend's EG(objects_store).
+enum ObjHandle {
+    Obj(std::rc::Weak<RefCell<PhpObject>>),
+    Callable(std::rc::Weak<PhpCallable>),
+}
+
+impl ObjHandle {
+    fn alive(&self) -> bool {
+        match self {
+            Self::Obj(w) => w.upgrade().is_some(),
+            Self::Callable(w) => w.upgrade().is_some(),
+        }
+    }
+}
+
+/// Evaluated call arguments: positional cells (call order) plus named
+/// entries the callee binds by param name (Zend/tests/named_params).
+pub struct CallArgs {
+    pub cells: Vec<Cell>,
+    /// `(name, cell, by_ref_ok, from_traversable)` — by_ref_ok marks
+    /// entries whose source expression was refable (`ref: $x`);
+    /// literals bind by value with a warning on by-ref params
+    /// (named_params/call_user_func). from_traversable marks cells
+    /// produced by unpacking a Traversable — by-ref params bind them
+    /// by value with a different warning (named_params/unpack).
+    pub named: Vec<(String, Cell, bool, bool)>,
+    /// Positional indexes (into `cells`) produced by Traversable unpack.
+    pub trav_cells: Vec<usize>,
+    /// Positional indexes that must bind by value even on by-ref
+    /// params — `call_user_func`-family forwards never create
+    /// references, so zend warns "must be passed by reference, value
+    /// given" (closure_invoke_ref_warning).
+    pub nonref_cells: Vec<usize>,
+}
+
+impl CallArgs {
+    pub fn positional(cells: Vec<Cell>) -> Self {
+        Self {
+            cells,
+            named: Vec::new(),
+            trav_cells: Vec::new(),
+            nonref_cells: Vec::new(),
+        }
+    }
+    pub fn empty() -> Self {
+        Self::positional(Vec::new())
+    }
+}
+
+/// Reads (len/get/iter/index) treat the arg list as its positional cells.
+impl std::ops::Deref for CallArgs {
+    type Target = [Cell];
+    fn deref(&self) -> &[Cell] {
+        &self.cells
+    }
+}
+
+pub struct Frame {
+    vars: HashMap<String, Cell>,
+    /// Actual call args for func_get_args().
+    args: Vec<Cell>,
+    /// Enclosing function name (for `static`/`__FUNCTION__`).
+    fn_name: String,
+    /// `$this` in method calls.
+    this_obj: Option<Rc<RefCell<PhpObject>>>,
+    /// Class context for self::/parent:: (the method's declaring class).
+    scope_class: Option<Rc<PhpClass>>,
+    /// Late-static-binding class — `static::`/`new static`/`get_called_class`
+    /// resolve here; falls back to scope_class when unset.
+    called_class: Option<Rc<PhpClass>>,
+    /// Class the running method was declared in — PHP's private
+    /// property slot is keyed by the declaring class (`\0Cls\0prop`).
+    decl_class: Option<Rc<PhpClass>>,
+    /// Declaration line — closures render in traces as
+    /// `{closure:FILE:LINE}` (typed_properties_055).
+    fn_line: usize,
+    /// File this frame's code was declared in (include resolution base).
+    file: String,
+    /// Namespace the running code was declared in — unqualified
+    /// function/const lookups try `ns\name` before the global name.
+    ns: String,
+    /// Function declared `&name()` — returns bind cells, not values.
+    ret_by_ref: bool,
+    /// While running a property hook: (object id, prop name, is_get,
+    /// owner class name) — `$this->prop` inside its own hook hits the
+    /// backing slot directly; the owner names `__METHOD__`'s class part
+    /// (trait origin too) (Zend/tests/property_hooks).
+    hook_prop: Option<(u64, String, bool, String)>,
+    /// Trait the running method was merged from (`use T`) — drives
+    /// `__TRAIT__` and the owner part of `__METHOD__`.
+    trait_origin: Option<String>,
+    /// The callable this frame executes (closure frames) —
+    /// `Closure::getCurrent()` returns it (closure_get_current).
+    closure_rc: Option<Rc<PhpCallable>>,
+    /// Name diagnostics report for this call — `[$closure,'__invoke']`
+    /// runs as `Closure::__invoke` (closure_invoke_ref_warning).
+    call_alias: Option<String>,
+}
+
+impl Frame {
+    fn new(fn_name: String) -> Self {
+        Self {
+            vars: HashMap::new(),
+            args: Vec::new(),
+            fn_name,
+            this_obj: None,
+            scope_class: None,
+            called_class: None,
+            decl_class: None,
+            fn_line: 0,
+            file: String::new(),
+            ns: String::new(),
+            ret_by_ref: false,
+            hook_prop: None,
+            trait_origin: None,
+            closure_rc: None,
+            call_alias: None,
+        }
+    }
+}
+
+pub struct Interp<'a> {
+    pub file: &'a str,
+    globals: Frame,
+    stack: Vec<Frame>,
+    pub functions: HashMap<String, Rc<FunctionDecl>>,
+    classes: HashMap<String, Rc<PhpClass>>,
+    /// Traits by name — their methods are copied into using classes.
+    pub traits: HashMap<String, Rc<ClassDecl>>,
+    /// Synthesized classes for direct `T::$s`/`T::m()` trait member
+    /// access (deprecated but functional in PHP) — one per trait so
+    /// statics share storage across accesses.
+    trait_statics: HashMap<String, Rc<PhpClass>>,
+    /// ClassDecls mid-registration — `is_a` ancestry checks during
+    /// signature verification resolve against these by name before the
+    /// class lands in `classes` (ret-covariance needs `B extends A`
+    /// while B is still linking).
+    linking: Vec<Rc<ClassDecl>>,
+    /// Class names whose autoloader callback is currently running —
+    /// Zend's in-linking guard: a re-entrant lookup of the same name
+    /// no-ops instead of recursing forever (autoload(D) → `D extends C`
+    /// → autoload(C) while C's own autoload is still in flight).
+    autoloading: std::collections::HashSet<String>,
+    /// Class lnames whose inheritance signature check deferred on a
+    /// compared type that was still loading — Zend's delayed variance
+    /// obligations, re-verified after each class finishes linking
+    /// (class_order_autoload*).
+    variance_obligations: Vec<String>,
+    /// Reentrancy guard: a class registering while the deferred pass
+    /// itself runs does not spawn a nested pass (error9 ordering — the
+    /// autoloaded class's own code runs before the recheck resumes).
+    in_variance_pass: bool,
+    /// Fatal raised inside an autoload a signature probe triggered —
+    /// the probe reports it to the checking context instead of
+    /// degrading to "could not check" (cascading variance failures
+    /// must surface the original fatal once).
+    sig_fatal: Option<PhpError>,
+    /// Decls currently mid-registration (register_class entered, the
+    /// decl not yet on `linking`/`classes`) — type probes resolve
+    /// them as class-likes so a check sees `C extends B` by name
+    /// while C's own dependencies still autoload
+    /// (class_order_autoload1; infinite_recursion).
+    declaring: Vec<Rc<ClassDecl>>,
+    /// (class, method) pairs of internal methods whose declared return
+    /// type is *tentative* — incompatible overrides get a Deprecated
+    /// notice, not a fatal (internal_parent/*).
+    tentative: HashSet<(String, String)>,
+    pub interfaces: HashMap<String, Rc<ClassDecl>>,
+    /// Declaration order of classes/interfaces/traits (lc names), for
+    /// get_declared_*().
+    pub decl_order: Vec<String>,
+    /// class_alias() display names (kind, lowercased alias) appended to
+    /// get_declared_{classes,interfaces,traits} output (Zend lists
+    /// aliases lowercased, right after real decls).
+    pub decl_aliases: Vec<(crate::ast::ClassKind, String)>,
+    /// Enum case singletons keyed `"cls\0case"` — `E::Foo === E::Foo`.
+    enum_cases: std::collections::HashMap<String, Value>,
+    /// Classes whose const initializers were already link-evaluated.
+    consts_linked: std::collections::HashSet<String>,
+    /// Top-level parentless classes registered by hoisting (early
+    /// binding); their decl stmt then no-ops (namespaces/ns_060).
+    early_bound_classes: HashSet<String>,
+    constants: HashMap<String, Value>,
+    /// Accumulated program output (display_errors prints to stdout under
+    /// CLI, and the PHPT harness merges streams via 2>&1).
+    pub out: Vec<u8>,
+    /// PHP CLI logs every diagnostic to stderr as `PHP <Level>: msg` when
+    /// log_errors is on (default); the harness merges stderr after stdout.
+    pub err_buf: String,
+    /// CLI file runs stream stdout/stderr to the real fds as they're
+    /// written so merged output keeps PHP's interleaved order; harness
+    /// contexts (phpun test, serve) leave this off and capture instead.
+    pub live_io: bool,
+    /// File a const-expr lexically belongs to while it's being evaluated
+    /// (prop/const/param defaults, attr args): __FILE__/__DIR__ bind to
+    /// the declaring file, not the accessing file.
+    decl_file_ctx: Option<String>,
+    /// Headers queued by header()/setcookie() — `phpun serve` emits them
+    /// into the HTTP response; CLI ignores them (like php-cli).
+    pub out_headers: Vec<String>,
+    /// Response status code set via http_response_code() or the third
+    /// arg of header() — serve mode reads it (200 default).
+    pub resp_code: i64,
+    /// Set by json_encode/json_decode for json_last_error().
+    pub last_json_error: i64,
+    /// Set by the preg_* builtins for preg_last_error().
+    pub last_preg_error: i64,
+    /// Raw request body for php://input — serve mode fills it.
+    pub php_input: std::rc::Rc<Vec<u8>>,
+    /// Real upload tmp paths created this request — is_uploaded_file()
+    /// and move_uploaded_file() check membership.
+    pub uploads: Vec<std::path::PathBuf>,
+    /// Output buffer stack for ob_*().
+    ob_stack: Vec<ObLevel>,
+    /// While >0, warnings are suppressed (implements `??`, `isset`,
+    /// `empty`, `@`).
+    silence: u32,
+    /// Cell returned by the last `&fn()` call (returnByReference tests).
+    last_ret_cell: Option<Cell>,
+    /// The last invoked function was declared `&name()` (returns by ref).
+    last_call_by_ref: bool,
+    /// Set just before invoking `[$closure,'__invoke']` so the callee
+    /// frame reports diagnostics as `Closure::__invoke` (zend).
+    pending_call_alias: Option<String>,
+    /// Insertion order of global vars (for $GLOBALS ordering).
+    globals_order: Vec<String>,
+    /// Shared PhpArray backing $GLOBALS — same cells as globals.vars.
+    globals_arr: Option<Rc<RefCell<PhpArray>>>,
+    /// Function-scoped static storage: fn name → var → cell.
+    pub(crate) statics: HashMap<String, HashMap<String, Cell>>,
+    /// Global static vars (`static` at top level).
+    global_statics: HashMap<String, Cell>,
+    /// static-decl sites per function scope (fn key → var → source line) —
+    /// PHP fatals on a same-scope redeclaration at a different site.
+    static_decls: HashMap<String, HashMap<String, usize>>,
+    /// include_once/require_once registry (canonical paths).
+    included: HashSet<std::path::PathBuf>,
+    /// Pending exception carried across an Err(Throw) return.
+    pending_exception: Option<Value>,
+    /// Live call stack (user + builtin) for getTrace() snapshots.
+    call_trace: Vec<TraceFrame>,
+    /// Pending fatal error message for exceptions raised as PhpError.
+    res_counter: u64,
+    shutdown_fns: Vec<(Value, Vec<Cell>)>,
+    error_handler: Option<Value>,
+    error_handler_stack: Vec<Value>,
+    exception_handler_stack: Vec<Value>,
+    /// error_reporting() level mask (E_* bits).
+    error_level: i64,
+    /// putenv() overrides read back by getenv() (no real process-env mutation).
+    env_overrides: HashMap<String, String>,
+    /// Raw argv entries after the script path, for `getopt()`.
+    pub script_args: Vec<String>,
+    exception_handler: Option<Value>,
+    in_handler: bool,
+    /// Current line estimate for error messages (best-effort).
+    pub cur_line: usize,
+    /// Active generator body's yield collector — `Expr::Yield` pushes
+    /// (key, value) here while a generator function's body runs.
+    gen_sink: Option<Rc<RefCell<Vec<crate::value::GenItem>>>>,
+    /// send() queue feeding `yield`-expr results in the running body.
+    gen_sends: std::collections::VecDeque<Value>,
+    /// Auto-key counter for keyless `yield $v` — counts keyless yields
+    /// only (explicit keys and `yield from` items don't advance it).
+    gen_auto: i64,
+    /// The generator whose body is currently running — output produced
+    /// after a yield suspends is tagged with that yield's item index
+    /// and buffered on the GenState until the consumer resumes past
+    /// it (closure_call_leak_with_exception).
+    gen_run_state: Option<Rc<RefCell<crate::value::GenState>>>,
+    /// Declaring class of the method about to be invoked (set by
+    /// invoke_method, consumed by invoke_fn to fill Frame::decl_class).
+    pending_decl_class: Option<Rc<PhpClass>>,
+    /// Called-scope (LSB) for the next invoke_fn frame — set by
+    /// invoke_method/static_invoke, consumed like pending_decl_class.
+    pending_called_class: Option<Rc<PhpClass>>,
+    /// (object id, prop, is_get, owner) whose hook is about to run —
+    /// consumed by invoke_fn to fill Frame::hook_prop.
+    pending_hook_prop: Option<(u64, String, bool, String)>,
+    /// Live object handles for PHP's var_dump `#N` id: the lowest freed
+    /// slot is reused, matching Zend's object store recycling.
+    obj_handles: Vec<ObjHandle>,
+    /// Per-callsite unqualified fn resolution cache — Zend resolves
+    /// `ns\f -> f` once per call site (constexpr/namespace_004).
+    fcc_fn_cache: HashMap<(String, String, String), Option<String>>,
+    /// Objects whose __destruct already ran (shutdown pass). The Rc
+    /// is pinned so a later object's allocation can't reuse the
+    /// address and collide with an entry (bug74053).
+    destructed: HashMap<usize, Rc<RefCell<PhpObject>>>,
+    /// `new` temporaries of the running expression statement — swept
+    /// at statement end so unowned objects destruct promptly
+    /// (bug29368_2/_3).
+    expr_temps: Vec<Rc<RefCell<PhpObject>>>,
+    /// Frame popped inside `bind_and_run_inner`, handed off to the
+    /// `bind_and_run` wrapper which runs its deferred __destruct
+    /// pass after the call-trace pop (bug52361).
+    last_popped_frame: Option<Frame>,
+    /// Container addresses currently being var_dumped — a re-entrant
+    /// dump prints `*RECURSION*` (closure_034/035).
+    pub dump_stack: std::collections::HashSet<usize>,
+    /// Nonzero while a callable is invoked from inside a builtin's
+    /// internals (ob handlers) — marks its trace site internal-function.
+    internal_cb: u32,
+    /// Nonzero while evaluating a compile-time constant expression
+    /// (const/class-const defaults, prop/param defaults): `...`-FCC and
+    /// `self`/`parent` resolution follow const-expr rules.
+    in_const_expr: u32,
+    /// Nonzero while a class-init const expr (prop default, static init,
+    /// class const) is being evaluated — errors get a synthetic
+    /// `[constant expression]` trace frame; top-level `const` decls
+    /// don't (constexpr/error_*).
+    class_const_ctx: u32,
+    /// The class whose const/prop initializer is being evaluated —
+    /// `self`/`parent` inside it bind to this class, not the caller.
+    const_self: Option<Rc<PhpClass>>,
+    /// spl_autoload_register() callbacks, in registration order.
+    pub autoload_fns: Vec<Value>,
+    /// File currently executing — include resolution uses its directory
+    /// (PHP checks include_path, then the calling file's dir, then cwd).
+    cur_file: String,
+    /// Files that ran `declare(strict_types=1)` — scalar arg/prop/return
+    /// coercion is off for code executing inside them.
+    strict_files: std::collections::HashSet<String>,
+    /// Cells backing declared-typed props, keyed by their Rc pointer —
+    /// writes *through a reference* to a typed slot stay checked
+    /// (typed_properties_045). The stored clone keeps the slot alive so
+    /// the pointer key stays unique.
+    pub typed_slots: std::collections::HashMap<usize, (Cell, Vec<String>, String, String)>,
+    /// Additional typed-prop owners of a shared ref cell (the
+    /// `typed_slots` entry holds the first) — `union_types/prop_ref_assign`.
+    pub slot_owners: std::collections::HashMap<usize, Vec<SlotOwner>>,
+    /// The running intersection of every bound owner's declared type —
+    /// `typed_slots` keeps the holder's declared type for messages.
+    pub slot_merged: std::collections::HashMap<usize, Vec<String>>,
+    /// Where each typed cell came from: a prop slot stays a prop slot
+    /// even while aliased — the rejecting owner is reported as
+    /// "Cannot assign X to property" only for prop-born cells
+    /// (typed_properties_034 vs _078).
+    pub slot_anchor: std::collections::HashMap<usize, SlotAnchor>,
+    /// Cells reached through a `=&` bind / by-ref fetch — Zend
+    /// IS_REFERENCE zvals. Write-through errors say "a reference held
+    /// by property"; plain prop slots say "property"
+    /// (typed_properties_034 first vs second foo() call).
+    pub ref_cells: std::collections::HashSet<usize>,
+    /// Zend's per-op magic-property guards, keyed
+    /// (object-ptr, kind, prop-name): while `__get($o,$p)` runs, an
+    /// access to `$o->$p` bypasses magic and hits real storage
+    /// (bug63462/bug66609 — no infinite recursion). kinds: 0 get,
+    /// 1 set, 2 isset, 3 unset.
+    pub magic_guards: std::collections::HashSet<(usize, u8, String)>,
+    /// Prop cells bound into an ArrayIterator whose decl is readonly —
+    /// acquiring a `&` on one is "Cannot acquire reference to readonly
+    /// property C::$p" (typed_properties_115). Value = (class, prop).
+    pub readonly_cells: std::collections::HashMap<usize, (String, String)>,
+    /// Ptr of a typed prop slot eval_cell materialized to `null` just
+    /// now — a rejected array auto-init must leave the prop
+    /// uninitialized again (typed_properties_083).
+    last_fresh_cell: Option<usize>,
+    /// Interfaces registered by the builtin-class table — their method
+    /// signatures carry *tentative* return types: implementations may
+    /// declare any return type (typed_properties_065).
+    builtin_ifaces: std::collections::HashSet<String>,
+    /// Implicit-nullable deprecations already emitted (function
+    /// declarations evaluate at both collect and `Stmt::Function`
+    /// time — Zend compiles once, so each param warns once).
+    dep_seen: std::collections::HashSet<String>,
+    /// File the last `fail()` was raised in (uncaught-print attribution
+    /// for engine errors — `self.file` is always the entry script).
+    last_err_file: String,
+    /// Rendered arg list of the current `assert()` call — the
+    /// AssertionError message shows `assert(<args>)` as written
+    /// (named_params/assert's `assert(assertion: false)`).
+    pub(crate) assert_src: String,
+    /// Closure captures staged for the next invoke_fn_run — a
+    /// yield-bearing closure's `use` vars bind when its generator body
+    /// finally starts (iterable_003).
+    pending_gen_captures: Vec<(String, Cell, bool)>,
+    /// Bytes emitted so far — memory_limit bookkeeping.
+    pub mem_used: u64,
+    /// Size of the last emit — the 'tried to allocate' figure.
+    mem_last: u64,
+    /// Raised once the memory_limit fatal fired — buffers are dropped
+    /// at shutdown instead of flushed (bug45392).
+    pub mem_exceeded: bool,
+    /// Execution deadline set by set_time_limit/hard_timeout (045).
+    deadline: Option<std::time::Instant>,
+    /// Seconds figure for the 'Maximum execution time' message.
+    deadline_secs: i64,
+    /// `-d` ini settings (e.g. short_open_tag=on).
+    pub ini: HashMap<String, String>,
+}
+
+/// Where a typed-slot owner lives — pruned when the named prop no
+/// longer points at the shared cell (static rebind 082, unset, dead
+/// object 094).
+#[derive(Clone)]
+pub enum SlotAnchor {
+    /// Object prop: weak object ref + the props-map slot key.
+    Obj(std::rc::Weak<RefCell<PhpObject>>, String),
+    /// Static prop: declaring class name + prop name.
+    Statics(String, String),
+    /// Unverifiable origin — kept unconditionally.
+    None,
+}
+
+/// One typed-prop owner of a shared cell: declared type members,
+/// declaring class name, prop name, and the anchor proving the owner
+/// still points at the cell.
+pub type SlotOwner = (Vec<String>, String, String, SlotAnchor);
+
+/// One output-buffer level (ob_start) with its optional handler.
+pub struct ObLevel {
+    pub buf: Vec<u8>,
+    pub handler: Option<Value>,
+    /// Set after the handler's first invocation — PHP's
+    /// PHP_OUTPUT_HANDLER_START bit is only passed once (bug24951).
+    pub started: bool,
+}
+
+/// Result of a top-level program run.
+pub struct RunResult {
+    pub exit_code: i32,
+    /// Set when a fatal error terminated execution.
+    pub fatal: Option<PhpError>,
+}
+
+impl<'a> Interp<'a> {
+    pub fn new(file: &'a str) -> Self {
+        let mut constants = HashMap::new();
+        constants.insert("PHP_EOL".into(), Value::str("\n"));
+        constants.insert("PHP_VERSION".into(), Value::str("8.5.11-phpun"));
+        constants.insert("PHP_MAJOR_VERSION".into(), Value::Int(8));
+        constants.insert("PHP_MINOR_VERSION".into(), Value::Int(5));
+        constants.insert("PHP_RELEASE_VERSION".into(), Value::Int(11));
+        constants.insert("PHP_EXTRA_VERSION".into(), Value::str(""));
+        constants.insert("PHP_VERSION_ID".into(), Value::Int(80511));
+        constants.insert("PHP_OS".into(), Value::str("Linux"));
+        constants.insert("PHP_OS_FAMILY".into(), Value::str("Linux"));
+        constants.insert("PHP_SAPI".into(), Value::str("cli"));
+        {
+            let exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "phpun".to_string());
+            let bindir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
+                .unwrap_or_default();
+            constants.insert("PHP_BINARY".into(), Value::str(&*exe));
+            constants.insert("PHP_BINDIR".into(), Value::str(&*bindir));
+        }
+        for (name, which) in [("STDIN", 0u8), ("STDOUT", 1u8), ("STDERR", 2u8)] {
+            constants.insert(
+                name.into(),
+                Value::Resource(Rc::new(RefCell::new(crate::value::PhpResource::Stdio {
+                    id: which as u64 + 1,
+                    which,
+                }))),
+            );
+        }
+        constants.insert("DIRECTORY_SEPARATOR".into(), Value::str("/"));
+        constants.insert("PATH_SEPARATOR".into(), Value::str(":"));
+        constants.insert("SCANDIR_SORT_ASCENDING".into(), Value::Int(0));
+        constants.insert("SCANDIR_SORT_DESCENDING".into(), Value::Int(1));
+        constants.insert("SCANDIR_SORT_NONE".into(), Value::Int(2));
+        // pathinfo() component selectors.
+        constants.insert("PATHINFO_DIRNAME".into(), Value::Int(1));
+        constants.insert("PATHINFO_BASENAME".into(), Value::Int(2));
+        constants.insert("PATHINFO_EXTENSION".into(), Value::Int(4));
+        constants.insert("PATHINFO_FILENAME".into(), Value::Int(8));
+        constants.insert("PATHINFO_ALL".into(), Value::Int(15));
+        // glob() flags (glibc values, as on Linux PHP builds).
+        constants.insert("GLOB_MARK".into(), Value::Int(8));
+        constants.insert("GLOB_NOSORT".into(), Value::Int(32));
+        constants.insert("GLOB_NOCHECK".into(), Value::Int(16));
+        constants.insert("GLOB_NOESCAPE".into(), Value::Int(4096));
+        constants.insert("GLOB_BRACE".into(), Value::Int(128));
+        constants.insert("GLOB_ONLYDIR".into(), Value::Int(1 << 30));
+        constants.insert("GLOB_ERR".into(), Value::Int(4));
+        // flock/file flags.
+        constants.insert("LOCK_SH".into(), Value::Int(1));
+        constants.insert("LOCK_EX".into(), Value::Int(2));
+        constants.insert("LOCK_NB".into(), Value::Int(4));
+        constants.insert("LOCK_UN".into(), Value::Int(3));
+        constants.insert("FILE_USE_INCLUDE_PATH".into(), Value::Int(1));
+        constants.insert("FILE_NO_DEFAULT_CONTEXT".into(), Value::Int(16));
+        constants.insert("FILE_APPEND".into(), Value::Int(8));
+        constants.insert("FILE_IGNORE_NEW_LINES".into(), Value::Int(4));
+        constants.insert("FILE_SKIP_EMPTY_LINES".into(), Value::Int(2));
+        // Reported as the engine's target PCRE2 level — feature checks
+        // like symfony's `>= 10.39` gate on this, not the vendored lib.
+        constants.insert("PCRE_VERSION".into(), Value::str("10.49 2026-09-28"));
+        constants.insert("INI_USER".into(), Value::Int(1));
+        constants.insert("INI_PERDIR".into(), Value::Int(2));
+        constants.insert("INI_SYSTEM".into(), Value::Int(4));
+        constants.insert("INI_ALL".into(), Value::Int(7));
+        constants.insert("STR_PAD_RIGHT".into(), Value::Int(1));
+        constants.insert("STR_PAD_LEFT".into(), Value::Int(0));
+        constants.insert("STR_PAD_BOTH".into(), Value::Int(2));
+        constants.insert("MB_CASE_UPPER".into(), Value::Int(0));
+        constants.insert("MB_CASE_LOWER".into(), Value::Int(1));
+        constants.insert("MB_CASE_TITLE".into(), Value::Int(2));
+        constants.insert("MB_CASE_FOLD".into(), Value::Int(3));
+        constants.insert("MB_CASE_UPPER_SIMPLE".into(), Value::Int(4));
+        constants.insert("MB_CASE_LOWER_SIMPLE".into(), Value::Int(5));
+        constants.insert("MB_CASE_TITLE_SIMPLE".into(), Value::Int(6));
+        constants.insert("MB_CASE_FOLD_SIMPLE".into(), Value::Int(7));
+        constants.insert("MB_OVERLOAD_MAIL".into(), Value::Int(1));
+        constants.insert("MB_OVERLOAD_STRING".into(), Value::Int(2));
+        constants.insert("MB_OVERLOAD_REGEX".into(), Value::Int(4));
+        constants.insert("MB_ONIGURUMA_VERSION".into(), Value::str("6.9.10"));
+        constants.insert("PHP_INT_MAX".into(), Value::Int(i64::MAX));
+        constants.insert("PHP_INT_MIN".into(), Value::Int(i64::MIN));
+        constants.insert("PHP_INT_SIZE".into(), Value::Int(8));
+        constants.insert("PHP_FLOAT_EPSILON".into(), Value::Float(f64::EPSILON));
+        constants.insert("PHP_FLOAT_MAX".into(), Value::Float(f64::MAX));
+        constants.insert("PHP_FLOAT_MIN".into(), Value::Float(f64::MIN_POSITIVE));
+        constants.insert("NAN".into(), Value::Float(f64::NAN));
+        constants.insert("INF".into(), Value::Float(f64::INFINITY));
+        constants.insert("M_PI".into(), Value::Float(std::f64::consts::PI));
+        constants.insert("PHP_EOL".into(), Value::str("\n"));
+        constants.insert("E_ERROR".into(), Value::Int(1));
+        constants.insert("E_WARNING".into(), Value::Int(2));
+        constants.insert("E_PARSE".into(), Value::Int(4));
+        constants.insert("E_NOTICE".into(), Value::Int(8));
+        constants.insert("E_DEPRECATED".into(), Value::Int(8192));
+        constants.insert("E_ALL".into(), Value::Int(32767));
+        constants.insert("E_STRICT".into(), Value::Int(2048));
+        constants.insert("E_USER_ERROR".into(), Value::Int(256));
+        constants.insert("E_USER_WARNING".into(), Value::Int(512));
+        constants.insert("E_USER_NOTICE".into(), Value::Int(1024));
+        constants.insert("E_USER_DEPRECATED".into(), Value::Int(16384));
+        constants.insert("PHP_OUTPUT_HANDLER_START".into(), Value::Int(1));
+        constants.insert("PHP_OUTPUT_HANDLER_WRITE".into(), Value::Int(0));
+        constants.insert("PHP_OUTPUT_HANDLER_CONT".into(), Value::Int(0));
+        constants.insert("PHP_OUTPUT_HANDLER_CLEAN".into(), Value::Int(2));
+        constants.insert("PHP_OUTPUT_HANDLER_FLUSH".into(), Value::Int(4));
+        constants.insert("PHP_OUTPUT_HANDLER_FINAL".into(), Value::Int(8));
+        constants.insert("PHP_OUTPUT_HANDLER_END".into(), Value::Int(8));
+        constants.insert("PHP_OUTPUT_HANDLER_CLEANABLE".into(), Value::Int(16));
+        constants.insert("PHP_OUTPUT_HANDLER_FLUSHABLE".into(), Value::Int(32));
+        constants.insert("PHP_OUTPUT_HANDLER_REMOVABLE".into(), Value::Int(64));
+        constants.insert("PHP_OUTPUT_HANDLER_STDFLAGS".into(), Value::Int(112));
+        // parse_url() component selectors.
+        constants.insert("PHP_URL_SCHEME".into(), Value::Int(0));
+        constants.insert("PHP_URL_HOST".into(), Value::Int(1));
+        constants.insert("PHP_URL_PORT".into(), Value::Int(2));
+        constants.insert("PHP_URL_USER".into(), Value::Int(3));
+        constants.insert("PHP_URL_PASS".into(), Value::Int(4));
+        constants.insert("PHP_URL_PATH".into(), Value::Int(5));
+        constants.insert("PHP_URL_QUERY".into(), Value::Int(6));
+        constants.insert("PHP_URL_FRAGMENT".into(), Value::Int(7));
+        constants.insert("PREG_PATTERN_ORDER".into(), Value::Int(1));
+        constants.insert("PREG_SET_ORDER".into(), Value::Int(2));
+        constants.insert("PREG_OFFSET_CAPTURE".into(), Value::Int(256));
+        constants.insert("PREG_UNMATCHED_AS_NULL".into(), Value::Int(512));
+        constants.insert("PREG_SPLIT_NO_EMPTY".into(), Value::Int(1));
+        constants.insert("PREG_SPLIT_DELIM_CAPTURE".into(), Value::Int(2));
+        constants.insert("PREG_SPLIT_OFFSET_CAPTURE".into(), Value::Int(4));
+        constants.insert("PREG_GREP_INVERT".into(), Value::Int(1));
+        constants.insert("PREG_NO_ERROR".into(), Value::Int(0));
+        constants.insert("PREG_INTERNAL_ERROR".into(), Value::Int(1));
+        constants.insert("PREG_BACKTRACK_LIMIT_ERROR".into(), Value::Int(2));
+        constants.insert("PREG_RECURSION_LIMIT_ERROR".into(), Value::Int(3));
+        constants.insert("PREG_BAD_UTF8_ERROR".into(), Value::Int(4));
+        constants.insert("PREG_BAD_UTF8_OFFSET_ERROR".into(), Value::Int(5));
+        constants.insert("PREG_JIT_STACKLIMIT_ERROR".into(), Value::Int(6));
+        constants.insert("PREG_BAD_MODE_LIMIT_ERROR".into(), Value::Int(7));
+        // ext/standard sort flags (used by sort-family builtins and
+        // symfony console's command sorting).
+        constants.insert("SORT_REGULAR".into(), Value::Int(0));
+        constants.insert("SORT_NUMERIC".into(), Value::Int(1));
+        constants.insert("SORT_STRING".into(), Value::Int(2));
+        constants.insert("SORT_DESC".into(), Value::Int(3));
+        constants.insert("SORT_ASC".into(), Value::Int(4));
+        constants.insert("SORT_LOCALE_STRING".into(), Value::Int(5));
+        constants.insert("SORT_NATURAL".into(), Value::Int(6));
+        constants.insert("SORT_FLAG_CASE".into(), Value::Int(8));
+        // ext/filter.
+        constants.insert("FILTER_VALIDATE_INT".into(), Value::Int(257));
+        constants.insert("FILTER_VALIDATE_BOOLEAN".into(), Value::Int(258));
+        constants.insert("FILTER_VALIDATE_BOOL".into(), Value::Int(258));
+        constants.insert("FILTER_VALIDATE_FLOAT".into(), Value::Int(259));
+        constants.insert("FILTER_VALIDATE_REGEXP".into(), Value::Int(272));
+        constants.insert("FILTER_VALIDATE_URL".into(), Value::Int(273));
+        constants.insert("FILTER_VALIDATE_EMAIL".into(), Value::Int(274));
+        constants.insert("FILTER_VALIDATE_IP".into(), Value::Int(275));
+        constants.insert("FILTER_VALIDATE_MAC".into(), Value::Int(276));
+        constants.insert("FILTER_VALIDATE_DOMAIN".into(), Value::Int(277));
+        constants.insert("FILTER_DEFAULT".into(), Value::Int(516));
+        constants.insert("FILTER_UNSAFE_RAW".into(), Value::Int(516));
+        constants.insert("FILTER_SANITIZE_ENCODED".into(), Value::Int(514));
+        constants.insert("FILTER_SANITIZE_SPECIAL_CHARS".into(), Value::Int(515));
+        constants.insert("FILTER_SANITIZE_EMAIL".into(), Value::Int(517));
+        constants.insert("FILTER_SANITIZE_URL".into(), Value::Int(518));
+        constants.insert("FILTER_SANITIZE_NUMBER_INT".into(), Value::Int(519));
+        constants.insert("FILTER_SANITIZE_NUMBER_FLOAT".into(), Value::Int(520));
+        constants.insert("FILTER_SANITIZE_FULL_SPECIAL_CHARS".into(), Value::Int(522));
+        constants.insert("FILTER_SANITIZE_ADD_SLASHES".into(), Value::Int(523));
+        constants.insert("FILTER_CALLBACK".into(), Value::Int(1024));
+        constants.insert("FILTER_REQUIRE_ARRAY".into(), Value::Int(16777216));
+        constants.insert("FILTER_REQUIRE_SCALAR".into(), Value::Int(33554432));
+        constants.insert("FILTER_FORCE_ARRAY".into(), Value::Int(67108864));
+        constants.insert("FILTER_NULL_ON_FAILURE".into(), Value::Int(134217728));
+        constants.insert("FILTER_FLAG_ALLOW_OCTAL".into(), Value::Int(1));
+        constants.insert("FILTER_FLAG_ALLOW_HEX".into(), Value::Int(2));
+        constants.insert("FILTER_FLAG_STRIP_LOW".into(), Value::Int(4));
+        constants.insert("FILTER_FLAG_STRIP_HIGH".into(), Value::Int(8));
+        constants.insert("FILTER_FLAG_ENCODE_LOW".into(), Value::Int(16));
+        constants.insert("FILTER_FLAG_ENCODE_HIGH".into(), Value::Int(32));
+        constants.insert("FILTER_FLAG_ENCODE_AMP".into(), Value::Int(64));
+        constants.insert("FILTER_FLAG_NO_ENCODE_QUOTES".into(), Value::Int(128));
+        constants.insert("FILTER_FLAG_EMPTY_STRING_NULL".into(), Value::Int(256));
+        constants.insert("FILTER_FLAG_STRIP_BACKTICK".into(), Value::Int(512));
+        constants.insert("FILTER_FLAG_ALLOW_FRACTION".into(), Value::Int(4096));
+        constants.insert("FILTER_FLAG_ALLOW_THOUSAND".into(), Value::Int(8192));
+        constants.insert("FILTER_FLAG_ALLOW_SCIENTIFIC".into(), Value::Int(16384));
+        constants.insert("FILTER_FLAG_PATH_REQUIRED".into(), Value::Int(262144));
+        constants.insert("FILTER_FLAG_QUERY_REQUIRED".into(), Value::Int(524288));
+        constants.insert("FILTER_FLAG_IPV4".into(), Value::Int(1048576));
+        constants.insert("FILTER_FLAG_IPV6".into(), Value::Int(2097152));
+        constants.insert("FILTER_FLAG_HOSTNAME".into(), Value::Int(1048576));
+        constants.insert("FILTER_FLAG_EMAIL_UNICODE".into(), Value::Int(1048576));
+        constants.insert("FILTER_FLAG_NO_RES_RANGE".into(), Value::Int(4194304));
+        constants.insert("FILTER_FLAG_NO_PRIV_RANGE".into(), Value::Int(8388608));
+        constants.insert("FILTER_FLAG_GLOBAL_RANGE".into(), Value::Int(536870912));
+        // ext-json.
+        constants.insert("JSON_ERROR_NONE".into(), Value::Int(0));
+        constants.insert("JSON_ERROR_DEPTH".into(), Value::Int(1));
+        constants.insert("JSON_ERROR_STATE_MISMATCH".into(), Value::Int(2));
+        constants.insert("JSON_ERROR_CTRL_CHAR".into(), Value::Int(3));
+        constants.insert("JSON_ERROR_SYNTAX".into(), Value::Int(4));
+        constants.insert("JSON_ERROR_UTF8".into(), Value::Int(5));
+        constants.insert("JSON_ERROR_RECURSION".into(), Value::Int(6));
+        constants.insert("JSON_ERROR_INF_OR_NAN".into(), Value::Int(7));
+        constants.insert("JSON_ERROR_UNSUPPORTED_TYPE".into(), Value::Int(8));
+        constants.insert("JSON_HEX_TAG".into(), Value::Int(1));
+        constants.insert("JSON_HEX_AMP".into(), Value::Int(2));
+        constants.insert("JSON_HEX_APOS".into(), Value::Int(4));
+        constants.insert("JSON_HEX_QUOT".into(), Value::Int(8));
+        constants.insert("JSON_FORCE_OBJECT".into(), Value::Int(16));
+        constants.insert("JSON_NUMERIC_CHECK".into(), Value::Int(32));
+        constants.insert("JSON_UNESCAPED_SLASHES".into(), Value::Int(64));
+        constants.insert("JSON_PRETTY_PRINT".into(), Value::Int(128));
+        constants.insert("JSON_UNESCAPED_UNICODE".into(), Value::Int(256));
+        constants.insert("JSON_PARTIAL_OUTPUT_ON_ERROR".into(), Value::Int(512));
+        constants.insert("JSON_PRESERVE_ZERO_FRACTION".into(), Value::Int(1024));
+        constants.insert("JSON_UNESCAPED_LINE_TERMINATORS".into(), Value::Int(2048));
+        constants.insert("JSON_INVALID_UTF8_IGNORE".into(), Value::Int(1048576));
+        constants.insert("JSON_INVALID_UTF8_SUBSTITUTE".into(), Value::Int(2097152));
+        constants.insert("JSON_THROW_ON_ERROR".into(), Value::Int(4194304));
+        constants.insert("JSON_OBJECT_AS_ARRAY".into(), Value::Int(1));
+        constants.insert("JSON_BIGINT_AS_STRING".into(), Value::Int(2));
+        constants.insert("E_RECOVERABLE_ERROR".into(), Value::Int(4096));
+        constants.insert("E_CORE_ERROR".into(), Value::Int(16));
+        constants.insert("E_CORE_WARNING".into(), Value::Int(32));
+        constants.insert("E_COMPILE_ERROR".into(), Value::Int(64));
+        constants.insert("E_COMPILE_WARNING".into(), Value::Int(128));
+        // Locale categories (glibc values).
+        constants.insert("LC_CTYPE".into(), Value::Int(0));
+        constants.insert("LC_NUMERIC".into(), Value::Int(1));
+        constants.insert("LC_TIME".into(), Value::Int(2));
+        constants.insert("LC_COLLATE".into(), Value::Int(3));
+        constants.insert("LC_MONETARY".into(), Value::Int(4));
+        constants.insert("LC_MESSAGES".into(), Value::Int(5));
+        constants.insert("LC_ALL".into(), Value::Int(6));
+        let mut it = Self {
+            file,
+            globals: Frame::new(String::new()),
+            last_ret_cell: None,
+            last_call_by_ref: false,
+            pending_call_alias: None,
+            globals_order: Vec::new(),
+            globals_arr: None,
+            stack: Vec::new(),
+            functions: HashMap::new(),
+            classes: HashMap::new(),
+            traits: HashMap::new(),
+            trait_statics: HashMap::new(),
+            linking: Vec::new(),
+            autoloading: std::collections::HashSet::new(),
+            variance_obligations: Vec::new(),
+            in_variance_pass: false,
+            sig_fatal: None,
+            declaring: Vec::new(),
+            tentative: {
+                let mut t = HashSet::new();
+                t.insert(("datetimezone".into(), "listidentifiers".into()));
+                t
+            },
+            interfaces: HashMap::new(),
+            decl_order: Vec::new(),
+            enum_cases: std::collections::HashMap::new(),
+            consts_linked: std::collections::HashSet::new(),
+            decl_aliases: Vec::new(),
+            early_bound_classes: HashSet::new(),
+            constants,
+            out: Vec::new(),
+            err_buf: String::new(),
+            live_io: false,
+            decl_file_ctx: None,
+            out_headers: Vec::new(),
+            resp_code: 200,
+            last_json_error: 0,
+            last_preg_error: 0,
+            php_input: std::rc::Rc::new(Vec::new()),
+            uploads: Vec::new(),
+            ob_stack: Vec::new(),
+            silence: 0,
+            statics: HashMap::new(),
+            global_statics: HashMap::new(),
+            static_decls: HashMap::new(),
+            included: HashSet::new(),
+            pending_exception: None,
+            call_trace: Vec::new(),
+            res_counter: 0,
+            shutdown_fns: Vec::new(),
+            error_handler: None,
+            error_handler_stack: Vec::new(),
+            exception_handler_stack: Vec::new(),
+            error_level: 32767,
+            env_overrides: HashMap::new(),
+            script_args: Vec::new(),
+            exception_handler: None,
+            in_handler: false,
+            cur_line: 1,
+            gen_sink: None,
+            pending_gen_captures: Vec::new(),
+            gen_sends: std::collections::VecDeque::new(),
+            gen_auto: 0,
+            gen_run_state: None,
+            pending_decl_class: None,
+            pending_called_class: None,
+            pending_hook_prop: None,
+            in_const_expr: 0,
+            class_const_ctx: 0,
+            const_self: None,
+            autoload_fns: Vec::new(),
+            obj_handles: Vec::new(),
+            fcc_fn_cache: HashMap::new(),
+            destructed: HashMap::new(),
+            expr_temps: Vec::new(),
+            last_popped_frame: None,
+            dump_stack: std::collections::HashSet::new(),
+            internal_cb: 0,
+            cur_file: file.to_string(),
+            strict_files: std::collections::HashSet::new(),
+            typed_slots: std::collections::HashMap::new(),
+            slot_owners: std::collections::HashMap::new(),
+            slot_merged: std::collections::HashMap::new(),
+            slot_anchor: std::collections::HashMap::new(),
+            ref_cells: std::collections::HashSet::new(),
+            magic_guards: std::collections::HashSet::new(),
+            readonly_cells: std::collections::HashMap::new(),
+            last_fresh_cell: None,
+            builtin_ifaces: std::collections::HashSet::new(),
+            dep_seen: std::collections::HashSet::new(),
+            last_err_file: String::new(),
+            assert_src: String::new(),
+            mem_used: 0,
+            mem_last: 0,
+            mem_exceeded: false,
+            deadline: None,
+            deadline_secs: 0,
+            ini: HashMap::new(),
+        };
+        // Auto-globals. PHP's $_SERVER carries env + script metadata;
+        // the request arrays start empty (bug24908 counts on non-empty
+        // $_SERVER inside __destruct).
+        {
+            let mut server = PhpArray::new();
+            for (k, v) in std::env::vars() {
+                server.set(ArrKey::Str(k.into()), Value::str(v));
+            }
+            server.set(ArrKey::Str("SCRIPT_FILENAME".into()), Value::str(file));
+            server.set(ArrKey::Str("PHP_SELF".into()), Value::str(file));
+            server.set(ArrKey::Str("SCRIPT_NAME".into()), Value::str(file));
+            server.set(ArrKey::Str("SERVER_NAME".into()), Value::str("localhost"));
+            server.set(
+                ArrKey::Str("SERVER_SOFTWARE".into()),
+                Value::str("phpun/0.0.0"),
+            );
+            server.set(
+                ArrKey::Str("SERVER_PROTOCOL".into()),
+                Value::str("HTTP/1.1"),
+            );
+            server.set(ArrKey::Str("REQUEST_METHOD".into()), Value::str("GET"));
+            let mut argv = PhpArray::new();
+            argv.push(Value::str(file));
+            server.set(
+                ArrKey::Str("argv".into()),
+                Value::Array(Rc::new(RefCell::new(argv))),
+            );
+            server.set(ArrKey::Str("argc".into()), Value::Int(1));
+            it.globals.vars.insert(
+                "_SERVER".into(),
+                cell(Value::Array(Rc::new(RefCell::new(server)))),
+            );
+            let mut env = PhpArray::new();
+            for (k, v) in std::env::vars() {
+                env.set(ArrKey::Str(k.into()), Value::str(v));
+            }
+            it.globals.vars.insert(
+                "_ENV".into(),
+                cell(Value::Array(Rc::new(RefCell::new(env)))),
+            );
+            for n in ["_GET", "_POST", "_COOKIE", "_FILES", "_REQUEST", "_SESSION"] {
+                it.globals.vars.insert(
+                    n.into(),
+                    cell(Value::Array(Rc::new(RefCell::new(PhpArray::new())))),
+                );
+            }
+            let mut argv = PhpArray::new();
+            argv.push(Value::str(file));
+            it.globals.vars.insert(
+                "argv".into(),
+                cell(Value::Array(Rc::new(RefCell::new(argv)))),
+            );
+            it.globals.vars.insert("argc".into(), cell(Value::Int(1)));
+        }
+        it.globals.file = file.to_string();
+        it.register_builtin_classes();
+        // SPL iterator wrappers in plain PHP — the delegation layer
+        // (OuterIterator, IteratorIterator, FilterIterator,
+        // RecursiveIteratorIterator, AppendIterator) needs only
+        // Iterator method calls, so a prelude keeps the engine small.
+        let _ = it.eval_code(SPL_ITERATOR_PRELUDE);
+        it
+    }
+
+    /// `phpun file.php a b c` — CLI args after the script name land in
+    /// `$argv`/`$argc`/`$_SERVER['argv']` like reference php.
+    pub fn set_script_args(&mut self, script: &str, args: &[String]) {
+        self.script_args = args.to_vec();
+        let mut argv = PhpArray::new();
+        argv.push(Value::str(script));
+        for a in args {
+            argv.push(Value::str(a));
+        }
+        let argc = argv.len() as i64;
+        let argv_v = Value::Array(Rc::new(RefCell::new(argv)));
+        if let Some(c) = self.globals.vars.get("_SERVER") {
+            if let Value::Array(srv) = &*c.borrow() {
+                srv.borrow_mut()
+                    .set(ArrKey::Str("argv".into()), argv_v.clone());
+                srv.borrow_mut()
+                    .set(ArrKey::Str("argc".into()), Value::Int(argc));
+            }
+        }
+        self.globals.vars.insert("argv".into(), cell(argv_v));
+        self.globals
+            .vars
+            .insert("argc".into(), cell(Value::Int(argc)));
+    }
+
+    /// eval_const for a decl-attached expr (prop/const/param default):
+    /// __FILE__/__DIR__ inside resolve to the declaring file.
+    fn eval_decl_const(&mut self, e: &Expr, decl_file: &str) -> Result<Value, PhpError> {
+        if decl_file.is_empty() {
+            return self.eval_const(e);
+        }
+        let old = self.decl_file_ctx.replace(decl_file.to_string());
+        let r = self.eval_const(e);
+        self.decl_file_ctx = old;
+        r
+    }
+
+    /// PHP binds a compilation unit's unconditional top-level function
+    /// decls before executing it (bug23279's later-declared handler).
+    fn hoist_funcs(&mut self, stmts: &[Stmt]) {
+        for s in stmts {
+            match s {
+                Stmt::Function(d) => {
+                    let _ = self.decl_type_checks(&d.name, d, None);
+                    let mut d = d.clone();
+                    d.file = self.cur_file.clone();
+                    self.functions.insert(d.name.to_lowercase(), Rc::new(d));
+                }
+                // `namespace X { stmts }` parses as
+                // Block[Namespace, Block[stmts]] — decls inside are still
+                // unconditional top-level for early binding (ns_085).
+                Stmt::Block(v) if matches!(v.first(), Some(Stmt::Namespace(_))) => {
+                    for s in &v[1..] {
+                        if let Stmt::Block(inner) = s {
+                            self.hoist_funcs(inner);
+                        }
+                    }
+                }
+                // Early binding: unconditional top-level classes with no
+                // parent/interfaces/traits register before execution
+                // (namespaces/ns_060).
+                Stmt::Class(d)
+                    if d.parent.is_none() && d.implements.is_empty() && d.traits.is_empty() =>
+                {
+                    let key = d.name.to_lowercase();
+                    if !self.classes.contains_key(&key) && !self.early_bound_classes.contains(&key)
+                    {
+                        let mut d = (**d).clone();
+                        for m in &mut d.methods {
+                            let mut mm = (**m).clone();
+                            mm.decl.file = self.cur_file.clone();
+                            *m = Rc::new(mm);
+                        }
+                        if self.register_class(Rc::new(d)).is_ok() {
+                            self.early_bound_classes.insert(key);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn run(&mut self, stmts: &[Stmt]) -> RunResult {
+        // hard_timeout ini is the absolute deadline (045).
+        let ht = self.ini_bytes("hard_timeout");
+        if ht > 0 {
+            self.deadline =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(ht as u64));
+            self.deadline_secs = ht;
+        }
+        self.hoist_funcs(stmts);
+        let flow = self.exec_block(stmts);
+        let result = self.finish(flow);
+        self.run_shutdown();
+        result
+    }
+
+    fn finish(&mut self, flow: Flow) -> RunResult {
+        match flow {
+            Flow::Exit(code) => RunResult {
+                exit_code: code,
+                fatal: None,
+            },
+            Flow::Normal | Flow::Return(_) => RunResult {
+                exit_code: 0,
+                fatal: None,
+            },
+            Flow::Throw(v) => {
+                // set_exception_handler replaces the uncaught display
+                // entirely; exit is still 255 (bug23279).
+                if let Some(h) = self.exception_handler.clone() {
+                    let _ = self.call_value(&h, CallArgs::positional(vec![cell(v)]));
+                } else {
+                    self.uncaught(&v);
+                }
+                RunResult {
+                    exit_code: 255,
+                    fatal: Some(PhpError::fatal("uncaught exception", 0)),
+                }
+            }
+            Flow::Break(_) | Flow::Continue(_) => {
+                let e =
+                    PhpError::fatal("'break' or 'continue' outside of loop or switch context", 0);
+                self.print_fatal(&e);
+                RunResult {
+                    exit_code: 255,
+                    fatal: Some(e),
+                }
+            }
+            Flow::Goto(l) => {
+                let e = PhpError::fatal(format!("'goto' to undefined label '{}'", l), 0);
+                self.print_fatal(&e);
+                RunResult {
+                    exit_code: 255,
+                    fatal: Some(e),
+                }
+            }
+        }
+    }
+
+    fn run_shutdown(&mut self) {
+        let fns = std::mem::take(&mut self.shutdown_fns);
+        for (f, args) in fns {
+            let _ = self.call_value(&f, CallArgs::positional(args));
+        }
+        // Zend calls __destruct on live objects after shutdown functions
+        // and before output buffers flush — destructors still see their
+        // buffers' contents (bug30578, bug24908). Two phases:
+        //  1) CV teardown — the global symbol table frees in reverse
+        //     declaration order; objects whose last ref is a global var
+        //     die newest-created first (bug36759).
+        //  2) object store pass — remaining live objects in creation
+        //     order; objects a dtor spawns get visited too (bug74053).
+        let mut cv_objs: Vec<(u64, Rc<RefCell<PhpObject>>)> = Vec::new();
+        for c in self.globals.vars.values() {
+            if let Value::Object(o) = &*c.borrow() {
+                cv_objs.push((o.borrow().id, o.clone()));
+            }
+        }
+        cv_objs.sort_by_key(|(id, _)| *id);
+        for (_, o) in cv_objs.into_iter().rev() {
+            // strong_count 2 = the var's cell + our clone.
+            if Rc::strong_count(&o) != 2 {
+                continue;
+            }
+            if self
+                .find_method_in(&o.borrow().class, "__destruct")
+                .is_some()
+                && self.mark_destructed(&o)
+            {
+                let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+            }
+        }
+        self.globals.vars.clear();
+        // Objects a dtor spawns may land in already-visited recycled
+        // handle slots — rescan until a full pass runs nothing new
+        // (bug51822/bug74053).
+        loop {
+            let mut progressed = false;
+            let mut i = 0;
+            while i < self.obj_handles.len() {
+                let w = match &self.obj_handles[i] {
+                    ObjHandle::Obj(w) => w.clone(),
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                };
+                i += 1;
+                let Some(o) = w.upgrade() else { continue };
+                let key = Rc::as_ptr(&o) as usize;
+                if self.destructed.contains_key(&key) {
+                    continue;
+                }
+                if self
+                    .find_method_in(&o.borrow().class, "__destruct")
+                    .is_some()
+                {
+                    self.mark_destructed(&o);
+                    progressed = true;
+                    let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        if !self.mem_exceeded {
+            self.flush_ob_all();
+        }
+    }
+
+    /// Free the expression statement's temporaries: an object with no
+    /// remaining owner destructs now, first-created first — matching
+    /// Zend freeing the VM temp slots at statement end. `base` scopes
+    /// the sweep to temporaries created during *this* statement — a
+    /// nested statement's unwind must not free an outer statement's
+    /// live temps (bug29368_3).
+    fn sweep_expr_temps(&mut self, base: usize) -> Result<(), PhpError> {
+        let temps = self.expr_temps.split_off(base);
+        for o in temps {
+            if Rc::strong_count(&o) != 1 {
+                continue;
+            }
+            let key = Rc::as_ptr(&o) as usize;
+            if self.destructed.contains_key(&key) {
+                continue;
+            }
+            if self
+                .find_method_in(&o.borrow().class, "__destruct")
+                .is_some()
+            {
+                self.mark_destructed(&o);
+                self.method_invoke(o.clone(), "__destruct", CallArgs::empty())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Objects whose last refs live inside a dropped value run
+    /// __destruct — `unset($closure)` decrefs the closure's bound
+    /// $this and captures (Zend refcount semantics — closure_005).
+    fn destruct_dying_value(&mut self, v: &Value) -> Result<(), PhpError> {
+        let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
+        let mut tally = |o: &Rc<RefCell<PhpObject>>| {
+            held.entry(Rc::as_ptr(o) as usize)
+                .or_insert_with(|| (0, o.clone()))
+                .0 += 1;
+        };
+        match v {
+            Value::Object(o) => tally(o),
+            Value::Callable(c) => {
+                if let Some(o) = &c.this_obj {
+                    tally(o);
+                }
+                for (_, cap, _) in &c.captures {
+                    if let Value::Object(o) = &*cap.borrow() {
+                        tally(o);
+                    }
+                }
+            }
+            _ => {}
+        }
+        for (_, (n, o)) in held {
+            // `o` contributes one ref from `held` itself; `v` holds n.
+            if Rc::strong_count(&o) != n + 1 {
+                continue;
+            }
+            if self
+                .find_method_in(&o.borrow().class, "__destruct")
+                .is_some()
+                && self.mark_destructed(&o)
+            {
+                let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+            }
+        }
+        Ok(())
+    }
+
+    /// Decref the running frame's CVs (vars/args/$this): an object
+    /// whose strong refs are exactly the cells this frame is about
+    /// to drop runs its __destruct now — Zend's behavior at function
+    /// exit and exception unwind (bug52361).
+    fn destruct_frame_objs(&mut self, f: &Frame) -> Result<(), PhpError> {
+        let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
+        let mut tally = |c: &Cell| {
+            if let Value::Object(o) = &*c.borrow() {
+                held.entry(Rc::as_ptr(o) as usize)
+                    .or_insert_with(|| (0, o.clone()))
+                    .0 += 1;
+            }
+        };
+        for c in f.vars.values() {
+            tally(c);
+        }
+        for c in f.args.iter() {
+            tally(c);
+        }
+        if let Some(o) = &f.this_obj {
+            held.entry(Rc::as_ptr(o) as usize)
+                .or_insert_with(|| (0, o.clone()))
+                .0 += 1;
+        }
+        for (_, (n, o)) in held {
+            // +1 for the `o` clone sitting in `held` itself.
+            if Rc::strong_count(&o) != n + 1 {
+                continue;
+            }
+            let key = Rc::as_ptr(&o) as usize;
+            if !self.destructed.contains_key(&key)
+                && self
+                    .find_method_in(&o.borrow().class, "__destruct")
+                    .is_some()
+            {
+                self.mark_destructed(&o);
+                // A throw inside the dtor must not clobber the
+                // in-flight exception being unwound (bug52361).
+                let saved = self.pending_exception.take();
+                let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                self.pending_exception = saved.or(self.pending_exception.take());
+            }
+        }
+        Ok(())
+    }
+
+    /// Convenience: parse+run a source string (used by tests and the CLI).
+    /// INI integer value with default (e.g. precision=14).
+    pub fn ini_int(&self, k: &str, dflt: i64) -> i64 {
+        self.ini.get(k).and_then(|s| s.parse().ok()).unwrap_or(dflt)
+    }
+
+    /// INI truthiness — PHP accepts 1/On/true/yes case-insensitively.
+    pub fn ini_on(&self, k: &str) -> bool {
+        match self.ini.get(k).map(|s| s.to_lowercase()) {
+            Some(v) => matches!(v.as_str(), "1" | "on" | "true" | "yes"),
+            None => false,
+        }
+    }
+
+    /// phpun serve: replace a request superglobal ($_GET/$_POST/...).
+    pub fn set_superglobal(&mut self, name: &str, arr: PhpArray) {
+        self.globals.vars.insert(
+            name.to_string(),
+            cell(Value::Array(Rc::new(RefCell::new(arr)))),
+        );
+    }
+
+    /// phpun serve: set one $_SERVER entry (REQUEST_METHOD, HTTP_*, ...).
+    pub fn set_server_var(&mut self, k: &str, v: &str) {
+        let c = match self.globals.vars.get("_SERVER") {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        let arr = match &*c.borrow() {
+            Value::Array(a) => a.clone(),
+            _ => return,
+        };
+        arr.borrow_mut().set(ArrKey::Str(k.into()), Value::str(v));
+    }
+
+    pub fn run_source(&mut self, src: &str) -> RunResult {
+        match parser::parse_source(src, self.ini_on("short_open_tag")) {
+            Ok(stmts) => self.run(&stmts),
+            Err(e) => {
+                // Compile-time semantic errors (hook decl checks, `parent::`
+                // misuse) are E_ERROR fatals, not syntax errors.
+                match e.kind {
+                    ErrorKind::Parse => self.print_parse(&e),
+                    _ => self.print_fatal(&e),
+                }
+                RunResult {
+                    exit_code: 255,
+                    fatal: Some(e),
+                }
+            }
+        }
+    }
+
+    /// Like run_source but also returns the script's top-level `return`
+    /// value — the boot phase of `phpun serve --worker` reads the app
+    /// handler this way.
+    pub fn run_source_ret(&mut self, src: &str) -> (RunResult, Option<Value>) {
+        match parser::parse_source(src, self.ini_on("short_open_tag")) {
+            Ok(stmts) => {
+                self.hoist_funcs(&stmts);
+                let flow = self.exec_block(&stmts);
+                let rv = match &flow {
+                    Flow::Return(v) => Some(v.clone()),
+                    _ => None,
+                };
+                let res = self.finish(flow);
+                self.run_shutdown();
+                (res, rv)
+            }
+            Err(e) => {
+                match e.kind {
+                    ErrorKind::Parse => self.print_parse(&e),
+                    _ => self.print_fatal(&e),
+                }
+                (
+                    RunResult {
+                        exit_code: 255,
+                        fatal: Some(e),
+                    },
+                    None,
+                )
+            }
+        }
+    }
+
+    /// Worker mode: clear per-request state while keeping the warm world
+    /// (classes, functions, global vars, objects) alive.
+    pub fn reset_request(&mut self) {
+        self.out.clear();
+        self.err_buf.clear();
+        self.out_headers.clear();
+        self.resp_code = 200;
+        self.uploads.clear();
+        self.ob_stack.clear();
+        self.silence = 0;
+        self.pending_exception = None;
+        self.call_trace.clear();
+        self.deadline = None;
+    }
+
+    /// Record an object as destructed: true iff newly marked.
+    fn mark_destructed(&mut self, o: &Rc<RefCell<PhpObject>>) -> bool {
+        self.destructed
+            .insert(Rc::as_ptr(o) as usize, o.clone())
+            .is_none()
+    }
+
+    /// Worker mode: objects created during boot are application state and
+    /// must not be destructed at request end. Call once after the boot
+    /// phase so per-request shutdown only sweeps request objects.
+    pub fn seal_boot_objects(&mut self) {
+        self.obj_handles.clear();
+    }
+
+    /// Worker-mode request end: registered shutdown functions and
+    /// destructors for request-created objects.
+    pub fn end_request(&mut self) {
+        self.run_shutdown();
+    }
+
+    fn cur(&mut self) -> &mut Frame {
+        self.stack.last_mut().unwrap_or(&mut self.globals)
+    }
+
+    /// PHP auto-globals resolve in every scope; first access links the
+    /// global cell into the local table (bug24908).
+    fn is_superglobal(name: &str) -> bool {
+        matches!(
+            name,
+            "_GET"
+                | "_POST"
+                | "_COOKIE"
+                | "_FILES"
+                | "_ENV"
+                | "_SERVER"
+                | "_REQUEST"
+                | "_SESSION"
+                | "GLOBALS"
+        )
+    }
+
+    fn superglobal_cell(&mut self, name: &str) -> Option<Cell> {
+        if name == "GLOBALS" {
+            // Live view — never the seeded/lazy globals.vars cell.
+            return Some(cell(self.globals_array_val()));
+        }
+        if !Self::is_superglobal(name) {
+            return None;
+        }
+        let g = self
+            .globals
+            .vars
+            .entry(name.to_string())
+            .or_insert_with(|| cell(Value::Null))
+            .clone();
+        self.cur().vars.insert(name.to_string(), g.clone());
+        Some(g)
+    }
+
+    /// Does the variable name resolve to an existing cell?
+    fn var_lookup(&mut self, name: &str) -> Option<Cell> {
+        self.cur()
+            .vars
+            .get(name)
+            .cloned()
+            .or_else(|| self.superglobal_cell(name))
+    }
+
+    fn var_get(&mut self, name: &str) -> Result<Value, PhpError> {
+        match self.cur().vars.get(name) {
+            Some(c) => Ok(c.borrow().clone()),
+            None => match self.superglobal_cell(name) {
+                Some(c) => Ok(c.borrow().clone()),
+                None => {
+                    // Inside any function frame, a missing $this is a
+                    // hard "Using $this when not in object context"
+                    // Error; top-level warns (closure_005).
+                    if name == "this" && !self.stack.is_empty() {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            "Using $this when not in object context",
+                            0,
+                        ));
+                    }
+                    if self.silence == 0 {
+                        self.warn(&format!("Undefined variable ${}", name))?;
+                    }
+                    Ok(Value::Null)
+                }
+            },
+        }
+    }
+
+    /// The cell behind a variable name — creating it on demand.
+    /// Superglobals resolve to the global cell (writes propagate).
+    pub fn var_cell(&mut self, name: &str) -> Cell {
+        if name == "GLOBALS" {
+            // $GLOBALS is a live view over the global symbol table — array
+            // entries share the same Cells as globals.vars so writes alias.
+            return cell(self.globals_array_val());
+        }
+        let is_global = self.stack.is_empty();
+        let existed = self.cur().vars.contains_key(name);
+        if let Some(c) = self.superglobal_cell(name) {
+            return c;
+        }
+        let c = self
+            .cur()
+            .vars
+            .entry(name.to_string())
+            .or_insert_with(|| Rc::new(RefCell::new(Value::Null)))
+            .clone();
+        if is_global && !existed {
+            self.globals_order.push(name.to_string());
+        }
+        c
+    }
+
+    /// Shared array backing $GLOBALS, synced both directions with globals.vars.
+    fn globals_array_val(&mut self) -> Value {
+        let arr = self
+            .globals_arr
+            .get_or_insert_with(|| Rc::new(RefCell::new(PhpArray::new())))
+            .clone();
+        // vars -> array (preserve global insertion order)
+        let mut names: Vec<String> = self.globals_order.clone();
+        for n in self.globals.vars.keys() {
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+        {
+            let mut a = arr.borrow_mut();
+            // Entries alias globals.vars cells — writes must never CoW-split.
+            a.is_ref = true;
+            for n in names {
+                if let Some(c) = self.globals.vars.get(&n) {
+                    a.set_cell(ArrKey::Str(n.into()), c.clone());
+                }
+            }
+        }
+        // array -> vars (writes through $GLOBALS create real globals)
+        let pairs: Vec<(String, Cell)> = {
+            let a = arr.borrow();
+            a.entries
+                .iter()
+                .filter_map(|(k, c)| match k {
+                    ArrKey::Str(s) => Some((s.to_string(), c.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (n, c) in pairs {
+            if !self.globals.vars.contains_key(&n) {
+                self.globals.vars.insert(n.clone(), c);
+                self.globals_order.push(n);
+            }
+        }
+        Value::Array(arr)
+    }
+
+    /// Peek without creating.
+    fn var_cell_opt(&mut self, name: &str) -> Option<Cell> {
+        match self.stack.last().unwrap_or(&self.globals).vars.get(name) {
+            Some(c) => Some(c.clone()),
+            None => self.superglobal_cell(name),
+        }
+    }
+
+    fn var_set(&mut self, name: &str, v: Value) {
+        match self.var_cell_opt(name) {
+            Some(c) => *c.borrow_mut() = v,
+            None => {
+                self.cur()
+                    .vars
+                    .insert(name.to_string(), Rc::new(RefCell::new(v)));
+            }
+        }
+    }
+
+    /// Write through an existing var cell honoring typed-slot gates —
+    /// a `&`-bound typed prop cell rejects bad values with TypeError
+    /// (typed_properties_108 catch binding). `strict` applies
+    /// catch-bind semantics: no coercion.
+    fn var_set_gated(&mut self, name: &str, v: Value, strict: bool) -> Result<(), PhpError> {
+        match self.var_cell_opt(name) {
+            Some(c) => {
+                let nv = self.typed_slot_store_mode(&c, v, strict)?;
+                *c.borrow_mut() = nv;
+                Ok(())
+            }
+            None => {
+                self.cur()
+                    .vars
+                    .insert(name.to_string(), Rc::new(RefCell::new(v)));
+                Ok(())
+            }
+        }
+    }
+
+    fn fn_statics_key(&self) -> String {
+        self.stack
+            .last()
+            .map(|f| {
+                // Method statics are per-(function, declaring class):
+                // trait-merged methods get independent statics in each
+                // using class, while inherited methods share their
+                // declaring class's table (language013).
+                match &f.decl_class {
+                    Some(c) => format!("{}\u{0}{}", c.name(), f.fn_name),
+                    None => f.fn_name.clone(),
+                }
+            })
+            .unwrap_or_else(|| "\u{0}global".into())
+    }
+
+    /// Emit output through the output-buffer stack.
+    pub fn emit(&mut self, s: &str) {
+        self.emit_bytes(s.as_bytes());
+    }
+
+    /// Byte-faithful emit — program output is bytes (echo of binary
+    /// strings, file reads, preg results must not be UTF-8 validated).
+    pub fn emit_bytes(&mut self, b: &[u8]) {
+        // memory_limit>0 turns into a deferred fatal once accumulated
+        // writes pass it (bug45392); checked at the next statement.
+        self.mem_used += b.len() as u64;
+        self.mem_last = b.len() as u64;
+        // Inside a generator run, output after a yield is deferred to
+        // resume — `f(yield)` must not observe the call (nor its echo)
+        // until the consumer advances past that yield.
+        if let Some(run) = &self.gen_run_state {
+            let done = self
+                .gen_sink
+                .as_ref()
+                .map(|s| s.borrow().len())
+                .unwrap_or(0);
+            if done > 0 {
+                run.borrow_mut().pending_out.push((done - 1, b.to_vec()));
+                return;
+            }
+        }
+        if let Some(buf) = self.ob_stack.last_mut() {
+            buf.buf.extend_from_slice(b);
+        } else if self.live_io {
+            use std::io::Write;
+            let mut so = std::io::stdout().lock();
+            let _ = so.write_all(b);
+            let _ = so.flush();
+        } else {
+            self.out.extend_from_slice(b);
+        }
+    }
+
+    /// Emit generator-deferred output whose suspending yield the
+    /// consumer has now advanced past (`pos > tag`). Pass
+    /// `usize::MAX` to flush everything (getReturn runs to the end).
+    fn gen_flush_out(&mut self, state: &Rc<RefCell<crate::value::GenState>>, pos: usize) {
+        let ready = {
+            let mut st = state.borrow_mut();
+            let split = st
+                .pending_out
+                .iter()
+                .position(|(t, _)| *t >= pos)
+                .unwrap_or(st.pending_out.len());
+            let mut rest = st.pending_out.split_off(split);
+            std::mem::swap(&mut st.pending_out, &mut rest);
+            rest
+        };
+        for (_, b) in ready {
+            self.emit_bytes(&b);
+        }
+    }
+
+    /// set_time_limit(N): restart the counter for N seconds (0 =
+    /// unlimited) (045).
+    pub fn set_deadline(&mut self, secs: i64) {
+        self.deadline_secs = secs;
+        self.deadline = if secs <= 0 {
+            None
+        } else {
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(secs as u64))
+        };
+    }
+
+    /// INI byte shorthand: `2M`, `512K`, `1G`, plain ints, -1 unlimited.
+    pub fn ini_bytes(&self, k: &str) -> i64 {
+        let Some(raw) = self.ini.get(k) else {
+            return -1;
+        };
+        let s = raw.trim();
+        let (num, mul) = match s.as_bytes().last() {
+            Some(b'K') | Some(b'k') => (&s[..s.len() - 1], 1i64 << 10),
+            Some(b'M') | Some(b'm') => (&s[..s.len() - 1], 1i64 << 20),
+            Some(b'G') | Some(b'g') => (&s[..s.len() - 1], 1i64 << 30),
+            _ => (s, 1),
+        };
+        num.trim().parse::<i64>().unwrap_or(-1) * mul
+    }
+
+    /// Shared diagnostic path: Warning/Notice/Deprecated all route through
+    /// a user error handler first (PHP semantics); the handler's error —
+    /// e.g. a thrown Error2Exception — propagates to the caller (038).
+    /// Only a literal `false` return lets the builtin handler continue.
+    fn emit_diag(&mut self, level: &str, errno: i64, msg: &str) -> Result<(), PhpError> {
+        if self.error_handler.is_some() && !self.in_handler {
+            let h = self.error_handler.clone().unwrap();
+            let args: Vec<Cell> = vec![
+                cell(Value::Int(errno)),
+                cell(Value::str(msg)),
+                cell(Value::str(self.diag_file())),
+                cell(Value::Int(self.cur_line as i64)),
+            ];
+            self.in_handler = true;
+            let r = self.call_value(&h, CallArgs::positional(args));
+            self.in_handler = false;
+            match r {
+                Err(e) => return Err(e),
+                Ok(v) if !matches!(v, Value::Bool(false)) => return Ok(()),
+                Ok(_) => {}
+            }
+        }
+        self.diag(level, msg);
+        Ok(())
+    }
+
+    fn warn(&mut self, msg: &str) -> Result<(), PhpError> {
+        if self.silence > 0 || self.error_level & 2 == 0 {
+            return Ok(());
+        }
+        self.emit_diag("Warning", 2, msg)
+    }
+
+    /// Public wrapper so builtins can share PHP's float→int coercion.
+    pub fn coerce_int_pub(&mut self, v: &Value) -> i64 {
+        self.coerce_int(v)
+    }
+
+    /// getenv(): putenv() overrides win over the process environment.
+    pub fn getenv_pub(&self, name: &str) -> Option<String> {
+        self.env_overrides
+            .get(name)
+            .cloned()
+            .or_else(|| std::env::var(name).ok())
+    }
+
+    /// putenv("K=V") → true on success.
+    pub fn putenv_pub(&mut self, s: &str) -> bool {
+        match s.split_once('=') {
+            Some((k, v)) => {
+                self.env_overrides.insert(k.to_string(), v.to_string());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// PHP CLI also logs a `PHP <Level>:` line to stderr (log_errors is
+    /// on by default) — buffered separately so it lands after stdout in
+    /// the merged PHPT stream.
+    /// html_errors=1 switches to the `<b>` docref format (bug35176).
+    fn diag(&mut self, level: &str, msg: &str) {
+        // PHP logs the `PHP <Level>:` line to stderr first, then writes
+        // the display line to stdout — the order is observable on a
+        // merged 2>&1 stream.
+        self.log_diag(level, msg);
+        if self.ini_on("html_errors") {
+            let msg = self.docref(msg);
+            self.emit(&format!(
+                "<br />\n<b>{}</b>:  {} in <b>{}</b> on line <b>{}</b><br />\n",
+                level,
+                msg,
+                self.diag_file(),
+                self.cur_line
+            ));
+        } else {
+            self.emit(&format!(
+                "\n{}: {} in {} on line {}\n",
+                level,
+                msg,
+                self.diag_file(),
+                self.cur_line
+            ));
+        }
+    }
+
+    /// stderr copy of a diagnostic (`PHP Warning: ...`); log_errors
+    /// defaults on and error_log to a file would change the destination,
+    /// which we don't model yet.
+    fn log_diag(&mut self, level: &str, msg: &str) {
+        let log_errors = self
+            .ini
+            .get("log_errors")
+            .is_none_or(|v| matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes"));
+        if !log_errors {
+            return;
+        }
+        self.diag_stderr(&format!(
+            "PHP {}:  {} in {} on line {}\n",
+            level,
+            msg,
+            self.diag_file(),
+            self.cur_line
+        ));
+    }
+
+    /// Route a diagnostic to stderr — streamed in live_io mode so it
+    /// interleaves with stdout like real PHP, captured otherwise.
+    pub fn diag_stderr(&mut self, s: &str) {
+        if self.live_io {
+            eprint!("{}", s);
+        } else {
+            self.err_buf.push_str(s);
+        }
+    }
+
+    /// html_errors docref: `fn(args): rest` becomes
+    /// `fn(args) [<a href='{root}function.{slug}.html'>...</a>]: rest`.
+    fn docref(&self, msg: &str) -> String {
+        let Some(p) = msg.find("): ") else {
+            return msg.to_string();
+        };
+        let Some(open) = msg.find('(') else {
+            return msg.to_string();
+        };
+        let fname = &msg[..open];
+        if fname.is_empty()
+            || !fname.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || open > p
+        {
+            return msg.to_string();
+        }
+        let args = &msg[open + 1..p];
+        let rest = &msg[p + 3..];
+        let strip_q = |s: &str| s.trim_matches('"').to_string();
+        let root = self
+            .ini
+            .get("docref_root")
+            .map(|s| strip_q(s))
+            .unwrap_or_default();
+        let ext = self
+            .ini
+            .get("docref_ext")
+            .map(|s| strip_q(s))
+            .unwrap_or_else(|| ".html".into());
+        let slug = fname.to_lowercase().replace('_', "-");
+        format!(
+            "{}({}) [<a href='{}function.{}{}'>function.{}{}</a>]: {}",
+            fname, args, root, slug, ext, slug, ext, rest
+        )
+    }
+
+    #[allow(dead_code)]
+    fn notice(&mut self, msg: &str) -> Result<(), PhpError> {
+        if self.silence > 0 || self.error_level & 8 == 0 {
+            return Ok(());
+        }
+        self.emit_diag("Notice", 8, msg)
+    }
+
+    fn deprecated(&mut self, msg: &str) -> Result<(), PhpError> {
+        if self.silence > 0 || self.error_level & 8192 == 0 {
+            return Ok(());
+        }
+        self.emit_diag("Deprecated", 8192, msg)
+    }
+
+    /// error_reporting([$level]) — returns previous level.
+    pub fn error_reporting(&mut self, level: Option<i64>) -> i64 {
+        let prev = self.error_level;
+        if let Some(l) = level {
+            self.error_level = l;
+        }
+        prev
+    }
+
+    fn print_parse(&mut self, e: &PhpError) {
+        self.emit(&format!(
+            "\nParse error: {} in {} on line {}\n",
+            e.message, self.file, e.line
+        ));
+        let log_errors = self
+            .ini
+            .get("log_errors")
+            .is_none_or(|v| matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes"));
+        if log_errors {
+            self.diag_stderr(&format!(
+                "PHP Parse error:  {} in {} on line {}\n",
+                e.message, self.file, e.line
+            ));
+        }
+    }
+
+    fn print_fatal(&mut self, e: &PhpError) {
+        match e.kind {
+            ErrorKind::Uncaught { ref class } => {
+                let frames = e.trace.clone().unwrap_or_default();
+                let mut t = String::new();
+                for (i, fr) in frames.iter().enumerate() {
+                    t.push_str(&format!("#{} {}\n", i, fr));
+                }
+                t.push_str(&format!("#{} {{main}}\n", frames.len()));
+                let ef = if self.last_err_file.is_empty() {
+                    self.file.to_string()
+                } else {
+                    self.last_err_file.clone()
+                };
+                let dmsg = e.display_msg.clone().unwrap_or_else(|| e.message.clone());
+                // stderr log line precedes the stdout display block (same
+                // ordering as PHP's error path — see diag()).
+                let log_errors = self.ini.get("log_errors").is_none_or(|v| {
+                    matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
+                });
+                if log_errors {
+                    self.diag_stderr(&format!(
+                        "PHP Fatal error:  Uncaught {}: {} in {}:{}\nStack trace:\n{}  thrown in {} on line {}\n",
+                        class,
+                        dmsg,
+                        ef,
+                        e.line,
+                        t,
+                        ef,
+                        e.thrown_line.unwrap_or(e.line)
+                    ));
+                }
+                self.emit(&format!(
+                    "\nFatal error: Uncaught {}: {} in {}:{}\nStack trace:\n{}  thrown in {} on line {}\n",
+                    class,
+                    dmsg,
+                    ef,
+                    e.line,
+                    t,
+                    ef,
+                    e.thrown_line.unwrap_or(e.line)
+                ));
+            }
+            // Plain fatals (E_ERROR) print no trace; compile fatals
+            // (duplicate named args, positional-after-named, ...) carry a
+            // `Stack trace:\n#0 {main}` block like the engine's.
+            _ => {
+                let ef = if self.last_err_file.is_empty() {
+                    self.file.to_string()
+                } else {
+                    self.last_err_file.clone()
+                };
+                let backtraces = self.ini.get("fatal_error_backtraces").is_none_or(|v| {
+                    !matches!(v.to_lowercase().as_str(), "0" | "off" | "false" | "no" | "")
+                });
+                let tr = match &e.trace {
+                    Some(frames) if backtraces => {
+                        let mut t = String::from("Stack trace:\n");
+                        for (i, fr) in frames.iter().enumerate() {
+                            t.push_str(&format!("#{} {}\n", i, fr));
+                        }
+                        t.push_str(&format!("#{} {{main}}\n", frames.len()));
+                        t
+                    }
+                    _ => String::new(),
+                };
+                let s = format!(
+                    "\nFatal error: {} in {} on line {}\n{}",
+                    e.message, ef, e.line, tr
+                );
+                let log_errors = self.ini.get("log_errors").is_none_or(|v| {
+                    matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
+                });
+                if log_errors {
+                    self.diag_stderr(&format!(
+                        "PHP Fatal error:  {} in {} on line {}\n{}",
+                        e.message, ef, e.line, tr
+                    ));
+                }
+                if self.mem_exceeded {
+                    // Memory-exhausted: buffers are dropped, so the
+                    // fatal goes straight to output (bug45392).
+                    self.out.extend_from_slice(s.as_bytes());
+                } else {
+                    self.emit(&s);
+                }
+            }
+        }
+    }
+
+    /// Print the uncaught-exception fatal for a Throwable value. Written
+    /// straight to `out` — reaching it means the script is ending, so it
+    /// must not be re-fed to an ob handler that may throw again
+    /// (bug32828).
+    fn uncaught(&mut self, v: &Value) {
+        if let Value::Object(o) = v {
+            let o = o.borrow();
+            let class = o.class.name().to_string();
+            let msg = o
+                .props
+                .get("message")
+                .map(|c| c.borrow().to_php_string())
+                .unwrap_or_default();
+            let (file, line, thrown, tr, msg, eval_ctx) = match &o.internal {
+                Some(ObjectInternal::Exception {
+                    file,
+                    line,
+                    trace,
+                    thrown,
+                    full_msg,
+                    eval_ctx,
+                    frames,
+                }) => (
+                    file.clone(),
+                    *line,
+                    *thrown,
+                    if !trace.is_empty() {
+                        trace.clone()
+                    } else if frames.is_empty() {
+                        "#0 {main}".to_string()
+                    } else {
+                        format_trace(frames)
+                    },
+                    if full_msg.is_empty() {
+                        msg
+                    } else {
+                        full_msg.clone()
+                    },
+                    *eval_ctx,
+                ),
+                _ => (
+                    self.diag_file(),
+                    self.cur_line as u32,
+                    self.cur_line as u32,
+                    "#0 {main}".to_string(),
+                    msg,
+                    0,
+                ),
+            };
+            drop(o);
+            if eval_ctx > 0 {
+                // ParseError inside eval'd code prints the plain
+                // `Parse error:` form (tests/lang/019).
+                self.emit(&format!(
+                    "\nParse error: {} in {}({}) : eval()'d code on line {}\n",
+                    msg, file, line, eval_ctx
+                ));
+            } else {
+                // Buffered output precedes the fatal, as PHP's output
+                // layer would emit it (bug32828's throwing handler).
+                self.flush_ob_all();
+                // Zend prints `Uncaught C: msg` — no colon when msg empty.
+                let colon = if msg.is_empty() { "" } else { ": " };
+                if self.ini_on("html_errors") {
+                    self.out.extend_from_slice(format!(
+                        "<br />\n<b>Fatal error</b>:  Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in <b>{}</b> on line <b>{}</b><br />\n",
+                        class, colon, msg, file, line, tr, file, thrown
+                    ).as_bytes());
+                } else {
+                    // The PHP CLI SAPI logs the uncaught to stderr first
+                    // (log_errors default on), then prints the display
+                    // block to stdout — same ordering as print_fatal.
+                    let log_errors = self.ini.get("log_errors").is_none_or(|v| {
+                        matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
+                    });
+                    if log_errors {
+                        self.diag_stderr(&format!(
+                            "PHP Fatal error:  Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
+                            class, colon, msg, file, line, tr, file, thrown
+                        ));
+                    }
+                    // ob_stack is empty here (flushed above), so emit
+                    // reaches out-or-stdout like a direct write did.
+                    self.emit(&format!(
+                        "\nFatal error: Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
+                        class, colon, msg, file, line, tr, file, thrown
+                    ));
+                }
+            }
+        } else {
+            self.print_fatal(&PhpError::fatal("Can only throw objects", self.cur_line));
+        }
+    }
+
+    /// Turn an eval error into control flow. `\u{1}exit:N` is the exit
+    /// sentinel; `ErrorKind::Throw` carries pending_exception.
+    fn err_flow(&mut self, e: PhpError) -> Flow {
+        if let Some(code) = e.message.strip_prefix("\u{1}exit:") {
+            return Flow::Exit(code.parse().unwrap_or(0));
+        }
+        if e.kind == ErrorKind::Throw {
+            return Flow::Throw(self.pending_exception.take().unwrap_or(Value::Null));
+        }
+        self.print_fatal(&e);
+        Flow::Exit(255)
+    }
+
+    /// Build a throwable object (used for internal errors).
+    pub fn exception(&mut self, class: &str, msg: &str) -> Value {
+        let resolved = self
+            .resolve_class(class)
+            .unwrap_or_else(|| "Exception".into());
+        let obj = self.instantiate(&resolved, &[]).unwrap_or(Value::Null);
+        if let Value::Object(o) = &obj {
+            let mut o = o.borrow_mut();
+            o.props.insert("message".into(), cell(Value::str(msg)));
+            o.props.insert("code".into(), cell(Value::Int(0)));
+            o.internal = Some(ObjectInternal::Exception {
+                file: self.diag_file(),
+                line: self.cur_line as u32,
+                trace: String::new(),
+                thrown: self.cur_line as u32,
+                full_msg: String::new(),
+                eval_ctx: 0,
+                frames: Rc::new(self.call_trace.clone()),
+            });
+            if !o.prop_order.contains(&"message".into()) {
+                o.prop_order.push("message".into());
+                o.prop_order.push("code".into());
+            }
+        }
+        obj
+    }
+
+    /// Raise `throw $v` as an error result.
+    fn throw(&mut self, v: Value) -> PhpError {
+        self.pending_exception = Some(v);
+        PhpError {
+            trace: None,
+            thrown_line: None,
+            display_msg: None,
+            kind: ErrorKind::Throw,
+            message: "throw".into(),
+            line: self.cur_line,
+        }
+    }
+
+    /// Builtin call — errors become catchable throwables via `fail`.
+    fn call_builtin(&mut self, name: &str, args: &CallArgs) -> Result<Option<Value>, PhpError> {
+        self.call_trace.push(TraceFrame {
+            function: name.to_string(),
+            class: None,
+            ty: String::new(),
+            file: self.diag_file(),
+            line: self.cur_line as u32,
+            args: args.to_vec(),
+            named_args: args
+                .named
+                .iter()
+                .map(|(n, c, ..)| (n.clone(), c.clone()))
+                .collect(),
+            internal: true,
+        });
+        if name == "assert" {
+            // AssertionError message = `assert(<args>)` as written.
+            let mut parts: Vec<String> = Vec::new();
+            for c in &args.cells {
+                parts.push(assert_arg_repr(&c.borrow()));
+            }
+            for (n, c, ..) in &args.named {
+                parts.push(format!("{}: {}", n, assert_arg_repr(&c.borrow())));
+            }
+            self.assert_src = parts.join(", ");
+        }
+        if !args.named.is_empty() && matches!(name, "call_user_func" | "forward_static_call") {
+            // call_user_func forwards named args to the callee, not to
+            // its own `callback` param (named_params/call_user_func).
+            let cb = args
+                .cells
+                .first()
+                .map(|c| c.borrow().clone())
+                .unwrap_or(Value::Null);
+            let ca = CallArgs {
+                cells: args.cells[1.min(args.cells.len())..].to_vec(),
+                named: args.named.clone(),
+                nonref_cells: args
+                    .nonref_cells
+                    .iter()
+                    .filter(|i| **i >= 1)
+                    .map(|i| i - 1)
+                    .collect(),
+                trav_cells: args
+                    .trav_cells
+                    .iter()
+                    .filter(|i| **i >= 1)
+                    .map(|i| i - 1)
+                    .collect(),
+            };
+            // Callbacks dispatched from inside an internal function
+            // trace from `[internal function]` (closure_064).
+            self.internal_cb += 1;
+            let r = self.call_value(&cb, ca);
+            self.internal_cb -= 1;
+            self.call_trace.pop();
+            return match r {
+                Ok(v) => Ok(Some(v)),
+                Err(e) => self.fail(e),
+            };
+        }
+        // strict_types applies to internal-function calls too: scalar
+        // args must already be the declared ZPP type (int->float still
+        // widens), else a catchable TypeError — the short form, no
+        // `called in ... and defined in` suffix (that's userland-only).
+        // `callable` params are validated eagerly even in weak mode
+        // (Zend's `f` ZPP flag) with the callback-specific messages.
+        if args.named.is_empty() {
+            if let Some(sig) = builtins::strict_sig(name) {
+                let strict = self.caller_file_strict();
+                for (i, (pname, pty)) in sig.iter().enumerate() {
+                    if i >= args.cells.len() {
+                        break;
+                    }
+                    let v = args.cells[i].borrow().clone();
+                    let has_cb = pty
+                        .trim_start_matches('?')
+                        .split('|')
+                        .any(|t| t == "callable");
+                    if has_cb {
+                        // A union member wins on its own type: '0'
+                        // satisfies `string` in `string|array|callable`
+                        // even though it is not callable
+                        // (closure_047/048).
+                        let ok = (pty.starts_with('?') && matches!(v, Value::Null))
+                            || self.is_callable_value(&v)
+                            || pty
+                                .trim_start_matches('?')
+                                .split('|')
+                                .filter(|t| *t != "callable")
+                                .any(|t| self.param_type_match(t, &v));
+                        if !ok {
+                            let null = if pty.starts_with('?') { " or null" } else { "" };
+                            let msg = format!(
+                                "{}(): Argument #{} (${}) must be a valid callback{}, {}",
+                                name,
+                                i + 1,
+                                pname,
+                                null,
+                                self.zpp_callback_detail(&v),
+                            );
+                            let e = self.exception("TypeError", &msg);
+                            let te = self.throw(e);
+                            let r = self.fail(te);
+                            self.call_trace.pop();
+                            return r;
+                        }
+                    } else if strict && !self.zpp_strict_ok(pty, &v) {
+                        let msg = format!(
+                            "{}(): Argument #{} (${}) must be of type {}, {} given",
+                            name,
+                            i + 1,
+                            pname,
+                            pty,
+                            self.zval_type_name(&v),
+                        );
+                        let e = self.exception("TypeError", &msg);
+                        let te = self.throw(e);
+                        let r = self.fail(te);
+                        self.call_trace.pop();
+                        return r;
+                    }
+                }
+            }
+        }
+        match builtins::builtin_params(name) {
+            // Internal fns with a known signature get Zend's named-arg
+            // resolution AND positional arity checks.
+            Some(params) => {
+                self.internal_cb += 1;
+                let r = match self.resolve_named_builtin(name, params, args) {
+                    Ok(cells) => builtins::call(self, name, &cells),
+                    Err(e) => Err(e),
+                };
+                self.internal_cb -= 1;
+                // fail() captures call_trace — pop AFTER it so the
+                // builtin's own frame shows in the backtrace
+                // (`array_multisort(: 1)` in call_user_func_array_variadic).
+                let r = match r {
+                    Ok(v) => Ok(v),
+                    Err(e) => self.fail(e),
+                };
+                self.call_trace.pop();
+                r
+            }
+            // Internal fns without a signature accept no named args;
+            // names that aren't builtins at all fall through so the
+            // userland invoke path sees them.
+            None if builtins::is_builtin(name) && !args.named.is_empty() => {
+                let r = self.fail(PhpError::uncaught(
+                    "Error",
+                    format!("Unknown named parameter ${}", args.named[0].0),
+                    0,
+                ));
+                self.call_trace.pop();
+                r
+            }
+            None => {
+                self.internal_cb += 1;
+                let r = builtins::call(self, name, args);
+                self.internal_cb -= 1;
+                let r = match r {
+                    Ok(r) => Ok(r),
+                    Err(e) => self.fail(e),
+                };
+                self.call_trace.pop();
+                r
+            }
+        }
+    }
+
+    /// Reorder named args to positional cells against an internal
+    /// function's stub signature (Zend/tests/named_params/internal*).
+    /// By-ref params receive the caller's cell; defaults fill interior
+    /// gaps; unknown names are the "Unknown named parameter" Error
+    /// (variadic-only stubs reject with a different message).
+    fn resolve_named_builtin(
+        &mut self,
+        name: &str,
+        params: &[(&'static str, builtins::BDef)],
+        args: &CallArgs,
+    ) -> Result<Vec<Cell>, PhpError> {
+        use builtins::BDef;
+        // Internal functions whose variadic is declared Z_PARAM_VARIADIC
+        // ('*') reject every named arg (zend_compile "does not accept
+        // unknown named parameters").
+        const NAMED_REJECT: &[&str] = &[
+            "array_merge",
+            "array_merge_recursive",
+            "array_diff",
+            "array_diff_key",
+            "array_diff_assoc",
+            "array_diff_ukey",
+            "array_diff_uassoc",
+            "array_udiff",
+            "array_udiff_assoc",
+            "array_udiff_uassoc",
+            "array_intersect",
+            "array_intersect_key",
+            "array_intersect_assoc",
+            "array_intersect_ukey",
+            "array_intersect_uassoc",
+            "array_uintersect",
+            "array_uintersect_assoc",
+            "array_uintersect_uassoc",
+        ];
+        if NAMED_REJECT.contains(&name) && !args.named.is_empty() {
+            return Err(PhpError::uncaught(
+                "ArgumentCountError",
+                format!("{}() does not accept unknown named parameters", name),
+                0,
+            ));
+        }
+        let variadic = params.iter().any(|(_, d)| matches!(d, BDef::Var));
+        let n_fixed = params
+            .iter()
+            .take_while(|(_, d)| !matches!(d, BDef::Var))
+            .count();
+        let required = params[..n_fixed]
+            .iter()
+            .filter(|(_, d)| matches!(d, BDef::Req))
+            .count();
+        // Positional arity errors use Zend's internal-function wording:
+        // "expects exactly" when all fixed params are required, else
+        // "at least"/"at most" with the required/fixed bound.
+        let arity_err = |got: usize, over: bool| {
+            let (word, n) = if !variadic && over {
+                if required == n_fixed {
+                    ("exactly", n_fixed)
+                } else {
+                    ("at most", n_fixed)
+                }
+            } else if required == n_fixed && !variadic {
+                ("exactly", required)
+            } else {
+                // Optional params or a variadic tail: "at least".
+                ("at least", required)
+            };
+            PhpError::uncaught(
+                "ArgumentCountError",
+                format!(
+                    "{}() expects {} {} argument{}, {} given",
+                    name,
+                    word,
+                    n,
+                    if n == 1 { "" } else { "s" },
+                    got
+                ),
+                0,
+            )
+        };
+        let mut slot: Vec<Option<Cell>> = vec![None; n_fixed];
+        let mut extra_pos: Vec<Cell> = Vec::new();
+        for (i, c) in args.cells.iter().enumerate() {
+            if i < n_fixed {
+                slot[i] = Some(c.clone());
+            } else {
+                extra_pos.push(c.clone());
+            }
+        }
+        if !variadic && !extra_pos.is_empty() {
+            return Err(arity_err(args.cells.len(), true));
+        }
+        // `assert(description: X)` with no positional/assertion arg hits
+        // a Zend arg-parsing quirk that reports an overwrite (assert.phpt).
+        if name == "assert" && args.cells.is_empty() {
+            if let Some((n, ..)) = args.named.iter().find(|(n, ..)| n == "description") {
+                if !args.named.iter().any(|(n, ..)| n == "assertion") {
+                    return Err(PhpError::uncaught(
+                        "Error",
+                        format!("Named parameter ${} overwrites previous argument", n),
+                        0,
+                    ));
+                }
+            }
+        }
+        let mut any_fixed_named = false;
+        for (n, c, ..) in &args.named {
+            match params[..n_fixed]
+                .iter()
+                .position(|(pn, _)| *pn == n.as_str())
+            {
+                Some(j) if slot[j].is_some() => {
+                    return Err(PhpError::uncaught(
+                        "Error",
+                        format!("Named parameter ${} overwrites previous argument", n),
+                        0,
+                    ))
+                }
+                Some(j) => {
+                    slot[j] = Some(c.clone());
+                    any_fixed_named = true;
+                }
+                None if variadic => extra_pos.push(c.clone()),
+                None => {
+                    return Err(PhpError::uncaught(
+                        "Error",
+                        format!("Unknown named parameter ${}", n),
+                        0,
+                    ))
+                }
+            }
+        }
+        // Materialize through the last bound slot: interior gaps take
+        // the param default (an "unknown default" param errors instead),
+        // unbound required params throw ArgumentCountError, unbound
+        // optional tail params are omitted.
+        let last_bound = slot
+            .iter()
+            .rposition(|s| s.is_some())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let mut out: Vec<Cell> = Vec::new();
+        for (i, s) in slot.iter().enumerate() {
+            match s {
+                Some(c) => out.push(c.clone()),
+                None if matches!(params[i].1, BDef::Req) => {
+                    if any_fixed_named {
+                        return Err(PhpError::uncaught(
+                            "ArgumentCountError",
+                            format!(
+                                "{}(): Argument #{} (${}) not passed",
+                                name,
+                                i + 1,
+                                params[i].0
+                            ),
+                            0,
+                        ));
+                    }
+                    return Err(arity_err(args.cells.len(), false));
+                }
+                None if matches!(params[i].1, BDef::Unk) && i < last_bound => {
+                    return Err(PhpError::uncaught(
+                        "ArgumentCountError",
+                        format!(
+                            "{}(): Argument #{} (${}) must be passed explicitly, because the default value is not known",
+                            name,
+                            i + 1,
+                            params[i].0
+                        ),
+                        0,
+                    ));
+                }
+                None if i < last_bound => out.push(cell(params[i].1.val())),
+                None => break,
+            }
+        }
+        out.extend(extra_pos);
+        Ok(out)
+    }
+
+    fn fail<T>(&mut self, e: PhpError) -> Result<T, PhpError> {
+        self.last_err_file = self.diag_file();
+        if let ErrorKind::Uncaught { class } = e.kind {
+            // Errors raised mid-const-expr get a pseudo-frame for the
+            // constant expression itself (property_initializer_scope_002:
+            // `#0 %s(%d): [constant expression]()`).
+            let e = if self.class_const_ctx > 0 {
+                let fr = format!(
+                    "{}({}): [constant expression]()",
+                    self.diag_file(),
+                    self.cur_line
+                );
+                let mut frames = e.trace.clone().unwrap_or_default();
+                frames.insert(0, fr);
+                PhpError {
+                    trace: Some(frames),
+                    ..e
+                }
+            } else {
+                e
+            };
+            // Internal errors raised as exceptions become real throwables so
+            // userland `catch` blocks can intercept them.
+            let v = self.exception(class, &e.message);
+            if let Value::Object(o) = &v {
+                if let Some(ObjectInternal::Exception {
+                    trace,
+                    thrown,
+                    line,
+                    full_msg,
+                    ..
+                }) = &mut o.borrow_mut().internal
+                {
+                    if let Some(frames) = &e.trace {
+                        let mut t = String::new();
+                        for (i, f) in frames.iter().enumerate() {
+                            t.push_str(&format!("#{} {}\n", i, f));
+                        }
+                        t.push_str(&format!("#{} {{main}}", frames.len()));
+                        *trace = t;
+                    }
+                    if let Some(l) = e.thrown_line {
+                        *thrown = l as u32;
+                        *line = l as u32;
+                    }
+                    if let Some(m) = &e.display_msg {
+                        *full_msg = m.clone();
+                    }
+                }
+            }
+            self.pending_exception = Some(v);
+            return Err(PhpError {
+                trace: None,
+                thrown_line: None,
+                display_msg: None,
+                kind: ErrorKind::Throw,
+                message: e.message,
+                line: e.line,
+            });
+        }
+        Err(e)
+    }
+
+    pub fn exec_block(&mut self, stmts: &[Stmt]) -> Flow {
+        // goto labels bind at the statement-list scope they appear in —
+        // a goto bubbling up from nested control flow lands here.
+        let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (i, s) in stmts.iter().enumerate() {
+            if let Stmt::Label(n) = s {
+                labels.entry(n.as_str()).or_insert(i);
+            }
+        }
+        let mut i = 0;
+        while i < stmts.len() {
+            let s = &stmts[i];
+            i += 1;
+            // memory_limit fires between statements (bug45392).
+            let limit = self.ini_bytes("memory_limit");
+            if limit > 0 && self.mem_used as i64 > limit {
+                self.mem_exceeded = true;
+                return self.err_flow(PhpError::fatal(
+                    format!(
+                        "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
+                        limit, self.mem_last
+                    ),
+                    self.cur_line,
+                ));
+            }
+            if let Some(d) = self.deadline {
+                if std::time::Instant::now() > d {
+                    let secs = self.deadline_secs;
+                    return self.err_flow(PhpError::fatal(
+                        format!(
+                            "Maximum execution time of {} second{} exceeded",
+                            secs,
+                            if secs == 1 { "" } else { "s" }
+                        ),
+                        self.cur_line,
+                    ));
+                }
+            }
+            match self.exec(s) {
+                Flow::Normal => {}
+                Flow::Goto(l) => match labels.get(l.as_str()) {
+                    Some(&t) => i = t + 1,
+                    None => return Flow::Goto(l),
+                },
+                f => return f,
+            }
+        }
+        Flow::Normal
+    }
+
+    fn exec(&mut self, s: &Stmt) -> Flow {
+        match s {
+            Stmt::Line(l) => {
+                self.cur_line = *l;
+                Flow::Normal
+            }
+            Stmt::Diag { level, msg, line } => {
+                self.cur_line = *line;
+                let r = match *level {
+                    "Warning" => self.warn(msg),
+                    "Notice" => self.notice(msg),
+                    _ => self.deprecated(msg),
+                };
+                match r {
+                    Ok(()) => Flow::Normal,
+                    Err(e) => self.err_flow(e),
+                }
+            }
+            Stmt::Deprecated { msg, line } => {
+                self.cur_line = *line;
+                match self.deprecated(msg) {
+                    Ok(()) => Flow::Normal,
+                    Err(e) => self.err_flow(e),
+                }
+            }
+            Stmt::Inline(t) => {
+                self.emit(t);
+                Flow::Normal
+            }
+            Stmt::Echo(args) => {
+                for a in args {
+                    match self.eval(a) {
+                        Ok(v) => match self.conv_bytes(&v) {
+                            Ok(s) => self.emit_bytes(&s),
+                            Err(e) => return self.err_flow(e),
+                        },
+                        Err(e) => return self.err_flow(e),
+                    }
+                }
+                Flow::Normal
+            }
+            Stmt::Expr(e) => match e {
+                // A lone `$x;` compiles to a dead FREE op in Zend — no
+                // undefined-variable warning (first_class_callable_dynamic).
+                Expr::Var(n) if self.var_lookup(n).is_none() => Flow::Normal,
+                _ => {
+                    let base = self.expr_temps.len();
+                    // A previous statement's `return $lval` can leave a
+                    // stale last_ret_cell pinned to a real storage cell
+                    // (inflating its strong_count → `&` in var_dump);
+                    // only the current statement may consume it.
+                    self.last_ret_cell = None;
+                    let r = self.eval(e);
+                    match r {
+                        Ok(v) => {
+                            // A discarded temporary object reaches
+                            // refcount 0 here — Zend runs its
+                            // __destruct immediately (methods_003
+                            // `new bar;`). strong_count 2 = the
+                            // statement value + its expr_temps slot.
+                            if let Value::Object(o) = &v {
+                                if Rc::strong_count(o) == 2
+                                    && self
+                                        .find_method_in(&o.borrow().class, "__destruct")
+                                        .is_some()
+                                    && self.mark_destructed(o)
+                                {
+                                    if let Err(e) = self.method_invoke(
+                                        o.clone(),
+                                        "__destruct",
+                                        CallArgs::empty(),
+                                    ) {
+                                        self.expr_temps.truncate(base);
+                                        return self.err_flow(e);
+                                    }
+                                }
+                            }
+                            // Statement end frees expression
+                            // temporaries; a dtor exception propagates
+                            // through the statement (bug29368_2).
+                            match self.sweep_expr_temps(base) {
+                                Ok(()) => Flow::Normal,
+                                Err(e) => self.err_flow(e),
+                            }
+                        }
+                        // On unwind the live temporaries die in order
+                        // before the exception propagates
+                        // (bug29368_3).
+                        Err(e) => {
+                            let _ = self.sweep_expr_temps(base);
+                            self.err_flow(e)
+                        }
+                    }
+                }
+            },
+            Stmt::Block(b) => self.exec_block(b),
+            Stmt::If { cond, then, else_ } => match self.eval(cond) {
+                Ok(c) => {
+                    if c.is_truthy() {
+                        self.exec_block(then)
+                    } else {
+                        self.exec_block(else_)
+                    }
+                }
+                Err(e) => self.err_flow(e),
+            },
+            Stmt::While { cond, body } => self.exec_while(cond, body, false),
+            Stmt::DoWhile { body, cond } => self.exec_while(cond, body, true),
+            Stmt::For {
+                init,
+                cond,
+                inc,
+                body,
+            } => {
+                for e in init {
+                    if let Err(e) = self.eval(e) {
+                        return self.err_flow(e);
+                    }
+                }
+                loop {
+                    if !cond.is_empty() {
+                        match self.eval(&cond[0]) {
+                            Ok(c) if !c.is_truthy() => break,
+                            Err(e) => return self.err_flow(e),
+                            _ => {}
+                        }
+                    }
+                    match self.exec_block(body) {
+                        Flow::Break(0) | Flow::Break(1) => break,
+                        Flow::Break(n) => return Flow::Break(n - 1),
+                        Flow::Continue(0) | Flow::Continue(1) => {}
+                        Flow::Continue(n) => return Flow::Continue(n - 1),
+                        Flow::Normal => {}
+                        f => return f,
+                    }
+                    for e in inc {
+                        if let Err(e) = self.eval(e) {
+                            return self.err_flow(e);
+                        }
+                    }
+                }
+                Flow::Normal
+            }
+            Stmt::Foreach {
+                arr,
+                key,
+                val,
+                body,
+            } => self.exec_foreach(arr, key, val, body),
+            Stmt::Switch { cond, cases } => {
+                let cv = match self.eval(cond) {
+                    Ok(v) => v,
+                    Err(e) => return self.err_flow(e),
+                };
+                // Find first matching case (loose ==); default is fallback.
+                let mut start: Option<usize> = None;
+                let mut default_idx: Option<usize> = None;
+                for (i, (c, _)) in cases.iter().enumerate() {
+                    match c {
+                        Some(ce) => {
+                            if start.is_none() {
+                                match self.eval(ce) {
+                                    Ok(v) => {
+                                        if compare(&cv, &v) == Ordering::Equal {
+                                            start = Some(i);
+                                        }
+                                    }
+                                    Err(e) => return self.err_flow(e),
+                                }
+                            }
+                        }
+                        None => default_idx = Some(i),
+                    }
+                }
+                let start = start.or(default_idx);
+                if let Some(si) = start {
+                    // Run all cases from `start`, stopping at Break.
+                    for (_, body) in &cases[si..] {
+                        match self.exec_block(body) {
+                            Flow::Break(0) | Flow::Break(1) => return Flow::Normal,
+                            Flow::Break(n) => return Flow::Break(n - 1),
+                            Flow::Normal => {}
+                            f => return f,
+                        }
+                    }
+                }
+                Flow::Normal
+            }
+            Stmt::Function(d) => {
+                if let Err(e) = self.decl_type_checks(&d.name, d, None) {
+                    return self.err_flow(e);
+                }
+                let mut d = d.clone();
+                d.file = self.cur_file.clone();
+                self.functions.insert(d.name.to_lowercase(), Rc::new(d));
+                Flow::Normal
+            }
+            Stmt::Class(d) => {
+                for m in &d.methods {
+                    let fname = format!("{}::{}", d.name, m.decl.name);
+                    if let Err(e) =
+                        self.decl_type_checks(&fname, &m.decl, Some((&d.name, d.parent.clone())))
+                    {
+                        return self.err_flow(e);
+                    }
+                }
+                let mut d = (**d).clone();
+                for m in &mut d.methods {
+                    let mut mm = (**m).clone();
+                    mm.decl.file = self.cur_file.clone();
+                    *m = Rc::new(mm);
+                }
+                if self.early_bound_classes.contains(&d.name.to_lowercase()) {
+                    return Flow::Normal;
+                }
+                if let Err(e) = self.register_class(Rc::new(d)) {
+                    return self.err_flow(e);
+                }
+                Flow::Normal
+            }
+            Stmt::Static { vars, line } => {
+                let key = self.fn_statics_key();
+                for (name, default) in vars {
+                    // `static $a` redeclared at a different site in the same
+                    // scope is a compile fatal (tests/lang/static_basic_002).
+                    let prev = self
+                        .static_decls
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(name.clone(), *line);
+                    if prev.is_some_and(|l| l != *line) {
+                        return self.err_flow(PhpError::fatal(
+                            format!("Duplicate declaration of static variable ${}", name),
+                            self.cur_line,
+                        ));
+                    }
+                    // Statics live per-function-decl: inside a function
+                    // they never fall back to the top-level table
+                    // (static_variation_001).
+                    let exists = {
+                        let table = if self.stack.is_empty() {
+                            Some(&self.global_statics)
+                        } else {
+                            self.statics.get(&key)
+                        };
+                        table.and_then(|t| t.get(name).cloned())
+                    };
+                    let cellv = match exists {
+                        Some(c) => c,
+                        None => {
+                            let v = match default {
+                                // Runtime init: an unresolved const is a
+                                // catchable Error, not silent NULL
+                                // (bug79778).
+                                Some(d) => match self.eval_const(d) {
+                                    Ok(v) => v,
+                                    Err(e) => return self.err_flow(e),
+                                },
+                                None => Value::Null,
+                            };
+                            let c = cell(v);
+                            if self.stack.is_empty() {
+                                self.global_statics.insert(name.clone(), c.clone());
+                            } else {
+                                self.statics
+                                    .entry(key.clone())
+                                    .or_default()
+                                    .insert(name.clone(), c.clone());
+                            }
+                            c
+                        }
+                    };
+                    self.cur().vars.insert(name.clone(), cellv);
+                }
+                Flow::Normal
+            }
+            Stmt::Return(e) => {
+                let ret_by_ref = self.stack.last().map(|f| f.ret_by_ref).unwrap_or(false);
+                if ret_by_ref {
+                    if let Some(e) = e {
+                        // `function &f() { return $x; }` — the returned cell is
+                        // bound, not copied (returnByReference tests).
+                        let is_lval = matches!(
+                            e,
+                            Expr::Var(_)
+                                | Expr::Index { .. }
+                                | Expr::Prop { .. }
+                                | Expr::VarVar(_)
+                                | Expr::StaticProp { .. }
+                        );
+                        if is_lval {
+                            let c = match self.eval_cell(e) {
+                                Ok(c) => c,
+                                Err(e) => return self.err_flow(e),
+                            };
+                            self.last_ret_cell = Some(c.clone());
+                            return Flow::Return(c.borrow().clone());
+                        }
+                        if matches!(
+                            e,
+                            Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. }
+                        ) {
+                            // `return &f()` chains through when callee returns
+                            // by reference (returnByReference.006/009).
+                            let (c, was_ref) = match self.eval_call_cell(e) {
+                                Ok(t) => t,
+                                Err(e) => return self.err_flow(e),
+                            };
+                            if was_ref {
+                                self.last_ret_cell = Some(c.clone());
+                            } else if let Err(e) = self
+                                .notice("Only variable references should be returned by reference")
+                            {
+                                return self.err_flow(e);
+                            }
+                            return Flow::Return(c.borrow().clone());
+                        }
+                        if let Err(e) =
+                            self.notice("Only variable references should be returned by reference")
+                        {
+                            return self.err_flow(e);
+                        }
+                    }
+                }
+                let v = match e {
+                    Some(e) => match self.eval(e) {
+                        Ok(v) => v,
+                        Err(e) => return self.err_flow(e),
+                    },
+                    None => Value::Null,
+                };
+                Flow::Return(v)
+            }
+            Stmt::Break(e) => {
+                let n = match e {
+                    Some(e) => self.eval(e).map(|v| v.to_int()).unwrap_or(1).max(1) as u32,
+                    None => 1,
+                };
+                Flow::Break(n)
+            }
+            Stmt::Continue(e) => {
+                let n = match e {
+                    Some(e) => self.eval(e).map(|v| v.to_int()).unwrap_or(1).max(1) as u32,
+                    None => 1,
+                };
+                Flow::Continue(n)
+            }
+            Stmt::Goto(l) => Flow::Goto(l.clone()),
+            Stmt::Label(_) => Flow::Normal,
+            Stmt::Global(names) => {
+                // Bind each local name to its global cell. `$$x` resolves
+                // the name dynamically (bug24396).
+                for e in names {
+                    let name = match e {
+                        Expr::Var(n) => n.clone(),
+                        // `global $$b` — the global name is $b's value.
+                        Expr::VarVar(inner) => match self.eval(inner) {
+                            Ok(v) => match self.conv_str(&v) {
+                                Ok(s) => s,
+                                Err(e) => return self.err_flow(e),
+                            },
+                            Err(e) => return self.err_flow(e),
+                        },
+                        other => match self.eval(other) {
+                            Ok(v) => match self.conv_str(&v) {
+                                Ok(s) => s,
+                                Err(e) => return self.err_flow(e),
+                            },
+                            Err(e) => return self.err_flow(e),
+                        },
+                    };
+                    let gcell = self
+                        .globals
+                        .vars
+                        .entry(name.clone())
+                        .or_insert_with(|| cell(Value::Null))
+                        .clone();
+                    self.cur().vars.insert(name, gcell);
+                }
+                Flow::Normal
+            }
+            Stmt::Unset(xs) => {
+                for x in xs {
+                    match x {
+                        Expr::Var(n) => {
+                            if let Some(c) = self.cur().vars.remove(n) {
+                                // Removing the last handle runs
+                                // __destruct immediately — for a
+                                // Callable that also decrefs its bound
+                                // $this and captures (closure_005).
+                                let v = c.borrow().clone();
+                                drop(c);
+                                if let Err(e) = self.destruct_dying_value(&v) {
+                                    return self.err_flow(e);
+                                }
+                            }
+                        }
+                        Expr::VarVar(inner) => {
+                            if let Ok(n) = self.eval(inner) {
+                                if let Ok(name) = self.conv_str(&n) {
+                                    self.cur().vars.remove(&name);
+                                }
+                            }
+                        }
+                        Expr::Index { e, i } => {
+                            let _ = self.unset_index(e, i.as_deref());
+                        }
+                        Expr::Prop { .. } => {
+                            if let Err(e) = self.unset_prop(x) {
+                                return self.err_flow(e);
+                            }
+                        }
+                        Expr::StaticProp { class, name } => {
+                            if let Ok(pn) = self.prop_name(name) {
+                                if let Ok(cls) = self.class_of(class) {
+                                    cls.statics.borrow_mut().remove(&pn);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Flow::Normal
+            }
+            Stmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                let flow = self.exec_block(body);
+                let out = match flow {
+                    Flow::Throw(v) => {
+                        let mut result = Flow::Throw(v.clone());
+                        for c in catches {
+                            if self.catch_matches(&v, &c.types) {
+                                if let Some(var) = &c.var {
+                                    // Binding the catch var is a normal
+                                    // assign — a `&`-bound typed ref
+                                    // gates it and the TypeError
+                                    // propagates out of the try
+                                    // (typed_properties_108).
+                                    match self.var_set_gated(var, v.clone(), true) {
+                                        Ok(_) => result = self.exec_block(&c.body),
+                                        Err(e) => result = self.err_flow(e),
+                                    }
+                                } else {
+                                    result = self.exec_block(&c.body);
+                                }
+                                break;
+                            }
+                        }
+                        result
+                    }
+                    f => f,
+                };
+                if let Some(fb) = finally {
+                    match self.exec_block(fb) {
+                        Flow::Normal => out,
+                        f => f,
+                    }
+                } else {
+                    out
+                }
+            }
+            Stmt::Namespace(n) => {
+                // Top-level scope follows `namespace` declarations —
+                // unqualified calls/consts resolve relative to it.
+                self.globals.ns = n.clone();
+                Flow::Normal
+            }
+            Stmt::Use(names) => {
+                // `use A;` / `use \B;` with no compound name has no
+                // effect and warns (namespaces/ns_033).
+                for n in names {
+                    if !n.contains('\\') {
+                        if let Err(e) = self.warn(&format!(
+                            "The use statement with non-compound name '{}' has no effect",
+                            n
+                        )) {
+                            return self.err_flow(e);
+                        }
+                    }
+                }
+                Flow::Normal
+            }
+            Stmt::ConstDecl(defs) => {
+                for (n, e) in defs {
+                    // TRUE/FALSE/NULL are reserved — `const NULL` is a
+                    // compile-time fatal (namespaces/ns_075).
+                    let short = n.rsplit('\\').next().unwrap_or(n);
+                    if matches!(short.to_uppercase().as_str(), "TRUE" | "FALSE" | "NULL") {
+                        return self.err_flow(PhpError::fatal(
+                            format!("Cannot redeclare constant '{}'", short),
+                            self.cur_line,
+                        ));
+                    }
+                    match self.eval_const(e) {
+                        Ok(v) => self.define_const(n, v),
+                        Err(e) => return self.err_flow(e),
+                    }
+                }
+                Flow::Normal
+            }
+            Stmt::Declare { name, value } => {
+                if name.eq_ignore_ascii_case("strict_types")
+                    && matches!(self.eval(value), Ok(Value::Int(1)))
+                {
+                    self.strict_files.insert(self.cur_file.clone());
+                }
+                Flow::Normal
+            }
+        }
+    }
+
+    fn catch_matches(&mut self, v: &Value, types: &[String]) -> bool {
+        if types.is_empty() {
+            return false;
+        }
+        if let Value::Object(o) = v {
+            let cls = o.borrow().class.clone();
+            for t in types {
+                if self.is_a(&cls, t) {
+                    return true;
+                }
+            }
+            false
+        } else {
+            false
+        }
+    }
+
+    /// `class X` is-a `name` (name = class or interface), parents included.
+    fn is_a(&mut self, cls: &Rc<PhpClass>, name: &str) -> bool {
+        let lname = name.trim_start_matches('\\').to_lowercase();
+        let mut cur = Some(cls.clone());
+        while let Some(c) = cur {
+            if c.name().eq_ignore_ascii_case(&lname) {
+                return true;
+            }
+            // Ancestor NAME match: a parent still mid-registration (an
+            // autoload cycle: `new C` → C's sig check autoloads D →
+            // `class D extends C`) isn't in `classes` yet, but its name
+            // is a known ancestor (abstract_method_9).
+            if c.decl
+                .parent
+                .as_deref()
+                .is_some_and(|p| p.trim_start_matches('\\').eq_ignore_ascii_case(&lname))
+            {
+                return true;
+            }
+            for i in &c.decl.implements {
+                if i.eq_ignore_ascii_case(&lname) {
+                    return true;
+                }
+                if let Some(iface) = self.interfaces.get(&i.to_lowercase()) {
+                    let mut stack = vec![iface.clone()];
+                    while let Some(f) = stack.pop() {
+                        if f.name.eq_ignore_ascii_case(&lname) {
+                            return true;
+                        }
+                        for p in &f.implements {
+                            if let Some(ff) = self.interfaces.get(&p.to_lowercase()) {
+                                stack.push(ff.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            let nxt = c
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+            cur = nxt;
+        }
+        false
+    }
+
+    /// File diagnostics attribute to: the executing frame's declaring
+    /// file, else the file currently being included/run (warnings inside
+    /// autoloaded/library code report the library file, not the caller).
+    fn diag_file(&self) -> String {
+        self.stack
+            .last()
+            .map(|f| f.file.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.cur_file.clone())
+    }
+
+    fn exec_while(&mut self, cond: &Expr, body: &[Stmt], do_first: bool) -> Flow {
+        if do_first {
+            match self.exec_block(body) {
+                Flow::Break(0) | Flow::Break(1) => return Flow::Normal,
+                Flow::Break(n) => return Flow::Break(n - 1),
+                Flow::Normal | Flow::Continue(_) => {}
+                f => return f,
+            }
+        }
+        loop {
+            match self.eval(cond) {
+                Ok(c) if !c.is_truthy() => break,
+                Err(e) => return self.err_flow(e),
+                _ => {}
+            }
+            match self.exec_block(body) {
+                Flow::Break(0) | Flow::Break(1) => break,
+                Flow::Break(n) => return Flow::Break(n - 1),
+                Flow::Continue(0) | Flow::Continue(1) => continue,
+                Flow::Continue(n) => return Flow::Continue(n - 1),
+                Flow::Normal => {}
+                f => return f,
+            }
+        }
+        Flow::Normal
+    }
+
+    fn exec_foreach(
+        &mut self,
+        arr: &Expr,
+        key: &Option<ForeachKey>,
+        val: &ForeachTarget,
+        body: &[Stmt],
+    ) -> Flow {
+        if matches!(key, Some(ForeachKey::ByRef)) {
+            return self.err_flow(PhpError::fatal(
+                "Key element cannot be a reference",
+                self.cur_line,
+            ));
+        }
+        let src = match self.eval(arr) {
+            Ok(v) => v,
+            Err(e) => return self.err_flow(e),
+        };
+        match src {
+            Value::Array(rc) => {
+                let by_ref = matches!(val, ForeachTarget::ByRef(_));
+                // `&$v` foreach iterates the live array — appends and
+                // removals during the loop are observed (foreachLoop.009).
+                let live = by_ref;
+                if live {
+                    // PHP separates a shared (non-reference) array when the
+                    // loop takes references to its elements, so &-writes
+                    // don't leak into other copies (foreachLoop.016). An
+                    // is_ref array is iterated live as-is.
+                    let rc = if Rc::strong_count(&rc) > 1 && !rc.borrow().is_ref {
+                        let sep: Vec<(ArrKey, Cell)> = rc
+                            .borrow()
+                            .entries
+                            .iter()
+                            .map(|(k, c)| (k.clone(), cell(c.borrow().clone())))
+                            .collect();
+                        let nr = Rc::new(RefCell::new(PhpArray {
+                            entries: sep,
+                            next: rc.borrow().next,
+                            is_ref: false,
+                            iter_pos: rc.borrow().iter_pos,
+                        }));
+                        if let Ok(c) = self.eval_cell(arr) {
+                            *c.borrow_mut() = Value::Array(nr.clone());
+                        }
+                        nr
+                    } else {
+                        rc
+                    };
+                    rc.borrow_mut().is_ref = true;
+                    // PHP's live iterator tracks "the element after the
+                    // current one in logical order" — prepends (unshift) and
+                    // renumbering (shift) don't move it, tombstoned current
+                    // elements still anchor it (foreachLoop.013/.015).
+                    let mut last: Option<Cell> = None;
+                    loop {
+                        let next = {
+                            let a = rc.borrow();
+                            let live_at = |from: usize| -> Option<(ArrKey, Cell)> {
+                                a.entries[from..]
+                                    .iter()
+                                    .find(|(k, _)| !matches!(k, ArrKey::Tomb))
+                                    .cloned()
+                            };
+                            match &last {
+                                None => live_at(0),
+                                Some(lc) => {
+                                    match a.entries.iter().position(|(_, c)| Rc::ptr_eq(c, lc)) {
+                                        Some(i) => live_at(i + 1),
+                                        // Current element gone entirely —
+                                        // restart at the first live element.
+                                        None => live_at(0),
+                                    }
+                                }
+                            }
+                        };
+                        let Some((k, c)) = next else { break };
+                        last = Some(c.clone());
+                        if let Some(ForeachKey::Var(kn)) = key {
+                            self.var_set(kn, key_value(&k));
+                        }
+                        match val {
+                            ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                            ForeachTarget::ByRef(n) => {
+                                if let Some(f) = self.readonly_ref_error(&c) {
+                                    return f;
+                                }
+                                self.cur().vars.insert(n.clone(), c);
+                            }
+                            ForeachTarget::Lvalue(e) => {
+                                let _ = self.store(e, c.borrow().clone());
+                            }
+                            ForeachTarget::List(items) => {
+                                if self.foreach_list(items, &c.borrow().clone()).is_err() {}
+                            }
+                        }
+                        match self.exec_block(body) {
+                            Flow::Break(0) | Flow::Break(1) => break,
+                            Flow::Break(n) => return Flow::Break(n - 1),
+                            Flow::Continue(0) | Flow::Continue(1) => continue,
+                            Flow::Continue(n) => return Flow::Continue(n - 1),
+                            Flow::Normal => {}
+                            f => return f,
+                        }
+                    }
+                    return Flow::Normal;
+                }
+                // Snapshot (key, cell) pairs — PHP iterates a copy for
+                // value-iteration but shares cells for &-iteration.
+                let snapshot: Vec<(ArrKey, Cell)> = if by_ref {
+                    rc.borrow().iter().cloned().collect()
+                } else {
+                    // .iter() skips tombstoned buckets — a value-foreach
+                    // never sees shifted/unset elements.
+                    rc.borrow()
+                        .iter()
+                        .map(|(k, c)| (k.clone(), cell(c.borrow().clone())))
+                        .collect()
+                };
+                for (idx, (k, c)) in snapshot.into_iter().enumerate() {
+                    self.cur_line = idx;
+                    if let Some(ForeachKey::Var(kn)) = key {
+                        self.var_set(kn, key_value(&k));
+                    }
+                    match val {
+                        ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                        ForeachTarget::ByRef(n) => {
+                            if let Some(f) = self.readonly_ref_error(&c) {
+                                return f;
+                            }
+                            self.cur().vars.insert(n.clone(), c);
+                        }
+                        ForeachTarget::Lvalue(e) => {
+                            let _ = self.store(e, c.borrow().clone());
+                        }
+                        ForeachTarget::List(items) => {
+                            if self.foreach_list(items, &c.borrow().clone()).is_err() {}
+                        }
+                    }
+                    match self.exec_block(body) {
+                        Flow::Break(0) | Flow::Break(1) => break,
+                        Flow::Break(n) => return Flow::Break(n - 1),
+                        Flow::Continue(0) | Flow::Continue(1) => continue,
+                        Flow::Continue(n) => return Flow::Continue(n - 1),
+                        Flow::Normal => {}
+                        f => return f,
+                    }
+                }
+                Flow::Normal
+            }
+            Value::Object(o) => {
+                // IteratorAggregate → getIterator() then iterate that
+                // (its result may itself be an IteratorAggregate — loop).
+                if self.obj_is_a(&o, "IteratorAggregate") {
+                    let mut cur = o.clone();
+                    loop {
+                        let it_obj =
+                            match self.method_invoke(cur.clone(), "getIterator", CallArgs::empty())
+                            {
+                                Ok(v) => v,
+                                Err(e) => return self.err_flow(e),
+                            };
+                        match it_obj {
+                            Value::Object(io) if self.obj_is_a(&io, "IteratorAggregate") => {
+                                cur = io;
+                            }
+                            // getIterator() must return a Traversable.
+                            Value::Object(io) if self.obj_is_a(&io, "Iterator") => {
+                                return self.exec_foreach_iter(io, key, val, body);
+                            }
+                            _ => {
+                                let cls_name = cur.borrow().class.name().to_string();
+                                let v = self.exception(
+                                    "Exception",
+                                    &format!(
+                                        "Objects returned by {}::getIterator() must be traversable or implement interface Iterator",
+                                        cls_name
+                                    ),
+                                );
+                                return Flow::Throw(v);
+                            }
+                        }
+                    }
+                }
+                if self.obj_is_a(&o, "Iterator") {
+                    // `function &gen()` generators DO support
+                    // `foreach .. as &$v` — their yields are cells
+                    // (typed_properties_033/034). An ArrayIterator's
+                    // entries are already cells too (113/115).
+                    let gen_byref = match &o.borrow().internal {
+                        Some(ObjectInternal::Generator(st)) => st.borrow().by_ref,
+                        Some(ObjectInternal::ArrayIter { .. }) => true,
+                        _ => false,
+                    };
+                    if matches!(val, ForeachTarget::ByRef(_)) && !gen_byref {
+                        let v = self.exception(
+                            "Error",
+                            "An iterator cannot be used with foreach by reference",
+                        );
+                        let e = self.throw(v);
+                        return self.err_flow(e);
+                    }
+                    return self.exec_foreach_iter(o.clone(), key, val, body);
+                }
+                // Plain object: iterate the property table in
+                // declaration order — backed slots plus *virtual* hooked
+                // props (which have no slot but still yield their get
+                // value), with dynamic props appended (property_hooks/
+                // foreach). unset() during the loop tombstones a slot
+                // (foreachLoopObjects.004/.005).
+                let cls = o.borrow().class.clone();
+                let (spec, decl_names) = self.object_foreach_spec(&o);
+                let mut pos = 0usize;
+                let mut dyn_pos = 0usize;
+                loop {
+                    // After the declared spec runs out, scan prop_order
+                    // live for dynamic props — ones added during the
+                    // loop are seen (foreach_002); declared names hide
+                    // same-named dynamics entirely.
+                    let (ent, resolved_decl) = if pos < spec.len() {
+                        (spec[pos].clone(), true)
+                    } else {
+                        let mut found = None;
+                        loop {
+                            let k = {
+                                let ob = o.borrow();
+                                ob.prop_order.get(dyn_pos).cloned()
+                            };
+                            let Some(k) = k else { break };
+                            dyn_pos += 1;
+                            let plain = k
+                                .strip_prefix('\0')
+                                .and_then(|r| r.split('\0').nth(1))
+                                .unwrap_or(k.as_str());
+                            if decl_names.contains(plain) {
+                                continue;
+                            }
+                            if !spec.iter().any(|(_, sk, _)| sk == &k) {
+                                found = Some((k.clone(), k.clone(), k.clone()));
+                                break;
+                            }
+                        }
+                        match found {
+                            Some(e) => (e, false),
+                            None => break,
+                        }
+                    };
+                    pos += 1;
+                    let (n, slot_key, dname) = ent;
+                    // Spec entries are already scope-resolved; dynamics
+                    // are runtime slots checked against the caller.
+                    if !resolved_decl && !self.prop_visible(&cls, &dname) {
+                        continue;
+                    }
+                    // Resolve this entry: hooked props (backed or
+                    // virtual) read/write through their hooks; plain
+                    // props read the live slot (unset() tombstones).
+                    let mut writeback: Option<(PropDecl, MergedHooks, Value)> = None;
+                    let c: Cell = if let Some((pd, hs)) = self.hooked_prop(&o, &dname) {
+                        // Write-only *virtual* hooked props aren't in the
+                        // readable property table — foreach skips them
+                        // (virtualSetOnly in property_hooks/foreach).
+                        // A set-only BACKED prop still has a table slot
+                        // and iterates as its raw value (gh15187).
+                        if !hs.iter().any(|(h, _)| h.is_get && h.body.is_some())
+                            && !self.backed_for(&o, &dname, &hs)
+                        {
+                            continue;
+                        }
+                        if !hs.iter().any(|(h, _)| h.is_get && h.body.is_some()) {
+                            // Set-only backed prop: iterate the raw
+                            // backing slot, no hook write-back. An
+                            // uninitialized typed slot isn't iterated
+                            // (gh15187_2).
+                            match o.borrow().props.get(&slot_key).cloned() {
+                                Some(c) => c,
+                                None if pd.ty.is_some() => continue,
+                                None => cell(Value::Null),
+                            }
+                        } else if matches!(val, ForeachTarget::ByRef(_)) {
+                            // By-ref binds a managed reference: virtual
+                            // props read via get and write back through
+                            // set; a backed prop is only bindable when a
+                            // `&get` hands back its real backing cell —
+                            // otherwise the reference can't be created
+                            // (foreach_val_to_ref, foreach_002).
+                            let backed = self.backed_for(&o, &dname, &hs);
+                            let by_ref_get = hs
+                                .iter()
+                                .find(|(h, _)| h.is_get && h.by_ref && h.body.is_some());
+                            if backed && by_ref_get.is_none() {
+                                let dc = self
+                                    .decl_prop(&o, &dname)
+                                    .map(|(_, c)| c.name().to_string())
+                                    .unwrap_or_else(|| cls.name().to_string());
+                                let v = self.exception(
+                                    "Error",
+                                    &format!(
+                                        "Cannot create reference to property {}::${}",
+                                        dc, dname
+                                    ),
+                                );
+                                let e = self.throw(v);
+                                return self.err_flow(e);
+                            }
+                            if let Some((h, hc)) = by_ref_get {
+                                self.last_ret_cell = None;
+                                match self.run_hook(&o, hc, &dname, h, None) {
+                                    Ok(_) => self
+                                        .last_ret_cell
+                                        .take()
+                                        .unwrap_or_else(|| cell(Value::Null)),
+                                    Err(e) => return self.err_flow(e),
+                                }
+                            } else if hs.iter().any(|(h, _)| !h.is_get && h.body.is_some()) {
+                                let v = match self.hook_read(&o, &pd, &hs) {
+                                    Ok(v) => v,
+                                    Err(e) => return self.err_flow(e),
+                                };
+                                writeback = Some((pd, hs, v.clone()));
+                                cell(v)
+                            } else {
+                                let dc = self
+                                    .decl_prop(&o, &dname)
+                                    .map(|(_, c)| c.name().to_string())
+                                    .unwrap_or_else(|| cls.name().to_string());
+                                let v = self.exception(
+                                    "Error",
+                                    &format!(
+                                        "Cannot create reference to property {}::${}",
+                                        dc, dname
+                                    ),
+                                );
+                                let e = self.throw(v);
+                                return self.err_flow(e);
+                            }
+                        } else {
+                            match self.hook_read(&o, &pd, &hs) {
+                                Ok(v) => cell(v),
+                                Err(e) => return self.err_flow(e),
+                            }
+                        }
+                    } else {
+                        let live = { o.borrow().props.get(&slot_key).cloned() };
+                        match live {
+                            Some(c) => c,
+                            None => continue, // tombstoned by unset()
+                        }
+                    };
+                    // `&$val` binds the prop cell — register it so
+                    // writes stay type-gated (typed_properties_045).
+                    if matches!(val, ForeachTarget::ByRef(_) | ForeachTarget::Lvalue(_)) {
+                        if let Some((pd, dcls)) = self.decl_prop(&o, &dname) {
+                            if let Some(tys) = &pd.ty {
+                                let p = Rc::as_ptr(&c) as usize;
+                                self.typed_slots.insert(
+                                    p,
+                                    (
+                                        c.clone(),
+                                        tys.clone(),
+                                        dcls.name().to_string(),
+                                        dname.clone(),
+                                    ),
+                                );
+                                let sk = self
+                                    .obj_prop_key(&o, &dname)
+                                    .unwrap_or_else(|| dname.clone());
+                                self.slot_anchor
+                                    .insert(p, SlotAnchor::Obj(Rc::downgrade(&o), sk));
+                                self.ref_cells.insert(p);
+                            }
+                        }
+                    }
+                    if let Some(ForeachKey::Var(kn)) = key {
+                        self.var_set(kn, Value::str(n.clone()));
+                    }
+                    match val {
+                        ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                        ForeachTarget::ByRef(n) => {
+                            self.ref_cells.insert(Rc::as_ptr(&c) as usize);
+                            self.cur().vars.insert(n.clone(), c.clone());
+                        }
+                        ForeachTarget::Lvalue(e) => {
+                            let _ = self.store(e, c.borrow().clone());
+                        }
+                        ForeachTarget::List(items) => {
+                            let _ = self.foreach_list(items, &c.borrow().clone());
+                        }
+                    }
+                    match self.exec_block(body) {
+                        Flow::Break(0) | Flow::Break(1) => break,
+                        Flow::Break(n) => return Flow::Break(n - 1),
+                        Flow::Normal | Flow::Continue(0) | Flow::Continue(1) => {}
+                        Flow::Continue(n) => return Flow::Continue(n - 1),
+                        f => return f,
+                    }
+                    // Managed reference: a changed bound value dispatches
+                    // to the set hook (property_hooks/foreach).
+                    if let Some((pd, hs, old)) = writeback.take() {
+                        let nv = c.borrow().clone();
+                        if !crate::value::identical(&nv, &old) {
+                            if let Err(e) = self.hook_write(&o, &pd, &hs, nv) {
+                                return self.err_flow(e);
+                            }
+                        }
+                    }
+                }
+                Flow::Normal
+            }
+            Value::Callable(_) => {
+                // A Closure is an object with no iterable props —
+                // foreach yields nothing (closure_028).
+                Flow::Normal
+            }
+            _ => {
+                if let Err(e) = self.warn(&format!(
+                    "foreach() argument must be of type array|object, {} given",
+                    src.debug_type()
+                )) {
+                    return self.err_flow(e);
+                }
+                Flow::Normal
+            }
+        }
+    }
+
+    /// foreach over an Iterator: rewind → valid → current/key → next.
+    fn exec_foreach_iter(
+        &mut self,
+        it: Rc<RefCell<PhpObject>>,
+        key: &Option<ForeachKey>,
+        val: &ForeachTarget,
+        body: &[Stmt],
+    ) -> Flow {
+        let f = self.exec_foreach_iter_loop(it.clone(), key, val, body);
+        // The iterator's temp dies with the foreach — a `new` captured
+        // only by the iteration frees here, not at statement end
+        // (typed_properties_115: its prop cells must unalias before a
+        // later var_dump counts holders).
+        if Rc::strong_count(&it) == 2 && self.expr_temps.iter().any(|o| Rc::ptr_eq(o, &it)) {
+            self.expr_temps.retain(|o| !Rc::ptr_eq(o, &it));
+            let key = Rc::as_ptr(&it) as usize;
+            if !self.destructed.contains_key(&key)
+                && self
+                    .find_method_in(&it.borrow().class, "__destruct")
+                    .is_some()
+            {
+                self.mark_destructed(&it);
+                if let Err(e) = self.method_invoke(it.clone(), "__destruct", CallArgs::empty()) {
+                    return self.err_flow(e);
+                }
+            }
+        }
+        f
+    }
+
+    fn exec_foreach_iter_loop(
+        &mut self,
+        it: Rc<RefCell<PhpObject>>,
+        key: &Option<ForeachKey>,
+        val: &ForeachTarget,
+        body: &[Stmt],
+    ) -> Flow {
+        if let Err(e) = self.method_invoke(it.clone(), "rewind", CallArgs::empty()) {
+            return self.err_flow(e);
+        }
+        loop {
+            let ok = self
+                .method_invoke(it.clone(), "valid", CallArgs::empty())
+                .map(|v| v.is_truthy())
+                .unwrap_or(false);
+            if !ok {
+                break;
+            }
+            // PHP calls current() before key() on each iteration.
+            let v = self
+                .method_invoke(it.clone(), "current", CallArgs::empty())
+                .unwrap_or(Value::Null);
+            if let Some(ForeachKey::Var(kn)) = key {
+                let k = self
+                    .method_invoke(it.clone(), "key", CallArgs::empty())
+                    .unwrap_or(Value::Null);
+                self.var_set(kn, k);
+            }
+            match val {
+                ForeachTarget::Var(n) => self.var_set(n, v),
+                ForeachTarget::ByRef(n) => {
+                    // A by-ref generator's current() is the yielded
+                    // cell itself — bind to it directly. An
+                    // ArrayIterator binds the backing entry cell —
+                    // prop cells write through the typed gate
+                    // (typed_properties_113/114).
+                    let c = match &it.borrow().internal {
+                        Some(ObjectInternal::Generator(st)) => {
+                            let st = st.borrow();
+                            st.items
+                                .get(st.pos)
+                                .map(|(_, c)| c.clone())
+                                .unwrap_or_else(|| cell(v.clone()))
+                        }
+                        Some(ObjectInternal::ArrayIter { arr, pos, .. }) => arr
+                            .borrow()
+                            .entries
+                            .get(*pos)
+                            .map(|(_, c)| c.clone())
+                            .unwrap_or_else(|| cell(v.clone())),
+                        _ => cell(v),
+                    };
+                    if let Some(f) = self.readonly_ref_error(&c) {
+                        return f;
+                    }
+                    self.ref_cells.insert(Rc::as_ptr(&c) as usize);
+                    self.cur().vars.insert(n.clone(), c);
+                }
+                ForeachTarget::Lvalue(e) => {
+                    let _ = self.store(e, v);
+                }
+                ForeachTarget::List(items) => {
+                    let _ = self.foreach_list(items, &v);
+                }
+            }
+            match self.exec_block(body) {
+                Flow::Break(0) | Flow::Break(1) => break,
+                Flow::Break(n) => return Flow::Break(n - 1),
+                Flow::Continue(0) | Flow::Continue(1) => {}
+                Flow::Continue(n) => return Flow::Continue(n - 1),
+                Flow::Normal => {}
+                f => return f,
+            }
+            if let Err(e) = self.method_invoke(it.clone(), "next", CallArgs::empty()) {
+                return self.err_flow(e);
+            }
+        }
+        Flow::Normal
+    }
+
+    fn foreach_list(&mut self, items: &[Option<ForeachTarget>], v: &Value) -> Result<(), PhpError> {
+        if let Value::Array(a) = v {
+            let a = a.borrow();
+            for (i, t) in items.iter().enumerate() {
+                if let Some(t) = t {
+                    let iv = a.get(&ArrKey::Int(i as i64)).unwrap_or(Value::Null);
+                    match t {
+                        ForeachTarget::Var(n) => self.var_set(n, iv),
+                        ForeachTarget::Lvalue(e) => {
+                            let _ = self.store(e, iv);
+                        }
+                        ForeachTarget::ByRef(n) => self.var_set(n, iv),
+                        ForeachTarget::List(sub) => {
+                            self.foreach_list(sub, &iv)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
