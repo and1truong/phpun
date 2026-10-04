@@ -4652,6 +4652,7 @@ pub(crate) fn builtin_sig(n: &str) -> Option<Vec<(String, bool)>> {
         ],
         "preg_grep" => &[("pattern", true), ("array", true), ("flags", false)],
         "preg_quote" => &[("str", true), ("delimiter", false)],
+        "iterator_to_array" => &[("iterator", true), ("preserve_keys", false)],
         // Unary math fns share the single `num` param name (bug75290).
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
         | "acosh" | "atanh" | "sqrt" | "exp" | "deg2rad" | "rad2deg" => &[("num", true)],
@@ -4659,6 +4660,17 @@ pub(crate) fn builtin_sig(n: &str) -> Option<Vec<(String, bool)>> {
         _ => return Some(Vec::new()),
     };
     Some(ps.iter().map(|(n, r)| (n.to_string(), *r)).collect())
+}
+
+/// Declared type members for builtin params, where builtin_sig
+/// tracks only name + required (bug69802_2).
+pub(crate) fn builtin_param_ty(f: &str, p: &str) -> Option<Vec<String>> {
+    let ms: &[&str] = match (f, p) {
+        ("iterator_to_array", "iterator") => &["Traversable", "array"],
+        ("iterator_to_array", "preserve_keys") => &["bool"],
+        _ => return None,
+    };
+    Some(ms.iter().map(|m| m.to_string()).collect())
 }
 
 pub(crate) fn is_builtin(n: &str) -> bool {

@@ -1946,6 +1946,7 @@ impl<'a> Interp<'a> {
                     mk_method("hasType", vec![]),
                     mk_method("getType", vec![]),
                     mk_method("getName", vec![]),
+                    mk_method("getClass", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -7929,6 +7930,94 @@ impl<'a> Interp<'a> {
             ns: String::new(),
             decl_in: None,
         })
+    }
+
+    /// Decl for the function a callable value points at — builtins
+    /// synthesize one from builtin_sig. Shared by the function and
+    /// method (Closure::__invoke) reflector paths.
+    fn callable_decl(&mut self, v: &Value) -> Option<Rc<crate::ast::FunctionDecl>> {
+        match v {
+            Value::Str(s) => {
+                let n = String::from_utf8_lossy(s).to_lowercase();
+                self.functions
+                    .get(&n)
+                    .cloned()
+                    .or_else(|| Self::builtin_decl(&n))
+            }
+            Value::Callable(c) => match &c.kind {
+                crate::value::CallableKind::Closure(d) => Some(d.clone()),
+                crate::value::CallableKind::Named(n) => self
+                    .functions
+                    .get(&n.to_lowercase())
+                    .cloned()
+                    .or_else(|| Self::builtin_decl(&n.to_lowercase())),
+                crate::value::CallableKind::Method { name, obj, class } => {
+                    let c = class
+                        .clone()
+                        .or_else(|| obj.as_ref().map(|o| o.borrow().class.clone()));
+                    match c {
+                        Some(c) => self
+                            .find_method_in(&c, name)
+                            .map(|(m, _)| Rc::new(m.decl.clone()))
+                            // A magic-method trampoline (`C::undef(...)`
+                            // on __callStatic / `$o->undef(...)` on
+                            // __call) reflects as `mixed ...$arguments`
+                            // (trampoline_closure_named_arguments).
+                            .or_else(|| {
+                                let magic = if obj.is_some() {
+                                    "__call"
+                                } else {
+                                    "__callstatic"
+                                };
+                                self.find_method_in(&c, magic)
+                                    .is_some()
+                                    .then(Self::trampoline_decl)
+                            }),
+                        None => None,
+                    }
+                }
+            },
+            _ => None,
+        }
+    }
+
+    /// Synthetic decl for an internal function, from builtin_sig +
+    /// builtin_param_ty — lets reflectors report param names,
+    /// required flags and declared types for builtins (bug69802_2).
+    fn builtin_decl(lname: &str) -> Option<Rc<crate::ast::FunctionDecl>> {
+        let sig = crate::builtins::builtin_sig(lname)?;
+        Some(Rc::new(crate::ast::FunctionDecl {
+            name: lname.into(),
+            params: sig
+                .into_iter()
+                .map(|(name, req)| crate::ast::Param {
+                    default: if req {
+                        None
+                    } else {
+                        Some(crate::ast::Expr::Null)
+                    },
+                    ty: crate::builtins::builtin_param_ty(lname, &name),
+                    name,
+                    by_ref: false,
+                    variadic: false,
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                })
+                .collect(),
+            ret: None,
+            body: vec![],
+            attrs: vec![],
+            by_ref: false,
+            line: 0,
+            end_line: 0,
+            file: String::new(),
+            ns: String::new(),
+            decl_in: None,
+        }))
     }
 
     /// Same-type same-value — owners must agree on the *exact* result
@@ -18176,12 +18265,22 @@ impl<'a> Interp<'a> {
                             .map(|c| c.decl.name.clone())
                             .unwrap_or(resolved)
                     }
+                    // A closure first arg is a Closure object to Zend
+                    // (bug69802_2).
+                    Value::Callable(_) => "Closure".into(),
                     _ => String::new(),
                 };
                 match ob.class.name().to_lowercase().as_str() {
                     "reflectionproperty" | "reflectionmethod" | "reflectionclassconstant" => {
                         ob.props.insert("name".into(), cell(prop));
                         ob.props.insert("class".into(), cell(Value::str(&cname)));
+                        // Public metadata props render in var_dump in
+                        // declaration order: name, then class.
+                        for k in ["name", "class"] {
+                            if !ob.prop_order.contains(&k.into()) {
+                                ob.prop_order.push(k.into());
+                            }
+                        }
                     }
                     "reflectionclass" | "reflectionfunction" => {
                         // A closure reflector's `name` is its Zend name
@@ -18195,6 +18294,9 @@ impl<'a> Interp<'a> {
                             _ => cls,
                         };
                         ob.props.insert("name".into(), cell(nm));
+                        if !ob.prop_order.contains(&"name".into()) {
+                            ob.prop_order.push("name".into());
+                        }
                     }
                     _ => {}
                 }
@@ -18715,7 +18817,6 @@ impl<'a> Interp<'a> {
                         .get("\0rc\0class")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
-                    let cn = self.conv_str(&cn)?.to_string();
                     let mn = obj
                         .borrow()
                         .props
@@ -18723,12 +18824,24 @@ impl<'a> Interp<'a> {
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
                     let mn = self.conv_str(&mn)?.to_string();
-                    let c = self.classes.get(&cn.to_lowercase()).cloned();
-                    match c {
-                        Some(c) => self
-                            .find_method_in(&c, &mn)
-                            .map(|(m, _)| Rc::new(m.decl.clone())),
-                        None => None,
+                    if matches!(&cn, Value::Callable(_)) {
+                        // new ReflectionMethod($closure, '__invoke') —
+                        // Closure::__invoke carries the wrapped
+                        // function's signature (bug69802_2).
+                        if mn.eq_ignore_ascii_case("__invoke") {
+                            self.callable_decl(&cn)
+                        } else {
+                            None
+                        }
+                    } else {
+                        let cn = self.conv_str(&cn)?.to_string();
+                        let c = self.classes.get(&cn.to_lowercase()).cloned();
+                        match c {
+                            Some(c) => self
+                                .find_method_in(&c, &mn)
+                                .map(|(m, _)| Rc::new(m.decl.clone())),
+                            None => None,
+                        }
                     }
                 } else {
                     let cb = obj
@@ -18737,46 +18850,7 @@ impl<'a> Interp<'a> {
                         .get("\0rc\0class")
                         .map(|c| c.borrow().clone())
                         .unwrap_or(Value::Null);
-                    match &cb {
-                        Value::Str(s) => self
-                            .functions
-                            .get(&String::from_utf8_lossy(s).to_lowercase())
-                            .cloned(),
-                        Value::Callable(c) => match &c.kind {
-                            crate::value::CallableKind::Closure(d) => Some(d.clone()),
-                            crate::value::CallableKind::Named(n) => {
-                                self.functions.get(&n.to_lowercase()).cloned()
-                            }
-                            crate::value::CallableKind::Method { name, obj, class } => {
-                                let c = class
-                                    .clone()
-                                    .or_else(|| obj.as_ref().map(|o| o.borrow().class.clone()));
-                                match c {
-                                    Some(c) => self
-                                        .find_method_in(&c, name)
-                                        .map(|(m, _)| Rc::new(m.decl.clone()))
-                                        // A magic-method trampoline
-                                        // (`C::undef(...)` on
-                                        // __callStatic / `$o->undef(...)`
-                                        // on __call) reflects as
-                                        // `mixed ...$arguments`
-                                        // (trampoline_closure_named_arguments).
-                                        .or_else(|| {
-                                            let magic = if obj.is_some() {
-                                                "__call"
-                                            } else {
-                                                "__callstatic"
-                                            };
-                                            self.find_method_in(&c, magic)
-                                                .is_some()
-                                                .then(Self::trampoline_decl)
-                                        }),
-                                    None => None,
-                                }
-                            }
-                        },
-                        _ => None,
-                    }
+                    self.callable_decl(&cb)
                 };
                 let mut arr = PhpArray::default();
                 if let Some(d) = decl {
@@ -18833,6 +18907,52 @@ impl<'a> Interp<'a> {
                     })
                     .unwrap_or(false);
                 Ok(Some(Value::Bool(has)))
+            }
+            "getclass" => {
+                // Deprecated since 8.0 — returns a ReflectionClass for
+                // the first class/interface member of the declared
+                // type (a union picks the class part — bug69802_2).
+                self.deprecated(
+                    "Method ReflectionParameter::getClass() is deprecated since 8.0, use ReflectionParameter::getType() instead",
+                )?;
+                let ty = obj
+                    .borrow()
+                    .props
+                    .get("\0rp\0ty")
+                    .map(|c| c.borrow().clone())
+                    .and_then(|v| match v {
+                        Value::Array(a) => Some(a),
+                        _ => None,
+                    });
+                let class_ty = ty.and_then(|ta| {
+                    ta.borrow().entries.iter().find_map(|(_, c)| {
+                        let n = c.borrow().to_php_string();
+                        self.classes
+                            .get(&n.to_lowercase())
+                            .map(|cl| cl.decl.name.clone())
+                            .or_else(|| {
+                                self.interfaces
+                                    .get(&n.to_lowercase())
+                                    .map(|d| d.name.clone())
+                            })
+                    })
+                });
+                match class_ty {
+                    Some(n) => {
+                        let rc = self.instantiate("reflectionclass", &[])?;
+                        if let Value::Object(o) = &rc {
+                            let mut ob = o.borrow_mut();
+                            ob.props
+                                .insert("\0rc\0class".into(), cell(Value::str(&n)));
+                            ob.props.insert("name".into(), cell(Value::str(&n)));
+                            if !ob.prop_order.contains(&"name".into()) {
+                                ob.prop_order.push("name".into());
+                            }
+                        }
+                        Ok(Some(rc))
+                    }
+                    None => Ok(Some(Value::Null)),
+                }
             }
             "iscallable" => {
                 self.deprecated(
