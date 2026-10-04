@@ -133,13 +133,24 @@ pub(crate) fn dispatch(
         "is_infinite" => Value::Bool(matches!(arg(args, 0), Value::Float(f) if f.is_infinite())),
 
         // ----- serialization -----
-        "serialize" => Value::str(serialize(it, &arg(args, 0))),
+        "serialize" => Value::str(php_serialize(it, &arg(args, 0))?),
         "unserialize" => {
             let s = arg_str(it, args, 0);
             let mut pos = 0;
-            match unserialize(it, &s, &mut pos) {
+            let mut err = None;
+            match php_unserialize(it, &s, &mut pos, &mut err) {
                 Ok(v) => v,
-                Err(_) => Value::Bool(false),
+                Err(_) => {
+                    if let Some(e) = err {
+                        return Err(e);
+                    }
+                    let _ = it.warn_pub(&format!(
+                        "unserialize(): Error at offset {} of {} bytes",
+                        pos,
+                        s.len()
+                    ));
+                    Value::Bool(false)
+                }
             }
         }
         _ => return Ok(None),
@@ -605,6 +616,20 @@ fn print_r(_it: &mut Interp, v: &Value, indent: usize) -> String {
                     }
                 }
             }
+            // spl array-objects print their internal storage as a
+            // private `storage` prop (same as var_dump).
+            if let Some(crate::value::ObjectInternal::ArrayIter { arr, .. }) = &ob.internal {
+                let dcl = if _it.obj_is_a_str(ob.class.name(), "arrayobject") {
+                    "ArrayObject"
+                } else {
+                    "ArrayIterator"
+                };
+                s.push_str(&"    ".repeat(indent + 1));
+                s.push_str(&format!("[storage:{}:private] => ", dcl));
+                s.push_str(&print_r(_it, &Value::Array(arr.clone()), indent + 2));
+                s.push('\n');
+                s.push('\n');
+            }
             s.push_str(&"    ".repeat(indent));
             s.push(')');
             s
@@ -674,6 +699,21 @@ fn var_export_depth(it: &mut Interp, v: &Value, depth: usize) -> String {
             // All decl entries (both private `changed`s), hooked props
             // via `get`, plain emitted names (property_hooks/dump).
             let mut s = format!("\\{}::__set_state(array(\n", o.borrow().class.name());
+            // spl array-objects export their internal storage as the
+            // object's "properties" (zend uses spl's property hash).
+            if let Some(crate::value::ObjectInternal::ArrayIter { arr, .. }) = &o.borrow().internal
+            {
+                for (k, c) in arr.borrow().iter() {
+                    let ks = match k {
+                        ArrKey::Int(i) => i.to_string(),
+                        ArrKey::Str(st) => st.to_string(),
+                        ArrKey::Tomb => continue,
+                    };
+                    s.push_str(&format!("   '{}' => ", ks));
+                    s.push_str(&var_export_depth(it, &c.borrow(), depth + 1));
+                    s.push_str(",\n");
+                }
+            }
             for (out, slot, decl) in it.object_serial_entries(o) {
                 let v = match &decl {
                     Some((p, dcls)) => it.serial_entry_value(o, p, dcls, &slot),
@@ -692,8 +732,8 @@ fn var_export_depth(it: &mut Interp, v: &Value, depth: usize) -> String {
     }
 }
 
-fn serialize(it: &mut Interp, v: &Value) -> String {
-    match v {
+pub(crate) fn php_serialize(it: &mut Interp, v: &Value) -> Result<String, PhpError> {
+    Ok(match v {
         Value::Null => "N;".into(),
         Value::Bool(b) => format!("b:{};", *b as i32),
         Value::Int(i) => format!("i:{};", i),
@@ -703,20 +743,71 @@ fn serialize(it: &mut Interp, v: &Value) -> String {
             let a = a.borrow();
             let mut s = format!("a:{}:{{", a.len());
             for (k, c) in a.iter() {
-                s.push_str(&serialize(
+                s.push_str(&php_serialize(
                     it,
                     &match k {
                         ArrKey::Int(i) => Value::Int(*i),
                         ArrKey::Str(st) => Value::str(st.to_string()),
                         ArrKey::Tomb => Value::Null,
                     },
-                ));
-                s.push_str(&serialize(it, &c.borrow()));
+                )?);
+                s.push_str(&php_serialize(it, &c.borrow())?);
             }
             s.push('}');
             s
         }
         Value::Object(o) => {
+            // Anonymous classes can't be serialized anywhere in the
+            // payload — zend throws an Exception naming the class
+            // (up to the "@anonymous" marker).
+            {
+                let cn = o.borrow().class.name().to_string();
+                if let Some(pos) = cn.find("@anonymous") {
+                    return Err(PhpError::uncaught(
+                        "Exception",
+                        format!(
+                            "Serialization of '{}' is not allowed",
+                            &cn[..pos + "@anonymous".len()]
+                        ),
+                        0,
+                    ));
+                }
+            }
+            // Zend prefers __serialize whenever the class defines it:
+            // the returned array's ENTRIES go inside
+            // O:<len>:"<cls>":<n>:{...} (spl array-objects emit their
+            // 4-slot payload this way).
+            let has_ser = it
+                .find_method_in(&o.borrow().class, "__serialize")
+                .is_some();
+            if has_ser {
+                if let Ok(Value::Array(sl)) =
+                    it.method_invoke(o.clone(), "__serialize", crate::interp::CallArgs::empty())
+                {
+                    let sl = sl.borrow();
+                    let mut body = String::new();
+                    let mut n = 0;
+                    for (k, c) in sl.iter() {
+                        body.push_str(&php_serialize(
+                            it,
+                            &match k {
+                                ArrKey::Int(i) => Value::Int(*i),
+                                ArrKey::Str(s) => Value::str(s.to_string()),
+                                ArrKey::Tomb => Value::Null,
+                            },
+                        )?);
+                        body.push_str(&php_serialize(it, &c.borrow())?);
+                        n += 1;
+                    }
+                    return Ok(format!(
+                        "O:{}:\"{}\":{}:{{{}}}",
+                        o.borrow().class.name().len(),
+                        o.borrow().class.name(),
+                        n,
+                        body
+                    ));
+                }
+            }
             // Serializable implementors serialize as C:...{payload}
             // where the payload is whatever ->serialize() returns.
             if it.obj_implements(o, "serializable") {
@@ -724,16 +815,16 @@ fn serialize(it: &mut Interp, v: &Value) -> String {
                     it.method_invoke(o.clone(), "serialize", crate::interp::CallArgs::empty())
                 {
                     let Value::Str(pb) = &payload else {
-                        return "N;".into();
+                        return Ok("N;".into());
                     };
                     let p = crate::value::lossy(pb);
-                    return format!(
+                    return Ok(format!(
                         "C:{}:\"{}\":{}:{{{}}}",
                         o.borrow().class.name().len(),
                         o.borrow().class.name(),
                         p.len(),
                         p
-                    );
+                    ));
                 }
             }
             let ob = o.borrow();
@@ -741,8 +832,8 @@ fn serialize(it: &mut Interp, v: &Value) -> String {
             let mut n = 0;
             for name in &ob.prop_order {
                 if let Some(c) = ob.props.get(name) {
-                    body.push_str(&serialize(it, &Value::str(name.clone())));
-                    body.push_str(&serialize(it, &c.borrow()));
+                    body.push_str(&php_serialize(it, &Value::str(name.clone()))?);
+                    body.push_str(&php_serialize(it, &c.borrow())?);
                     n += 1;
                 }
             }
@@ -755,10 +846,17 @@ fn serialize(it: &mut Interp, v: &Value) -> String {
             )
         }
         _ => "N;".into(),
-    }
+    })
 }
 
-fn unserialize(it: &mut Interp, s: &str, pos: &mut usize) -> Result<Value, ()> {
+/// Err(None) = malformed payload (warn + false like zend);
+/// Err(Some(e)) = a userland __unserialize threw — propagate it.
+pub(crate) fn php_unserialize(
+    it: &mut Interp,
+    s: &str,
+    pos: &mut usize,
+    err: &mut Option<PhpError>,
+) -> Result<Value, ()> {
     let b = s.as_bytes();
     let take_until = |pos: &mut usize, ch: u8| -> Result<String, ()> {
         let start = *pos;
@@ -811,8 +909,8 @@ fn unserialize(it: &mut Interp, s: &str, pos: &mut usize) -> Result<Value, ()> {
             *pos += 1; // {
             let mut arr = PhpArray::new();
             for _ in 0..n {
-                let k = unserialize(it, s, pos)?;
-                let v = unserialize(it, s, pos)?;
+                let k = php_unserialize(it, s, pos, err)?;
+                let v = php_unserialize(it, s, pos, err)?;
                 arr.set(to_key(&k), v);
             }
             *pos += 1; // }
@@ -843,11 +941,14 @@ fn unserialize(it: &mut Interp, s: &str, pos: &mut usize) -> Result<Value, ()> {
                 Ok(Value::Object(o)) => o,
                 _ => return Err(()),
             };
-            let _ = it.method_invoke(
+            if let Err(e) = it.method_invoke(
                 obj.clone(),
                 "unserialize",
                 crate::interp::CallArgs::positional(vec![cell(Value::str(payload))]),
-            );
+            ) {
+                *err = Some(e);
+                return Err(());
+            }
             Ok(Value::Object(obj))
         }
         Some(b'O') => {
@@ -868,8 +969,47 @@ fn unserialize(it: &mut Interp, s: &str, pos: &mut usize) -> Result<Value, ()> {
                 Ok(Value::Object(o)) => o,
                 _ => return Err(()),
             };
+            // Classes defining __unserialize receive the parsed pairs
+            // as an array (zend routes O: payloads through it instead
+            // of writing props).
+            if it
+                .find_method_in(&obj.borrow().class, "__unserialize")
+                .is_some()
+            {
+                let mut slots = PhpArray::new();
+                for _ in 0..n {
+                    let k = php_unserialize(it, s, pos, err)?;
+                    let v = php_unserialize(it, s, pos, err)?;
+                    match k {
+                        Value::Int(i) => slots.set(ArrKey::Int(i), v),
+                        Value::Str(ks) => slots.set(
+                            ArrKey::Str(Rc::from(crate::value::lossy(&ks).into_owned())),
+                            v,
+                        ),
+                        _ => return Err(()),
+                    }
+                }
+                *pos += 1; // }
+                if let Err(e) = it.method_invoke(
+                    obj.clone(),
+                    "__unserialize",
+                    crate::interp::CallArgs::positional(vec![cell(Value::Array(Rc::new(
+                        RefCell::new(slots),
+                    )))]),
+                ) {
+                    // spl's internal __unserialize surfaces as an
+                    // offset failure (warning + false); a userland
+                    // override's exception propagates like zend.
+                    if it.obj_is_a(&obj, "arrayobject") || it.obj_is_a(&obj, "arrayiterator") {
+                        return Err(());
+                    }
+                    *err = Some(e);
+                    return Err(());
+                }
+                return Ok(Value::Object(obj));
+            }
             for _ in 0..n {
-                let k = unserialize(it, s, pos)?;
+                let k = php_unserialize(it, s, pos, err)?;
                 let Value::Str(ks) = k else { return Err(()) };
                 let plain = ks
                     .strip_prefix(&[0u8][..])
@@ -891,7 +1031,7 @@ fn unserialize(it: &mut Interp, s: &str, pos: &mut usize) -> Result<Value, ()> {
                     ));
                     return Err(());
                 }
-                let v = unserialize(it, s, pos)?;
+                let v = php_unserialize(it, s, pos, err)?;
                 let mut ob = obj.borrow_mut();
                 let key = crate::value::lossy(&ks).into_owned();
                 if !ob.prop_order.contains(&key) {

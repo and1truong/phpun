@@ -1361,6 +1361,20 @@ impl<'a> Interp<'a> {
                             .iter()
                             .any(|k| k.ends_with(&format!("\0{}", pn)))
                 };
+                // ARRAY_AS_PROPS: undeclared props resolve against the
+                // storage hash — spl read_property hashes it like an
+                // array dimension (Undefined array key + NULL, no __get).
+                if self.aap_active(&o) && (self.decl_prop(&o, pn).is_none() || was_unset) {
+                    let arr = self.ao_state(&o).0;
+                    let v = arr.borrow().get(&ArrKey::Str(Rc::from(pn)));
+                    return match v {
+                        Some(v) => Ok(v),
+                        None => {
+                            self.warn(&format!("Undefined array key \"{}\"", pn))?;
+                            Ok(Value::Null)
+                        }
+                    };
+                }
                 // Without __get, an unset() declared prop still reads
                 // as uninitialized; with __get it routes to magic
                 // (typed_properties_047 vs _009).
@@ -1779,6 +1793,11 @@ impl<'a> Interp<'a> {
                     // __unset only fires for UNDECLARED props — a
                     // declared one is simply marked uninitialized
                     // (typed_properties_magic_set).
+                } else if self.aap_active(&o) {
+                    // ARRAY_AS_PROPS: undeclared unsets delete from the
+                    // storage hash — zend never reaches __unset.
+                    let arr = self.ao_state(&o).0;
+                    arr.borrow_mut().unset(&ArrKey::Str(Rc::from(pn.as_str())));
                 } else if self.find_method_in(&cls, "__unset").is_some()
                     && self
                         .magic_guards

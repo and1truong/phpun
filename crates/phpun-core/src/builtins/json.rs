@@ -68,7 +68,12 @@ pub(crate) fn dispatch(
 
 // ----- helpers -----
 
-fn json_encode(_it: &mut Interp, v: &Value, flags: i64) -> Result<String, ()> {
+fn json_encode(it: &mut Interp, v: &Value, flags: i64) -> Result<String, ()> {
+    let mut seen: Vec<usize> = Vec::new();
+    json_enc(it, v, flags, &mut seen)
+}
+
+fn json_enc(_it: &mut Interp, v: &Value, flags: i64, seen: &mut Vec<usize>) -> Result<String, ()> {
     Ok(match v {
         Value::Null => "null".into(),
         Value::Bool(b) => b.to_string(),
@@ -92,7 +97,7 @@ fn json_encode(_it: &mut Interp, v: &Value, flags: i64) -> Result<String, ()> {
                 let parts: Vec<String> = a
                     .entries
                     .iter()
-                    .map(|(_, c)| json_encode(_it, &c.borrow(), flags).unwrap_or("null".into()))
+                    .map(|(_, c)| json_enc(_it, &c.borrow(), flags, seen).unwrap_or("null".into()))
                     .collect();
                 format!("[{}]", parts.join(","))
             } else {
@@ -103,7 +108,7 @@ fn json_encode(_it: &mut Interp, v: &Value, flags: i64) -> Result<String, ()> {
                         format!(
                             "{}:{}",
                             json_str(&key_str(k), flags),
-                            json_encode(_it, &c.borrow(), flags).unwrap_or("null".into())
+                            json_enc(_it, &c.borrow(), flags, seen).unwrap_or("null".into())
                         )
                     })
                     .collect();
@@ -112,15 +117,37 @@ fn json_encode(_it: &mut Interp, v: &Value, flags: i64) -> Result<String, ()> {
         }
         Value::Object(o) => {
             // JsonSerializable::jsonSerialize() wins over the raw
-            // public-property view (gh16725).
-            if _it
-                .find_method_in(&o.borrow().class, "jsonserialize")
-                .is_some()
+            // public-property view (gh16725) — once per object per
+            // encode: a serializable that returns $this (gh10519)
+            // falls through to the property view instead of looping.
+            let key = Rc::as_ptr(o) as usize;
+            if !seen.contains(&key)
+                && _it
+                    .find_method_in(&o.borrow().class, "jsonserialize")
+                    .is_some()
             {
+                seen.push(key);
                 let v = _it
                     .method_invoke(o.clone(), "jsonSerialize", crate::interp::CallArgs::empty())
                     .unwrap_or(Value::Null);
-                return json_encode(_it, &v, flags);
+                return json_enc(_it, &v, flags, seen);
+            }
+            // spl array-objects encode their internal storage as the
+            // object's property hash (spl_array_get_properties).
+            if let Some(crate::value::ObjectInternal::ArrayIter { arr, .. }) = &o.borrow().internal
+            {
+                let parts: Vec<String> = arr
+                    .borrow()
+                    .iter()
+                    .map(|(k, c)| {
+                        format!(
+                            "{}:{}",
+                            json_str(&key_str(k), flags),
+                            json_enc(_it, &c.borrow(), flags, seen).unwrap_or("null".into())
+                        )
+                    })
+                    .collect();
+                return Ok(format!("{{{}}}", parts.join(",")));
             }
             // Public props only; hooked props serialize their `get`
             // value (property_hooks/dump, oss-fuzz-382922236).
