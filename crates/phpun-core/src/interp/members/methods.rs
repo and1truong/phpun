@@ -972,10 +972,7 @@ impl<'a> Interp<'a> {
 
     /// Parse the legacy spl payload `x:i:<flags>;<a:…>;m:<props>` —
     /// returns (storage, props) or Err(consumed-offset).
-    fn ao_parse_payload(
-        &mut self,
-        data: &str,
-    ) -> Result<AoUnserData, usize> {
+    fn ao_parse_payload(&mut self, data: &str) -> Result<AoUnserData, usize> {
         let b = data.as_bytes();
         let mut pos = 0usize;
         // x:i:<flags>; — flags are consumed but not restored by
