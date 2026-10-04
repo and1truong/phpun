@@ -2357,7 +2357,9 @@ impl<'a> Parser<'a> {
         let line = self.line();
         let mut arrow = false;
         let mut uses = Vec::new();
+        let mut is_static = false;
         if self.ident_is("static") {
+            is_static = true;
             self.pos += 1;
         }
         if self.eat_ident("fn") {
@@ -2390,6 +2392,30 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_op(")")?;
+            // Zend compile checks on the use list (closure_use_*).
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (n, _) in &uses {
+                if n == "GLOBALS" {
+                    return Err(PhpError::fatal(
+                        "Cannot use auto-global as lexical variable",
+                        self.prev_line(),
+                    ));
+                }
+                if !seen.insert(n.as_str()) {
+                    return Err(PhpError::fatal(
+                        format!("Cannot use variable ${} twice", n),
+                        self.prev_line(),
+                    ));
+                }
+            }
+            for (n, _) in &uses {
+                if params.iter().any(|p| p.name == *n) {
+                    return Err(PhpError::fatal(
+                        format!("Cannot use lexical variable ${} as a parameter name", n),
+                        self.prev_line(),
+                    ));
+                }
+            }
         }
         // `: ret` after `(` — return types apply to closures too
         // (scalar_strict uses `{closure:...}(): Return value ...` TypeErrors).
@@ -2402,7 +2428,9 @@ impl<'a> Parser<'a> {
             self.expect_op("=>")?;
             let e = self.expr()?;
             let el = self.prev_line();
-            (vec![Stmt::Return(Some(e))], el)
+            // A call inside the arrow expr needs a line marker — the
+            // body has no statements to set cur_line (closure_064).
+            (vec![Stmt::Line(line), Stmt::Return(Some(e))], el)
         } else {
             let b = self.body()?;
             let el = self.prev_line();
@@ -2425,6 +2453,7 @@ impl<'a> Parser<'a> {
             },
             uses,
             arrow,
+            is_static,
         }))
     }
 

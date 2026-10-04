@@ -782,6 +782,51 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
             }
             Ordering::Equal
         }
+        // Loose closure == : zend compares the wrapped function —
+        // same function name/method target is equal (closure_compare).
+        (Callable(x), Callable(y)) => {
+            let eq = match (&x.kind, &y.kind) {
+                (CallableKind::Named(a), CallableKind::Named(b)) => a.eq_ignore_ascii_case(b),
+                (
+                    CallableKind::Method {
+                        obj: o1,
+                        class: c1,
+                        name: n1,
+                    },
+                    CallableKind::Method {
+                        obj: o2,
+                        class: c2,
+                        name: n2,
+                    },
+                ) => {
+                    n1.eq_ignore_ascii_case(n2)
+                        && match (o1, o2) {
+                            (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                        && match (c1, c2) {
+                            (Some(a), Some(b)) => a.name() == b.name(),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                }
+                (CallableKind::Closure(d1), CallableKind::Closure(d2)) => {
+                    Rc::ptr_eq(d1, d2)
+                        && match (&x.this_obj, &y.this_obj) {
+                            (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                }
+                _ => false,
+            };
+            if eq {
+                Ordering::Equal
+            } else {
+                Ordering::Less
+            }
+        }
         (Object(_), _) | (Callable(_), _) => Ordering::Greater,
         (_, Object(_)) | (_, Callable(_)) => Ordering::Less,
         (Resource(x), Resource(y)) => x.borrow().id().cmp(&y.borrow().id()),
@@ -1003,7 +1048,7 @@ pub enum GenSetup {
         decl_class: Option<Rc<PhpClass>>,
         called_class: Option<Rc<PhpClass>>,
         /// `use ($a, &$b)` cells for closure-generators.
-        captures: Vec<(String, Cell)>,
+        captures: Vec<(String, Cell, bool)>,
     },
 }
 
@@ -1029,11 +1074,17 @@ pub struct PhpCallable {
     /// None for plain closures built from a decl.
     pub kind: CallableKind,
     /// Captured `use`/`fn` scope: name → cell.
-    pub captures: Vec<(String, Cell)>,
+    pub captures: Vec<(String, Cell, bool)>,
     /// `$this` binding for methods-as-closures.
     pub this_obj: Option<Rc<RefCell<PhpObject>>>,
     /// Declared class context for `self::`/`static::` inside the body.
     pub scope_class: Option<Rc<PhpClass>>,
+    /// Late-static-binding class captured at creation — `static::`
+    /// inside the body resolves to it (closure_049-052, bug66622).
+    pub called_class: Option<Rc<PhpClass>>,
+    /// `static function`/static-method callables can never bind $this
+    /// (closure_041/043, disallows_*).
+    pub is_static: bool,
 }
 
 #[derive(Debug, Clone)]

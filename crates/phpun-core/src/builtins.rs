@@ -479,7 +479,7 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             } else {
                 it.emit(&s);
                 // print_r echoes a trailing newline only for arrays/objects.
-                if matches!(v, Value::Array(_) | Value::Object(_)) {
+                if matches!(v, Value::Array(_) | Value::Object(_) | Value::Callable(_)) {
                     it.emit("\n");
                 }
                 Value::Bool(true)
@@ -1904,16 +1904,41 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 }
                 arr.entries = head.to_vec();
                 if let Some(repl) = args.get(3) {
-                    if let Value::Array(r) = &*repl.borrow() {
-                        for (_, c) in r.borrow().iter() {
-                            arr.push(c.borrow().clone());
+                    let rv = repl.borrow().clone();
+                    match &rv {
+                        Value::Array(r) => {
+                            for (_, c) in r.borrow().iter() {
+                                arr.push(c.borrow().clone());
+                            }
                         }
+                        // Non-array replacement is `(array)`-cast — an
+                        // object yields its prop values, everything else
+                        // becomes `[0 => $v]` (bug52193).
+                        Value::Object(o) => {
+                            let ob = o.borrow();
+                            for n in &ob.prop_order {
+                                if let Some(c) = ob.props.get(n) {
+                                    arr.push(c.borrow().clone());
+                                }
+                            }
+                        }
+                        Value::Null => {}
+                        _ => arr.push(rv.clone()),
                     }
                 }
                 for (k, c) in tail2 {
                     let _ = k;
                     arr.push(c.borrow().clone());
                 }
+                // Splice renumbers integer keys (bug52193).
+                let mut i = 0i64;
+                for (k, _) in arr.entries.iter_mut() {
+                    if matches!(k, ArrKey::Int(_)) {
+                        *k = ArrKey::Int(i);
+                        i += 1;
+                    }
+                }
+                arr.next = i;
             }
             Value::Array(Rc::new(RefCell::new(removed)))
         }
@@ -2755,32 +2780,22 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             arg(args, 0),
             Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_)
         )),
-        "is_callable" => Value::Bool(match arg(args, 0) {
-            Value::Callable(_) => true,
-            Value::Str(s) => {
-                it.functions
-                    .contains_key(&crate::value::lossy(&s).to_lowercase())
-                    || is_builtin(&crate::value::lossy(&s).to_lowercase())
-            }
-            Value::Array(a) => {
-                let e: Vec<Value> = a
-                    .borrow()
-                    .entries
-                    .iter()
-                    .map(|x| x.1.borrow().clone())
-                    .collect();
-                if e.len() != 2 {
-                    false
-                } else {
-                    let mname = match &e[1] {
-                        Value::Str(s) => crate::value::lossy(s).to_string(),
-                        _ => String::new(),
-                    };
-                    it.is_callable_arr(&e[0], &mname)
+        "is_callable" => {
+            let v = arg(args, 0);
+            let syntax_only = arg(args, 1).is_truthy();
+            let ok = it.is_callable_value(&v);
+            // $callable_name writes back through the arg cell —
+            // syntax_only gives the canonical `Class::m` /
+            // `{closure:fn():L}` form (closure_016).
+            if ok {
+                if let Some(nm) = it.callable_name_of(&v, syntax_only) {
+                    if let Some(c) = args.get(2) {
+                        *c.borrow_mut() = Value::str(nm);
+                    }
                 }
             }
-            _ => false,
-        }),
+            Value::Bool(ok)
+        }
         "is_iterable" => Value::Bool(matches!(arg(args, 0), Value::Array(_))),
         "is_countable" => Value::Bool(matches!(arg(args, 0), Value::Array(_))),
         "is_resource" => Value::Bool(matches!(arg(args, 0), Value::Resource(_))),
@@ -2848,17 +2863,30 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
             }
         }
         "method_exists" => match arg(args, 0) {
+            // Closures are objects of class Closure — __invoke exists
+            // (bug52060, bug77627).
+            Value::Callable(_) => {
+                let m = arg_str(it, args, 1).to_lowercase();
+                Value::Bool(m == "__invoke")
+            }
             Value::Object(o) => {
                 let m = arg_str(it, args, 1).to_lowercase();
                 Value::Bool(o.borrow().class.find_method(&m).is_some())
             }
-            Value::Str(cn) => match it.lookup_class(&crate::value::lossy(&cn)) {
-                Some(c) => Value::Bool(
-                    c.find_method(&arg_str(it, args, 1).to_lowercase())
-                        .is_some(),
-                ),
-                None => Value::Bool(false),
-            },
+            Value::Str(cn) => {
+                if crate::value::lossy(&cn).eq_ignore_ascii_case("closure") {
+                    return Ok(Some(Value::Bool(
+                        arg_str(it, args, 1).eq_ignore_ascii_case("__invoke"),
+                    )));
+                }
+                match it.lookup_class(&crate::value::lossy(&cn)) {
+                    Some(c) => Value::Bool(
+                        c.find_method(&arg_str(it, args, 1).to_lowercase())
+                            .is_some(),
+                    ),
+                    None => Value::Bool(false),
+                }
+            }
             _ => Value::Bool(false),
         },
         "property_exists" => match arg(args, 0) {
@@ -3047,6 +3075,10 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                 let n = arg_str(it, args, 1);
                 Value::Bool(it.obj_is_a(&o, &n))
             }
+            Value::Callable(_) => {
+                let n = arg_str(it, args, 1);
+                Value::Bool(n.eq_ignore_ascii_case("closure"))
+            }
             _ => Value::Bool(false),
         },
         "is_subclass_of" => match arg(args, 0) {
@@ -3143,12 +3175,20 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
                         }
                     }
                 }
+                // call_user_func* never forwards by reference — mark
+                // every arg nonref so `&$p` params warn "value given".
+                let n = ca.cells.len();
+                ca.nonref_cells = (0..n).collect();
+                for t in ca.named.iter_mut() {
+                    t.2 = false;
+                }
                 it.call_value(&cb, ca)?
             } else {
-                it.call_value(
-                    &cb,
-                    crate::interp::CallArgs::positional(args[1.min(args.len())..].to_vec()),
-                )?
+                let mut ca =
+                    crate::interp::CallArgs::positional(args[1.min(args.len())..].to_vec());
+                let n = ca.cells.len();
+                ca.nonref_cells = (0..n).collect();
+                it.call_value(&cb, ca)?
             }
         }
         "register_shutdown_function" => {
@@ -4837,6 +4877,10 @@ pub(crate) fn builtin_sig(n: &str) -> Option<Vec<(String, bool)>> {
         ],
         "preg_grep" => &[("pattern", true), ("array", true), ("flags", false)],
         "preg_quote" => &[("str", true), ("delimiter", false)],
+        // Unary math fns share the single `num` param name (bug75290).
+        "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
+        | "acosh" | "atanh" | "sqrt" | "exp" | "deg2rad" | "rad2deg" => &[("num", true)],
+        "log" | "log10" => &[("num", true), ("base", false)],
         _ => return Some(Vec::new()),
     };
     Some(ps.iter().map(|(n, r)| (n.to_string(), *r)).collect())
@@ -5264,6 +5308,11 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
             .concat(),
         ),
         Value::Array(a) => {
+            let aptr = Rc::as_ptr(a) as usize;
+            if !it.dump_stack.insert(aptr) {
+                it.emit(&format!("{}*RECURSION*\n", pad));
+                return;
+            }
             let rcn = Rc::strong_count(a);
             let a = a.borrow();
             // zval: `array(2) refcount(1){` — plain: `array(2) {`.
@@ -5287,8 +5336,14 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                 );
             }
             it.emit(&format!("{}}}\n", pad));
+            it.dump_stack.remove(&aptr);
         }
         Value::Object(o) => {
+            let optr = Rc::as_ptr(o) as usize;
+            if !it.dump_stack.insert(optr) {
+                it.emit(&format!("{}*RECURSION*\n", pad));
+                return;
+            }
             let ob = o.borrow();
             // Enum cases print `enum(E::Case1)` (single line).
             if ob.class.decl.kind == crate::ast::ClassKind::Enum {
@@ -5300,6 +5355,7 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                             ob.class.name(),
                             crate::value::lossy(case)
                         ));
+                        it.dump_stack.remove(&optr);
                         return;
                     }
                 }
@@ -5417,130 +5473,192 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                 var_dump(it, v, indent + 1, zval, false);
             }
             it.emit(&format!("{}}}\n", pad));
+            it.dump_stack.remove(&optr);
         }
         Value::Callable(c) => {
-            // Closure debug info (zend_closures.c): function/name key +
-            // bound $this + file/line for literals + parameter map.
-            let pad2 = format!("{}  ", pad);
-            let pad3 = format!("{}    ", pad);
-            let mut keys: Vec<(String, String)> = Vec::new();
-            let mut this_obj = None;
-            let params: Option<Vec<(String, bool)>> = match &c.kind {
-                crate::value::CallableKind::Named(n) => {
-                    keys.push(("function".into(), n.clone()));
-                    it.functions
-                        .get(&n.to_lowercase())
-                        .map(|d| {
-                            d.params
-                                .iter()
-                                .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
-                                .collect()
-                        })
-                        .or_else(|| builtin_sig(&n.to_lowercase()))
-                }
-                crate::value::CallableKind::Method { obj, class, name } => {
-                    let cn = c
-                        .scope_class
-                        .as_ref()
-                        .map(|sc| sc.name().to_string())
-                        .or_else(|| {
-                            obj.as_ref()
-                                .map(|o| o.borrow().class.name().to_string())
-                                .or_else(|| class.as_ref().map(|cl| cl.name().to_string()))
-                        })
-                        .unwrap_or_default();
-                    keys.push(("function".into(), format!("{}::{}", cn, name)));
-                    if let Some(o) = obj {
-                        this_obj = Some(o.clone());
-                    }
-                    let cls = obj
-                        .as_ref()
-                        .map(|o| o.borrow().class.clone())
-                        .or_else(|| class.clone());
-                    cls.and_then(|cl| {
-                        it.find_method_in(&cl, name).map(|(m, _)| {
-                            m.decl
-                                .params
-                                .iter()
-                                .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
-                                .collect()
-                        })
-                    })
-                }
-                crate::value::CallableKind::Closure(d) => {
-                    keys.push(("name".into(), format!("{{closure:{}:{}}}", d.file, d.line)));
-                    keys.push(("file".into(), d.file.clone()));
-                    keys.push(("line".into(), String::new())); // int below
-                    Some(
-                        d.params
-                            .iter()
-                            .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
-                            .collect(),
-                    )
-                }
-            };
-            let has_params = params.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
-            let nfields = keys.len() + this_obj.is_some() as usize + has_params as usize;
+            let cptr = Rc::as_ptr(c) as usize;
+            if !it.dump_stack.insert(cptr) {
+                it.emit(&format!("{}*RECURSION*\n", pad));
+                return;
+            }
+            let props = closure_debug_props(it, c);
             it.emit(&format!(
                 "{}object(Closure)#{} ({}) {{\n",
                 pad,
                 c.id.get(),
-                nfields
+                props.len()
             ));
-            let mut line_int = 0i64;
-            if let crate::value::CallableKind::Closure(d) = &c.kind {
-                line_int = d.line as i64;
-            }
-            for (k, v) in &keys {
-                if k == "line" {
-                    it.emit(&format!(
-                        "{}[\"line\"]=>\n{}int({})\n",
-                        pad2, pad2, line_int
-                    ));
-                } else {
-                    it.emit(&format!(
-                        "{}[\"{}\"]=>\n{}string({}) \"{}\"\n",
-                        pad2,
-                        k,
-                        pad2,
-                        v.len(),
-                        v
-                    ));
-                }
-            }
-            if let Some(o) = &this_obj {
-                it.emit(&format!("{}[\"this\"]=>\n", pad2));
-                var_dump(it, &Value::Object(o.clone()), indent + 1, zval, false);
-            }
-            if let Some(ps) = &params {
-                if has_params {
-                    it.emit(&format!(
-                        "{}[\"parameter\"]=>\n{}array({}) {{\n",
-                        pad2,
-                        pad2,
-                        ps.len()
-                    ));
-                    for (pn, req) in ps {
-                        let word = if *req { "<required>" } else { "<optional>" };
-                        it.emit(&format!(
-                            "{}[\"${}\"]=>\n{}string({}) \"{}\"\n",
-                            pad3,
-                            pn,
-                            pad3,
-                            word.len(),
-                            word
-                        ));
-                    }
-                    it.emit(&format!("{}}}\n", pad2));
-                }
+            for (k, v) in &props {
+                it.emit(&format!("{}  [\"{}\"]=>\n", pad, k));
+                var_dump(it, v, indent + 1, zval, false);
             }
             it.emit(&format!("{}}}\n", pad));
+            it.dump_stack.remove(&cptr);
         }
         Value::Resource(r) => it.emit(&format!(
             "{}resource({}) of type (stream)\n",
             pad,
             r.borrow().id()
         )),
+    }
+}
+
+/// The props Zend reports for a Closure in var_dump/print_r
+/// (zend_closures.c get_debug_info): `function` for callables made
+/// from functions/methods, `name`/`file`/`line` for literals, then
+/// `static` (use-captures ∪ function static vars), bound `this`, and
+/// `parameter` — each only when present.
+fn closure_debug_props(it: &mut Interp, c: &crate::value::PhpCallable) -> Vec<(String, Value)> {
+    use crate::value::CallableKind;
+    let mut props: Vec<(String, Value)> = Vec::new();
+    let mut params: Vec<(String, bool)> = Vec::new();
+    let mut body_statics: Vec<String> = Vec::new();
+    let mut statics_key: Option<String> = None;
+    match &c.kind {
+        CallableKind::Named(n) => {
+            props.push(("function".into(), Value::str(n.clone())));
+            if let Some(d) = it.functions.get(&n.to_lowercase()) {
+                params = d
+                    .params
+                    .iter()
+                    .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
+                    .collect();
+                static_var_names(&d.body, &mut body_statics);
+                statics_key = Some(d.name.clone());
+            } else if let Some(sig) = builtin_sig(&n.to_lowercase()) {
+                params = sig;
+            }
+        }
+        CallableKind::Method { obj, class, name } => {
+            let cn = c
+                .scope_class
+                .as_ref()
+                .map(|sc| sc.name().to_string())
+                .or_else(|| {
+                    obj.as_ref()
+                        .map(|o| o.borrow().class.name().to_string())
+                        .or_else(|| class.as_ref().map(|cl| cl.name().to_string()))
+                })
+                .unwrap_or_default();
+            props.push(("function".into(), Value::str(format!("{}::{}", cn, name))));
+            let cls = obj
+                .as_ref()
+                .map(|o| o.borrow().class.clone())
+                .or_else(|| class.clone());
+            if let Some((m, dc)) = cls.and_then(|cl| it.find_method_in(&cl, name)) {
+                params = m
+                    .decl
+                    .params
+                    .iter()
+                    .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
+                    .collect();
+                static_var_names(&m.decl.body, &mut body_statics);
+                statics_key = Some(format!("{}\u{0}{}", dc.name(), name));
+            }
+        }
+        CallableKind::Closure(d) => {
+            props.push((
+                "name".into(),
+                Value::str(format!("{{closure:{}:{}}}", d.file, d.line)),
+            ));
+            props.push(("file".into(), Value::str(d.file.clone())));
+            props.push(("line".into(), Value::Int(d.line as i64)));
+            params = d
+                .params
+                .iter()
+                .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
+                .collect();
+            static_var_names(&d.body, &mut body_statics);
+            statics_key = Some(d.name.clone());
+        }
+    }
+    // `static` member: bound use-vars first, then function statics —
+    // declared-but-unrun statics report NULL (gh8083, bug79778).
+    let mut sa = PhpArray::new();
+    for (n, cap, _by_ref) in &c.captures {
+        sa.set_cell(ArrKey::Str(n.clone().into()), cap.clone());
+    }
+    if let Some(key) = &statics_key {
+        for n in body_statics {
+            if sa.get(&ArrKey::Str(n.clone().into())).is_none() {
+                let cv = it
+                    .statics
+                    .get(key)
+                    .and_then(|t| t.get(&n).map(|c| cell(c.borrow().clone())))
+                    .unwrap_or_else(|| cell(Value::Null));
+                sa.set_cell(ArrKey::Str(n.into()), cv);
+            }
+        }
+    }
+    if !sa.is_empty() {
+        props.push((
+            "static".into(),
+            Value::Array(std::rc::Rc::new(std::cell::RefCell::new(sa))),
+        ));
+    }
+    let this_obj = match &c.kind {
+        CallableKind::Method { obj, .. } => obj.clone().or_else(|| c.this_obj.clone()),
+        _ => c.this_obj.clone(),
+    };
+    if let Some(o) = this_obj {
+        props.push(("this".into(), Value::Object(o)));
+    }
+    if !params.is_empty() {
+        let mut pa = PhpArray::new();
+        for (pn, req) in &params {
+            let word = if *req { "<required>" } else { "<optional>" };
+            pa.set(ArrKey::Str(format!("${}", pn).into()), Value::str(word));
+        }
+        props.push((
+            "parameter".into(),
+            Value::Array(std::rc::Rc::new(std::cell::RefCell::new(pa))),
+        ));
+    }
+    props
+}
+
+/// Names of `static $x` declarations anywhere in a body — nested
+/// function/class bodies declare their own (bug79778).
+fn static_var_names(stmts: &[crate::ast::Stmt], out: &mut Vec<String>) {
+    use crate::ast::Stmt;
+    for st in stmts {
+        match st {
+            Stmt::Static { vars, .. } => {
+                for (n, _) in vars {
+                    if !out.iter().any(|x| x == n) {
+                        out.push(n.clone());
+                    }
+                }
+            }
+            Stmt::Block(b) => static_var_names(b, out),
+            Stmt::If { then, else_, .. } => {
+                static_var_names(then, out);
+                static_var_names(else_, out);
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::Foreach { body, .. } => static_var_names(body, out),
+            Stmt::Switch { cases, .. } => {
+                for (_, b) in cases {
+                    static_var_names(b, out);
+                }
+            }
+            Stmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                static_var_names(body, out);
+                for c in catches {
+                    static_var_names(&c.body, out);
+                }
+                if let Some(f) = finally {
+                    static_var_names(f, out);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -5558,6 +5676,23 @@ fn print_r(_it: &mut Interp, v: &Value, indent: usize) -> String {
                 s.push_str(&inner);
                 s.push('\n');
                 if matches!(*c.borrow(), Value::Array(_) | Value::Object(_)) {
+                    s.push('\n');
+                }
+            }
+            s.push_str(&"    ".repeat(indent));
+            s.push(')');
+            s
+        }
+        Value::Callable(c) => {
+            let mut s = String::from("Closure Object\n");
+            s.push_str(&"    ".repeat(indent));
+            s.push_str("(\n");
+            for (k, v) in closure_debug_props(_it, c) {
+                s.push_str(&"    ".repeat(indent + 1));
+                s.push_str(&format!("[{}] => ", k));
+                s.push_str(&print_r(_it, &v, indent + 2));
+                s.push('\n');
+                if matches!(v, Value::Array(_) | Value::Object(_)) {
                     s.push('\n');
                 }
             }
