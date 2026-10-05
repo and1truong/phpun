@@ -17,6 +17,15 @@ impl<'a> Interp<'a> {
         if kind == IncludeKind::Eval {
             return self.eval_code(&path_s);
         }
+        // zend's stream wrapper refuses an empty path outright — a
+        // catchable ValueError, not the warning+false open failure.
+        if path_s.is_empty() {
+            return self.fail(PhpError::uncaught(
+                "ValueError",
+                "Path must not be empty",
+                self.cur_line,
+            ));
+        }
         // include()/require() appear in backtraces as internal-function
         // frames — even for a failed open (bug28213).
         self.call_trace.push(TraceFrame {
