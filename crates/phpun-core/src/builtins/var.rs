@@ -218,10 +218,10 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                     &c.borrow(),
                     indent + 1,
                     zval,
-                    // typed_slots pins a clone of bound cells — exclude it
-                    // from the &-marker count (typed_properties_038).
-                    Rc::strong_count(c)
-                        > 1 + it.typed_slots.contains_key(&(Rc::as_ptr(c) as usize)) as usize,
+                    // `&` is zend's IS_REFERENCE mark, not sharing —
+                    // prop-bound cells (AoStore mirrors) shared by
+                    // structure print plain.
+                    it.is_ref_cell(c) && Rc::strong_count(c) > 1,
                 );
             }
             it.emit(&format!("{}}}\n", pad));
@@ -348,6 +348,19 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                     continue;
                 }
                 if let Some(c) = ob.props.get(n) {
+                    // Int-keyed buckets (SPL `[]=` appends) display
+                    // their index unquoted, like array elements.
+                    if let Some(i) = crate::value::int_prop_index(n) {
+                        it.emit(&format!("{}  [{}]=>\n", pad, i));
+                        var_dump(
+                            it,
+                            &c.borrow(),
+                            indent + 1,
+                            zval,
+                            it.is_ref_cell(c) && Rc::strong_count(c) > 1,
+                        );
+                        continue;
+                    }
                     let (vis, dcls) = it.prop_visibility(&ob.class, n);
                     // Mangled private keys "\0Cls\0name" display only `name`.
                     let disp = n
@@ -364,15 +377,20 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                         crate::ast::Visibility::Public => format!("\"{}\"", disp),
                     };
                     it.emit(&format!("{}  [{}]=>\n", pad, key));
+                    // `&` is zend's IS_REFERENCE mark on the SLOT —
+                    // a typed prop can't hold a ref (zend stores the
+                    // value), so no `&` even though the shared cell
+                    // stays marked for write-through gating.
+                    let typed = it
+                        .decl_for_slot(o, n)
+                        .map(|pd| pd.ty.is_some())
+                        .unwrap_or(false);
                     var_dump(
                         it,
                         &c.borrow(),
                         indent + 1,
                         zval,
-                        // typed_slots pins a clone of bound cells — exclude it
-                        // from the &-marker count (typed_properties_038).
-                        Rc::strong_count(c)
-                            > 1 + it.typed_slots.contains_key(&(Rc::as_ptr(c) as usize)) as usize,
+                        !typed && it.is_ref_cell(c) && Rc::strong_count(c) > 1,
                     );
                 }
             }
@@ -618,8 +636,13 @@ fn print_r(_it: &mut Interp, v: &Value, indent: usize) -> String {
             s.push_str("(\n");
             for n in &ob.prop_order {
                 if let Some(c) = ob.props.get(n) {
+                    // Int-keyed buckets print their bare index.
+                    let disp = match crate::value::int_prop_index(n) {
+                        Some(i) => i.to_string(),
+                        None => n.clone(),
+                    };
                     s.push_str(&"    ".repeat(indent + 1));
-                    s.push_str(&format!("[{}] => ", n));
+                    s.push_str(&format!("[{}] => ", disp));
                     s.push_str(&print_r(_it, &c.borrow(), indent + 2));
                     s.push('\n');
                     if matches!(
@@ -734,19 +757,36 @@ fn var_export_depth(it: &mut Interp, v: &Value, depth: usize) -> String {
             } else {
                 None
             };
+            let has_ao = ao_arr.is_some();
             if let Some(arr) = ao_arr {
                 for (k, c) in arr.borrow().iter() {
+                    // Int keys print bare, strings quoted — zend's
+                    // var_export key rule.
                     let ks = match k {
-                        ArrKey::Int(i) => i.to_string(),
-                        ArrKey::Str(st) => st.to_string(),
+                        ArrKey::Int(i) => format!("   {} => ", i),
+                        ArrKey::Str(st) => format!("   '{}' => ", st),
                         ArrKey::Tomb => continue,
                     };
-                    s.push_str(&format!("   '{}' => ", ks));
+                    s.push_str(&ks);
                     s.push_str(&var_export_depth(it, &c.borrow(), depth + 1));
                     s.push_str(",\n");
                 }
             }
             for (out, slot, decl) in it.object_serial_entries(o) {
+                // Int-keyed buckets (SPL `[]=` appends) print their
+                // index unquoted; on spl storage the storage table
+                // above already emitted them.
+                if let Some(i) = crate::value::int_prop_index(&out) {
+                    if has_ao {
+                        continue;
+                    }
+                    if let Some(v) = o.borrow().props.get(&slot).map(|c| c.borrow().clone()) {
+                        s.push_str(&format!("   {} => ", i));
+                        s.push_str(&var_export_depth(it, &v, depth + 1));
+                        s.push_str(",\n");
+                    }
+                    continue;
+                }
                 let v = match &decl {
                     Some((p, dcls)) => it.serial_entry_value(o, p, dcls, &slot),
                     None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
@@ -793,6 +833,14 @@ fn ser_cell(it: &mut Interp, c: &Cell, ctx: &mut SerCtx) -> Result<String, PhpEr
         let p = Rc::as_ptr(c) as usize;
         if let Some(id) = ctx.refs.get(&p) {
             return Ok(format!("R:{};", id));
+        }
+        // A ref pointing at an already-serialized object repeats that
+        // element's slot — R: since the repeating zval is a reference
+        // (a plain zval repeating the object emits r: instead).
+        if let Value::Object(o) = &*c.borrow() {
+            if let Some(id) = ctx.objs.get(&(Rc::as_ptr(o) as usize)) {
+                return Ok(format!("R:{};", id));
+            }
         }
         ctx.refs.insert(p, ctx.n);
     }
@@ -898,7 +946,12 @@ fn ser_value(it: &mut Interp, v: &Value, ctx: &mut SerCtx) -> Result<String, Php
                 .collect();
             drop(ob);
             for (name, c) in pairs {
-                body.push_str(&format!("s:{}:\"{}\";", name.len(), name));
+                // Int-keyed buckets (SPL `[]=` appends) serialize
+                // their key as `i:N;` like an array's int member.
+                match crate::value::int_prop_index(&name) {
+                    Some(i) => body.push_str(&format!("i:{};", i)),
+                    None => body.push_str(&format!("s:{}:\"{}\";", name.len(), name)),
+                }
                 body.push_str(&ser_cell(it, &c, ctx)?);
                 n += 1;
             }
@@ -915,7 +968,8 @@ fn ser_value(it: &mut Interp, v: &Value, ctx: &mut SerCtx) -> Result<String, Php
 }
 
 pub(crate) fn php_serialize(it: &mut Interp, v: &Value) -> Result<String, PhpError> {
-    // The root zval takes slot 1 like an array element.
+    // The root zval takes slot 1 like an element; zend dereferences
+    // the argument, so a ref-typed arg registers by VALUE.
     let mut ctx = SerCtx {
         n: 1,
         objs: Default::default(),
@@ -1204,7 +1258,27 @@ pub(crate) fn php_unserialize(
             }
             for _ in 0..n {
                 let k = php_unserialize_key(s, pos)?;
-                let Value::Str(ks) = k else { return Err(()) };
+                // `i:` prop keys land as plain string-name props —
+                // unserialize writes the decimal name into the
+                // (string-keyed) prop table, so `i:0` round-trips as
+                // the quoted `["0"]` prop, not an int bucket.
+                let int_key = match &k {
+                    Value::Int(i) => Some(*i),
+                    _ => None,
+                };
+                let Value::Str(ks) = k else {
+                    if let Some(i) = int_key {
+                        let v = php_unserialize(it, s, pos, err, vhash)?;
+                        let mut ob = obj.borrow_mut();
+                        let key = i.to_string();
+                        if !ob.prop_order.contains(&key) {
+                            ob.prop_order.push(key.clone());
+                        }
+                        ob.props.insert(key, v);
+                        continue;
+                    }
+                    return Err(());
+                };
                 let plain = ks
                     .strip_prefix(&[0u8][..])
                     .and_then(|r| r.split(|b| *b == 0).nth(1))

@@ -1043,9 +1043,26 @@ impl<'a> Interp<'a> {
             },
             Flow::Throw(v) => {
                 // set_exception_handler replaces the uncaught display
-                // entirely; exit is still 255 (bug23279).
+                // entirely — a handled exception exits cleanly
+                // (bug23279 only covers the handler firing).
                 if let Some(h) = self.exception_handler.clone() {
-                    let _ = self.call_value(&h, CallArgs::positional(vec![cell(v)]));
+                    match self.call_value(&h, CallArgs::positional(vec![cell(v)])) {
+                        Ok(_) => {
+                            return RunResult {
+                                exit_code: 0,
+                                fatal: None,
+                            };
+                        }
+                        // A handler that itself throws leaves THAT
+                        // exception uncaught — still a fatal exit.
+                        Err(e) => {
+                            if let Some(nv) = self.pending_exception.take() {
+                                self.uncaught(&nv);
+                            } else {
+                                self.print_fatal(&e);
+                            }
+                        }
+                    }
                 } else {
                     self.uncaught(&v);
                 }

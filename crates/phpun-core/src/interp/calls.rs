@@ -3224,14 +3224,15 @@ impl<'a> Interp<'a> {
     /// drops it when the immediate caller is an internal function
     /// (array_map's driver frame) — except the VM-inlined
     /// call_user_func family, whose caller frame is the user's own.
-    fn arg_err_in(&self) -> String {
-        // last() is this callee's own (user) frame — the caller is the
-        // frame just below it.
+    /// `caller_depth` says how far back the caller sits on call_trace:
+    /// 1 when this callee's own frame is already pushed, 0 when the
+    /// count check fires before the push (invoke_fn).
+    fn arg_err_in(&self, caller_depth: usize) -> String {
         let internal_driver = self
             .call_trace
             .iter()
             .rev()
-            .nth(1)
+            .nth(caller_depth)
             .map(|f| {
                 f.internal
                     && !matches!(
@@ -3456,7 +3457,7 @@ impl<'a> Interp<'a> {
                     "Too few arguments to function {}(), {} passed{} and {} {} expected",
                     self.decl_fname(decl),
                     args.len(),
-                    self.arg_err_in(),
+                    self.arg_err_in(1),
                     if required == decl.params.len() {
                         "exactly"
                     } else {
@@ -4141,7 +4142,7 @@ impl<'a> Interp<'a> {
                     "Too few arguments to function {}(), {} passed{} and {} {} expected",
                     self.decl_fname(decl),
                     args.len(),
-                    self.arg_err_in(),
+                    self.arg_err_in(0),
                     if required == decl.params.len() {
                         "exactly"
                     } else {

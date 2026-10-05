@@ -290,6 +290,10 @@ impl<'a> Interp<'a> {
         self.deprecated(msg)
     }
 
+    pub fn notice_pub(&mut self, msg: &str) -> Result<(), PhpError> {
+        self.notice(msg)
+    }
+
     /// Diagnostic at a caller-selected E_USER_* level (trigger_error).
     /// Respects error_reporting masking + the silence (@) counter.
     pub fn emit_diag_pub(&mut self, level: i64, msg: &str) -> Result<(), PhpError> {

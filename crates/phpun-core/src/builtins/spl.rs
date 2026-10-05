@@ -132,12 +132,25 @@ pub(crate) fn dispatch(
             Value::Bool(true)
         }
         "spl_autoload_unregister" => {
-            // exact-value match — autoload lists are tiny in practice.
-            if let Some(v) = args.first() {
-                let target = v.borrow().clone();
-                it.autoload_fns
-                    .retain(|f| !crate::value::identical(f, &target));
+            // ZPP `f` flag: the callback validates eagerly — invalid
+            // args are a TypeError; a throwing autoloader propagates.
+            let target = arg(args, 0);
+            if !it.is_callable_value(&target) {
+                if let Some(pe) = it.take_callable_probe_err() {
+                    return Err(pe);
+                }
+                return err(
+                    "TypeError",
+                    format!(
+                        "spl_autoload_unregister(): Argument #1 ($callback) must be a valid callback, {}",
+                        it.zpp_callback_detail(&target)
+                    ),
+                );
             }
+            it.take_callable_probe_err();
+            // exact-value match — autoload lists are tiny in practice.
+            it.autoload_fns
+                .retain(|f| !crate::value::identical(f, &target));
             Value::Bool(true)
         }
         "spl_autoload_functions" => {

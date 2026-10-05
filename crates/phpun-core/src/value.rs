@@ -222,6 +222,19 @@ pub fn to_key(v: &Value) -> ArrKey {
     }
 }
 
+/// Prop-table slot name for zend's int-keyed object bucket: an SPL
+/// `[]=` append on object-backed storage lands in the prop hash under
+/// an INT key — a name no userland prop write can produce. Surfaces
+/// that enumerate props decode it back (`int_prop_index`).
+pub fn int_prop_key(n: i64) -> String {
+    format!("\0int\0{}", n)
+}
+
+/// Decode an int-keyed prop slot back to its int index.
+pub fn int_prop_index(k: &str) -> Option<i64> {
+    k.strip_prefix("\0int\0")?.parse().ok()
+}
+
 /// PHP's stack-trace argument printer: `'str'`, `Object(C)`, `Array`,
 /// scalars as their plain value (tests/lang/type_hints_001.phpt).
 /// Render Zend-style stack frames innermost-first, `#N {main}` last:
@@ -758,30 +771,77 @@ pub fn gcvt(value: f64, precision: usize) -> String {
 }
 
 thread_local! {
-    /// Object/array pairs currently being compared — zend marks the
-    /// containers while recursing; a pair re-entered through a cyclic
-    /// reference compares equal instead of looping (observer_007).
-    static CMP_PAIRS: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
+    /// Containers currently open on the compare stack — zend marks a
+    /// container while recursing inside it (Z_IS_RECURSIVE); reaching
+    /// an already-marked container on EITHER side through a cyclic
+    /// reference aborts the whole comparison.
+    static CMP_MARKS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// Set when a marked container is re-entered — zend fatals with
+    /// "Nesting level too deep - recursive dependency?" rather than
+    /// comparing equal. Read+cleared by the interpreter eval site.
+    static CMP_DEPTH_ERR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Clear the cyclic-compare flag before a fresh top-level comparison.
+pub fn clear_cmp_depth_err() {
+    CMP_DEPTH_ERR.with(|f| f.set(false));
+}
+
+/// True when a container pair was re-entered during the comparison
+/// just run — the interpreter turns it into zend's catchable
+/// `Error: Nesting level too deep - recursive dependency?`.
+pub fn cmp_depth_err() -> bool {
+    CMP_DEPTH_ERR.with(|f| f.get())
 }
 
 /// PHP loose comparison (`<=>` semantics) implementing the PHP 8 rules.
 pub fn compare(a: &Value, b: &Value) -> Ordering {
-    let pair = match (a, b) {
+    let marks = match (a, b) {
         (Value::Object(x), Value::Object(y)) => {
+            // Same zval short-circuits — zend's quick_equal never
+            // descends into props (also covers cyclic self-compares).
+            if Rc::ptr_eq(x, y) {
+                return Ordering::Equal;
+            }
             Some((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize))
         }
         (Value::Array(x), Value::Array(y)) => {
+            if Rc::ptr_eq(x, y) {
+                return Ordering::Equal;
+            }
             Some((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize))
         }
         _ => None,
     };
-    if let Some(p) = pair {
-        if CMP_PAIRS.with(|v| v.borrow().contains(&p)) {
+    if let Some((ap, bp)) = marks {
+        let reentered = CMP_MARKS.with(|v| {
+            let mut v = v.borrow_mut();
+            // zend's depth check fires when EITHER operand is already
+            // marked — a cyclic ref reaching back into an open
+            // container, whatever it now pairs against.
+            if v.contains(&ap) || v.contains(&bp) {
+                true
+            } else {
+                // The outermost call resets the flag so a stale one
+                // left by non-interp callers (sort callbacks) can't
+                // leak into the next eval.
+                if v.is_empty() {
+                    CMP_DEPTH_ERR.with(|f| f.set(false));
+                }
+                v.push(ap);
+                v.push(bp);
+                false
+            }
+        });
+        if reentered {
+            CMP_DEPTH_ERR.with(|f| f.set(true));
             return Ordering::Equal;
         }
-        CMP_PAIRS.with(|v| v.borrow_mut().push(p));
         let r = compare_r(a, b);
-        CMP_PAIRS.with(|v| v.borrow_mut().pop());
+        CMP_MARKS.with(|v| {
+            v.borrow_mut().pop();
+            v.borrow_mut().pop();
+        });
         return r;
     }
     compare_r(a, b)
@@ -923,16 +983,38 @@ pub fn identical(a: &Value, b: &Value) -> bool {
         (Float(x), Float(y)) => x == y,
         (Str(x), Str(y)) => x == y,
         (Array(x), Array(y)) => {
+            // Same zval → identical without descending (covers cyclic
+            // self-compares, which zend resolves via zval_ptr_eq).
+            if Rc::ptr_eq(x, y) {
+                return true;
+            }
+            let ap = Rc::as_ptr(x) as usize;
+            let bp = Rc::as_ptr(y) as usize;
+            // zend marks each operand while inside it — a cyclic ref
+            // back to either side just answers NOT identical
+            // (operator_identical_recusion-01), unlike =='s fatal.
+            if CMP_MARKS.with(|v| v.borrow().iter().any(|p| *p == ap || *p == bp)) {
+                return false;
+            }
+            CMP_MARKS.with(|v| {
+                v.borrow_mut().push(ap);
+                v.borrow_mut().push(bp);
+            });
             let x = x.borrow();
             let y = y.borrow();
-            x.len() == y.len()
+            let r = x.len() == y.len()
                 && x.iter().enumerate().all(|(i, (k, c))| {
                     // === also requires same order.
                     match y.entries.get(i) {
                         Some((yk, yc)) => k == yk && identical(&c.borrow(), &yc.borrow()),
                         None => false,
                     }
-                })
+                });
+            CMP_MARKS.with(|v| {
+                v.borrow_mut().pop();
+                v.borrow_mut().pop();
+            });
+            r
         }
         (Object(x), Object(y)) => Rc::ptr_eq(x, y),
         (Callable(x), Callable(y)) => Rc::ptr_eq(x, y),

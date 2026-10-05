@@ -167,11 +167,15 @@ impl<'a> Interp<'a> {
         }
         // Dynamic props follow the declared entries in insertion order
         // (gh20479's g/h, oss-fuzz-382922236's b); mangled keys are
-        // declared-private slots emitted by their own entries already.
+        // declared-private slots emitted by their own entries already —
+        // except int-keyed buckets (SPL `[]=` appends), which are real
+        // enumerable props.
         let emitted: std::collections::HashSet<String> =
             entries.iter().map(|(_, s, _)| s.clone()).collect();
         for k in &o.borrow().prop_order {
-            if emitted.contains(k) || k.starts_with('\0') {
+            if emitted.contains(k)
+                || (k.starts_with('\0') && crate::value::int_prop_index(k).is_none())
+            {
                 continue;
             }
             entries.push((k.clone(), k.clone(), None));

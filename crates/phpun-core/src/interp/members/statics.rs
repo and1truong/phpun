@@ -331,45 +331,13 @@ impl<'a> Interp<'a> {
                         .unwrap_or(Value::Null);
                     match self.callable_to_closure(&v) {
                         Ok(c) => return Ok(c),
-                        Err(fail) => {
-                            // Zend appends the reason:
-                            // "Failed to create closure from callable:
-                            // non-static method A::m() cannot be called
-                            // statically" (from_callable_non_static). A
-                            // plain string that resolves to nothing gets
-                            // the dedicated not-found wording.
-                            let not_found = match &v {
-                                Value::Str(s)
-                                    if !crate::value::lossy(s).contains("::")
-                                        && fail
-                                            .message
-                                            .starts_with("Call to undefined function") =>
-                                {
-                                    Some(format!(
-                                        "function \"{}\" not found or invalid function name",
-                                        crate::value::lossy(s)
-                                    ))
-                                }
-                                _ => None,
-                            };
-                            let reason = if let Some(r) = not_found {
-                                r
-                            } else if !fail.message.is_empty() {
-                                fail.message
-                                    .replacen("Non-static method", "non-static method", 1)
-                            } else {
-                                self.pending_exception
-                                    .as_ref()
-                                    .and_then(|e| match e {
-                                        Value::Object(o) => o
-                                            .borrow()
-                                            .props
-                                            .get("message")
-                                            .map(|c| c.borrow().to_php_string()),
-                                        _ => None,
-                                    })
-                                    .unwrap_or_default()
-                            };
+                        Err(_fail) => {
+                            // Zend's wording is the zpp callback ladder
+                            // verbatim — "Failed to create closure from
+                            // callable: <detail>" — including a throwing
+                            // autoloader reducing to TypeError.
+                            self.take_callable_probe_err();
+                            let reason = self.zpp_callback_detail(&v);
                             let e = self.exception(
                                 "TypeError",
                                 &format!("Failed to create closure from callable: {}", reason),
