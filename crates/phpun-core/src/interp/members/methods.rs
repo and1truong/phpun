@@ -142,7 +142,10 @@ impl<'a> Interp<'a> {
             if let Some(f) = args.cells.get(1) {
                 let fv = f.borrow().clone();
                 match self.spl_int_arg(&fv, family, canonical, 2, "flags") {
-                    Ok(i) => flags = i,
+                    // User input is masked to the 16 user bits — bits
+                    // >= 0x10000 are engine-internal (self-backed
+                    // storage) and not forgeable through zpp.
+                    Ok(i) => flags = i & 0xFFFF,
                     Err(e) => return self.fail(e),
                 }
             }
@@ -178,12 +181,13 @@ impl<'a> Interp<'a> {
                 Some(Value::Object(o)) => Some(o.clone()),
                 _ => None,
             };
-            // No explicit flags arg → an spl-array source's flags carry
-            // over (zend spl_array_object_new_ex); array/plain inputs
-            // default to 0.
+            // No explicit flags arg → an spl-array source's user flags
+            // carry over (zend spl_array_object_new_ex); array/plain
+            // inputs default to 0. Engine bits never transfer — the
+            // new object resolves through the src chain instead.
             if args.cells.len() < 2 {
                 if let Some((_, Some(sf))) = &backing {
-                    flags = *sf;
+                    flags = *sf & 0xFFFF;
                 }
             }
             if self_backed {
@@ -304,10 +308,13 @@ impl<'a> Interp<'a> {
                         let mut ob = obj.borrow_mut();
                         match &mut ob.internal {
                             Some(ObjectInternal::ArrayIter { flags: f, .. }) => {
-                                // An spl-array source merges its flags in
-                                // (zend USE_OTHER |= ); plain inputs keep ours.
+                                // An spl-array source merges its user
+                                // flags in (zend USE_OTHER |= ); plain
+                                // inputs keep ours. Engine bits of the
+                                // source stay behind — dst isn't
+                                // self/other-backed itself.
                                 if let Some(sf) = src_flags {
-                                    *f |= sf;
+                                    *f |= sf & 0xFFFF;
                                 }
                             }
                             _ => unreachable!(),
@@ -520,7 +527,9 @@ impl<'a> Interp<'a> {
                 if let Some(ObjectInternal::ArrayIter { flags: fp, .. }) =
                     &mut obj.borrow_mut().internal
                 {
-                    *fp = f;
+                    // Replace the 16 user bits; engine bits
+                    // (self-backed storage) are preserved.
+                    *fp = (*fp & !0xFFFFi64) | (f & 0xFFFF);
                 }
                 Value::Null
             }
@@ -938,7 +947,9 @@ impl<'a> Interp<'a> {
                                     src: src_obj,
                                 })),
                                 pos: 0,
-                                flags: backing.1.unwrap_or(flags),
+                                // The iterator is a different object —
+                                // only the source's user flags carry.
+                                flags: backing.1.unwrap_or(flags) & 0xFFFF,
                                 iterator_class: None,
                             }),
                             unset_props: Default::default(),
