@@ -1608,7 +1608,7 @@ impl<'a> Interp<'a> {
                                         got.borrow().clone(),
                                     )?;
                                     *got.borrow_mut() = cv;
-                                    self.ref_cells.insert(Rc::as_ptr(&got) as usize);
+                                    self.mark_ref(&got);
                                     return Ok(got);
                                 }
                                 return self.fail(PhpError::uncaught(
