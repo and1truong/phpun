@@ -783,6 +783,12 @@ thread_local! {
     /// "Nesting level too deep - recursive dependency?" rather than
     /// comparing equal. Read+cleared by the interpreter eval site.
     static CMP_DEPTH_ERR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Sticky "an exception is pending" for the compare layer — zend's
+    /// `if (EG(exception)) return 1` inside zend_compare's conversion
+    /// arm: once a depth Error is pending, later scalar-to-array /
+    /// scalar-to-resource compares in the SAME sort report 1 too.
+    /// Cleared alongside CMP_DEPTH_ERR at eval/builtin boundaries.
+    static CMP_EXC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// E_NOTICEs raised inside a comparison (object→number casts);
     /// the interp layer drains and emits them at the call site so
     /// they flow through the user error-handler machinery.
@@ -793,6 +799,13 @@ thread_local! {
 /// Clear the cyclic-compare flag before a fresh top-level comparison.
 pub fn clear_cmp_depth_err() {
     CMP_DEPTH_ERR.with(|f| f.set(false));
+    CMP_EXC.with(|f| f.set(false));
+}
+
+/// zend's `EG(exception)` as compare sees it — the caller threw
+/// mid-sort and every later conversion-arm compare answers 1.
+pub(crate) fn cmp_exc() -> bool {
+    CMP_EXC.with(|f| f.get())
 }
 
 /// True when a container pair was re-entered during the comparison
@@ -851,8 +864,12 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
             }
         });
         if reentered {
+            // zend_hash_compare returns ZEND_UNCOMPARABLE (2) with the
+            // depth Error pending — for every caller that survives the
+            // error (a sort keeps comparing) that reads "greater".
             CMP_DEPTH_ERR.with(|f| f.set(true));
-            return Ordering::Equal;
+            CMP_EXC.with(|f| f.set(true));
+            return Ordering::Greater;
         }
         let r = compare_r(a, b);
         CMP_MARKS.with(|v| {
@@ -866,6 +883,29 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
 fn compare_r(a: &Value, b: &Value) -> Ordering {
     use Value::*;
     match (a, b) {
+        // zend_compare's explicit type pairs ahead of the truthy
+        // default block: null vs string compares by string length
+        // alone — `null <=> "0"` is -1 (nonempty), not truthy-equal.
+        (Null, Str(s)) => {
+            if s.is_empty() {
+                Ordering::Equal
+            } else {
+                Ordering::Less
+            }
+        }
+        (Str(s), Null) => {
+            if s.is_empty() {
+                Ordering::Equal
+            } else {
+                Ordering::Greater
+            }
+        }
+        // DOUBLE×STRING / STRING×DOUBLE short-circuit on NaN — zend
+        // returns 1 in BOTH directions.
+        (Float(f), Str(_)) if f.is_nan() => Ordering::Greater,
+        (Str(_), Float(f)) if f.is_nan() => Ordering::Greater,
+        // zend's default-block bool/null arms (op<IS_TRUE / op==IS_TRUE
+        // against zval_is_true) — truthiness on either side decides.
         (Bool(_), _) | (_, Bool(_)) | (Null, _) | (_, Null) => a.is_truthy().cmp(&b.is_truthy()),
         (Int(_) | Float(_), Str(s)) => {
             match numeric(s) {
@@ -886,16 +926,8 @@ fn compare_r(a: &Value, b: &Value) -> Ordering {
         (Str(_), Int(_) | Float(_)) => compare(b, a).reverse(),
         (Int(x), Int(y)) => x.cmp(y),
         (Int(_) | Float(_), Int(_) | Float(_)) => num_cmp(a.to_float(), b.to_float()),
-        (Str(x), Str(y)) => {
-            // Both numeric strings → numeric compare, else string compare.
-            match (numeric(x), numeric(y)) {
-                (Numeric::Int(xi), Numeric::Int(yi)) => xi.cmp(&yi),
-                (Numeric::Int(_) | Numeric::Float(_), Numeric::Int(_) | Numeric::Float(_)) => {
-                    num_cmp(numeric(x).to_float(), numeric(y).to_float())
-                }
-                _ => x.as_ref().cmp(y.as_ref()),
-            }
-        }
+        // STRING×STRING → zendi_smart_strcmp.
+        (Str(x), Str(y)) => smart_strcmp(x, y),
         (Array(x), Array(y)) => {
             // Loose array comparison (zend_hash_compare ordered=0):
             // equal len, then each ht1 key must exist in ht2 with an
@@ -1032,17 +1064,136 @@ fn compare_r(a: &Value, b: &Value) -> Ordering {
         // Objects beat everything else — including arrays.
         (Object(_) | Callable(_), _) => Ordering::Greater,
         (_, Object(_) | Callable(_)) => Ordering::Less,
+        // zend's conversion arm: arrays and resources convert the pair
+        // to numbers, and with an exception already pending the arm
+        // returns 1 in BOTH directions ("to stop comparison of
+        // arrays").
         (Array(_), _) => Ordering::Greater,
-        (_, Array(_)) => Ordering::Less,
-        (Resource(x), Resource(y)) => x.borrow().id().cmp(&y.borrow().id()),
+        (_, Array(_)) => {
+            if cmp_exc() {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (Resource(x), Resource(y)) => {
+            if cmp_exc() {
+                Ordering::Greater
+            } else {
+                x.borrow().id().cmp(&y.borrow().id())
+            }
+        }
         (Resource(_), _) => Ordering::Greater,
-        (_, Resource(_)) => Ordering::Less,
+        (_, Resource(_)) => {
+            // zend converts the resource to its numeric handle and
+            // does THREEWAY — a NaN left operand still wins — and a
+            // pending exception returns 1 in both directions.
+            if cmp_exc() || matches!(a, Float(f) if f.is_nan()) {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
     }
 }
 
-fn num_cmp(a: f64, b: f64) -> Ordering {
-    // NaN is never equal, not even to NaN (nan-comparison-false.phpt).
-    a.partial_cmp(&b).unwrap_or(Ordering::Less)
+/// ZEND_THREEWAY_COMPARE: `a==b ? 0 : (a<b ? -1 : 1)` — NaN fails both
+/// legs so it reports 1: NaN sorts GREATER than everything
+/// (`sort([1,NAN])` → `[NAN,1]`; `NAN <=> NAN` → 1).
+pub(crate) fn num_cmp(a: f64, b: f64) -> Ordering {
+    if a.is_nan() || b.is_nan() {
+        Ordering::Greater
+    } else {
+        a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+    }
+}
+
+/// zendi_smart_strcmp (Zend/zend_operators.c): two fully-numeric
+/// strings compare numerically — integer literals that overflowed
+/// i64 in the same direction fall back to the byte compare (double
+/// precision would tie), as do two same-sign infinities. Anything
+/// else is a binary strcmp.
+pub(crate) fn smart_strcmp(a: &[u8], b: &[u8]) -> Ordering {
+    let na = numeric(a);
+    let nb = numeric(b);
+    let a_num = matches!(na, Numeric::Int(_) | Numeric::Float(_));
+    let b_num = matches!(nb, Numeric::Int(_) | Numeric::Float(_));
+    if !a_num || !b_num {
+        return a.cmp(b);
+    }
+    // oflow in zend's is_numeric_string: the string is a pure integer
+    // literal that overflowed i64 (numeric() reports it Float).
+    fn int_oflow(s: &[u8], n: &Numeric) -> Option<i32> {
+        if !matches!(n, Numeric::Float(_)) {
+            return None;
+        }
+        let ws = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+        let mut i = 0;
+        while i < s.len() && ws(s[i]) {
+            i += 1;
+        }
+        let neg = s.get(i) == Some(&b'-');
+        if matches!(s.get(i), Some(b'+') | Some(b'-')) {
+            i += 1;
+        }
+        let start = i;
+        while i < s.len() && s[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start || s[i..].iter().any(|&c| !ws(c)) {
+            return None;
+        }
+        Some(if neg { -1 } else { 1 })
+    }
+    let oa = int_oflow(a, &na);
+    let ob = int_oflow(b, &nb);
+    if let (Some(x), Some(y)) = (oa, ob) {
+        if x == y && na.to_float() == nb.to_float() {
+            // Same-direction integer overflows whose doubles tie —
+            // precision lost, string-compare instead.
+            return a.cmp(b);
+        }
+    }
+    let a_dbl = matches!(na, Numeric::Float(_));
+    let b_dbl = matches!(nb, Numeric::Float(_));
+    if a_dbl || b_dbl {
+        if !a_dbl {
+            // a is a long, b a double: an overflowed-int b sits beyond
+            // every representable long on its side.
+            if let Some(y) = ob {
+                return if y > 0 {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                };
+            }
+        } else if !b_dbl {
+            if let Some(x) = oa {
+                return if x > 0 {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                };
+            }
+        } else {
+            let (da, db) = (na.to_float(), nb.to_float());
+            if da == db && !da.is_finite() {
+                return a.cmp(b);
+            }
+        }
+        let d = na.to_float() - nb.to_float();
+        return if d > 0.0 {
+            Ordering::Greater
+        } else if d < 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Equal
+        };
+    }
+    match (na, nb) {
+        (Numeric::Int(x), Numeric::Int(y)) => x.cmp(&y),
+        _ => a.cmp(b),
+    }
 }
 
 /// Strict comparison `===`.
@@ -1070,6 +1221,7 @@ pub fn identical(a: &Value, b: &Value) -> bool {
             let am = CMP_MARKS.with(|v| v.borrow().contains(&ap));
             if am {
                 CMP_DEPTH_ERR.with(|f| f.set(true));
+                CMP_EXC.with(|f| f.set(true));
                 return false;
             }
             CMP_MARKS.with(|v| {

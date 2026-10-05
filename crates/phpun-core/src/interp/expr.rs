@@ -3928,16 +3928,6 @@ impl<'a> Interp<'a> {
         a: &Value,
         b: &Value,
     ) -> Result<Value, PhpError> {
-        // NaN is unordered: every ordered comparison is false, <=> is -1.
-        let nan = matches!((a, b), (Value::Float(f), _) | (_, Value::Float(f)) if f.is_nan());
-        if nan {
-            return Ok(match op {
-                "===" | "!==" => Value::Bool((op == "!==") != identical(a, b)),
-                "==" | "!=" => Value::Bool(op == "!="),
-                "<=>" => Value::Int(-1),
-                _ => Value::Bool(false),
-            });
-        }
         // pass_two (zend_vm_set_opcode_handler) swaps the operands of the
         // COMMUTATIVE ops IS_EQUAL/IS_NOT_EQUAL/IS_IDENTICAL/
         // IS_NOT_IDENTICAL when op1's znode type ranks below op2's
