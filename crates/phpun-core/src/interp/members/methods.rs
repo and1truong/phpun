@@ -275,15 +275,29 @@ impl<'a> Interp<'a> {
                     );
                     return self.fail(e);
                 }
-                let (new, src_flags) = self.ao_backing(&v, family, canonical)?;
+                // Passing the object itself: zend doesn't share its own
+                // storage — the arg takes the plain-object path (prop-hash
+                // backing, self-backed flag), which for an ArrayObject's
+                // empty prop table means an empty storage.
+                let self_arg = matches!(&v, Value::Object(o) if Rc::ptr_eq(o, obj));
+                let (new, src_flags) = if self_arg {
+                    self.deprecated(&format!(
+                        "{}::{}(): Using an object as a backing array for {} is deprecated, as it allows violating class constraints and invariants",
+                        family, canonical, family
+                    ))?;
+                    (self.ao_obj_backing(obj)?, None)
+                } else {
+                    self.ao_backing(&v, family, canonical)?
+                };
                 // The new backing object replaces `src` too — plain-object
                 // input binds prop cells live; array/spl input clears it.
                 let new_src = match &v {
                     Value::Object(o)
-                        if !matches!(
-                            o.borrow().internal,
-                            Some(ObjectInternal::ArrayIter { .. })
-                        ) =>
+                        if self_arg
+                            || !matches!(
+                                o.borrow().internal,
+                                Some(ObjectInternal::ArrayIter { .. })
+                            ) =>
                     {
                         Some(o.clone())
                     }
@@ -299,7 +313,8 @@ impl<'a> Interp<'a> {
                 let arg_is_spl = matches!(
                     &v,
                     Value::Object(o)
-                        if matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. }))
+                        if !self_arg
+                            && matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. }))
                 );
                 let st = self.ao_store(obj);
                 let old_inner = {
@@ -315,6 +330,9 @@ impl<'a> Interp<'a> {
                                 // self/other-backed itself.
                                 if let Some(sf) = src_flags {
                                     *f |= sf & 0xFFFF;
+                                }
+                                if self_arg {
+                                    *f |= 0x1000000;
                                 }
                             }
                             _ => unreachable!(),
