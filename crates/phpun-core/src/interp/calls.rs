@@ -3457,7 +3457,11 @@ impl<'a> Interp<'a> {
                     self.decl_fname(decl),
                     args.len(),
                     self.arg_err_in(),
-                    if required == decl.params.len() { "exactly" } else { "at least" },
+                    if required == decl.params.len() {
+                        "exactly"
+                    } else {
+                        "at least"
+                    },
                     required
                 ),
                 0,
@@ -4138,7 +4142,11 @@ impl<'a> Interp<'a> {
                     self.decl_fname(decl),
                     args.len(),
                     self.arg_err_in(),
-                    if required == decl.params.len() { "exactly" } else { "at least" },
+                    if required == decl.params.len() {
+                        "exactly"
+                    } else {
+                        "at least"
+                    },
                     required
                 ),
                 0,

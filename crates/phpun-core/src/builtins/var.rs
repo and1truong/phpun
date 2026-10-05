@@ -1101,9 +1101,9 @@ pub(crate) fn php_unserialize(
             *pos += 1; // :
             let plen: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
             *pos += 1; // {
-                     // zend bounds-checks the payload AND its closing `}`
-                     // together — past the end it warns "Insufficient data"
-                     // and fails at the payload start.
+                       // zend bounds-checks the payload AND its closing `}`
+                       // together — past the end it warns "Insufficient data"
+                       // and fails at the payload start.
             if *pos + plen >= b.len() {
                 let _ = it.warn_pub(&format!(
                     "Insufficient data for unserializing - {} required, {} present",
