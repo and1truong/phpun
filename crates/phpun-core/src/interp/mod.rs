@@ -29,7 +29,7 @@ mod gen;
 mod include;
 mod members;
 mod registry;
-mod util;
+pub(crate) mod util;
 
 use util::*;
 

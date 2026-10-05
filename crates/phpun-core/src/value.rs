@@ -1257,58 +1257,6 @@ pub fn identical(a: &Value, b: &Value) -> bool {
 /// plus the bucket's key/value cell.
 pub(crate) type SortElem = (u32, ArrKey, Cell);
 
-/// zend_hash_sort_internal's pre-pass: tombstones compact out (the
-/// "remove holes" path) and each live entry is stamped with its
-/// insertion position — position travels with the element through
-/// every swap, like Z_EXTRA inside the bucket zval.
-pub(crate) fn zend_sort_prepare(entries: &mut Vec<(ArrKey, Cell)>) -> Vec<SortElem> {
-    entries.retain(|(k, _)| !matches!(k, ArrKey::Tomb));
-    std::mem::take(entries)
-        .into_iter()
-        .enumerate()
-        .map(|(i, (k, c))| (i as u32, k, c))
-        .collect()
-}
-
-/// Write the sorted elements back over `entries` (zend_sort_finish).
-pub(crate) fn zend_sort_finish(entries: &mut Vec<(ArrKey, Cell)>, sorted: Vec<SortElem>) {
-    entries.extend(sorted.into_iter().map(|(_, k, c)| (k, c)));
-}
-
-/// php_array_data_compare / php_array_reverse_data_compare over
-/// SortElems: zend_compare on the values (the reverse variant negates
-/// the RESULT, operand order kept), then RETURN_STABLE_SORT falls back
-/// to insertion position on Equal — ascending for both directions.
-pub(crate) fn zend_data_cmp(a: &SortElem, b: &SortElem, desc: bool) -> Ordering {
-    let r = compare(&a.2.borrow(), &b.2.borrow());
-    let r = if desc { r.reverse() } else { r };
-    if r != Ordering::Equal {
-        r
-    } else {
-        a.0.cmp(&b.0)
-    }
-}
-
-/// zend_array_sort over value cells (sort/rsort/asort/arsort
-/// SORT_REGULAR plus the SPL equivalents): prepare → introsort →
-/// write back. Returns true when a compare set CMP_DEPTH_ERR — zend
-/// aborts mid-sort on the depth Error, so the flag accumulates per
-/// compare and the caller throws after.
-pub(crate) fn zend_sort_data(entries: &mut Vec<(ArrKey, Cell)>, desc: bool) -> bool {
-    // A stale CMP_DEPTH_ERR from an earlier caught Error must not
-    // bleed into this sort's flag reads.
-    clear_cmp_depth_err();
-    let mut deep = false;
-    let mut v = zend_sort_prepare(entries);
-    zend_sort(&mut v, &mut |a, b| {
-        let r = zend_data_cmp(a, b, desc);
-        deep |= cmp_depth_err();
-        r
-    });
-    zend_sort_finish(entries, v);
-    deep
-}
-
 /// zend_sort_2/3/4/5: fixed sorting networks for the smallest slices —
 /// element order, compare pairing and arg order byte-match the C.
 fn zsort_2<T>(v: &mut [T], a: usize, b: usize, cmp: &mut impl FnMut(&T, &T) -> Ordering) {

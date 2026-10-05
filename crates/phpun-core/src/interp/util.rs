@@ -17,7 +17,7 @@ pub(in crate::interp) fn cell(v: Value) -> Cell {
     Rc::new(RefCell::new(v))
 }
 
-pub(in crate::interp) fn key_value(k: &ArrKey) -> Value {
+pub(crate) fn key_value(k: &ArrKey) -> Value {
     match k {
         ArrKey::Int(i) => Value::Int(*i),
         ArrKey::Str(s) => Value::str(s.to_string()),
