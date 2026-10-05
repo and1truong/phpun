@@ -483,9 +483,16 @@ fn closure_debug_props(it: &mut Interp, c: &crate::value::PhpCallable) -> Vec<(S
             }
         }
         CallableKind::Closure(d) => {
+            // `name` is the Zend scope name `{closure:scope():L}`
+            // computed at creation — falls back to file:line for
+            // decls that never got one.
             props.push((
                 "name".into(),
-                Value::str(format!("{{closure:{}:{}}}", d.file, d.line)),
+                Value::str(if d.name.is_empty() {
+                    format!("{{closure:{}:{}}}", d.file, d.line)
+                } else {
+                    d.name.clone()
+                }),
             ));
             props.push(("file".into(), Value::str(d.file.clone())));
             props.push(("line".into(), Value::Int(d.line as i64)));
@@ -495,7 +502,9 @@ fn closure_debug_props(it: &mut Interp, c: &crate::value::PhpCallable) -> Vec<(S
                 .map(|p| (p.name.clone(), p.default.is_none() && !p.variadic))
                 .collect();
             static_var_names(&d.body, &mut body_statics);
-            statics_key = Some(d.name.clone());
+            // Closure statics live per-instance — the table is keyed
+            // by decl name + the callable's object id.
+            statics_key = Some(format!("{}\u{0}c{}", d.name, c.id.get()));
         }
     }
     // `static` member: bound use-vars first, then function statics —

@@ -351,8 +351,11 @@ impl<'a> Interp<'a> {
                             let v = match default {
                                 // Runtime init: an unresolved const is a
                                 // catchable Error, not silent NULL
-                                // (bug79778).
-                                Some(d) => match self.eval_const(d) {
+                                // (bug79778). `static` initializers are
+                                // runtime expressions in Zend — calls,
+                                // `new`, and non-static closures all
+                                // work (static_initalizer).
+                                Some(d) => match self.eval(d) {
                                     Ok(v) => v,
                                     Err(e) => return self.err_flow(e),
                                 },

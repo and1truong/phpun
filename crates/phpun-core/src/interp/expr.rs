@@ -318,6 +318,29 @@ impl<'a> Interp<'a> {
                 }
             }
             Expr::Closure(c) => {
+                // PHP 8.5 closures in constant expressions must be
+                // static and can't import use() vars; `fn` arrow bodies
+                // are never const-expr material (closure_const_expr/*).
+                if self.in_const_expr > 0 {
+                    if c.arrow {
+                        return self.fail(PhpError::compile_fatal(
+                            "Constant expression contains invalid operations",
+                            self.cur_line,
+                        ));
+                    }
+                    if !c.is_static {
+                        return self.fail(PhpError::compile_fatal(
+                            "Closures in constant expressions must be static",
+                            self.cur_line,
+                        ));
+                    }
+                    if !c.uses.is_empty() {
+                        return self.fail(PhpError::compile_fatal(
+                            "Cannot use(...) variables in constant expression",
+                            self.cur_line,
+                        ));
+                    }
+                }
                 // Compile-time param checks for the closure's decl —
                 // `{closure:FILE:LINE}():` names it (namespaces/ns_073).
                 let cfile = if c.decl.file.is_empty() {
@@ -329,28 +352,34 @@ impl<'a> Interp<'a> {
                 // `{closure:Class::m():L}` inside a method,
                 // `{closure:fn():L}` inside a function, `{closure:FILE:L}`
                 // at top level, and `{closure:{closure:...}:L}` when
-                // nested (iterable_003, closure_065).
-                let enclosing = self
-                    .stack
-                    .last()
-                    .map(|f| {
-                        if f.fn_name.is_empty() || f.fn_name == "{main}" {
-                            String::new()
-                        } else if f.fn_name.starts_with("{closure:") {
-                            f.fn_name.clone()
-                        } else {
-                            match f.trait_origin.clone().or_else(|| {
-                                f.decl_class
-                                    .as_ref()
-                                    .or(f.scope_class.as_ref())
-                                    .map(|c| c.name().to_string())
-                            }) {
-                                Some(o) => format!("{}::{}", o, f.fn_name),
-                                None => f.fn_name.clone(),
+                // nested (iterable_003, closure_065). Class-init
+                // initializers (prop/const/static-prop defaults) have no
+                // enclosing function — file-based name regardless of the
+                // runtime caller's frame.
+                let enclosing = if self.const_self.is_some() {
+                    String::new()
+                } else {
+                    self.stack
+                        .last()
+                        .map(|f| {
+                            if f.fn_name.is_empty() || f.fn_name == "{main}" {
+                                String::new()
+                            } else if f.fn_name.starts_with("{closure:") {
+                                f.fn_name.clone()
+                            } else {
+                                match f.trait_origin.clone().or_else(|| {
+                                    f.decl_class
+                                        .as_ref()
+                                        .or(f.scope_class.as_ref())
+                                        .map(|c| c.name().to_string())
+                                }) {
+                                    Some(o) => format!("{}::{}", o, f.fn_name),
+                                    None => f.fn_name.clone(),
+                                }
                             }
-                        }
-                    })
-                    .unwrap_or_default();
+                        })
+                        .unwrap_or_default()
+                };
                 let fname = if enclosing.is_empty() {
                     format!("{{closure:{}:{}}}", cfile, c.decl.line)
                 } else if enclosing.starts_with('{') {
@@ -380,7 +409,12 @@ impl<'a> Interp<'a> {
                 } else {
                     for (n, by_ref) in &c.uses {
                         let cap = if *by_ref {
-                            self.var_cell(n)
+                            // `use (&$x)` promotes the imported var to
+                            // an IS_REFERENCE cell (bug52193's `&` in
+                            // var_dump of the captures table).
+                            let cellv = self.var_cell(n);
+                            self.mark_ref(&cellv);
+                            cellv
                         } else {
                             match self.var_cell_opt(n) {
                                 Some(c) => cell(c.borrow().clone()),
@@ -398,9 +432,17 @@ impl<'a> Interp<'a> {
                 }
                 // `static function` never binds $this; `static::`
                 // keeps the creating frame's late-bound class
-                // (closure_049-052).
+                // (closure_049-052). Class-init initializers bind the
+                // DECLARING class's scope instead (const_self), so a
+                // prop-default closure can reach private props
+                // (property_initializer_scope_*).
                 let is_static = c.is_static;
-                Ok(Value::Callable(self.new_callable(PhpCallable {
+                // Zend seeds a closure's static-variable table at
+                // creation — each instance owns its own copy of the
+                // compiled defaults (closure_const_expr/static_variable).
+                let mut sv = Vec::new();
+                closure_static_vars(&decl.body, &mut sv);
+                let callable = self.new_callable(PhpCallable {
                     id: std::cell::Cell::new(0),
                     kind: CallableKind::Closure(Rc::new(decl)),
                     captures,
@@ -409,10 +451,38 @@ impl<'a> Interp<'a> {
                     } else {
                         self.stack.last().and_then(|f| f.this_obj.clone())
                     },
-                    scope_class: self.stack.last().and_then(|f| f.scope_class.clone()),
-                    called_class: self.stack.last().and_then(|f| f.called_class.clone()),
+                    scope_class: self
+                        .const_self
+                        .clone()
+                        .or_else(|| self.stack.last().and_then(|f| f.scope_class.clone())),
+                    called_class: self
+                        .const_self
+                        .clone()
+                        .or_else(|| self.stack.last().and_then(|f| f.called_class.clone())),
                     is_static,
-                })))
+                });
+                if !sv.is_empty() {
+                    let key = format!("{}\u{0}c{}", fname, callable.id.get());
+                    for (n, d) in sv {
+                        // Only literal-only defaults are bound at
+                        // creation — consts, `new`, calls and anything
+                        // needing a runtime env stay NULL until the
+                        // `static` statement first executes
+                        // (closure_const_expr/bug79778).
+                        let Some(e) = d else { continue };
+                        if !literal_static_init(&e) {
+                            continue;
+                        }
+                        let Ok(v) = self.eval_const(&e) else {
+                            continue;
+                        };
+                        self.statics
+                            .entry(key.clone())
+                            .or_default()
+                            .insert(n, cell(v));
+                    }
+                }
+                Ok(Value::Callable(callable))
             }
             Expr::New { class, args } => {
                 let name = self.class_name_of(class)?;
@@ -4446,4 +4516,81 @@ fn bitwise_str(op: &str, a: &[u8], b: &[u8]) -> Vec<u8> {
         });
     }
     out
+}
+
+/// `static` declarations anywhere in a body, with their default exprs —
+/// nested function/class bodies declare their own.
+fn closure_static_vars(stmts: &[Stmt], out: &mut Vec<(String, Option<Expr>)>) {
+    use crate::ast::Stmt;
+    for st in stmts {
+        match st {
+            Stmt::Static { vars, .. } => {
+                for (n, d) in vars {
+                    if !out.iter().any(|(x, _)| x == n) {
+                        out.push((n.clone(), d.clone()));
+                    }
+                }
+            }
+            Stmt::Block(b) => closure_static_vars(b, out),
+            Stmt::If { then, else_, .. } => {
+                closure_static_vars(then, out);
+                closure_static_vars(else_, out);
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::Foreach { body, .. } => closure_static_vars(body, out),
+            Stmt::Switch { cases, .. } => {
+                for (_, b) in cases {
+                    closure_static_vars(b, out);
+                }
+            }
+            Stmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                closure_static_vars(body, out);
+                for c in catches {
+                    closure_static_vars(&c.body, out);
+                }
+                if let Some(f) = finally {
+                    closure_static_vars(f, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Compile-time bindable `static` initializer: literals and ops on
+/// literals only. Zend resolves consts/`new`/calls when the `static`
+/// statement runs, not at closure creation (probe_sv3), so those
+/// stay NULL in the seeded table.
+fn literal_static_init(e: &Expr) -> bool {
+    match e {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::MagicConst(_) => true,
+        Expr::ArrayLit(items) => items.iter().all(|(k, v)| {
+            k.as_ref().map(|k| literal_static_init(k)).unwrap_or(true) && literal_static_init(v)
+        }),
+        Expr::Interp(parts) => parts
+            .iter()
+            .all(|p| matches!(p, crate::lexer::StringPart::Lit(_))),
+        Expr::Paren(inner) | Expr::ByRef(inner) | Expr::Unary { e: inner, .. } => {
+            literal_static_init(inner)
+        }
+        Expr::Cast { e: inner, .. } => literal_static_init(inner),
+        Expr::Binary { l, r, .. } => literal_static_init(l) && literal_static_init(r),
+        Expr::Ternary { c, t, f, .. } => {
+            literal_static_init(c)
+                && t.as_ref().map(|t| literal_static_init(t)).unwrap_or(true)
+                && literal_static_init(f)
+        }
+        _ => false,
+    }
 }

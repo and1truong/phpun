@@ -1776,6 +1776,12 @@ impl<'a> Interp<'a> {
         self.stack
             .last()
             .map(|f| {
+                // Closure statics are per-INSTANCE: each `function(){}`
+                // eval creates its own table seeded from the decl's
+                // defaults (zend_create_closure).
+                if let Some(rc) = &f.closure_rc {
+                    return format!("{}\u{0}c{}", f.fn_name, rc.id.get());
+                }
                 // Method statics are per-(function, declaring class):
                 // trait-merged methods get independent statics in each
                 // using class, while inherited methods share their

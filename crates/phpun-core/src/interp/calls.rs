@@ -1991,11 +1991,9 @@ impl<'a> Interp<'a> {
             .stack
             .last()
             .map(|f| TraceFrame {
-                function: if f.fn_name.starts_with("{closure:") {
-                    format!("{{closure:{}:{}}}", f.file, f.fn_line)
-                } else {
-                    f.fn_name.clone()
-                },
+                // fn_name is already the Zend scope name —
+                // `{closure:Foo::m():L}`/`{closure:FILE:L}` included.
+                function: f.fn_name.clone(),
                 // A closure bound to $this without a real scope runs
                 // on the "dummy scope" — traces show `Closure->`
                 // (closure_038).
