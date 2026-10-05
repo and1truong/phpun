@@ -3170,13 +3170,20 @@ impl<'a> Interp<'a> {
     }
 
     /// Validation-style callable check: a throwing autoloader's
-    /// exception is abandoned — the value simply is not callable
-    /// (zend turns it into a zpp TypeError upstream).
+    /// exception is abandoned — the value simply is not callable.
+    /// The error is stashed in `callable_probe_err` so a failing
+    /// `callable` param type can re-raise it (zend propagates the
+    /// autoload exception instead of emitting TypeError).
     pub fn is_callable_value(&mut self, v: &Value) -> bool {
         match self.try_is_callable_value(v) {
             Ok(b) => b,
-            Err(_) => {
+            Err(e) => {
+                // The throwable VALUE lives in pending_exception —
+                // stash it with the error so a `callable` param can
+                // re-raise the original exception, not a Null.
+                let v = self.pending_exception.take().unwrap_or(Value::Null);
                 self.pending_exception = None;
+                self.callable_probe_err = Some((v, e));
                 false
             }
         }
@@ -3468,6 +3475,8 @@ impl<'a> Interp<'a> {
                 }
                 continue;
             }
+            // Probe errors belong to THIS param's type check only.
+            self.callable_probe_err = None;
             let v = a.borrow().clone();
             let implicit_null = !ty.iter().any(|m| m.eq_ignore_ascii_case("null"))
                 && match &p.default {
@@ -3505,6 +3514,18 @@ impl<'a> Interp<'a> {
                 }
             }
             if !ok {
+                // A `callable` member's resolution ran a swallowing
+                // probe — an autoloader that threw has its exception
+                // propagate (zend raises it, not the TypeError).
+                if ty.iter().any(|m| m.eq_ignore_ascii_case("callable")) {
+                    if let Some((v, e)) = self.callable_probe_err.take() {
+                        if e.kind == crate::error::ErrorKind::Throw {
+                            self.pending_exception = Some(v);
+                        }
+                        self.stack.pop();
+                        return self.fail(e);
+                    }
+                }
                 let mut fname = self.decl_fname(decl);
                 // Anonymous-class methods report args under just the
                 // class name (union_types/anonymous_class).
@@ -3628,7 +3649,7 @@ impl<'a> Interp<'a> {
                     for v in &args.cells[i.min(args.cells.len())..] {
                         if p.by_ref {
                             arr.is_ref = true;
-                            self.ref_cells.insert(Rc::as_ptr(v) as usize);
+                            self.mark_ref(v);
                             arr.push_cell(v.clone());
                         } else {
                             arr.push(v.borrow().clone());
@@ -3637,7 +3658,7 @@ impl<'a> Interp<'a> {
                     for (n, c) in &variadic_named {
                         if p.by_ref {
                             arr.is_ref = true;
-                            self.ref_cells.insert(Rc::as_ptr(c) as usize);
+                            self.mark_ref(c);
                             arr.set_cell(ArrKey::Str(n.clone().into()), c.clone());
                         } else {
                             arr.set(ArrKey::Str(n.clone().into()), c.borrow().clone());
@@ -3658,7 +3679,7 @@ impl<'a> Interp<'a> {
                             // reference — zend keeps ref-ness through
                             // cufa arrays (bug50394).
                             !args.nonref_cells.contains(&i)
-                                || self.ref_cells.contains(&(Rc::as_ptr(c) as usize)),
+                                || (self.is_ref_cell(c) && Rc::strong_count(c) > 1),
                             args.trav_cells.contains(&i),
                         )
                     })
@@ -3692,7 +3713,7 @@ impl<'a> Interp<'a> {
                         // over the caller's cell — write-through errors
                         // say "reference held by property"
                         // (typed_properties_055/108).
-                        self.ref_cells.insert(Rc::as_ptr(v) as usize);
+                        self.mark_ref(v);
                         binds.push((p.name.clone(), v.clone()));
                     } else {
                         binds.push((p.name.clone(), cell(v.borrow().clone())));

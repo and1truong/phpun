@@ -60,8 +60,7 @@ impl<'a> Interp<'a> {
                     // `&$x` elements bind the source cell, not a copy.
                     if let Expr::ByRef(e) = v {
                         let c = self.eval_cell(e)?;
-                        self.ref_cells.insert(Rc::as_ptr(&c) as usize);
-                        arr.is_ref = true;
+                        self.mark_ref(&c);
                         match k {
                             Some(ke) => {
                                 let kv = self.eval(ke)?;
@@ -473,7 +472,7 @@ impl<'a> Interp<'a> {
                         // (typed_properties_081).
                         let mut shared: Vec<(String, Cell)> = Vec::new();
                         for (k, c) in ob.props.iter() {
-                            if self.ref_cells.contains(&(Rc::as_ptr(c) as usize)) {
+                            if self.is_ref_cell(c) && Rc::strong_count(c) > 1 {
                                 shared.push((k.clone(), c.clone()));
                             }
                             props.insert(k.clone(), cell(c.borrow().clone()));
@@ -1485,7 +1484,7 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn eval_call_cell(&mut self, e: &Expr) -> Result<(Cell, bool), PhpError> {
         let (c, was_ref) = self.eval_call_cell_inner(e)?;
         if was_ref {
-            self.ref_cells.insert(Rc::as_ptr(&c) as usize);
+            self.mark_ref(&c);
         }
         Ok((c, was_ref))
     }
@@ -1507,7 +1506,7 @@ impl<'a> Interp<'a> {
     fn bind_cell(&mut self, target: &Expr, src: Cell) -> Result<(), PhpError> {
         // `=&` creates Zend's IS_REFERENCE — writes through it say
         // "a reference held by property", not "property" (034/078).
-        self.ref_cells.insert(Rc::as_ptr(&src) as usize);
+        self.mark_ref(&src);
         match target {
             Expr::Var(n) => {
                 self.cur().vars.insert(n.clone(), src);
@@ -1847,7 +1846,7 @@ impl<'a> Interp<'a> {
             .get(&ptr)
             .map(|(_, _, n, p)| (n.clone(), p.clone()))
             .unwrap_or_default();
-        let where_ = if self.ref_cells.contains(&ptr) {
+        let where_ = if self.is_ref_ptr(ptr) {
             "a reference held by property"
         } else {
             "property"
@@ -1995,7 +1994,7 @@ impl<'a> Interp<'a> {
                     // Object-backed: storage IS the prop table — the
                     // write lands a dynamic prop on the backing object.
                     if let Some(src) = self.ao_src_obj(&o) {
-                        self.ao_obj_dim_write(&src, &arr, k, v.clone());
+                        self.ao_obj_dim_write(&o, &src, &arr, k, v.clone());
                     } else {
                         arr.borrow_mut().set(k, v.clone());
                     }
@@ -2461,7 +2460,7 @@ impl<'a> Interp<'a> {
     pub fn arr_mut(&self, c: &Cell) -> Option<Rc<RefCell<PhpArray>>> {
         let mut b = c.borrow_mut();
         if let Value::Array(rc) = &mut *b {
-            if Rc::strong_count(rc) > 1 {
+            if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
                 let fresh = self.dup_array(&rc.borrow());
                 *b = Value::Array(Rc::new(RefCell::new(fresh)));
             }
@@ -2478,7 +2477,9 @@ impl<'a> Interp<'a> {
     /// with the source — everything else copies by value.
     pub(in crate::interp) fn cow_split(&self, v: &mut Value) {
         if let Value::Array(rc) = v {
-            if Rc::strong_count(rc) > 1 {
+            // Deliberately-shared tables ($GLOBALS, &-bound storage,
+            // arrays under a live by-ref foreach) never separate.
+            if Rc::strong_count(rc) > 1 && !rc.borrow().is_ref {
                 let fresh = self.dup_array(&rc.borrow());
                 *v = Value::Array(Rc::new(RefCell::new(fresh)));
             }
@@ -2495,7 +2496,10 @@ impl<'a> Interp<'a> {
             iter_pos: a.iter_pos,
         };
         for (k, c) in &a.entries {
-            let nc = if self.ref_cells.contains(&(Rc::as_ptr(c) as usize)) {
+            // zend unwraps a refcount-1 IS_REFERENCE bucket on copy;
+            // only cells still aliased elsewhere re-bind (a stale
+            // mark from a dead foreach/binding copies by value).
+            let nc = if self.is_ref_cell(c) && Rc::strong_count(c) > 1 {
                 c.clone()
             } else {
                 cell(c.borrow().clone())
@@ -2563,17 +2567,21 @@ impl<'a> Interp<'a> {
             unreachable!()
         };
         self.last_ret_cell = None;
+        // zend evaluates this read as BP_VAR_RW — a missing bucket is
+        // created silently inside offsetGet.
+        let was = std::mem::replace(&mut self.dim_by_ref, true);
         let rv = self.method_invoke(
             o,
             "offsetGet",
             CallArgs::positional(vec![cell(key.unwrap_or(Value::Null))]),
-        )?;
+        );
+        self.dim_by_ref = was;
         match self.last_ret_cell.take() {
             Some(rc) => {
-                self.ref_cells.insert(Rc::as_ptr(&rc) as usize);
+                self.mark_ref(&rc);
                 Ok(rc)
             }
-            None => Ok(cell(rv)),
+            None => Ok(cell(rv?)),
         }
     }
 
@@ -2774,9 +2782,10 @@ impl<'a> Interp<'a> {
                 cur = b;
             }
             if let Ok(Value::Object(o)) = self.eval(cur) {
-                let ao = match &o.borrow().internal {
-                    Some(ObjectInternal::ArrayIter { arr, .. }) => Some(arr.clone()),
-                    _ => None,
+                let ao = if matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. })) {
+                    Some(self.ao_arr(&o))
+                } else {
+                    None
                 };
                 if let Some(arr) = ao {
                     let mut cur_arr = arr;
@@ -2789,12 +2798,16 @@ impl<'a> Interp<'a> {
                         let next = match cur_arr.borrow().get_cell(&to_key(&kv)) {
                             Some(cc) => match &*cc.borrow() {
                                 Value::Array(na) => Some(na.clone()),
-                                Value::Object(oo) => match &oo.borrow().internal {
-                                    Some(ObjectInternal::ArrayIter { arr: na, .. }) => {
-                                        Some(na.clone())
+                                Value::Object(oo) => {
+                                    if matches!(
+                                        oo.borrow().internal,
+                                        Some(ObjectInternal::ArrayIter { .. })
+                                    ) {
+                                        Some(self.ao_arr(oo))
+                                    } else {
+                                        None
                                     }
-                                    _ => None,
-                                },
+                                }
                                 _ => None,
                             },
                             None => None,
@@ -3082,7 +3095,7 @@ impl<'a> Interp<'a> {
         }
         if let Some(bad) = results.iter().position(|r| r.is_none()) {
             let (tys, cn, pn) = &owners[bad];
-            let where_ = if self.ref_cells.contains(&ptr) {
+            let where_ = if self.is_ref_ptr(ptr) {
                 "reference held by property"
             } else {
                 "property"
@@ -3104,7 +3117,7 @@ impl<'a> Interp<'a> {
         }
         let mut e = if owners.len() == 1 {
             let (tys, cn, pn) = &owners[0];
-            let where_ = if self.ref_cells.contains(&ptr) {
+            let where_ = if self.is_ref_ptr(ptr) {
                 "reference held by property"
             } else {
                 "property"
@@ -3403,14 +3416,17 @@ impl<'a> Interp<'a> {
         post: bool,
     ) -> Result<Value, PhpError> {
         self.last_ret_cell = None;
+        let was = std::mem::replace(&mut self.dim_by_ref, true);
         let rv = self.method_invoke(
             o.clone(),
             "offsetGet",
             CallArgs::positional(vec![cell(key.clone())]),
-        )?;
+        );
+        self.dim_by_ref = was;
+        let rv = rv?;
         let rc = self.last_ret_cell.take();
         if let Some(c) = &rc {
-            self.ref_cells.insert(Rc::as_ptr(c) as usize);
+            self.mark_ref(c);
         }
         let old = rc.as_ref().map(|c| c.borrow().clone()).unwrap_or(rv);
         // int-typed backing cell can't overflow to float — dedicated

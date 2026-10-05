@@ -134,8 +134,15 @@ fn json_enc(_it: &mut Interp, v: &Value, flags: i64, seen: &mut Vec<usize>) -> R
             }
             // spl array-objects encode their internal storage as the
             // object's property hash (spl_array_get_properties).
-            if let Some(crate::value::ObjectInternal::ArrayIter { arr, .. }) = &o.borrow().internal
-            {
+            let ao_arr = if matches!(
+                o.borrow().internal,
+                Some(crate::value::ObjectInternal::ArrayIter { .. })
+            ) {
+                Some(_it.ao_arr(o))
+            } else {
+                None
+            };
+            if let Some(arr) = ao_arr {
                 let parts: Vec<String> = arr
                     .borrow()
                     .iter()

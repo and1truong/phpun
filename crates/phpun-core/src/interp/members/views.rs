@@ -287,6 +287,21 @@ impl<'a> Interp<'a> {
         let lname = name.to_lowercase();
         match lname.as_str() {
             "__construct" => {
+                // zend's ReflectionClass ctor resolves the subject
+                // through lookup_class — it autoloads, and a throwing
+                // loader's exception propagates.
+                if matches!(
+                    obj.borrow().class.name().to_lowercase().as_str(),
+                    "reflectionclass"
+                ) {
+                    if let Some(Value::Str(s)) = args.first().map(|c| c.borrow().clone()) {
+                        let raw = String::from_utf8_lossy(&s).to_string();
+                        let key = raw.trim_start_matches('\\').to_lowercase();
+                        if !self.classes.contains_key(&key) && !self.interfaces.contains_key(&key) {
+                            self.run_autoload(raw.trim_start_matches('\\'))?;
+                        }
+                    }
+                }
                 let mut ob = obj.borrow_mut();
                 let cls = args
                     .first()

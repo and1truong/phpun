@@ -26,8 +26,11 @@ pub struct PhpArray {
     pub entries: Vec<(ArrKey, Cell)>,
     /// Next free integer key for `$arr[] = ...` (max int key seen + 1).
     pub next: i64,
-    /// Zend's is_ref: once elements are aliased (`foreach &$v`, `=&`),
-    /// writes through a shared (copied) zval must NOT copy-on-write split.
+    /// "Deliberately shared" table flag (zend's IS_REFERENCE on the
+    /// array zval itself): the $GLOBALS table, `&...$refs` variadic
+    /// tables and arrays under a live `foreach(&$v)` iteration never
+    /// CoW-split on write. NOT the element-aliasing mark — per-element
+    /// references live in `ref_cells`.
     pub is_ref: bool,
     /// Internal pointer for current/key/next/prev/reset/end/each — an index
     /// into `entries` (may sit on a tombstone; live_* helpers skip it).
@@ -982,6 +985,20 @@ pub struct TraceFrame {
     pub internal: bool,
 }
 
+/// Shared storage slot for spl array-objects — zend's `intern->array`
+/// zval. Objects linked by getIterator()/exchangeArray()/spl-source
+/// construction hold clones of this cell, so a storage swap reaches
+/// every sibling; `pos`/`flags`/`iterator_class` stay per-object.
+pub struct AoStore {
+    /// The backing table (prop-mirror for object storage).
+    pub arr: Rc<RefCell<PhpArray>>,
+    /// The backing OBJECT when storage came from an object input —
+    /// zend serializes it as `__serialize()` slot 1 instead of the
+    /// storage hash. For a self-backed object (ctor arg `$this`) this
+    /// is the object itself and flag bit 0x1000000 is set on `flags`.
+    pub src: Option<Rc<RefCell<PhpObject>>>,
+}
+
 pub enum ObjectInternal {
     /// Throwable fields (message/code/file/line/trace string).
     Exception {
@@ -1003,19 +1020,18 @@ pub enum ObjectInternal {
         /// Call stack snapshot at construction → getTrace() (tests/lang/038).
         frames: Rc<Vec<TraceFrame>>,
     },
-    /// SPL ArrayIterator state: backing array + iteration cursor.
+    /// SPL ArrayIterator state: shared storage slot + iteration cursor.
     ArrayIter {
-        arr: Rc<RefCell<PhpArray>>,
+        /// The `intern->array` slot: getIterator()/exchangeArray()
+        /// siblings see the same backing table because they hold clones
+        /// of this cell, not copies of the table Rc.
+        store: Rc<RefCell<AoStore>>,
         pos: usize,
         flags: i64,
         /// ArrayObject's `iteratorClass` ctor arg / setIteratorClass —
         /// a validated ArrayIterator-derived class name getIterator()
         /// instantiates; None = "ArrayIterator".
         iterator_class: Option<String>,
-        /// The backing OBJECT when storage came from an object input —
-        /// zend serializes it as `__serialize()` slot 1 instead of the
-        /// storage hash.
-        src: Option<Rc<RefCell<PhpObject>>>,
     },
     /// ReflectionAttribute payload: the attribute's name, unevaluated arg
     /// Exprs, and the TARGET_* bit of the declaration it was read from.
