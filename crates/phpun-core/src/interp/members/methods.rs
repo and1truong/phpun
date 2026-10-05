@@ -1480,11 +1480,13 @@ impl<'a> Interp<'a> {
                   // storage: serialized array|object — zend reports a
                   // bad storage value at its start offset.
         let st_start = pos;
-        let mut vhash: Vec<Value> = Vec::new();
+        let mut vhash: Vec<crate::value::Cell> = Vec::new();
         let sv = {
             let mut ie = None;
             crate::builtins::var::php_unserialize(self, data, &mut pos, &mut ie, &mut vhash)
                 .map_err(|_| pos)?
+                .borrow()
+                .clone()
         };
         if !matches!(sv, Value::Array(_) | Value::Object(_)) {
             return Err(st_start);
@@ -1498,6 +1500,8 @@ impl<'a> Interp<'a> {
             let mut ie = None;
             crate::builtins::var::php_unserialize(self, data, &mut pos, &mut ie, &mut vhash)
                 .map_err(|_| pos)?
+                .borrow()
+                .clone()
         };
         let Value::Array(pr) = pr else {
             return Err(pos);

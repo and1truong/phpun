@@ -140,9 +140,9 @@ pub(crate) fn dispatch(
             let s = arg_str(it, args, 0);
             let mut pos = 0;
             let mut err = None;
-            let mut vhash: Vec<Value> = Vec::new();
+            let mut vhash: Vec<Cell> = Vec::new();
             match php_unserialize(it, &s, &mut pos, &mut err, &mut vhash) {
-                Ok(v) => v,
+                Ok(v) => v.borrow().clone(),
                 Err(_) => {
                     if let Some(e) = err {
                         return Err(e);
@@ -967,18 +967,21 @@ fn php_unserialize_key(s: &str, pos: &mut usize) -> Result<Value, ()> {
     }
 }
 
-/// Deserialize one zval. `vhash` is zend's var_hash: every parsed
-/// element/prop VALUE occupies one slot (keys take none, `r:`/`R:`
-/// elements resolve earlier slots but still occupy their own).
-/// Containers register their Rc BEFORE parsing children so
-/// self-references inside the subtree resolve to the live object.
+/// Deserialize one zval into a fresh-or-shared Cell. `vhash` is
+/// zend's var_hash: every parsed element/prop VALUE occupies one slot
+/// (keys take none, `r:`/`R:` elements resolve earlier slots but still
+/// occupy their own). Containers register their cell BEFORE parsing
+/// children so self-references inside the subtree resolve to the live
+/// object. `R:` returns the SAME cell — element refs survive a
+/// serialize/unserialize round-trip; `r:` copies the value into a new
+/// cell (only the underlying object is shared).
 pub(crate) fn php_unserialize(
     it: &mut Interp,
     s: &str,
     pos: &mut usize,
     err: &mut Option<PhpError>,
-    vhash: &mut Vec<Value>,
-) -> Result<Value, ()> {
+    vhash: &mut Vec<Cell>,
+) -> Result<Cell, ()> {
     let b = s.as_bytes();
     let take_until = |pos: &mut usize, ch: u8| -> Result<String, ()> {
         let start = *pos;
@@ -995,22 +998,23 @@ pub(crate) fn php_unserialize(
     match b.get(*pos) {
         Some(b'N') => {
             *pos += 2;
-            vhash.push(Value::Null);
-            Ok(Value::Null)
+            let c = cell(Value::Null);
+            vhash.push(c.clone());
+            Ok(c)
         }
         Some(b'b') => {
             *pos += 2;
             let n = take_until(pos, b';')?;
-            let v = Value::Bool(n == "1");
-            vhash.push(v.clone());
-            Ok(v)
+            let c = cell(Value::Bool(n == "1"));
+            vhash.push(c.clone());
+            Ok(c)
         }
         Some(b'i') => {
             *pos += 2;
             let n = take_until(pos, b';')?;
-            let v = Value::Int(n.parse().map_err(|_| ())?);
-            vhash.push(v.clone());
-            Ok(v)
+            let c = cell(Value::Int(n.parse().map_err(|_| ())?));
+            vhash.push(c.clone());
+            Ok(c)
         }
         Some(b'd') => {
             *pos += 2;
@@ -1021,8 +1025,9 @@ pub(crate) fn php_unserialize(
                 "-INF" => Value::Float(f64::NEG_INFINITY),
                 _ => Value::Float(n.parse().map_err(|_| ())?),
             };
-            vhash.push(v.clone());
-            Ok(v)
+            let c = cell(v);
+            vhash.push(c.clone());
+            Ok(c)
         }
         Some(b's') => {
             *pos += 2;
@@ -1030,27 +1035,39 @@ pub(crate) fn php_unserialize(
             *pos += 1; // opening quote
             let st = String::from_utf8_lossy(&b[*pos..*pos + len]).into_owned();
             *pos += len + 2; // closing quote + ;
-            let v = Value::str(st);
-            vhash.push(v.clone());
-            Ok(v)
+            let c = cell(Value::str(st));
+            vhash.push(c.clone());
+            Ok(c)
         }
         // r:<n> object reference, R:<n> reference — resolve to the
         // zval already parsed at var_hash slot n (1-based), then take
-        // a slot of their own like any element.
+        // a slot of their own like any element. R: binds the slot's
+        // very cell (a true zend reference); r: copies the zval into a
+        // new cell, keeping only the shared object underneath.
         Some(b'r') | Some(b'R') => {
             let lower = b[*pos] == b'r';
             *pos += 2;
             let n: usize = take_until(pos, b';')?.parse().map_err(|_| ())?;
-            let v = n
+            let target = n
                 .checked_sub(1)
                 .and_then(|i| vhash.get(i))
                 .cloned()
                 .ok_or(())?;
-            if lower && !matches!(v, Value::Object(_)) {
-                return Err(());
+            if lower {
+                if !matches!(&*target.borrow(), Value::Object(_)) {
+                    return Err(());
+                }
+                let c = cell(target.borrow().clone());
+                vhash.push(c.clone());
+                Ok(c)
+            } else {
+                // zend turns the target slot into an IS_REFERENCE
+                // bucket — the shared cell must mark so var_dump
+                // prints `&` and a later serialize re-emits R:.
+                it.mark_ref(&target);
+                vhash.push(target.clone());
+                Ok(target)
             }
-            vhash.push(v.clone());
-            Ok(v)
         }
         Some(b'a') => {
             *pos += 2;
@@ -1058,15 +1075,16 @@ pub(crate) fn php_unserialize(
             *pos += 1; // {
             let arr = Rc::new(RefCell::new(PhpArray::new()));
             // Register BEFORE elements: a self-reference inside the
-            // array's own subtree resolves to this same table.
-            vhash.push(Value::Array(arr.clone()));
+            // array's own subtree resolves to this same cell.
+            let this = cell(Value::Array(arr.clone()));
+            vhash.push(this.clone());
             for _ in 0..n {
                 let k = php_unserialize_key(s, pos)?;
                 let v = php_unserialize(it, s, pos, err, vhash)?;
-                arr.borrow_mut().set(to_key(&k), v);
+                arr.borrow_mut().bind_cell(to_key(&k), v);
             }
             *pos += 1; // }
-            Ok(Value::Array(arr))
+            Ok(this)
         }
         Some(b'C') => {
             // C:<clen>:"<class>":<plen>:{<payload>} — a Serializable
@@ -1094,7 +1112,8 @@ pub(crate) fn php_unserialize(
                 Ok(Value::Object(o)) => o,
                 _ => return Err(()),
             };
-            vhash.push(Value::Object(obj.clone()));
+            let this = cell(Value::Object(obj.clone()));
+            vhash.push(this.clone());
             if let Err(e) = it.method_invoke(
                 obj.clone(),
                 "unserialize",
@@ -1122,7 +1141,7 @@ pub(crate) fn php_unserialize(
                 *err = Some(e);
                 return Err(());
             }
-            Ok(Value::Object(obj))
+            Ok(this)
         }
         Some(b'O') => {
             // O:<clen>:"<class>":<n>:{<pairs>}
@@ -1143,8 +1162,9 @@ pub(crate) fn php_unserialize(
                 _ => return Err(()),
             };
             // The object takes its var_hash slot before member values
-            // parse — r: refs inside point back to it.
-            vhash.push(Value::Object(obj.clone()));
+            // parse — r:/R: refs inside point back to it.
+            let this = cell(Value::Object(obj.clone()));
+            vhash.push(this.clone());
             // Classes defining __unserialize receive the parsed pairs
             // as an array (zend routes O: payloads through it instead
             // of writing props).
@@ -1157,8 +1177,8 @@ pub(crate) fn php_unserialize(
                     let k = php_unserialize_key(s, pos)?;
                     let v = php_unserialize(it, s, pos, err, vhash)?;
                     match k {
-                        Value::Int(i) => slots.set(ArrKey::Int(i), v),
-                        Value::Str(ks) => slots.set(
+                        Value::Int(i) => slots.bind_cell(ArrKey::Int(i), v),
+                        Value::Str(ks) => slots.bind_cell(
                             ArrKey::Str(Rc::from(crate::value::lossy(&ks).into_owned())),
                             v,
                         ),
@@ -1178,7 +1198,7 @@ pub(crate) fn php_unserialize(
                     *err = Some(e);
                     return Err(());
                 }
-                return Ok(Value::Object(obj));
+                return Ok(this);
             }
             for _ in 0..n {
                 let k = php_unserialize_key(s, pos)?;
@@ -1209,10 +1229,10 @@ pub(crate) fn php_unserialize(
                 if !ob.prop_order.contains(&key) {
                     ob.prop_order.push(key.clone());
                 }
-                ob.props.insert(key, cell(v));
+                ob.props.insert(key, v);
             }
             *pos += 1; // }
-            Ok(Value::Object(obj))
+            Ok(this)
         }
         _ => Err(()),
     }
