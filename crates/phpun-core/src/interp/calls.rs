@@ -1079,7 +1079,7 @@ impl<'a> Interp<'a> {
         c: &PhpCallable,
         new_this: Option<Rc<RefCell<PhpObject>>>,
         scope_arg: Option<Value>,
-    ) -> Result<Option<PhpCallable>, PhpError> {
+    ) -> Result<Option<Rc<PhpCallable>>, PhpError> {
         if new_this.is_some() && c.is_static {
             self.warn(
                 "Cannot bind an instance to a static closure, this will be an error in PHP 9",
@@ -1214,7 +1214,27 @@ impl<'a> Interp<'a> {
                 let _ = name;
             }
         }
-        Ok(Some(nc))
+        // A rebound closure is a new object (fresh handle id) that
+        // SNAPSHOTS the source's static vars — the two tables evolve
+        // independently afterwards (probe_bind: bindTo copies values).
+        let nc_rc = Rc::new(nc);
+        let id = self.next_callable_id(&nc_rc);
+        nc_rc.id.set(id);
+        if let CallableKind::Closure(d) = &nc_rc.kind {
+            let src_key = format!("{}\u{0}c{}", d.name, c.id.get());
+            if let Some(src) = self.statics.get(&src_key).cloned() {
+                let mut snap = std::collections::HashMap::new();
+                for (n, sc) in &src {
+                    let cc = cell(sc.borrow().clone());
+                    if self.is_ref_cell(sc) {
+                        self.mark_ref(&cc);
+                    }
+                    snap.insert(n.clone(), cc);
+                }
+                self.statics.insert(format!("{}\u{0}c{}", d.name, id), snap);
+            }
+        }
+        Ok(Some(nc_rc))
     }
 
     /// Scope comparison for rebind warnings: None-vs-Some counts as

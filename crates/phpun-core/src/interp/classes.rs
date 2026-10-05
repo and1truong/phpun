@@ -3185,7 +3185,7 @@ impl<'a> Interp<'a> {
         self.push_handle(w)
     }
 
-    fn next_callable_id(&mut self, c: &Rc<PhpCallable>) -> u64 {
+    pub(in crate::interp) fn next_callable_id(&mut self, c: &Rc<PhpCallable>) -> u64 {
         self.push_handle(ObjHandle::Callable(Rc::downgrade(c)))
     }
 

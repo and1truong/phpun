@@ -463,6 +463,7 @@ impl<'a> Interp<'a> {
                 });
                 if !sv.is_empty() {
                     let key = format!("{}\u{0}c{}", fname, callable.id.get());
+                    let mut table = std::collections::HashMap::new();
                     for (n, d) in sv {
                         // Only literal-only defaults are bound at
                         // creation — consts, `new`, calls and anything
@@ -476,11 +477,12 @@ impl<'a> Interp<'a> {
                         let Ok(v) = self.eval_const(&e) else {
                             continue;
                         };
-                        self.statics
-                            .entry(key.clone())
-                            .or_default()
-                            .insert(n, cell(v));
+                        table.insert(n, cell(v));
                     }
+                    // Wholesale replace: a recycled handle id could
+                    // otherwise expose a dead closure's stale table
+                    // to this fresh instance.
+                    self.statics.insert(key, table);
                 }
                 Ok(Value::Callable(callable))
             }
