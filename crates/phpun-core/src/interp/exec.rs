@@ -493,7 +493,12 @@ impl<'a> Interp<'a> {
                             }
                         }
                         Expr::Index { e, i } => {
-                            let _ = self.unset_index(e, i.as_deref());
+                            // zend's unset Errors (non-array offset,
+                            // string offsets, object-as-array) are
+                            // catchable — they must propagate.
+                            if let Err(e) = self.unset_index(e, i.as_deref()) {
+                                return self.err_flow(e);
+                            }
                         }
                         Expr::Prop { .. } => {
                             if let Err(e) = self.unset_prop(x) {

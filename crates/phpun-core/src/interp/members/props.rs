@@ -1650,11 +1650,17 @@ impl<'a> Interp<'a> {
                             if gm.decl.by_ref {
                                 return Ok(self.last_ret_cell.take().unwrap_or_else(|| cell(rv)));
                             }
-                            self.notice(&format!(
-                                "Indirect modification of overloaded property {}::${} has no effect",
-                                cls.name(),
-                                pn
-                            ))?;
+                            // zend applies the dim op to an *object*
+                            // result (objects pass by handle) — no
+                            // notice; scalar/array results die in the
+                            // temp with one (object_in_hook rule).
+                            if !matches!(rv, Value::Object(_)) {
+                                self.notice(&format!(
+                                    "Indirect modification of overloaded property {}::${} has no effect",
+                                    cls.name(),
+                                    pn
+                                ))?;
+                            }
                             return Ok(cell(rv));
                         }
                         // Re-entrant `&`-fetch of a declared prop the
@@ -1667,6 +1673,26 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let key = key.unwrap_or_else(|| pn.clone());
+                // An RW fetch of an undeclared prop materializes a
+                // dynamic one — E_DEPRECATED on non-exempt classes
+                // (stdClass / #[AllowDynamicProperties]).
+                if !o.borrow().props.contains_key(&key)
+                    && self.decl_prop(&o, &pn).is_none()
+                    && !self.obj_is_a(&o, "stdclass")
+                    && !o.borrow().class.decl.attrs.iter().any(|a| {
+                        a.name
+                            .rsplit('\\')
+                            .next()
+                            .unwrap_or(&a.name)
+                            .eq_ignore_ascii_case("AllowDynamicProperties")
+                    })
+                {
+                    let cn = o.borrow().class.name().to_string();
+                    self.deprecated(&format!(
+                        "Creation of dynamic property {}::${} is deprecated",
+                        cn, pn
+                    ))?;
+                }
                 let mut ob = o.borrow_mut();
                 if !ob.props.contains_key(&key) {
                     if !ob.prop_order.contains(&key) {
