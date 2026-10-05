@@ -46,7 +46,7 @@ impl<'a> Interp<'a> {
                 t, name
             ))?;
         }
-        self.statics_init(&cls);
+        self.statics_init(&cls)?;
         let v = cls.statics.borrow().get(&name).map(|c| c.borrow().clone());
         match v {
             Some(v) => Ok(v),
@@ -98,7 +98,7 @@ impl<'a> Interp<'a> {
                 t, name
             ))?;
         }
-        self.statics_init(&cls);
+        self.statics_init(&cls)?;
         let found = cls.statics.borrow().get(name).cloned();
         match found {
             Some(c) => {
@@ -161,9 +161,9 @@ impl<'a> Interp<'a> {
     }
 
     /// Lazily initialize static prop defaults.
-    pub(in crate::interp) fn statics_init(&mut self, cls: &Rc<PhpClass>) {
+    pub(in crate::interp) fn statics_init(&mut self, cls: &Rc<PhpClass>) -> Result<(), PhpError> {
         if *cls.statics_init.borrow() {
-            return;
+            return Ok(());
         }
         *cls.statics_init.borrow_mut() = true;
         // Inherited statics: PHP snapshots the parent's static-prop
@@ -171,7 +171,7 @@ impl<'a> Interp<'a> {
         // on the child resolves parent defaults.
         if let Some(pname) = &cls.decl.parent {
             if let Some(p) = self.classes.get(&pname.to_lowercase()).cloned() {
-                self.statics_init(&p);
+                self.statics_init(&p)?;
                 for (k, v) in p.statics.borrow().iter() {
                     cls.statics
                         .borrow_mut()
@@ -188,12 +188,13 @@ impl<'a> Interp<'a> {
                 Some(d) => {
                     let old = self.const_self.replace(cls.clone());
                     self.class_const_ctx += 1;
-                    let v = self
-                        .eval_decl_const(d, &cls.decl.file)
-                        .unwrap_or(Value::Null);
+                    let v = self.eval_decl_const(d, &cls.decl.file);
                     self.class_const_ctx -= 1;
                     self.const_self = old;
-                    v
+                    // Gate/const errors are real fatals (e.g. a
+                    // non-static closure in the default) — swallowing
+                    // them to NULL hid the divergence.
+                    v?
                 }
                 None => Value::Null,
             };
@@ -211,6 +212,7 @@ impl<'a> Interp<'a> {
                 .borrow_mut()
                 .insert(p.name.clone(), cell(default));
         }
+        Ok(())
     }
 
     pub(in crate::interp) fn static_call(

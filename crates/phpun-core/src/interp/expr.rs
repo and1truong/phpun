@@ -325,19 +325,19 @@ impl<'a> Interp<'a> {
                     if c.arrow {
                         return self.fail(PhpError::compile_fatal(
                             "Constant expression contains invalid operations",
-                            self.cur_line,
+                            c.decl.line,
                         ));
                     }
                     if !c.is_static {
                         return self.fail(PhpError::compile_fatal(
                             "Closures in constant expressions must be static",
-                            self.cur_line,
+                            c.decl.line,
                         ));
                     }
                     if !c.uses.is_empty() {
                         return self.fail(PhpError::compile_fatal(
                             "Cannot use(...) variables in constant expression",
-                            self.cur_line,
+                            c.decl.line,
                         ));
                     }
                 }
@@ -1058,7 +1058,7 @@ impl<'a> Interp<'a> {
                     Ok(c) => c,
                     Err(_) => return Ok(None),
                 };
-                self.statics_init(&cls);
+                self.statics_init(&cls)?;
                 let v = cls.statics.borrow().get(&pn).map(|c| c.borrow().clone());
                 let ok = match self.find_static_prop_decl(&cls, &pn) {
                     Some((pd, dcls)) => match pd.visibility {
@@ -1837,7 +1837,7 @@ impl<'a> Interp<'a> {
             Expr::StaticProp { class, name } => {
                 let pn = self.prop_name(name)?;
                 let (cls, _t) = self.member_class_of(class)?;
-                self.statics_init(&cls);
+                self.statics_init(&cls)?;
                 let mut merged: Option<Vec<String>> = None;
                 if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pn) {
                     if pd.ty.is_some() {
