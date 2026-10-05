@@ -318,7 +318,7 @@ impl<'a> Interp<'a> {
                             return Err(self.throw(e));
                         }
                     };
-                    match self.rebind_closure(&cb, new_this, scope_arg)? {
+                    match self.rebind_closure(&cb, new_this, scope_arg, false)? {
                         Some(nc) => return Ok(Value::Callable(nc)),
                         None => return Ok(Value::Null),
                     }

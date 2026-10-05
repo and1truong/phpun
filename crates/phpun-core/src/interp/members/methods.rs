@@ -1757,7 +1757,7 @@ impl<'a> Interp<'a> {
                 if let Value::Object(t) = newthis {
                     // call() scopes to the new instance's class
                     // (unlike bindTo's default 'static' scope).
-                    match self.rebind_closure(&c, Some(t.clone()), Some(Value::Object(t)))? {
+                    match self.rebind_closure(&c, Some(t.clone()), Some(Value::Object(t)), true)? {
                         Some(nc) => {
                             ca.cells.remove(0);
                             return self.call_value(&Value::Callable(nc), ca);
@@ -1801,7 +1801,7 @@ impl<'a> Interp<'a> {
                         return Err(self.throw(e));
                     }
                 };
-                match self.rebind_closure(&c, new_this, scope_arg)? {
+                match self.rebind_closure(&c, new_this, scope_arg, false)? {
                     Some(nc) => Ok(Value::Callable(nc)),
                     None => Ok(Value::Null),
                 }
