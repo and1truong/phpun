@@ -771,11 +771,12 @@ pub fn gcvt(value: f64, precision: usize) -> String {
 }
 
 thread_local! {
-    /// Object/array pairs currently being compared — zend marks the
-    /// containers while recursing; a pair re-entered through a cyclic
+    /// Containers currently open on the compare stack — zend marks a
+    /// container while recursing inside it (Z_IS_RECURSIVE); reaching
+    /// an already-marked container on EITHER side through a cyclic
     /// reference aborts the whole comparison.
-    static CMP_PAIRS: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
-    /// Set when a container pair is re-entered — zend fatals with
+    static CMP_MARKS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// Set when a marked container is re-entered — zend fatals with
     /// "Nesting level too deep - recursive dependency?" rather than
     /// comparing equal. Read+cleared by the interpreter eval site.
     static CMP_DEPTH_ERR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -795,7 +796,7 @@ pub fn cmp_depth_err() -> bool {
 
 /// PHP loose comparison (`<=>` semantics) implementing the PHP 8 rules.
 pub fn compare(a: &Value, b: &Value) -> Ordering {
-    let pair = match (a, b) {
+    let marks = match (a, b) {
         (Value::Object(x), Value::Object(y)) => {
             // Same zval short-circuits — zend's quick_equal never
             // descends into props (also covers cyclic self-compares).
@@ -812,10 +813,13 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
         }
         _ => None,
     };
-    if let Some(p) = pair {
-        let reentered = CMP_PAIRS.with(|v| {
+    if let Some((ap, bp)) = marks {
+        let reentered = CMP_MARKS.with(|v| {
             let mut v = v.borrow_mut();
-            if v.contains(&p) {
+            // zend's depth check fires when EITHER operand is already
+            // marked — a cyclic ref reaching back into an open
+            // container, whatever it now pairs against.
+            if v.contains(&ap) || v.contains(&bp) {
                 true
             } else {
                 // The outermost call resets the flag so a stale one
@@ -824,7 +828,8 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
                 if v.is_empty() {
                     CMP_DEPTH_ERR.with(|f| f.set(false));
                 }
-                v.push(p);
+                v.push(ap);
+                v.push(bp);
                 false
             }
         });
@@ -833,7 +838,10 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
             return Ordering::Equal;
         }
         let r = compare_r(a, b);
-        CMP_PAIRS.with(|v| v.borrow_mut().pop());
+        CMP_MARKS.with(|v| {
+            v.borrow_mut().pop();
+            v.borrow_mut().pop();
+        });
         return r;
     }
     compare_r(a, b)
@@ -980,12 +988,18 @@ pub fn identical(a: &Value, b: &Value) -> bool {
             if Rc::ptr_eq(x, y) {
                 return true;
             }
-            let p = (Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize);
-            if CMP_PAIRS.with(|v| v.borrow().contains(&p)) {
+            let ap = Rc::as_ptr(x) as usize;
+            let bp = Rc::as_ptr(y) as usize;
+            // zend marks each operand while inside it — a cyclic ref
+            // back to either aborts with the depth Error.
+            if CMP_MARKS.with(|v| v.borrow().iter().any(|p| *p == ap || *p == bp)) {
                 CMP_DEPTH_ERR.with(|f| f.set(true));
                 return true;
             }
-            CMP_PAIRS.with(|v| v.borrow_mut().push(p));
+            CMP_MARKS.with(|v| {
+                v.borrow_mut().push(ap);
+                v.borrow_mut().push(bp);
+            });
             let x = x.borrow();
             let y = y.borrow();
             let r = x.len() == y.len()
@@ -996,7 +1010,10 @@ pub fn identical(a: &Value, b: &Value) -> bool {
                         None => false,
                     }
                 });
-            CMP_PAIRS.with(|v| v.borrow_mut().pop());
+            CMP_MARKS.with(|v| {
+                v.borrow_mut().pop();
+                v.borrow_mut().pop();
+            });
             r
         }
         (Object(x), Object(y)) => Rc::ptr_eq(x, y),

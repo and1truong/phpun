@@ -135,7 +135,7 @@ pub(crate) fn dispatch(
         "is_infinite" => Value::Bool(matches!(arg(args, 0), Value::Float(f) if f.is_infinite())),
 
         // ----- serialization -----
-        "serialize" => Value::str(php_serialize_root(it, args.first(), &arg(args, 0))?),
+        "serialize" => Value::str(php_serialize(it, &arg(args, 0))?),
         "unserialize" => {
             let s = arg_str(it, args, 0);
             let mut pos = 0;
@@ -829,6 +829,14 @@ fn ser_cell(it: &mut Interp, c: &Cell, ctx: &mut SerCtx) -> Result<String, PhpEr
         if let Some(id) = ctx.refs.get(&p) {
             return Ok(format!("R:{};", id));
         }
+        // A ref pointing at an already-serialized object repeats that
+        // element's slot — R: since the repeating zval is a reference
+        // (a plain zval repeating the object emits r: instead).
+        if let Value::Object(o) = &*c.borrow() {
+            if let Some(id) = ctx.objs.get(&(Rc::as_ptr(o) as usize)) {
+                return Ok(format!("R:{};", id));
+            }
+        }
         ctx.refs.insert(p, ctx.n);
     }
     ser_value(it, &c.borrow(), ctx)
@@ -955,28 +963,13 @@ fn ser_value(it: &mut Interp, v: &Value, ctx: &mut SerCtx) -> Result<String, Php
 }
 
 pub(crate) fn php_serialize(it: &mut Interp, v: &Value) -> Result<String, PhpError> {
-    php_serialize_root(it, None, v)
-}
-
-pub(crate) fn php_serialize_root(
-    it: &mut Interp,
-    root: Option<&Cell>,
-    v: &Value,
-) -> Result<String, PhpError> {
-    // The root zval takes slot 1 like an array element — and a shared
-    // IS_REFERENCE arg cell registers there too, so a ref pointing at
-    // the same cell anywhere inside serializes as R:1 (zend hashes
-    // every zval, the argument slot included).
+    // The root zval takes slot 1 like an element; zend dereferences
+    // the argument, so a ref-typed arg registers by VALUE.
     let mut ctx = SerCtx {
         n: 1,
         objs: Default::default(),
         refs: Default::default(),
     };
-    if let Some(c) = root {
-        if it.is_ref_cell(c) && Rc::strong_count(c) > 1 {
-            ctx.refs.insert(Rc::as_ptr(c) as usize, 1);
-        }
-    }
     ser_value(it, v, &mut ctx)
 }
 
