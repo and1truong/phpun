@@ -816,10 +816,11 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
     if let Some((ap, bp)) = marks {
         let reentered = CMP_MARKS.with(|v| {
             let mut v = v.borrow_mut();
-            // zend's depth check fires when EITHER operand is already
-            // marked — a cyclic ref reaching back into an open
-            // container, whatever it now pairs against.
-            if v.contains(&ap) || v.contains(&bp) {
+            // zend's depth check fires only when BOTH operands are
+            // already marked — the inner comparison re-entered the
+            // same open pair. A (fresh, marked) pair descends fine,
+            // e.g. `$a=[[$n]]; $b=[&$a]; $a==$b` → false, no Error.
+            if v.contains(&ap) && v.contains(&bp) {
                 true
             } else {
                 // The outermost call resets the flag so a stale one
@@ -990,10 +991,24 @@ pub fn identical(a: &Value, b: &Value) -> bool {
             }
             let ap = Rc::as_ptr(x) as usize;
             let bp = Rc::as_ptr(y) as usize;
-            // zend marks each operand while inside it — a cyclic ref
-            // back to either side just answers NOT identical
-            // (operator_identical_recusion-01), unlike =='s fatal.
-            if CMP_MARKS.with(|v| v.borrow().iter().any(|p| *p == ap || *p == bp)) {
+            // zend marks each operand while inside it — re-entering
+            // with BOTH marked raises the same catchable depth Error
+            // as == (the eval site reads CMP_DEPTH_ERR). One marked
+            // side alone is legitimately NOT identical: a finite fresh
+            // array can never be deep-identical to a cyclic marked
+            // one (operator_identical_recusion-01).
+            let (am, bm) = CMP_MARKS.with(|v| {
+                let v = v.borrow();
+                (
+                    v.iter().any(|p| *p == ap),
+                    v.iter().any(|p| *p == bp),
+                )
+            });
+            if am && bm {
+                CMP_DEPTH_ERR.with(|f| f.set(true));
+                return false;
+            }
+            if am || bm {
                 return false;
             }
             CMP_MARKS.with(|v| {

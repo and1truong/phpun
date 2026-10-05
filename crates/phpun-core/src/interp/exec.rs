@@ -223,11 +223,13 @@ impl<'a> Interp<'a> {
                                             start = Some(i);
                                         }
                                         if crate::value::cmp_depth_err() {
-                                            return self.err_flow(PhpError::uncaught(
+                                            if let Err(e) = self.fail::<()>(PhpError::uncaught(
                                                 "Error",
                                                 "Nesting level too deep - recursive dependency?",
                                                 self.cur_line,
-                                            ));
+                                            )) {
+                                                return self.err_flow(e);
+                                            }
                                         }
                                     }
                                     Err(e) => return self.err_flow(e),
