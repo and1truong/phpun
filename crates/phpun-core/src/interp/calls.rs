@@ -682,6 +682,7 @@ impl<'a> Interp<'a> {
                         frame.this_obj = c.this_obj.clone();
                         frame.scope_class = c.scope_class.clone();
                         frame.called_class = c.called_class.clone();
+                        frame.trait_origin = decl.decl_in.clone();
                         // $this binds like a normal method frame —
                         // closures defined in an object context auto-capture it.
                         if let Some(o) = &c.this_obj {

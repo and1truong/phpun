@@ -395,6 +395,22 @@ impl<'a> Interp<'a> {
                     decl.file = cfile;
                 }
                 decl.name = fname.clone();
+                // A closure declared lexically inside a trait method
+                // keeps the trait as its __TRAIT__ origin; the decl is
+                // cloned per instance so the creating context stamps it
+                // here (closure_trait_const).
+                if decl.decl_in.is_none() {
+                    decl.decl_in = self
+                        .stack
+                        .last()
+                        .and_then(|f| f.trait_origin.clone())
+                        .or_else(|| {
+                            self.const_self
+                                .as_ref()
+                                .filter(|c| c.decl.kind == crate::ast::ClassKind::Trait)
+                                .map(|c| c.name().to_string())
+                        });
+                }
                 self.decl_type_checks(&fname, &decl, None)?;
                 let mut captures = Vec::new();
                 if c.arrow {
@@ -442,6 +458,11 @@ impl<'a> Interp<'a> {
                 // compiled defaults (closure_const_expr/static_variable).
                 let mut sv = Vec::new();
                 closure_static_vars(&decl.body, &mut sv);
+                let mut seed_frame = Frame::new(fname.clone());
+                seed_frame.fn_line = decl.line;
+                seed_frame.file = decl.file.clone();
+                seed_frame.ns = decl.ns.clone();
+                seed_frame.trait_origin = decl.decl_in.clone();
                 let callable = self.new_callable(PhpCallable {
                     id: std::cell::Cell::new(0),
                     kind: CallableKind::Closure(Rc::new(decl)),
@@ -464,7 +485,16 @@ impl<'a> Interp<'a> {
                 if !sv.is_empty() {
                     let key = format!("{}\u{0}c{}", fname, callable.id.get());
                     let mut table = std::collections::HashMap::new();
-                    for (n, d) in sv {
+                    // The seeded defaults compile against the CLOSURE's
+                    // own scope: __FUNCTION__/__METHOD__ name it and
+                    // __CLASS__ sees its bound scope — evaluating in
+                    // the enclosing frame would stamp the caller's
+                    // context in permanently.
+                    seed_frame.scope_class = callable.scope_class.clone();
+                    seed_frame.called_class = callable.called_class.clone();
+                    let saved_line = self.cur_line;
+                    self.stack.push(seed_frame);
+                    for (n, d, sline) in sv {
                         // Only literal-only defaults are bound at
                         // creation — consts, `new`, calls and anything
                         // needing a runtime env stay NULL until the
@@ -474,11 +504,16 @@ impl<'a> Interp<'a> {
                         if !literal_static_init(&e) {
                             continue;
                         }
+                        // __LINE__ resolves to the `static` statement's
+                        // line inside the body (probe_sv_line).
+                        self.cur_line = sline;
                         let Ok(v) = self.eval_const(&e) else {
                             continue;
                         };
                         table.insert(n, cell(v));
                     }
+                    self.stack.pop();
+                    self.cur_line = saved_line;
                     // Wholesale replace: a recycled handle id could
                     // otherwise expose a dead closure's stale table
                     // to this fresh instance.
@@ -4520,16 +4555,17 @@ fn bitwise_str(op: &str, a: &[u8], b: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `static` declarations anywhere in a body, with their default exprs —
-/// nested function/class bodies declare their own.
-fn closure_static_vars(stmts: &[Stmt], out: &mut Vec<(String, Option<Expr>)>) {
+/// `static` declarations anywhere in a body, with their default exprs
+/// and the `static` keyword's line — nested function/class bodies
+/// declare their own.
+fn closure_static_vars(stmts: &[Stmt], out: &mut Vec<(String, Option<Expr>, usize)>) {
     use crate::ast::Stmt;
     for st in stmts {
         match st {
-            Stmt::Static { vars, .. } => {
+            Stmt::Static { vars, line } => {
                 for (n, d) in vars {
-                    if !out.iter().any(|(x, _)| x == n) {
-                        out.push((n.clone(), d.clone()));
+                    if !out.iter().any(|(x, ..)| x == n) {
+                        out.push((n.clone(), d.clone(), *line));
                     }
                 }
             }
