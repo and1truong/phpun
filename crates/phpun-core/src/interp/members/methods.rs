@@ -202,6 +202,7 @@ impl<'a> Interp<'a> {
                 pos: 0,
                 flags,
                 iterator_class,
+                sorting: false,
             });
             return Ok(Some(Value::Null));
         }
@@ -254,6 +255,9 @@ impl<'a> Interp<'a> {
             }
             "count" => Value::Int(arr.borrow().len() as i64),
             "append" => {
+                if let Some(e) = self.ao_sorting_err(obj) {
+                    return self.fail(e);
+                }
                 let v = args
                     .cells
                     .first()
@@ -263,6 +267,9 @@ impl<'a> Interp<'a> {
                 Value::Null
             }
             "exchangearray" => {
+                if let Some(e) = self.ao_sorting_err(obj) {
+                    return self.fail(e);
+                }
                 let v = args.cells.first().unwrap().borrow().clone();
                 if !matches!(v, Value::Array(_) | Value::Object(_)) {
                     let tn = self.zval_type_name(&v);
@@ -370,6 +377,14 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let k = self.ao_dim_key(obj, &raw_k);
+                // zend read_dimension(BP_VAR_W|RW) trips nApplyCount —
+                // `$o[k]=`, `$o[k][j]=`, `$o[k]++`, `=& $o[k]` inside a
+                // sort callback all error; plain reads don't.
+                if self.dim_by_ref {
+                    if let Some(e) = self.ao_sorting_err(obj) {
+                        return self.fail(e);
+                    }
+                }
                 let got = arr.borrow().get_cell(&k);
                 match got {
                     Some(c) => {
@@ -415,6 +430,9 @@ impl<'a> Interp<'a> {
                 Value::Bool(arr.borrow().get(&k).is_some())
             }
             "offsetset" => {
+                if let Some(e) = self.ao_sorting_err(obj) {
+                    return self.fail(e);
+                }
                 let v = args
                     .cells
                     .get(1)
@@ -514,6 +532,9 @@ impl<'a> Interp<'a> {
                 Value::Null
             }
             "offsetunset" => {
+                if let Some(e) = self.ao_sorting_err(obj) {
+                    return self.fail(e);
+                }
                 let raw_k = args
                     .cells
                     .first()
@@ -595,6 +616,7 @@ impl<'a> Interp<'a> {
                                 pos: 0,
                                 flags,
                                 iterator_class: None,
+                                sorting: false,
                             }),
                             unset_props: Default::default(),
                         });
@@ -635,96 +657,76 @@ impl<'a> Interp<'a> {
                     Err(e) => return self.fail(e),
                 }
             }
-            "asort" | "ksort" => {
-                let flag = args.cells.first().map(|c| c.borrow().clone());
-                let flag = match flag {
-                    Some(v) => match self.spl_int_arg(&v, family, canonical, 1, "flags") {
-                        Ok(f) => f,
-                        Err(e) => return self.fail(e),
-                    },
-                    None => 0,
-                };
-                {
-                    let mut a = arr.borrow_mut();
-                    // zend runs the same zend_sort + RETURN_STABLE_SORT
-                    // position fallback here as for plain arrays.
-                    let fb = |x: &crate::value::SortElem, y: &crate::value::SortElem, r| {
-                        if r != std::cmp::Ordering::Equal {
-                            r
-                        } else {
-                            x.0.cmp(&y.0)
-                        }
-                    };
-                    if lname == "asort" {
+            "asort" | "ksort" | "natsort" | "natcasesort" => {
+                // zend spl_array_object_sort: flag param only on the
+                // OPTIONAL_FLAG sorts; the nat sorts call the global
+                // function with no flag arg (natcasesort ⇒
+                // SORT_NATURAL|SORT_FLAG_CASE).
+                let flag = match lname.as_str() {
+                    "natsort" => 6,
+                    "natcasesort" => 6 | 8,
+                    _ => {
+                        let flag = args.cells.first().map(|c| c.borrow().clone());
                         match flag {
-                            // SORT_NUMERIC / SORT_STRING / plain regular.
-                            1 => {
-                                let mut v = crate::value::zend_sort_prepare(&mut a.entries);
-                                crate::value::zend_sort(&mut v, &mut |x, y| {
-                                    let r =
-                                        x.2.borrow()
-                                            .to_float()
-                                            .partial_cmp(&y.2.borrow().to_float())
-                                            .unwrap_or(std::cmp::Ordering::Equal);
-                                    fb(x, y, r)
-                                });
-                                crate::value::zend_sort_finish(&mut a.entries, v);
-                            }
-                            2 | 5 | 3 => {
-                                let mut v = crate::value::zend_sort_prepare(&mut a.entries);
-                                crate::value::zend_sort(&mut v, &mut |x, y| {
-                                    let r =
-                                        x.2.borrow()
-                                            .to_php_string()
-                                            .cmp(&y.2.borrow().to_php_string());
-                                    fb(x, y, r)
-                                });
-                                crate::value::zend_sort_finish(&mut a.entries, v);
-                            }
-                            _ => {
-                                crate::value::zend_sort_data(&mut a.entries, false);
-                            }
-                        }
-                    } else {
-                        match flag {
-                            1 => {
-                                let mut v = crate::value::zend_sort_prepare(&mut a.entries);
-                                crate::value::zend_sort(&mut v, &mut |x, y| {
-                                    let r = key_value(&x.1)
-                                        .to_float()
-                                        .partial_cmp(&key_value(&y.1).to_float())
-                                        .unwrap_or(std::cmp::Ordering::Equal);
-                                    fb(x, y, r)
-                                });
-                                crate::value::zend_sort_finish(&mut a.entries, v);
-                            }
-                            2 | 5 | 3 => {
-                                let mut v = crate::value::zend_sort_prepare(&mut a.entries);
-                                crate::value::zend_sort(&mut v, &mut |x, y| {
-                                    let r = key_value(&x.1)
-                                        .to_php_string()
-                                        .cmp(&key_value(&y.1).to_php_string());
-                                    fb(x, y, r)
-                                });
-                                crate::value::zend_sort_finish(&mut a.entries, v);
-                            }
-                            _ => {
-                                let mut v = crate::value::zend_sort_prepare(&mut a.entries);
-                                crate::value::zend_sort(&mut v, &mut |x, y| {
-                                    let r = compare(&key_value(&x.1), &key_value(&y.1));
-                                    fb(x, y, r)
-                                });
-                                crate::value::zend_sort_finish(&mut a.entries, v);
-                            }
+                            Some(v) => match self.spl_int_arg(&v, family, canonical, 1, "flags") {
+                                Ok(f) => f,
+                                Err(e) => return self.fail(e),
+                            },
+                            None => 0,
                         }
                     }
-                }
+                };
+                Self::ao_set_sorting(obj, true);
+                let src = arr.borrow().entries.clone();
+                // zend's spl_array_object_sort invokes the GLOBAL builtin
+                // (asort/ksort/natsort/natcasesort) — it leaves a builtin
+                // frame on the stack that shows in thrown traces.
+                let frame_args = if matches!(lname.as_str(), "natsort" | "natcasesort") {
+                    vec![cell(Value::Array(arr.clone()))]
+                } else {
+                    vec![cell(Value::Array(arr.clone())), cell(Value::Int(flag))]
+                };
+                self.call_trace.push(crate::value::TraceFrame {
+                    function: lname.clone(),
+                    class: None,
+                    ty: String::new(),
+                    file: "[internal function]".into(),
+                    line: 0,
+                    args: frame_args,
+                    named_args: Vec::new(),
+                    internal: true,
+                });
+                self.internal_cb += 1;
+                let (sorted, deep, conv_err) = crate::builtins::array::zend_sort_flags(
+                    self,
+                    &src,
+                    flag,
+                    false,
+                    lname == "ksort",
+                );
+                self.internal_cb -= 1;
+                Self::ao_set_sorting(obj, false);
+                arr.borrow_mut().entries = sorted;
                 // Notices queued inside the sort's compares (object→
                 // number casts) must drain at THIS call site — the
                 // builtin-boundary flush in call_builtin never runs on
                 // the method path, so they'd strand onto the next
                 // unrelated compare or vanish.
-                self.emit_cmp_notices()?;
+                let nr = self.emit_cmp_notices();
+                if deep {
+                    let e =
+                        self.spl_throw("Error", "Nesting level too deep - recursive dependency?");
+                    self.call_trace.pop();
+                    nr?;
+                    return self.fail(e);
+                }
+                if let Some(e) = conv_err {
+                    self.call_trace.pop();
+                    nr?;
+                    return self.fail(e);
+                }
+                self.call_trace.pop();
+                nr?;
                 Value::Bool(true)
             }
             "uasort" | "uksort" => {
@@ -747,50 +749,37 @@ impl<'a> Interp<'a> {
                     );
                     return self.fail(e);
                 }
-                // Bubble-sort through the callback — zend uses a stable
-                // sort and the comparator sees (a, b) pairs of cells.
-                let mut sorted: Vec<(ArrKey, Cell)> = arr.borrow().iter().cloned().collect();
-                let mut swapped = true;
-                while swapped {
-                    swapped = false;
-                    for i in 0..sorted.len().saturating_sub(1) {
-                        let (ka, ca) = sorted[i].clone();
-                        let (kb, cbb) = sorted[i + 1].clone();
-                        let call_args = if lname == "uksort" {
-                            vec![cell(key_value(&ka)), cell(key_value(&kb))]
-                        } else {
-                            vec![ca.clone(), cbb.clone()]
-                        };
-                        let r = self.call_value(&cb, CallArgs::positional(call_args))?;
-                        if r.to_int() > 0 {
-                            sorted.swap(i, i + 1);
-                            swapped = true;
-                        }
-                    }
-                }
+                Self::ao_set_sorting(obj, true);
+                let src = arr.borrow().entries.clone();
+                self.call_trace.push(crate::value::TraceFrame {
+                    function: lname.clone(),
+                    class: None,
+                    ty: String::new(),
+                    file: "[internal function]".into(),
+                    line: 0,
+                    args: vec![cell(Value::Array(arr.clone())), cell(cb.clone())],
+                    named_args: Vec::new(),
+                    internal: true,
+                });
+                self.internal_cb += 1;
+                let (sorted, cb_err) = crate::builtins::array::zend_sort_user(
+                    self,
+                    &src,
+                    &cb,
+                    lname == "uksort",
+                    &lname,
+                );
+                self.internal_cb -= 1;
+                Self::ao_set_sorting(obj, false);
                 arr.borrow_mut().entries = sorted;
-                Value::Bool(true)
-            }
-            "natsort" | "natcasesort" => {
-                let ci = lname == "natcasesort";
-                {
-                    let mut a = arr.borrow_mut();
-                    let mut v = crate::value::zend_sort_prepare(&mut a.entries);
-                    crate::value::zend_sort(&mut v, &mut |x, y| {
-                        let r = crate::builtins::array::natcmp(
-                            &x.2.borrow().to_php_bytes(),
-                            &y.2.borrow().to_php_bytes(),
-                            ci,
-                        );
-                        if r != std::cmp::Ordering::Equal {
-                            r
-                        } else {
-                            x.0.cmp(&y.0)
-                        }
-                    });
-                    crate::value::zend_sort_finish(&mut a.entries, v);
+                let nr = self.emit_cmp_notices();
+                if let Some(e) = cb_err {
+                    self.call_trace.pop();
+                    nr?;
+                    return self.fail(e);
                 }
-                self.emit_cmp_notices()?;
+                self.call_trace.pop();
+                nr?;
                 Value::Bool(true)
             }
             "serialize" => {
@@ -831,6 +820,11 @@ impl<'a> Interp<'a> {
                     // is left untouched, no error.
                     return Ok(Some(Value::Null));
                 }
+                // zend order: ZPP → empty-payload early return →
+                // nApplyCount guard → payload parse.
+                if let Some(e) = self.ao_sorting_err(obj) {
+                    return self.fail(e);
+                }
                 match self.ao_parse_payload(&data) {
                     Ok((pflags, sv, parr)) => {
                         // Storage goes through ao_backing like
@@ -859,6 +853,7 @@ impl<'a> Interp<'a> {
                             pos: 0,
                             flags: pflags,
                             iterator_class: None,
+                            sorting: false,
                         });
                         drop(ob);
                         for (k, c) in parr.borrow().iter() {
@@ -890,6 +885,9 @@ impl<'a> Interp<'a> {
                 Value::Array(Rc::new(RefCell::new(out)))
             }
             "__unserialize" => {
+                if let Some(e) = self.ao_sorting_err(obj) {
+                    return self.fail(e);
+                }
                 let data = args.cells.first().unwrap().borrow().clone();
                 let arr_v = match &data {
                     Value::Array(a) => a.clone(),
@@ -972,6 +970,7 @@ impl<'a> Interp<'a> {
                     pos: 0,
                     flags: flags_i,
                     iterator_class: None,
+                    sorting: false,
                 });
                 drop(ob);
                 for (k, c) in props_arr.borrow().iter() {
@@ -1042,6 +1041,7 @@ impl<'a> Interp<'a> {
                                 // only the source's user flags carry.
                                 flags: backing.1.unwrap_or(flags) & 0xFFFF,
                                 iterator_class: None,
+                                sorting: false,
                             }),
                             unset_props: Default::default(),
                         });
@@ -1065,6 +1065,37 @@ impl<'a> Interp<'a> {
     fn spl_throw(&mut self, class: &str, msg: impl Into<String>) -> PhpError {
         let e = self.exception(class, &msg.into());
         self.throw(e)
+    }
+
+    /// zend's nApplyCount++/−− around spl_array_object_sort: set while
+    /// a sort method runs so writes below trip the guard.
+    fn ao_set_sorting(obj: &Rc<RefCell<PhpObject>>, on: bool) {
+        if let Some(ObjectInternal::ArrayIter { sorting, .. }) = &mut obj.borrow_mut().internal {
+            *sorting = on;
+        }
+    }
+
+    /// zend's spl_array_apply_count_guard: every storage write while a
+    /// sort is in flight raises this Error (the message uses the
+    /// runtime class name).
+    pub(in crate::interp) fn ao_sorting_err(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+    ) -> Option<PhpError> {
+        let sorted = matches!(
+            obj.borrow().internal,
+            Some(ObjectInternal::ArrayIter { sorting: true, .. })
+        );
+        if sorted {
+            // zend hardcodes "ArrayObject" even when the object is an
+            // ArrayIterator (spl_array_apply_count_guard).
+            Some(self.spl_throw(
+                "Error",
+                "Modification of ArrayObject during sorting is prohibited",
+            ))
+        } else {
+            None
+        }
     }
 
     /// ARRAY_AS_PROPS (flag bit 2): undeclared prop access on this spl
@@ -1092,6 +1123,7 @@ impl<'a> Interp<'a> {
                 pos: 0,
                 flags: 0,
                 iterator_class: None,
+                sorting: false,
             });
         }
         match &ob.internal {

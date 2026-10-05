@@ -1583,6 +1583,10 @@ pub enum ObjectInternal {
         /// a validated ArrayIterator-derived class name getIterator()
         /// instantiates; None = "ArrayIterator".
         iterator_class: Option<String>,
+        /// zend's nApplyCount > 0: true while a sort method runs —
+        /// storage mutations (dim writes, exchangeArray, unserialize)
+        /// raise "Modification of X during sorting is prohibited".
+        sorting: bool,
     },
     /// ReflectionAttribute payload: the attribute's name, unevaluated arg
     /// Exprs, and the TARGET_* bit of the declaration it was read from.

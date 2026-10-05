@@ -2028,6 +2028,11 @@ impl<'a> Interp<'a> {
                     && self.decl_prop(&o, pn).is_none()
                     && !o.borrow().props.contains_key(pn)
                 {
+                    // AAP prop writes route through spl_array_write_
+                    // dimension in zend — the mid-sort guard applies.
+                    if let Some(e) = self.ao_sorting_err(&o) {
+                        return self.fail(e);
+                    }
                     let arr = self.ao_state(&o).0;
                     let k = ArrKey::Str(Rc::from(pn));
                     // Object-backed: storage IS the prop table — the
@@ -2941,6 +2946,11 @@ impl<'a> Interp<'a> {
                     }
                 }
                 if ok {
+                    // The terminal dim write routes through zend's
+                    // spl_array_unset_dimension — mid-sort it throws.
+                    if let Some(e) = self.ao_sorting_err(&o) {
+                        return self.fail(e);
+                    }
                     if let Some(k) = &key {
                         cur_arr.borrow_mut().unset(&to_key(k));
                     }
