@@ -29,10 +29,12 @@ pub(crate) fn dispatch(
                     if let Some(sv) = &search {
                         let ev = c.borrow();
                         crate::value::clear_cmp_depth_err();
+                        // zend compares (search_value, entry) — the
+                        // search value is the protected LEFT operand.
                         let hit = if strict {
-                            crate::value::identical(&ev, sv)
+                            crate::value::identical(sv, &ev)
                         } else {
-                            crate::value::compare(&ev, sv) == std::cmp::Ordering::Equal
+                            crate::value::compare(sv, &ev) == std::cmp::Ordering::Equal
                         };
                         if crate::value::cmp_depth_err() {
                             return depth_err();
@@ -77,10 +79,13 @@ pub(crate) fn dispatch(
                     for (_, c) in a.borrow().iter() {
                         let v = c.borrow();
                         crate::value::clear_cmp_depth_err();
+                        // zend's _php_search_array compares
+                        // (needle, entry) — the needle is the
+                        // protected LEFT operand.
                         found = if strict {
-                            crate::value::identical(&v, &needle)
+                            crate::value::identical(&needle, &v)
                         } else {
-                            compare(&v, &needle) == std::cmp::Ordering::Equal
+                            compare(&needle, &v) == std::cmp::Ordering::Equal
                         };
                         if crate::value::cmp_depth_err() {
                             return depth_err();
@@ -102,10 +107,11 @@ pub(crate) fn dispatch(
                     for (k, c) in a.borrow().iter() {
                         let v = c.borrow().clone();
                         crate::value::clear_cmp_depth_err();
+                        // zend compares (needle, entry) — needle LEFT.
                         let hit = if strict {
-                            crate::value::identical(&v, &needle)
+                            crate::value::identical(&needle, &v)
                         } else {
-                            compare(&v, &needle) == std::cmp::Ordering::Equal
+                            compare(&needle, &v) == std::cmp::Ordering::Equal
                         };
                         if crate::value::cmp_depth_err() {
                             return depth_err();
@@ -1150,6 +1156,63 @@ pub(crate) fn dispatch(
 
 // ----- helpers -----
 
+/// Stable bottom-up merge sort preserving zend's compare direction:
+/// zend_sort always calls `cmp(earlier, later)` (`cmp(j, i)` with
+/// j < i), so the protected LEFT operand of each compare is the
+/// earlier element — `sort([$cyclic, $finite])` raises the depth
+/// Error while `sort([$finite, $cyclic])` sorts silently. Rust's
+/// `sort_by` hands the comparator pairs in no guaranteed order, so
+/// the merges are done by hand. Returns true when a compare set
+/// CMP_DEPTH_ERR.
+fn zend_merge_sort(entries: &mut [(ArrKey, Cell)]) -> bool {
+    let n = entries.len();
+    if n < 2 {
+        return false;
+    }
+    let mut deep = false;
+    let mut scratch: Vec<(ArrKey, Cell)> = entries.to_vec();
+    // `work` is a clone so `scratch`/`entries` stay borrowable — the
+    // cell Rcs are cheap to clone.
+    let mut work: Vec<(ArrKey, Cell)> = entries.to_vec();
+    let mut width = 1;
+    while width < n {
+        let mut lo = 0;
+        while lo < n {
+            let mid = (lo + width).min(n);
+            let hi = (lo + 2 * width).min(n);
+            let (mut i, mut j, mut k) = (lo, mid, lo);
+            while i < mid && j < hi {
+                // (earlier, later) — left run i < right run j.
+                let ord = compare(&work[i].1.borrow(), &work[j].1.borrow());
+                deep |= crate::value::cmp_depth_err();
+                if ord == std::cmp::Ordering::Greater {
+                    scratch[k] = work[j].clone();
+                    j += 1;
+                } else {
+                    scratch[k] = work[i].clone();
+                    i += 1;
+                }
+                k += 1;
+            }
+            while i < mid {
+                scratch[k] = work[i].clone();
+                i += 1;
+                k += 1;
+            }
+            while j < hi {
+                scratch[k] = work[j].clone();
+                j += 1;
+                k += 1;
+            }
+            lo += 2 * width;
+        }
+        std::mem::swap(&mut work, &mut scratch);
+        width *= 2;
+    }
+    entries.clone_from_slice(&work);
+    deep
+}
+
 fn sort_array(
     it: &mut Interp,
     arr: &mut PhpArray,
@@ -1158,15 +1221,9 @@ fn sort_array(
 ) -> Result<(), PhpError> {
     match name {
         "sort" | "rsort" => {
-            // Rust's sort_by is infallible — accumulate the depth flag
-            // per compare and throw after (zend aborts mid-sort).
-            let mut deep = false;
-            arr.entries.sort_by(|(_, a), (_, b)| {
-                let o = compare(&a.borrow(), &b.borrow());
-                deep |= crate::value::cmp_depth_err();
-                o
-            });
-            if deep {
+            // zend aborts mid-sort on a depth Error — accumulate the
+            // flag per compare and throw after.
+            if zend_merge_sort(&mut arr.entries) {
                 return depth_err();
             }
             if name == "rsort" {
@@ -1188,13 +1245,7 @@ fn sort_array(
             });
         }
         "asort" | "arsort" => {
-            let mut deep = false;
-            arr.entries.sort_by(|(_, a), (_, b)| {
-                let o = compare(&a.borrow(), &b.borrow());
-                deep |= crate::value::cmp_depth_err();
-                o
-            });
-            if deep {
+            if zend_merge_sort(&mut arr.entries) {
                 return depth_err();
             }
             if name == "arsort" {

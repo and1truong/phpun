@@ -3909,8 +3909,11 @@ impl<'a> Interp<'a> {
             }),
             "<" => Value::Bool(compare(a, b) == Ordering::Less),
             "<=" => Value::Bool(compare(a, b) != Ordering::Greater),
-            ">" => Value::Bool(compare(a, b) == Ordering::Greater),
-            ">=" => Value::Bool(compare(a, b) != Ordering::Less),
+            // zend compiles `>`/`>=` as IS_SMALLER(_OR_EQUAL) with the
+            // operands swapped — the RHS is the compare's protected
+            // left operand for the cyclic depth check.
+            ">" => Value::Bool(compare(b, a) == Ordering::Less),
+            ">=" => Value::Bool(compare(b, a) != Ordering::Greater),
             _ => unreachable!(),
         };
         if crate::value::cmp_depth_err() {

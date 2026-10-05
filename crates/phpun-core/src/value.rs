@@ -771,10 +771,13 @@ pub fn gcvt(value: f64, precision: usize) -> String {
 }
 
 thread_local! {
-    /// Containers currently open on the compare stack — zend marks a
-    /// container while recursing inside it (Z_IS_RECURSIVE); reaching
-    /// an already-marked container on EITHER side through a cyclic
-    /// reference aborts the whole comparison.
+    /// Left operands currently open on the compare stack — zend marks
+    /// only the LEFT container while recursing inside it
+    /// (GC_PROTECT_RECURSION(ht1) / Z_PROTECT_RECURSION_P(o1): "It's
+    /// enough to protect only one of the arrays. The second one may
+    /// be referenced from the first"); re-entering an already-marked
+    /// LEFT operand through a cyclic reference aborts the whole
+    /// comparison.
     static CMP_MARKS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     /// Set when a marked container is re-entered — zend fatals with
     /// "Nesting level too deep - recursive dependency?" rather than
@@ -796,31 +799,33 @@ pub fn cmp_depth_err() -> bool {
 
 /// PHP loose comparison (`<=>` semantics) implementing the PHP 8 rules.
 pub fn compare(a: &Value, b: &Value) -> Ordering {
-    let marks = match (a, b) {
+    let mark = match (a, b) {
         (Value::Object(x), Value::Object(y)) => {
             // Same zval short-circuits — zend's quick_equal never
             // descends into props (also covers cyclic self-compares).
             if Rc::ptr_eq(x, y) {
                 return Ordering::Equal;
             }
-            Some((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize))
+            Some(Rc::as_ptr(x) as usize)
         }
         (Value::Array(x), Value::Array(y)) => {
             if Rc::ptr_eq(x, y) {
                 return Ordering::Equal;
             }
-            Some((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize))
+            Some(Rc::as_ptr(x) as usize)
         }
         _ => None,
     };
-    if let Some((ap, bp)) = marks {
+    if let Some(ap) = mark {
         let reentered = CMP_MARKS.with(|v| {
             let mut v = v.borrow_mut();
-            // zend's depth check fires only when BOTH operands are
-            // already marked — the inner comparison re-entered the
-            // same open pair. A (fresh, marked) pair descends fine,
-            // e.g. `$a=[[$n]]; $b=[&$a]; $a==$b` → false, no Error.
-            if v.contains(&ap) && v.contains(&bp) {
+            // zend's depth check fires on re-entry into a marked LEFT
+            // operand — zend_hash_compare checks GC_IS_RECURSIVE(ht1)
+            // before protecting ht1 alone. The right operand is
+            // compared structurally with no mark check of its own, so
+            // a (fresh, marked) pair still descends fine, e.g.
+            // `$a=[[$n]]; $b=[&$a]; $a==$b` → false, no Error.
+            if v.contains(&ap) {
                 true
             } else {
                 // The outermost call resets the flag so a stale one
@@ -830,7 +835,6 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
                     CMP_DEPTH_ERR.with(|f| f.set(false));
                 }
                 v.push(ap);
-                v.push(bp);
                 false
             }
         });
@@ -840,7 +844,6 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
         }
         let r = compare_r(a, b);
         CMP_MARKS.with(|v| {
-            v.borrow_mut().pop();
             v.borrow_mut().pop();
         });
         return r;
@@ -882,7 +885,10 @@ fn compare_r(a: &Value, b: &Value) -> Ordering {
             }
         }
         (Array(x), Array(y)) => {
-            // Loose array comparison: equal if same key/values loosely.
+            // Loose array comparison (zend_hash_compare ordered=0):
+            // equal len, then each ht1 key must exist in ht2 with an
+            // equal element — the first differing pair's ordering is
+            // the result; a missing key means ht1 > ht2.
             let x = x.borrow();
             let y = y.borrow();
             if x.len() != y.len() {
@@ -890,8 +896,13 @@ fn compare_r(a: &Value, b: &Value) -> Ordering {
             }
             for (k, c) in &x.entries {
                 match y.get(k) {
-                    Some(yv) if compare(&c.borrow(), &yv) == Ordering::Equal => {}
-                    _ => return Ordering::Less, // PHP's real rule is more subtle; approximate.
+                    Some(yv) => {
+                        let ord = compare(&c.borrow(), &yv);
+                        if ord != Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    None => return Ordering::Greater,
                 }
             }
             Ordering::Equal
@@ -900,18 +911,26 @@ fn compare_r(a: &Value, b: &Value) -> Ordering {
         (_, Array(_)) => Ordering::Less,
         (Object(x), Object(y)) => {
             // Loose object ==: same class and loosely-equal props.
+            // Like the array walk, the first differing prop's ordering
+            // is the result; a prop missing in ht2 means ht1 > ht2.
             let x = x.borrow();
             let y = y.borrow();
             if x.class.name() != y.class.name() {
-                return Ordering::Less;
+                // zend_std_compare_objects: different ce → ret 1.
+                return Ordering::Greater;
             }
             if x.props.len() != y.props.len() {
                 return x.props.len().cmp(&y.props.len());
             }
             for (k, c) in x.props.iter() {
                 match y.props.get(k) {
-                    Some(yc) if compare(&c.borrow(), &yc.borrow()) == Ordering::Equal => {}
-                    _ => return Ordering::Less,
+                    Some(yc) => {
+                        let ord = compare(&c.borrow(), &yc.borrow());
+                        if ord != Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    None => return Ordering::Greater,
                 }
             }
             Ordering::Equal
@@ -990,27 +1009,19 @@ pub fn identical(a: &Value, b: &Value) -> bool {
                 return true;
             }
             let ap = Rc::as_ptr(x) as usize;
-            let bp = Rc::as_ptr(y) as usize;
-            // zend marks each operand while inside it — re-entering
-            // with BOTH marked raises the same catchable depth Error
-            // as == (the eval site reads CMP_DEPTH_ERR). One marked
-            // side alone is legitimately NOT identical: a finite fresh
-            // array can never be deep-identical to a cyclic marked
-            // one (operator_identical_recusion-01).
-            let (am, bm) = CMP_MARKS.with(|v| {
-                let v = v.borrow();
-                (v.contains(&ap), v.contains(&bp))
-            });
-            if am && bm {
+            // zend_hash_compare marks only the LEFT operand while
+            // inside it (ordered=1 goes through the same impl) —
+            // re-entering a marked left raises the same catchable
+            // depth Error as == (the eval site reads CMP_DEPTH_ERR).
+            // A marked right operand alone gets no check: zend
+            // compares it structurally.
+            let am = CMP_MARKS.with(|v| v.borrow().contains(&ap));
+            if am {
                 CMP_DEPTH_ERR.with(|f| f.set(true));
-                return false;
-            }
-            if am || bm {
                 return false;
             }
             CMP_MARKS.with(|v| {
                 v.borrow_mut().push(ap);
-                v.borrow_mut().push(bp);
             });
             let x = x.borrow();
             let y = y.borrow();
@@ -1023,7 +1034,6 @@ pub fn identical(a: &Value, b: &Value) -> bool {
                     }
                 });
             CMP_MARKS.with(|v| {
-                v.borrow_mut().pop();
                 v.borrow_mut().pop();
             });
             r
