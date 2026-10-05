@@ -991,10 +991,10 @@ pub fn identical(a: &Value, b: &Value) -> bool {
             let ap = Rc::as_ptr(x) as usize;
             let bp = Rc::as_ptr(y) as usize;
             // zend marks each operand while inside it — a cyclic ref
-            // back to either aborts with the depth Error.
+            // back to either side just answers NOT identical
+            // (operator_identical_recusion-01), unlike =='s fatal.
             if CMP_MARKS.with(|v| v.borrow().iter().any(|p| *p == ap || *p == bp)) {
-                CMP_DEPTH_ERR.with(|f| f.set(true));
-                return true;
+                return false;
             }
             CMP_MARKS.with(|v| {
                 v.borrow_mut().push(ap);

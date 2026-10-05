@@ -377,15 +377,20 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                         crate::ast::Visibility::Public => format!("\"{}\"", disp),
                     };
                     it.emit(&format!("{}  [{}]=>\n", pad, key));
+                    // `&` is zend's IS_REFERENCE mark on the SLOT —
+                    // a typed prop can't hold a ref (zend stores the
+                    // value), so no `&` even though the shared cell
+                    // stays marked for write-through gating.
+                    let typed = it
+                        .decl_for_slot(o, n)
+                        .map(|pd| pd.ty.is_some())
+                        .unwrap_or(false);
                     var_dump(
                         it,
                         &c.borrow(),
                         indent + 1,
                         zval,
-                        // `&` is zend's IS_REFERENCE mark, not sharing —
-                        // prop-bound cells (AoStore mirrors) shared by
-                        // structure print plain.
-                        it.is_ref_cell(c) && Rc::strong_count(c) > 1,
+                        !typed && it.is_ref_cell(c) && Rc::strong_count(c) > 1,
                     );
                 }
             }
