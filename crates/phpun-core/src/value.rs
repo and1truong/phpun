@@ -1752,6 +1752,9 @@ pub enum PhpResource {
         buf: Vec<u8>,
         pos: u64,
         eof: bool,
+        /// fwrite honors the fopen mode ('r' → false); fprintf does not
+        /// (zend php_stream_printf bypasses the check).
+        write: bool,
     },
     /// curl/db handles etc. — opaque placeholder.
     Other { id: u64, kind: &'static str },

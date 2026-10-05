@@ -155,7 +155,9 @@ pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>,
 pub(crate) fn builtin_sig(n: &str) -> Option<Vec<(String, bool)>> {
     let ps: &[(&str, bool)] = match n {
         "strlen" | "strrev" | "strtoupper" | "strtolower" | "md5" | "sha1" => &[("string", true)],
-        "sprintf" => &[("format", true), ("args", false)],
+        "sprintf" | "printf" => &[("format", true), ("values", false)],
+        "vsprintf" | "vprintf" => &[("format", true), ("values", true)],
+        "fprintf" | "vfprintf" => &[("stream", true), ("format", true), ("values", true)],
         "str_repeat" => &[("string", true), ("times" /* multi */, true)],
         "substr" => &[("string", true), ("offset", true), ("length", false)],
         "strpos" => &[("haystack", true), ("needle", true), ("offset", false)],
@@ -561,6 +563,7 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "var_dump"
             | "var_export"
             | "version_compare"
+            | "vfprintf"
             | "vprintf"
             | "vsprintf"
             | "wordwrap"
@@ -672,9 +675,12 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
             ("cut_long_words", Bool(false))
         ),
         "nl2br" => bp!(("string", Req), ("use_xhtml", Bool(true))),
-        "sprintf" | "printf" | "vsprintf" | "fprintf" => {
-            bp!(("format", Req), ("...", Var))
+        "sprintf" | "printf" => {
+            bp!(("format", Req), ("values", Var))
         }
+        "vsprintf" | "vprintf" => bp!(("format", Req), ("values", Req)),
+        "fprintf" => bp!(("stream", Req), ("format", Req), ("values", Var)),
+        "vfprintf" => bp!(("stream", Req), ("format", Req), ("values", Req)),
         "number_format" => bp!(
             ("num", Req),
             ("decimals", Int(0)),
@@ -948,7 +954,14 @@ pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
         "array_flip" | "array_unique" | "array_rand" => &[("array", "array")],
         "str_word_count" | "similar_text" => &[("string", "string")],
         "ucwords" | "lcwords" => &[("string", "string"), ("separators", "string")],
-        "sprintf" | "printf" | "vsprintf" | "vprintf" => &[("format", "string")],
+        "sprintf" | "printf" => &[("format", "string")],
+        "vsprintf" | "vprintf" => &[("format", "string"), ("values", "array")],
+        "fprintf" => &[("stream", "resource"), ("format", "string")],
+        "vfprintf" => &[
+            ("stream", "resource"),
+            ("format", "string"),
+            ("values", "array"),
+        ],
         "number_format" => &[("num", "float"), ("decimals", "int")],
         "preg_match" | "preg_match_all" => &[("pattern", "string"), ("subject", "string")],
         "preg_replace" | "preg_filter" => &[

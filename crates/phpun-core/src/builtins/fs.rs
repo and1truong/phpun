@@ -349,18 +349,24 @@ pub(crate) fn dispatch(
                 || path == "php://temp"
                 || path.starts_with("php://temp/maxmemory:")
             {
-                // php://memory and php://temp are always read/write.
+                // php://memory and php://temp are always read/write
+                // internally; fwrite still honors the fopen mode.
                 let id = it.next_res_id();
+                let (_, w) = mode_flags(&mode);
                 Value::Resource(Rc::new(RefCell::new(PhpResource::Mem {
                     id,
                     buf: Vec::new(),
                     pos: 0,
                     eof: false,
+                    write: w,
                 })))
             } else if let Some(which) = match path.as_str() {
                 "php://stdin" => Some(0u8),
-                "php://stdout" | "php://output" => Some(1u8),
+                "php://stdout" => Some(1u8),
                 "php://stderr" => Some(2u8),
+                // php://output writes through the output-buffer chain
+                // (ob_* can capture them), unlike php://stdout.
+                "php://output" => Some(3u8),
                 _ => None,
             } {
                 let id = it.next_res_id();
@@ -394,9 +400,18 @@ pub(crate) fn dispatch(
         }
         "fwrite" | "fputs" => {
             let data = arg(args, 1).to_php_string();
-            match write_resource(it, args.first(), data.as_bytes()) {
-                Ok(_) => Value::Int(data.len() as i64),
-                Err(_) => Value::Bool(false),
+            let readonly = matches!(
+                args.first().map(|c| c.borrow().clone()),
+                Some(Value::Resource(r))
+                    if matches!(&*r.borrow(), PhpResource::Mem { write: false, .. })
+            );
+            if readonly {
+                Value::Bool(false)
+            } else {
+                match write_resource(it, args.first(), data.as_bytes()) {
+                    Ok(_) => Value::Int(data.len() as i64),
+                    Err(_) => Value::Bool(false),
+                }
             }
         }
         "fread" => {
@@ -921,6 +936,10 @@ pub(in crate::builtins) fn write_resource(
                         } else {
                             it.out.extend_from_slice(data);
                         }
+                        Ok(())
+                    }
+                    3 => {
+                        it.emit_bytes(data);
                         Ok(())
                     }
                     2 => {

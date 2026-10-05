@@ -9,17 +9,78 @@ pub(crate) fn dispatch(
 ) -> Result<Option<Value>, PhpError> {
     Ok(Some(match name {
         "number_format" => {
-            let n = arg(args, 0).to_float();
-            let dec = arg(args, 1).to_int() as usize;
-            let dp = arg_str(it, args, 2);
-            let dp = if args.len() > 2 { dp.as_str() } else { "." };
-            let ts = if args.len() > 3 {
-                arg_str(it, args, 3)
-            } else {
-                ",".into()
+            // ZEND_PARSE_PARAMETERS(1, 4): Z_PARAM_NUMBER + Z_PARAM_LONG
+            // + two Z_PARAM_STRING_OR_NULL.
+            if args.is_empty() {
+                return err(
+                    "ArgumentCountError",
+                    "number_format() expects at least 1 argument, 0 given",
+                );
+            }
+            enum Num {
+                Int(i64),
+                Float(f64),
+            }
+            let num = match arg(args, 0) {
+                Value::Int(i) => Num::Int(i),
+                Value::Float(f) => Num::Float(f),
+                Value::Bool(b) => Num::Int(b as i64),
+                Value::Null => {
+                    it.deprecated_pub(
+                        "number_format(): Passing null to parameter #1 ($num) of type float is deprecated",
+                    )?;
+                    Num::Float(0.0)
+                }
+                Value::Str(s) => match numeric(&s) {
+                    Numeric::Int(i) => Num::Int(i),
+                    Numeric::Float(f) => Num::Float(f),
+                    _ => {
+                        return err(
+                            "TypeError",
+                            "number_format(): Argument #1 ($num) must be of type int|float, string given",
+                        )
+                    }
+                },
+                v => {
+                    return err(
+                        "TypeError",
+                        format!(
+                            "number_format(): Argument #1 ($num) must be of type int|float, {} given",
+                            zval_word(&v)
+                        ),
+                    )
+                }
             };
-            let ts = if args.len() > 3 { ts.as_str() } else { "," };
-            Value::str(number_format(n, dec, dp, ts))
+            let dec = zpp_long_arg(it, args, 1, "number_format", 2, "$decimals")?;
+            let dp = zpp_string_or_null(it, args, 2, "number_format", 3, "$decimal_separator")?
+                .unwrap_or_else(|| b".".to_vec());
+            let ts = zpp_string_or_null(it, args, 3, "number_format", 4, "$thousands_separator")?
+                .unwrap_or_else(|| b",".to_vec());
+            let is_long = match num {
+                Num::Int(_) => true,
+                Num::Float(f) => {
+                    (f >= 4503599627370496.0 || f <= -4503599627370496.0)
+                        && (-9223372036854775808.0..9223372036854775808.0).contains(&f)
+                }
+            };
+            Value::bytes(if is_long {
+                let n = match num {
+                    Num::Int(i) => i,
+                    Num::Float(f) => f as i64,
+                };
+                number_format_long(n, dec, &dp, &ts)
+            } else {
+                let d = match num {
+                    Num::Int(i) => i as f64,
+                    Num::Float(f) => f,
+                };
+                number_format_ex(
+                    d,
+                    dec.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                    &dp,
+                    &ts,
+                )
+            })
         }
 
         // ----- strings -----
@@ -1284,25 +1345,300 @@ fn strtr_chars(s: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-fn number_format(n: f64, dec: usize, dp: &str, ts: &str) -> String {
-    let s = format!("{:.*}", dec, n.abs());
-    let (int_part, frac) = match s.split_once('.') {
-        Some((i, f)) => (i.to_string(), Some(f)),
-        None => (s, None),
-    };
-    let mut grouped = String::new();
-    let bytes = int_part.as_bytes();
-    for (i, c) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
-            grouped.push_str(ts);
+/// `Z_PARAM_LONG` emulation for number_format's $decimals: ints and
+/// integral floats/strings coerce quietly, fractional values raise the
+/// "loses precision" deprecation, anything else is a TypeError.
+fn zpp_long_arg(
+    it: &mut Interp,
+    args: &[Cell],
+    i: usize,
+    fname: &str,
+    pnum: usize,
+    pname: &str,
+) -> Result<i64, PhpError> {
+    if i >= args.len() {
+        return Ok(0);
+    }
+    match arg(args, i) {
+        Value::Int(v) => Ok(v),
+        Value::Float(f) => {
+            if f.fract() != 0.0 {
+                it.deprecated_pub(&format!(
+                    "Implicit conversion from float {} to int loses precision",
+                    format_float_repr(f)
+                ))?;
+            }
+            Ok(f as i64)
         }
-        grouped.push(*c as char);
+        Value::Bool(b) => Ok(b as i64),
+        Value::Null => {
+            it.deprecated_pub(&format!(
+                "{}(): Passing null to parameter #{} ({}) of type int is deprecated",
+                fname, pnum, pname
+            ))?;
+            Ok(0)
+        }
+        Value::Str(s) => match numeric(&s) {
+            Numeric::Int(v) => Ok(v),
+            Numeric::Float(f) => {
+                if f.fract() != 0.0 {
+                    it.deprecated_pub(&format!(
+                        "Implicit conversion from float-string \"{}\" to int loses precision",
+                        String::from_utf8_lossy(&s)
+                    ))?;
+                }
+                Ok(f as i64)
+            }
+            _ => err(
+                "TypeError",
+                format!(
+                    "{}(): Argument #{} ({}) must be of type int, string given",
+                    fname, pnum, pname
+                ),
+            ),
+        },
+        v => err(
+            "TypeError",
+            format!(
+                "{}(): Argument #{} ({}) must be of type int, {} given",
+                fname,
+                pnum,
+                pname,
+                zval_word(&v)
+            ),
+        ),
     }
-    if n < 0.0 {
-        grouped.insert(0, '-');
+}
+
+/// `Z_PARAM_STRING_OR_NULL`: strings/scalars coerce (objects need
+/// __toString), null → None (caller substitutes the default).
+fn zpp_string_or_null(
+    it: &mut Interp,
+    args: &[Cell],
+    i: usize,
+    fname: &str,
+    pnum: usize,
+    pname: &str,
+) -> Result<Option<Vec<u8>>, PhpError> {
+    if i >= args.len() {
+        return Ok(None);
     }
-    match frac {
-        Some(f) => format!("{}{}{}", grouped, dp, f),
-        None => grouped,
+    match arg(args, i) {
+        Value::Null => Ok(None),
+        Value::Str(s) => Ok(Some(s.to_vec())),
+        Value::Int(_) | Value::Float(_) | Value::Bool(_) => {
+            it.try_conv_bytes(&arg(args, i)).map(Some)
+        }
+        Value::Object(o) => {
+            if it.find_method_in(&o.borrow().class, "__tostring").is_some() {
+                it.try_conv_bytes(&arg(args, i)).map(Some)
+            } else {
+                let v = arg(args, i);
+                err(
+                    "TypeError",
+                    format!(
+                        "{}(): Argument #{} ({}) must be of type ?string, {} given",
+                        fname,
+                        pnum,
+                        pname,
+                        zval_word(&v)
+                    ),
+                )
+            }
+        }
+        v => err(
+            "TypeError",
+            format!(
+                "{}(): Argument #{} ({}) must be of type ?string, {} given",
+                fname,
+                pnum,
+                pname,
+                zval_word(&v)
+            ),
+        ),
+    }
+}
+
+/// `_php_math_number_format_long` — int path: negative decimals round
+/// via the 10^k table, positive decimals append "0" * dec.
+fn number_format_long(num: i64, dec: i64, dp: &[u8], ts: &[u8]) -> Vec<u8> {
+    const POWERS: [u64; 20] = [
+        1,
+        10,
+        100,
+        1000,
+        10000,
+        100000,
+        1000000,
+        10000000,
+        100000000,
+        1000000000,
+        10000000000,
+        100000000000,
+        1000000000000,
+        10000000000000,
+        100000000000000,
+        1000000000000000,
+        10000000000000000,
+        100000000000000000,
+        1000000000000000000,
+        10000000000000000000,
+    ];
+    let mut is_negative = false;
+    let mut tmpnum = if num < 0 {
+        is_negative = true;
+        num.unsigned_abs()
+    } else {
+        num as u64
+    };
+    if dec < 0 {
+        if dec < -19 {
+            tmpnum = 0;
+        } else {
+            let power = POWERS[(-dec) as usize];
+            let rest = tmpnum % power;
+            tmpnum /= power;
+            if rest >= power / 2 {
+                tmpnum = tmpnum * power + power;
+            } else {
+                tmpnum *= power;
+            }
+        }
+        if tmpnum == 0 {
+            is_negative = false;
+        }
+    }
+    let digits = tmpnum.to_string().into_bytes();
+    let zeros = if dec > 0 {
+        vec![b'0'; dec as usize]
+    } else {
+        vec![]
+    };
+    group_int(&digits, &zeros, dp, ts, is_negative)
+}
+
+/// `_php_math_number_format_ex` — double path: HALF_UP round via
+/// _php_math_round, then %.*F-style fixed format, then grouping.
+fn number_format_ex(d: f64, dec: i32, dp: &[u8], ts: &[u8]) -> Vec<u8> {
+    let mut is_negative = d < 0.0;
+    let d = php_math_round_half_up(d.abs(), dec);
+    let prec = dec.max(0) as usize;
+    // php_conv_fp caps its dtoa precision at NDIG-2 = 318; extra decimals
+    // arrive as '0' padding in the copy loop.
+    let used = prec.min(318);
+    let s = format!("{:.*}", used, d);
+    if !s.as_bytes()[0].is_ascii_digit() {
+        // "inf" / "nan" — sign is lost (-INF prints "inf"), and Zend's
+        // %F spells them lowercase.
+        return s.to_lowercase().into_bytes();
+    }
+    if is_negative && d == 0.0 {
+        is_negative = false;
+    }
+    let (int_part, frac) = match s.split_once('.') {
+        Some((a, b)) => (a.to_string(), b.as_bytes().to_vec()),
+        None => (s, Vec::new()),
+    };
+    let mut frac = frac;
+    frac.resize(prec, b'0');
+    group_int(int_part.as_bytes(), &frac, dp, ts, is_negative)
+}
+
+/// Shared tail of both number_format paths: group digits right-to-left
+/// with the thousands separator, append dec_point + fraction, prepend
+/// sign. An empty `dp` emits the fraction with no separator byte.
+fn group_int(digits: &[u8], frac: &[u8], dp: &[u8], ts: &[u8], neg: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(digits.len() + frac.len() + dp.len() + 4);
+    if neg {
+        out.push(b'-');
+    }
+    let n = digits.len();
+    for (i, &c) in digits.iter().enumerate() {
+        if i > 0 && (n - i) % 3 == 0 {
+            out.extend_from_slice(ts);
+        }
+        out.push(c);
+    }
+    if !frac.is_empty() {
+        out.extend_from_slice(dp);
+        out.extend_from_slice(frac);
+    }
+    out
+}
+
+/// `php_intpow10` — exact table below 23, pow() beyond.
+fn php_intpow10(power: i64) -> f64 {
+    if !(0..=22).contains(&power) {
+        return 10f64.powi(power as i32);
+    }
+    const P: [f64; 23] = [
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+        1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+    ];
+    P[power as usize]
+}
+
+/// `_php_math_round` with PHP_ROUND_HALF_UP — the error-correction pass
+/// (tmp+1 compared back) is what makes number_format(0.045, 2) == "0.05".
+fn php_math_round_half_up(value: f64, places: i32) -> f64 {
+    if !value.is_finite() || value == 0.0 {
+        return value;
+    }
+    if places == 0 && value == value.trunc() {
+        return value;
+    }
+    let places = (places as i64).max(i32::MIN as i64 + 1);
+    let exponent = php_intpow10(places.unsigned_abs() as i64);
+    let mut tmp_value = if value >= 0.0 {
+        (if places > 0 {
+            value * exponent
+        } else {
+            value / exponent
+        })
+        .floor()
+    } else {
+        (if places > 0 {
+            value * exponent
+        } else {
+            value / exponent
+        })
+        .ceil()
+    };
+    let tmp_value2 = tmp_value + if value >= 0.0 { 1.0 } else { -1.0 };
+    if (if places > 0 {
+        tmp_value2 / exponent
+    } else {
+        tmp_value2 * exponent
+    }) == value
+    {
+        tmp_value = tmp_value2;
+    }
+    if tmp_value.abs() >= 1e16 {
+        return value;
+    }
+    // PHP_ROUND_HALF_UP edge case.
+    let edge = if places > 0 {
+        ((tmp_value + 0.5f64.copysign(tmp_value)) / exponent).abs()
+    } else {
+        ((tmp_value + 0.5f64.copysign(tmp_value)) * exponent).abs()
+    };
+    if value.abs() >= edge {
+        tmp_value += 1.0f64.copysign(tmp_value);
+    }
+    if places.unsigned_abs() < 23 {
+        if places > 0 {
+            tmp_value / exponent
+        } else {
+            tmp_value * exponent
+        }
+    } else {
+        let v: f64 = format!("{}e{}", tmp_value, -places)
+            .parse()
+            .unwrap_or(value);
+        if !v.is_finite() {
+            value
+        } else {
+            v
+        }
     }
 }

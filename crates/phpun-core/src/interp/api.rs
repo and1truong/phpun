@@ -4,6 +4,7 @@
 
 use super::util::*;
 use super::*;
+use crate::value::{trace_frame_hidden, trace_frame_str};
 
 impl<'a> Interp<'a> {
     /// Flush all output buffers at script end, innermost first so each
@@ -298,6 +299,17 @@ impl<'a> Interp<'a> {
     }
     pub fn warn_pub(&mut self, msg: &str) -> Result<(), PhpError> {
         self.warn(msg)
+    }
+
+    /// Backtrace frames (innermost first) for an E_ERROR raised inside a
+    /// builtin — Zend attaches the call stack to runtime fatals.
+    pub fn fatal_frames(&self) -> Vec<String> {
+        self.call_trace
+            .iter()
+            .rev()
+            .filter(|f| !trace_frame_hidden(f))
+            .map(trace_frame_str)
+            .collect()
     }
 
     pub fn deprecated_pub(&mut self, msg: &str) -> Result<(), PhpError> {
