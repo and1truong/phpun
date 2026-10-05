@@ -3,6 +3,7 @@
 use super::datetime::date_format;
 use super::url::urlencode;
 use super::*;
+use crate::error::ErrorKind;
 
 pub(crate) fn dispatch(
     it: &mut Interp,
@@ -153,26 +154,59 @@ pub(crate) fn dispatch(
         }
         "register_shutdown_function" => {
             let f = arg(args, 0);
+            // Eager callback validation (zend zpp 'f'): a throwing
+            // autoloader propagates; an invalid arg is a TypeError.
+            if !it.is_callable_value(&f) {
+                if let Some(pe) = it.take_callable_probe_err() {
+                    return Err(pe);
+                }
+                return err(
+                    "TypeError",
+                    format!(
+                        "register_shutdown_function(): Argument #1 ($callback) must be a valid callback, {}",
+                        it.zpp_callback_detail(&f)
+                    ),
+                );
+            }
             let rest: Vec<Cell> = args[1.min(args.len())..].to_vec();
             it.register_shutdown(f, rest);
             Value::Null
         }
-        "set_error_handler" => {
-            let prev = it.error_handler().unwrap_or(Value::Null);
-            it.set_error_handler(if matches!(arg(args, 0), Value::Null) {
-                None
+        "set_error_handler" | "set_exception_handler" => {
+            let cb = arg(args, 0);
+            // `?callable` — null restores the engine default, anything
+            // else must validate (a throwing autoloader propagates).
+            if !matches!(cb, Value::Null) && !it.is_callable_value(&cb) {
+                if let Some(pe) = it.take_callable_probe_err() {
+                    return Err(pe);
+                }
+                return err(
+                    "TypeError",
+                    format!(
+                        "{}(): Argument #1 ($callback) must be a valid callback or null, {}",
+                        name,
+                        it.zpp_callback_detail(&cb)
+                    ),
+                );
+            }
+            let (prev, none) = if name == "set_error_handler" {
+                (it.error_handler().unwrap_or(Value::Null), false)
             } else {
-                Some(arg(args, 0))
-            });
-            prev
-        }
-        "set_exception_handler" => {
-            let prev = it.exception_handler().unwrap_or(Value::Null);
-            it.set_exception_handler(if matches!(arg(args, 0), Value::Null) {
-                None
+                (it.exception_handler().unwrap_or(Value::Null), true)
+            };
+            if none {
+                it.set_exception_handler(if matches!(cb, Value::Null) {
+                    None
+                } else {
+                    Some(cb)
+                });
             } else {
-                Some(arg(args, 0))
-            });
+                it.set_error_handler(if matches!(cb, Value::Null) {
+                    None
+                } else {
+                    Some(cb)
+                });
+            }
             prev
         }
         "restore_error_handler" => {
@@ -207,20 +241,22 @@ pub(crate) fn dispatch(
                                 && *f < 9.223372036854776e18
                                 && *f >= -9.223372036854776e18 =>
                         {
+                            // A real float → int coerces with the
+                            // loses-precision deprecation (zend).
+                            if f.fract() != 0.0 {
+                                it.deprecated_pub(&format!(
+                                    "Implicit conversion from float {} to int loses precision",
+                                    crate::value::format_float_repr(*f)
+                                ))?;
+                            }
                             Some(*f as i64)
                         }
                         Value::Bool(b) => Some(*b as i64),
                         Value::Str(s) => match crate::value::numeric(s) {
                             crate::value::Numeric::Int(i) => Some(i),
-                            crate::value::Numeric::Float(f) => {
-                                if f != f.trunc() {
-                                    it.deprecated_pub(&format!(
-                                        "Implicit conversion from float-string \"{}\" to int loses precision",
-                                        crate::value::lossy(s)
-                                    ))?;
-                                }
-                                Some(f as i64)
-                            }
+                            // A float-STRING truncates silently — zend
+                            // only warns on real floats.
+                            crate::value::Numeric::Float(f) => Some(f as i64),
                             _ => {
                                 return err(
                                     "TypeError",
@@ -596,6 +632,27 @@ pub(crate) fn dispatch(
         },
         "proc_open" | "proc_close" | "proc_get_status" | "proc_terminate" => Value::Bool(false),
         "shell_exec" | "exec" | "system" | "passthru" => Value::Null,
+        // exit()/die() exist in zend's function table too — reachable
+        // through 'exit'/'die' string callables (FCC, call_user_func).
+        // Top-level exit() parses to Expr::Exit and never lands here.
+        "die" | "exit" => {
+            let code = match args.first().map(|c| c.borrow().clone()) {
+                Some(Value::Int(i)) => i as i32,
+                Some(Value::Str(s)) => {
+                    it.emit_bytes(&s);
+                    0
+                }
+                _ => 0,
+            };
+            return Err(PhpError {
+                trace: None,
+                thrown_line: None,
+                display_msg: None,
+                kind: ErrorKind::Fatal,
+                message: format!("\u{1}exit:{}", code),
+                line: 0,
+            });
+        }
         "escapeshellarg" | "escapeshellcmd" => {
             let s = arg_str(it, args, 0);
             Value::str(format!("'{}'", s.replace('\'', "'\\''")))

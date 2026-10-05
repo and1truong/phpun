@@ -443,12 +443,19 @@ impl<'a> Interp<'a> {
                             Err(e) => return self.err_flow(e),
                         },
                     };
-                    let gcell = self
-                        .globals
-                        .vars
-                        .entry(name.clone())
-                        .or_insert_with(|| cell(Value::Null))
-                        .clone();
+                    // Materialize through the $GLOBALS table first — a
+                    // `global $x` after `$GLOBALS['x']=v` sees the
+                    // arr-written cell.
+                    let gcell = match self.global_var_cell(&name) {
+                        Some(c) => c,
+                        None => {
+                            let c = cell(Value::Null);
+                            self.globals.vars.insert(name.clone(), c.clone());
+                            self.globals_order.push(name.clone());
+                            c
+                        }
+                    };
+                    self.mark_ref(&gcell);
                     self.cur().vars.insert(name, gcell);
                 }
                 Flow::Normal
@@ -457,6 +464,15 @@ impl<'a> Interp<'a> {
                 for x in xs {
                     match x {
                         Expr::Var(n) => {
+                            // Global scope: unset($x) ==
+                            // unset($GLOBALS['x']) — tombstone the
+                            // table entry too.
+                            if self.stack.is_empty() {
+                                if let Some(arr) = self.globals_arr.clone() {
+                                    arr.borrow_mut().unset(&ArrKey::Str(Rc::from(n.as_str())));
+                                }
+                                self.globals_synced.remove(n);
+                            }
                             if let Some(c) = self.cur().vars.remove(n) {
                                 // Removing the last handle runs
                                 // __destruct immediately — for a
@@ -665,8 +681,10 @@ impl<'a> Interp<'a> {
                     // PHP separates a shared array when the loop takes
                     // references to its elements — ref-marked cells stay
                     // bound, everything else copies, so &-writes don't
-                    // leak into non-ref elements of other copies.
-                    let rc = if Rc::strong_count(&rc) > 1 {
+                    // leak into non-ref elements of other copies. A
+                    // deliberately-shared table ($GLOBALS) iterates
+                    // in place.
+                    let rc = if Rc::strong_count(&rc) > 1 && !rc.borrow().is_ref {
                         let fresh = self.dup_array(&rc.borrow());
                         let nr = Rc::new(RefCell::new(fresh));
                         if let Ok(c) = self.eval_cell(arr) {
@@ -676,13 +694,17 @@ impl<'a> Interp<'a> {
                     } else {
                         rc
                     };
+                    // The table never CoW-splits while the loop holds
+                    // it by reference — restored on exit so later
+                    // copies separate normally again.
+                    let was_shared = rc.borrow().is_ref;
                     rc.borrow_mut().is_ref = true;
                     // PHP's live iterator tracks "the element after the
                     // current one in logical order" — prepends (unshift) and
                     // renumbering (shift) don't move it, tombstoned current
                     // elements still anchor it (foreachLoop.013/.015).
                     let mut last: Option<Cell> = None;
-                    loop {
+                    let flow = loop {
                         let next = {
                             let a = rc.borrow();
                             let live_at = |from: usize| -> Option<(ArrKey, Cell)> {
@@ -703,7 +725,9 @@ impl<'a> Interp<'a> {
                                 }
                             }
                         };
-                        let Some((k, c)) = next else { break };
+                        let Some((k, c)) = next else {
+                            break Flow::Normal;
+                        };
                         last = Some(c.clone());
                         if let Some(ForeachKey::Var(kn)) = key {
                             self.var_set(kn, key_value(&k));
@@ -712,8 +736,11 @@ impl<'a> Interp<'a> {
                             ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
                             ForeachTarget::ByRef(n) => {
                                 if let Some(f) = self.readonly_ref_error(&c) {
-                                    return f;
+                                    break f;
                                 }
+                                // zend leaves the element IS_REFERENCE
+                                // — post-loop copies re-bind it.
+                                self.mark_ref(&c);
                                 self.cur().vars.insert(n.clone(), c);
                             }
                             ForeachTarget::Lvalue(e) => {
@@ -724,15 +751,16 @@ impl<'a> Interp<'a> {
                             }
                         }
                         match self.exec_block(body) {
-                            Flow::Break(0) | Flow::Break(1) => break,
-                            Flow::Break(n) => return Flow::Break(n - 1),
+                            Flow::Break(0) | Flow::Break(1) => break Flow::Normal,
+                            Flow::Break(n) => break Flow::Break(n - 1),
                             Flow::Continue(0) | Flow::Continue(1) => continue,
-                            Flow::Continue(n) => return Flow::Continue(n - 1),
+                            Flow::Continue(n) => break Flow::Continue(n - 1),
                             Flow::Normal => {}
-                            f => return f,
+                            f => break f,
                         }
-                    }
-                    return Flow::Normal;
+                    };
+                    rc.borrow_mut().is_ref = was_shared;
+                    return flow;
                 }
                 // Snapshot (key, cell) pairs — PHP iterates a copy for
                 // value-iteration but shares cells for &-iteration.
@@ -996,7 +1024,7 @@ impl<'a> Interp<'a> {
                                     .unwrap_or_else(|| dname.clone());
                                 self.slot_anchor
                                     .insert(p, SlotAnchor::Obj(Rc::downgrade(&o), sk));
-                                self.ref_cells.insert(p);
+                                self.mark_ref(&c);
                             }
                         }
                     }
@@ -1006,7 +1034,7 @@ impl<'a> Interp<'a> {
                     match val {
                         ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
                         ForeachTarget::ByRef(n) => {
-                            self.ref_cells.insert(Rc::as_ptr(&c) as usize);
+                            self.mark_ref(&c);
                             self.cur().vars.insert(n.clone(), c.clone());
                         }
                         ForeachTarget::Lvalue(e) => {
@@ -1127,7 +1155,9 @@ impl<'a> Interp<'a> {
                                 .map(|(_, c)| c.clone())
                                 .unwrap_or_else(|| cell(v.clone()))
                         }
-                        Some(ObjectInternal::ArrayIter { arr, pos, .. }) => arr
+                        Some(ObjectInternal::ArrayIter { store, pos, .. }) => store
+                            .borrow()
+                            .arr
                             .borrow()
                             .entries
                             .get(*pos)
@@ -1138,7 +1168,7 @@ impl<'a> Interp<'a> {
                     if let Some(f) = self.readonly_ref_error(&c) {
                         return f;
                     }
-                    self.ref_cells.insert(Rc::as_ptr(&c) as usize);
+                    self.mark_ref(&c);
                     self.cur().vars.insert(n.clone(), c);
                 }
                 ForeachTarget::Lvalue(e) => {

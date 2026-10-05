@@ -724,7 +724,32 @@ impl<'a> Interp<'a> {
                         let val = self
                             .method_invoke(o.clone(), "current", CallArgs::empty())
                             .unwrap_or(Value::Null);
-                        out.push((k, cell(val)));
+                        // Storage-backed iterators expose live cells:
+                        // zend's materialization keeps IS_REFERENCE
+                        // bindings (a by-ref foreach's marks re-bind,
+                        // writes through the copy reach the storage).
+                        let c = match &o.borrow().internal {
+                            Some(crate::value::ObjectInternal::ArrayIter {
+                                store, pos, ..
+                            }) => store
+                                .borrow()
+                                .arr
+                                .borrow()
+                                .iter()
+                                .nth(*pos)
+                                .map(|(_, c)| c.clone())
+                                .filter(|c| self.is_ref_cell(c)),
+                            Some(crate::value::ObjectInternal::Generator(st)) => {
+                                let st = st.borrow();
+                                st.items
+                                    .get(st.pos)
+                                    .map(|(_, c)| c.clone())
+                                    .filter(|c| self.is_ref_cell(c))
+                            }
+                            _ => None,
+                        }
+                        .unwrap_or_else(|| cell(val));
+                        out.push((k, c));
                         let _ = self.method_invoke(o.clone(), "next", CallArgs::empty())?;
                     }
                     Ok(out)

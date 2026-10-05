@@ -20,15 +20,63 @@ pub(crate) fn dispatch(
         },
 
         // ----- misc -----
-        "iterator_to_array" | "iterator_count" | "iterator_apply" => {
+        "iterator_apply" => {
+            let iter = arg(args, 0);
+            // arginfo: (Traversable, callable, ?array) — arg 1 must be
+            // an object implementing Traversable.
+            let traversable = match &iter {
+                Value::Object(o) => it.obj_implements(o, "traversable"),
+                _ => false,
+            };
+            if !traversable {
+                return err(
+                    "TypeError",
+                    format!(
+                        "iterator_apply(): Argument #1 ($iterator) must be of type Traversable, {} given",
+                        it.zval_type_name(&iter)
+                    ),
+                );
+            }
+            let cb = arg(args, 1);
+            if !it.is_callable_value(&cb) {
+                if let Some(pe) = it.take_callable_probe_err() {
+                    return Err(pe);
+                }
+                return err(
+                    "TypeError",
+                    format!(
+                        "iterator_apply(): Argument #2 ($callback) must be a valid callback, {}",
+                        it.zpp_callback_detail(&cb)
+                    ),
+                );
+            }
+            // zend calls cb(...$args) per element — the current item is
+            // NOT passed; the count includes the falsy-stopping call.
+            let cb_args: Vec<Cell> = match arg(args, 2) {
+                Value::Array(a) => a.borrow().iter().map(|(_, c)| c.clone()).collect(),
+                _ => Vec::new(),
+            };
+            let items = it.yield_from_collect(&iter)?;
+            let mut count = 0i64;
+            for (_, _) in items {
+                let r = it.call_value(&cb, crate::interp::CallArgs::positional(cb_args.clone()))?;
+                count += 1;
+                if !r.is_truthy() {
+                    break;
+                }
+            }
+            Value::Int(count)
+        }
+        "iterator_to_array" | "iterator_count" => {
             let name_l = name.to_lowercase();
             match arg(args, 0) {
                 Value::Array(a) => {
-                    let mut out = PhpArray::new();
-                    for (k, c) in a.borrow().iter() {
-                        out.set(k.clone(), c.borrow().clone());
+                    if name_l == "iterator_count" {
+                        return Ok(Some(Value::Int(a.borrow().len() as i64)));
                     }
-                    Value::Array(Rc::new(RefCell::new(out)))
+                    // Separated copy — zend_array_dup keeps shared
+                    // IS_REFERENCE bindings, plain elements duplicate.
+                    Value::Array(Rc::new(RefCell::new(it.dup_array(&a.borrow()))))
                 }
                 Value::Object(o) => {
                     // Materialize via the Iterator protocol (Generator,
@@ -41,12 +89,11 @@ pub(crate) fn dispatch(
                     // $preserve_keys (default true): duplicate int keys
                     // overwrite; false → append.
                     let preserve = args.get(1).map(|c| c.borrow().is_truthy()).unwrap_or(true);
-                    for (k, v) in items {
-                        let v = v.borrow().clone();
+                    for (k, c) in items {
                         if preserve {
-                            out.set(crate::value::to_key(&k), v);
+                            out.bind_cell(crate::value::to_key(&k), c);
                         } else {
-                            out.push(v);
+                            out.push_cell(c);
                         }
                     }
                     Value::Array(Rc::new(RefCell::new(out)))
@@ -56,13 +103,30 @@ pub(crate) fn dispatch(
         }
         "spl_autoload_register" => {
             if let Some(v) = args.first() {
-                // ($callback, $throw, $prepend) — a truthy 3rd arg
-                // prepends the loader (variance/loading_exception*).
-                let prepend = args.get(2).map(|v| v.borrow().is_truthy()).unwrap_or(false);
-                if prepend {
-                    it.autoload_fns.insert(0, v.borrow().clone());
-                } else {
-                    it.autoload_fns.push(v.borrow().clone());
+                // (?callable, $throw, $prepend) — null registers
+                // nothing; non-null validates eagerly like zend.
+                let cb = v.borrow().clone();
+                if !matches!(cb, Value::Null) {
+                    if !it.is_callable_value(&cb) {
+                        if let Some(pe) = it.take_callable_probe_err() {
+                            return Err(pe);
+                        }
+                        return err(
+                            "TypeError",
+                            format!(
+                                "spl_autoload_register(): Argument #1 ($callback) must be a valid callback or null, {}",
+                                it.zpp_callback_detail(&cb)
+                            ),
+                        );
+                    }
+                    // ($callback, $throw, $prepend) — a truthy 3rd arg
+                    // prepends the loader (variance/loading_exception*).
+                    let prepend = args.get(2).map(|v| v.borrow().is_truthy()).unwrap_or(false);
+                    if prepend {
+                        it.autoload_fns.insert(0, cb);
+                    } else {
+                        it.autoload_fns.push(cb);
+                    }
                 }
             }
             Value::Bool(true)

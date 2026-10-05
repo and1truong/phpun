@@ -269,7 +269,11 @@ impl<'a> Interp<'a> {
             };
             if by_ref {
                 match expr {
-                    Expr::Var(_) | Expr::Index { .. } | Expr::Prop { .. } | Expr::VarVar(_) => {
+                    Expr::Var(_) | Expr::Index { .. } | Expr::Prop { .. } | Expr::VarVar(_)
+                        // zend's SEND_REF check rejects the $GLOBALS
+                        // table itself (its elements are fine).
+                        if !matches!(expr, Expr::Var(n) if n == "GLOBALS") =>
+                    {
                         match self.eval_cell(expr) {
                             Ok(c) => {
                                 if let Some(n) = name {
@@ -537,13 +541,20 @@ impl<'a> Interp<'a> {
         // (passByReference_012, array_shift(array_shift($a))).
         let builtin_params: Vec<Param> = if decl.is_none() {
             let sig = crate::builtins::builtin_sig(&lname).unwrap_or_default();
+            let bparams = crate::builtins::builtin_params(&lname);
             builtin_byref(&lname)
                 .map(|flags| {
                     flags
                         .iter()
                         .enumerate()
                         .map(|(i, by_ref)| Param {
-                            name: sig.get(i).map(|(n, _)| n.clone()).unwrap_or_default(),
+                            name: sig
+                                .get(i)
+                                .map(|(n, _)| n.clone())
+                                .or_else(|| {
+                                    bparams.and_then(|p| p.get(i).map(|(n, _)| n.to_string()))
+                                })
+                                .unwrap_or_default(),
                             default: None,
                             by_ref: *by_ref,
                             variadic: false,
@@ -733,10 +744,13 @@ impl<'a> Interp<'a> {
                 self.invoke_fn(&decl, args, None, None)
             }
             Value::Array(a) => {
-                // [$obj, 'method'] or ['Class', 'method']
-                let a = a.borrow();
-                let o0 = a.get(&ArrKey::Int(0));
-                let m = a.get(&ArrKey::Int(1));
+                // [$obj, 'method'] or ['Class', 'method'] — drop the
+                // borrow before dispatch: resolving `['Cls','m']`
+                // autoloads, and user loader code may write this array.
+                let (o0, m) = {
+                    let a = a.borrow();
+                    (a.get(&ArrKey::Int(0)), a.get(&ArrKey::Int(1)))
+                };
                 match (o0, m) {
                     (Some(t), Some(mv)) => {
                         let mname = mv.to_php_string();
@@ -1315,10 +1329,11 @@ impl<'a> Interp<'a> {
                 let name = crate::value::lossy(s);
                 let name = name.trim_start_matches('\\');
                 if let Some((cls, m)) = name.split_once("::") {
-                    if let Some(rcn) = self.resolve_class(cls) {
-                        if let Some(c) = self.classes.get(&rcn.to_lowercase()).cloned() {
-                            return self.fcc_static(c, m);
-                        }
+                    // The lookup autoloads — a throwing loader's
+                    // exception propagates (zend), it is not a
+                    // "not found" Error.
+                    if let Some(c) = self.str_callable_class(cls)? {
+                        return self.fcc_static(c, m);
                     }
                     return self.fail(PhpError::uncaught(
                         "Error",
@@ -1371,9 +1386,13 @@ impl<'a> Interp<'a> {
                 }
             }
             Value::Array(a) => {
-                let a = a.borrow();
-                let t = a.get(&ArrKey::Int(0));
-                let m = a.get(&ArrKey::Int(1));
+                // Drop the borrow before any dispatch below — a
+                // throwing autoloader under `['Cls','m']` runs user
+                // code that may write this same array.
+                let (t, m) = {
+                    let a = a.borrow();
+                    (a.get(&ArrKey::Int(0)), a.get(&ArrKey::Int(1)))
+                };
                 match (t, m) {
                     (Some(Value::Object(o)), Some(mv)) => {
                         let mn = mv.to_php_string();
@@ -1395,10 +1414,9 @@ impl<'a> Interp<'a> {
                     }
                     (Some(Value::Str(cn)), Some(mv)) => {
                         let mn = mv.to_php_string();
-                        match self
-                            .resolve_class(&crate::value::lossy(&cn))
-                            .and_then(|c| self.classes.get(&c.to_lowercase()).cloned())
-                        {
+                        // `['Cls','m']` invoke autoloads the class — a
+                        // throwing loader's exception propagates.
+                        match self.str_callable_class(&crate::value::lossy(&cn))? {
                             Some(c) => self.fcc_static(c, &mn),
                             None => self.fail(PhpError::uncaught(
                                 "Error",
@@ -3170,20 +3188,70 @@ impl<'a> Interp<'a> {
     }
 
     /// Validation-style callable check: a throwing autoloader's
-    /// exception is abandoned — the value simply is not callable
-    /// (zend turns it into a zpp TypeError upstream).
+    /// exception is abandoned — the value simply is not callable.
+    /// The error is stashed in `callable_probe_err` so a failing
+    /// `callable` param type can re-raise it (zend propagates the
+    /// autoload exception instead of emitting TypeError).
     pub fn is_callable_value(&mut self, v: &Value) -> bool {
         match self.try_is_callable_value(v) {
             Ok(b) => b,
-            Err(_) => {
+            Err(e) => {
+                // The throwable VALUE lives in pending_exception —
+                // stash it with the error so a `callable` param can
+                // re-raise the original exception, not a Null.
+                let v = self.pending_exception.take().unwrap_or(Value::Null);
                 self.pending_exception = None;
+                self.callable_probe_err = Some((v, e));
                 false
             }
         }
     }
 
+    /// Consume the stashed probe error of a failing
+    /// `is_callable_value`, restoring the throwable for re-raise.
+    /// Zend propagates a throwing autoloader's exception through
+    /// callable validation everywhere except the call_user_func
+    /// family, which wraps it in its own TypeError.
+    pub fn take_callable_probe_err(&mut self) -> Option<PhpError> {
+        let (v, e) = self.callable_probe_err.take()?;
+        if e.kind == ErrorKind::Throw {
+            self.pending_exception = Some(v);
+        }
+        Some(e)
+    }
+
+    /// The ` in <file> on line <n>` tail of a too-few-args error. Zend
+    /// drops it when the immediate caller is an internal function
+    /// (array_map's driver frame) — except the VM-inlined
+    /// call_user_func family, whose caller frame is the user's own.
+    fn arg_err_in(&self) -> String {
+        // last() is this callee's own (user) frame — the caller is the
+        // frame just below it.
+        let internal_driver = self
+            .call_trace
+            .iter()
+            .rev()
+            .nth(1)
+            .map(|f| {
+                f.internal
+                    && !matches!(
+                        f.function.as_str(),
+                        "call_user_func"
+                            | "call_user_func_array"
+                            | "forward_static_call"
+                            | "forward_static_call_array"
+                    )
+            })
+            .unwrap_or(false);
+        if internal_driver {
+            String::new()
+        } else {
+            format!(" in {} on line {}", self.diag_file(), self.cur_line)
+        }
+    }
+
     /// PHP's "given" type word in TypeError messages.
-    pub(in crate::interp) fn zval_type_name(&self, v: &Value) -> String {
+    pub fn zval_type_name(&self, v: &Value) -> String {
         match v {
             Value::Null => "null".into(),
             Value::Bool(b) => if *b { "true" } else { "false" }.into(),
@@ -3385,12 +3453,15 @@ impl<'a> Interp<'a> {
             return self.fail(PhpError::uncaught(
                 "ArgumentCountError",
                 format!(
-                    "Too few arguments to function {}(), {} passed in {} on line {} and {} {} expected",
+                    "Too few arguments to function {}(), {} passed{} and {} {} expected",
                     self.decl_fname(decl),
                     args.len(),
-                    self.diag_file(),
-                    self.cur_line,
-                    if required == decl.params.len() { "exactly" } else { "at least" },
+                    self.arg_err_in(),
+                    if required == decl.params.len() {
+                        "exactly"
+                    } else {
+                        "at least"
+                    },
                     required
                 ),
                 0,
@@ -3468,6 +3539,8 @@ impl<'a> Interp<'a> {
                 }
                 continue;
             }
+            // Probe errors belong to THIS param's type check only.
+            self.callable_probe_err = None;
             let v = a.borrow().clone();
             let implicit_null = !ty.iter().any(|m| m.eq_ignore_ascii_case("null"))
                 && match &p.default {
@@ -3505,6 +3578,15 @@ impl<'a> Interp<'a> {
                 }
             }
             if !ok {
+                // A `callable` member's resolution ran a swallowing
+                // probe — an autoloader that threw has its exception
+                // propagate (zend raises it, not the TypeError).
+                if ty.iter().any(|m| m.eq_ignore_ascii_case("callable")) {
+                    if let Some(e) = self.take_callable_probe_err() {
+                        self.stack.pop();
+                        return self.fail(e);
+                    }
+                }
                 let mut fname = self.decl_fname(decl);
                 // Anonymous-class methods report args under just the
                 // class name (union_types/anonymous_class).
@@ -3628,7 +3710,7 @@ impl<'a> Interp<'a> {
                     for v in &args.cells[i.min(args.cells.len())..] {
                         if p.by_ref {
                             arr.is_ref = true;
-                            self.ref_cells.insert(Rc::as_ptr(v) as usize);
+                            self.mark_ref(v);
                             arr.push_cell(v.clone());
                         } else {
                             arr.push(v.borrow().clone());
@@ -3637,7 +3719,7 @@ impl<'a> Interp<'a> {
                     for (n, c) in &variadic_named {
                         if p.by_ref {
                             arr.is_ref = true;
-                            self.ref_cells.insert(Rc::as_ptr(c) as usize);
+                            self.mark_ref(c);
                             arr.set_cell(ArrKey::Str(n.clone().into()), c.clone());
                         } else {
                             arr.set(ArrKey::Str(n.clone().into()), c.borrow().clone());
@@ -3658,7 +3740,7 @@ impl<'a> Interp<'a> {
                             // reference — zend keeps ref-ness through
                             // cufa arrays (bug50394).
                             !args.nonref_cells.contains(&i)
-                                || self.ref_cells.contains(&(Rc::as_ptr(c) as usize)),
+                                || (self.is_ref_cell(c) && Rc::strong_count(c) > 1),
                             args.trav_cells.contains(&i),
                         )
                     })
@@ -3692,7 +3774,7 @@ impl<'a> Interp<'a> {
                         // over the caller's cell — write-through errors
                         // say "reference held by property"
                         // (typed_properties_055/108).
-                        self.ref_cells.insert(Rc::as_ptr(v) as usize);
+                        self.mark_ref(v);
                         binds.push((p.name.clone(), v.clone()));
                     } else {
                         binds.push((p.name.clone(), cell(v.borrow().clone())));
@@ -4056,12 +4138,15 @@ impl<'a> Interp<'a> {
             return self.fail(PhpError::uncaught(
                 "ArgumentCountError",
                 format!(
-                    "Too few arguments to function {}(), {} passed in {} on line {} and {} {} expected",
+                    "Too few arguments to function {}(), {} passed{} and {} {} expected",
                     self.decl_fname(decl),
                     args.len(),
-                    self.diag_file(),
-                    self.cur_line,
-                    if required == decl.params.len() { "exactly" } else { "at least" },
+                    self.arg_err_in(),
+                    if required == decl.params.len() {
+                        "exactly"
+                    } else {
+                        "at least"
+                    },
                     required
                 ),
                 0,

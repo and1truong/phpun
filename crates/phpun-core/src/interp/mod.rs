@@ -290,6 +290,17 @@ pub struct Interp<'a> {
     globals_order: Vec<String>,
     /// Shared PhpArray backing $GLOBALS — same cells as globals.vars.
     globals_arr: Option<Rc<RefCell<PhpArray>>>,
+    /// Var names the $GLOBALS table currently manages — a name whose
+    /// array entry was tombstoned (unset($GLOBALS['x'])) unsets the
+    /// global var on next lookup.
+    globals_synced: std::collections::HashSet<String>,
+    /// Set while a dim-read runs in a by-ref context (`$x =& $o['k']`):
+    /// zend's read_dimension(BP_VAR_RW) silently creates missing
+    /// buckets instead of warning.
+    dim_by_ref: bool,
+    /// Autoload/lookup error swallowed by the last `is_callable_value`
+    /// probe — re-raised when a `callable` param type rejects the arg.
+    callable_probe_err: Option<(Value, PhpError)>,
     /// Function-scoped static storage: fn name → var → cell.
     pub(crate) statics: HashMap<String, HashMap<String, Cell>>,
     /// Global static vars (`static` at top level).
@@ -404,8 +415,14 @@ pub struct Interp<'a> {
     /// Cells reached through a `=&` bind / by-ref fetch — Zend
     /// IS_REFERENCE zvals. Write-through errors say "a reference held
     /// by property"; plain prop slots say "property"
-    /// (typed_properties_034 first vs second foo() call).
-    pub ref_cells: std::collections::HashSet<usize>,
+    /// (typed_properties_034 first vs second foo() call). Weak refs pin
+    /// each marked cell's allocation so a freed cell's recycled address
+    /// can never inherit the mark (ABA); marks left on cells that
+    /// outlive their last alias are inert — dup paths also require
+    /// `Rc::strong_count > 1` before re-binding.
+    pub ref_cells: std::collections::HashMap<usize, std::rc::Weak<RefCell<Value>>>,
+    /// Next `mark_ref` inserts past this size first sweep dead marks.
+    ref_cells_prune: usize,
     /// Zend's per-op magic-property guards, keyed
     /// (object-ptr, kind, prop-name): while `__get($o,$p)` runs, an
     /// access to `$o->$p` bypasses magic and hits real storage
@@ -735,6 +752,9 @@ impl<'a> Interp<'a> {
             pending_call_alias: None,
             globals_order: Vec::new(),
             globals_arr: None,
+            globals_synced: std::collections::HashSet::new(),
+            dim_by_ref: false,
+            callable_probe_err: None,
             stack: Vec::new(),
             functions: HashMap::new(),
             classes: HashMap::new(),
@@ -815,7 +835,8 @@ impl<'a> Interp<'a> {
             slot_owners: std::collections::HashMap::new(),
             slot_merged: std::collections::HashMap::new(),
             slot_anchor: std::collections::HashMap::new(),
-            ref_cells: std::collections::HashSet::new(),
+            ref_cells: std::collections::HashMap::new(),
+            ref_cells_prune: 1024,
             magic_guards: std::collections::HashSet::new(),
             readonly_cells: std::collections::HashMap::new(),
             last_fresh_cell: None,
@@ -1476,8 +1497,78 @@ impl<'a> Interp<'a> {
         Some(g)
     }
 
+    /// Mark `c` as an IS_REFERENCE cell (`=&`, by-ref binds). The
+    /// Weak pin keeps the cell's allocation alive so its address can
+    /// never be recycled under a stale mark.
+    pub(crate) fn mark_ref(&mut self, c: &Cell) {
+        self.ref_cells
+            .insert(Rc::as_ptr(c) as usize, Rc::downgrade(c));
+        if self.ref_cells.len() > self.ref_cells_prune {
+            self.ref_cells.retain(|_, w| w.strong_count() > 0);
+            self.ref_cells_prune = (self.ref_cells.len() * 2).max(1024);
+        }
+    }
+
+    /// Is `c` a live IS_REFERENCE cell? The Weak pins the allocation,
+    /// so an upgraded ptr_eq proves the mark belongs to this cell.
+    pub(crate) fn is_ref_cell(&self, c: &Cell) -> bool {
+        self.ref_cells
+            .get(&(Rc::as_ptr(c) as usize))
+            .and_then(|w| w.upgrade())
+            .map(|u| Rc::ptr_eq(&u, c))
+            .unwrap_or(false)
+    }
+
+    /// Ptr-level variant for sites that only kept `Rc::as_ptr`.
+    pub(crate) fn is_ref_ptr(&self, ptr: usize) -> bool {
+        self.ref_cells
+            .get(&ptr)
+            .and_then(|w| w.upgrade())
+            .map(|u| Rc::as_ptr(&u) as usize == ptr)
+            .unwrap_or(false)
+    }
+
+    /// Global-scope var cell: a name the $GLOBALS table manages but
+    /// globals.vars doesn't have yet materializes out of the table
+    /// (a `$GLOBALS['x']=v` write IS `$x=`), while a name whose array
+    /// entry died unsets the var on next lookup.
+    fn global_var_cell(&mut self, name: &str) -> Option<Cell> {
+        if self.globals_synced.contains(name) {
+            let live = self
+                .globals_arr
+                .as_ref()
+                .and_then(|a| a.borrow().get_cell(&ArrKey::Str(Rc::from(name))))
+                .is_some();
+            if !live {
+                self.globals_synced.remove(name);
+                if let Some(c) = self.globals.vars.remove(name) {
+                    let v = c.borrow().clone();
+                    drop(c);
+                    let _ = self.destruct_dying_value(&v);
+                }
+                return None;
+            }
+        }
+        if let Some(c) = self.globals.vars.get(name) {
+            return Some(c.clone());
+        }
+        let arr = self.globals_arr.clone()?;
+        let c = arr.borrow().get_cell(&ArrKey::Str(Rc::from(name)))?;
+        self.globals_synced.insert(name.to_string());
+        self.mark_ref(&c);
+        self.globals.vars.insert(name.to_string(), c.clone());
+        self.globals_order.push(name.to_string());
+        Some(c)
+    }
+
     /// Does the variable name resolve to an existing cell?
     fn var_lookup(&mut self, name: &str) -> Option<Cell> {
+        if self.stack.is_empty() {
+            if let Some(c) = self.global_var_cell(name) {
+                return Some(c);
+            }
+            return self.superglobal_cell(name);
+        }
         self.cur()
             .vars
             .get(name)
@@ -1486,6 +1577,31 @@ impl<'a> Interp<'a> {
     }
 
     fn var_get(&mut self, name: &str) -> Result<Value, PhpError> {
+        // `$g = $GLOBALS` snapshots (PHP 8.1): a cloned table whose
+        // cells are copies — writes through $g never reach the real
+        // globals.
+        if name == "GLOBALS" {
+            let snap = self.globals_array_val();
+            if let Value::Array(a) = &snap {
+                return Ok(Value::Array(Rc::new(RefCell::new(a.borrow().clone()))));
+            }
+            return Ok(snap);
+        }
+        // Global scope: the $GLOBALS table may know the var (a
+        // `$GLOBALS['x']=v` write IS `$x=`), or may have killed a name
+        // still sitting in vars (unset($GLOBALS['x'])).
+        if self.stack.is_empty() {
+            if let Some(c) = self.global_var_cell(name) {
+                return Ok(c.borrow().clone());
+            }
+            if let Some(c) = self.superglobal_cell(name) {
+                return Ok(c.borrow().clone());
+            }
+            if self.silence == 0 {
+                self.warn(&format!("Undefined variable ${}", name))?;
+            }
+            return Ok(Value::Null);
+        }
         match self.cur().vars.get(name) {
             Some(c) => Ok(c.borrow().clone()),
             None => match self.superglobal_cell(name) {
@@ -1494,7 +1610,7 @@ impl<'a> Interp<'a> {
                     // Inside any function frame, a missing $this is a
                     // hard "Using $this when not in object context"
                     // Error; top-level warns (closure_005).
-                    if name == "this" && !self.stack.is_empty() {
+                    if name == "this" {
                         return self.fail(PhpError::uncaught(
                             "Error",
                             "Using $this when not in object context",
@@ -1523,6 +1639,13 @@ impl<'a> Interp<'a> {
         if let Some(c) = self.superglobal_cell(name) {
             return c;
         }
+        // Global scope: a `$GLOBALS['x']=v` write materializes $x's
+        // cell (and a dead table entry suppresses a stale var).
+        if is_global {
+            if let Some(c) = self.global_var_cell(name) {
+                return c;
+            }
+        }
         let c = self
             .cur()
             .vars
@@ -1550,13 +1673,15 @@ impl<'a> Interp<'a> {
         }
         {
             let mut a = arr.borrow_mut();
-            // Entries alias globals.vars cells — writes must never
-            // CoW-split, so the bound cells ride the ref-mark set too.
+            // Entries alias globals.vars cells — the shared table must
+            // never CoW-split, so it's the deliberately-shared is_ref
+            // kind; the cells are ref-marked so dup paths re-bind.
             a.is_ref = true;
             for n in names {
-                if let Some(c) = self.globals.vars.get(&n) {
-                    self.ref_cells.insert(Rc::as_ptr(c) as usize);
-                    a.set_cell(ArrKey::Str(n.into()), c.clone());
+                if let Some(c) = self.globals.vars.get(&n).cloned() {
+                    self.mark_ref(&c);
+                    a.set_cell(ArrKey::Str(n.clone().into()), c);
+                    self.globals_synced.insert(n);
                 }
             }
         }
@@ -1573,7 +1698,9 @@ impl<'a> Interp<'a> {
         };
         for (n, c) in pairs {
             if !self.globals.vars.contains_key(&n) {
+                self.mark_ref(&c);
                 self.globals.vars.insert(n.clone(), c);
+                self.globals_synced.insert(n.clone());
                 self.globals_order.push(n);
             }
         }
@@ -1582,7 +1709,13 @@ impl<'a> Interp<'a> {
 
     /// Peek without creating.
     fn var_cell_opt(&mut self, name: &str) -> Option<Cell> {
-        match self.stack.last().unwrap_or(&self.globals).vars.get(name) {
+        if self.stack.is_empty() {
+            if let Some(c) = self.global_var_cell(name) {
+                return Some(c);
+            }
+            return self.superglobal_cell(name);
+        }
+        match self.stack.last().unwrap().vars.get(name) {
             Some(c) => Some(c.clone()),
             None => self.superglobal_cell(name),
         }
@@ -1858,6 +1991,8 @@ impl<'a> Interp<'a> {
                     if i >= args.cells.len() {
                         break;
                     }
+                    // Probe errors belong to THIS param's check only.
+                    self.callable_probe_err = None;
                     let v = args.cells[i].borrow().clone();
                     let has_cb = pty
                         .trim_start_matches('?')
@@ -1876,6 +2011,13 @@ impl<'a> Interp<'a> {
                                 .filter(|t| *t != "callable")
                                 .any(|t| self.param_type_match(t, &v));
                         if !ok {
+                            // A throwing autoloader propagates through
+                            // the probe (usort/array_map/... — zend
+                            // re-raises it rather than TypeError-ing).
+                            if let Some(pe) = self.take_callable_probe_err() {
+                                self.call_trace.pop();
+                                return self.fail(pe);
+                            }
                             let null = if pty.starts_with('?') { " or null" } else { "" };
                             let msg = format!(
                                 "{}(): Argument #{} (${}) must be a valid callback{}, {}",
@@ -2498,7 +2640,6 @@ class SplObjectStorage implements Countable, Iterator, ArrayAccess {
     private array $data = [];
     private int $pos = 0;
     private int $idx = 0;
-    private $info;
     private function hashOf($obj) {
         if (!is_object($obj)) {
             throw new TypeError('SplObjectStorage::offsetSet(): Argument #1 ($object) must be of type object');
@@ -2527,10 +2668,21 @@ class SplObjectStorage implements Countable, Iterator, ArrayAccess {
         $h = $this->hashOf($obj);
         unset($this->objs[$h], $this->data[$h]);
     }
-    public function getHash($obj) { return (string) $this->hashOf($obj); }
+    public function getHash($obj) { return spl_object_hash($obj); }
     public function count(): int { return count($this->objs); }
-    public function setInfo($data) { $this->info = $data; }
-    public function getInfo() { return $this->info; }
+    // zend's info slot hangs off the CURRENT iterator element.
+    public function setInfo($data) {
+        $objs = array_values($this->objs);
+        if ($this->idx < count($objs)) {
+            $this->data[$this->hashOf($objs[$this->idx])] = $data;
+        }
+    }
+    public function getInfo() {
+        $objs = array_values($this->objs);
+        return $this->idx < count($objs)
+            ? ($this->data[$this->hashOf($objs[$this->idx])] ?? null)
+            : null;
+    }
     // Iteration: key() is a 0-based index, current() the stored object.
     public function rewind(): void { $this->pos = 0; $this->idx = 0; }
     public function valid(): bool { return $this->idx < count($this->objs); }
@@ -2538,15 +2690,35 @@ class SplObjectStorage implements Countable, Iterator, ArrayAccess {
     public function key(): int { return $this->idx; }
     public function next(): void { $this->idx++; }
     public function addAll($storage) {
-        foreach ($storage as $obj) { $this->attach($obj, $storage->getInfo()); }
+        foreach ($storage as $obj) { $this->offsetSet($obj, $storage->getInfo()); }
     }
     public function removeAll($storage) {
-        foreach ($storage as $obj) { $this->detach($obj); }
+        foreach ($storage as $obj) { $this->offsetUnset($obj); }
     }
     public function removeAllExcept($storage) {
         foreach ($this->objs as $h => $obj) {
-            if (!$storage->contains($obj)) { unset($this->objs[$h], $this->data[$h]); }
+            if (!$storage->offsetExists($obj)) { unset($this->objs[$h], $this->data[$h]); }
         }
+    }
+    // zend serializes SplObjectStorage as [flat obj,info pairs, dynamic props].
+    public function __serialize(): array {
+        $st = [];
+        foreach ($this->objs as $h => $o) {
+            $st[] = $o;
+            $st[] = $this->data[$h];
+        }
+        $props = get_object_vars($this);
+        unset($props['objs'], $props['data'], $props['pos'], $props['idx']);
+        return [$st, $props];
+    }
+    public function __unserialize(array $pairs): void {
+        $this->objs = []; $this->data = [];
+        $this->pos = 0; $this->idx = 0;
+        $st = $pairs[0] ?? [];
+        for ($i = 0; $i + 1 < count($st); $i += 2) {
+            $this->offsetSet($st[$i], $st[$i + 1]);
+        }
+        foreach (($pairs[1] ?? []) as $k => $v) { $this->$k = $v; }
     }
 }
 class SplFixedArray implements ArrayAccess, Iterator, Countable {
