@@ -108,6 +108,14 @@ fn err<T>(cls: &'static str, msg: impl Into<String>) -> Result<T, PhpError> {
     Err(PhpError::uncaught(cls, msg, 0))
 }
 
+/// `Nesting level too deep` — the catchable Error zend's container
+/// compares raise on re-entry into a marked left operand of a cyclic
+/// structure. Builtin compare loops (in_array, sort, min, ...) check
+/// CMP_DEPTH_ERR and fail this.
+fn depth_err<T>() -> Result<T, PhpError> {
+    err("Error", "Nesting level too deep - recursive dependency?")
+}
+
 /// Dispatch by extension family: each `dispatch` returns `Ok(Some(v))`
 /// when `name` is one of its builtins, `Ok(None)` to fall through.
 type Dispatch = fn(&mut Interp, &str, &[Cell]) -> Result<Option<Value>, PhpError>;
@@ -616,7 +624,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
             ("pad_type", Int(1))
         ),
         "str_repeat" => bp!(("string", Req), ("times", Req)),
-        "substr" => bp!(("string", Req), ("start", Req), ("length", Null)),
+        "substr" => bp!(("string", Req), ("offset", Req), ("length", Null)),
         "strpos" | "stripos" | "strrpos" | "strripos" => {
             bp!(("haystack", Req), ("needle", Req), ("offset", Int(0)))
         }
@@ -715,6 +723,15 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         }
         "array_key_exists" | "key_exists" => bp!(("key", Req), ("array", Req)),
         "assert" => bp!(("assertion", Req), ("description", Null)),
+        // call_user_func's variadic is Z_PARAM_VARIADIC('+') — unknown
+        // named args forward to the callee (the mod.rs named arm
+        // handles them); the *_array stubs are fixed 2-param.
+        "call_user_func" | "forward_static_call" => {
+            bp!(("callback", Req), ("...", Var))
+        }
+        "call_user_func_array" | "forward_static_call_array" => {
+            bp!(("callback", Req), ("args", Req))
+        }
         "array_map" => bp!(("callback", Req), ("array", Req), ("...", Var)),
         "array_filter" => bp!(("array", Req), ("callback", Null), ("mode", Int(0))),
         "array_reduce" => bp!(("array", Req), ("callback", Req), ("initial", Null)),

@@ -32,27 +32,83 @@ pub(crate) fn dispatch(
         }
         "divmod" => Value::Null,
         "max" | "min" => {
-            let mut vals: Vec<Value> = Vec::new();
-            for a in args {
-                let v = a.borrow().clone();
-                if let Value::Array(arr) = &v {
-                    for (_, c) in arr.borrow().iter() {
-                        vals.push(c.borrow().clone());
+            // zend's compare direction depends on the call shape — the
+            // LEFT operand is the side the cyclic-compare check
+            // protects:
+            //   min($arr)     — zend_hash_minmax does compar(res, zv):
+            //                   LEFT = running best (earlier element).
+            //   min($a, ...)  — PHP_FUNCTION does zend_compare(args[i],
+            //                   best): LEFT = each later arg. Array
+            //                   args are NOT flattened here.
+            //   min($a, $b)   — a direct call compiles to the frameless
+            //                   fast path zend_compare(lhs, rhs): LEFT
+            //                   = arg 1 — handled in call_named.
+            if args.is_empty() {
+                return Err(PhpError::uncaught(
+                    "ArgumentCountError",
+                    format!("{}() expects at least 1 argument, 0 given", name),
+                    0,
+                ));
+            }
+            if args.len() == 1 {
+                let v = arg(args, 0);
+                let Value::Array(arr) = &v else {
+                    return Err(PhpError::uncaught(
+                        "TypeError",
+                        format!(
+                            "{}(): Argument #1 ($value) must be of type array, {} given",
+                            name,
+                            zval_word(&v)
+                        ),
+                        0,
+                    ));
+                };
+                let mut best: Option<Value> = None;
+                for (_, c) in arr.borrow().iter() {
+                    let v = c.borrow().clone();
+                    let Some(b) = &best else {
+                        best = Some(v);
+                        continue;
+                    };
+                    let ord = compare(b, &v);
+                    if crate::value::cmp_depth_err() {
+                        return depth_err();
                     }
-                } else {
-                    vals.push(v);
+                    if (name == "min" && ord == std::cmp::Ordering::Greater)
+                        || (name == "max" && ord == std::cmp::Ordering::Less)
+                    {
+                        best = Some(v);
+                    }
                 }
-            }
-            let mut best = vals.first().cloned().unwrap_or(Value::Null);
-            for v in &vals[1.min(vals.len())..] {
-                let ord = compare(v, &best);
-                if (name == "max" && ord == std::cmp::Ordering::Greater)
-                    || (name == "min" && ord == std::cmp::Ordering::Less)
-                {
-                    best = v.clone();
+                match best {
+                    Some(v) => v,
+                    None => {
+                        return Err(PhpError::uncaught(
+                            "ValueError",
+                            format!(
+                                "{}(): Argument #1 ($value) must contain at least one element",
+                                name
+                            ),
+                            0,
+                        ));
+                    }
                 }
+            } else {
+                let mut best = arg(args, 0);
+                for a in &args[1..] {
+                    let v = a.borrow().clone();
+                    let ord = compare(&v, &best);
+                    if crate::value::cmp_depth_err() {
+                        return depth_err();
+                    }
+                    if (name == "min" && ord == std::cmp::Ordering::Less)
+                        || (name == "max" && ord == std::cmp::Ordering::Greater)
+                    {
+                        best = v;
+                    }
+                }
+                best
             }
-            best
         }
         "round" => {
             let v = arg(args, 0).to_float();

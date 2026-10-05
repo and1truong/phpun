@@ -2812,7 +2812,12 @@ impl<'a> Interp<'a> {
         i: Option<&Expr>,
     ) -> Result<(), PhpError> {
         let key = match i {
-            Some(ie) => Some(self.eval(ie)?),
+            // eval errors surface as catchable throwables like zend's
+            // (an uncaught Error from the index expr is a `throw`).
+            Some(ie) => match self.eval(ie) {
+                Ok(v) => Some(v),
+                Err(e) => return self.fail::<()>(e),
+            },
             None => None,
         };
         // Peel e's own dims — `unset(root[d0][d1]...[k])` descends the
@@ -2850,6 +2855,17 @@ impl<'a> Interp<'a> {
             }
             _ => None,
         };
+        // Roots without storage cells evaluate once — zend runs the
+        // root expression a single time and unsets inside the result
+        // (`unset(ret()["a"])` calls ret() once). The value rides a
+        // scratch cell through the same dim-descent as real storage.
+        let root_cell = match root_cell {
+            Some(c) => c,
+            None => match self.eval(cur) {
+                Ok(v) => cell(v),
+                Err(e) => return self.fail::<()>(e),
+            },
+        };
         // Nested-dim unset on an spl array-object — `unset($o[k][j])`:
         // intermediate levels read live storage elements (zend's
         // indirect modification); a missing level reports the
@@ -2858,25 +2874,18 @@ impl<'a> Interp<'a> {
         // take this path — `unset($o[k])` must dispatch offsetUnset so
         // userland overrides still run.
         if !idxs.is_empty() {
-            let ao_obj = match &root_cell {
-                Some(c) => match &*c.borrow() {
-                    Value::Object(o) => Some(o.clone()),
-                    _ => None,
-                },
-                None => match self.eval(cur) {
-                    Ok(Value::Object(o)) => Some(o),
-                    _ => None,
-                },
-            };
-            let ao = match ao_obj {
-                Some(o)
+            let ao_obj = match &*root_cell.borrow() {
+                Value::Object(o)
                     if matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. })) =>
                 {
-                    let arr = self.ao_arr(&o);
-                    Some((o, arr))
+                    Some(o.clone())
                 }
                 _ => None,
             };
+            let ao = ao_obj.map(|o| {
+                let arr = self.ao_arr(&o);
+                (o, arr)
+            });
             if let Some((o, arr)) = ao {
                 let mut cur_arr = arr;
                 let mut ok = true;
@@ -2886,20 +2895,27 @@ impl<'a> Interp<'a> {
                         None => Value::Null,
                     };
                     let next = match cur_arr.borrow().get_cell(&to_key(&kv)) {
-                        Some(cc) => match &*cc.borrow() {
-                            Value::Array(na) => Some(na.clone()),
-                            Value::Object(oo) => {
-                                if matches!(
-                                    oo.borrow().internal,
-                                    Some(ObjectInternal::ArrayIter { .. })
-                                ) {
-                                    Some(self.ao_arr(oo))
-                                } else {
-                                    None
+                        Some(cc) => {
+                            let mut b = cc.borrow_mut();
+                            // The fetched array may alias other slots
+                            // (assigned by value elsewhere) — cow-split
+                            // like the cell descent below does.
+                            self.cow_split(&mut b);
+                            match &*b {
+                                Value::Array(na) => Some(na.clone()),
+                                Value::Object(oo) => {
+                                    if matches!(
+                                        oo.borrow().internal,
+                                        Some(ObjectInternal::ArrayIter { .. })
+                                    ) {
+                                        Some(self.ao_arr(oo))
+                                    } else {
+                                        None
+                                    }
                                 }
+                                _ => None,
                             }
-                            _ => None,
-                        },
+                        }
                         None => None,
                     };
                     match next {
@@ -2931,56 +2947,18 @@ impl<'a> Interp<'a> {
         // autovivify on unset); non-array containers throw zend's
         // catchable unset Errors ("Cannot unset offset in a non-array
         // variable" &c).
-        if let Some(rc0) = root_cell {
-            let mut c = rc0;
-            for ix in idxs {
-                let kv = match ix {
-                    Some(ie) => self.eval(ie)?,
-                    None => Value::Null,
-                };
-                match self.unset_dim_cell(&c, kv)? {
-                    Some(nc) => c = nc,
-                    None => return Ok(()),
-                }
-            }
-            return self.unset_in_cell(c, key);
-        }
-        // ArrayAccess object: `unset($o[k])` -> offsetUnset.
-        if let Ok(Value::Object(o)) = self.eval(e) {
-            if self.obj_is_a(&o, "ArrayAccess") {
-                let kv = key.unwrap_or(Value::Null);
-                return match self.method_invoke(
-                    o,
-                    "offsetUnset",
-                    CallArgs::positional(vec![cell(kv)]),
-                ) {
-                    Ok(_) => Ok(()),
-                    Err(err) => Err(err),
-                };
+        let mut c = root_cell;
+        for ix in idxs {
+            let kv = match ix {
+                Some(ie) => self.eval(ie)?,
+                None => Value::Null,
+            };
+            match self.unset_dim_cell(&c, kv)? {
+                Some(nc) => c = nc,
+                None => return Ok(()),
             }
         }
-        match e {
-            Expr::Index { e: inner, i: ii } => {
-                if let Ok(Value::Object(o)) = self.eval(inner) {
-                    if self.obj_is_a(&o, "ArrayAccess") {
-                        let kv = key.unwrap_or(Value::Null);
-                        match self.method_invoke(
-                            o,
-                            "offsetUnset",
-                            CallArgs::positional(vec![cell(kv)]),
-                        ) {
-                            Ok(_) => return Ok(()),
-                            Err(e) => return Err(e),
-                        }
-                    }
-                }
-                if let Ok(c) = self.index_cell(inner, ii.as_deref()) {
-                    return self.unset_in_cell(c, key);
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
+        self.unset_in_cell(c, key)
     }
 
     /// One intermediate dim down for `unset`: plain arrays yield the
@@ -3022,7 +3000,18 @@ impl<'a> Interp<'a> {
                         }
                     }
                 } else if self.obj_is_a(&o, "ArrayAccess") {
-                    Ok(Some(self.index_cell_object(c, Some(key))?))
+                    let cc = self.index_cell_object(c, Some(key))?;
+                    // Non-lvalue offsetGet: zend notices the indirect
+                    // modification is lost, then keeps descending into
+                    // the temporary (later dims may still throw).
+                    if !self.is_ref_cell(&cc) && self.silence == 0 {
+                        let cn = o.borrow().class.name().to_string();
+                        self.notice(&format!(
+                            "Indirect modification of overloaded element of {} has no effect",
+                            cn
+                        ))?;
+                    }
+                    Ok(Some(cc))
                 } else {
                     let cn = o.borrow().class.name().to_string();
                     self.fail(PhpError::uncaught(
@@ -3034,7 +3023,12 @@ impl<'a> Interp<'a> {
             }
             Value::Str(_) => self.fail(PhpError::uncaught(
                 "Error",
-                "Cannot unset string offsets",
+                "Cannot use string offset as an array",
+                self.cur_line,
+            )),
+            Value::Callable(_) => self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot use object of type Closure as array",
                 self.cur_line,
             )),
             _ => self.fail(PhpError::uncaught(
@@ -3088,6 +3082,11 @@ impl<'a> Interp<'a> {
             Value::Str(_) => self.fail(PhpError::uncaught(
                 "Error",
                 "Cannot unset string offsets",
+                self.cur_line,
+            )),
+            Value::Callable(_) => self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot use object of type Closure as array",
                 self.cur_line,
             )),
             _ => self.fail(PhpError::uncaught(
@@ -3910,8 +3909,11 @@ impl<'a> Interp<'a> {
             }),
             "<" => Value::Bool(compare(a, b) == Ordering::Less),
             "<=" => Value::Bool(compare(a, b) != Ordering::Greater),
-            ">" => Value::Bool(compare(a, b) == Ordering::Greater),
-            ">=" => Value::Bool(compare(a, b) != Ordering::Less),
+            // zend compiles `>`/`>=` as IS_SMALLER(_OR_EQUAL) with the
+            // operands swapped — the RHS is the compare's protected
+            // left operand for the cyclic depth check.
+            ">" => Value::Bool(compare(b, a) == Ordering::Less),
+            ">=" => Value::Bool(compare(b, a) != Ordering::Greater),
             _ => unreachable!(),
         };
         if crate::value::cmp_depth_err() {

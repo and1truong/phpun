@@ -57,6 +57,20 @@ impl<'a> Interp<'a> {
     pub fn to_bytes_of(&mut self, v: &Value) -> Vec<u8> {
         self.conv_bytes(v).unwrap_or_else(|_| v.to_php_bytes())
     }
+    /// Fallible byte cast — array_diff/intersect emulate Zend's
+    /// `zval_get_tmp_string`, which yields "" with the cast Error left
+    /// pending instead of aborting the builtin.
+    pub fn try_conv_bytes(&mut self, v: &Value) -> Result<Vec<u8>, PhpError> {
+        self.conv_bytes(v)
+    }
+    /// Take the throwable object a failed cast stashed (ErrorKind::Throw).
+    pub fn take_pending_exception(&mut self) -> Option<Value> {
+        self.pending_exception.take()
+    }
+    /// Re-raise a deferred throwable as a builtin's error result.
+    pub fn throw_value(&mut self, v: Value) -> PhpError {
+        self.throw(v)
+    }
     /// Variable lookup for compact() — reads current scope quietly.
     pub fn lookup_var(&mut self, name: &str) -> Option<Value> {
         self.var_cell_opt(name).map(|c| c.borrow().clone())

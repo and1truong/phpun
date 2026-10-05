@@ -28,11 +28,17 @@ pub(crate) fn dispatch(
                 for (k, c) in a.borrow().iter() {
                     if let Some(sv) = &search {
                         let ev = c.borrow();
+                        crate::value::clear_cmp_depth_err();
+                        // zend compares (search_value, entry) — the
+                        // search value is the protected LEFT operand.
                         let hit = if strict {
-                            crate::value::identical(&ev, sv)
+                            crate::value::identical(sv, &ev)
                         } else {
-                            crate::value::compare(&ev, sv) == std::cmp::Ordering::Equal
+                            crate::value::compare(sv, &ev) == std::cmp::Ordering::Equal
                         };
+                        if crate::value::cmp_depth_err() {
+                            return depth_err();
+                        }
                         if !hit {
                             continue;
                         }
@@ -68,14 +74,28 @@ pub(crate) fn dispatch(
             let needle = arg(args, 0);
             let strict = arg(args, 2).is_truthy();
             match arg(args, 1) {
-                Value::Array(a) => Value::Bool(a.borrow().iter().any(|(_, c)| {
-                    let v = c.borrow();
-                    if strict {
-                        crate::value::identical(&v, &needle)
-                    } else {
-                        compare(&v, &needle) == std::cmp::Ordering::Equal
+                Value::Array(a) => {
+                    let mut found = false;
+                    for (_, c) in a.borrow().iter() {
+                        let v = c.borrow();
+                        crate::value::clear_cmp_depth_err();
+                        // zend's _php_search_array compares
+                        // (needle, entry) — the needle is the
+                        // protected LEFT operand.
+                        found = if strict {
+                            crate::value::identical(&needle, &v)
+                        } else {
+                            compare(&needle, &v) == std::cmp::Ordering::Equal
+                        };
+                        if crate::value::cmp_depth_err() {
+                            return depth_err();
+                        }
+                        if found {
+                            break;
+                        }
                     }
-                })),
+                    Value::Bool(found)
+                }
                 _ => Value::Bool(false),
             }
         }
@@ -86,11 +106,16 @@ pub(crate) fn dispatch(
                 Value::Array(a) => {
                     for (k, c) in a.borrow().iter() {
                         let v = c.borrow().clone();
+                        crate::value::clear_cmp_depth_err();
+                        // zend compares (needle, entry) — needle LEFT.
                         let hit = if strict {
-                            crate::value::identical(&v, &needle)
+                            crate::value::identical(&needle, &v)
                         } else {
-                            compare(&v, &needle) == std::cmp::Ordering::Equal
+                            compare(&needle, &v) == std::cmp::Ordering::Equal
                         };
+                        if crate::value::cmp_depth_err() {
+                            return depth_err();
+                        }
                         if hit {
                             return Ok(Some(match k {
                                 ArrKey::Int(i) => Value::Int(*i),
@@ -507,45 +532,14 @@ pub(crate) fn dispatch(
             }
             _ => Value::Null,
         },
-        "array_diff" => {
-            let mut out = PhpArray::new();
-            if let Value::Array(a) = arg(args, 0) {
-                'outer: for (k, c) in a.borrow().iter() {
-                    let v = c.borrow().clone();
-                    for other in &args[1..] {
-                        if let Value::Array(o) = &*other.borrow() {
-                            for (_, oc) in o.borrow().iter() {
-                                if compare(&v, &oc.borrow()) == std::cmp::Ordering::Equal {
-                                    continue 'outer;
-                                }
-                            }
-                        }
-                    }
-                    out.set(k.clone(), v);
-                }
-            }
-            Value::Array(Rc::new(RefCell::new(out)))
-        }
-        "array_diff_assoc" => {
-            let mut out = PhpArray::new();
-            if let Value::Array(a) = arg(args, 0) {
-                'outer: for (k, c) in a.borrow().iter() {
-                    let v = c.borrow().clone();
-                    for other in &args[1..] {
-                        if let Value::Array(o) = &*other.borrow() {
-                            if let Some(oc) = o.borrow().get_cell(k) {
-                                if compare(&v, &oc.borrow()) == std::cmp::Ordering::Equal {
-                                    continue 'outer;
-                                }
-                            }
-                        }
-                    }
-                    out.set(k.clone(), v);
-                }
-            }
-            Value::Array(Rc::new(RefCell::new(out)))
+        "array_diff" => array_diff(it, args)?,
+        "array_diff_assoc" | "array_intersect_assoc" => {
+            array_assoc_match(it, name, args, name == "array_diff_assoc")?
         }
         "array_diff_key" => {
+            if let Some(e) = need_arrays(name, args) {
+                return Err(e);
+            }
             let mut out = PhpArray::new();
             if let Value::Array(a) = arg(args, 0) {
                 'outer: for (k, c) in a.borrow().iter() {
@@ -561,51 +555,11 @@ pub(crate) fn dispatch(
             }
             Value::Array(Rc::new(RefCell::new(out)))
         }
-        "array_intersect" => {
-            let mut out = PhpArray::new();
-            if let Value::Array(a) = arg(args, 0) {
-                'outer: for (k, c) in a.borrow().iter() {
-                    let v = c.borrow().clone();
-                    for other in &args[1..] {
-                        if let Value::Array(o) = &*other.borrow() {
-                            let mut found = false;
-                            for (_, oc) in o.borrow().iter() {
-                                if compare(&v, &oc.borrow()) == std::cmp::Ordering::Equal {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if !found {
-                                continue 'outer;
-                            }
-                        }
-                    }
-                    out.set(k.clone(), v);
-                }
-            }
-            Value::Array(Rc::new(RefCell::new(out)))
-        }
-        "array_intersect_assoc" => {
-            let mut out = PhpArray::new();
-            if let Value::Array(a) = arg(args, 0) {
-                'outer: for (k, c) in a.borrow().iter() {
-                    let v = c.borrow().clone();
-                    for other in &args[1..] {
-                        if let Value::Array(o) = &*other.borrow() {
-                            let hit = o.borrow().get_cell(k).is_some_and(|oc| {
-                                compare(&v, &oc.borrow()) == std::cmp::Ordering::Equal
-                            });
-                            if !hit {
-                                continue 'outer;
-                            }
-                        }
-                    }
-                    out.set(k.clone(), v);
-                }
-            }
-            Value::Array(Rc::new(RefCell::new(out)))
-        }
+        "array_intersect" => array_intersect(it, args)?,
         "array_intersect_key" => {
+            if let Some(e) = need_arrays(name, args) {
+                return Err(e);
+            }
             let mut out = PhpArray::new();
             if let Value::Array(a) = arg(args, 0) {
                 'outer: for (k, c) in a.borrow().iter() {
@@ -1202,6 +1156,63 @@ pub(crate) fn dispatch(
 
 // ----- helpers -----
 
+/// Stable bottom-up merge sort preserving zend's compare direction:
+/// zend_sort always calls `cmp(earlier, later)` (`cmp(j, i)` with
+/// j < i), so the protected LEFT operand of each compare is the
+/// earlier element — `sort([$cyclic, $finite])` raises the depth
+/// Error while `sort([$finite, $cyclic])` sorts silently. Rust's
+/// `sort_by` hands the comparator pairs in no guaranteed order, so
+/// the merges are done by hand. Returns true when a compare set
+/// CMP_DEPTH_ERR.
+fn zend_merge_sort(entries: &mut [(ArrKey, Cell)]) -> bool {
+    let n = entries.len();
+    if n < 2 {
+        return false;
+    }
+    let mut deep = false;
+    let mut scratch: Vec<(ArrKey, Cell)> = entries.to_vec();
+    // `work` is a clone so `scratch`/`entries` stay borrowable — the
+    // cell Rcs are cheap to clone.
+    let mut work: Vec<(ArrKey, Cell)> = entries.to_vec();
+    let mut width = 1;
+    while width < n {
+        let mut lo = 0;
+        while lo < n {
+            let mid = (lo + width).min(n);
+            let hi = (lo + 2 * width).min(n);
+            let (mut i, mut j, mut k) = (lo, mid, lo);
+            while i < mid && j < hi {
+                // (earlier, later) — left run i < right run j.
+                let ord = compare(&work[i].1.borrow(), &work[j].1.borrow());
+                deep |= crate::value::cmp_depth_err();
+                if ord == std::cmp::Ordering::Greater {
+                    scratch[k] = work[j].clone();
+                    j += 1;
+                } else {
+                    scratch[k] = work[i].clone();
+                    i += 1;
+                }
+                k += 1;
+            }
+            while i < mid {
+                scratch[k] = work[i].clone();
+                i += 1;
+                k += 1;
+            }
+            while j < hi {
+                scratch[k] = work[j].clone();
+                j += 1;
+                k += 1;
+            }
+            lo += 2 * width;
+        }
+        std::mem::swap(&mut work, &mut scratch);
+        width *= 2;
+    }
+    entries.clone_from_slice(&work);
+    deep
+}
+
 fn sort_array(
     it: &mut Interp,
     arr: &mut PhpArray,
@@ -1210,8 +1221,11 @@ fn sort_array(
 ) -> Result<(), PhpError> {
     match name {
         "sort" | "rsort" => {
-            arr.entries
-                .sort_by(|(_, a), (_, b)| compare(&a.borrow(), &b.borrow()));
+            // zend aborts mid-sort on a depth Error — accumulate the
+            // flag per compare and throw after.
+            if zend_merge_sort(&mut arr.entries) {
+                return depth_err();
+            }
             if name == "rsort" {
                 arr.entries.reverse();
             }
@@ -1231,8 +1245,9 @@ fn sort_array(
             });
         }
         "asort" | "arsort" => {
-            arr.entries
-                .sort_by(|(_, a), (_, b)| compare(&a.borrow(), &b.borrow()));
+            if zend_merge_sort(&mut arr.entries) {
+                return depth_err();
+            }
             if name == "arsort" {
                 arr.entries.reverse();
             }
@@ -1491,4 +1506,563 @@ fn natcmp(a: &[u8], b: &[u8], ci: bool) -> std::cmp::Ordering {
         ca = a[i];
         cb = b[j];
     }
+}
+
+/// `zend_argument_type_error` for the array family: arg #1 names
+/// `$array`, the variadic rest is nameless.
+fn need_array_arg(name: &str, n: usize, v: &Value) -> PhpError {
+    if n == 1 {
+        PhpError::uncaught(
+            "TypeError",
+            format!(
+                "{}(): Argument #1 ($array) must be of type array, {} given",
+                name,
+                zval_word(v)
+            ),
+            0,
+        )
+    } else {
+        PhpError::uncaught(
+            "TypeError",
+            format!(
+                "{}(): Argument #{} must be of type array, {} given",
+                name,
+                n,
+                zval_word(v)
+            ),
+            0,
+        )
+    }
+}
+
+/// `Z_PARAM_VARIADIC('+')` arity: at least one argument.
+fn need_args(name: &str, args: &[Cell]) -> Result<(), PhpError> {
+    if args.is_empty() {
+        return Err(PhpError::uncaught(
+            "ArgumentCountError",
+            format!("{}() expects at least 1 argument, 0 given", name),
+            0,
+        ));
+    }
+    Ok(())
+}
+
+/// Check every arg is an array, in order (zend validates args[i] lazily
+/// while each list is built — but for the simple key-only walks it is
+/// just the in-order TypeError).
+fn need_arrays(name: &str, args: &[Cell]) -> Option<PhpError> {
+    if let Err(e) = need_args(name, args) {
+        return Some(e);
+    }
+    for (i, a) in args.iter().enumerate() {
+        if !matches!(&*a.borrow(), Value::Array(_)) {
+            return Some(need_array_arg(name, i + 1, &a.borrow()));
+        }
+    }
+    None
+}
+
+/// A conversion error deferred the way `zval_get_tmp_string` defers it
+/// in zend: the cast Error stays pending in EG(exception), execution
+/// continues with "", and the FIRST exception propagates when the C
+/// function returns. Later failed casts see EG(exception) already set
+/// and stay silent.
+enum DeferredErr {
+    /// The throwable object a failed cast left pending.
+    Exc(Value),
+    /// A non-throwable conversion error.
+    Raw(PhpError),
+}
+
+type Deferred = Option<DeferredErr>;
+
+/// `zval_get_tmp_string` emulation for the diff/intersect family.
+fn ztmp_str(it: &mut Interp, v: &Value, pending: &mut Deferred) -> Vec<u8> {
+    match v {
+        Value::Str(s) => s.to_vec(),
+        _ => match it.try_conv_bytes(v) {
+            Ok(b) => b,
+            Err(e) => {
+                if e.kind == crate::error::ErrorKind::Throw {
+                    match it.take_pending_exception() {
+                        Some(x) => {
+                            if pending.is_none() {
+                                *pending = Some(DeferredErr::Exc(x));
+                            }
+                        }
+                        None => {
+                            if pending.is_none() {
+                                *pending = Some(DeferredErr::Raw(e));
+                            }
+                        }
+                    }
+                } else if pending.is_none() {
+                    *pending = Some(DeferredErr::Raw(e));
+                }
+                Vec::new()
+            }
+        },
+    }
+}
+
+/// `string_compare_function`: binary strcmp over tmp strings.
+fn zstr_cmp(it: &mut Interp, a: &Value, b: &Value, pending: &mut Deferred) -> std::cmp::Ordering {
+    let sa = ztmp_str(it, a, pending);
+    let sb = ztmp_str(it, b, pending);
+    sa.cmp(&sb)
+}
+
+/// Propagate a deferred conversion error as the builtin's result —
+/// re-arms `pending_exception` so `err_flow` hands the saved object to
+/// the unwinder (later casts may have overwritten it in the meantime).
+fn deferred_err(it: &mut Interp, pending: Deferred) -> Option<PhpError> {
+    match pending? {
+        DeferredErr::Exc(v) => Some(it.throw_value(v)),
+        DeferredErr::Raw(e) => Some(e),
+    }
+}
+
+/// A deferred error takes precedence over a later type error (zend
+/// can't throw the second exception while one is pending).
+fn deferred_or<T>(it: &mut Interp, pending: Deferred, e: PhpError) -> Result<T, PhpError> {
+    match deferred_err(it, pending) {
+        Some(p) => Err(p),
+        None => Err(e),
+    }
+}
+
+// --- zend_sort port (Zend/zend_sort.c): identical comparison ORDER so
+// conversion warnings/errors land exactly where oracle 8.5.11 puts them.
+
+fn zgt2<T>(a: &mut [T], x: usize, y: usize, gt: &mut impl FnMut(&T, &T) -> bool) {
+    if gt(&a[x], &a[y]) {
+        a.swap(x, y);
+    }
+}
+
+fn zend_sort_3<T>(a: &mut [T], x: usize, y: usize, z: usize, gt: &mut impl FnMut(&T, &T) -> bool) {
+    if !gt(&a[x], &a[y]) {
+        if !gt(&a[y], &a[z]) {
+            return;
+        }
+        a.swap(y, z);
+        if gt(&a[x], &a[y]) {
+            a.swap(x, y);
+        }
+        return;
+    }
+    if !gt(&a[z], &a[y]) {
+        a.swap(x, z);
+        return;
+    }
+    a.swap(x, y);
+    if gt(&a[y], &a[z]) {
+        a.swap(y, z);
+    }
+}
+
+fn zend_sort_4<T>(
+    a: &mut [T],
+    x: usize,
+    y: usize,
+    z: usize,
+    w: usize,
+    gt: &mut impl FnMut(&T, &T) -> bool,
+) {
+    zend_sort_3(a, x, y, z, gt);
+    if gt(&a[z], &a[w]) {
+        a.swap(z, w);
+        if gt(&a[y], &a[z]) {
+            a.swap(y, z);
+            if gt(&a[x], &a[y]) {
+                a.swap(x, y);
+            }
+        }
+    }
+}
+
+fn zend_sort_5<T>(
+    a: &mut [T],
+    x: usize,
+    y: usize,
+    z: usize,
+    w: usize,
+    v: usize,
+    gt: &mut impl FnMut(&T, &T) -> bool,
+) {
+    zend_sort_4(a, x, y, z, w, gt);
+    if gt(&a[w], &a[v]) {
+        a.swap(w, v);
+        if gt(&a[z], &a[w]) {
+            a.swap(z, w);
+            if gt(&a[y], &a[z]) {
+                a.swap(y, z);
+                if gt(&a[x], &a[y]) {
+                    a.swap(x, y);
+                }
+            }
+        }
+    }
+}
+
+fn zend_insert_sort<T>(a: &mut [T], start: usize, n: usize, gt: &mut impl FnMut(&T, &T) -> bool) {
+    match n {
+        0 | 1 => {}
+        2 => zgt2(a, start, start + 1, gt),
+        3 => zend_sort_3(a, start, start + 1, start + 2, gt),
+        4 => zend_sort_4(a, start, start + 1, start + 2, start + 3, gt),
+        5 => zend_sort_5(a, start, start + 1, start + 2, start + 3, start + 4, gt),
+        _ => {
+            let end = start + n;
+            let sentry = start + 6;
+            for i in (start + 1)..sentry {
+                let mut j = i - 1;
+                if !gt(&a[j], &a[i]) {
+                    continue;
+                }
+                while j != start {
+                    j -= 1;
+                    if !gt(&a[j], &a[i]) {
+                        j += 1;
+                        break;
+                    }
+                }
+                a[j..=i].rotate_right(1);
+            }
+            for i in sentry..end.min(a.len()) {
+                let mut j = i - 1;
+                if !gt(&a[j], &a[i]) {
+                    continue;
+                }
+                loop {
+                    j = j.saturating_sub(2);
+                    if !gt(&a[j], &a[i]) {
+                        j += 1;
+                        if !gt(&a[j], &a[i]) {
+                            j += 1;
+                        }
+                        break;
+                    }
+                    if j == start {
+                        break;
+                    }
+                    if j == start + 1 {
+                        j -= 1;
+                        if gt(&a[i], &a[j]) {
+                            j += 1;
+                        }
+                        break;
+                    }
+                }
+                a[j..=i].rotate_right(1);
+            }
+        }
+    }
+}
+
+fn zend_sort<T>(a: &mut [T], start: usize, nmemb: usize, gt: &mut impl FnMut(&T, &T) -> bool) {
+    let mut start = start;
+    let mut nmemb = nmemb;
+    loop {
+        if nmemb <= 16 {
+            zend_insert_sort(a, start, nmemb, gt);
+            return;
+        }
+        let end = start + nmemb;
+        let mut pivot = start + (nmemb >> 1);
+        if (nmemb >> 10) != 0 {
+            let delta = (nmemb >> 1) >> 1;
+            zend_sort_5(a, start, start + delta, pivot, pivot + delta, end - 1, gt);
+        } else {
+            zend_sort_3(a, start, pivot, end - 1, gt);
+        }
+        a.swap(start + 1, pivot);
+        pivot = start + 1;
+        let mut i = pivot + 1;
+        let mut j = end - 1;
+        'part: loop {
+            while gt(&a[pivot], &a[i]) {
+                i += 1;
+                if i == j {
+                    break 'part;
+                }
+            }
+            j -= 1;
+            if j == i {
+                break 'part;
+            }
+            while gt(&a[j], &a[pivot]) {
+                j -= 1;
+                if j == i {
+                    break 'part;
+                }
+            }
+            a.swap(i, j);
+            i += 1;
+            if i == j {
+                break 'part;
+            }
+        }
+        a.swap(pivot, i - 1);
+        if (i - 1) - start < end - i {
+            zend_sort(a, start, i - start - 1, gt);
+            start = i;
+            nmemb = end - i;
+        } else {
+            zend_sort(a, i, end - i, gt);
+            nmemb = i - start - 1;
+        }
+    }
+}
+
+/// 8.5's hash-based `array_diff` (php-src @614b22a+): elements compare
+/// by tmp string. arg#1 checks first; a 1-element arg0 casts itself
+/// once then scans each arg lazily until a hit; otherwise all
+/// args[1..] elements populate an exclude set first, then arg0 scans.
+fn array_diff(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
+    need_args("array_diff", args)?;
+    let a0 = arg(args, 0);
+    let Value::Array(arr) = &a0 else {
+        return Err(need_array_arg("array_diff", 1, &a0));
+    };
+    let elems: Vec<(ArrKey, Cell)> = arr
+        .borrow()
+        .iter()
+        .map(|(k, c)| (k.clone(), c.clone()))
+        .collect();
+    let mut pending: Deferred = None;
+    if elems.is_empty() {
+        for (i, o) in args[1..].iter().enumerate() {
+            if !matches!(&*o.borrow(), Value::Array(_)) {
+                return deferred_or(
+                    it,
+                    pending,
+                    need_array_arg("array_diff", i + 2, &o.borrow()),
+                );
+            }
+        }
+        return Ok(Value::Array(Rc::new(RefCell::new(PhpArray::new()))));
+    }
+    if elems.len() == 1 {
+        let search = ztmp_str(it, &elems[0].1.borrow(), &mut pending);
+        let mut found = false;
+        for (i, o) in args[1..].iter().enumerate() {
+            let ob = o.borrow();
+            let Value::Array(oa) = &*ob else {
+                return deferred_or(it, pending, need_array_arg("array_diff", i + 2, &ob));
+            };
+            if !found {
+                for (_, oc) in oa.borrow().iter() {
+                    let s = ztmp_str(it, &oc.borrow(), &mut pending);
+                    if s == search {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(e) = deferred_err(it, pending) {
+            return Err(e);
+        }
+        return Ok(if found {
+            Value::Array(Rc::new(RefCell::new(PhpArray::new())))
+        } else {
+            a0
+        });
+    }
+    let mut num = 0usize;
+    for (i, o) in args[1..].iter().enumerate() {
+        match &*o.borrow() {
+            Value::Array(oa) => num += oa.borrow().iter().count(),
+            v => {
+                return deferred_or(it, pending, need_array_arg("array_diff", i + 2, v));
+            }
+        }
+    }
+    if num == 0 {
+        return Ok(a0);
+    }
+    if num >= 0x4000_0000 {
+        return err(
+            "Error",
+            "The total number of elements must be lower than 1073741824",
+        );
+    }
+    let mut exclude: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for o in &args[1..] {
+        if let Value::Array(oa) = &*o.borrow() {
+            for (_, oc) in oa.borrow().iter() {
+                exclude.insert(ztmp_str(it, &oc.borrow(), &mut pending));
+            }
+        }
+    }
+    let mut out = PhpArray::new();
+    for (k, c) in &elems {
+        let s = ztmp_str(it, &c.borrow(), &mut pending);
+        if !exclude.contains(&s) {
+            out.set(k.clone(), c.borrow().clone());
+        }
+    }
+    if let Some(e) = deferred_err(it, pending) {
+        return Err(e);
+    }
+    Ok(Value::Array(Rc::new(RefCell::new(out))))
+}
+
+/// `php_array_intersect` INTERSECT_NORMAL: sort each arg's bucket list
+/// by tmp string, merge-walk, keep arg0 entries found in every other.
+fn array_intersect(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
+    need_args("array_intersect", args)?;
+    let mut pending: Deferred = None;
+    let mut lists: Vec<Vec<(ArrKey, Value)>> = Vec::with_capacity(args.len());
+    for (i, a) in args.iter().enumerate() {
+        let ab = a.borrow();
+        let Value::Array(arr) = &*ab else {
+            return deferred_or(it, pending, need_array_arg("array_intersect", i + 1, &ab));
+        };
+        let mut list: Vec<(ArrKey, Value)> = arr
+            .borrow()
+            .iter()
+            .map(|(k, c)| (k.clone(), c.borrow().clone()))
+            .collect();
+        if list.len() > 1 {
+            let n = list.len();
+            zend_sort(
+                &mut list,
+                0,
+                n,
+                &mut |x: &(ArrKey, Value), y: &(ArrKey, Value)| {
+                    zstr_cmp(it, &x.1, &y.1, &mut pending) == std::cmp::Ordering::Greater
+                },
+            );
+        }
+        lists.push(list);
+    }
+    let argc = lists.len();
+    let mut ptrs = vec![0usize; argc];
+    let mut deleted: Vec<ArrKey> = Vec::new();
+    let mut c;
+    'out: while ptrs[0] < lists[0].len() {
+        c = std::cmp::Ordering::Equal;
+        let mut i = 1;
+        while i < argc {
+            while ptrs[i] < lists[i].len() {
+                c = zstr_cmp(it, &lists[0][ptrs[0]].1, &lists[i][ptrs[i]].1, &mut pending);
+                if c != std::cmp::Ordering::Greater {
+                    break;
+                }
+                ptrs[i] += 1;
+            }
+            if ptrs[i] >= lists[i].len() {
+                // arg i exhausted → nothing left of arg0 can match it:
+                // delete the rest and stop.
+                while ptrs[0] < lists[0].len() {
+                    deleted.push(lists[0][ptrs[0]].0.clone());
+                    ptrs[0] += 1;
+                }
+                break 'out;
+            }
+            if c != std::cmp::Ordering::Equal {
+                break;
+            }
+            ptrs[i] += 1;
+            i += 1;
+        }
+        if c != std::cmp::Ordering::Equal {
+            // delete arg0 entries while they stay below ptrs[i]
+            loop {
+                deleted.push(lists[0][ptrs[0]].0.clone());
+                ptrs[0] += 1;
+                if ptrs[0] >= lists[0].len() {
+                    break 'out;
+                }
+                if zstr_cmp(it, &lists[0][ptrs[0]].1, &lists[i][ptrs[i]].1, &mut pending)
+                    != std::cmp::Ordering::Less
+                {
+                    break;
+                }
+            }
+        } else {
+            // kept — skip same-valued run (compare order matches zend)
+            loop {
+                ptrs[0] += 1;
+                if ptrs[0] >= lists[0].len() {
+                    break 'out;
+                }
+                if zstr_cmp(
+                    it,
+                    &lists[0][ptrs[0] - 1].1,
+                    &lists[0][ptrs[0]].1,
+                    &mut pending,
+                ) != std::cmp::Ordering::Equal
+                {
+                    break;
+                }
+            }
+        }
+    }
+    let mut out = PhpArray::new();
+    if let Value::Array(a) = arg(args, 0) {
+        for (k, cell_v) in a.borrow().iter() {
+            if !deleted.contains(k) {
+                out.set(k.clone(), cell_v.borrow().clone());
+            }
+        }
+    }
+    if let Some(e) = deferred_err(it, pending) {
+        return Err(e);
+    }
+    Ok(Value::Array(Rc::new(RefCell::new(out))))
+}
+
+/// `php_array_diff_key` / `php_array_intersect_key` with internal data
+/// compare (`zval_compare` = string cmp): diff keeps arg0 entries whose
+/// key is absent from every other array OR whose value differs;
+/// intersect keeps entries whose key is in every other array with an
+/// equal tmp string.
+fn array_assoc_match(
+    it: &mut Interp,
+    name: &str,
+    args: &[Cell],
+    diff: bool,
+) -> Result<Value, PhpError> {
+    if let Some(e) = need_arrays(name, args) {
+        return Err(e);
+    }
+    let Value::Array(arr) = arg(args, 0) else {
+        unreachable!()
+    };
+    let mut pending: Deferred = None;
+    let mut out = PhpArray::new();
+    'entry: for (k, c) in arr.borrow().iter() {
+        let v = c.borrow();
+        for o in args[1..].iter() {
+            let ob = o.borrow();
+            let oc = match &*ob {
+                Value::Array(oa) => oa.borrow().get_cell(k),
+                _ => unreachable!(),
+            };
+            match oc {
+                Some(oc) => {
+                    let equal =
+                        zstr_cmp(it, &v, &oc.borrow(), &mut pending) == std::cmp::Ordering::Equal;
+                    // diff drops on a same-key equal value; intersect
+                    // drops on a same-key unequal one.
+                    if equal == diff {
+                        continue 'entry;
+                    }
+                }
+                None => {
+                    if !diff {
+                        continue 'entry;
+                    }
+                }
+            }
+        }
+        out.set(k.clone(), v.clone());
+    }
+    if let Some(e) = deferred_err(it, pending) {
+        return Err(e);
+    }
+    Ok(Value::Array(Rc::new(RefCell::new(out))))
 }

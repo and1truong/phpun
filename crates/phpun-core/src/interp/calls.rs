@@ -581,6 +581,38 @@ impl<'a> Interp<'a> {
             decl.is_none(),
         )?;
         if !ns_resolved {
+            // zend's ZEND_FRAMELESS_FUNCTION for a compile-time-bound
+            // direct 2-arg min/max call does zend_compare(lhs, rhs) —
+            // arg 1 is the compare's protected LEFT operand. The
+            // generic builtin used by every indirect call instead
+            // compares each new arg against the running best.
+            // Compile-time-bound = an unqualified literal at global
+            // scope or a `\min` qualified literal (INIT_FCALL);
+            // unqualified calls inside a namespace stay dynamic.
+            if decl.is_none()
+                && matches!(lname.as_str(), "min" | "max")
+                && argvals.cells.len() == 2
+                && argvals.named.is_empty()
+                && (fname.starts_with('\\') || (unqualified && self.caller_ns().is_empty()))
+            {
+                let lhs = argvals.cells[0].borrow().clone();
+                let rhs = argvals.cells[1].borrow().clone();
+                crate::value::clear_cmp_depth_err();
+                let ord = crate::value::compare(&lhs, &rhs);
+                if crate::value::cmp_depth_err() {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        "Nesting level too deep - recursive dependency?",
+                        self.cur_line,
+                    ));
+                }
+                let pick_lhs = if lname == "min" {
+                    ord == std::cmp::Ordering::Less
+                } else {
+                    ord != std::cmp::Ordering::Less
+                };
+                return Ok(if pick_lhs { lhs } else { rhs });
+            }
             if let Some(v) = self.call_builtin(&lname, &argvals)? {
                 return Ok(v);
             }
