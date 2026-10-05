@@ -146,3 +146,25 @@ pub(in crate::interp) fn is_compile_const(e: &Expr) -> bool {
         _ => false,
     }
 }
+
+/// The znode op_type zend's pass_two assigns each operand shape:
+/// IS_CONST(1) < IS_TMP_VAR(2) < IS_VAR(4) < IS_CV(8). `Expr::Var` is the
+/// only CV-grade operand; calls/`new` produce VAR; compile-time
+/// constants rank IS_CONST; every other expression (fetches, unary/
+/// binary ops, assignments, `??`, ternaries) is IS_TMP_VAR. Used by the
+/// COMMUTATIVE canonicalization of the equality ops (see compare_op).
+pub(in crate::interp) fn compare_operand_rank(e: &Expr) -> u8 {
+    match e {
+        Expr::Var(_) => 8,
+        // zend strips parens during compilation — `($x)` is the CV.
+        Expr::Paren(e) => compare_operand_rank(e),
+        Expr::Call { .. }
+        | Expr::MethodCall { .. }
+        | Expr::StaticCall { .. }
+        | Expr::StaticCallDyn { .. }
+        | Expr::New { .. }
+        | Expr::AnonClass(_) => 4,
+        _ if is_compile_const(e) => 1,
+        _ => 2,
+    }
+}

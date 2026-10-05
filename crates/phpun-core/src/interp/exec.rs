@@ -218,9 +218,25 @@ impl<'a> Interp<'a> {
                             if start.is_none() {
                                 match self.eval(ce) {
                                     Ok(v) => {
+                                        // ZEND_CASE (TMP|VAR subjects) is
+                                        // noncommutative — subject stays
+                                        // left; CONST|CV subjects emit
+                                        // IS_EQUAL which pass_two
+                                        // commutative-swaps when the case
+                                        // operand ranks higher.
+                                        let r = compare_operand_rank(cond);
+                                        let (x, y) = if (r & 6) == 0 && r < compare_operand_rank(ce)
+                                        {
+                                            (&v, &cv)
+                                        } else {
+                                            (&cv, &v)
+                                        };
                                         crate::value::clear_cmp_depth_err();
-                                        if compare(&cv, &v) == Ordering::Equal {
+                                        if compare(x, y) == Ordering::Equal {
                                             start = Some(i);
+                                        }
+                                        if let Err(e) = self.emit_cmp_notices() {
+                                            return self.err_flow(e);
                                         }
                                         if crate::value::cmp_depth_err() {
                                             if let Err(e) = self.fail::<()>(PhpError::uncaught(

@@ -64,6 +64,9 @@ pub(crate) fn dispatch(
                     ));
                 };
                 let mut best: Option<Value> = None;
+                // A stale CMP_DEPTH_ERR from an earlier caught Error
+                // must not bleed into this builtin's flag reads.
+                crate::value::clear_cmp_depth_err();
                 for (_, c) in arr.borrow().iter() {
                     let v = c.borrow().clone();
                     let Some(b) = &best else {
@@ -95,6 +98,7 @@ pub(crate) fn dispatch(
                 }
             } else {
                 let mut best = arg(args, 0);
+                crate::value::clear_cmp_depth_err();
                 for a in &args[1..] {
                     let v = a.borrow().clone();
                     let ord = compare(&v, &best);

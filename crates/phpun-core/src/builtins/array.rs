@@ -1164,11 +1164,14 @@ pub(crate) fn dispatch(
 /// `sort_by` hands the comparator pairs in no guaranteed order, so
 /// the merges are done by hand. Returns true when a compare set
 /// CMP_DEPTH_ERR.
-fn zend_merge_sort(entries: &mut [(ArrKey, Cell)]) -> bool {
+fn zend_merge_sort(entries: &mut [(ArrKey, Cell)], desc: bool) -> bool {
     let n = entries.len();
     if n < 2 {
         return false;
     }
+    // A stale CMP_DEPTH_ERR from an earlier caught Error must not
+    // bleed into this sort's flag reads.
+    crate::value::clear_cmp_depth_err();
     let mut deep = false;
     let mut scratch: Vec<(ArrKey, Cell)> = entries.to_vec();
     // `work` is a clone so `scratch`/`entries` stay borrowable — the
@@ -1183,9 +1186,19 @@ fn zend_merge_sort(entries: &mut [(ArrKey, Cell)]) -> bool {
             let (mut i, mut j, mut k) = (lo, mid, lo);
             while i < mid && j < hi {
                 // (earlier, later) — left run i < right run j.
+                // zend's reversed variants negate the compare result
+                // rather than the operands, so cyclic-left stays the
+                // earlier element for rsort/arsort too; ties still fall
+                // back to original position (RETURN_STABLE_SORT), which
+                // prefers the left-run element in this merge.
                 let ord = compare(&work[i].1.borrow(), &work[j].1.borrow());
                 deep |= crate::value::cmp_depth_err();
-                if ord == std::cmp::Ordering::Greater {
+                let take_j = if desc {
+                    ord == std::cmp::Ordering::Less
+                } else {
+                    ord == std::cmp::Ordering::Greater
+                };
+                if take_j {
                     scratch[k] = work[j].clone();
                     j += 1;
                 } else {
@@ -1223,11 +1236,8 @@ fn sort_array(
         "sort" | "rsort" => {
             // zend aborts mid-sort on a depth Error — accumulate the
             // flag per compare and throw after.
-            if zend_merge_sort(&mut arr.entries) {
+            if zend_merge_sort(&mut arr.entries, name == "rsort") {
                 return depth_err();
-            }
-            if name == "rsort" {
-                arr.entries.reverse();
             }
             // renumber
             let mut i = 0;
@@ -1245,11 +1255,8 @@ fn sort_array(
             });
         }
         "asort" | "arsort" => {
-            if zend_merge_sort(&mut arr.entries) {
+            if zend_merge_sort(&mut arr.entries, name == "arsort") {
                 return depth_err();
-            }
-            if name == "arsort" {
-                arr.entries.reverse();
             }
         }
         "ksort" | "krsort" => {

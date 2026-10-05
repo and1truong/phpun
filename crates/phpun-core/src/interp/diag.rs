@@ -146,6 +146,15 @@ impl<'a> Interp<'a> {
         self.emit_diag("Notice", 8, msg)
     }
 
+    /// Flush notices queued by a just-run comparison (object→number
+    /// casts) through the normal E_NOTICE path, in order.
+    pub(in crate::interp) fn emit_cmp_notices(&mut self) -> Result<(), PhpError> {
+        for m in crate::value::take_cmp_notices() {
+            self.notice(&m)?;
+        }
+        Ok(())
+    }
+
     pub(in crate::interp) fn deprecated(&mut self, msg: &str) -> Result<(), PhpError> {
         if self.silence > 0 || self.error_level & 8192 == 0 {
             return Ok(());
