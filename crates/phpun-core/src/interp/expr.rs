@@ -2488,7 +2488,7 @@ impl<'a> Interp<'a> {
 
     /// The separated copy for CoW / array-copy contexts (`=`, exchange
     /// values): ref-marked cells are re-bound, the rest duplicated.
-    pub(in crate::interp) fn dup_array(&self, a: &PhpArray) -> PhpArray {
+    pub fn dup_array(&self, a: &PhpArray) -> PhpArray {
         let mut copy = PhpArray {
             entries: Vec::with_capacity(a.entries.len()),
             next: a.next,

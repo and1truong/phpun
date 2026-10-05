@@ -74,11 +74,9 @@ pub(crate) fn dispatch(
                     if name_l == "iterator_count" {
                         return Ok(Some(Value::Int(a.borrow().len() as i64)));
                     }
-                    let mut out = PhpArray::new();
-                    for (k, c) in a.borrow().iter() {
-                        out.set(k.clone(), c.borrow().clone());
-                    }
-                    Value::Array(Rc::new(RefCell::new(out)))
+                    // Separated copy — zend_array_dup keeps shared
+                    // IS_REFERENCE bindings, plain elements duplicate.
+                    Value::Array(Rc::new(RefCell::new(it.dup_array(&a.borrow()))))
                 }
                 Value::Object(o) => {
                     // Materialize via the Iterator protocol (Generator,
@@ -91,12 +89,11 @@ pub(crate) fn dispatch(
                     // $preserve_keys (default true): duplicate int keys
                     // overwrite; false → append.
                     let preserve = args.get(1).map(|c| c.borrow().is_truthy()).unwrap_or(true);
-                    for (k, v) in items {
-                        let v = v.borrow().clone();
+                    for (k, c) in items {
                         if preserve {
-                            out.set(crate::value::to_key(&k), v);
+                            out.bind_cell(crate::value::to_key(&k), c);
                         } else {
-                            out.push(v);
+                            out.push_cell(c);
                         }
                     }
                     Value::Array(Rc::new(RefCell::new(out)))
