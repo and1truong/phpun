@@ -46,6 +46,9 @@ pub(crate) fn dispatch(
             let mut best = vals.first().cloned().unwrap_or(Value::Null);
             for v in &vals[1.min(vals.len())..] {
                 let ord = compare(v, &best);
+                if crate::value::cmp_depth_err() {
+                    return depth_err();
+                }
                 if (name == "max" && ord == std::cmp::Ordering::Greater)
                     || (name == "min" && ord == std::cmp::Ordering::Less)
                 {

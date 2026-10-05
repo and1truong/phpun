@@ -108,6 +108,13 @@ fn err<T>(cls: &'static str, msg: impl Into<String>) -> Result<T, PhpError> {
     Err(PhpError::uncaught(cls, msg, 0))
 }
 
+/// `Nesting level too deep` — the catchable Error zend's container
+/// compares raise on a doubly-marked cyclic re-entry. Builtin compare
+/// loops (in_array, sort, min, ...) check CMP_DEPTH_ERR and fail this.
+fn depth_err<T>() -> Result<T, PhpError> {
+    err("Error", "Nesting level too deep - recursive dependency?")
+}
+
 /// Dispatch by extension family: each `dispatch` returns `Ok(Some(v))`
 /// when `name` is one of its builtins, `Ok(None)` to fall through.
 type Dispatch = fn(&mut Interp, &str, &[Cell]) -> Result<Option<Value>, PhpError>;
