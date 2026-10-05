@@ -79,6 +79,42 @@ impl<'a> Interp<'a> {
             None => false,
         }
     }
+    /// `is_subclass_of`: subject may be a class OR interface name —
+    /// the target is a parent class or any transitively implemented /
+    /// extended interface. Self-match is false, and the subject name
+    /// autoloads (zend behavior).
+    pub fn is_subclass_name(&mut self, sub: &str, target: &str) -> Result<bool, PhpError> {
+        let sub_l = sub.trim_start_matches('\\').to_lowercase();
+        let tgt_l = target.trim_start_matches('\\').to_lowercase();
+        if sub_l == tgt_l {
+            return Ok(false);
+        }
+        // Only an UNREGISTERED name autoloads (zend lookup_class) —
+        // builtin classes/interfaces resolve without a loader call,
+        // and the loader receives the name as written, not lowered.
+        if !self.classes.contains_key(&sub_l) && !self.interfaces.contains_key(&sub_l) {
+            self.run_autoload(sub.trim_start_matches('\\'))?;
+        }
+        if let Some(c) = self.classes.get(&sub_l).cloned() {
+            return Ok(self.is_a(&c, &tgt_l));
+        }
+        // Interface subject: its parent interfaces live in
+        // `implements` (zend stores them as interface parents).
+        if let Some(iface) = self.interfaces.get(&sub_l).cloned() {
+            let mut stack = vec![iface];
+            while let Some(f) = stack.pop() {
+                for p in &f.implements {
+                    if p.trim_start_matches('\\').eq_ignore_ascii_case(&tgt_l) {
+                        return Ok(true);
+                    }
+                    if let Some(ff) = self.interfaces.get(&p.to_lowercase()) {
+                        stack.push(ff.clone());
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
     // public helpers for builtins
     pub fn ob_push(&mut self, handler: Option<Value>) {
         self.ob_stack.push(ObLevel {
@@ -202,6 +238,11 @@ impl<'a> Interp<'a> {
         self.classes
             .get(&name.trim_start_matches('\\').to_lowercase())
             .cloned()
+    }
+    /// Drop any pending thrown exception (native-failure soft-error
+    /// paths that warn + return false instead of propagating).
+    pub fn clear_pending_exception(&mut self) {
+        self.pending_exception = None;
     }
     /// get_called_class(): late-static-binding class of the current
     /// frame, `false` outside a called-class context (static_get_called_class).

@@ -16,8 +16,10 @@ pub(crate) fn dispatch(
         "class_exists" | "interface_exists" | "trait_exists" | "enum_exists" => {
             let n = arg_str(it, args, 0);
             // $autoload defaults to true; an explicit false skips it.
+            // A throwing autoloader's exception propagates (zend does
+            // not swallow it into a `false` result).
             if args.len() <= 1 || arg(args, 1).is_truthy() {
-                let _ = it.run_autoload(&n);
+                it.run_autoload(&n)?;
             }
             let key = n.trim_start_matches('\\').to_lowercase();
             match name {
@@ -251,33 +253,28 @@ pub(crate) fn dispatch(
             }
             _ => Value::Bool(false),
         },
-        "is_subclass_of" => match arg(args, 0) {
-            Value::Object(o) => {
-                let n = arg_str(it, args, 1);
-                let cls = o.borrow().class.clone();
-                Value::Bool(
-                    cls.decl
-                        .parent
-                        .as_ref()
-                        .map(|p| it.obj_is_a_str(p, &n))
-                        .unwrap_or(false),
-                )
-            }
-            Value::Str(cn) => {
-                let n = arg_str(it, args, 1);
-                match it.lookup_class(&crate::value::lossy(&cn)) {
-                    Some(c) => Value::Bool(
-                        c.decl
-                            .parent
-                            .as_ref()
-                            .map(|p| it.obj_is_a_str(p, &n))
-                            .unwrap_or(false),
-                    ),
-                    None => Value::Bool(false),
+        "is_subclass_of" => {
+            let n = arg_str(it, args, 1);
+            match arg(args, 0) {
+                Value::Object(o) => {
+                    let cls = o.borrow().class.clone();
+                    // Strict subclass: parents+interfaces transitively,
+                    // self excluded.
+                    Value::Bool(it.is_subclass_name(cls.name(), &n)?)
                 }
+                Value::Str(cn) => {
+                    // allow_string arg (default true): a string
+                    // subject resolves by name.
+                    let allow = args.get(2).map(|c| c.borrow().is_truthy()).unwrap_or(true);
+                    if !allow {
+                        Value::Bool(false)
+                    } else {
+                        Value::Bool(it.is_subclass_name(&crate::value::lossy(&cn), &n)?)
+                    }
+                }
+                _ => Value::Bool(false),
             }
-            _ => Value::Bool(false),
-        },
+        }
         "class_implements" | "class_uses" | "class_parents" => {
             let c0 = arg(args, 0);
             let cn = match &c0 {
