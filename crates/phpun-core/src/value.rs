@@ -783,6 +783,11 @@ thread_local! {
     /// "Nesting level too deep - recursive dependency?" rather than
     /// comparing equal. Read+cleared by the interpreter eval site.
     static CMP_DEPTH_ERR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// E_NOTICEs raised inside a comparison (object→number casts);
+    /// the interp layer drains and emits them at the call site so
+    /// they flow through the user error-handler machinery.
+    static CMP_NOTICES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Clear the cyclic-compare flag before a fresh top-level comparison.
@@ -795,6 +800,13 @@ pub fn clear_cmp_depth_err() {
 /// `Error: Nesting level too deep - recursive dependency?`.
 pub fn cmp_depth_err() -> bool {
     CMP_DEPTH_ERR.with(|f| f.get())
+}
+
+/// Take the notices a comparison just queued (object→number casts).
+/// Called right after `compare`/`identical` at interp + builtin
+/// boundaries; the messages go out as E_NOTICE in order.
+pub fn take_cmp_notices() -> Vec<String> {
+    CMP_NOTICES.with(|v| std::mem::take(&mut *v.borrow_mut()))
 }
 
 /// PHP loose comparison (`<=>` semantics) implementing the PHP 8 rules.
@@ -907,8 +919,6 @@ fn compare_r(a: &Value, b: &Value) -> Ordering {
             }
             Ordering::Equal
         }
-        (Array(_), _) => Ordering::Greater,
-        (_, Array(_)) => Ordering::Less,
         (Object(x), Object(y)) => {
             // Loose object ==: same class and loosely-equal props.
             // Like the array walk, the first differing prop's ordering
@@ -922,10 +932,19 @@ fn compare_r(a: &Value, b: &Value) -> Ordering {
             if x.props.len() != y.props.len() {
                 return x.props.len().cmp(&y.props.len());
             }
-            for (k, c) in x.props.iter() {
+            // zend walks the properties hash in insertion order —
+            // prop_order mirrors it; any leftover slots not tracked
+            // there trail behind.
+            let mut keys: Vec<&String> = x
+                .prop_order
+                .iter()
+                .filter(|k| x.props.contains_key(*k))
+                .collect();
+            keys.extend(x.props.keys().filter(|k| !x.prop_order.contains(k)));
+            for k in keys {
                 match y.props.get(k) {
                     Some(yc) => {
-                        let ord = compare(&c.borrow(), &yc.borrow());
+                        let ord = compare(&x.props[k].borrow(), &yc.borrow());
                         if ord != Ordering::Equal {
                             return ord;
                         }
@@ -980,8 +999,41 @@ fn compare_r(a: &Value, b: &Value) -> Ordering {
                 Ordering::Less
             }
         }
-        (Object(_), _) | (Callable(_), _) => Ordering::Greater,
-        (_, Object(_)) | (_, Callable(_)) => Ordering::Less,
+        // Mixed object kinds (Closure object vs stdClass): zend's
+        // zend_std_compare_objects returns 1 on class mismatch for
+        // BOTH directions — asymmetric.
+        (Object(_) | Callable(_), Object(_) | Callable(_)) => Ordering::Greater,
+        // Object vs number: zend casts the object to the operand's
+        // number type (an E_NOTICE "could not be converted") and it
+        // counts as 1 — `new stdClass == 1` is true.
+        (Object(_) | Callable(_), Int(_) | Float(_))
+        | (Int(_) | Float(_), Object(_) | Callable(_)) => {
+            let cls = match (a, b) {
+                (Object(o), _) | (_, Object(o)) => o.borrow().class.name().to_string(),
+                _ => "Closure".to_string(),
+            };
+            let ty = if matches!(a, Float(_)) || matches!(b, Float(_)) {
+                "float"
+            } else {
+                "int"
+            };
+            CMP_NOTICES.with(|v| {
+                v.borrow_mut().push(format!(
+                    "Object of class {} could not be converted to {}",
+                    cls, ty
+                ))
+            });
+            if matches!(a, Object(_) | Callable(_)) {
+                num_cmp(1.0, b.to_float())
+            } else {
+                num_cmp(a.to_float(), 1.0)
+            }
+        }
+        // Objects beat everything else — including arrays.
+        (Object(_) | Callable(_), _) => Ordering::Greater,
+        (_, Object(_) | Callable(_)) => Ordering::Less,
+        (Array(_), _) => Ordering::Greater,
+        (_, Array(_)) => Ordering::Less,
         (Resource(x), Resource(y)) => x.borrow().id().cmp(&y.borrow().id()),
         (Resource(_), _) => Ordering::Greater,
         (_, Resource(_)) => Ordering::Less,

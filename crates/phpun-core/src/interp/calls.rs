@@ -589,16 +589,20 @@ impl<'a> Interp<'a> {
             // Compile-time-bound = an unqualified literal at global
             // scope or a `\min` qualified literal (INIT_FCALL);
             // unqualified calls inside a namespace stay dynamic.
+            // `...` unpack compiles to SEND_UNPACK — a generic builtin
+            // call, never the frameless path.
             if decl.is_none()
                 && matches!(lname.as_str(), "min" | "max")
                 && argvals.cells.len() == 2
                 && argvals.named.is_empty()
+                && !args.iter().any(|a| matches!(a, Expr::Unpack(_)))
                 && (fname.starts_with('\\') || (unqualified && self.caller_ns().is_empty()))
             {
                 let lhs = argvals.cells[0].borrow().clone();
                 let rhs = argvals.cells[1].borrow().clone();
                 crate::value::clear_cmp_depth_err();
                 let ord = crate::value::compare(&lhs, &rhs);
+                self.emit_cmp_notices()?;
                 if crate::value::cmp_depth_err() {
                     return self.fail(PhpError::uncaught(
                         "Error",

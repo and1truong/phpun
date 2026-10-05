@@ -275,7 +275,18 @@ impl<'a> Interp<'a> {
                     for c in &arm.conds {
                         let cv = self.eval(c)?;
                         crate::value::clear_cmp_depth_err();
-                        let hit = identical(&sv, &cv);
+                        // ZEND_CASE_STRICT (TMP|VAR subjects) is
+                        // noncommutative — subject stays left; CONST|CV
+                        // subjects emit IS_IDENTICAL which pass_two
+                        // commutative-swaps when the arm ranks higher.
+                        let r = compare_operand_rank(subject);
+                        let (x, y) = if (r & 6) == 0 && r < compare_operand_rank(c) {
+                            (&cv, &sv)
+                        } else {
+                            (&sv, &cv)
+                        };
+                        let hit = identical(x, y);
+                        self.emit_cmp_notices()?;
                         if crate::value::cmp_depth_err() {
                             return self.fail(PhpError::uncaught(
                                 "Error",
@@ -358,10 +369,13 @@ impl<'a> Interp<'a> {
                 self.decl_type_checks(&fname, &decl, None)?;
                 let mut captures = Vec::new();
                 if c.arrow {
-                    // `fn` captures whole scope by value.
+                    // `fn` captures whole scope by value — the zval
+                    // share keeps the same array until a write, when
+                    // cow_split separates it (cyclic self-refs stay
+                    // intact; writes can't leak out).
                     let f = self.stack.last().unwrap_or(&self.globals);
                     for (n, cellv) in f.vars.iter() {
-                        captures.push((n.clone(), cell(capture_copy(&cellv.borrow())), false));
+                        captures.push((n.clone(), cell(cellv.borrow().clone()), false));
                     }
                 } else {
                     for (n, by_ref) in &c.uses {
@@ -369,7 +383,7 @@ impl<'a> Interp<'a> {
                             self.var_cell(n)
                         } else {
                             match self.var_cell_opt(n) {
-                                Some(c) => cell(capture_copy(&c.borrow())),
+                                Some(c) => cell(c.borrow().clone()),
                                 // `use ($x)` on an undefined var warns
                                 // and captures null; `use (&$x)` binds
                                 // silently (closure_027).
@@ -3696,7 +3710,29 @@ impl<'a> Interp<'a> {
                     Value::Null
                 }
             }
-            Value::Bool(_) => v.clone(), // bools don't change
+            Value::Bool(_) => {
+                // bools don't change, but PHP 8.3+ warns on inc/dec.
+                let dir = if delta > 0 { "Increment" } else { "Decrement" };
+                self.warn(&format!(
+                    "{} on type bool has no effect, this will change in the next major version of PHP",
+                    dir
+                ))?;
+                v.clone()
+            }
+            Value::Array(_) | Value::Object(_) | Value::Resource(_) | Value::Callable(_) => {
+                let dir = if delta > 0 { "increment" } else { "decrement" };
+                let what = match v {
+                    Value::Array(_) => "array".to_string(),
+                    Value::Object(o) => o.borrow().class.name().to_string(),
+                    Value::Callable(_) => "Closure".to_string(),
+                    _ => "resource".to_string(),
+                };
+                return self.fail(PhpError::uncaught(
+                    "TypeError",
+                    format!("Cannot {} {}", dir, what),
+                    0,
+                ));
+            }
             // Int overflow on ++ promotes to float (postinc_basiclong_64bit).
             Value::Int(i) => match i.checked_add(delta) {
                 Some(n) => Value::Int(n),
@@ -3726,7 +3762,6 @@ impl<'a> Interp<'a> {
                     }
                 }
             },
-            _ => v.clone(),
         })
     }
 
@@ -3856,7 +3891,7 @@ impl<'a> Interp<'a> {
             }
             "==" | "!=" | "===" | "!==" | "<" | "<=" | ">" | ">=" | "<=>" => {
                 let (lv, rv) = self.binary_operands(l, r)?;
-                self.compare_op(op, &lv, &rv)
+                self.compare_op(op, l, r, &lv, &rv)
             }
             "named" => self.eval(r), // named-arg marker: value passthrough
             _ => {
@@ -3885,7 +3920,14 @@ impl<'a> Interp<'a> {
         Ok((lv, rv))
     }
 
-    fn compare_op(&mut self, op: &str, a: &Value, b: &Value) -> Result<Value, PhpError> {
+    fn compare_op(
+        &mut self,
+        op: &str,
+        l: &Expr,
+        r: &Expr,
+        a: &Value,
+        b: &Value,
+    ) -> Result<Value, PhpError> {
         // NaN is unordered: every ordered comparison is false, <=> is -1.
         let nan = matches!((a, b), (Value::Float(f), _) | (_, Value::Float(f)) if f.is_nan());
         if nan {
@@ -3896,6 +3938,22 @@ impl<'a> Interp<'a> {
                 _ => Value::Bool(false),
             });
         }
+        // pass_two (zend_vm_set_opcode_handler) swaps the operands of the
+        // COMMUTATIVE ops IS_EQUAL/IS_NOT_EQUAL/IS_IDENTICAL/
+        // IS_NOT_IDENTICAL when op1's znode type ranks below op2's
+        // (IS_CONST < IS_TMP_VAR < IS_VAR < IS_CV). The cyclic/protected
+        // operand of zend_hash_compare is always the compare's left, so a
+        // literal-left compare like `[[1,2]] == cyc()` actually runs
+        // compare(cyc_result, literal) and the self-referencing array is
+        // the marked one — re-entry throws "Nesting level too deep".
+        // `<`/`<=`/`<=>` aren't commutative (source order kept); `>`/`>=`
+        // emit as IS_SMALLER(_OR_EQUAL) on the reversed nodes.
+        let (a, b) = match op {
+            "==" | "!=" | "===" | "!==" if compare_operand_rank(l) < compare_operand_rank(r) => {
+                (b, a)
+            }
+            _ => (a, b),
+        };
         crate::value::clear_cmp_depth_err();
         let v = match op {
             "===" => Value::Bool(identical(a, b)),
@@ -3916,6 +3974,9 @@ impl<'a> Interp<'a> {
             ">=" => Value::Bool(compare(b, a) != Ordering::Greater),
             _ => unreachable!(),
         };
+        // Notices queued inside the compare (object→number casts)
+        // already fired — emit them before a cyclic depth throw.
+        self.emit_cmp_notices()?;
         if crate::value::cmp_depth_err() {
             return self.fail(PhpError::uncaught(
                 "Error",
@@ -4385,14 +4446,4 @@ fn bitwise_str(op: &str, a: &[u8], b: &[u8]) -> Vec<u8> {
         });
     }
     out
-}
-
-/// By-value capture copy: PHP's copy-on-write means a captured array is
-/// independent of the outer variable (our Rc aliases share, so separate
-/// eagerly). Objects stay shared (handle semantics).
-fn capture_copy(v: &Value) -> Value {
-    match v {
-        Value::Array(rc) => Value::Array(Rc::new(RefCell::new(rc.borrow().clone()))),
-        other => other.clone(),
-    }
 }

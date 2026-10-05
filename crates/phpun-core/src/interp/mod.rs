@@ -2151,6 +2151,7 @@ impl<'a> Interp<'a> {
                     Err(e) => self.fail(e),
                 };
                 self.call_trace.pop();
+                self.emit_cmp_notices()?;
                 r
             }
             // Internal fns without a signature accept no named args;
@@ -2174,6 +2175,7 @@ impl<'a> Interp<'a> {
                     Err(e) => self.fail(e),
                 };
                 self.call_trace.pop();
+                self.emit_cmp_notices()?;
                 r
             }
         }
