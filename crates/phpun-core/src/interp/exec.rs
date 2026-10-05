@@ -516,10 +516,35 @@ impl<'a> Interp<'a> {
                             }
                         }
                         Expr::StaticProp { class, name } => {
-                            if let Ok(pn) = self.prop_name(name) {
-                                if let Ok(cls) = self.class_of(class) {
-                                    cls.statics.borrow_mut().remove(&pn);
+                            // zend refuses with a catchable Error —
+                            // declared, undeclared and dynamic static
+                            // props all throw `Attempt to unset static
+                            // property K::$x` instead of deleting.
+                            let cls = match self.class_of(class) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    let te = self.fail::<()>(e).unwrap_err();
+                                    return self.err_flow(te);
                                 }
+                            };
+                            let pn = match self.prop_name(name) {
+                                Ok(pn) => pn,
+                                Err(e) => {
+                                    let te = self.fail::<()>(e).unwrap_err();
+                                    return self.err_flow(te);
+                                }
+                            };
+                            let e = PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Attempt to unset static property {}::${}",
+                                    cls.name(),
+                                    pn
+                                ),
+                                self.cur_line,
+                            );
+                            if let Err(e) = self.fail::<()>(e) {
+                                return self.err_flow(e);
                             }
                         }
                         _ => {}

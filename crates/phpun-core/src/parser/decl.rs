@@ -112,6 +112,184 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Switch { cond, cases })
     }
 
+    /// One `unset(...)` argument — zend's `unset_variable` grammar: a
+    /// variable/property/dim/call chain (postfix continuations only),
+    /// then compile checks on the result. Bare literals are parse
+    /// errors naming their token; everything else that isn't a valid
+    /// unset target is a whole-file compile fatal.
+    pub(in crate::parser) fn unset_arg(&mut self, first: bool) -> Result<Expr, PhpError> {
+        let paren = self.at_op("(");
+        let e = self.postfix()?;
+        // Walk the chain links — `nullsafe` anywhere and `[]` appends
+        // anywhere fire zend's write-context fatals (nullsafe first).
+        let mut nullsafe = false;
+        let mut has_append = false;
+        let mut cur = &e;
+        let root: &Expr = loop {
+            cur = match cur {
+                Expr::Index { e: inner, i } => {
+                    has_append |= i.is_none();
+                    inner
+                }
+                Expr::Prop {
+                    obj, nullsafe: ns, ..
+                }
+                | Expr::MethodCall {
+                    obj, nullsafe: ns, ..
+                } => {
+                    nullsafe |= *ns;
+                    obj
+                }
+                _ => break cur,
+            };
+        };
+        // `dim`/`prop` args are chains; everything else is a leaf — its
+        // own outermost kind decides which write-context check applies.
+        let leaf = !matches!(e, Expr::Index { .. } | Expr::Prop { .. });
+        let expecting = |p: &mut Parser| -> PhpError {
+            PhpError::parse(
+                format!(
+                    "syntax error, unexpected {}, expecting \"->\" or \"?->\" or \"[\"",
+                    p.describe()
+                ),
+                p.line(),
+            )
+        };
+        if leaf {
+            match &e {
+                Expr::Int(n) => {
+                    let suffix = if first { "" } else { ", expecting \")\"" };
+                    return Err(PhpError::parse(
+                        format!("syntax error, unexpected integer \"{}\"{}", n, suffix),
+                        self.line(),
+                    ));
+                }
+                Expr::Float(f) => {
+                    let suffix = if first { "" } else { ", expecting \")\"" };
+                    return Err(PhpError::parse(
+                        format!(
+                            "syntax error, unexpected floating-point number \"{}\"{}",
+                            f, suffix
+                        ),
+                        self.line(),
+                    ));
+                }
+                Expr::PostInc(_) => {
+                    return Err(PhpError::parse(
+                        "syntax error, unexpected token \"++\", expecting \"->\" or \"?->\" or \"[\"",
+                        self.line(),
+                    ));
+                }
+                Expr::PostDec(_) => {
+                    return Err(PhpError::parse(
+                        "syntax error, unexpected token \"--\", expecting \"->\" or \"?->\" or \"[\"",
+                        self.line(),
+                    ));
+                }
+                Expr::Isset(_) => {
+                    return Err(PhpError::parse(
+                        "syntax error, unexpected token \"isset\"",
+                        self.line(),
+                    ));
+                }
+                Expr::Empty(_) => {
+                    return Err(PhpError::parse(
+                        "syntax error, unexpected token \"empty\"",
+                        self.line(),
+                    ));
+                }
+                // literals and other non-chain starters: zend parsed
+                // them as a dim-root then dies on the token that must
+                // have been a continuation.
+                Expr::Str(_)
+                | Expr::Interp(_)
+                | Expr::Bool(_)
+                | Expr::Null
+                | Expr::ArrayLit(_)
+                | Expr::Const(_)
+                | Expr::Paren(_)
+                | Expr::New { .. } => return Err(expecting(self)),
+                _ => {}
+            }
+        }
+        if paren && leaf {
+            // `unset(($a))` — a parenthesized expr is no variable.
+            return Err(expecting(self));
+        }
+        // The chain must be followed by `,` or `)` — any other token is
+        // a parse error with zend's continuation list.
+        if !self.at_op(",") && !self.at_op(")") {
+            return Err(expecting(self));
+        }
+        if nullsafe {
+            return Err(PhpError::compile_fatal(
+                "Can't use nullsafe operator in write context",
+                self.line(),
+            ));
+        }
+        if !std::ptr::eq(root, &e) {
+            // Root of a dim/prop chain must be a writable container —
+            // anything else is a "temporary expression".
+            let writable = matches!(
+                root,
+                Expr::Var(_)
+                    | Expr::VarVar(_)
+                    | Expr::Prop { .. }
+                    | Expr::StaticProp { .. }
+                    | Expr::Call { .. }
+                    | Expr::MethodCall { .. }
+                    | Expr::StaticCall { .. }
+                    | Expr::StaticCallDyn { .. }
+                    | Expr::Fcc(_)
+                    | Expr::New { .. }
+            );
+            if !writable {
+                return Err(PhpError::compile_fatal(
+                    "Cannot use temporary expression in write context",
+                    self.line(),
+                ));
+            }
+        }
+        if has_append {
+            return Err(PhpError::compile_fatal(
+                "Cannot use [] for unsetting",
+                self.line(),
+            ));
+        }
+        if leaf {
+            match &e {
+                Expr::Var(n) if n == "this" => {
+                    return Err(PhpError::compile_fatal("Cannot unset $this", self.line()));
+                }
+                Expr::Call { .. } => {
+                    return Err(PhpError::compile_fatal(
+                        "Can't use function return value in write context",
+                        self.line(),
+                    ));
+                }
+                Expr::MethodCall { .. }
+                | Expr::StaticCall { .. }
+                | Expr::StaticCallDyn { .. } => {
+                    return Err(PhpError::compile_fatal(
+                        "Can't use method return value in write context",
+                        self.line(),
+                    ));
+                }
+                Expr::Fcc(inner) => {
+                    // `unset(f(...))` — FCC of a call is still a call
+                    // result in write context.
+                    let msg = match inner.as_ref() {
+                        Expr::Call { .. } => "Can't use function return value in write context",
+                        _ => "Can't use method return value in write context",
+                    };
+                    return Err(PhpError::compile_fatal(msg, self.line()));
+                }
+                _ => {}
+            }
+        }
+        Ok(e)
+    }
+
     pub(in crate::parser) fn foreach_stmt(&mut self) -> Result<Stmt, PhpError> {
         self.pos += 1; // foreach
         self.expect_op("(")?;

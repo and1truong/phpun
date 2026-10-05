@@ -590,9 +590,16 @@ impl<'a> Parser<'a> {
                 } else if self.ident_is("unset") {
                     self.pos += 1;
                     self.expect_op("(")?;
+                    if self.at_op(")") {
+                        return Err(PhpError::parse(
+                            format!("syntax error, unexpected {}", self.describe()),
+                            self.line(),
+                        ));
+                    }
                     let mut xs = Vec::new();
                     while !self.at_op(")") {
-                        xs.push(self.expr()?);
+                        let first = xs.is_empty();
+                        xs.push(self.unset_arg(first)?);
                         if !self.eat_op(",") {
                             break;
                         }
