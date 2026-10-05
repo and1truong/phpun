@@ -335,8 +335,26 @@ impl<'a> Interp<'a> {
                             // Zend appends the reason:
                             // "Failed to create closure from callable:
                             // non-static method A::m() cannot be called
-                            // statically" (from_callable_non_static).
-                            let reason = if !fail.message.is_empty() {
+                            // statically" (from_callable_non_static). A
+                            // plain string that resolves to nothing gets
+                            // the dedicated not-found wording.
+                            let not_found = match &v {
+                                Value::Str(s)
+                                    if !crate::value::lossy(s).contains("::")
+                                        && fail
+                                            .message
+                                            .starts_with("Call to undefined function") =>
+                                {
+                                    Some(format!(
+                                        "function \"{}\" not found or invalid function name",
+                                        crate::value::lossy(s)
+                                    ))
+                                }
+                                _ => None,
+                            };
+                            let reason = if let Some(r) = not_found {
+                                r
+                            } else if !fail.message.is_empty() {
                                 fail.message
                                     .replacen("Non-static method", "non-static method", 1)
                             } else {
