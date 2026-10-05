@@ -1961,16 +1961,52 @@ impl<'a> Interp<'a> {
             self.assert_src = parts.join(", ");
         }
         if !args.named.is_empty() && matches!(name, "call_user_func" | "forward_static_call") {
-            // call_user_func forwards named args to the callee, not to
-            // its own `callback` param (named_params/call_user_func).
-            let cb = args
-                .cells
-                .first()
-                .map(|c| c.borrow().clone())
-                .unwrap_or(Value::Null);
+            // `callback:` binds the builtin's own first param like any
+            // named arg; the rest of the names behave per the stub
+            // variadic — call_user_func forwards them to the callee
+            // ('+'), forward_static_call rejects them ('*').
+            let fwd = name == "forward_static_call";
+            let cb_named = args.named.iter().position(|(n, ..)| n == "callback");
+            let cb = if let Some(c) = args.cells.first() {
+                if cb_named.is_some() {
+                    self.call_trace.pop();
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        "Named parameter $callback overwrites previous argument",
+                        0,
+                    ));
+                }
+                c.borrow().clone()
+            } else if let Some(i) = cb_named {
+                args.named[i].1.borrow().clone()
+            } else {
+                self.call_trace.pop();
+                return self.fail(PhpError::uncaught(
+                    "ArgumentCountError",
+                    format!(
+                        "{}() expects at least 1 argument, {} given",
+                        name,
+                        args.cells.len()
+                    ),
+                    0,
+                ));
+            };
+            if fwd && args.named.iter().any(|(n, ..)| n != "callback") {
+                self.call_trace.pop();
+                return self.fail(PhpError::uncaught(
+                    "ArgumentCountError",
+                    format!("{}() does not accept unknown named parameters", name),
+                    0,
+                ));
+            }
             let ca = CallArgs {
                 cells: args.cells[1.min(args.cells.len())..].to_vec(),
-                named: args.named.clone(),
+                named: args
+                    .named
+                    .iter()
+                    .filter(|(n, ..)| n != "callback")
+                    .cloned()
+                    .collect(),
                 nonref_cells: args
                     .nonref_cells
                     .iter()
@@ -1984,6 +2020,35 @@ impl<'a> Interp<'a> {
                     .map(|i| i - 1)
                     .collect(),
             };
+            // Zend's `f` flag validates the callback eagerly with a
+            // TypeError before any callee work; forward_static_call's
+            // autoloader probe propagates instead of wrapping.
+            if !self.is_callable_value(&cb) {
+                if fwd {
+                    if let Some(pe) = self.take_callable_probe_err() {
+                        self.call_trace.pop();
+                        return self.fail(pe);
+                    }
+                }
+                let msg = format!(
+                    "{}(): Argument #1 ($callback) must be a valid callback, {}",
+                    name,
+                    self.zpp_callback_detail(&cb)
+                );
+                let e = self.exception("TypeError", &msg);
+                let te = self.throw(e);
+                let r = self.fail(te);
+                self.call_trace.pop();
+                return r;
+            }
+            if fwd && self.caller_scope_name().is_none() {
+                self.call_trace.pop();
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    "Cannot call forward_static_call() when no class scope is active",
+                    0,
+                ));
+            }
             // Callbacks dispatched from inside an internal function
             // trace from `[internal function]` (closure_064).
             self.internal_cb += 1;
@@ -2206,6 +2271,10 @@ impl<'a> Interp<'a> {
         if !variadic && !extra_pos.is_empty() {
             return Err(arity_err(args.cells.len(), true));
         }
+        // "given" counts positional args plus named args that bound to
+        // a fixed param — a name landing in the variadic tail is not
+        // counted (call_user_func(x:) reports "0 given").
+        let mut given = args.cells.len();
         // `assert(description: X)` with no positional/assertion arg hits
         // a Zend arg-parsing quirk that reports an overwrite (assert.phpt).
         if name == "assert" && args.cells.is_empty() {
@@ -2219,7 +2288,6 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        let mut any_fixed_named = false;
         for (n, c, ..) in &args.named {
             match params[..n_fixed]
                 .iter()
@@ -2234,7 +2302,7 @@ impl<'a> Interp<'a> {
                 }
                 Some(j) => {
                     slot[j] = Some(c.clone());
-                    any_fixed_named = true;
+                    given += 1;
                 }
                 None if variadic => extra_pos.push(c.clone()),
                 None => {
@@ -2260,7 +2328,11 @@ impl<'a> Interp<'a> {
             match s {
                 Some(c) => out.push(c.clone()),
                 None if matches!(params[i].1, BDef::Req) => {
-                    if any_fixed_named {
+                    // A named arg bound to a LATER param leaves this
+                    // required one skipped: `#N not passed`. Nothing
+                    // bound after it is just the plain arity error
+                    // (`substr(string:)` => "expects at least 2").
+                    if slot.iter().skip(i + 1).any(|s| s.is_some()) {
                         return Err(PhpError::uncaught(
                             "ArgumentCountError",
                             format!(
@@ -2272,7 +2344,7 @@ impl<'a> Interp<'a> {
                             0,
                         ));
                     }
-                    return Err(arity_err(args.cells.len(), false));
+                    return Err(arity_err(given, false));
                 }
                 None if matches!(params[i].1, BDef::Unk) && i < last_bound => {
                     return Err(PhpError::uncaught(

@@ -114,6 +114,24 @@ pub(crate) fn dispatch(
                     ),
                 );
             }
+            // `*_array`'s second param is ZPP-checked at parse time —
+            // the TypeError fires before the no-scope Error below.
+            let av = if name.ends_with("_array") {
+                let av = arg(args, 1);
+                if !matches!(av, Value::Array(_)) {
+                    return err::<Option<Value>>(
+                        "TypeError",
+                        format!(
+                            "{}(): Argument #2 ($args) must be of type array, {} given",
+                            name,
+                            it.zval_type_name(&av)
+                        ),
+                    );
+                }
+                Some(av)
+            } else {
+                None
+            };
             // forward_static_call forwards the current called_scope —
             // no scope, nothing to forward (zend_execute_API).
             if name.starts_with("forward_static_call") && it.caller_scope_name().is_none() {
@@ -127,7 +145,7 @@ pub(crate) fn dispatch(
             if name.ends_with("_array") {
                 let mut ca = crate::interp::CallArgs::empty();
                 let mut seen_str = false;
-                if let Value::Array(a) = arg(args, 1) {
+                if let Some(Value::Array(a)) = &av {
                     for (k, c) in a.borrow().iter() {
                         match k {
                             ArrKey::Str(s) => {
