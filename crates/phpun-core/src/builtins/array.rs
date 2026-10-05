@@ -1329,14 +1329,22 @@ pub(crate) fn zend_sort_user(
     let mut dep_thrown = false;
     let mut v = sort_snapshot(entries);
     let call = |it: &mut Interp, x: &crate::value::SortElem, y: &crate::value::SortElem| {
+        // zend passes the bucket zvals BY VALUE — a `&$k` param warns
+        // "must be passed by reference, value given" and binds a copy,
+        // so callback writes can never reach the sorted storage.
         let args = if by_key {
             crate::interp::CallArgs::positional(vec![
                 cell(crate::interp::util::key_value(&x.1)),
                 cell(crate::interp::util::key_value(&y.1)),
             ])
         } else {
-            crate::interp::CallArgs::positional(vec![x.2.clone(), y.2.clone()])
+            crate::interp::CallArgs::positional(vec![
+                cell(x.2.borrow().clone()),
+                cell(y.2.borrow().clone()),
+            ])
         };
+        let mut args = args;
+        args.nonref_cells = vec![0, 1];
         it.call_value(cb, args)
     };
     crate::value::zend_sort(&mut v, &mut |x, y| {
