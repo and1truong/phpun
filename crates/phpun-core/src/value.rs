@@ -999,10 +999,7 @@ pub fn identical(a: &Value, b: &Value) -> bool {
             // one (operator_identical_recusion-01).
             let (am, bm) = CMP_MARKS.with(|v| {
                 let v = v.borrow();
-                (
-                    v.iter().any(|p| *p == ap),
-                    v.iter().any(|p| *p == bp),
-                )
+                (v.contains(&ap), v.contains(&bp))
             });
             if am && bm {
                 CMP_DEPTH_ERR.with(|f| f.set(true));

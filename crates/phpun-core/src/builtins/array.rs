@@ -1783,7 +1783,11 @@ fn array_diff(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
     if elems.is_empty() {
         for (i, o) in args[1..].iter().enumerate() {
             if !matches!(&*o.borrow(), Value::Array(_)) {
-                return deferred_or(it, pending, need_array_arg("array_diff", i + 2, &o.borrow()));
+                return deferred_or(
+                    it,
+                    pending,
+                    need_array_arg("array_diff", i + 2, &o.borrow()),
+                );
             }
         }
         return Ok(Value::Array(Rc::new(RefCell::new(PhpArray::new()))));
@@ -1872,9 +1876,14 @@ fn array_intersect(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
             .collect();
         if list.len() > 1 {
             let n = list.len();
-            zend_sort(&mut list, 0, n, &mut |x: &(ArrKey, Value), y: &(ArrKey, Value)| {
-                zstr_cmp(it, &x.1, &y.1, &mut pending) == std::cmp::Ordering::Greater
-            });
+            zend_sort(
+                &mut list,
+                0,
+                n,
+                &mut |x: &(ArrKey, Value), y: &(ArrKey, Value)| {
+                    zstr_cmp(it, &x.1, &y.1, &mut pending) == std::cmp::Ordering::Greater
+                },
+            );
         }
         lists.push(list);
     }
@@ -1984,8 +1993,8 @@ fn array_assoc_match(
             };
             match oc {
                 Some(oc) => {
-                    let equal = zstr_cmp(it, &v, &oc.borrow(), &mut pending)
-                        == std::cmp::Ordering::Equal;
+                    let equal =
+                        zstr_cmp(it, &v, &oc.borrow(), &mut pending) == std::cmp::Ordering::Equal;
                     // diff drops on a same-key equal value; intersect
                     // drops on a same-key unequal one.
                     if equal == diff {

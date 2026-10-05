@@ -536,11 +536,7 @@ impl<'a> Interp<'a> {
                             };
                             let e = PhpError::uncaught(
                                 "Error",
-                                format!(
-                                    "Attempt to unset static property {}::${}",
-                                    cls.name(),
-                                    pn
-                                ),
+                                format!("Attempt to unset static property {}::${}", cls.name(), pn),
                                 self.cur_line,
                             );
                             if let Err(e) = self.fail::<()>(e) {

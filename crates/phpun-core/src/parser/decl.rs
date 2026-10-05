@@ -267,9 +267,7 @@ impl<'a> Parser<'a> {
                         self.line(),
                     ));
                 }
-                Expr::MethodCall { .. }
-                | Expr::StaticCall { .. }
-                | Expr::StaticCallDyn { .. } => {
+                Expr::MethodCall { .. } | Expr::StaticCall { .. } | Expr::StaticCallDyn { .. } => {
                     return Err(PhpError::compile_fatal(
                         "Can't use method return value in write context",
                         self.line(),
