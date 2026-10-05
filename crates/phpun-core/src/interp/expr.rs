@@ -4576,7 +4576,7 @@ fn literal_static_init(e: &Expr) -> bool {
         | Expr::Str(_)
         | Expr::MagicConst(_) => true,
         Expr::ArrayLit(items) => items.iter().all(|(k, v)| {
-            k.as_ref().map(|k| literal_static_init(k)).unwrap_or(true) && literal_static_init(v)
+            k.as_ref().map(literal_static_init).unwrap_or(true) && literal_static_init(v)
         }),
         Expr::Interp(parts) => parts
             .iter()
