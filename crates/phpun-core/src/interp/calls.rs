@@ -537,13 +537,20 @@ impl<'a> Interp<'a> {
         // (passByReference_012, array_shift(array_shift($a))).
         let builtin_params: Vec<Param> = if decl.is_none() {
             let sig = crate::builtins::builtin_sig(&lname).unwrap_or_default();
+            let bparams = crate::builtins::builtin_params(&lname);
             builtin_byref(&lname)
                 .map(|flags| {
                     flags
                         .iter()
                         .enumerate()
                         .map(|(i, by_ref)| Param {
-                            name: sig.get(i).map(|(n, _)| n.clone()).unwrap_or_default(),
+                            name: sig
+                                .get(i)
+                                .map(|(n, _)| n.clone())
+                                .or_else(|| {
+                                    bparams.and_then(|p| p.get(i).map(|(n, _)| n.to_string()))
+                                })
+                                .unwrap_or_default(),
                             default: None,
                             by_ref: *by_ref,
                             variadic: false,
@@ -733,10 +740,13 @@ impl<'a> Interp<'a> {
                 self.invoke_fn(&decl, args, None, None)
             }
             Value::Array(a) => {
-                // [$obj, 'method'] or ['Class', 'method']
-                let a = a.borrow();
-                let o0 = a.get(&ArrKey::Int(0));
-                let m = a.get(&ArrKey::Int(1));
+                // [$obj, 'method'] or ['Class', 'method'] — drop the
+                // borrow before dispatch: resolving `['Cls','m']`
+                // autoloads, and user loader code may write this array.
+                let (o0, m) = {
+                    let a = a.borrow();
+                    (a.get(&ArrKey::Int(0)), a.get(&ArrKey::Int(1)))
+                };
                 match (o0, m) {
                     (Some(t), Some(mv)) => {
                         let mname = mv.to_php_string();
@@ -1315,10 +1325,11 @@ impl<'a> Interp<'a> {
                 let name = crate::value::lossy(s);
                 let name = name.trim_start_matches('\\');
                 if let Some((cls, m)) = name.split_once("::") {
-                    if let Some(rcn) = self.resolve_class(cls) {
-                        if let Some(c) = self.classes.get(&rcn.to_lowercase()).cloned() {
-                            return self.fcc_static(c, m);
-                        }
+                    // The lookup autoloads — a throwing loader's
+                    // exception propagates (zend), it is not a
+                    // "not found" Error.
+                    if let Some(c) = self.str_callable_class(cls)? {
+                        return self.fcc_static(c, m);
                     }
                     return self.fail(PhpError::uncaught(
                         "Error",
@@ -1371,9 +1382,13 @@ impl<'a> Interp<'a> {
                 }
             }
             Value::Array(a) => {
-                let a = a.borrow();
-                let t = a.get(&ArrKey::Int(0));
-                let m = a.get(&ArrKey::Int(1));
+                // Drop the borrow before any dispatch below — a
+                // throwing autoloader under `['Cls','m']` runs user
+                // code that may write this same array.
+                let (t, m) = {
+                    let a = a.borrow();
+                    (a.get(&ArrKey::Int(0)), a.get(&ArrKey::Int(1)))
+                };
                 match (t, m) {
                     (Some(Value::Object(o)), Some(mv)) => {
                         let mn = mv.to_php_string();
@@ -1395,10 +1410,9 @@ impl<'a> Interp<'a> {
                     }
                     (Some(Value::Str(cn)), Some(mv)) => {
                         let mn = mv.to_php_string();
-                        match self
-                            .resolve_class(&crate::value::lossy(&cn))
-                            .and_then(|c| self.classes.get(&c.to_lowercase()).cloned())
-                        {
+                        // `['Cls','m']` invoke autoloads the class — a
+                        // throwing loader's exception propagates.
+                        match self.str_callable_class(&crate::value::lossy(&cn))? {
                             Some(c) => self.fcc_static(c, &mn),
                             None => self.fail(PhpError::uncaught(
                                 "Error",
@@ -3189,8 +3203,51 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Consume the stashed probe error of a failing
+    /// `is_callable_value`, restoring the throwable for re-raise.
+    /// Zend propagates a throwing autoloader's exception through
+    /// callable validation everywhere except the call_user_func
+    /// family, which wraps it in its own TypeError.
+    pub fn take_callable_probe_err(&mut self) -> Option<PhpError> {
+        let (v, e) = self.callable_probe_err.take()?;
+        if e.kind == ErrorKind::Throw {
+            self.pending_exception = Some(v);
+        }
+        Some(e)
+    }
+
+    /// The ` in <file> on line <n>` tail of a too-few-args error. Zend
+    /// drops it when the immediate caller is an internal function
+    /// (array_map's driver frame) — except the VM-inlined
+    /// call_user_func family, whose caller frame is the user's own.
+    fn arg_err_in(&self) -> String {
+        // last() is this callee's own (user) frame — the caller is the
+        // frame just below it.
+        let internal_driver = self
+            .call_trace
+            .iter()
+            .rev()
+            .nth(1)
+            .map(|f| {
+                f.internal
+                    && !matches!(
+                        f.function.as_str(),
+                        "call_user_func"
+                            | "call_user_func_array"
+                            | "forward_static_call"
+                            | "forward_static_call_array"
+                    )
+            })
+            .unwrap_or(false);
+        if internal_driver {
+            String::new()
+        } else {
+            format!(" in {} on line {}", self.diag_file(), self.cur_line)
+        }
+    }
+
     /// PHP's "given" type word in TypeError messages.
-    pub(in crate::interp) fn zval_type_name(&self, v: &Value) -> String {
+    pub fn zval_type_name(&self, v: &Value) -> String {
         match v {
             Value::Null => "null".into(),
             Value::Bool(b) => if *b { "true" } else { "false" }.into(),
@@ -3392,11 +3449,10 @@ impl<'a> Interp<'a> {
             return self.fail(PhpError::uncaught(
                 "ArgumentCountError",
                 format!(
-                    "Too few arguments to function {}(), {} passed in {} on line {} and {} {} expected",
+                    "Too few arguments to function {}(), {} passed{} and {} {} expected",
                     self.decl_fname(decl),
                     args.len(),
-                    self.diag_file(),
-                    self.cur_line,
+                    self.arg_err_in(),
                     if required == decl.params.len() { "exactly" } else { "at least" },
                     required
                 ),
@@ -3518,10 +3574,7 @@ impl<'a> Interp<'a> {
                 // probe — an autoloader that threw has its exception
                 // propagate (zend raises it, not the TypeError).
                 if ty.iter().any(|m| m.eq_ignore_ascii_case("callable")) {
-                    if let Some((v, e)) = self.callable_probe_err.take() {
-                        if e.kind == crate::error::ErrorKind::Throw {
-                            self.pending_exception = Some(v);
-                        }
+                    if let Some(e) = self.take_callable_probe_err() {
                         self.stack.pop();
                         return self.fail(e);
                     }
@@ -4077,11 +4130,10 @@ impl<'a> Interp<'a> {
             return self.fail(PhpError::uncaught(
                 "ArgumentCountError",
                 format!(
-                    "Too few arguments to function {}(), {} passed in {} on line {} and {} {} expected",
+                    "Too few arguments to function {}(), {} passed{} and {} {} expected",
                     self.decl_fname(decl),
                     args.len(),
-                    self.diag_file(),
-                    self.cur_line,
+                    self.arg_err_in(),
                     if required == decl.params.len() { "exactly" } else { "at least" },
                     required
                 ),

@@ -655,6 +655,9 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 if !self.is_callable_value(&cb) {
+                    if let Some(pe) = self.take_callable_probe_err() {
+                        return self.fail(pe);
+                    }
                     let detail = self.zpp_callback_detail(&cb);
                     let e = self.spl_throw(
                         "TypeError",

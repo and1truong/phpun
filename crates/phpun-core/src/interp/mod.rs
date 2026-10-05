@@ -1991,6 +1991,8 @@ impl<'a> Interp<'a> {
                     if i >= args.cells.len() {
                         break;
                     }
+                    // Probe errors belong to THIS param's check only.
+                    self.callable_probe_err = None;
                     let v = args.cells[i].borrow().clone();
                     let has_cb = pty
                         .trim_start_matches('?')
@@ -2009,6 +2011,13 @@ impl<'a> Interp<'a> {
                                 .filter(|t| *t != "callable")
                                 .any(|t| self.param_type_match(t, &v));
                         if !ok {
+                            // A throwing autoloader propagates through
+                            // the probe (usort/array_map/... — zend
+                            // re-raises it rather than TypeError-ing).
+                            if let Some(pe) = self.take_callable_probe_err() {
+                                self.call_trace.pop();
+                                return self.fail(pe);
+                            }
                             let null = if pty.starts_with('?') { " or null" } else { "" };
                             let msg = format!(
                                 "{}(): Argument #{} (${}) must be a valid callback{}, {}",

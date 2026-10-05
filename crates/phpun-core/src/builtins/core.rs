@@ -153,26 +153,59 @@ pub(crate) fn dispatch(
         }
         "register_shutdown_function" => {
             let f = arg(args, 0);
+            // Eager callback validation (zend zpp 'f'): a throwing
+            // autoloader propagates; an invalid arg is a TypeError.
+            if !it.is_callable_value(&f) {
+                if let Some(pe) = it.take_callable_probe_err() {
+                    return Err(pe);
+                }
+                return err(
+                    "TypeError",
+                    format!(
+                        "register_shutdown_function(): Argument #1 ($callback) must be a valid callback, {}",
+                        it.zpp_callback_detail(&f)
+                    ),
+                );
+            }
             let rest: Vec<Cell> = args[1.min(args.len())..].to_vec();
             it.register_shutdown(f, rest);
             Value::Null
         }
-        "set_error_handler" => {
-            let prev = it.error_handler().unwrap_or(Value::Null);
-            it.set_error_handler(if matches!(arg(args, 0), Value::Null) {
-                None
+        "set_error_handler" | "set_exception_handler" => {
+            let cb = arg(args, 0);
+            // `?callable` — null restores the engine default, anything
+            // else must validate (a throwing autoloader propagates).
+            if !matches!(cb, Value::Null) && !it.is_callable_value(&cb) {
+                if let Some(pe) = it.take_callable_probe_err() {
+                    return Err(pe);
+                }
+                return err(
+                    "TypeError",
+                    format!(
+                        "{}(): Argument #1 ($callback) must be a valid callback or null, {}",
+                        name,
+                        it.zpp_callback_detail(&cb)
+                    ),
+                );
+            }
+            let (prev, none) = if name == "set_error_handler" {
+                (it.error_handler().unwrap_or(Value::Null), false)
             } else {
-                Some(arg(args, 0))
-            });
-            prev
-        }
-        "set_exception_handler" => {
-            let prev = it.exception_handler().unwrap_or(Value::Null);
-            it.set_exception_handler(if matches!(arg(args, 0), Value::Null) {
-                None
+                (it.exception_handler().unwrap_or(Value::Null), true)
+            };
+            if none {
+                it.set_exception_handler(if matches!(cb, Value::Null) {
+                    None
+                } else {
+                    Some(cb)
+                });
             } else {
-                Some(arg(args, 0))
-            });
+                it.set_error_handler(if matches!(cb, Value::Null) {
+                    None
+                } else {
+                    Some(cb)
+                });
+            }
             prev
         }
         "restore_error_handler" => {
