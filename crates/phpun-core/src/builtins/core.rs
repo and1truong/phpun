@@ -3,6 +3,7 @@
 use super::datetime::date_format;
 use super::url::urlencode;
 use super::*;
+use crate::error::ErrorKind;
 
 pub(crate) fn dispatch(
     it: &mut Interp,
@@ -631,6 +632,27 @@ pub(crate) fn dispatch(
         },
         "proc_open" | "proc_close" | "proc_get_status" | "proc_terminate" => Value::Bool(false),
         "shell_exec" | "exec" | "system" | "passthru" => Value::Null,
+        // exit()/die() exist in zend's function table too — reachable
+        // through 'exit'/'die' string callables (FCC, call_user_func).
+        // Top-level exit() parses to Expr::Exit and never lands here.
+        "die" | "exit" => {
+            let code = match args.first().map(|c| c.borrow().clone()) {
+                Some(Value::Int(i)) => i as i32,
+                Some(Value::Str(s)) => {
+                    it.emit_bytes(&s);
+                    0
+                }
+                _ => 0,
+            };
+            return Err(PhpError {
+                trace: None,
+                thrown_line: None,
+                display_msg: None,
+                kind: ErrorKind::Fatal,
+                message: format!("\u{1}exit:{}", code),
+                line: 0,
+            });
+        }
         "escapeshellarg" | "escapeshellcmd" => {
             let s = arg_str(it, args, 0);
             Value::str(format!("'{}'", s.replace('\'', "'\\''")))
