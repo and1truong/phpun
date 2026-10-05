@@ -2631,7 +2631,6 @@ class SplObjectStorage implements Countable, Iterator, ArrayAccess {
     private array $data = [];
     private int $pos = 0;
     private int $idx = 0;
-    private $info;
     private function hashOf($obj) {
         if (!is_object($obj)) {
             throw new TypeError('SplObjectStorage::offsetSet(): Argument #1 ($object) must be of type object');
@@ -2662,8 +2661,19 @@ class SplObjectStorage implements Countable, Iterator, ArrayAccess {
     }
     public function getHash($obj) { return (string) $this->hashOf($obj); }
     public function count(): int { return count($this->objs); }
-    public function setInfo($data) { $this->info = $data; }
-    public function getInfo() { return $this->info; }
+    // zend's info slot hangs off the CURRENT iterator element.
+    public function setInfo($data) {
+        $objs = array_values($this->objs);
+        if ($this->idx < count($objs)) {
+            $this->data[$this->hashOf($objs[$this->idx])] = $data;
+        }
+    }
+    public function getInfo() {
+        $objs = array_values($this->objs);
+        return $this->idx < count($objs)
+            ? ($this->data[$this->hashOf($objs[$this->idx])] ?? null)
+            : null;
+    }
     // Iteration: key() is a 0-based index, current() the stored object.
     public function rewind(): void { $this->pos = 0; $this->idx = 0; }
     public function valid(): bool { return $this->idx < count($this->objs); }
@@ -2680,6 +2690,26 @@ class SplObjectStorage implements Countable, Iterator, ArrayAccess {
         foreach ($this->objs as $h => $obj) {
             if (!$storage->contains($obj)) { unset($this->objs[$h], $this->data[$h]); }
         }
+    }
+    // zend serializes SplObjectStorage as [flat obj,info pairs, dynamic props].
+    public function __serialize(): array {
+        $st = [];
+        foreach ($this->objs as $h => $o) {
+            $st[] = $o;
+            $st[] = $this->data[$h];
+        }
+        $props = get_object_vars($this);
+        unset($props['objs'], $props['data'], $props['pos'], $props['idx']);
+        return [$st, $props];
+    }
+    public function __unserialize(array $pairs): void {
+        $this->objs = []; $this->data = [];
+        $this->pos = 0; $this->idx = 0;
+        $st = $pairs[0] ?? [];
+        for ($i = 0; $i + 1 < count($st); $i += 2) {
+            $this->offsetSet($st[$i], $st[$i + 1]);
+        }
+        foreach (($pairs[1] ?? []) as $k => $v) { $this->$k = $v; }
     }
 }
 class SplFixedArray implements ArrayAccess, Iterator, Countable {

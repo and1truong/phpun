@@ -1994,7 +1994,7 @@ impl<'a> Interp<'a> {
                     // Object-backed: storage IS the prop table — the
                     // write lands a dynamic prop on the backing object.
                     if let Some(src) = self.ao_src_obj(&o) {
-                        self.ao_obj_dim_write(&src, &arr, k, v.clone());
+                        self.ao_obj_dim_write(&o, &src, &arr, k, v.clone());
                     } else {
                         arr.borrow_mut().set(k, v.clone());
                     }
@@ -2567,17 +2567,21 @@ impl<'a> Interp<'a> {
             unreachable!()
         };
         self.last_ret_cell = None;
+        // zend evaluates this read as BP_VAR_RW — a missing bucket is
+        // created silently inside offsetGet.
+        let was = std::mem::replace(&mut self.dim_by_ref, true);
         let rv = self.method_invoke(
             o,
             "offsetGet",
             CallArgs::positional(vec![cell(key.unwrap_or(Value::Null))]),
-        )?;
+        );
+        self.dim_by_ref = was;
         match self.last_ret_cell.take() {
             Some(rc) => {
-                self.ref_cells.insert(Rc::as_ptr(&rc) as usize);
+                self.mark_ref(&rc);
                 Ok(rc)
             }
-            None => Ok(cell(rv)),
+            None => Ok(cell(rv?)),
         }
     }
 
@@ -2778,9 +2782,10 @@ impl<'a> Interp<'a> {
                 cur = b;
             }
             if let Ok(Value::Object(o)) = self.eval(cur) {
-                let ao = match &o.borrow().internal {
-                    Some(ObjectInternal::ArrayIter { arr, .. }) => Some(arr.clone()),
-                    _ => None,
+                let ao = if matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. })) {
+                    Some(self.ao_arr(&o))
+                } else {
+                    None
                 };
                 if let Some(arr) = ao {
                     let mut cur_arr = arr;
@@ -2793,12 +2798,16 @@ impl<'a> Interp<'a> {
                         let next = match cur_arr.borrow().get_cell(&to_key(&kv)) {
                             Some(cc) => match &*cc.borrow() {
                                 Value::Array(na) => Some(na.clone()),
-                                Value::Object(oo) => match &oo.borrow().internal {
-                                    Some(ObjectInternal::ArrayIter { arr: na, .. }) => {
-                                        Some(na.clone())
+                                Value::Object(oo) => {
+                                    if matches!(
+                                        oo.borrow().internal,
+                                        Some(ObjectInternal::ArrayIter { .. })
+                                    ) {
+                                        Some(self.ao_arr(oo))
+                                    } else {
+                                        None
                                     }
-                                    _ => None,
-                                },
+                                }
                                 _ => None,
                             },
                             None => None,
@@ -3407,14 +3416,17 @@ impl<'a> Interp<'a> {
         post: bool,
     ) -> Result<Value, PhpError> {
         self.last_ret_cell = None;
+        let was = std::mem::replace(&mut self.dim_by_ref, true);
         let rv = self.method_invoke(
             o.clone(),
             "offsetGet",
             CallArgs::positional(vec![cell(key.clone())]),
-        )?;
+        );
+        self.dim_by_ref = was;
+        let rv = rv?;
         let rc = self.last_ret_cell.take();
         if let Some(c) = &rc {
-            self.ref_cells.insert(Rc::as_ptr(c) as usize);
+            self.mark_ref(c);
         }
         let old = rc.as_ref().map(|c| c.borrow().clone()).unwrap_or(rv);
         // int-typed backing cell can't overflow to float — dedicated
