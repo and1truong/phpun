@@ -163,7 +163,26 @@ pub(in crate::interp) fn compare_operand_rank(e: &Expr) -> u8 {
         | Expr::StaticCall { .. }
         | Expr::StaticCallDyn { .. }
         | Expr::New { .. }
-        | Expr::AnonClass(_) => 4,
+        | Expr::AnonClass(_)
+        // ZEND_INCLUDE_OR_EVAL and ZEND_YIELD emit their result into a
+        // real znode (zend_emit_op, not _tmp) → IS_VAR. YIELD_FROM and
+        // closure literals are _tmp emits → IS_TMP_VAR.
+        | Expr::Include { .. }
+        | Expr::Yield { .. } => 4,
+        // BEGIN_SILENCE is rank-transparent: `@expr` keeps the inner
+        // znode's type — except `@$var`, which zend forces through
+        // zend_compile_simple_var_no_cv (FETCH_R → IS_TMP_VAR) so the
+        // CV read happens inside the silenced section.
+        Expr::Unary { op: "@", e } => {
+            let mut inner = &**e;
+            while let Expr::Paren(p) = inner {
+                inner = p;
+            }
+            match inner {
+                Expr::Var(_) => 2,
+                _ => compare_operand_rank(inner),
+            }
+        }
         _ if is_compile_const(e) => 1,
         _ => 2,
     }
