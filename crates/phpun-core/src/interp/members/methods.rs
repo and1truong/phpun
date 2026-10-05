@@ -1760,7 +1760,7 @@ impl<'a> Interp<'a> {
                     match self.rebind_closure(&c, Some(t.clone()), Some(Value::Object(t)))? {
                         Some(nc) => {
                             ca.cells.remove(0);
-                            return self.call_value(&Value::Callable(Rc::new(nc)), ca);
+                            return self.call_value(&Value::Callable(nc), ca);
                         }
                         // A failed bind (warned) skips the invocation
                         // (closure_from_callable_rebinding).
@@ -1802,7 +1802,7 @@ impl<'a> Interp<'a> {
                     }
                 };
                 match self.rebind_closure(&c, new_this, scope_arg)? {
-                    Some(nc) => Ok(Value::Callable(Rc::new(nc))),
+                    Some(nc) => Ok(Value::Callable(nc)),
                     None => Ok(Value::Null),
                 }
             }
