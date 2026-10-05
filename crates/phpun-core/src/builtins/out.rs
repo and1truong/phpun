@@ -55,6 +55,26 @@ pub(crate) fn dispatch(
         // ----- output buffering -----
         "ob_start" => {
             let h = args.first().map(|c| c.borrow().clone());
+            // Zend validates the callback before creating the buffer:
+            // string|array|null only, full callable ladder — failure
+            // warns, emits the "Failed to create buffer" notice, and
+            // returns false without pushing. A throwing autoloader's
+            // exception propagates after the diagnostics.
+            match &h {
+                None | Some(Value::Null) => {}
+                Some(v) if it.is_callable_value(v) => {
+                    it.take_callable_probe_err();
+                }
+                Some(v) => {
+                    let detail = it.zpp_callback_detail(v);
+                    it.warn_pub(&format!("ob_start(): {}", detail))?;
+                    it.notice_pub("ob_start(): Failed to create buffer")?;
+                    if let Some(pe) = it.take_callable_probe_err() {
+                        return Err(pe);
+                    }
+                    return Ok(Some(Value::Bool(false)));
+                }
+            }
             it.ob_push(h);
             Value::Bool(true)
         }

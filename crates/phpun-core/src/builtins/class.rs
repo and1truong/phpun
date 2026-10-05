@@ -99,11 +99,16 @@ pub(crate) fn dispatch(
                 let mut a = PhpArray::new();
                 if name == "get_mangled_object_vars" {
                     // Raw slots with mangled keys — no hooks
-                    // (property_hooks/dump).
+                    // (property_hooks/dump); int-keyed buckets decode
+                    // to int keys.
                     let ob = o.borrow();
                     for n in &ob.prop_order {
                         if let Some(c) = ob.props.get(n) {
-                            a.set(ArrKey::Str(n.clone().into()), c.borrow().clone());
+                            let k = match crate::value::int_prop_index(n) {
+                                Some(i) => ArrKey::Int(i),
+                                None => ArrKey::Str(n.clone().into()),
+                            };
+                            a.set(k, c.borrow().clone());
                         }
                     }
                 } else {
@@ -135,7 +140,11 @@ pub(crate) fn dispatch(
                             None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
                         };
                         if let Some(v) = v {
-                            a.set(ArrKey::Str(out.into()), v);
+                            let k = match crate::value::int_prop_index(&out) {
+                                Some(i) => ArrKey::Int(i),
+                                None => ArrKey::Str(out.into()),
+                            };
+                            a.set(k, v);
                         }
                     }
                 }

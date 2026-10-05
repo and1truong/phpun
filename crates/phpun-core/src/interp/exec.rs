@@ -218,8 +218,16 @@ impl<'a> Interp<'a> {
                             if start.is_none() {
                                 match self.eval(ce) {
                                     Ok(v) => {
+                                        crate::value::clear_cmp_depth_err();
                                         if compare(&cv, &v) == Ordering::Equal {
                                             start = Some(i);
+                                        }
+                                        if crate::value::cmp_depth_err() {
+                                            return self.err_flow(PhpError::uncaught(
+                                                "Error",
+                                                "Nesting level too deep - recursive dependency?",
+                                                self.cur_line,
+                                            ));
                                         }
                                     }
                                     Err(e) => return self.err_flow(e),
@@ -910,8 +918,13 @@ impl<'a> Interp<'a> {
                     pos += 1;
                     let (n, slot_key, dname) = ent;
                     // Spec entries are already scope-resolved; dynamics
-                    // are runtime slots checked against the caller.
-                    if !resolved_decl && !self.prop_visible(&cls, &dname) {
+                    // are runtime slots checked against the caller —
+                    // int-keyed buckets (SPL `[]=` appends) are public
+                    // dynamics that bypass name visibility.
+                    if !resolved_decl
+                        && crate::value::int_prop_index(&dname).is_none()
+                        && !self.prop_visible(&cls, &dname)
+                    {
                         continue;
                     }
                     // Resolve this entry: hooked props (backed or
@@ -1034,7 +1047,11 @@ impl<'a> Interp<'a> {
                         }
                     }
                     if let Some(ForeachKey::Var(kn)) = key {
-                        self.var_set(kn, Value::str(n.clone()));
+                        let kv = match crate::value::int_prop_index(&n) {
+                            Some(i) => Value::Int(i),
+                            None => Value::str(n.clone()),
+                        };
+                        self.var_set(kn, kv);
                     }
                     match val {
                         ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),

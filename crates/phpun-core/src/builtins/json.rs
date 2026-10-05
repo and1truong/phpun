@@ -168,6 +168,11 @@ fn json_enc(_it: &mut Interp, v: &Value, flags: i64, seen: &mut Vec<usize>) -> R
                 if !public {
                     continue;
                 }
+                // Int-keyed buckets encode their index as the name.
+                let out = match crate::value::int_prop_index(&out) {
+                    Some(i) => i.to_string(),
+                    None => out,
+                };
                 let v = match &decl {
                     Some((p, dcls)) => _it.serial_entry_value(o, p, dcls, &slot),
                     None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),

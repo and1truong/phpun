@@ -456,7 +456,10 @@ impl<'a> Interp<'a> {
                                     .borrow()
                                     .props
                                     .keys()
-                                    .filter_map(|k| k.parse::<i64>().ok())
+                                    // Only int-keyed buckets count —
+                                    // a "5" string prop doesn't move
+                                    // zend's next-index cursor.
+                                    .filter_map(|k| crate::value::int_prop_index(k))
                                     .max()
                                     .map(|m| m + 1);
                                 arr_max.max(prop_max).unwrap_or(0)
@@ -464,8 +467,20 @@ impl<'a> Interp<'a> {
                             // Int-keyed bucket only — dim reads resolve
                             // prop NAMES, so it stays unreachable via
                             // $ao[0] / isset (oracle: counted + iterated
-                            // but never readable).
-                            arr.borrow_mut().bind_cell(ArrKey::Int(next), cell(v));
+                            // but never readable). Zend lands the bucket
+                            // in the backing object's prop hash too — as
+                            // an INT-keyed slot — so dumps/count/casts
+                            // and foreach see it.
+                            let pc = cell(v);
+                            arr.borrow_mut().bind_cell(ArrKey::Int(next), pc.clone());
+                            {
+                                let mut so = src.borrow_mut();
+                                let pk = crate::value::int_prop_key(next);
+                                if !so.props.contains_key(&pk) {
+                                    so.prop_order.push(pk.clone());
+                                }
+                                so.props.insert(pk, pc);
+                            }
                             return Ok(Some(Value::Null));
                         }
                         arr.borrow_mut().push(v)
@@ -1201,9 +1216,14 @@ impl<'a> Interp<'a> {
             if !so.props.contains_key(&pname) {
                 so.prop_order.push(pname.clone());
             }
-            so.props.insert(pname, pc.clone());
+            so.props.insert(pname.clone(), pc.clone());
         }
-        arr.borrow_mut().bind_cell(k, pc);
+        // The prop HT is the storage hash — `$ao[5]` writes a STRING
+        // "5" slot (zend doesn't symtable-convert object prop names),
+        // so storage iterates it under the string key and `[]=`'s
+        // int-cursor doesn't see it.
+        arr.borrow_mut()
+            .bind_cell(ArrKey::Str(pname.into()), pc);
     }
 
     /// Object-backed storage mirrors the live prop table (zend keeps
@@ -1419,18 +1439,28 @@ impl<'a> Interp<'a> {
                 .iter()
                 // `\0Class\0priv` mangled names are visibility
                 // metadata — zend keeps private props out of the
-                // spl storage hash entirely.
-                .filter(|n| !n.starts_with('\0'))
+                // spl storage hash entirely; int-keyed buckets are
+                // real storage slots.
+                .filter(|n| {
+                    !n.starts_with('\0') || crate::value::int_prop_index(n).is_some()
+                })
                 .filter_map(|n| ob.props.get(n).map(|c| (n.clone(), c.clone())))
                 .collect();
             for (k, c) in &ob.props {
-                if !k.starts_with('\0') && !seen.iter().any(|(n, _)| n == k) {
+                if (!k.starts_with('\0') || crate::value::int_prop_index(k).is_some())
+                    && !seen.iter().any(|(n, _)| n == k)
+                {
                     seen.push((k.clone(), c.clone()));
                 }
             }
             seen
         };
         for (k, c) in pairs {
+            // Int-keyed prop slots mirror back as int array keys.
+            if let Some(i) = crate::value::int_prop_index(&k) {
+                copy.bind_cell(ArrKey::Int(i), c.clone());
+                continue;
+            }
             let pn = k.rsplit('\0').next().unwrap_or(&k).to_string();
             if let Some((pd, dcls)) = self.decl_prop(o, &pn) {
                 let p = Rc::as_ptr(&c) as usize;

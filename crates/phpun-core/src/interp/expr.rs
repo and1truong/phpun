@@ -274,7 +274,16 @@ impl<'a> Interp<'a> {
                     }
                     for c in &arm.conds {
                         let cv = self.eval(c)?;
-                        if identical(&sv, &cv) {
+                        crate::value::clear_cmp_depth_err();
+                        let hit = identical(&sv, &cv);
+                        if crate::value::cmp_depth_err() {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                "Nesting level too deep - recursive dependency?",
+                                self.cur_line,
+                            ));
+                        }
+                        if hit {
                             return self.eval(&arm.result);
                         }
                     }
@@ -1105,7 +1114,9 @@ impl<'a> Interp<'a> {
             // element access $GLOBALS['x'] is fine.
             if let Expr::Var(n) = value {
                 if n == "GLOBALS" {
-                    return self.fail(PhpError::fatal(
+                    // Engine-side fatal — zend prints the
+                    // `Stack trace:\n#0 {main}` block too.
+                    return self.fail(PhpError::compile_fatal(
                         "Cannot acquire reference to $GLOBALS",
                         self.cur_line,
                     ));
@@ -3846,7 +3857,7 @@ impl<'a> Interp<'a> {
             }
             "==" | "!=" | "===" | "!==" | "<" | "<=" | ">" | ">=" | "<=>" => {
                 let (lv, rv) = self.binary_operands(l, r)?;
-                Ok(self.compare_op(op, &lv, &rv))
+                self.compare_op(op, &lv, &rv)
             }
             "named" => self.eval(r), // named-arg marker: value passthrough
             _ => {
@@ -3875,18 +3886,19 @@ impl<'a> Interp<'a> {
         Ok((lv, rv))
     }
 
-    fn compare_op(&self, op: &str, a: &Value, b: &Value) -> Value {
+    fn compare_op(&mut self, op: &str, a: &Value, b: &Value) -> Result<Value, PhpError> {
         // NaN is unordered: every ordered comparison is false, <=> is -1.
         let nan = matches!((a, b), (Value::Float(f), _) | (_, Value::Float(f)) if f.is_nan());
         if nan {
-            return match op {
+            return Ok(match op {
                 "===" | "!==" => Value::Bool((op == "!==") != identical(a, b)),
                 "==" | "!=" => Value::Bool(op == "!="),
                 "<=>" => Value::Int(-1),
                 _ => Value::Bool(false),
-            };
+            });
         }
-        match op {
+        crate::value::clear_cmp_depth_err();
+        let v = match op {
             "===" => Value::Bool(identical(a, b)),
             "!==" => Value::Bool(!identical(a, b)),
             "==" => Value::Bool(compare(a, b) == Ordering::Equal),
@@ -3901,7 +3913,15 @@ impl<'a> Interp<'a> {
             ">" => Value::Bool(compare(a, b) == Ordering::Greater),
             ">=" => Value::Bool(compare(a, b) != Ordering::Less),
             _ => unreachable!(),
+        };
+        if crate::value::cmp_depth_err() {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Nesting level too deep - recursive dependency?",
+                self.cur_line,
+            ));
         }
+        Ok(v)
     }
 
     /// Arithmetic / bitwise with PHP numeric-string coercion.
@@ -4173,10 +4193,31 @@ impl<'a> Interp<'a> {
                 // mangled) keys — hooks are not run (dump.phpt).
                 Value::Object(o) => {
                     let mut a = PhpArray::new();
+                    // spl array-objects cast their STORAGE hash, not
+                    // the object's own props (zend get_properties_for).
+                    if matches!(
+                        o.borrow().internal,
+                        Some(crate::value::ObjectInternal::ArrayIter { .. })
+                    ) {
+                        let arr = self.ao_arr(&o);
+                        for (k, c) in arr.borrow().iter() {
+                            if let ArrKey::Tomb = k {
+                                continue;
+                            }
+                            a.set(k.clone(), c.borrow().clone());
+                        }
+                        return Ok(Value::Array(Rc::new(RefCell::new(a))));
+                    }
                     let ob = o.borrow();
                     for n in &ob.prop_order {
                         if let Some(c) = ob.props.get(n) {
-                            a.set(ArrKey::Str(n.clone().into()), c.borrow().clone());
+                            // Int-keyed buckets decode to int keys like
+                            // zend's property-HT int slots.
+                            let k = match crate::value::int_prop_index(n) {
+                                Some(i) => ArrKey::Int(i),
+                                None => ArrKey::Str(n.clone().into()),
+                            };
+                            a.set(k, c.borrow().clone());
                         }
                     }
                     Value::Array(Rc::new(RefCell::new(a)))

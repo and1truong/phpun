@@ -96,7 +96,15 @@ pub(crate) fn dispatch(
             // ZPP `f` flag: the callback validates eagerly — an
             // invalid one throws TypeError naming the arg before any
             // side effects (bug45186's `cannot access "self"`).
+            // forward_static_call* propagates a throwing autoloader's
+            // exception; only the call_user_func family wraps it in
+            // its own TypeError.
             if !it.is_callable_value(&cb) {
+                if name.starts_with("forward_static_call") {
+                    if let Some(pe) = it.take_callable_probe_err() {
+                        return Err(pe);
+                    }
+                }
                 return err(
                     "TypeError",
                     format!(
