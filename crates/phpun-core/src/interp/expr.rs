@@ -1097,6 +1097,17 @@ impl<'a> Interp<'a> {
             }
         }
         if op == "=&" {
+            // zend refuses the $GLOBALS table itself as a by-ref source
+            // (compile error `Cannot acquire reference to $GLOBALS`) —
+            // element access $GLOBALS['x'] is fine.
+            if let Expr::Var(n) = value {
+                if n == "GLOBALS" {
+                    return self.fail(PhpError::fatal(
+                        "Cannot acquire reference to $GLOBALS",
+                        self.cur_line,
+                    ));
+                }
+            }
             // By-reference assignment: bind cells.
             let src = match value {
                 Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. } => {

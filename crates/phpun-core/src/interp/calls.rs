@@ -269,7 +269,11 @@ impl<'a> Interp<'a> {
             };
             if by_ref {
                 match expr {
-                    Expr::Var(_) | Expr::Index { .. } | Expr::Prop { .. } | Expr::VarVar(_) => {
+                    Expr::Var(_) | Expr::Index { .. } | Expr::Prop { .. } | Expr::VarVar(_)
+                        // zend's SEND_REF check rejects the $GLOBALS
+                        // table itself (its elements are fine).
+                        if !matches!(expr, Expr::Var(n) if n == "GLOBALS") =>
+                    {
                         match self.eval_cell(expr) {
                             Ok(c) => {
                                 if let Some(n) = name {
