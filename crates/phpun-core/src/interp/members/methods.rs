@@ -1222,8 +1222,7 @@ impl<'a> Interp<'a> {
         // "5" slot (zend doesn't symtable-convert object prop names),
         // so storage iterates it under the string key and `[]=`'s
         // int-cursor doesn't see it.
-        arr.borrow_mut()
-            .bind_cell(ArrKey::Str(pname.into()), pc);
+        arr.borrow_mut().bind_cell(ArrKey::Str(pname.into()), pc);
     }
 
     /// Object-backed storage mirrors the live prop table (zend keeps
@@ -1441,9 +1440,7 @@ impl<'a> Interp<'a> {
                 // metadata — zend keeps private props out of the
                 // spl storage hash entirely; int-keyed buckets are
                 // real storage slots.
-                .filter(|n| {
-                    !n.starts_with('\0') || crate::value::int_prop_index(n).is_some()
-                })
+                .filter(|n| !n.starts_with('\0') || crate::value::int_prop_index(n).is_some())
                 .filter_map(|n| ob.props.get(n).map(|c| (n.clone(), c.clone())))
                 .collect();
             for (k, c) in &ob.props {
