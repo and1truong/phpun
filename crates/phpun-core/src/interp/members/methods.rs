@@ -726,6 +726,11 @@ impl<'a> Interp<'a> {
                         return self.fail(e);
                     }
                 };
+                if data.is_empty() {
+                    // zend returns early on an empty payload — storage
+                    // is left untouched, no error.
+                    return Ok(Some(Value::Null));
+                }
                 match self.ao_parse_payload(&data) {
                     Ok((pflags, sv, parr)) => {
                         // Storage goes through ao_backing like
@@ -1455,60 +1460,79 @@ impl<'a> Interp<'a> {
         props
     }
 
-    /// Parse the legacy spl payload `x:i:<flags>;<a:…>;m:<props>` —
-    /// returns (storage, props) or Err(consumed-offset).
+    /// Parse the legacy spl payload `x:i:<flags>;<storage>;m:<props>` —
+    /// returns (flags, storage, props) or Err(zend's reported offset):
+    /// the literal-match position for `x:`/`;`/m`:` separators, or the
+    /// sub-parse's own start offset for flags/storage/props failures.
     fn ao_parse_payload(&mut self, data: &str) -> Result<AoUnserData, usize> {
         let b = data.as_bytes();
         let mut pos = 0usize;
-        // x:i:<flags>; — flags are consumed but not restored by
-        // serialize()/unserialize() (zend stores them in the payload but
-        // a plain unserialize doesn't write ar_flags? — zend DOES read
-        // flags from x:; keep them).
-        if !data.starts_with("x:i:") {
-            return Err(0);
+        if b.get(pos) != Some(&b'x') {
+            return Err(pos);
         }
-        pos += 4;
+        pos += 1;
+        if b.get(pos) != Some(&b':') {
+            return Err(pos);
+        }
+        pos += 1;
+        // flags `i:<int>;` — any failure inside reports offset 2.
         let fstart = pos;
+        if b.get(pos) != Some(&b'i') {
+            return Err(fstart);
+        }
+        pos += 1;
+        if b.get(pos) != Some(&b':') {
+            return Err(fstart);
+        }
+        pos += 1;
+        let dstart = pos;
         while pos < b.len() && b[pos] != b';' {
             pos += 1;
         }
         if pos >= b.len() {
-            return Err(pos);
+            return Err(fstart);
         }
-        let fl: i64 = data[fstart..pos].parse().map_err(|_| pos)?;
+        let fl: i64 = data[dstart..pos].parse().map_err(|_| fstart)?;
         pos += 1; // ;
-                  // storage: serialized array|object — zend reports a
-                  // bad storage value at its start offset.
+                  // storage: serialized array|object — zend reports the
+                  // sub-parse's start offset, not where inside it died.
         let st_start = pos;
         let mut vhash: Vec<crate::value::Cell> = Vec::new();
         let sv = {
             let mut ie = None;
             crate::builtins::var::php_unserialize(self, data, &mut pos, &mut ie, &mut vhash)
-                .map_err(|_| pos)?
+                .map_err(|_| st_start)?
                 .borrow()
                 .clone()
         };
         if !matches!(sv, Value::Array(_) | Value::Object(_)) {
             return Err(st_start);
         }
-        // ;m:<props>
-        if pos + 2 >= b.len() || &data[pos..pos + 3] != ";m:" {
+        // `;m:` — each separator char reports its own position.
+        if b.get(pos) != Some(&b';') {
             return Err(pos);
         }
-        pos += 3;
+        pos += 1;
+        if b.get(pos) != Some(&b'm') {
+            return Err(pos);
+        }
+        pos += 1;
+        if b.get(pos) != Some(&b':') {
+            return Err(pos);
+        }
+        pos += 1;
+        let pr_start = pos;
         let pr = {
             let mut ie = None;
             crate::builtins::var::php_unserialize(self, data, &mut pos, &mut ie, &mut vhash)
-                .map_err(|_| pos)?
+                .map_err(|_| pr_start)?
                 .borrow()
                 .clone()
         };
         let Value::Array(pr) = pr else {
-            return Err(pos);
+            return Err(pr_start);
         };
-        if pos != b.len() {
-            return Err(pos);
-        }
+        // Trailing bytes after the props payload are ignored by zend.
         Ok((fl, sv, pr))
     }
 

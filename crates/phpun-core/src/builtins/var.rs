@@ -1101,45 +1101,47 @@ pub(crate) fn php_unserialize(
             *pos += 1; // :
             let plen: usize = take_until(pos, b':')?.parse().map_err(|_| ())?;
             *pos += 1; // {
-            let payload_start = *pos;
-            if *pos + plen > b.len() {
+                     // zend bounds-checks the payload AND its closing `}`
+                     // together — past the end it warns "Insufficient data"
+                     // and fails at the payload start.
+            if *pos + plen >= b.len() {
+                let _ = it.warn_pub(&format!(
+                    "Insufficient data for unserializing - {} required, {} present",
+                    plen,
+                    b.len() - *pos
+                ));
+                return Err(());
+            }
+            // A payload whose plen doesn't land exactly on `}` fails AT
+            // the offending byte.
+            if b[*pos + plen] != b'}' {
+                *pos += plen;
                 return Err(());
             }
             let payload = String::from_utf8_lossy(&b[*pos..*pos + plen]).into_owned();
-            *pos += plen;
-            *pos += 1; // }
+            *pos += plen + 1; // payload + }
             let obj = match it.instantiate(&cname.to_lowercase(), &[]) {
                 Ok(Value::Object(o)) => o,
                 _ => return Err(()),
             };
             let this = cell(Value::Object(obj.clone()));
             vhash.push(this.clone());
-            if let Err(e) = it.method_invoke(
-                obj.clone(),
-                "unserialize",
-                crate::interp::CallArgs::positional(vec![cell(Value::str(payload.clone()))]),
-            ) {
-                // A NATIVE handler failing (spl storage parse) warns
-                // inside zend and the whole unserialize() returns
-                // false — only a userland ->unserialize() throw
-                // propagates as an exception.
-                let native_unserialize = it
-                    .find_method_in(&obj.borrow().class, "unserialize")
-                    .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
-                    .unwrap_or(true);
-                if native_unserialize {
-                    it.clear_pending_exception();
-                    let _ = it.warn_pub(&format!(
-                        "Insufficient data for unserializing - {} required, {} present",
-                        plen, plen
-                    ));
-                    // zend reports the inner payload's parse offset —
-                    // the element start right after '{'.
-                    *pos = payload_start;
+            if it.obj_implements(&obj, "serializable") {
+                if let Err(e) = it.method_invoke(
+                    obj.clone(),
+                    "unserialize",
+                    crate::interp::CallArgs::positional(vec![cell(Value::str(payload))]),
+                ) {
+                    // zend propagates whatever ->unserialize() throws — a
+                    // native spl storage-parse failure surfaces as its
+                    // UnexpectedValueException, a userland throw as itself.
+                    *err = Some(e);
                     return Err(());
                 }
-                *err = Some(e);
-                return Err(());
+            } else {
+                // No Serializable: zend warns and still returns the
+                // (uninitialized) object.
+                let _ = it.warn_pub(&format!("Class {} has no unserializer", cname));
             }
             Ok(this)
         }
