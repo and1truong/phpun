@@ -726,7 +726,10 @@ impl<'a> Interp<'a> {
                     Some(k) => self.eval(k)?,
                     None => return Ok(None),
                 };
-                self.check_offset_key(&key)?;
+                // ArrayAccess containers see any key type (offsetExists).
+                if !matches!(&base, Value::Object(o) if self.obj_is_a(o, "ArrayAccess")) {
+                    self.check_offset_key(&key)?;
+                }
                 match base {
                     Value::Array(a) => Ok(match a.borrow().get(&to_key(&key)) {
                         Some(v) => match v {
@@ -2164,12 +2167,6 @@ impl<'a> Interp<'a> {
         let mut c = self.eval_cell(e)?;
         let last = keys.len() - 1;
         for (n, k) in keys.iter().enumerate() {
-            // Illegal offset types must not fall into the string-offset
-            // fallback — the key Error propagates
-            // (closure_array_offset_error).
-            if let Some(kv) = k {
-                self.check_offset_key(kv)?;
-            }
             // Auto-init gate: writing through a typed slot that is
             // null (or a just-materialized uninit slot) must produce
             // `Cannot auto-initialize an array inside property ...`
@@ -2186,6 +2183,15 @@ impl<'a> Interp<'a> {
                     _ => None,
                 }
             };
+            // Illegal offset types must not fall into the string-offset
+            // fallback — the key Error propagates
+            // (closure_array_offset_error). ArrayAccess containers see
+            // any key type — offsetSet receives it raw.
+            if let Some(kv) = k {
+                if as_obj.is_none() {
+                    self.check_offset_key(kv)?;
+                }
+            }
             if let Some(o) = as_obj {
                 if n == last {
                     match self.method_invoke(
@@ -2306,7 +2312,18 @@ impl<'a> Interp<'a> {
     /// `set_index` with an already-evaluated key.
     fn set_index_val(&mut self, e: &Expr, key: Option<Value>, v: Value) -> Result<(), PhpError> {
         if let Some(k) = &key {
-            self.check_offset_key(k)?;
+            // ArrayAccess containers take any key type — zend hands it
+            // to offsetSet untouched (SplObjectStorage keys on objects).
+            let obj_container = match e {
+                Expr::Var(n) => matches!(
+                    self.var_cell_opt(n).map(|c| c.borrow().clone()),
+                    Some(Value::Object(o)) if self.obj_is_a(&o, "ArrayAccess")
+                ),
+                _ => false,
+            };
+            if !obj_container {
+                self.check_offset_key(k)?;
+            }
         }
         match e {
             Expr::Var(name) => {
@@ -2523,7 +2540,11 @@ impl<'a> Interp<'a> {
     /// Index into `c`'s array value, taking a cell for `key`/`[]`.
     fn index_into_key(&mut self, c: Cell, key: Option<Value>) -> Result<Cell, PhpError> {
         if let Some(k) = &key {
-            self.check_offset_key(k)?;
+            // Objects route to index_cell_object (ArrayAccess accepts
+            // any key); only true arrays reject object keys.
+            if !matches!(&*c.borrow(), Value::Object(_)) {
+                self.check_offset_key(k)?;
+            }
         }
         let mut b = c.borrow_mut();
         if matches!(*b, Value::Null) {
@@ -2666,7 +2687,10 @@ impl<'a> Interp<'a> {
     }
 
     fn index_read_base(&mut self, base: Value, key: Value) -> Result<Value, PhpError> {
-        self.check_offset_key(&key)?;
+        // ArrayAccess containers see any key type (offsetGet).
+        if !matches!(&base, Value::Object(o) if self.obj_is_a(o, "ArrayAccess")) {
+            self.check_offset_key(&key)?;
+        }
         match base {
             Value::Array(rc) => {
                 let k = to_key(&key);

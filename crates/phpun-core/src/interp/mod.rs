@@ -2668,7 +2668,7 @@ class SplObjectStorage implements Countable, Iterator, ArrayAccess {
         $h = $this->hashOf($obj);
         unset($this->objs[$h], $this->data[$h]);
     }
-    public function getHash($obj) { return (string) $this->hashOf($obj); }
+    public function getHash($obj) { return spl_object_hash($obj); }
     public function count(): int { return count($this->objs); }
     // zend's info slot hangs off the CURRENT iterator element.
     public function setInfo($data) {
@@ -2690,14 +2690,14 @@ class SplObjectStorage implements Countable, Iterator, ArrayAccess {
     public function key(): int { return $this->idx; }
     public function next(): void { $this->idx++; }
     public function addAll($storage) {
-        foreach ($storage as $obj) { $this->attach($obj, $storage->getInfo()); }
+        foreach ($storage as $obj) { $this->offsetSet($obj, $storage->getInfo()); }
     }
     public function removeAll($storage) {
-        foreach ($storage as $obj) { $this->detach($obj); }
+        foreach ($storage as $obj) { $this->offsetUnset($obj); }
     }
     public function removeAllExcept($storage) {
         foreach ($this->objs as $h => $obj) {
-            if (!$storage->contains($obj)) { unset($this->objs[$h], $this->data[$h]); }
+            if (!$storage->offsetExists($obj)) { unset($this->objs[$h], $this->data[$h]); }
         }
     }
     // zend serializes SplObjectStorage as [flat obj,info pairs, dynamic props].

@@ -1729,6 +1729,23 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        // zend 8.5 deprecates SplObjectStorage's pre-offset* aliases —
+        // the engine body still runs, so a subclass's own override
+        // does NOT warn (dc differs from SplObjectStorage then).
+        if dc.name().eq_ignore_ascii_case("splobjectstorage") {
+            let alias = match m.decl.name.to_lowercase().as_str() {
+                "attach" => Some("offsetSet"),
+                "detach" => Some("offsetUnset"),
+                "contains" => Some("offsetExists"),
+                _ => None,
+            };
+            if let Some(new) = alias {
+                self.deprecated(&format!(
+                    "Method SplObjectStorage::{}() is deprecated since 8.5, use method SplObjectStorage::{}() instead",
+                    m.decl.name, new
+                ))?;
+            }
+        }
         let called = obj.borrow().class.clone();
         self.pending_decl_class = Some(dc.clone());
         self.pending_called_class = Some(called);
