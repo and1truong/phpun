@@ -1549,7 +1549,13 @@ impl<'a> Parser<'a> {
                         "require_once" => IncludeKind::RequireOnce,
                         _ => IncludeKind::Eval,
                     };
-                    let e = if self.eat_op("(") {
+                    // zend grammar: `T_INCLUDE expr` — the operand is a
+                    // full expression at include's very low precedence,
+                    // so `include ('/f') == 5` includes the bool result
+                    // (zend throws "Path cannot be empty"). `eval` is
+                    // `T_EVAL '(' expr ')'` — its parens are syntax.
+                    let e = if kind == IncludeKind::Eval {
+                        self.expect_op("(")?;
                         let e = self.expr()?;
                         self.expect_op(")")?;
                         e

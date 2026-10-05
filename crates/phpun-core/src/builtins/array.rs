@@ -863,10 +863,7 @@ pub(crate) fn dispatch(
         }
         "sort" | "rsort" | "asort" | "arsort" | "ksort" | "krsort" | "usort" | "uasort"
         | "uksort" | "natsort" | "natcasesort" | "shuffle" => {
-            if let Some(rc) = it.arr_mut(&args[0]) {
-                let mut arr = rc.borrow_mut();
-                sort_array(it, &mut arr, name, args.get(1))?;
-            }
+            sort_array(it, &args[0], name, args.get(1))?;
             Value::Bool(true)
         }
         "array_multisort" => {
@@ -964,12 +961,13 @@ pub(crate) fn dispatch(
                 }
                 col_entries.push(entries);
             }
+            let mut pending: Deferred = None;
             let mut perm: Vec<usize> = (0..n_rows).collect();
             perm.sort_by(|&x, &y| {
                 for (ci, col) in cols.iter().enumerate() {
                     let va = col_entries[ci][x].1.borrow();
                     let vb = col_entries[ci][y].1.borrow();
-                    let c = ms_cmp(&va, &vb, col.flag);
+                    let c = data_cmp(it, &va, &vb, col.flag as i64, &mut pending);
                     let c = if col.desc { c.reverse() } else { c };
                     if c != std::cmp::Ordering::Equal {
                         return c;
@@ -977,6 +975,9 @@ pub(crate) fn dispatch(
                 }
                 std::cmp::Ordering::Equal
             });
+            if let Some(e) = deferred_err(it, pending) {
+                return Err(e);
+            }
             // Write each column back: numeric keys renumber, others preserved.
             for (ci, col) in cols.iter().enumerate() {
                 let mut arr = col.arr.borrow_mut();
@@ -1156,122 +1157,345 @@ pub(crate) fn dispatch(
 
 // ----- helpers -----
 
+/// zend_hash_sort compacts tombstones and dups the array for user
+/// sorts — either way the compare loop sees the live entries only.
+fn sort_snapshot(entries: &[(ArrKey, Cell)]) -> Vec<crate::value::SortElem> {
+    entries
+        .iter()
+        .filter(|(k, _)| !matches!(k, ArrKey::Tomb))
+        .cloned()
+        .enumerate()
+        .map(|(i, (k, c))| (i as u32, k, c))
+        .collect()
+}
+
+/// `php_get_data_compare_func`: `sort_type & ~SORT_FLAG_CASE` picks the
+/// comparator — SORT_NUMERIC is a THREEWAY on zval_get_double,
+/// SORT_STRING/SORT_LOCALE_STRING strcmp (+8 → strcasecmp) on
+/// zval_get_tmp_string (deferred conversion errors land in `pending`),
+/// SORT_NATURAL strnatcmp (+8 → strnatcasecmp), anything else is
+/// SORT_REGULAR's zend_compare.
+fn data_cmp(
+    it: &mut Interp,
+    x: &Value,
+    y: &Value,
+    flag: i64,
+    pending: &mut Deferred,
+) -> std::cmp::Ordering {
+    let ci = flag & 8 != 0;
+    match flag & !8 {
+        1 => crate::value::num_cmp(x.to_float(), y.to_float()),
+        2 | 5 => {
+            let xs = ztmp_str(it, x, pending);
+            let ys = ztmp_str(it, y, pending);
+            if ci {
+                fold_case(&xs).cmp(&fold_case(&ys))
+            } else {
+                xs.cmp(&ys)
+            }
+        }
+        6 => {
+            let xs = ztmp_str(it, x, pending);
+            let ys = ztmp_str(it, y, pending);
+            natcmp(&xs, &ys, ci)
+        }
+        _ => compare(x, y),
+    }
+}
+
+/// `php_get_key_compare_func`: SORT_NUMERIC parses leading-numerics
+/// (`zend_strtod` — "2a" → 2.0, "x" → 0.0); string-ish flags compare
+/// the key's printed form; anything else is `php_array_key_compare` —
+/// int×int ±1, str×str `zendi_smart_strcmp`, mixed zend_compare.
+fn key_cmp(x: &ArrKey, y: &ArrKey, flag: i64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let ci = flag & 8 != 0;
+    match flag & !8 {
+        1 => crate::value::num_cmp(key_strtod(x), key_strtod(y)),
+        2 | 5 => {
+            let xs = key_bytes(x);
+            let ys = key_bytes(y);
+            if ci {
+                fold_case(&xs).cmp(&fold_case(&ys))
+            } else {
+                xs.cmp(&ys)
+            }
+        }
+        6 => natcmp(&key_bytes(x), &key_bytes(y), ci),
+        _ => match (x, y) {
+            // Unique keys → zend never reports int keys equal.
+            (ArrKey::Int(a), ArrKey::Int(b)) => {
+                if a > b {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (ArrKey::Str(a), ArrKey::Str(b)) => {
+                crate::value::smart_strcmp(a.as_bytes(), b.as_bytes())
+            }
+            _ => compare(
+                &crate::interp::util::key_value(x),
+                &crate::interp::util::key_value(y),
+            ),
+        },
+    }
+}
+
+fn key_bytes(k: &ArrKey) -> Vec<u8> {
+    match k {
+        ArrKey::Int(i) => i.to_string().into_bytes(),
+        ArrKey::Str(s) => s.as_bytes().to_vec(),
+        ArrKey::Tomb => Vec::new(),
+    }
+}
+
+/// zend_strtod on the key's printed form — leading-parse only.
+fn key_strtod(k: &ArrKey) -> f64 {
+    match k {
+        ArrKey::Int(i) => *i as f64,
+        ArrKey::Str(s) => match crate::value::numeric(s.as_bytes()) {
+            crate::value::Numeric::Int(i) => i as f64,
+            crate::value::Numeric::Float(f) | crate::value::Numeric::Leading(f, _) => f,
+            crate::value::Numeric::NonNumeric => 0.0,
+        },
+        ArrKey::Tomb => 0.0,
+    }
+}
+
+/// The zend_sort driver every flag-taking sort goes through (global
+/// builtins AND the SPL ArrayObject/ArrayIterator methods — zend's SPL
+/// hands its storage HashTable straight to the same functions). Takes a
+/// pre-cloned entry list — no borrow may be held while user code
+/// (`__toString`, error handlers) runs inside a comparator — and
+/// returns the sorted entries with the depth-err flag so the caller
+/// writes back wherever its storage resolves and throws "Nesting level
+/// too deep" only after the array has been permuted like zend's.
+pub(crate) fn zend_sort_flags(
+    it: &mut Interp,
+    entries: &[(ArrKey, Cell)],
+    flag: i64,
+    desc: bool,
+    by_key: bool,
+) -> (Vec<(ArrKey, Cell)>, bool, Option<PhpError>) {
+    crate::value::clear_cmp_depth_err();
+    let mut pending: Deferred = None;
+    let mut deep = false;
+    let mut v = sort_snapshot(entries);
+    crate::value::zend_sort(&mut v, &mut |x, y| {
+        let r = if by_key {
+            key_cmp(&x.1, &y.1, flag)
+        } else {
+            data_cmp(it, &x.2.borrow(), &y.2.borrow(), flag, &mut pending)
+        };
+        deep |= crate::value::cmp_depth_err();
+        // Reverse sorts in zend are `inner(a, b) * -1` — result negation
+        // (a cyclic UNCOMPARABLE keeps sorting as "less"), not a swap
+        // of operands.
+        let r = if desc { r.reverse() } else { r };
+        if r != std::cmp::Ordering::Equal {
+            r
+        } else {
+            // RETURN_STABLE_SORT: ties fall back on insertion position.
+            x.0.cmp(&y.0)
+        }
+    });
+    // zend sorts ht->arData in place: a mid-sort conversion Error
+    // leaves the partially-permuted table visible after the throw.
+    let conv_err = deferred_err(it, pending);
+    (
+        v.into_iter().map(|(_, k, c)| (k, c)).collect(),
+        deep,
+        conv_err,
+    )
+}
+
+/// `php_usort` family: zend dups the array so the callback sees the
+/// pre-sort contents (a callback's own writes to the argument are
+/// discarded when the sorted copy replaces it — snapshot, don't take).
+/// A bool retval deprecates once per sort; `false` retries the
+/// comparison with swapped operands and negates the result. A thrown
+/// error keeps the sort running (retval UNDEF → 0 → equal); the caller
+/// still writes the sorted entries back, then the error propagates.
+pub(crate) fn zend_sort_user(
+    it: &mut Interp,
+    entries: &[(ArrKey, Cell)],
+    cb: &Value,
+    by_key: bool,
+    fname: &str,
+) -> (Vec<(ArrKey, Cell)>, Option<PhpError>) {
+    crate::value::clear_cmp_depth_err();
+    let mut cb_err: Option<PhpError> = None;
+    let mut dep_thrown = false;
+    let mut v = sort_snapshot(entries);
+    let call = |it: &mut Interp, x: &crate::value::SortElem, y: &crate::value::SortElem| {
+        // zend passes the bucket zvals BY VALUE — a `&$k` param warns
+        // "must be passed by reference, value given" and binds a copy,
+        // so callback writes can never reach the sorted storage.
+        let args = if by_key {
+            crate::interp::CallArgs::positional(vec![
+                cell(crate::interp::util::key_value(&x.1)),
+                cell(crate::interp::util::key_value(&y.1)),
+            ])
+        } else {
+            crate::interp::CallArgs::positional(vec![
+                cell(x.2.borrow().clone()),
+                cell(y.2.borrow().clone()),
+            ])
+        };
+        let mut args = args;
+        args.nonref_cells = vec![0, 1];
+        it.call_value(cb, args)
+    };
+    crate::value::zend_sort(&mut v, &mut |x, y| {
+        // zend keeps the comparator running after an exception but the
+        // call short-circuits (retval UNDEF → 0) — the callback body
+        // does NOT execute again once it threw.
+        if cb_err.is_some() {
+            return x.0.cmp(&y.0);
+        }
+        let r = match call(it, x, y) {
+            Err(e) => {
+                if cb_err.is_none() {
+                    cb_err = Some(e);
+                }
+                std::cmp::Ordering::Equal
+            }
+            Ok(Value::Bool(true)) => {
+                if !dep_thrown {
+                    dep_thrown = true;
+                    let r = it.deprecated_pub(&format!(
+                        "{}(): Returning bool from comparison function is deprecated, return an integer less than, equal to, or greater than zero",
+                        fname
+                    ));
+                    if let Err(e) = r {
+                        if cb_err.is_none() {
+                            cb_err = Some(e);
+                        }
+                    }
+                }
+                // php_get_long(true) → 1 → NORMALIZE → greater.
+                std::cmp::Ordering::Greater
+            }
+            Ok(Value::Bool(false)) => {
+                if !dep_thrown {
+                    dep_thrown = true;
+                    let r = it.deprecated_pub(&format!(
+                        "{}(): Returning bool from comparison function is deprecated, return an integer less than, equal to, or greater than zero",
+                        fname
+                    ));
+                    if let Err(e) = r {
+                        if cb_err.is_none() {
+                            cb_err = Some(e);
+                        }
+                    }
+                }
+                // zend retries the swapped pair and NEGATES the result.
+                match call(it, y, x) {
+                    Err(e) => {
+                        if cb_err.is_none() {
+                            cb_err = Some(e);
+                        }
+                        std::cmp::Ordering::Equal
+                    }
+                    Ok(r) => match r.to_int() {
+                        i if i > 0 => std::cmp::Ordering::Less,
+                        i if i < 0 => std::cmp::Ordering::Greater,
+                        _ => std::cmp::Ordering::Equal,
+                    },
+                }
+            }
+            // php_get_long on the retval, ZEND_NORMALIZE_BOOL.
+            Ok(r) => match r.to_int() {
+                i if i > 0 => std::cmp::Ordering::Greater,
+                i if i < 0 => std::cmp::Ordering::Less,
+                _ => std::cmp::Ordering::Equal,
+            },
+        };
+        if r != std::cmp::Ordering::Equal {
+            r
+        } else {
+            x.0.cmp(&y.0)
+        }
+    });
+    let sorted: Vec<(ArrKey, Cell)> = v.into_iter().map(|(_, k, c)| (k, c)).collect();
+    // zend replaces the arg's array with the sorted dup BEFORE the
+    // pending callback error propagates — the write-back is the
+    // caller's job on either outcome.
+    (sorted, cb_err)
+}
+
+fn need_callback_arg(it: &mut Interp, name: &str, cb: &Value) -> PhpError {
+    let detail = it.zpp_callback_detail(cb);
+    PhpError::uncaught(
+        "TypeError",
+        format!(
+            "{}(): Argument #2 ($callback) must be a valid callback, {}",
+            name, detail
+        ),
+        it.cur_line,
+    )
+}
+
 fn sort_array(
     it: &mut Interp,
-    arr: &mut PhpArray,
+    cell: &Cell,
     name: &str,
     cb_arg: Option<&Cell>,
 ) -> Result<(), PhpError> {
+    let renumber = matches!(name, "sort" | "rsort" | "usort" | "shuffle");
     match name {
-        "sort" | "rsort" => {
-            // zend aborts mid-sort on a depth Error — accumulate the
-            // flag per compare and throw after.
-            if crate::value::zend_sort_data(&mut arr.entries, name == "rsort") {
-                return depth_err();
-            }
-            // renumber
-            let mut i = 0;
-            for (k, _) in arr.entries.iter_mut() {
-                *k = ArrKey::Int(i);
-                i += 1;
-            }
-            arr.next = i;
-        }
-        // natsort/natcasesort compare naturally and keep keys (like asort).
-        "natsort" | "natcasesort" => {
-            let ci = name == "natcasesort";
-            let mut v = crate::value::zend_sort_prepare(&mut arr.entries);
-            crate::value::zend_sort(&mut v, &mut |x, y| {
-                let r = natcmp(
-                    &x.2.borrow().to_php_bytes(),
-                    &y.2.borrow().to_php_bytes(),
-                    ci,
-                );
-                if r != std::cmp::Ordering::Equal {
-                    r
-                } else {
-                    x.0.cmp(&y.0)
-                }
-            });
-            crate::value::zend_sort_finish(&mut arr.entries, v);
-        }
-        "asort" | "arsort" => {
-            if crate::value::zend_sort_data(&mut arr.entries, name == "arsort") {
-                return depth_err();
-            }
-        }
-        "ksort" | "krsort" => {
-            // php_array_key_compare + zend_sort: int×int numeric (zend
-            // returns ±1, never 0 — keys are unique), str×str bytewise
-            // (zendi_smart_strcmp — string keys are never numeric), and
-            // mixed int×str through loose zend_compare — NOT a fixed
-            // int-before-str order, and non-transitive on inputs like
-            // "10x" vs 2, where the pairing decides.
-            let kv = |k: &ArrKey| match k {
-                ArrKey::Int(i) => Value::Int(*i),
-                ArrKey::Str(s) => Value::str(s.to_string()),
-                ArrKey::Tomb => Value::Null,
+        "sort" | "rsort" | "asort" | "arsort" | "ksort" | "krsort" | "natsort" | "natcasesort" => {
+            let Some(arr) = it.arr_mut(cell) else {
+                return Ok(());
             };
-            let desc = name == "krsort";
-            let mut v = crate::value::zend_sort_prepare(&mut arr.entries);
-            crate::value::zend_sort(&mut v, &mut |x, y| {
-                let r = match (&x.1, &y.1) {
-                    (ArrKey::Int(a), ArrKey::Int(b)) => a.cmp(b),
-                    // str×str zendi_smart_strcmp and mixed int×str both
-                    // reduce to loose compare on the key zvals.
-                    _ => compare(&kv(&x.1), &kv(&y.1)),
-                };
-                let r = if desc { r.reverse() } else { r };
-                if r != std::cmp::Ordering::Equal {
-                    r
-                } else {
-                    x.0.cmp(&y.0)
-                }
-            });
-            crate::value::zend_sort_finish(&mut arr.entries, v);
+            let src = arr.borrow().entries.clone();
+            let (flag, desc, by_key) = match name {
+                "natsort" => (6, false, false),
+                "natcasesort" => (6 | 8, false, false),
+                _ => (
+                    cb_arg.map(|c| c.borrow().to_int()).unwrap_or(0),
+                    matches!(name, "rsort" | "arsort" | "krsort"),
+                    matches!(name, "ksort" | "krsort"),
+                ),
+            };
+            let (sorted, deep, conv_err) = zend_sort_flags(it, &src, flag, desc, by_key);
+            // Write back through a fresh resolve — a `__toString` mid-sort
+            // may have COW-split the arg cell to another table. zend's
+            // in-place arData sort means the partial permutation sticks
+            // even when a conversion Error aborts it.
+            if let Some(rc) = it.arr_mut(cell) {
+                rc.borrow_mut().entries = sorted;
+            }
+            if deep {
+                return depth_err();
+            }
+            if let Some(e) = conv_err {
+                return Err(e);
+            }
         }
         "usort" | "uasort" | "uksort" => {
             if let Some(cbc) = cb_arg {
                 let cb = cbc.borrow().clone();
-                // insertion-sort-ish via comparisons through callback
-                let mut sorted = arr.entries.clone();
-                // simple bubble for callback correctness (test arrays are small)
-                let mut swapped = true;
-                while swapped {
-                    swapped = false;
-                    for i in 0..sorted.len().saturating_sub(1) {
-                        let (ka, ca) = sorted[i].clone();
-                        let (kb, cbb) = sorted[i + 1].clone();
-                        let args = match name {
-                            "uksort" => vec![
-                                cell(match ka {
-                                    ArrKey::Int(i) => Value::Int(i),
-                                    ArrKey::Str(s) => Value::str(s.to_string()),
-                                    ArrKey::Tomb => Value::Null,
-                                }),
-                                cell(match kb {
-                                    ArrKey::Int(i) => Value::Int(i),
-                                    ArrKey::Str(s) => Value::str(s.to_string()),
-                                    ArrKey::Tomb => Value::Null,
-                                }),
-                            ],
-                            _ => vec![ca.clone(), cbb.clone()],
-                        };
-                        let r = it.call_value(&cb, crate::interp::CallArgs::positional(args))?;
-                        if r.to_int() > 0 {
-                            sorted.swap(i, i + 1);
-                            swapped = true;
-                        }
-                    }
+                if !it.is_callable_value(&cb) {
+                    return Err(need_callback_arg(it, name, &cb));
                 }
-                arr.entries = sorted;
-                if name == "usort" {
-                    let mut i = 0;
-                    for (k, _) in arr.entries.iter_mut() {
-                        *k = ArrKey::Int(i);
-                        i += 1;
-                    }
-                    arr.next = i;
+                let Some(arr) = it.arr_mut(cell) else {
+                    return Ok(());
+                };
+                let (src, next) = {
+                    let a = arr.borrow();
+                    (a.entries.clone(), a.next)
+                };
+                let (sorted, cb_err) = zend_sort_user(it, &src, &cb, name == "uksort", name);
+                // zend assigns the sorted dup into the arg zval —
+                // whatever the callback wrote mid-sort is discarded.
+                let mut out = PhpArray::new();
+                out.entries = sorted;
+                out.next = next;
+                *cell.borrow_mut() = Value::Array(Rc::new(RefCell::new(out)));
+                if let Some(e) = cb_err {
+                    return Err(e);
                 }
             }
         }
@@ -1281,23 +1505,33 @@ fn sort_array(
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(1);
-            for i in (1..arr.entries.len()).rev() {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                let j = (x as usize) % (i + 1);
-                arr.entries.swap(i, j);
+            if let Some(arr) = it.arr_mut(cell) {
+                let mut a = arr.borrow_mut();
+                for i in (1..a.entries.len()).rev() {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let j = (x as usize) % (i + 1);
+                    a.entries.swap(i, j);
+                }
             }
-            let mut i = 0;
-            for (k, _) in arr.entries.iter_mut() {
-                *k = ArrKey::Int(i);
-                i += 1;
-            }
-            arr.next = i;
         }
         _ => {}
     }
-    arr.iter_pos = 0;
+    if let Some(arr) = it.arr_mut(cell) {
+        let mut a = arr.borrow_mut();
+        if renumber {
+            // renumber=1 rewrites every key — string keys are
+            // destroyed, not canonicalized.
+            let mut i = 0;
+            for (k, _) in a.entries.iter_mut() {
+                *k = ArrKey::Int(i);
+                i += 1;
+            }
+            a.next = i;
+        }
+        a.iter_pos = 0;
+    }
     Ok(())
 }
 
@@ -1316,31 +1550,6 @@ fn num_val(x: f64, orig: Value, _step: f64) -> Value {
         Value::Int(x as i64)
     } else {
         Value::Float(x)
-    }
-}
-
-/// Column comparator for array_multisort: flag = sort-type|sort-flag-case.
-fn ms_cmp(a: &Value, b: &Value, flag: u8) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let base = flag & !8;
-    let ci = flag & 8 != 0;
-    match base {
-        1 => a
-            .to_float()
-            .partial_cmp(&b.to_float())
-            .unwrap_or(Ordering::Equal),
-        2 | 5 => {
-            // SORT_STRING / SORT_LOCALE_STRING (C locale → plain bytes)
-            let x = a.to_php_bytes();
-            let y = b.to_php_bytes();
-            if ci {
-                fold_case(&x).cmp(&fold_case(&y))
-            } else {
-                x.cmp(&y)
-            }
-        }
-        6 => natcmp(&a.to_php_bytes(), &b.to_php_bytes(), ci),
-        _ => compare(a, b), // SORT_REGULAR (and bare SORT_FLAG_CASE)
     }
 }
 
@@ -1596,190 +1805,6 @@ fn deferred_or<T>(it: &mut Interp, pending: Deferred, e: PhpError) -> Result<T, 
     }
 }
 
-// --- zend_sort port (Zend/zend_sort.c): identical comparison ORDER so
-// conversion warnings/errors land exactly where oracle 8.5.11 puts them.
-
-fn zgt2<T>(a: &mut [T], x: usize, y: usize, gt: &mut impl FnMut(&T, &T) -> bool) {
-    if gt(&a[x], &a[y]) {
-        a.swap(x, y);
-    }
-}
-
-fn zend_sort_3<T>(a: &mut [T], x: usize, y: usize, z: usize, gt: &mut impl FnMut(&T, &T) -> bool) {
-    if !gt(&a[x], &a[y]) {
-        if !gt(&a[y], &a[z]) {
-            return;
-        }
-        a.swap(y, z);
-        if gt(&a[x], &a[y]) {
-            a.swap(x, y);
-        }
-        return;
-    }
-    if !gt(&a[z], &a[y]) {
-        a.swap(x, z);
-        return;
-    }
-    a.swap(x, y);
-    if gt(&a[y], &a[z]) {
-        a.swap(y, z);
-    }
-}
-
-fn zend_sort_4<T>(
-    a: &mut [T],
-    x: usize,
-    y: usize,
-    z: usize,
-    w: usize,
-    gt: &mut impl FnMut(&T, &T) -> bool,
-) {
-    zend_sort_3(a, x, y, z, gt);
-    if gt(&a[z], &a[w]) {
-        a.swap(z, w);
-        if gt(&a[y], &a[z]) {
-            a.swap(y, z);
-            if gt(&a[x], &a[y]) {
-                a.swap(x, y);
-            }
-        }
-    }
-}
-
-fn zend_sort_5<T>(
-    a: &mut [T],
-    x: usize,
-    y: usize,
-    z: usize,
-    w: usize,
-    v: usize,
-    gt: &mut impl FnMut(&T, &T) -> bool,
-) {
-    zend_sort_4(a, x, y, z, w, gt);
-    if gt(&a[w], &a[v]) {
-        a.swap(w, v);
-        if gt(&a[z], &a[w]) {
-            a.swap(z, w);
-            if gt(&a[y], &a[z]) {
-                a.swap(y, z);
-                if gt(&a[x], &a[y]) {
-                    a.swap(x, y);
-                }
-            }
-        }
-    }
-}
-
-fn zend_insert_sort<T>(a: &mut [T], start: usize, n: usize, gt: &mut impl FnMut(&T, &T) -> bool) {
-    match n {
-        0 | 1 => {}
-        2 => zgt2(a, start, start + 1, gt),
-        3 => zend_sort_3(a, start, start + 1, start + 2, gt),
-        4 => zend_sort_4(a, start, start + 1, start + 2, start + 3, gt),
-        5 => zend_sort_5(a, start, start + 1, start + 2, start + 3, start + 4, gt),
-        _ => {
-            let end = start + n;
-            let sentry = start + 6;
-            for i in (start + 1)..sentry {
-                let mut j = i - 1;
-                if !gt(&a[j], &a[i]) {
-                    continue;
-                }
-                while j != start {
-                    j -= 1;
-                    if !gt(&a[j], &a[i]) {
-                        j += 1;
-                        break;
-                    }
-                }
-                a[j..=i].rotate_right(1);
-            }
-            for i in sentry..end.min(a.len()) {
-                let mut j = i - 1;
-                if !gt(&a[j], &a[i]) {
-                    continue;
-                }
-                loop {
-                    j = j.saturating_sub(2);
-                    if !gt(&a[j], &a[i]) {
-                        j += 1;
-                        if !gt(&a[j], &a[i]) {
-                            j += 1;
-                        }
-                        break;
-                    }
-                    if j == start {
-                        break;
-                    }
-                    if j == start + 1 {
-                        j -= 1;
-                        if gt(&a[i], &a[j]) {
-                            j += 1;
-                        }
-                        break;
-                    }
-                }
-                a[j..=i].rotate_right(1);
-            }
-        }
-    }
-}
-
-fn zend_sort<T>(a: &mut [T], start: usize, nmemb: usize, gt: &mut impl FnMut(&T, &T) -> bool) {
-    let mut start = start;
-    let mut nmemb = nmemb;
-    loop {
-        if nmemb <= 16 {
-            zend_insert_sort(a, start, nmemb, gt);
-            return;
-        }
-        let end = start + nmemb;
-        let mut pivot = start + (nmemb >> 1);
-        if (nmemb >> 10) != 0 {
-            let delta = (nmemb >> 1) >> 1;
-            zend_sort_5(a, start, start + delta, pivot, pivot + delta, end - 1, gt);
-        } else {
-            zend_sort_3(a, start, pivot, end - 1, gt);
-        }
-        a.swap(start + 1, pivot);
-        pivot = start + 1;
-        let mut i = pivot + 1;
-        let mut j = end - 1;
-        'part: loop {
-            while gt(&a[pivot], &a[i]) {
-                i += 1;
-                if i == j {
-                    break 'part;
-                }
-            }
-            j -= 1;
-            if j == i {
-                break 'part;
-            }
-            while gt(&a[j], &a[pivot]) {
-                j -= 1;
-                if j == i {
-                    break 'part;
-                }
-            }
-            a.swap(i, j);
-            i += 1;
-            if i == j {
-                break 'part;
-            }
-        }
-        a.swap(pivot, i - 1);
-        if (i - 1) - start < end - i {
-            zend_sort(a, start, i - start - 1, gt);
-            start = i;
-            nmemb = end - i;
-        } else {
-            zend_sort(a, i, end - i, gt);
-            nmemb = i - start - 1;
-        }
-    }
-}
-
 /// 8.5's hash-based `array_diff` (php-src @614b22a+): elements compare
 /// by tmp string. arg#1 checks first; a 1-element arg0 casts itself
 /// once then scans each arg lazily until a hit; otherwise all
@@ -1891,15 +1916,9 @@ fn array_intersect(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
             .map(|(k, c)| (k.clone(), c.borrow().clone()))
             .collect();
         if list.len() > 1 {
-            let n = list.len();
-            zend_sort(
-                &mut list,
-                0,
-                n,
-                &mut |x: &(ArrKey, Value), y: &(ArrKey, Value)| {
-                    zstr_cmp(it, &x.1, &y.1, &mut pending) == std::cmp::Ordering::Greater
-                },
-            );
+            crate::value::zend_sort(&mut list, &mut |x, y| {
+                zstr_cmp(it, &x.1, &y.1, &mut pending)
+            });
         }
         lists.push(list);
     }

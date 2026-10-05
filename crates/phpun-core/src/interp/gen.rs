@@ -235,12 +235,13 @@ impl<'a> Interp<'a> {
             (setup, st.sends.clone())
         };
         let (decl, this_obj, scope_class, decl_class, called_class, captures) = setup;
-        // Re-evaluating stored arg cells is unnecessary — bind_and_run
-        // consumes the cells captured at call time.
+        // Replay keeps the original arg cells (zend re-runs the same
+        // frame): taking them once left the send()-triggered re-run
+        // with an empty arg list and a fatals on required params.
         let args = {
-            let mut st = state.borrow_mut();
-            match &mut st.setup {
-                GenSetup::Invoke { args, .. } => std::mem::replace(args, CallArgs::empty()),
+            let st = state.borrow();
+            match &st.setup {
+                GenSetup::Invoke { args, .. } => args.clone(),
             }
         };
         let items = Rc::new(RefCell::new(Vec::new()));

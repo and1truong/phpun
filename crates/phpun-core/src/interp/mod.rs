@@ -29,7 +29,7 @@ mod gen;
 mod include;
 mod members;
 mod registry;
-mod util;
+pub(crate) mod util;
 
 use util::*;
 
@@ -65,6 +65,9 @@ impl ObjHandle {
 
 /// Evaluated call arguments: positional cells (call order) plus named
 /// entries the callee binds by param name (Zend/tests/named_params).
+/// Clone shares the arg cells — generator replay re-binds the same
+/// values exactly like zend re-entering the call frame.
+#[derive(Clone)]
 pub struct CallArgs {
     pub cells: Vec<Cell>,
     /// `(name, cell, by_ref_ok, from_traversable)` — by_ref_ok marks
