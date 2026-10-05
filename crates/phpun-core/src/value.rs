@@ -757,8 +757,37 @@ pub fn gcvt(value: f64, precision: usize) -> String {
     }
 }
 
+thread_local! {
+    /// Object/array pairs currently being compared — zend marks the
+    /// containers while recursing; a pair re-entered through a cyclic
+    /// reference compares equal instead of looping (observer_007).
+    static CMP_PAIRS: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
+}
+
 /// PHP loose comparison (`<=>` semantics) implementing the PHP 8 rules.
 pub fn compare(a: &Value, b: &Value) -> Ordering {
+    let pair = match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            Some((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize))
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            Some((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize))
+        }
+        _ => None,
+    };
+    if let Some(p) = pair {
+        if CMP_PAIRS.with(|v| v.borrow().contains(&p)) {
+            return Ordering::Equal;
+        }
+        CMP_PAIRS.with(|v| v.borrow_mut().push(p));
+        let r = compare_r(a, b);
+        CMP_PAIRS.with(|v| v.borrow_mut().pop());
+        return r;
+    }
+    compare_r(a, b)
+}
+
+fn compare_r(a: &Value, b: &Value) -> Ordering {
     use Value::*;
     match (a, b) {
         (Bool(_), _) | (_, Bool(_)) | (Null, _) | (_, Null) => a.is_truthy().cmp(&b.is_truthy()),
