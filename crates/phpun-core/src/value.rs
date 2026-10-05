@@ -1673,6 +1673,9 @@ pub enum GenSetup {
         called_class: Option<Rc<PhpClass>>,
         /// `use ($a, &$b)` cells for closure-generators.
         captures: Vec<(String, Cell, bool)>,
+        /// The generator-creating closure — its id keys the
+        /// per-instance statics table (`fn_statics_key`).
+        closure_rc: Option<Rc<PhpCallable>>,
     },
 }
 

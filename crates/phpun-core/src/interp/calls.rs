@@ -654,6 +654,10 @@ impl<'a> Interp<'a> {
                                 decl_class: None,
                                 called_class: c.called_class.clone(),
                                 captures: c.captures.clone(),
+                                // Per-instance statics key off the
+                                // callable id — the generator frame
+                                // needs it like any closure frame.
+                                closure_rc: Some(c.clone()),
                             })));
                         }
                         let mut frame_args = Vec::new();
@@ -4222,11 +4226,12 @@ impl<'a> Interp<'a> {
                 decl_class: dc,
                 called_class: cc,
                 captures: Vec::new(),
+                closure_rc: None,
             })));
         }
         let dc = self.pending_decl_class.take();
         let cc = self.pending_called_class.take();
-        self.invoke_fn_run(decl, args, this_obj, scope_class, dc, cc)
+        self.invoke_fn_run(decl, args, this_obj, scope_class, dc, cc, None)
     }
 
     /// Frame push + body run — the part of invoke_fn the Generator
@@ -4239,8 +4244,10 @@ impl<'a> Interp<'a> {
         scope_class: Option<Rc<PhpClass>>,
         decl_class: Option<Rc<PhpClass>>,
         called_class: Option<Rc<PhpClass>>,
+        closure_rc: Option<Rc<PhpCallable>>,
     ) -> Result<Value, PhpError> {
         let mut frame = Frame::new(decl.name.clone());
+        frame.closure_rc = closure_rc;
         frame.fn_line = decl.line;
         frame.file = decl.file.clone();
         frame.ns = decl.ns.clone();

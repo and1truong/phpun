@@ -222,6 +222,7 @@ impl<'a> Interp<'a> {
                     decl_class,
                     called_class,
                     captures,
+                    closure_rc,
                     ..
                 } => (
                     decl.clone(),
@@ -230,11 +231,12 @@ impl<'a> Interp<'a> {
                     decl_class.clone(),
                     called_class.clone(),
                     captures.clone(),
+                    closure_rc.clone(),
                 ),
             };
             (setup, st.sends.clone())
         };
-        let (decl, this_obj, scope_class, decl_class, called_class, captures) = setup;
+        let (decl, this_obj, scope_class, decl_class, called_class, captures, closure_rc) = setup;
         // Replay keeps the original arg cells (zend re-runs the same
         // frame): taking them once left the send()-triggered re-run
         // with an empty arg list and a fatals on required params.
@@ -253,7 +255,15 @@ impl<'a> Interp<'a> {
         if !captures.is_empty() {
             self.pending_gen_captures = captures;
         }
-        let r = self.invoke_fn_run(&decl, args, this_obj, scope_class, decl_class, called_class);
+        let r = self.invoke_fn_run(
+            &decl,
+            args,
+            this_obj,
+            scope_class,
+            decl_class,
+            called_class,
+            closure_rc,
+        );
         self.gen_sink = saved_sink;
         self.gen_sends = saved_sends;
         self.gen_auto = saved_auto;
