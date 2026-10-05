@@ -1097,6 +1097,272 @@ pub fn identical(a: &Value, b: &Value) -> bool {
     }
 }
 
+// ----- zend_sort (libc++ introsort) -----
+
+/// Element carried through a zend sort: the original insertion index
+/// (zend stamps it into Z_EXTRA before sorting so the comparator's
+/// RETURN_STABLE_SORT fallback can tiebreak Equal pairs on position),
+/// plus the bucket's key/value cell.
+pub(crate) type SortElem = (u32, ArrKey, Cell);
+
+/// zend_hash_sort_internal's pre-pass: tombstones compact out (the
+/// "remove holes" path) and each live entry is stamped with its
+/// insertion position — position travels with the element through
+/// every swap, like Z_EXTRA inside the bucket zval.
+pub(crate) fn zend_sort_prepare(entries: &mut Vec<(ArrKey, Cell)>) -> Vec<SortElem> {
+    entries.retain(|(k, _)| !matches!(k, ArrKey::Tomb));
+    std::mem::take(entries)
+        .into_iter()
+        .enumerate()
+        .map(|(i, (k, c))| (i as u32, k, c))
+        .collect()
+}
+
+/// Write the sorted elements back over `entries` (zend_sort_finish).
+pub(crate) fn zend_sort_finish(entries: &mut Vec<(ArrKey, Cell)>, sorted: Vec<SortElem>) {
+    entries.extend(sorted.into_iter().map(|(_, k, c)| (k, c)));
+}
+
+/// php_array_data_compare / php_array_reverse_data_compare over
+/// SortElems: zend_compare on the values (the reverse variant negates
+/// the RESULT, operand order kept), then RETURN_STABLE_SORT falls back
+/// to insertion position on Equal — ascending for both directions.
+pub(crate) fn zend_data_cmp(a: &SortElem, b: &SortElem, desc: bool) -> Ordering {
+    let r = compare(&a.2.borrow(), &b.2.borrow());
+    let r = if desc { r.reverse() } else { r };
+    if r != Ordering::Equal {
+        r
+    } else {
+        a.0.cmp(&b.0)
+    }
+}
+
+/// zend_array_sort over value cells (sort/rsort/asort/arsort
+/// SORT_REGULAR plus the SPL equivalents): prepare → introsort →
+/// write back. Returns true when a compare set CMP_DEPTH_ERR — zend
+/// aborts mid-sort on the depth Error, so the flag accumulates per
+/// compare and the caller throws after.
+pub(crate) fn zend_sort_data(entries: &mut Vec<(ArrKey, Cell)>, desc: bool) -> bool {
+    // A stale CMP_DEPTH_ERR from an earlier caught Error must not
+    // bleed into this sort's flag reads.
+    clear_cmp_depth_err();
+    let mut deep = false;
+    let mut v = zend_sort_prepare(entries);
+    zend_sort(&mut v, &mut |a, b| {
+        let r = zend_data_cmp(a, b, desc);
+        deep |= cmp_depth_err();
+        r
+    });
+    zend_sort_finish(entries, v);
+    deep
+}
+
+/// zend_sort_2/3/4/5: fixed sorting networks for the smallest slices —
+/// element order, compare pairing and arg order byte-match the C.
+fn zsort_2<T>(v: &mut [T], a: usize, b: usize, cmp: &mut impl FnMut(&T, &T) -> Ordering) {
+    if cmp(&v[a], &v[b]) == Ordering::Greater {
+        v.swap(a, b);
+    }
+}
+
+fn zsort_3<T>(v: &mut [T], a: usize, b: usize, c: usize, cmp: &mut impl FnMut(&T, &T) -> Ordering) {
+    if cmp(&v[a], &v[b]) != Ordering::Greater {
+        if cmp(&v[b], &v[c]) != Ordering::Greater {
+            return;
+        }
+        v.swap(b, c);
+        if cmp(&v[a], &v[b]) == Ordering::Greater {
+            v.swap(a, b);
+        }
+        return;
+    }
+    if cmp(&v[c], &v[b]) != Ordering::Greater {
+        v.swap(a, c);
+        return;
+    }
+    v.swap(a, b);
+    if cmp(&v[b], &v[c]) == Ordering::Greater {
+        v.swap(b, c);
+    }
+}
+
+fn zsort_4<T>(
+    v: &mut [T],
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+    cmp: &mut impl FnMut(&T, &T) -> Ordering,
+) {
+    zsort_3(v, a, b, c, cmp);
+    if cmp(&v[c], &v[d]) == Ordering::Greater {
+        v.swap(c, d);
+        if cmp(&v[b], &v[c]) == Ordering::Greater {
+            v.swap(b, c);
+            if cmp(&v[a], &v[b]) == Ordering::Greater {
+                v.swap(a, b);
+            }
+        }
+    }
+}
+
+fn zsort_5<T>(
+    v: &mut [T],
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+    e: usize,
+    cmp: &mut impl FnMut(&T, &T) -> Ordering,
+) {
+    zsort_4(v, a, b, c, d, cmp);
+    if cmp(&v[d], &v[e]) == Ordering::Greater {
+        v.swap(d, e);
+        if cmp(&v[c], &v[d]) == Ordering::Greater {
+            v.swap(c, d);
+            if cmp(&v[b], &v[c]) == Ordering::Greater {
+                v.swap(b, c);
+                if cmp(&v[a], &v[b]) == Ordering::Greater {
+                    v.swap(a, b);
+                }
+            }
+        }
+    }
+}
+
+/// zend_insert_sort: networks for n<=5, sentinel insertion above.
+/// The first pass sorts elements 0..5; the second strides down by
+/// two, guarded by that sorted prefix — ported line-for-line so the
+/// compare sequence under a non-total relation is zend's.
+fn zend_insert_sort<T>(v: &mut [T], cmp: &mut impl FnMut(&T, &T) -> Ordering) {
+    match v.len() {
+        0 | 1 => {}
+        2 => zsort_2(v, 0, 1, cmp),
+        3 => zsort_3(v, 0, 1, 2, cmp),
+        4 => zsort_4(v, 0, 1, 2, 3, cmp),
+        5 => zsort_5(v, 0, 1, 2, 3, 4, cmp),
+        _ => {
+            let n = v.len();
+            let sentry = 6;
+            for i in 1..sentry {
+                let mut j = i - 1;
+                if cmp(&v[j], &v[i]) != Ordering::Greater {
+                    continue;
+                }
+                while j != 0 {
+                    j -= 1;
+                    if cmp(&v[j], &v[i]) != Ordering::Greater {
+                        j += 1;
+                        break;
+                    }
+                }
+                let mut k = i;
+                while k > j {
+                    v.swap(k, k - 1);
+                    k -= 1;
+                }
+            }
+            for i in sentry..n {
+                let mut j = i - 1;
+                if cmp(&v[j], &v[i]) != Ordering::Greater {
+                    continue;
+                }
+                loop {
+                    j -= 2;
+                    if cmp(&v[j], &v[i]) != Ordering::Greater {
+                        j += 1;
+                        if cmp(&v[j], &v[i]) != Ordering::Greater {
+                            j += 1;
+                        }
+                        break;
+                    }
+                    if j == 0 {
+                        break;
+                    }
+                    if j == 1 {
+                        j -= 1;
+                        if cmp(&v[i], &v[j]) == Ordering::Greater {
+                            j += 1;
+                        }
+                        break;
+                    }
+                }
+                let mut k = i;
+                while k > j {
+                    v.swap(k, k - 1);
+                    k -= 1;
+                }
+            }
+        }
+    }
+}
+
+/// zend_sort (Zend/zend_sort.c, php-8.5.11): the libc++-derived
+/// introsort — insertion sort at n<=16, quicksort with a median pivot
+/// above, recursing on the smaller partition and looping on the
+/// larger. Element pairing and `cmp(arg1, arg2)` operand order match
+/// the C exactly, which is observable whenever the comparator is not
+/// a total order (loose compare's bool arm) — and the left operand
+/// stays the cyclic-protected one.
+pub(crate) fn zend_sort<T>(v: &mut [T], cmp: &mut impl FnMut(&T, &T) -> Ordering) {
+    let mut base = 0usize;
+    let mut n = v.len();
+    loop {
+        if n <= 16 {
+            zend_insert_sort(&mut v[base..base + n], cmp);
+            return;
+        }
+        let start = base;
+        let end = base + n;
+        let offset = n >> 1;
+        let mut pivot = start + offset;
+        if n >> 10 != 0 {
+            let delta = offset >> 1;
+            zsort_5(v, start, start + delta, pivot, pivot + delta, end - 1, cmp);
+        } else {
+            zsort_3(v, start, pivot, end - 1, cmp);
+        }
+        v.swap(start + 1, pivot);
+        pivot = start + 1;
+        let mut i = pivot + 1;
+        let mut j = end - 1;
+        'part: loop {
+            while cmp(&v[pivot], &v[i]) == Ordering::Greater {
+                i += 1;
+                if i == j {
+                    break 'part;
+                }
+            }
+            j -= 1;
+            if j == i {
+                break 'part;
+            }
+            while cmp(&v[j], &v[pivot]) == Ordering::Greater {
+                j -= 1;
+                if j == i {
+                    break 'part;
+                }
+            }
+            v.swap(i, j);
+            i += 1;
+            if i == j {
+                break 'part;
+            }
+        }
+        v.swap(pivot, i - 1);
+        let left = (i - 1) - start;
+        let right = end - i;
+        if left < right {
+            zend_sort(&mut v[start..i - 1], cmp);
+            base = i;
+            n = right;
+        } else {
+            zend_sort(&mut v[i..end], cmp);
+            n = left;
+        }
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.to_php_string())
