@@ -1670,6 +1670,9 @@ pub enum ObjectInternal {
         /// (RecursiveDirectoryIterator::getSubPath).
         sub_path: String,
     },
+    /// WeakReference::create($obj) payload — a weak handle; get()
+    /// upgrades to the object or null once freed.
+    WeakRef(std::rc::Weak<RefCell<PhpObject>>),
     /// DateTime, closures-as-objects, etc. — opaque marker.
     None,
 }
@@ -1733,6 +1736,7 @@ impl std::fmt::Debug for ObjectInternal {
             ObjectInternal::DirIter { .. } => f.write_str("DirIter"),
             ObjectInternal::Sqlite { .. } => f.write_str("Sqlite"),
             ObjectInternal::SqliteStmt { .. } => f.write_str("SqliteStmt"),
+            ObjectInternal::WeakRef(_) => f.write_str("WeakRef"),
             ObjectInternal::None => f.write_str("None"),
         }
     }
@@ -1783,6 +1787,9 @@ pub enum PhpResource {
         /// Byte position used for reads (we do our own buffering for fgets).
         pos: u64,
         eof: bool,
+        /// Path and mode as given to fopen() — stream_get_meta_data().
+        path: String,
+        mode: String,
     },
     /// STDIN/STDOUT/STDERR — php:// and the CLI-SAPI constants.
     Stdio { id: u64, which: u8 },
@@ -1808,6 +1815,36 @@ pub enum PhpResource {
     /// var_dump "of type (Unknown)", is_resource() false) and every
     /// stream function on it throws "must be an open stream resource".
     Closed { id: u64 },
+    /// A proc_open() pipe end (or socketpair/pty end) as seen by the
+    /// parent: a raw fd wrapped in File. `write` mirrors zend's
+    /// mode; reads always hit the real fd so EBADF reports like zend.
+    Pipe {
+        id: u64,
+        file: std::fs::File,
+        write: bool,
+        /// ["socket"] descriptor pair — bidirectional, different
+        /// stream_type in stream_get_meta_data().
+        socket: bool,
+        /// stream_set_blocking($s, false) — reads return "" instead
+        /// of waiting (fcntl O_NONBLOCK on the fd).
+        nonblock: bool,
+        pos: u64,
+        eof: bool,
+    },
+    /// proc_open() process handle — type "process" in zend.
+    Proc {
+        id: u64,
+        pid: i32,
+        command: String,
+        /// Raw waitpid status cached after a WIFEXITED reap
+        /// (zend's waitpid_cached: only normal exits are cached).
+        cached_status: Option<i32>,
+        /// proc_close() already consumed this handle.
+        closed: bool,
+        /// The proc's pipe streams — zend's proc dtor zend_list_close()s
+        /// them, so proc_close()/GC turns every $pipes entry "Unknown".
+        pipes: Vec<std::rc::Rc<std::cell::RefCell<PhpResource>>>,
+    },
     /// curl/db handles etc. — opaque placeholder.
     Other { id: u64, kind: &'static str },
 }
@@ -1820,6 +1857,8 @@ impl PhpResource {
             PhpResource::Input { id, .. } => *id,
             PhpResource::Mem { id, .. } => *id,
             PhpResource::Closed { id, .. } => *id,
+            PhpResource::Pipe { id, .. } => *id,
+            PhpResource::Proc { id, .. } => *id,
             PhpResource::Other { id, .. } => *id,
         }
     }
@@ -1829,8 +1868,38 @@ impl PhpResource {
     pub fn type_name(&self) -> &'static str {
         match self {
             PhpResource::Closed { .. } => "Unknown",
+            PhpResource::Proc { .. } => "process",
             PhpResource::Other { kind, .. } => kind,
             _ => "stream",
+        }
+    }
+}
+
+/// A dropped process handle closes its pipes and gets one non-blocking
+/// reap so exited children don't stay zombies (zend's proc dtor does
+/// the same — pipes first, then waitpid).
+impl Drop for PhpResource {
+    fn drop(&mut self) {
+        if let PhpResource::Proc {
+            pid,
+            cached_status,
+            closed,
+            pipes,
+            ..
+        } = self
+        {
+            for p in pipes {
+                let mut b = p.borrow_mut();
+                if let PhpResource::Pipe { id, .. } = &*b {
+                    *b = PhpResource::Closed { id: *id };
+                }
+            }
+            if !*closed && cached_status.is_none() {
+                unsafe {
+                    let mut st = 0;
+                    libc::waitpid(*pid, &mut st, libc::WNOHANG);
+                }
+            }
         }
     }
 }

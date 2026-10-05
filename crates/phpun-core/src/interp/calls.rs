@@ -270,6 +270,7 @@ impl<'a> Interp<'a> {
             if by_ref {
                 match expr {
                     Expr::Var(_) | Expr::Index { .. } | Expr::Prop { .. } | Expr::VarVar(_)
+                    | Expr::StaticProp { .. }
                         // zend's SEND_REF check rejects the $GLOBALS
                         // table itself (its elements are fine).
                         if !matches!(expr, Expr::Var(n) if n == "GLOBALS") =>
@@ -670,6 +671,7 @@ impl<'a> Interp<'a> {
                         frame.call_alias = self.pending_call_alias.take();
                         frame.fn_line = decl.line;
                         frame.file = decl.file.clone();
+                        frame.ns = decl.ns.clone();
                         frame.ret_by_ref = decl.by_ref;
                         for (n, cap, by_ref) in &c.captures {
                             // By-value captures re-import the stored
@@ -4363,6 +4365,8 @@ fn builtin_byref(name: &str) -> Option<&'static [bool]> {
         "sscanf" | "fscanf" => &[false, false],
         "exec" => &[false, true, true],
         "passthru" | "system" => &[false, true],
+        "proc_open" => &[false, false, true],
+        "stream_select" => &[true, true, true, false, false],
         "preg_grep" => &[false],
         _ => return None,
     })

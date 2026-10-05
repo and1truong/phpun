@@ -1671,38 +1671,16 @@ impl<'a> Interp<'a> {
                     Some(ie) => Some(self.eval(ie)?),
                     None => None,
                 };
+                // zend binds into any indexable lvalue base —
+                // `$this->jobs[$id] =& $job` (ProcessExecutor).
                 match &**e {
-                    Expr::Var(n) => {
-                        let arr_cell = self.var_cell(n);
-                        let mut b = arr_cell.borrow_mut();
-                        match &mut *b {
-                            Value::Null => {
-                                let mut arr = PhpArray::new();
-                                match key {
-                                    Some(k) => arr.bind_cell(to_key(&k), src),
-                                    None => arr.bind_cell(ArrKey::Int(arr.next), src),
-                                }
-                                *b = Value::Array(Rc::new(RefCell::new(arr)));
-                            }
-                            Value::Array(rc) => {
-                                let mut arr = rc.borrow_mut();
-                                match key {
-                                    Some(k) => arr.bind_cell(to_key(&k), src),
-                                    None => {
-                                        let k = ArrKey::Int(arr.next);
-                                        arr.bind_cell(k, src);
-                                    }
-                                }
-                            }
-                            _ => {
-                                drop(b);
-                                return self.fail(PhpError::fatal(
-                                    "Cannot use scalar value as an array",
-                                    0,
-                                ));
-                            }
-                        }
-                        Ok(())
+                    Expr::Var(..)
+                    | Expr::Index { .. }
+                    | Expr::Prop { .. }
+                    | Expr::VarVar(..)
+                    | Expr::StaticProp { .. } => {
+                        let c = self.eval_cell(e)?;
+                        self.bind_into_key(c, key, src)
                     }
                     _ => self.fail(PhpError::fatal("Cannot create reference to expression", 0)),
                 }
@@ -2728,6 +2706,40 @@ impl<'a> Interp<'a> {
         } else if matches!(*b, Value::Object(_)) {
             drop(b);
             self.index_cell_object(&c, key)
+        } else {
+            drop(b);
+            self.fail(PhpError::fatal("Cannot use scalar value as an array", 0))
+        }
+    }
+
+    /// `index_into_key` variant for `=&`: the slot's stored cell is
+    /// swapped for `src` so the array element aliases the source.
+    fn bind_into_key(&mut self, c: Cell, key: Option<Value>, src: Cell) -> Result<(), PhpError> {
+        if let Some(k) = &key {
+            if !matches!(&*c.borrow(), Value::Object(_)) {
+                self.check_offset_key(k)?;
+            }
+        }
+        let mut b = c.borrow_mut();
+        if matches!(*b, Value::Null) {
+            *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+        }
+        if let Value::Array(_) = &mut *b {
+            self.cow_split(&mut b);
+            let rc = match &*b {
+                Value::Array(rc) => rc.clone(),
+                _ => unreachable!(),
+            };
+            drop(b);
+            let mut arr = rc.borrow_mut();
+            match key {
+                Some(k) => arr.bind_cell(to_key(&k), src),
+                None => {
+                    let k = ArrKey::Int(arr.next);
+                    arr.bind_cell(k, src);
+                }
+            }
+            Ok(())
         } else {
             drop(b);
             self.fail(PhpError::fatal("Cannot use scalar value as an array", 0))

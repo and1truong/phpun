@@ -2159,6 +2159,23 @@ impl<'a> Interp<'a> {
                 || self.is_throwable_name(&ob.class.decl.name)
         };
         let cls = obj.borrow().class.clone();
+        // WeakReference::get() — upgrades the weak handle (null when
+        // the target was collected).
+        if name.eq_ignore_ascii_case("get") {
+            let w = {
+                let ob = obj.borrow();
+                match &ob.internal {
+                    Some(ObjectInternal::WeakRef(w)) => Some(w.upgrade()),
+                    _ => None,
+                }
+            };
+            if let Some(u) = w {
+                return Ok(match u {
+                    Some(o) => Value::Object(o),
+                    None => Value::Null,
+                });
+            }
+        }
         if is_throwable {
             // Native method only when the resolved method is a builtin
             // registration (line 0 — userland always runs, even an empty

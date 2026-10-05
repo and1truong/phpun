@@ -214,6 +214,8 @@ pub(crate) fn dispatch(
                         write: true,
                         pos: 0,
                         eof: false,
+                        path: name.display().to_string(),
+                        mode: "w+b".into(),
                     })))
                 }
                 Err(_) => Value::Bool(false),
@@ -390,6 +392,8 @@ pub(crate) fn dispatch(
                                 write: spec.write,
                                 pos: 0,
                                 eof: false,
+                                path: path.clone(),
+                                mode: mode.clone(),
                             })))
                         }
                         Err(e) => {
@@ -422,6 +426,7 @@ pub(crate) fn dispatch(
             let data = arg(args, 1).to_php_string();
             match write_resource(it, args.first(), data.as_bytes())? {
                 StreamWrite::Written => Value::Int(data.len() as i64),
+                StreamWrite::Partial(n) => Value::Int(n as i64),
                 StreamWrite::Ebadf(errno, msg) => {
                     write_ebadf_notice(it, name, data.len(), errno, &msg)?;
                     Value::Bool(false)
@@ -474,6 +479,7 @@ pub(crate) fn dispatch(
                     Value::Resource(r) => match &*r.borrow() {
                         PhpResource::File { eof, .. } => Value::Bool(*eof),
                         PhpResource::Mem { eof, .. } => Value::Bool(*eof),
+                        PhpResource::Pipe { eof, .. } => Value::Bool(*eof),
                         _ => Value::Bool(true),
                     },
                     _ => Value::Bool(true),
@@ -490,6 +496,10 @@ pub(crate) fn dispatch(
                             *pos = arg(args, 1).to_int().max(0) as u64;
                             *eof = false;
                         }
+                        PhpResource::Pipe { .. } => {
+                            it.warn_pub(&format!("{}(): Stream does not support seeking", name))?;
+                            return Ok(Some(Value::Int(-1)));
+                        }
                         _ => {}
                     }
                 }
@@ -504,6 +514,7 @@ pub(crate) fn dispatch(
                         PhpResource::File { pos, .. } | PhpResource::Mem { pos, .. } => {
                             Value::Int(*pos as i64)
                         }
+                        PhpResource::Pipe { .. } => Value::Bool(false),
                         _ => Value::Int(0),
                     },
                     _ => Value::Int(0),
@@ -519,6 +530,10 @@ pub(crate) fn dispatch(
                         PhpResource::File { pos, eof, .. } | PhpResource::Mem { pos, eof, .. } => {
                             *pos = 0;
                             *eof = false;
+                        }
+                        PhpResource::Pipe { .. } => {
+                            it.warn_pub(&format!("{}(): Stream does not support seeking", name))?;
+                            return Ok(Some(Value::Bool(false)));
                         }
                         _ => {}
                     }
@@ -790,7 +805,7 @@ pub(crate) fn dispatch(
                         total += b.len() as i64;
                         remaining -= b.len() as i64;
                         match write_resource(it, args.get(1), &b)? {
-                            StreamWrite::Written => {}
+                            StreamWrite::Written | StreamWrite::Partial(_) => {}
                             StreamWrite::Ebadf(errno, msg) => {
                                 write_ebadf_notice(it, name, b.len(), errno, &msg)?;
                                 ok = false;
@@ -827,8 +842,36 @@ pub(crate) fn dispatch(
             stream_open_check(args, 0, name, 1, "stream")?;
             Value::Bool(false)
         }
+        "stream_set_blocking" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            let mode = arg(args, 1).is_truthy();
+            let Value::Resource(r) = arg(args, 0) else {
+                return Ok(Some(Value::Bool(false)));
+            };
+            let mut rb = r.borrow_mut();
+            match &mut *rb {
+                PhpResource::Pipe { file, nonblock, .. } => {
+                    use std::os::fd::AsRawFd;
+                    *nonblock = !mode;
+                    let fd = file.as_raw_fd();
+                    unsafe {
+                        let fl = libc::fcntl(fd, libc::F_GETFL);
+                        if fl >= 0 {
+                            let fl2 = if mode {
+                                fl & !libc::O_NONBLOCK
+                            } else {
+                                fl | libc::O_NONBLOCK
+                            };
+                            libc::fcntl(fd, libc::F_SETFL, fl2);
+                        }
+                    }
+                    Value::Bool(true)
+                }
+                _ => Value::Bool(true),
+            }
+        }
+        "stream_select" => return stream_select(it, name, args),
         "stream_set_timeout"
-        | "stream_set_blocking"
         | "stream_set_read_buffer"
         | "stream_set_write_buffer"
         | "stream_set_chunk_size" => {
@@ -837,7 +880,100 @@ pub(crate) fn dispatch(
         }
         "stream_get_meta_data" => {
             stream_open_check(args, 0, name, 1, "stream")?;
-            Value::Array(Rc::new(RefCell::new(PhpArray::new())))
+            let mk = |pairs: Vec<(&'static str, Value)>| {
+                let mut a = PhpArray::new();
+                for (k, v) in pairs {
+                    a.set(ArrKey::Str(k.into()), v);
+                }
+                Value::Array(Rc::new(RefCell::new(a)))
+            };
+            let mut base = vec![
+                ("timed_out", Value::Bool(false)),
+                ("blocked", Value::Bool(true)),
+            ];
+            match arg(args, 0) {
+                Value::Resource(r) => {
+                    let rb = r.borrow();
+                    match &*rb {
+                        PhpResource::Pipe {
+                            write, socket, eof, ..
+                        } => {
+                            base.push(("eof", Value::Bool(*eof)));
+                            base.push((
+                                "stream_type",
+                                Value::str(if *socket { "generic_socket" } else { "STDIO" }),
+                            ));
+                            base.push((
+                                "mode",
+                                Value::str(if *socket {
+                                    "r+"
+                                } else if *write {
+                                    "w"
+                                } else {
+                                    "r"
+                                }),
+                            ));
+                            base.push(("unread_bytes", Value::Int(0)));
+                            base.push(("seekable", Value::Bool(false)));
+                            mk(base)
+                        }
+                        PhpResource::File {
+                            eof, path, mode, ..
+                        } => {
+                            base.push(("eof", Value::Bool(*eof)));
+                            base.push(("wrapper_type", Value::str("plainfile")));
+                            base.push(("stream_type", Value::str("STDIO")));
+                            base.push(("mode", Value::str(mode.clone())));
+                            base.push(("unread_bytes", Value::Int(0)));
+                            base.push(("seekable", Value::Bool(true)));
+                            base.push(("uri", Value::str(path.clone())));
+                            mk(base)
+                        }
+                        PhpResource::Stdio { which, .. } => {
+                            base.push(("eof", Value::Bool(false)));
+                            base.push(("wrapper_type", Value::str("PHP")));
+                            base.push(("stream_type", Value::str("STDIO")));
+                            base.push(("mode", Value::str(if *which == 0 { "rb" } else { "wb" })));
+                            base.push(("unread_bytes", Value::Int(0)));
+                            // zend probes the fd: lseek(fd,0,SEEK_CUR)
+                            // fails on pipes/ttys, succeeds on files.
+                            let seekable = unsafe {
+                                libc::lseek(*which as libc::c_int, 0, libc::SEEK_CUR) != -1
+                            };
+                            base.push(("seekable", Value::Bool(seekable)));
+                            base.push((
+                                "uri",
+                                Value::str(match which {
+                                    0 => "php://stdin",
+                                    1 => "php://stdout",
+                                    _ => "php://stderr",
+                                }),
+                            ));
+                            mk(base)
+                        }
+                        PhpResource::Mem { eof, .. } => {
+                            base.push(("eof", Value::Bool(*eof)));
+                            base.push(("wrapper_type", Value::str("PHP")));
+                            base.push(("stream_type", Value::str("TEMP")));
+                            base.push(("mode", Value::str("w+b")));
+                            base.push(("unread_bytes", Value::Int(0)));
+                            base.push(("seekable", Value::Bool(true)));
+                            mk(base)
+                        }
+                        PhpResource::Input { body, pos, .. } => {
+                            base.push(("eof", Value::Bool(*pos as usize >= body.len())));
+                            base.push(("wrapper_type", Value::str("PHP")));
+                            base.push(("stream_type", Value::str("Input")));
+                            base.push(("mode", Value::str("rb")));
+                            base.push(("unread_bytes", Value::Int(0)));
+                            base.push(("seekable", Value::Bool(false)));
+                            mk(base)
+                        }
+                        _ => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+                    }
+                }
+                _ => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+            }
         }
         "stream_get_filters" | "stream_get_wrappers" => {
             Value::Array(Rc::new(RefCell::new(PhpArray::new())))
@@ -853,6 +989,7 @@ pub(crate) fn dispatch(
                         let res = r.borrow();
                         match &*res {
                             crate::value::PhpResource::File { file, .. } => file.metadata().ok(),
+                            crate::value::PhpResource::Pipe { file, .. } => file.metadata().ok(),
                             crate::value::PhpResource::Stdio { which, .. } => {
                                 std::fs::metadata(match which {
                                     0 => "/dev/stdin",
@@ -1011,13 +1148,17 @@ pub(in crate::builtins) fn stream_open_check(
 ) -> Result<(), PhpError> {
     match arg(args, i) {
         Value::Resource(r) => match &*r.borrow() {
-            PhpResource::Closed { .. } | PhpResource::Other { .. } => err(
-                "TypeError",
-                format!(
-                    "{}(): Argument #{} (${}) must be an open stream resource",
-                    fname, pnum, pname
-                ),
-            ),
+            // A proc_open() handle is a resource but not a stream —
+            // zend's stream fns reject it the same as a closed one.
+            PhpResource::Closed { .. } | PhpResource::Proc { .. } | PhpResource::Other { .. } => {
+                err(
+                    "TypeError",
+                    format!(
+                        "{}(): Argument #{} (${}) must be an open stream resource",
+                        fname, pnum, pname
+                    ),
+                )
+            }
             _ => Ok(()),
         },
         v => err(
@@ -1039,6 +1180,9 @@ pub(in crate::builtins) fn stream_open_check(
 /// discard silently (no write op → -1/0 with no diagnostic).
 pub(in crate::builtins) enum StreamWrite {
     Written,
+    /// Short write on a pipe (or a 0-byte EAGAIN on a nonblocking
+    /// one): php_stream_write returns the count, fwrite reports it.
+    Partial(usize),
     Ebadf(i32, String),
     Discarded,
 }
@@ -1057,6 +1201,15 @@ fn io_errno_str(e: &std::io::Error) -> (i32, String) {
     let msg = e.to_string();
     let suffix = format!(" (os error {})", n);
     (n, msg.strip_suffix(&suffix).unwrap_or(&msg).to_string())
+}
+
+/// proc_open()'s `['file', path, mode]` descriptor — the same mode
+/// table fopen uses (proc_open validates the mode letters itself).
+pub(in crate::builtins) fn fopen(path: &str, mode: &str) -> std::io::Result<std::fs::File> {
+    match fopen_mode(mode) {
+        Some(spec) => open_file(path, &spec),
+        None => open_file(path, &fopen_mode("r").unwrap()),
+    }
 }
 
 /// `<fn>(): Write of N bytes failed with errno=E STR` E_NOTICE (the
@@ -1142,6 +1295,34 @@ pub(in crate::builtins) fn write_resource(
                     // write(2) returns EBADF.
                     _ => Ok(StreamWrite::Ebadf(9, "Bad file descriptor".into())),
                 },
+                PhpResource::Pipe {
+                    file,
+                    write,
+                    pos,
+                    nonblock,
+                    ..
+                } => {
+                    if !*write {
+                        return Ok(StreamWrite::Ebadf(9, "Bad file descriptor".into()));
+                    }
+                    match file.write(data) {
+                        Ok(n) => {
+                            *pos += n as u64;
+                            if n == data.len() {
+                                Ok(StreamWrite::Written)
+                            } else {
+                                Ok(StreamWrite::Partial(n))
+                            }
+                        }
+                        Err(e) if *nonblock && e.kind() == std::io::ErrorKind::WouldBlock => {
+                            Ok(StreamWrite::Partial(0))
+                        }
+                        Err(e) => {
+                            let (errno, msg) = io_errno_str(&e);
+                            Ok(StreamWrite::Ebadf(errno, msg))
+                        }
+                    }
+                }
                 PhpResource::File {
                     file, pos, write, ..
                 } => {
@@ -1190,12 +1371,92 @@ pub(in crate::builtins) fn write_resource(
     }
 }
 
+/// Read up to `n` bytes from a pipe fd. EOF (read 0) latches `eof`;
+/// EAGAIN on a nonblocking stream reads "" silently — zend returns
+/// "" there rather than retrying.
+fn read_pipe(
+    file: &mut std::fs::File,
+    eof: &mut bool,
+    nonblock: bool,
+    pos: &mut u64,
+    n: usize,
+) -> Result<StreamRead, PhpError> {
+    use std::io::Read;
+    if *eof {
+        return Ok(StreamRead::Data(Vec::new()));
+    }
+    let mut buf = vec![0u8; n];
+    match file.read(&mut buf) {
+        Ok(0) => {
+            *eof = true;
+            Ok(StreamRead::Data(Vec::new()))
+        }
+        Ok(got) => {
+            buf.truncate(got);
+            *pos += got as u64;
+            Ok(StreamRead::Data(buf))
+        }
+        Err(e) if nonblock && e.kind() == std::io::ErrorKind::WouldBlock => {
+            Ok(StreamRead::Data(Vec::new()))
+        }
+        Err(e) => {
+            let (errno, msg) = io_errno_str(&e);
+            Ok(StreamRead::Ebadf(errno, msg))
+        }
+    }
+}
+
+/// php_stream_gets on a pipe: byte-wise reads up to `limit` bytes,
+/// stopping after '\n'.
+fn read_line_pipe(
+    file: &mut std::fs::File,
+    eof: &mut bool,
+    nonblock: bool,
+    pos: &mut u64,
+    limit: usize,
+) -> Result<StreamRead, PhpError> {
+    use std::io::Read;
+    if *eof {
+        return Ok(StreamRead::Data(Vec::new()));
+    }
+    let mut out = Vec::new();
+    let mut byte = [0u8; 1];
+    while out.len() < limit {
+        match file.read(&mut byte) {
+            Ok(0) => {
+                *eof = true;
+                break;
+            }
+            Ok(_) => {
+                out.push(byte[0]);
+                *pos += 1;
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            Err(e) if nonblock && e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                let (errno, msg) = io_errno_str(&e);
+                return Ok(StreamRead::Ebadf(errno, msg));
+            }
+        }
+    }
+    Ok(StreamRead::Data(out))
+}
+
 fn read_resource(c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
     use std::io::{Read, Seek};
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
             let mut rb = r.borrow_mut();
             match &mut *rb {
+                PhpResource::Pipe {
+                    file,
+                    pos,
+                    eof,
+                    nonblock,
+                    ..
+                } => read_pipe(file, eof, *nonblock, pos, n),
                 PhpResource::Stdio { which, .. } => match *which {
                     // STDIN reads are not modeled; STDOUT/STDERR/
                     // php://output are write-only fds → read(2) EBADF.
@@ -1262,6 +1523,13 @@ fn read_line_resource(c: Option<&Cell>) -> Result<StreamRead, PhpError> {
         Some(Value::Resource(r)) => {
             let mut rb = r.borrow_mut();
             match &mut *rb {
+                PhpResource::Pipe {
+                    file,
+                    pos,
+                    eof,
+                    nonblock,
+                    ..
+                } => read_line_pipe(file, eof, *nonblock, pos, usize::MAX),
                 PhpResource::Stdio { which, .. } => match *which {
                     0 => Ok(StreamRead::Data(Vec::new())),
                     _ => Ok(StreamRead::Ebadf(9, "Bad file descriptor".into())),
@@ -1349,6 +1617,13 @@ fn csv_gets(c: &Cell, limit: usize) -> Result<StreamRead, PhpError> {
         Value::Resource(r) => {
             let mut rb = r.borrow_mut();
             match &mut *rb {
+                PhpResource::Pipe {
+                    file,
+                    pos,
+                    eof,
+                    nonblock,
+                    ..
+                } => read_line_pipe(file, eof, *nonblock, pos, limit),
                 PhpResource::File {
                     file,
                     pos,
@@ -1667,4 +1942,123 @@ fn stat_array(m: &std::fs::Metadata) -> PhpArray {
         a.set(to_key(&Value::str(*name)), Value::Int(*v));
     }
     a
+}
+
+/// stream_select(&$read, &$write, &$except, ?$seconds, ?$usec): libc
+/// select() over the fd of each resource in the input arrays, then the
+/// arrays are rewritten to only the ready entries. NULL $seconds waits
+/// forever (zend's NULL timeval).
+fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<Value>, PhpError> {
+    use std::os::fd::AsRawFd;
+    let mut sets: [Vec<(ArrKey, Value, i32)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for (ai, arg_c) in args.iter().take(3).enumerate() {
+        let v = arg_c.borrow().clone();
+        match v {
+            Value::Array(a) => {
+                for (k, c) in a.borrow().iter() {
+                    let item = c.borrow().clone();
+                    match item {
+                        Value::Resource(ref r) => {
+                            let fd = {
+                                let rb = r.borrow();
+                                match &*rb {
+                                    PhpResource::File { file, .. }
+                                    | PhpResource::Pipe { file, .. } => file.as_raw_fd(),
+                                    PhpResource::Stdio { which, .. } => *which as i32,
+                                    other => {
+                                        let ty = other.type_name();
+                                        it.warn_pub(&format!(
+                                            "{}(): cannot represent a stream of type {} as a File Descriptor",
+                                            fname, ty
+                                        ))?;
+                                        continue;
+                                    }
+                                }
+                            };
+                            sets[ai].push((k.clone(), item, fd));
+                        }
+                        other => {
+                            it.warn_pub(&format!(
+                                "{}(): cannot represent a stream of type {} as a File Descriptor",
+                                fname,
+                                other.gettype()
+                            ))?;
+                        }
+                    }
+                }
+            }
+            Value::Null => {}
+            _ => {
+                return err(
+                    "TypeError",
+                    format!(
+                        "{}(): Argument #{} must be of type ?array, {} given",
+                        fname,
+                        ai + 1,
+                        v.gettype()
+                    ),
+                )
+            }
+        }
+    }
+    if sets.iter().all(|s| s.is_empty()) {
+        return err("ValueError", "No stream arrays were passed");
+    }
+    let mut fds = [
+        unsafe { std::mem::zeroed::<libc::fd_set>() },
+        unsafe { std::mem::zeroed::<libc::fd_set>() },
+        unsafe { std::mem::zeroed::<libc::fd_set>() },
+    ];
+    let mut nfds = 0i32;
+    for (i, s) in sets.iter().enumerate() {
+        for (_, _, fd) in s {
+            unsafe {
+                libc::FD_SET(*fd, &mut fds[i]);
+            }
+            nfds = nfds.max(*fd + 1);
+        }
+    }
+    let has_tv = args
+        .get(3)
+        .map(|c| !matches!(*c.borrow(), Value::Null))
+        .unwrap_or(false);
+    let mut tv = libc::timeval {
+        tv_sec: args.get(3).map(|c| c.borrow().to_int()).unwrap_or(0),
+        tv_usec: args.get(4).map(|c| c.borrow().to_int()).unwrap_or(0),
+    };
+    let n = unsafe {
+        libc::select(
+            nfds,
+            &mut fds[0],
+            &mut fds[1],
+            &mut fds[2],
+            if has_tv {
+                &mut tv
+            } else {
+                std::ptr::null_mut()
+            },
+        )
+    };
+    if n < 0 {
+        let e = std::io::Error::last_os_error();
+        let (en, reason) = io_errno_str(&e);
+        it.warn_pub(&format!(
+            "stream_select(): unable to select [{}]: {} (max_fd={})",
+            en, reason, nfds
+        ))?;
+        return Ok(Some(Value::Bool(false)));
+    }
+    // Rewrite each input array: keep only ready entries.
+    for (i, s) in sets.iter().enumerate() {
+        let mut ready = PhpArray::new();
+        for (k, v, fd) in s {
+            if unsafe { libc::FD_ISSET(*fd, &fds[i]) } {
+                ready.set(k.clone(), v.clone());
+            }
+        }
+        if let Some(c) = args.get(i) {
+            *c.borrow_mut() = Value::Array(Rc::new(RefCell::new(ready)));
+        }
+    }
+    Ok(Some(Value::Int(n as i64)))
 }

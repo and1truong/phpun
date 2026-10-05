@@ -3275,6 +3275,33 @@ impl<'a> Interp<'a> {
         rc
     }
 
+    /// `WeakReference::create($obj)` — fresh object holding a weak
+    /// handle to $obj (the WeakRef internal; get() upgrades it).
+    pub(in crate::interp) fn new_weakref(
+        &mut self,
+        target: Rc<RefCell<PhpObject>>,
+    ) -> Result<Value, PhpError> {
+        let cls = match self.classes.get("weakreference").cloned() {
+            Some(c) => c,
+            None => {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    "Class \"WeakReference\" not found",
+                    0,
+                ))
+            }
+        };
+        let rc = self.alloc_obj(PhpObject {
+            class: cls,
+            props: HashMap::new(),
+            prop_order: vec![],
+            id: 0,
+            internal: Some(ObjectInternal::WeakRef(Rc::downgrade(&target))),
+            unset_props: std::collections::HashSet::new(),
+        });
+        Ok(Value::Object(rc))
+    }
+
     /// `new X(args)` — instantiate + call __construct.
     pub(in crate::interp) fn new_instance(
         &mut self,
@@ -3307,6 +3334,13 @@ impl<'a> Interp<'a> {
             return self.fail(PhpError::uncaught(
                 "Error",
                 "Instantiation of class Closure is not allowed",
+                0,
+            ));
+        }
+        if cls.name().eq_ignore_ascii_case("weakreference") {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Direct instantiation of WeakReference is not allowed, use WeakReference::create instead",
                 0,
             ));
         }

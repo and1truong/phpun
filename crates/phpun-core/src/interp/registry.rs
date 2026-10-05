@@ -1989,6 +1989,28 @@ impl<'a> Interp<'a> {
             },
             false,
         );
+        // WeakReference — native dispatch: static_invoke's `create`
+        // and method_invoke's `get` on the WeakRef internal.
+        reg(
+            ClassDecl {
+                name: "WeakReference".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: true,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![],
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+                line: 0,
+            },
+            false,
+        );
         for (name, parent) in [
             ("ErrorException", "Exception"),
             ("RuntimeException", "Exception"),

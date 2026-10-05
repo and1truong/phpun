@@ -661,6 +661,48 @@ impl<'a> Interp<'a> {
         constants.insert("E_USER_WARNING".into(), Value::Int(512));
         constants.insert("E_USER_NOTICE".into(), Value::Int(1024));
         constants.insert("E_USER_DEPRECATED".into(), Value::Int(16384));
+        for (name, n) in [
+            ("SIGHUP", 1),
+            ("SIGINT", 2),
+            ("SIGQUIT", 3),
+            ("SIGILL", 4),
+            ("SIGTRAP", 5),
+            ("SIGABRT", 6),
+            ("SIGBUS", 7),
+            ("SIGFPE", 8),
+            ("SIGKILL", 9),
+            ("SIGUSR1", 10),
+            ("SIGSEGV", 11),
+            ("SIGUSR2", 12),
+            ("SIGPIPE", 13),
+            ("SIGALRM", 14),
+            ("SIGTERM", 15),
+            ("SIGSTKFLT", 16),
+            ("SIGCHLD", 17),
+            ("SIGCLD", 17),
+            ("SIGCONT", 18),
+            ("SIGSTOP", 19),
+            ("SIGTSTP", 20),
+            ("SIGURG", 23),
+            ("SIGXCPU", 24),
+            ("SIGXFSZ", 25),
+            ("SIGVTALRM", 26),
+            ("SIGPROF", 27),
+            ("SIGWINCH", 28),
+            ("SIGIO", 29),
+            ("SIGSYS", 31),
+            ("SIG_BLOCK", 0),
+            ("SIG_UNBLOCK", 1),
+            ("SIG_SETMASK", 2),
+            ("SIG_DFL", 0),
+            ("SIG_IGN", 1),
+            ("WNOHANG", 1),
+        ] {
+            constants.insert(name.into(), Value::Int(n));
+        }
+        constants.insert("SEEK_SET".into(), Value::Int(0));
+        constants.insert("SEEK_CUR".into(), Value::Int(1));
+        constants.insert("SEEK_END".into(), Value::Int(2));
         constants.insert("PHP_OUTPUT_HANDLER_START".into(), Value::Int(1));
         constants.insert("PHP_OUTPUT_HANDLER_WRITE".into(), Value::Int(0));
         constants.insert("PHP_OUTPUT_HANDLER_CONT".into(), Value::Int(0));
@@ -2426,6 +2468,18 @@ impl<'a> Interp<'a> {
             .get(name)
             .cloned()
             .or_else(|| std::env::var(name).ok())
+    }
+
+    /// getenv() with no args: the whole environment as name → value.
+    pub fn getenv_all_pub(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = std::env::vars().collect();
+        for (k, v) in &self.env_overrides {
+            match out.iter_mut().find(|(ek, _)| ek == k) {
+                Some(e) => e.1 = v.clone(),
+                None => out.push((k.clone(), v.clone())),
+            }
+        }
+        out
     }
 
     /// putenv("K=V") → true on success.

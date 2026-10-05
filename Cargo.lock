@@ -542,6 +542,7 @@ dependencies = [
 name = "phpun-core"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "md5",
  "phpun-phpt",
  "regex",
