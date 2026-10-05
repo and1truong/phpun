@@ -207,20 +207,22 @@ pub(crate) fn dispatch(
                                 && *f < 9.223372036854776e18
                                 && *f >= -9.223372036854776e18 =>
                         {
+                            // A real float → int coerces with the
+                            // loses-precision deprecation (zend).
+                            if f.fract() != 0.0 {
+                                it.deprecated_pub(&format!(
+                                    "Implicit conversion from float {} to int loses precision",
+                                    crate::value::format_float_repr(*f)
+                                ))?;
+                            }
                             Some(*f as i64)
                         }
                         Value::Bool(b) => Some(*b as i64),
                         Value::Str(s) => match crate::value::numeric(s) {
                             crate::value::Numeric::Int(i) => Some(i),
-                            crate::value::Numeric::Float(f) => {
-                                if f != f.trunc() {
-                                    it.deprecated_pub(&format!(
-                                        "Implicit conversion from float-string \"{}\" to int loses precision",
-                                        crate::value::lossy(s)
-                                    ))?;
-                                }
-                                Some(f as i64)
-                            }
+                            // A float-STRING truncates silently — zend
+                            // only warns on real floats.
+                            crate::value::Numeric::Float(f) => Some(f as i64),
                             _ => {
                                 return err(
                                     "TypeError",
