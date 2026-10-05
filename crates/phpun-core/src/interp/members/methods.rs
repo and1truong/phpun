@@ -644,41 +644,87 @@ impl<'a> Interp<'a> {
                     },
                     None => 0,
                 };
-                let mut a = arr.borrow_mut();
-                if lname == "asort" {
-                    match flag {
-                        // SORT_NUMERIC / SORT_STRING / plain regular.
-                        1 => a.entries.sort_by(|(_, x), (_, y)| {
-                            x.borrow()
-                                .to_float()
-                                .partial_cmp(&y.borrow().to_float())
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        }),
-                        2 | 5 | 3 => a.entries.sort_by(|(_, x), (_, y)| {
-                            x.borrow().to_php_string().cmp(&y.borrow().to_php_string())
-                        }),
-                        _ => a
-                            .entries
-                            .sort_by(|(_, x), (_, y)| compare(&x.borrow(), &y.borrow())),
-                    }
-                } else {
-                    match flag {
-                        1 => a.entries.sort_by(|(x, _), (y, _)| {
-                            key_value(x)
-                                .to_float()
-                                .partial_cmp(&key_value(y).to_float())
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        }),
-                        2 | 5 | 3 => a.entries.sort_by(|(x, _), (y, _)| {
-                            key_value(x)
-                                .to_php_string()
-                                .cmp(&key_value(y).to_php_string())
-                        }),
-                        _ => a
-                            .entries
-                            .sort_by(|(x, _), (y, _)| compare(&key_value(x), &key_value(y))),
+                {
+                    let mut a = arr.borrow_mut();
+                    // zend runs the same zend_sort + RETURN_STABLE_SORT
+                    // position fallback here as for plain arrays.
+                    let fb = |x: &crate::value::SortElem, y: &crate::value::SortElem, r| {
+                        if r != std::cmp::Ordering::Equal {
+                            r
+                        } else {
+                            x.0.cmp(&y.0)
+                        }
+                    };
+                    if lname == "asort" {
+                        match flag {
+                            // SORT_NUMERIC / SORT_STRING / plain regular.
+                            1 => {
+                                let mut v = crate::value::zend_sort_prepare(&mut a.entries);
+                                crate::value::zend_sort(&mut v, &mut |x, y| {
+                                    let r =
+                                        x.2.borrow()
+                                            .to_float()
+                                            .partial_cmp(&y.2.borrow().to_float())
+                                            .unwrap_or(std::cmp::Ordering::Equal);
+                                    fb(x, y, r)
+                                });
+                                crate::value::zend_sort_finish(&mut a.entries, v);
+                            }
+                            2 | 5 | 3 => {
+                                let mut v = crate::value::zend_sort_prepare(&mut a.entries);
+                                crate::value::zend_sort(&mut v, &mut |x, y| {
+                                    let r =
+                                        x.2.borrow()
+                                            .to_php_string()
+                                            .cmp(&y.2.borrow().to_php_string());
+                                    fb(x, y, r)
+                                });
+                                crate::value::zend_sort_finish(&mut a.entries, v);
+                            }
+                            _ => {
+                                crate::value::zend_sort_data(&mut a.entries, false);
+                            }
+                        }
+                    } else {
+                        match flag {
+                            1 => {
+                                let mut v = crate::value::zend_sort_prepare(&mut a.entries);
+                                crate::value::zend_sort(&mut v, &mut |x, y| {
+                                    let r = key_value(&x.1)
+                                        .to_float()
+                                        .partial_cmp(&key_value(&y.1).to_float())
+                                        .unwrap_or(std::cmp::Ordering::Equal);
+                                    fb(x, y, r)
+                                });
+                                crate::value::zend_sort_finish(&mut a.entries, v);
+                            }
+                            2 | 5 | 3 => {
+                                let mut v = crate::value::zend_sort_prepare(&mut a.entries);
+                                crate::value::zend_sort(&mut v, &mut |x, y| {
+                                    let r = key_value(&x.1)
+                                        .to_php_string()
+                                        .cmp(&key_value(&y.1).to_php_string());
+                                    fb(x, y, r)
+                                });
+                                crate::value::zend_sort_finish(&mut a.entries, v);
+                            }
+                            _ => {
+                                let mut v = crate::value::zend_sort_prepare(&mut a.entries);
+                                crate::value::zend_sort(&mut v, &mut |x, y| {
+                                    let r = compare(&key_value(&x.1), &key_value(&y.1));
+                                    fb(x, y, r)
+                                });
+                                crate::value::zend_sort_finish(&mut a.entries, v);
+                            }
+                        }
                     }
                 }
+                // Notices queued inside the sort's compares (object→
+                // number casts) must drain at THIS call site — the
+                // builtin-boundary flush in call_builtin never runs on
+                // the method path, so they'd strand onto the next
+                // unrelated compare or vanish.
+                self.emit_cmp_notices()?;
                 Value::Bool(true)
             }
             "uasort" | "uksort" => {
@@ -727,15 +773,24 @@ impl<'a> Interp<'a> {
             }
             "natsort" | "natcasesort" => {
                 let ci = lname == "natcasesort";
-                arr.borrow_mut().entries.sort_by(|(_, x), (_, y)| {
-                    let mut a = x.borrow().to_php_string();
-                    let mut b = y.borrow().to_php_string();
-                    if ci {
-                        a = a.to_lowercase();
-                        b = b.to_lowercase();
-                    }
-                    compare(&Value::str(a), &Value::str(b))
-                });
+                {
+                    let mut a = arr.borrow_mut();
+                    let mut v = crate::value::zend_sort_prepare(&mut a.entries);
+                    crate::value::zend_sort(&mut v, &mut |x, y| {
+                        let r = crate::builtins::array::natcmp(
+                            &x.2.borrow().to_php_bytes(),
+                            &y.2.borrow().to_php_bytes(),
+                            ci,
+                        );
+                        if r != std::cmp::Ordering::Equal {
+                            r
+                        } else {
+                            x.0.cmp(&y.0)
+                        }
+                    });
+                    crate::value::zend_sort_finish(&mut a.entries, v);
+                }
+                self.emit_cmp_notices()?;
                 Value::Bool(true)
             }
             "serialize" => {

@@ -1156,76 +1156,6 @@ pub(crate) fn dispatch(
 
 // ----- helpers -----
 
-/// Stable bottom-up merge sort preserving zend's compare direction:
-/// zend_sort always calls `cmp(earlier, later)` (`cmp(j, i)` with
-/// j < i), so the protected LEFT operand of each compare is the
-/// earlier element — `sort([$cyclic, $finite])` raises the depth
-/// Error while `sort([$finite, $cyclic])` sorts silently. Rust's
-/// `sort_by` hands the comparator pairs in no guaranteed order, so
-/// the merges are done by hand. Returns true when a compare set
-/// CMP_DEPTH_ERR.
-fn zend_merge_sort(entries: &mut [(ArrKey, Cell)], desc: bool) -> bool {
-    let n = entries.len();
-    if n < 2 {
-        return false;
-    }
-    // A stale CMP_DEPTH_ERR from an earlier caught Error must not
-    // bleed into this sort's flag reads.
-    crate::value::clear_cmp_depth_err();
-    let mut deep = false;
-    let mut scratch: Vec<(ArrKey, Cell)> = entries.to_vec();
-    // `work` is a clone so `scratch`/`entries` stay borrowable — the
-    // cell Rcs are cheap to clone.
-    let mut work: Vec<(ArrKey, Cell)> = entries.to_vec();
-    let mut width = 1;
-    while width < n {
-        let mut lo = 0;
-        while lo < n {
-            let mid = (lo + width).min(n);
-            let hi = (lo + 2 * width).min(n);
-            let (mut i, mut j, mut k) = (lo, mid, lo);
-            while i < mid && j < hi {
-                // (earlier, later) — left run i < right run j.
-                // zend's reversed variants negate the compare result
-                // rather than the operands, so cyclic-left stays the
-                // earlier element for rsort/arsort too; ties still fall
-                // back to original position (RETURN_STABLE_SORT), which
-                // prefers the left-run element in this merge.
-                let ord = compare(&work[i].1.borrow(), &work[j].1.borrow());
-                deep |= crate::value::cmp_depth_err();
-                let take_j = if desc {
-                    ord == std::cmp::Ordering::Less
-                } else {
-                    ord == std::cmp::Ordering::Greater
-                };
-                if take_j {
-                    scratch[k] = work[j].clone();
-                    j += 1;
-                } else {
-                    scratch[k] = work[i].clone();
-                    i += 1;
-                }
-                k += 1;
-            }
-            while i < mid {
-                scratch[k] = work[i].clone();
-                i += 1;
-                k += 1;
-            }
-            while j < hi {
-                scratch[k] = work[j].clone();
-                j += 1;
-                k += 1;
-            }
-            lo += 2 * width;
-        }
-        std::mem::swap(&mut work, &mut scratch);
-        width *= 2;
-    }
-    entries.clone_from_slice(&work);
-    deep
-}
-
 fn sort_array(
     it: &mut Interp,
     arr: &mut PhpArray,
@@ -1236,7 +1166,7 @@ fn sort_array(
         "sort" | "rsort" => {
             // zend aborts mid-sort on a depth Error — accumulate the
             // flag per compare and throw after.
-            if zend_merge_sort(&mut arr.entries, name == "rsort") {
+            if crate::value::zend_sort_data(&mut arr.entries, name == "rsort") {
                 return depth_err();
             }
             // renumber
@@ -1250,27 +1180,55 @@ fn sort_array(
         // natsort/natcasesort compare naturally and keep keys (like asort).
         "natsort" | "natcasesort" => {
             let ci = name == "natcasesort";
-            arr.entries.sort_by(|(_, a), (_, b)| {
-                natcmp(&a.borrow().to_php_bytes(), &b.borrow().to_php_bytes(), ci)
+            let mut v = crate::value::zend_sort_prepare(&mut arr.entries);
+            crate::value::zend_sort(&mut v, &mut |x, y| {
+                let r = natcmp(
+                    &x.2.borrow().to_php_bytes(),
+                    &y.2.borrow().to_php_bytes(),
+                    ci,
+                );
+                if r != std::cmp::Ordering::Equal {
+                    r
+                } else {
+                    x.0.cmp(&y.0)
+                }
             });
+            crate::value::zend_sort_finish(&mut arr.entries, v);
         }
         "asort" | "arsort" => {
-            if zend_merge_sort(&mut arr.entries, name == "arsort") {
+            if crate::value::zend_sort_data(&mut arr.entries, name == "arsort") {
                 return depth_err();
             }
         }
         "ksort" | "krsort" => {
-            arr.entries.retain(|(k, _)| !matches!(k, ArrKey::Tomb));
-            arr.entries.sort_by(|(a, _), (b, _)| match (a, b) {
-                (ArrKey::Int(x), ArrKey::Int(y)) => x.cmp(y),
-                (ArrKey::Str(x), ArrKey::Str(y)) => x.cmp(y),
-                (ArrKey::Int(_), ArrKey::Str(_)) => std::cmp::Ordering::Less,
-                (ArrKey::Str(_), ArrKey::Int(_)) => std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
+            // php_array_key_compare + zend_sort: int×int numeric (zend
+            // returns ±1, never 0 — keys are unique), str×str bytewise
+            // (zendi_smart_strcmp — string keys are never numeric), and
+            // mixed int×str through loose zend_compare — NOT a fixed
+            // int-before-str order, and non-transitive on inputs like
+            // "10x" vs 2, where the pairing decides.
+            let kv = |k: &ArrKey| match k {
+                ArrKey::Int(i) => Value::Int(*i),
+                ArrKey::Str(s) => Value::str(s.to_string()),
+                ArrKey::Tomb => Value::Null,
+            };
+            let desc = name == "krsort";
+            let mut v = crate::value::zend_sort_prepare(&mut arr.entries);
+            crate::value::zend_sort(&mut v, &mut |x, y| {
+                let r = match (&x.1, &y.1) {
+                    (ArrKey::Int(a), ArrKey::Int(b)) => a.cmp(b),
+                    // str×str zendi_smart_strcmp and mixed int×str both
+                    // reduce to loose compare on the key zvals.
+                    _ => compare(&kv(&x.1), &kv(&y.1)),
+                };
+                let r = if desc { r.reverse() } else { r };
+                if r != std::cmp::Ordering::Equal {
+                    r
+                } else {
+                    x.0.cmp(&y.0)
+                }
             });
-            if name == "krsort" {
-                arr.entries.reverse();
-            }
+            crate::value::zend_sort_finish(&mut arr.entries, v);
         }
         "usort" | "uasort" | "uksort" => {
             if let Some(cbc) = cb_arg {
@@ -1391,7 +1349,7 @@ fn fold_case(b: &[u8]) -> Vec<u8> {
 }
 
 /// Port of PHP's strnatcmp_ex (ext/standard/strnatcmp.c).
-fn natcmp(a: &[u8], b: &[u8], ci: bool) -> std::cmp::Ordering {
+pub(crate) fn natcmp(a: &[u8], b: &[u8], ci: bool) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
     fn digit(c: u8) -> bool {
         c.is_ascii_digit()

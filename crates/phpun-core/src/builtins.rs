@@ -11,7 +11,7 @@ pub(in crate::builtins) use std::cell::RefCell;
 pub(in crate::builtins) use std::collections::HashMap;
 pub(in crate::builtins) use std::rc::Rc;
 
-mod array;
+pub(crate) mod array;
 mod class;
 mod core;
 mod crypto;
