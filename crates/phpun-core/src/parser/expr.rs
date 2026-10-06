@@ -152,8 +152,9 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_op("{")?;
-            self.class_ctx
-                .push((parent.is_some() || !implements.is_empty(), false));
+            // Only a real `extends` gives the anonymous class a
+            // `parent` (see class_decl).
+            self.class_ctx.push((parent.is_some(), false));
             let mut methods = Vec::new();
             let mut props = Vec::new();
             let mut consts = Vec::new();

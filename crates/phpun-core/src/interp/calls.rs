@@ -2965,13 +2965,15 @@ impl<'a> Interp<'a> {
                     .as_deref()
                     .and_then(|p| self.classes.get(&p.to_lowercase()).cloned())
                 {
-                    // A class without parent — zend's uncatchable
-                    // 'Cannot use "parent" when current class scope
-                    // has no parent' (p15/y), not a thrown Error.
-                    None => Err(SiteErr::Thrown(PhpError::compile_fatal(
-                        "Cannot use \"parent\" when current class scope has no parent",
-                        self.cur_line,
-                    ))),
+                    // Callable validation (`is_callable`, cuf arginfo)
+                    // reports this as a not-callable detail — zend's
+                    // 'Cannot use "parent" ...' compile fatal is gated
+                    // to the `parent::` dispatch syntax (traits/
+                    // bug76773-deprecated).
+                    None => Err(SiteErr::Msg(
+                        "cannot access \"parent\" when current class scope has no parent"
+                            .to_string(),
+                    )),
                     Some(p) => {
                         if emit_dep {
                             let _ = self.deprecated("Use of \"parent\" in callables is deprecated");

@@ -1014,10 +1014,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op("{")?;
-        self.class_ctx.push((
-            parent.is_some() || !implements.is_empty(),
-            kind == ClassKind::Trait,
-        ));
+        // `implements I` alone does NOT give the class a `parent` —
+        // `parent::`/`new parent()`/`parent::$p` inside must still hit
+        // zend's whole-file compile fatal.
+        self.class_ctx
+            .push((parent.is_some(), kind == ClassKind::Trait));
         let mut methods = Vec::new();
         let mut props = Vec::new();
         let mut consts = Vec::new();

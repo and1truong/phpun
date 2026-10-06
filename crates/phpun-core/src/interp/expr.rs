@@ -4545,6 +4545,13 @@ impl<'a> Interp<'a> {
                         && !o.borrow().props.contains_key(&pn)
                         && self.find_method_in(&cls, "__get").is_none()
                     {
+                        // A DECLARED prop the scope can't see is
+                        // `Cannot access private/protected property`,
+                        // not a dynamic-prop materialization
+                        // (closure_038/closure_039).
+                        if let Some(e) = self.hidden_decl_error(&o, &pn) {
+                            return self.fail(e);
+                        }
                         let cn = o.borrow().class.name().to_string();
                         if self.dyn_prop_deprecated(o, &pn, &pn) {
                             self.deprecated(&format!(
