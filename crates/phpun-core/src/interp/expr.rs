@@ -864,8 +864,12 @@ impl<'a> Interp<'a> {
                     Some(k) => self.eval(k)?,
                     None => return Ok(None),
                 };
-                // ArrayAccess containers see any key type (offsetExists).
-                if !matches!(&base, Value::Object(o) if self.obj_is_a(o, "ArrayAccess")) {
+                // ArrayAccess containers see any key type (offsetExists);
+                // string bases take the isset/empty/?? dim matrix —
+                // composite keys are silent there, never 'on array' Errors.
+                if !matches!(&base, Value::Object(o) if self.obj_is_a(o, "ArrayAccess"))
+                    && !matches!(&base, Value::Str(_))
+                {
                     self.check_offset_key(&key)?;
                 }
                 match base {
@@ -876,14 +880,7 @@ impl<'a> Interp<'a> {
                         },
                         None => None,
                     }),
-                    Value::Str(s) => {
-                        let i = key.to_int();
-                        Ok(if i >= 0 && (i as usize) < s.len() {
-                            Some(Value::bytes(vec![s[i as usize]]))
-                        } else {
-                            None
-                        })
-                    }
+                    Value::Str(s) => self.str_offset_dim(&s, &key, mode),
                     Value::Object(o) => {
                         if self.obj_is_a(&o, "ArrayAccess") {
                             match self.method_invoke(
@@ -1261,7 +1258,13 @@ impl<'a> Interp<'a> {
                     c
                 }
                 _ => {
-                    let c = self.eval_cell(value)?;
+                    // By-ref dim fetches flag dim_by_ref so a string
+                    // leaf errors 'Cannot create references to/from
+                    // string offsets' instead of 'as an array'.
+                    let was = std::mem::replace(&mut self.dim_by_ref, true);
+                    let c = self.eval_cell(value);
+                    self.dim_by_ref = was;
+                    let c = c?;
                     // A `=&` source that is itself a typed-prop slot
                     // carries that prop's declared type into the
                     // conflict check (typed_properties_068/076).
@@ -1309,7 +1312,10 @@ impl<'a> Interp<'a> {
                     c
                 }
             };
-            self.bind_cell(target, src.clone())?;
+            let was = std::mem::replace(&mut self.dim_by_ref, true);
+            let br = self.bind_cell(target, src.clone());
+            self.dim_by_ref = was;
+            br?;
             return Ok(src.borrow().clone());
         }
         let needs_read = op != "=";
@@ -1446,12 +1452,20 @@ impl<'a> Interp<'a> {
                 None => {
                     // `??=` reads with isset() semantics (no undefined
                     // warnings); every other compound op warns
-                    // (typed_properties_103).
+                    // (typed_properties_103). The read itself is the
+                    // IS-mode fetch — an uninitialized string offset
+                    // means "not set" (assign), not the "" a BP_VAR_R
+                    // read produces.
                     let quiet = op == "??=";
                     if quiet {
                         self.silence += 1;
                     }
-                    let c = self.eval(target);
+                    let c = if op == "??=" {
+                        self.isset_val_mode(target, 2)
+                            .map(|v| v.unwrap_or(Value::Null))
+                    } else {
+                        self.eval(target)
+                    };
                     if quiet {
                         self.silence -= 1;
                     }
@@ -1461,6 +1475,23 @@ impl<'a> Interp<'a> {
         } else {
             Value::Null
         };
+        // zend ASSIGN_DIM_OP walks the dim chain for write before the
+        // op combines operands — a string leaf refuses first (the rhs
+        // still evaluated). `??=` is exempt: it assigns through the
+        // plain path, which splices string offsets fine.
+        if op != "=" && op != "??=" {
+            match &late {
+                Late::Keyed { e, keys } => self.str_offset_op_gate(e, keys)?,
+                Late::Index { base, .. } if matches!(*base.borrow(), Value::Str(_)) => {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        "Cannot use assign-op operators with string offsets",
+                        self.cur_line,
+                    ));
+                }
+                _ => {}
+            }
+        }
         let newv = match op {
             "=" => rhs,
             "+=" => self.arith("+", cur, rhs)?,
@@ -1587,7 +1618,9 @@ impl<'a> Interp<'a> {
                         _ => Vec::new(),
                     };
                     let off = self.str_offset_key(key.as_ref())?;
-                    if op != "=" {
+                    // `??=` writes like `=` once the offset shows
+                    // unset — only real compound ops are refused.
+                    if op != "=" && op != "??=" {
                         return self.fail(PhpError::uncaught(
                             "Error",
                             "Cannot use assign-op operators with string offsets",
@@ -1599,7 +1632,7 @@ impl<'a> Interp<'a> {
                         if let Value::Str(s) = &mut *b {
                             *s = bytes.into();
                         }
-                        return Ok(Value::str(String::from_utf8_lossy(&[byte]).into_owned()));
+                        return Ok(Value::bytes(vec![byte]));
                     }
                 }
             }
@@ -1616,7 +1649,7 @@ impl<'a> Interp<'a> {
                 *c.borrow_mut() = nv;
             }
             Late::Keyed { e, keys } => {
-                newv = self.assign_index_path(&e, &keys, newv, op != "=")?;
+                newv = self.assign_index_path(&e, &keys, newv, op != "=" && op != "??=")?;
             }
             Late::None => match target_cell {
                 Some(c) => {
@@ -2366,7 +2399,7 @@ impl<'a> Interp<'a> {
                         if let Value::Str(s) = &mut *b {
                             *s = bytes.into();
                         }
-                        return Ok(Value::str(String::from_utf8_lossy(&[byte]).into_owned()));
+                        return Ok(Value::bytes(vec![byte]));
                     }
                 }
             }
@@ -2515,6 +2548,120 @@ impl<'a> Interp<'a> {
                 ))
             }
         }
+    }
+
+    /// isset/empty/?? on a string offset. zend_isset_dim_slow and
+    /// zend_isempty_dim_slow accept a LONG dim, a scalar (floats go
+    /// through zval_get_long_ex — the lossy-precision deprecation still
+    /// fires) or a fully int-numeric string; anything else is silently
+    /// not-set/empty — composite keys included. The ?? value read
+    /// (FETCH_DIM_IS) instead warns 'Illegal string offset' on
+    /// leading-junk numerics, silently casts scalars, yields NULL for
+    /// non-numeric strings, and still raises 'on string' TypeErrors for
+    /// composite keys (zend_illegal_string_offset runs with BP_VAR_R).
+    /// Negative offsets wrap from the end in both paths.
+    fn str_offset_dim(
+        &mut self,
+        s: &Rc<[u8]>,
+        key: &Value,
+        mode: u8,
+    ) -> Result<Option<Value>, PhpError> {
+        let len = s.len() as i64;
+        let off = if mode == 2 {
+            match key {
+                Value::Int(i) => *i,
+                Value::Str(str) => match numeric(str) {
+                    Numeric::Int(i) => i,
+                    Numeric::Leading(f, true) => {
+                        let orig = crate::value::lossy(str).into_owned();
+                        self.warn(&format!("Illegal string offset \"{}\"", orig))?;
+                        f as i64
+                    }
+                    // Non-numeric string keys are NULL, not an error.
+                    _ => return Ok(None),
+                },
+                // Scalars cast silently — no 'String offset cast
+                // occurred' warning and no lossy-float deprecation.
+                Value::Float(_) | Value::Bool(_) | Value::Null => key.to_int(),
+                _ => {
+                    let ty = match key {
+                        Value::Array(_) => "array".to_string(),
+                        Value::Object(o) => o.borrow().class.name().to_string(),
+                        Value::Callable(_) => "Closure".to_string(),
+                        _ => "resource".to_string(),
+                    };
+                    return self.fail(PhpError::uncaught(
+                        "TypeError",
+                        format!("Cannot access offset of type {} on string", ty),
+                        self.cur_line,
+                    ));
+                }
+            }
+        } else {
+            match key {
+                Value::Int(i) => *i,
+                Value::Float(f) => {
+                    // zval_get_long_ex(is_strict): fractional floats warn.
+                    if f.fract() != 0.0 {
+                        self.deprecated(&format!(
+                            "Implicit conversion from float {} to int loses precision",
+                            format_float_repr(*f)
+                        ))?;
+                    }
+                    *f as i64
+                }
+                Value::Bool(_) | Value::Null => key.to_int(),
+                Value::Str(str) => match numeric(str) {
+                    Numeric::Int(i) => i,
+                    _ => return Ok(None),
+                },
+                _ => return Ok(None),
+            }
+        };
+        // Negative offsets wrap from the end (isset($s[-1]) → last
+        // byte); still-out-of-range is not-set in every mode.
+        let idx = if off < 0 {
+            off.checked_add(len).unwrap_or(i64::MIN)
+        } else {
+            off
+        };
+        if idx >= 0 && idx < len {
+            Ok(Some(Value::bytes(vec![s[idx as usize]])))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// zend ASSIGN_DIM_OP fetches the dim chain for write before the
+    /// operation combines operands — a string leaf errors 'Cannot use
+    /// string offset as an array' mid-path or 'Cannot use assign-op
+    /// operators with string offsets' at the final dim. The gate runs
+    /// before `newv` arith; the leaf's key already validated during the
+    /// current-value read.
+    fn str_offset_op_gate(&mut self, e: &Expr, keys: &[Option<Value>]) -> Result<(), PhpError> {
+        let mut c = self.eval_cell(e)?;
+        let last = keys.len() - 1;
+        for (n, k) in keys.iter().enumerate() {
+            if matches!(*c.borrow(), Value::Str(_)) {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    if n != last {
+                        "Cannot use string offset as an array"
+                    } else {
+                        "Cannot use assign-op operators with string offsets"
+                    },
+                    self.cur_line,
+                ));
+            }
+            if !matches!(*c.borrow(), Value::Array(_)) {
+                return Ok(());
+            }
+            match self.index_into_key(c.clone(), k.clone()) {
+                Ok(nc) => c = nc,
+                Err(_) => return Ok(()),
+            }
+        }
+        Ok(())
     }
 
     /// The zend string-offset byte splice on an already-validated
@@ -2817,12 +2964,17 @@ impl<'a> Interp<'a> {
             if is_str {
                 // zend_check_string_offset validates the key first —
                 // bad keys throw 'on string' TypeErrors or the []
-                // Error; a valid offset on a non-final dim is
-                // 'Cannot use string offset as an array'.
+                // Error; a valid offset on a non-final dim errors —
+                // 'as an array' on write, 'Cannot create references'
+                // in a =& context (FETCH_DIM_REF).
                 self.str_offset_key(key.as_ref())?;
                 self.fail(PhpError::uncaught(
                     "Error",
-                    "Cannot use string offset as an array",
+                    if self.dim_by_ref {
+                        "Cannot create references to/from string offsets"
+                    } else {
+                        "Cannot use string offset as an array"
+                    },
                     self.cur_line,
                 ))
             } else {
@@ -3066,7 +3218,9 @@ impl<'a> Interp<'a> {
                     if self.silence == 0 {
                         self.warn(&format!("Uninitialized string offset {}", key.to_int()))?;
                     }
-                    Ok(Value::Null)
+                    // zend reads an empty string out of an
+                    // uninitialized offset, not NULL.
+                    Ok(Value::str(String::new()))
                 } else {
                     Ok(Value::bytes(bytes[idx as usize..idx as usize + 1].to_vec()))
                 }
@@ -3813,11 +3967,12 @@ impl<'a> Interp<'a> {
                     }
                 }
                 if matches!(&base, Value::Str(_)) {
-                    // zend validates the key, then refuses the assign-op.
+                    // zend validates the key, then refuses the incdec
+                    // (FETCH_DIM_INCDEC → 'Cannot increment/decrement').
                     self.str_offset_key(Some(&key))?;
                     return self.fail(PhpError::uncaught(
                         "Error",
-                        "Cannot use assign-op operators with string offsets",
+                        "Cannot increment/decrement string offsets",
                         self.cur_line,
                     ));
                 }
