@@ -29,14 +29,20 @@ impl Ctx {
 struct ScanScope {
     /// Enclosing breakable contexts, outermost→innermost.
     ctxs: Vec<Ctx>,
-    /// Innermost enclosing `finally` node id (gotos must not cross it).
-    fin: Option<usize>,
+    /// Try ids of the `finally` regions enclosing the scan position
+    /// (outermost→innermost) — Zend's per-element op-range check
+    /// (zend_check_finally_breakout) walks all of them.
+    fins: Vec<usize>,
+    /// Every try-with-finally in this scope, in scan order — Zend's
+    /// try_catch_array registration order; the FIRST element whose
+    /// range separates goto and label decides the message direction.
+    fin_order: Vec<usize>,
     /// `ctxs` depth where the innermost enclosing `finally` began — a
     /// break/continue resolving to a context pushed before it jumps
     /// out of the finally (Zend zend_check_finally_break).
     fin_depth: Option<usize>,
-    /// label name → (enclosing loop ids outermost→innermost, fin id)
-    labels: HashMap<String, (Vec<usize>, Option<usize>)>,
+    /// label name → (enclosing loop ids outermost→innermost, fin stack)
+    labels: HashMap<String, (Vec<usize>, Vec<usize>)>,
     gotos: Vec<GotoSite>,
     /// static var name → first decl line (dup-decl detection).
     statics: HashMap<String, usize>,
@@ -55,7 +61,7 @@ struct GotoSite {
     line: usize,
     /// Loop/switch node ids enclosing the goto (outermost→innermost).
     loops: Vec<usize>,
-    fin: Option<usize>,
+    fins: Vec<usize>,
 }
 
 impl<'a> Interp<'a> {
@@ -129,18 +135,29 @@ impl<'a> Interp<'a> {
                         g.line,
                     ));
                 }
-                Some((loops, fin)) => {
-                    if *fin != g.fin {
-                        if fin.is_some() {
-                            return Err(PhpError::compile_fatal(
-                                "jump into a finally block is disallowed",
-                                g.line,
-                            ));
+                Some((loops, fins)) => {
+                    if *fins != g.fins {
+                        // zend_check_finally_breakout: the FIRST try
+                        // element (registration order) whose finally
+                        // range separates goto and label decides —
+                        // 'into' when only the label is inside, 'out
+                        // of' when only the goto is.
+                        for e in &sc.fin_order {
+                            let g_in = g.fins.contains(e);
+                            let l_in = fins.contains(e);
+                            if !g_in && l_in {
+                                return Err(PhpError::compile_fatal(
+                                    "jump into a finally block is disallowed",
+                                    g.line,
+                                ));
+                            }
+                            if g_in && !l_in {
+                                return Err(PhpError::compile_fatal(
+                                    "jump out of a finally block is disallowed",
+                                    g.line,
+                                ));
+                            }
                         }
-                        return Err(PhpError::compile_fatal(
-                            "jump out of a finally block is disallowed",
-                            g.line,
-                        ));
                     }
                     if !loops.iter().all(|id| g.loops.contains(id)) {
                         return Err(PhpError::compile_fatal(
@@ -211,10 +228,10 @@ impl<'a> Interp<'a> {
                     name: n.clone(),
                     line: sc.line,
                     loops: sc.ctxs.iter().map(|c| c.id()).collect(),
-                    fin: sc.fin,
+                    fins: sc.fins.clone(),
                 }),
                 Stmt::Label(n) => {
-                    let site = (sc.ctxs.iter().map(|c| c.id()).collect(), sc.fin);
+                    let site = (sc.ctxs.iter().map(|c| c.id()).collect(), sc.fins.clone());
                     if sc.labels.insert(n.clone(), site).is_some() {
                         return Err(PhpError::compile_fatal(
                             format!("Label '{}' already defined", n),
@@ -280,19 +297,25 @@ impl<'a> Interp<'a> {
                     catches,
                     finally,
                 } => {
+                    if finally.is_some() {
+                        // try_catch_array registers the element when
+                        // the try compiles — before its body — so
+                        // outer trys are checked before inner ones.
+                        sc.fin_order.push(std::ptr::from_ref(s) as usize);
+                    }
                     Self::flow_scan(body, sc)?;
                     for c in catches {
                         Self::flow_scan(&c.body, sc)?;
                     }
                     if let Some(f) = finally {
                         // A finally region is closed to gotos in either
-                        // direction — the innermost id marks the boundary.
-                        let saved = sc.fin.replace(std::ptr::from_ref(s) as usize);
+                        // direction — the stack marks its boundaries.
+                        sc.fins.push(std::ptr::from_ref(s) as usize);
                         // …and to break/continue operands resolving to a
                         // context outside it — the ctx depth marks that line.
                         let saved_depth = sc.fin_depth.replace(sc.ctxs.len());
                         Self::flow_scan(f, sc)?;
-                        sc.fin = saved;
+                        sc.fins.pop();
                         sc.fin_depth = saved_depth;
                     }
                 }
