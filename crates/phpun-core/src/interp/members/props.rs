@@ -414,7 +414,7 @@ impl<'a> Interp<'a> {
                 // Interpolated `{$expr}` parts are source strings — a
                 // substring check for `$this->prop` is close enough for
                 // the backed-prop heuristic.
-                crate::lexer::StringPart::Expr(s) => {
+                crate::lexer::StringPart::Expr(s, _) => {
                     s.contains(&format!("this->{pn}")) || s.contains(&format!("this->${pn}"))
                 }
                 _ => false,

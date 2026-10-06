@@ -34,23 +34,35 @@ impl<'a> Interp<'a> {
                 for p in parts {
                     match p {
                         StringPart::Lit(t) => s.extend_from_slice(t),
-                        StringPart::Var(name) => {
+                        // Each interpolated part sites at its own
+                        // absolute line (the marker's/the `$`'s line):
+                        // Zend attributes the part's read ops there, so
+                        // diagnostics inside unmarked positions and in
+                        // `$var` parts report the part's line, not the
+                        // enclosing statement's.
+                        StringPart::Var(name, base) => {
+                            self.cur_line = *base;
+                            self.send_line = Some(*base);
                             let v = self.var_get(name)?;
                             let cs = self.conv_bytes(&v)?;
                             s.extend_from_slice(&cs);
                         }
-                        StringPart::Expr(src) => {
-                            let (expr, _) = parser::parse_expr_src(src)
+                        StringPart::Expr(src, base) => {
+                            self.cur_line = *base;
+                            self.send_line = Some(*base);
+                            let (expr, _) = parser::parse_expr_src(src, *base)
                                 .map_err(|e| PhpError::parse(e.message, e.line))?;
                             let v = self.eval(&expr)?;
                             s.extend_from_slice(&self.conv_bytes(&v)?);
                         }
-                        StringPart::DollarBraceExpr(src) => {
+                        StringPart::DollarBraceExpr(src, base) => {
+                            self.cur_line = *base;
+                            self.send_line = Some(*base);
                             // `${expr}` — deprecated variable-variable
                             // interpolation; its deprecation + inner
                             // diagnostics already emitted at lex time
                             // (heredoc_nowdoc/flexible-heredoc-complex-*).
-                            let (expr, _) = parser::parse_expr_src(src)
+                            let (expr, _) = parser::parse_expr_src(src, *base)
                                 .map_err(|e| PhpError::parse(e.message, e.line))?;
                             let nv = self.eval(&expr)?;
                             let name = self.conv_str(&nv)?;

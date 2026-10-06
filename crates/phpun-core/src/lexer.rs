@@ -30,13 +30,17 @@ pub enum StringPart {
     /// Literal bytes — escapes decode to raw bytes (PHP strings are
     /// byte arrays; `\xNN` is a byte, not a codepoint).
     Lit(Vec<u8>),
-    /// `$name`
-    Var(String),
-    /// `{$expr_source}` — re-lexed lazily by the parser.
-    Expr(String),
+    /// `$name` — the usize is the `$`'s absolute line (diagnostics
+    /// while reading the variable site there, Zend's per-op lines).
+    Var(String, usize),
+    /// `{$expr_source}` — re-lexed lazily by the parser. The usize is
+    /// the embedded source's absolute start line: the snippet re-lexes
+    /// with snippet-relative (1-based) lines, and diagnostics rebase
+    /// onto this so they report file lines.
+    Expr(String, usize),
     /// `${expr_source}` — deprecated variable-variable interpolation
     /// (evaluates the expr to a *name*, then reads that variable).
-    DollarBraceExpr(String),
+    DollarBraceExpr(String, usize),
 }
 
 #[derive(Debug, Clone)]
@@ -836,7 +840,10 @@ fn interp_scan(
                         }
                     }
                 }
-                parts.push(StringPart::Expr(src[pos + n + 1..pos + k].to_string()));
+                parts.push(StringPart::Expr(
+                    src[pos + n + 1..pos + k].to_string(),
+                    line + s_matches(&src[pos..pos + n]),
+                ));
                 n = k + 1;
             }
             Some(&b'$') => {
@@ -892,6 +899,7 @@ fn interp_scan(
                     });
                     parts.push(StringPart::DollarBraceExpr(
                         src[pos + n + 2..pos + k].to_string(),
+                        line + s_matches(&src[pos..pos + n]),
                     ));
                     n = k + 1;
                 } else {
@@ -907,10 +915,16 @@ fn interp_scan(
                         if src[rest..].starts_with("->") {
                             let (pn, plen) = ident(src, rest + 2);
                             if !pn.is_empty() {
-                                parts.push(StringPart::Expr(format!("${}->{}", name, pn)));
+                                parts.push(StringPart::Expr(
+                                    format!("${}->{}", name, pn),
+                                    line + s_matches(&src[pos..pos + n]),
+                                ));
                                 n = rest + 2 + plen - pos;
                             } else {
-                                parts.push(StringPart::Var(name));
+                                parts.push(StringPart::Var(
+                                    name,
+                                    line + s_matches(&src[pos..pos + n]),
+                                ));
                                 n += 1 + len;
                             }
                         } else if src[rest..].starts_with('[') {
@@ -932,18 +946,20 @@ fn interp_scan(
                                 k += 1;
                             }
                             if b.get(k) == Some(&b']') {
-                                parts.push(StringPart::Expr(format!(
-                                    "${}{}",
-                                    name,
-                                    &src[rest..=k]
-                                )));
+                                parts.push(StringPart::Expr(
+                                    format!("${}{}", name, &src[rest..=k]),
+                                    line + s_matches(&src[pos..pos + n]),
+                                ));
                                 n = k + 1 - pos;
                             } else {
-                                parts.push(StringPart::Var(name));
+                                parts.push(StringPart::Var(
+                                    name,
+                                    line + s_matches(&src[pos..pos + n]),
+                                ));
                                 n += 1 + len;
                             }
                         } else {
-                            parts.push(StringPart::Var(name));
+                            parts.push(StringPart::Var(name, line + s_matches(&src[pos..pos + n])));
                             n += 1 + len;
                         }
                     }

@@ -254,21 +254,32 @@ fn bracket_check(toks: &[crate::lexer::Lexed], eof_line: usize) -> Option<(PhpEr
 pub type SrcDiags = Vec<(&'static str, String, usize)>;
 
 /// Parse a standalone PHP expression source (used for string
-/// interpolation). Diagnostics produced while re-lexing the embedded
-/// source (e.g. octal overflow inside `${"\400"}`) come back in the
-/// second tuple element so the evaluator can print them inline.
-pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
+/// interpolation). `base` is the absolute line the source's first byte
+/// sits on in the enclosing file: snippet token/marker lines are
+/// 1-based relative, so every line is rebased by `base - 1` for
+/// diagnostics to report file lines. Diagnostics produced while
+/// re-lexing the embedded source (e.g. octal overflow inside
+/// `${"\400"}`) come back in the second tuple element so the
+/// evaluator can print them inline.
+pub fn parse_expr_src(src: &str, base: usize) -> Result<(Expr, SrcDiags), PhpError> {
     let wrapped = format!("<?php {};", src);
-    let toks = lex(&wrapped)?;
+    let rebase = |mut e: PhpError| {
+        e.line += base - 1;
+        e
+    };
+    let toks = lex(&wrapped).map_err(rebase)?;
     let mut diags = Vec::new();
     let toks: Vec<Lexed> = toks
         .into_iter()
-        .filter_map(|t| match t.token {
-            Token::Diag(level, msg) => {
-                diags.push((level, msg, t.line));
-                None
+        .filter_map(|mut t| {
+            t.line += base - 1;
+            match t.token {
+                Token::Diag(level, msg) => {
+                    diags.push((level, msg, t.line));
+                    None
+                }
+                _ => Some(t),
             }
-            _ => Some(t),
         })
         .collect();
     let mut p = Parser {
@@ -292,7 +303,7 @@ pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
         strict_slot: false,
         in_closure: false,
     };
-    let e = p.expr()?;
+    let e = p.expr().map_err(rebase)?;
     Ok((e, diags))
 }
 
