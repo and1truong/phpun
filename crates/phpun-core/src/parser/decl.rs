@@ -460,7 +460,7 @@ impl<'a> Parser<'a> {
         // top-level statement — nowhere nested, nothing before it
         // (scalar_strict_declaration_placement_*, strict_nested).
         if is_strict && !self.strict_slot {
-            return Err(PhpError::fatal(
+            return Err(PhpError::compile_fatal(
                 "strict_types declaration must be the very first statement in the script",
                 self.line(),
             ));
@@ -472,7 +472,7 @@ impl<'a> Parser<'a> {
             // `declare(...) { }` / `declare(...):` block forms —
             // strict_types forbids block mode entirely (placement_008).
             if is_strict {
-                return Err(PhpError::fatal(
+                return Err(PhpError::compile_fatal(
                     "strict_types declaration must not use block mode",
                     self.line(),
                 ));
@@ -603,7 +603,7 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         if kind == NsKind::Class && self.declared_types.contains(&alias.to_lowercase()) {
-            return Err(PhpError::fatal(
+            return Err(PhpError::compile_fatal(
                 format!(
                     "Cannot use {} as {} because the name is already in use",
                     fq, alias
@@ -920,7 +920,7 @@ impl<'a> Parser<'a> {
             .use_map
             .contains_key(&name.rsplit('\\').next().unwrap_or(&name).to_lowercase())
         {
-            return Err(PhpError::fatal(
+            return Err(PhpError::compile_fatal(
                 format!(
                     "Cannot redeclare class {} (previously declared as local import)",
                     name
@@ -1382,7 +1382,7 @@ impl<'a> Parser<'a> {
     ) -> Result<Option<Vec<PropHook>>, PhpError> {
         self.expect_op("{")?;
         if self.at_op("}") {
-            return Err(PhpError::fatal(
+            return Err(PhpError::compile_fatal(
                 "Property hook list must not be empty",
                 self.line(),
             ));
@@ -1412,7 +1412,7 @@ impl<'a> Parser<'a> {
                     hfinal = true;
                     self.pos += 1;
                 } else if self.ident_is("static") {
-                    return Err(PhpError::fatal(
+                    return Err(PhpError::compile_fatal(
                         "Cannot use the static modifier on a property hook",
                         self.line(),
                     ));
@@ -1436,7 +1436,7 @@ impl<'a> Parser<'a> {
                 }
             };
             if hname != "get" && hname != "set" {
-                return Err(PhpError::fatal(
+                return Err(PhpError::compile_fatal(
                     format!(
                         "Unknown hook \"{}\" for property {}::${}, expected \"get\" or \"set\"",
                         hname, self.cur_class, pname
@@ -1446,7 +1446,7 @@ impl<'a> Parser<'a> {
             }
             let is_get = hname == "get";
             if hs.iter().any(|h| h.is_get == is_get) {
-                return Err(PhpError::fatal(
+                return Err(PhpError::compile_fatal(
                     format!("Cannot redeclare property hook \"{}\"", hname),
                     self.line(),
                 ));
@@ -1575,7 +1575,7 @@ impl<'a> Parser<'a> {
             // `static` is never a legal param modifier/type
             // (static_type_param).
             if self.ident_is("static") {
-                return Err(PhpError::fatal(
+                return Err(PhpError::compile_fatal(
                     "Cannot use the static modifier on a parameter",
                     self.line(),
                 ));

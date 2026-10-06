@@ -459,7 +459,7 @@ impl<'a> Parser<'a> {
                 // unreachable (guarded above); keeps the flow explicit.
             }
             if is_ns && !saw_ns && saw_code {
-                return Err(PhpError::fatal(
+                return Err(PhpError::compile_fatal(
                     "Namespace declaration statement has to be the very first statement or after any declare call in the script".to_string(),
                     self.line(),
                 ));
@@ -484,7 +484,7 @@ impl<'a> Parser<'a> {
                 && !matches!(&s, Stmt::Declare { .. })
                 && !matches!(&s, Stmt::Expr(Expr::Null))
             {
-                return Err(PhpError::fatal(
+                return Err(PhpError::compile_fatal(
                     "No code may exist outside of namespace {}".to_string(),
                     stmt_line,
                 ));
@@ -716,7 +716,7 @@ impl<'a> Parser<'a> {
                                 self.line(),
                             ));
                         }
-                        return Err(PhpError::fatal(
+                        return Err(PhpError::compile_fatal(
                             format!("Cannot use '{}' as namespace name", name),
                             self.line(),
                         ));
@@ -728,7 +728,7 @@ impl<'a> Parser<'a> {
                     self.declared_types.clear();
                     let braced = self.at_op("{");
                     if self.in_braced_ns {
-                        return Err(PhpError::fatal(
+                        return Err(PhpError::compile_fatal(
                             if braced {
                                 "Namespace declarations cannot be nested".to_string()
                             } else {
@@ -739,7 +739,7 @@ impl<'a> Parser<'a> {
                     }
                     let style = if braced { 2 } else { 1 };
                     if self.ns_style != 0 && self.ns_style != style {
-                        return Err(PhpError::fatal(
+                        return Err(PhpError::compile_fatal(
                             "Cannot mix bracketed namespace declarations with unbracketed namespace declarations".to_string(),
                             self.line(),
                         ));

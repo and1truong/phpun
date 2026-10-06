@@ -57,13 +57,13 @@ impl<'a> Parser<'a> {
             let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
             for (n, _) in &uses {
                 if n == "GLOBALS" {
-                    return Err(PhpError::fatal(
+                    return Err(PhpError::compile_fatal(
                         "Cannot use auto-global as lexical variable",
                         self.prev_line(),
                     ));
                 }
                 if !seen.insert(n.as_str()) {
-                    return Err(PhpError::fatal(
+                    return Err(PhpError::compile_fatal(
                         format!("Cannot use variable ${} twice", n),
                         self.prev_line(),
                     ));
@@ -71,7 +71,7 @@ impl<'a> Parser<'a> {
             }
             for (n, _) in &uses {
                 if params.iter().any(|p| p.name == *n) {
-                    return Err(PhpError::fatal(
+                    return Err(PhpError::compile_fatal(
                         format!("Cannot use lexical variable ${} as a parameter name", n),
                         self.prev_line(),
                     ));
@@ -835,7 +835,7 @@ impl<'a> Parser<'a> {
                     | Expr::StaticCall { .. }
                     | Expr::StaticCallDyn { .. }
             ) {
-                return Err(PhpError::fatal(
+                return Err(PhpError::compile_fatal(
                     "Can't use method return value in write context",
                     self.line(),
                 ));
@@ -851,7 +851,7 @@ impl<'a> Parser<'a> {
                     | Expr::StaticCall { .. }
                     | Expr::StaticCallDyn { .. }
             ) {
-                return Err(PhpError::fatal(
+                return Err(PhpError::compile_fatal(
                     "Can't use method return value in write context",
                     self.line(),
                 ));
@@ -954,7 +954,7 @@ impl<'a> Parser<'a> {
                         | Expr::StaticCall { .. }
                         | Expr::StaticCallDyn { .. }
                 ) {
-                    return Err(PhpError::fatal(
+                    return Err(PhpError::compile_fatal(
                         "Can't use method return value in write context",
                         self.line(),
                     ));
@@ -968,7 +968,7 @@ impl<'a> Parser<'a> {
                         | Expr::StaticCall { .. }
                         | Expr::StaticCallDyn { .. }
                 ) {
-                    return Err(PhpError::fatal(
+                    return Err(PhpError::compile_fatal(
                         "Can't use method return value in write context",
                         self.line(),
                     ));
@@ -1050,14 +1050,14 @@ impl<'a> Parser<'a> {
                                                 || n.eq_ignore_ascii_case("set"))
                                         {
                                             if self.cur_class.is_empty() {
-                                                return Err(PhpError::fatal(
+                                                return Err(PhpError::compile_fatal(
                                                 "Cannot use \"parent\" when no class scope is active",
                                                 self.line(),
                                             ));
                                             }
                                             match &self.hook_ctx {
                                             None => {
-                                                return Err(PhpError::fatal(
+                                                return Err(PhpError::compile_fatal(
                                                     format!(
                                                         "Must not use parent::${}::{}() outside a property hook",
                                                         pn, n
@@ -1067,7 +1067,7 @@ impl<'a> Parser<'a> {
                                             }
                                             Some((hp, hg)) => {
                                                 if hp != pn {
-                                                    return Err(PhpError::fatal(
+                                                    return Err(PhpError::compile_fatal(
                                                         format!(
                                                             "Must not use parent::${}::{}() in a different property (${})",
                                                             pn, n, hp
@@ -1076,7 +1076,7 @@ impl<'a> Parser<'a> {
                                                     ));
                                                 }
                                                 if *hg != n.eq_ignore_ascii_case("get") {
-                                                    return Err(PhpError::fatal(
+                                                    return Err(PhpError::compile_fatal(
                                                         format!(
                                                             "Must not use parent::${}::{}() in a different property hook ({})",
                                                             pn,
@@ -1221,7 +1221,7 @@ impl<'a> Parser<'a> {
         // (`$o?->p->m(...)`) — is a compile-time fatal
         // (first_class_callable_012/013).
         if Self::has_nullsafe(&node) {
-            return Err(PhpError::fatal(
+            return Err(PhpError::compile_fatal(
                 "Cannot combine nullsafe operator with Closure creation",
                 0,
             ));
@@ -1233,7 +1233,7 @@ impl<'a> Parser<'a> {
     /// ("Cannot create Closure for new expression" — zend_compile.c).
     pub(in crate::parser) fn check_no_fcc_ctor(&self, args: &[Expr]) -> Result<(), PhpError> {
         if args.len() == 1 && matches!(args[0], Expr::FccMark) {
-            return Err(PhpError::fatal(
+            return Err(PhpError::compile_fatal(
                 "Cannot create Closure for new expression",
                 self.line(),
             ));
