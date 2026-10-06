@@ -1017,23 +1017,21 @@ impl<'a> Interp<'a> {
                         .unwrap_or(Value::Null);
                     self.callable_decl(&cb)
                 };
-                // (name, variadic, has-default, default, type members,
-                //  has-type, optional, by-ref, allows-null,
-                //  default-const name) — userland decls read Param,
-                // internal functions synthesize from arginfo
-                // (builtin_params).
-                let mut prs: Vec<(
-                    String,
-                    bool,
-                    bool,
-                    Value,
-                    Vec<String>,
-                    bool,
-                    bool,
-                    bool,
-                    bool,
-                    Option<String>,
-                )> = Vec::new();
+                // userland decls read Param; internal functions
+                // synthesize from arginfo (builtin_params).
+                struct RParam {
+                    name: String,
+                    variadic: bool,
+                    has_def: bool,
+                    def: Value,
+                    ty: Vec<String>,
+                    hasty: bool,
+                    opt: bool,
+                    by_ref: bool,
+                    allow_null: bool,
+                    const_name: Option<String>,
+                }
+                let mut prs: Vec<RParam> = Vec::new();
                 let bp: Option<&'static [(&'static str, crate::builtins::BDef)]> = if is_method {
                     None
                 } else {
@@ -1077,18 +1075,18 @@ impl<'a> Interp<'a> {
                         // zend marks internal params non-nullable
                         // unless arginfo says otherwise (strlen $string),
                         // but every arginfo param does have a type.
-                        prs.push((
-                            pn.to_string(),
-                            var,
-                            has,
-                            d.val(),
-                            Vec::new(),
-                            true,
+                        prs.push(RParam {
+                            name: pn.to_string(),
+                            variadic: var,
+                            has_def: has,
+                            def: d.val(),
+                            ty: Vec::new(),
+                            hasty: true,
                             opt,
-                            false,
-                            false,
-                            None,
-                        ));
+                            by_ref: false,
+                            allow_null: false,
+                            const_name: None,
+                        });
                     }
                 } else if let Some(d) = &decl {
                     let req = d
@@ -1136,60 +1134,61 @@ impl<'a> Interp<'a> {
                         } else {
                             None
                         };
-                        prs.push((
-                            p.name.clone(),
-                            p.variadic,
-                            has,
-                            dv,
-                            tys.clone(),
-                            !tys.is_empty(),
-                            has || p.variadic,
-                            p.by_ref,
+                        prs.push(RParam {
+                            name: p.name.clone(),
+                            variadic: p.variadic,
+                            has_def: has,
+                            def: dv,
+                            hasty: !tys.is_empty(),
+                            ty: tys,
+                            opt: has || p.variadic,
+                            by_ref: p.by_ref,
                             allow_null,
                             const_name,
-                        ));
+                        });
                     }
                 }
                 let mut arr = PhpArray::default();
-                for (
-                    pos,
-                    (pn, variadic, has_def, dv, ty, hasty, opt, by_ref, allow_null, const_name),
-                ) in prs.iter().enumerate()
-                {
+                for (pos, rp_decl) in prs.iter().enumerate() {
                     let rp = self.instantiate("reflectionparameter", &[])?;
                     if let Value::Object(o) = &rp {
                         o.borrow_mut()
                             .props
-                            .insert("\0rp\0name".into(), cell(Value::str(pn)));
+                            .insert("\0rp\0name".into(), cell(Value::str(&rp_decl.name)));
                         // Zend's ReflectionParameter exposes the name
                         // as a public prop rendered by var_dump.
                         let mut ob = o.borrow_mut();
-                        ob.props.insert("name".into(), cell(Value::str(pn)));
+                        ob.props
+                            .insert("name".into(), cell(Value::str(&rp_decl.name)));
                         if !ob.prop_order.contains(&"name".into()) {
                             ob.prop_order.push("name".into());
                         }
                         drop(ob);
                         let mut ob = o.borrow_mut();
                         ob.props
-                            .insert("\0rp\0variadic".into(), cell(Value::Bool(*variadic)));
+                            .insert("\0rp\0variadic".into(), cell(Value::Bool(rp_decl.variadic)));
                         ob.props
                             .insert("\0rp\0pos".into(), cell(Value::Int(pos as i64)));
                         ob.props
-                            .insert("\0rp\0hasdef".into(), cell(Value::Bool(*has_def)));
-                        ob.props.insert("\0rp\0opt".into(), cell(Value::Bool(*opt)));
-                        ob.props.insert("\0rp\0def".into(), cell(dv.clone()));
+                            .insert("\0rp\0hasdef".into(), cell(Value::Bool(rp_decl.has_def)));
                         ob.props
-                            .insert("\0rp\0byref".into(), cell(Value::Bool(*by_ref)));
+                            .insert("\0rp\0opt".into(), cell(Value::Bool(rp_decl.opt)));
                         ob.props
-                            .insert("\0rp\0hasty".into(), cell(Value::Bool(*hasty)));
+                            .insert("\0rp\0def".into(), cell(rp_decl.def.clone()));
                         ob.props
-                            .insert("\0rp\0allownull".into(), cell(Value::Bool(*allow_null)));
-                        if let Some(cn) = const_name {
+                            .insert("\0rp\0byref".into(), cell(Value::Bool(rp_decl.by_ref)));
+                        ob.props
+                            .insert("\0rp\0hasty".into(), cell(Value::Bool(rp_decl.hasty)));
+                        ob.props.insert(
+                            "\0rp\0allownull".into(),
+                            cell(Value::Bool(rp_decl.allow_null)),
+                        );
+                        if let Some(cn) = &rp_decl.const_name {
                             ob.props
                                 .insert("\0rp\0defconst".into(), cell(Value::str(cn.clone())));
                         }
                         let mut ta = PhpArray::default();
-                        for m in ty {
+                        for m in &rp_decl.ty {
                             ta.push(Value::str(m));
                         }
                         ob.props.insert(

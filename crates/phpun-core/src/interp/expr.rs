@@ -7,6 +7,21 @@ use super::*;
 impl<'a> Interp<'a> {
     // ----- expressions -----
 
+    /// Runs a call-producing expression with send_line scoped to that
+    /// call's own dispatch: the site covers frames pushed while binding
+    /// and invoking, then the previous send_line resumes — a callee's
+    /// own `new`/call sites must not leak into the caller's error
+    /// lines (foreach's traversable check after getIterator()).
+    fn scoped_send<T>(
+        &mut self,
+        run: impl FnOnce(&mut Self) -> Result<T, PhpError>,
+    ) -> Result<T, PhpError> {
+        let prev = self.send_line;
+        let r = run(self);
+        self.send_line = prev;
+        r
+    }
+
     pub fn eval(&mut self, e: &Expr) -> Result<Value, PhpError> {
         match e {
             Expr::Null => Ok(Value::Null),
@@ -124,7 +139,9 @@ impl<'a> Interp<'a> {
                     self.eval(f)
                 }
             }
-            Expr::Call { name, args, site } => self.call(name, args, Some(*site)),
+            Expr::Call { name, args, site } => {
+                self.scoped_send(|s| s.call(name, args, Some(*site)))
+            }
             Expr::Fcc(inner) => self.fcc(inner),
             Expr::Unpack(_) | Expr::FccMark => {
                 self.fail(PhpError::fatal("argument unpacking/FCC outside of call", 0))
@@ -529,27 +546,27 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Callable(callable))
             }
-            Expr::New { class, args, site } => {
+            Expr::New { class, args, site } => self.scoped_send(|s| {
                 // Autoload inside class_name_of may push frames — they
                 // site at this `new` (the class expr's first token).
-                self.send_line = Some(*site);
-                let name = self.class_name_of(class)?;
-                let params = self
+                s.send_line = Some(*site);
+                let name = s.class_name_of(class)?;
+                let params = s
                     .classes
                     .get(&name.to_lowercase())
                     .cloned()
-                    .and_then(|c| self.find_method_in(&c, "__construct"))
+                    .and_then(|c| s.find_method_in(&c, "__construct"))
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
-                let argvals = self.arg_cells(
+                let argvals = s.arg_cells(
                     args,
                     &params,
                     &format!("{}::__construct()", name),
                     false,
                     Some(*site),
                 )?;
-                self.new_instance(&name, argvals)
-            }
+                s.new_instance(&name, argvals)
+            }),
             Expr::Prop {
                 obj,
                 name,
@@ -561,7 +578,7 @@ impl<'a> Interp<'a> {
                 args,
                 nullsafe,
                 site,
-            } => self.method_call(obj, name, args, *nullsafe, Some(*site)),
+            } => self.scoped_send(|s| s.method_call(obj, name, args, *nullsafe, Some(*site))),
             Expr::Paren(e) => self.eval(e),
             Expr::StaticProp { class, name } => self.static_prop_read(class, name),
             Expr::StaticCall {
@@ -581,35 +598,37 @@ impl<'a> Interp<'a> {
                             && (name.eq_ignore_ascii_case("get")
                                 || name.eq_ignore_ascii_case("set"))
                         {
-                            return self.hook_parent_call(
-                                pn,
-                                name.eq_ignore_ascii_case("get"),
-                                args,
-                                Some(*site),
-                            );
+                            return self.scoped_send(|s| {
+                                s.hook_parent_call(
+                                    pn,
+                                    name.eq_ignore_ascii_case("get"),
+                                    args,
+                                    Some(*site),
+                                )
+                            });
                         }
                     }
                 }
-                self.static_call(class, name, args, Some(*site))
+                self.scoped_send(|s| s.static_call(class, name, args, Some(*site)))
             }
             Expr::StaticCallDyn {
                 class,
                 name,
                 args,
                 site,
-            } => {
+            } => self.scoped_send(|s| {
                 // Class-name resolution may autoload — site those
                 // frames at this call.
-                self.send_line = Some(*site);
+                s.send_line = Some(*site);
                 // `C::$var(...)`: class resolves first, then the name.
                 // Non-string names are a catchable Error
                 // (call_static_004).
-                let cls = self.class_of(class)?;
-                let nv = self.eval(name)?;
+                let cls = s.class_of(class)?;
+                let nv = s.eval(name)?;
                 let n = match nv {
-                    Value::Str(s) => Self::nul_trunc(&crate::value::lossy(&s)),
+                    Value::Str(v) => Self::nul_trunc(&crate::value::lossy(&v)),
                     _ => {
-                        return self.fail(PhpError::uncaught(
+                        return s.fail(PhpError::uncaught(
                             "Error",
                             "Method name must be a string",
                             0,
@@ -617,15 +636,15 @@ impl<'a> Interp<'a> {
                     }
                 };
                 let fwd = matches!(&**class, Expr::Const(_) | Expr::Str(_) | Expr::AnonClass(_));
-                let argvals = self.arg_cells(
+                let argvals = s.arg_cells(
                     args,
                     &[],
                     &format!("{}::{{closure}}()", cls.name()),
                     false,
                     Some(*site),
                 )?;
-                self.static_invoke_vis(cls, &n, argvals, None, fwd)
-            }
+                s.static_invoke_vis(cls, &n, argvals, None, fwd)
+            }),
             Expr::ClassConst { class, name } => self.class_const(class, name),
             Expr::Clone(e) => {
                 let v = self.eval(e)?;
