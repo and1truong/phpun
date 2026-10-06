@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// `(key expr, target)` pairs of a destructuring list — `None` is a
+/// hole, `None` key is positional.
+type ListItems<T> = Vec<Option<(Option<Expr>, T)>>;
+
 impl<'a> Parser<'a> {
     pub(in crate::parser) fn expr_stmt(&mut self) -> Result<Stmt, PhpError> {
         let e = self.expr()?;
@@ -421,10 +425,7 @@ impl<'a> Parser<'a> {
     /// positional elements, holes, and `expr => target` keyed pairs
     /// (zend-legal `as ['a' => $a]` / `as list('a' => $a)`); keyed and
     /// unkeyed entries can't mix.
-    fn foreach_list_items(
-        &mut self,
-        close: &str,
-    ) -> Result<Vec<Option<(Option<Expr>, ForeachTarget)>>, PhpError> {
+    fn foreach_list_items(&mut self, close: &str) -> Result<ListItems<ForeachTarget>, PhpError> {
         let mut items = Vec::new();
         let (mut keyed, mut unkeyed) = (false, false);
         while !self.at_op(close) {

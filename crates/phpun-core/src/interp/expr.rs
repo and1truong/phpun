@@ -4653,7 +4653,7 @@ impl<'a> Interp<'a> {
                         // `Cannot access private/protected property`,
                         // not a dynamic-prop materialization
                         // (closure_038/closure_039).
-                        if let Some(e) = self.hidden_decl_error(&o, &pn) {
+                        if let Some(e) = self.hidden_decl_error(o, &pn) {
                             return self.fail(e);
                         }
                         let cn = o.borrow().class.name().to_string();
