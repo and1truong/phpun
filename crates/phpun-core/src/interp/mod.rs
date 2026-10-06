@@ -394,6 +394,12 @@ pub struct Interp<'a> {
     /// frames, userland calls) the deferred death renders ahead of
     /// the resume stack.
     gen_raise_ctx: Vec<crate::value::TraceFrame>,
+    /// While a unit's compile gate runs (eval()/include() flow_gate +
+    /// hoisting), the callsite that triggered compilation — the user
+    /// error handler invoked for a compile diagnostic reports its
+    /// call frame there (Zend runs the handler at the caller site),
+    /// not at the diagnostic's in-unit position.
+    compile_callsite: Option<(String, u32)>,
     /// Declaring class of the method about to be invoked (set by
     /// invoke_method, consumed by invoke_fn to fill Frame::decl_class).
     pending_decl_class: Option<Rc<PhpClass>>,
@@ -895,6 +901,7 @@ impl<'a> Interp<'a> {
             gen_internal_resume: 0,
             gen_pending_fatal: None,
             gen_raise_ctx: Vec::new(),
+            compile_callsite: None,
             pending_decl_class: None,
             pending_called_class: None,
             pending_hook_prop: None,
@@ -1397,7 +1404,17 @@ impl<'a> Interp<'a> {
     /// name collision is the compile-time 'Cannot redeclare' fatal.
     /// Called from the flow gate at the decl's position (flow.rs).
     fn hoist_func(&mut self, d: &FunctionDecl) -> Result<(), PhpError> {
-        let _ = self.decl_type_checks(&d.name, d, None);
+        if let Err(e) = self.decl_type_checks(&d.name, d, None) {
+            // A throwable from the user error handler (e.g. throwing
+            // on a signature deprecation) escapes at the caller site —
+            // the eval()/include() call — and dies uncaught, it is not
+            // a compile diagnostic to re-emit at exec time. Compile
+            // fatals stay deferred: the exec-time decl arm re-runs
+            // the same checks through err_flow.
+            if e.kind == ErrorKind::Throw {
+                return Err(e);
+            }
+        }
         let key = d.name.to_lowercase();
         if let Some(prev) = self.functions.get(&key) {
             // Early binding dies at compile time in Zend —

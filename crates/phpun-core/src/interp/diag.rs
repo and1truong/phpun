@@ -24,9 +24,22 @@ impl<'a> Interp<'a> {
                 cell(Value::str(self.diag_file())),
                 cell(Value::Int(self.cur_line as i64)),
             ];
+            // The handler runs at the CALLER's position for a compile
+            // diagnostic — Zend reports the handler-call frame at the
+            // eval()/include() callsite, not the in-unit diagnostic
+            // line (the $file/$line args still carry the unit's own).
+            let saved_site = self.compile_callsite.clone().map(|(f, l)| {
+                let sf = std::mem::replace(&mut self.cur_file, f);
+                let sl = std::mem::replace(&mut self.cur_line, l as usize);
+                (sf, sl)
+            });
             self.in_handler = true;
             let r = self.call_value(&h, CallArgs::positional(args));
             self.in_handler = false;
+            if let Some((f, l)) = saved_site {
+                self.cur_file = f;
+                self.cur_line = l;
+            }
             match r {
                 Err(e) => return Err(e),
                 Ok(v) if !matches!(v, Value::Bool(false)) => return Ok(()),

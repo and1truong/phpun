@@ -3490,8 +3490,19 @@ impl<'a> Interp<'a> {
             }
         }
         let internal = if self.is_throwable_name(&cls.decl.name) {
+            // A throwable's file/line attribute to the executing code
+            // unit — inside a call frame that's the frame's own file
+            // (an error handler declared in the caller's file reports
+            // there even when invoked for an eval'd unit's diag); only
+            // outside frames does the ambient diag file apply.
+            let exec_file = self
+                .stack
+                .last()
+                .map(|f| f.file.clone())
+                .filter(|f| !f.is_empty())
+                .unwrap_or_else(|| self.diag_file());
             Some(ObjectInternal::Exception {
-                file: self.diag_file(),
+                file: exec_file,
                 line: self.cur_line as u32,
                 trace: String::new(),
                 thrown: self.cur_line as u32,
