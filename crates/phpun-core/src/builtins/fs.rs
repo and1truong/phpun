@@ -1,6 +1,7 @@
 //! Filesystem/stream builtins: file fns, stream resources, stat, glob.
 
 use super::crypto::base64_decode;
+use super::string::zpp_long;
 use super::*;
 
 pub(crate) fn dispatch(
@@ -447,7 +448,21 @@ pub(crate) fn dispatch(
         }
         "fgets" => {
             stream_open_check(args, 0, name, 1, "stream")?;
-            match read_line_resource(args.first())? {
+            // ?int $length = null: zend reads at most $length-1 bytes
+            // (php_stream_gets size-1), newline included in the budget.
+            let limit = if args.len() < 2 || matches!(arg(args, 1), Value::Null) {
+                usize::MAX
+            } else {
+                let n = zpp_long(it, args, 1, name, 2, "$length", "?int")?;
+                if n <= 0 {
+                    return err(
+                        "ValueError",
+                        "fgets(): Argument #2 ($length) must be greater than 0",
+                    );
+                }
+                (n - 1) as usize
+            };
+            match read_line_resource(args.first(), limit)? {
                 StreamRead::Data(b) => {
                     if b.is_empty() {
                         Value::Bool(false)
@@ -1517,7 +1532,7 @@ fn read_resource(c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
     }
 }
 
-fn read_line_resource(c: Option<&Cell>) -> Result<StreamRead, PhpError> {
+fn read_line_resource(c: Option<&Cell>, limit: usize) -> Result<StreamRead, PhpError> {
     use std::io::{Read, Seek};
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
@@ -1529,7 +1544,7 @@ fn read_line_resource(c: Option<&Cell>) -> Result<StreamRead, PhpError> {
                     eof,
                     nonblock,
                     ..
-                } => read_line_pipe(file, eof, *nonblock, pos, usize::MAX),
+                } => read_line_pipe(file, eof, *nonblock, pos, limit),
                 PhpResource::Stdio { which, .. } => match *which {
                     0 => Ok(StreamRead::Data(Vec::new())),
                     _ => Ok(StreamRead::Ebadf(9, "Bad file descriptor".into())),
@@ -1543,7 +1558,8 @@ fn read_line_resource(c: Option<&Cell>) -> Result<StreamRead, PhpError> {
                             .iter()
                             .position(|b| *b == b'\n')
                             .map(|o| start + o + 1)
-                            .unwrap_or(body.len());
+                            .unwrap_or(body.len())
+                            .min(start.saturating_add(limit));
                         let out = body[start..nl].to_vec();
                         *pos = nl as u64;
                         Ok(StreamRead::Data(out))
@@ -1559,7 +1575,8 @@ fn read_line_resource(c: Option<&Cell>) -> Result<StreamRead, PhpError> {
                             .iter()
                             .position(|b| *b == b'\n')
                             .map(|o| start + o + 1)
-                            .unwrap_or(buf.len());
+                            .unwrap_or(buf.len())
+                            .min(start.saturating_add(limit));
                         let out = buf[start..nl].to_vec();
                         *pos = nl as u64;
                         Ok(StreamRead::Data(out))
@@ -1581,7 +1598,7 @@ fn read_line_resource(c: Option<&Cell>) -> Result<StreamRead, PhpError> {
                     let _ = file.seek(std::io::SeekFrom::Start(*pos));
                     let mut out = Vec::new();
                     let mut byte = [0u8; 1];
-                    loop {
+                    while out.len() < limit {
                         match file.read(&mut byte) {
                             Ok(0) => {
                                 *eof = true;

@@ -1381,13 +1381,27 @@ fn strtr_chars(s: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 /// `Z_PARAM_LONG` emulation for number_format's $decimals: ints and
 /// integral floats/strings coerce quietly, fractional values raise the
 /// "loses precision" deprecation, anything else is a TypeError.
-fn zpp_long_arg(
+pub(in crate::builtins) fn zpp_long_arg(
     it: &mut Interp,
     args: &[Cell],
     i: usize,
     fname: &str,
     pnum: usize,
     pname: &str,
+) -> Result<i64, PhpError> {
+    zpp_long(it, args, i, fname, pnum, pname, "int")
+}
+
+/// zpp_long_arg with an explicit type word for TypeError messages
+/// (zend prints `?int` for `Z_PARAM_LONG_OR_NULL` params).
+pub(in crate::builtins) fn zpp_long(
+    it: &mut Interp,
+    args: &[Cell],
+    i: usize,
+    fname: &str,
+    pnum: usize,
+    pname: &str,
+    ty: &str,
 ) -> Result<i64, PhpError> {
     if i >= args.len() {
         return Ok(0);
@@ -1425,18 +1439,19 @@ fn zpp_long_arg(
             _ => err(
                 "TypeError",
                 format!(
-                    "{}(): Argument #{} ({}) must be of type int, string given",
-                    fname, pnum, pname
+                    "{}(): Argument #{} ({}) must be of type {}, string given",
+                    fname, pnum, pname, ty
                 ),
             ),
         },
         v => err(
             "TypeError",
             format!(
-                "{}(): Argument #{} ({}) must be of type int, {} given",
+                "{}(): Argument #{} ({}) must be of type {}, {} given",
                 fname,
                 pnum,
                 pname,
+                ty,
                 zval_word(&v)
             ),
         ),
