@@ -46,7 +46,7 @@ impl<'a> Parser<'a> {
         self.pos += 1; // switch
         self.expect_op("(")?;
         let cond = self.expr()?;
-        self.expect_op(")")?;
+        self.expect_group(")")?;
         let alt = self.eat_op(":");
         if !alt {
             self.expect_op("{")?;
@@ -1646,7 +1646,7 @@ impl<'a> Parser<'a> {
         self.pos += 1; // if
         self.expect_op("(")?;
         let cond = self.expr()?;
-        self.expect_op(")")?;
+        self.expect_group(")")?;
         let alt = self.at_op(":");
         let arm_body = |p: &mut Self, stops: &[&str]| -> Result<Vec<Stmt>, PhpError> {
             if alt {
@@ -1669,7 +1669,7 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 self.expect_op("(")?;
                 let c = self.expr()?;
-                self.expect_op(")")?;
+                self.expect_group(")")?;
                 let b = arm_body(self, &["elseif", "else", "endif"])?;
                 arms.push((c, b));
                 continue;
@@ -1707,12 +1707,14 @@ impl<'a> Parser<'a> {
         if !self.at_op(";") {
             init = self.expr_list()?;
         }
-        self.expect_op(";")?;
+        // Zend reports the single-token expected set at the for-header
+        // separators (`unexpected "{", expecting ";"`).
+        self.expect_op_full(";")?;
         let mut cond = Vec::new();
         if !self.at_op(";") {
             cond = self.expr_list()?;
         }
-        self.expect_op(";")?;
+        self.expect_op_full(";")?;
         let mut inc = Vec::new();
         if !self.at_op(")") {
             inc = self.expr_list()?;
