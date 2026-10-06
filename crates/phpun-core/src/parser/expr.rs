@@ -36,6 +36,11 @@ impl<'a> Parser<'a> {
         // nested, `{closure:FILE:L}` at top level (\u{1} is the file,
         // substituted when the diagnostic is emitted).
         let clo_name = match self.fn_ctx.last() {
+            // An enclosing closure's own name already embeds its
+            // `{closure:FILE:L}` — nest it as-is, no `()` appended.
+            Some(parent) if parent.starts_with("{closure:") => {
+                format!("{{closure:{}:{}}}", parent, line)
+            }
             Some(parent) => format!("{{closure:{}():{}}}", parent, line),
             None => format!("{{closure:{}:{}}}", '\u{1}', line),
         };
