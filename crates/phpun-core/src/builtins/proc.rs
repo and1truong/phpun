@@ -323,6 +323,16 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
                     "proc_open(): Argument #1 ($command) must not be empty",
                 );
             }
+            // zend checks every element for NUL before exec and throws
+            // "Command array element N contains a null byte" (1-based).
+            for (i, e) in elems.iter().enumerate() {
+                if e.contains(&0) {
+                    return err(
+                        "ValueError",
+                        format!("Command array element {} contains a null byte", i + 1),
+                    );
+                }
+            }
             (
                 Some(elems.clone()),
                 String::from_utf8_lossy(&elems[0]).into_owned(),
@@ -496,8 +506,22 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
                 continue;
             }
             match k {
-                ArrKey::Str(ks) if !ks.is_empty() && !ks.contains('=') && !ks.contains('\0') => {
-                    cmd.env(to_os(ks.as_bytes()), to_os(&v));
+                ArrKey::Str(ks) if !ks.is_empty() && !ks.contains('\0') => {
+                    // Keys containing '=' are injected verbatim by zend's
+                    // putenv-style envp assembly: 'A=B' => 'v' lands as
+                    // "A=B=v", which resolves to name A / value B=v.
+                    match ks.find('=') {
+                        Some(p) if p > 0 => {
+                            let mut joined = ks.as_bytes()[p + 1..].to_vec();
+                            joined.push(b'=');
+                            joined.extend_from_slice(&v);
+                            cmd.env(to_os(ks[..p].as_bytes()), to_os(&joined));
+                        }
+                        Some(_) => {}
+                        None => {
+                            cmd.env(to_os(ks.as_bytes()), to_os(&v));
+                        }
+                    }
                 }
                 // Numeric-keyed entries are injected bare by zend
                 // ("v" or "K=V" text as-is); entries without '=' are
