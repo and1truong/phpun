@@ -919,7 +919,14 @@ impl<'a> Interp<'a> {
                             self.var_set(kn, key_value(&k));
                         }
                         match val {
-                            ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                            ForeachTarget::Var(n) => {
+                            // Hoist the clone: after `as &$v` the var
+                            // slot can alias this same cell — an inline
+                            // `c.borrow()` would outlive var_set and
+                            // panic (probe12b).
+                            let v = c.borrow().clone();
+                            self.var_set(n, v)
+                        }
                             ForeachTarget::ByRef(e) => {
                                 if let Some(f) = self.readonly_ref_error(&c) {
                                     break f;
@@ -932,7 +939,8 @@ impl<'a> Interp<'a> {
                                 }
                             }
                             ForeachTarget::Lvalue(e) => {
-                                let _ = self.store(e, c.borrow().clone());
+                                let v = c.borrow().clone();
+                                let _ = self.store(e, v);
                             }
                             ForeachTarget::List(items) => {
                                 match self.foreach_list(items, &c, stmt_line) {
@@ -959,10 +967,21 @@ impl<'a> Interp<'a> {
                     rc.borrow().iter().cloned().collect()
                 } else {
                     // .iter() skips tombstoned buckets — a value-foreach
-                    // never sees shifted/unset elements.
+                    // never sees shifted/unset elements. IS_REFERENCE
+                    // elements stay LIVE: zend reads the real bucket,
+                    // so writes through a held alias are observed and a
+                    // `&$v`-bound var writes back into the array
+                    // (probe12c/p12e vs oracle).
                     rc.borrow()
                         .iter()
-                        .map(|(k, c)| (k.clone(), cell(c.borrow().clone())))
+                        .map(|(k, c)| {
+                            let cc = if self.is_ref_cell(c) {
+                                c.clone()
+                            } else {
+                                cell(c.borrow().clone())
+                            };
+                            (k.clone(), cc)
+                        })
                         .collect()
                 };
                 for (idx, (k, c)) in snapshot.into_iter().enumerate() {
@@ -971,7 +990,14 @@ impl<'a> Interp<'a> {
                         self.var_set(kn, key_value(&k));
                     }
                     match val {
-                        ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                        ForeachTarget::Var(n) => {
+                            // Hoist the clone: after `as &$v` the var
+                            // slot can alias this same cell — an inline
+                            // `c.borrow()` would outlive var_set and
+                            // panic (probe12b).
+                            let v = c.borrow().clone();
+                            self.var_set(n, v)
+                        }
                         ForeachTarget::ByRef(e) => {
                             if let Some(f) = self.readonly_ref_error(&c) {
                                 return f;
@@ -982,7 +1008,8 @@ impl<'a> Interp<'a> {
                             }
                         }
                         ForeachTarget::Lvalue(e) => {
-                            let _ = self.store(e, c.borrow().clone());
+                            let v = c.borrow().clone();
+                            let _ = self.store(e, v);
                         }
                         ForeachTarget::List(items) => {
                             match self.foreach_list(items, &c, stmt_line) {
@@ -1238,13 +1265,41 @@ impl<'a> Interp<'a> {
                         self.var_set(kn, kv);
                     }
                     match val {
-                        ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
-                        ForeachTarget::ByRef(e) => match self.bind_cell(e, c.clone()) {
-                            Ok(()) => {}
-                            Err(e2) => return self.err_flow(e2),
-                        },
+                        ForeachTarget::Var(n) => {
+                            // Hoist the clone: after `as &$v` the var
+                            // slot can alias this same cell — an inline
+                            // `c.borrow()` would outlive var_set and
+                            // panic (probe12b).
+                            let v = c.borrow().clone();
+                            self.var_set(n, v)
+                        }
+                        ForeachTarget::ByRef(e) => {
+                            // `foreach($o as &$v)` can't hand out a
+                            // reference to a readonly property —
+                            // 'Cannot acquire reference to readonly
+                            // property C::$p' (probe12a vs oracle).
+                            if let Some((pd, dcls)) = self.decl_prop(&o, &dname) {
+                                if pd.readonly {
+                                    let v = self.exception(
+                                        "Error",
+                                        &format!(
+                                            "Cannot acquire reference to readonly property {}::${}",
+                                            dcls.name(),
+                                            dname
+                                        ),
+                                    );
+                                    let e = self.throw(v);
+                                    return self.err_flow(e);
+                                }
+                            }
+                            match self.bind_cell(e, c.clone()) {
+                                Ok(()) => {}
+                                Err(e2) => return self.err_flow(e2),
+                            }
+                        }
                         ForeachTarget::Lvalue(e) => {
-                            let _ = self.store(e, c.borrow().clone());
+                            let v = c.borrow().clone();
+                            let _ = self.store(e, v);
                         }
                         ForeachTarget::List(items) => {
                             if let Err(e2) = self.foreach_list(items, &c, stmt_line) {

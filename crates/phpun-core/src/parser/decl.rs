@@ -1290,6 +1290,16 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
+                if m_readonly && default.is_some() {
+                    // Only promoted ctor params may default (probe12c).
+                    return Err(PhpError::compile_fatal(
+                        format!(
+                            "Readonly property {}::${} cannot have default value",
+                            name, pname
+                        ),
+                        self.line(),
+                    ));
+                }
                 props.push(PropDecl {
                     name: pname,
                     default,
