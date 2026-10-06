@@ -380,6 +380,20 @@ pub struct Interp<'a> {
     /// userland `Generator->next()`-style resume renders the engine's
     /// internal resume stack instead.
     iter_calls: u32,
+    /// Nonzero while an internal materializer (iterator_to_array,
+    /// iterator_count) drives the iteration — a deferred death renders
+    /// the resume stack WITHOUT the `Generator->{method}()`
+    /// pseudo-frame (`[internal function]: g()` then the caller).
+    gen_internal_resume: u32,
+    /// A fatal surfaced by err_flow while a generator body runs —
+    /// stored instead of printed so the deferred death restamps the
+    /// resume-stack trace and prints once at the consumer's resume.
+    gen_pending_fatal: Option<PhpError>,
+    /// call_trace snapshot at the last raise while a gen body ran —
+    /// the suspended throw-site context (eval()/include() pseudo-
+    /// frames, userland calls) the deferred death renders ahead of
+    /// the resume stack.
+    gen_raise_ctx: Vec<crate::value::TraceFrame>,
     /// Declaring class of the method about to be invoked (set by
     /// invoke_method, consumed by invoke_fn to fill Frame::decl_class).
     pending_decl_class: Option<Rc<PhpClass>>,
@@ -878,6 +892,9 @@ impl<'a> Interp<'a> {
             gen_auto: 0,
             gen_run_state: None,
             iter_calls: 0,
+            gen_internal_resume: 0,
+            gen_pending_fatal: None,
+            gen_raise_ctx: Vec::new(),
             pending_decl_class: None,
             pending_called_class: None,
             pending_hook_prop: None,
@@ -2487,6 +2504,9 @@ impl<'a> Interp<'a> {
 
     /// Raise `throw $v` as an error result.
     fn throw(&mut self, v: Value) -> PhpError {
+        if self.gen_run_state.is_some() {
+            self.gen_raise_ctx = self.call_trace.clone();
+        }
         self.pending_exception = Some(v);
         PhpError {
             trace: None,
@@ -2934,6 +2954,9 @@ impl<'a> Interp<'a> {
     }
 
     fn fail<T>(&mut self, e: PhpError) -> Result<T, PhpError> {
+        if self.gen_run_state.is_some() {
+            self.gen_raise_ctx = self.call_trace.clone();
+        }
         self.last_err_file = self.diag_file();
         if let ErrorKind::Uncaught { class } = e.kind {
             // Errors raised mid-const-expr get a pseudo-frame for the

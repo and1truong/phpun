@@ -211,10 +211,20 @@ impl<'a> Interp<'a> {
                     Some(sink) => {
                         // `yield from` splices the inner keys verbatim —
                         // duplicates and all — and doesn't touch the
-                        // keyless auto counter.
-                        let items = self.yield_from_collect(&v)?;
+                        // keyless auto counter. The materialization
+                        // drives inner iterators under the foreach
+                        // marking so an inner-gen death keeps its own
+                        // trace; items gathered before it still reach
+                        // the sink, and the death becomes this body's
+                        // own (deferred-raising) death.
+                        self.iter_calls += 1;
+                        let (items, death) = self.yield_from_collect(&v);
+                        self.iter_calls -= 1;
                         sink.borrow_mut().extend(items);
-                        Ok(Value::Null)
+                        match death {
+                            Some(e) => Err(e),
+                            None => Ok(Value::Null),
+                        }
                     }
                     None => self.fail(PhpError::fatal(
                         "The \"yield from\" expression can only be used inside a function",

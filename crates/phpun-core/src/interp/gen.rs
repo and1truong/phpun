@@ -188,6 +188,8 @@ impl<'a> Interp<'a> {
             sends: Vec::new(),
             pending_out: Vec::new(),
             deferred_err: None,
+            dead: false,
+            closed: false,
         }));
         let cls = self
             .classes
@@ -252,6 +254,12 @@ impl<'a> Interp<'a> {
         let saved_sends = std::mem::replace(&mut self.gen_sends, sends.into_iter().collect());
         let saved_auto = std::mem::replace(&mut self.gen_auto, 0);
         let saved_run = self.gen_run_state.replace(state.clone());
+        self.gen_pending_fatal = None;
+        // The body frame lands at call_trace[trace_base] — everything
+        // above it at death time (eval()/include() pseudo-frames,
+        // userland calls) is the suspended raise context the deferred
+        // render prepends to the resume stack.
+        let trace_base = self.call_trace.len();
         // Closure-generator captures bind as extra frame vars.
         if !captures.is_empty() {
             self.pending_gen_captures = captures;
@@ -286,8 +294,31 @@ impl<'a> Interp<'a> {
                 // after the bytes it already echoed between yields.
                 // Hold it on the state; collected items stay
                 // consumable until the consumer asks for the dead
-                // resume (gen_raise_deferred).
-                state.borrow_mut().deferred_err = Some(e);
+                // resume (gen_raise_deferred). A fatal stashed by
+                // err_flow inside the body is the real error behind
+                // the exit:N sentinel that propagated out.
+                let e = self.gen_pending_fatal.take().unwrap_or(e);
+                // Throw deaths need their throwable here — the ambient
+                // pending_exception slot gets clobbered by consumer
+                // calls between death and resume.
+                let throwable = if e.kind == crate::error::ErrorKind::Throw {
+                    self.pending_exception.take()
+                } else {
+                    None
+                };
+                // call_trace is already unwound past the body frame —
+                // the suspended raise context was snapshotted at the
+                // last throw()/fail()/err_flow inside the body; slice
+                // out everything at/below the gen's own frame.
+                let raise_frames = self
+                    .gen_raise_ctx
+                    .get(trace_base + 1..)
+                    .unwrap_or_default()
+                    .to_vec();
+                self.gen_raise_ctx.clear();
+                let mut st = state.borrow_mut();
+                st.deferred_err = Some((e, throwable, raise_frames));
+                st.dead = true;
                 Ok(())
             }
         }
@@ -614,15 +645,34 @@ impl<'a> Interp<'a> {
         }
         // The body's tail output belongs to this final resume.
         self.gen_flush_out(state, usize::MAX);
-        let mut e = state.borrow_mut().deferred_err.take().unwrap();
+        let (mut e, throwable, raise_frames) = state.borrow_mut().deferred_err.take().unwrap();
+        if e.kind == crate::error::ErrorKind::Throw {
+            // Restore the throwable captured at death — consumer calls
+            // since then may have overwritten the ambient slot.
+            if throwable.is_some() {
+                self.pending_exception = throwable;
+            }
+        }
         // Foreach-internal resume: the body dies under the iteration
         // machinery, keeping its original call frame; a userland
         // `Generator->{m}()` resume renders the engine stack instead.
         if self.iter_calls > 0 {
             return Err(e);
         }
-        let frames = self.gen_resume_frames(state, method);
+        let mut frames = self.gen_resume_frames(state, method, self.gen_internal_resume == 0);
         if e.kind == crate::error::ErrorKind::Throw {
+            // Frames suspended between the throw site and the gen body
+            // — eval()/include() pseudo-frames and userland calls —
+            // lead the resume stack in Zend's render.
+            if !raise_frames.is_empty() {
+                let prefix: Vec<String> = raise_frames
+                    .iter()
+                    .rev()
+                    .enumerate()
+                    .map(|(i, f)| crate::value::trace_frame_str_at(f, i))
+                    .collect();
+                frames = prefix.into_iter().chain(frames).collect();
+            }
             // The uncaught render reads the Throwable's own trace —
             // swap it for the resume stack.
             if let Some(Value::Object(o)) = &self.pending_exception {
@@ -648,7 +698,12 @@ impl<'a> Interp<'a> {
     /// ran as an internal call (`[internal function]: g()`), invoked
     /// from `Generator->{method}()` at the consumer's call site,
     /// under whatever frames the consumer itself is in.
-    fn gen_resume_frames(&mut self, state: &Rc<RefCell<GenState>>, method: &str) -> Vec<String> {
+    fn gen_resume_frames(
+        &mut self,
+        state: &Rc<RefCell<GenState>>,
+        method: &str,
+        include_method: bool,
+    ) -> Vec<String> {
         let fn_name = {
             let st = state.borrow();
             match &st.setup {
@@ -656,12 +711,14 @@ impl<'a> Interp<'a> {
             }
         };
         let mut frames = vec![format!("[internal function]: {}()", fn_name)];
-        frames.push(format!(
-            "{}({}): Generator->{}()",
-            self.diag_file(),
-            self.cur_line,
-            method
-        ));
+        if include_method {
+            frames.push(format!(
+                "{}({}): Generator->{}()",
+                self.diag_file(),
+                self.cur_line,
+                method
+            ));
+        }
         for fr in self.call_trace.iter().rev() {
             if crate::value::trace_frame_hidden(fr) {
                 continue;
@@ -686,24 +743,23 @@ impl<'a> Interp<'a> {
         let lname = name.to_lowercase();
         match lname.as_str() {
             "rewind" => {
-                let (started, finished) = {
-                    let st = state.borrow();
-                    (st.started, st.finished)
-                };
-                if finished {
-                    let v =
-                        self.exception("Exception", "Cannot traverse an already closed generator");
-                    return Err(self.throw(v));
+                if !state.borrow().started {
+                    self.gen_start(&state)?;
+                    self.gen_raise_deferred(&state, "rewind")?;
+                    return Ok(Some(Value::Null));
                 }
-                if started {
+                self.gen_raise_deferred(&state, "rewind")?;
+                let st = state.borrow();
+                // Zend throws once the gen ran past its first yield —
+                // a still-positioned-at-first-item rewind is a no-op,
+                // and a closed/dead gen reports 'already run'.
+                if st.pos > 0 || st.closed || st.dead {
                     let v = self.exception(
                         "Exception",
                         "Cannot rewind a generator that was already run",
                     );
                     return Err(self.throw(v));
                 }
-                self.gen_start(&state)?;
-                self.gen_raise_deferred(&state, "rewind")?;
                 Ok(Some(Value::Null))
             }
             "valid" => {
@@ -741,6 +797,10 @@ impl<'a> Interp<'a> {
             }
             "send" => {
                 let v = args.cells.first().map(|c| c.borrow().clone()).unwrap_or(Value::Null);
+                if state.borrow().closed {
+                    // send() on a killed gen is a silent no-op.
+                    return Ok(Some(Value::Null));
+                }
                 {
                     let mut st = state.borrow_mut();
                     st.sends.push(v);
@@ -754,6 +814,8 @@ impl<'a> Interp<'a> {
                         st.pos = 0;
                         st.pending_out.clear();
                         st.deferred_err = None;
+                        st.dead = false;
+                        st.closed = false;
                     }
                 }
                 self.gen_start(&state)?;
@@ -775,16 +837,42 @@ impl<'a> Interp<'a> {
             }
             "throw" => {
                 let e = args.cells.first().map(|c| c.borrow().clone()).unwrap_or(Value::Null);
-                state.borrow_mut().finished = true;
+                {
+                    // Zend's closed generator: the kill discards the
+                    // buffered item stream — subsequent reads report
+                    // exhausted (valid() false, current()/key() null),
+                    // send()/next() stay silent.
+                    let mut st = state.borrow_mut();
+                    st.finished = true;
+                    st.closed = true;
+                    st.items.clear();
+                    st.pending_out.clear();
+                    st.deferred_err = None;
+                }
                 Err(self.throw(e))
             }
             "getreturn" => {
-                // getReturn() runs the generator to completion —
-                // everything still deferred past yields belongs to
-                // that final resume.
+                // getReturn() never runs the body: Zend throws
+                // 'hasn't returned' for unstarted, still-running, or
+                // dead generators — it only reports the stored return
+                // once the consumer exhausted the gen cleanly.
+                if !state.borrow().started {
+                    let v = self.exception(
+                        "Exception",
+                        "Cannot get return value of a generator that hasn't returned",
+                    );
+                    return Err(self.throw(v));
+                }
                 self.gen_flush_out(&state, usize::MAX);
                 self.gen_raise_deferred(&state, "getReturn")?;
                 let st = state.borrow();
+                if st.pos < st.items.len() || st.closed || st.dead {
+                    let v = self.exception(
+                        "Exception",
+                        "Cannot get return value of a generator that hasn't returned",
+                    );
+                    return Err(self.throw(v));
+                }
                 Ok(Some(st.return_val.clone()))
             }
             "__construct" => self.fail(PhpError::uncaught(
@@ -796,41 +884,65 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Materialize an iterable's (key, value) pairs for `yield from`.
-    pub fn yield_from_collect(
+    /// Materialize an iterable's (key, value) pairs. Returns the
+    /// items collected plus a death to propagate afterwards — an
+    /// inner-generator death mid-materialization keeps the prefix it
+    /// already yielded (`yield from` streams up to the death, then
+    /// dies), so the error travels beside the items rather than
+    /// discarding them.
+    pub(in crate::interp) fn yield_from_collect(
         &mut self,
         v: &Value,
-    ) -> Result<Vec<crate::value::GenItem>, PhpError> {
+    ) -> (Vec<crate::value::GenItem>, Option<PhpError>) {
         match v {
-            Value::Array(a) => Ok(a
-                .borrow()
-                .iter()
-                .map(|(k, c)| (key_value(k), c.clone()))
-                .collect()),
+            Value::Array(a) => (
+                a.borrow()
+                    .iter()
+                    .map(|(k, c)| (key_value(k), c.clone()))
+                    .collect(),
+                None,
+            ),
             Value::Object(o) => {
                 if self.obj_is_a(o, "IteratorAggregate") {
-                    let it = self.method_invoke(o.clone(), "getIterator", CallArgs::empty())?;
+                    let it = match self.method_invoke(o.clone(), "getIterator", CallArgs::empty())
+                    {
+                        Ok(it) => it,
+                        Err(e) => return (Vec::new(), Some(e)),
+                    };
                     return self.yield_from_collect(&it);
                 }
                 if self.obj_is_a(o, "Iterator")
                     || o.borrow().class.name().eq_ignore_ascii_case("generator")
                 {
                     let mut out = Vec::new();
-                    let _ = self.method_invoke(o.clone(), "rewind", CallArgs::empty())?;
-                    loop {
-                        let ok = self
-                            .method_invoke(o.clone(), "valid", CallArgs::empty())
-                            .map(|v| v.is_truthy())
-                            .unwrap_or(false);
-                        if !ok {
-                            break;
+                    let mut death = None;
+                    if let Err(e) = self.method_invoke(o.clone(), "rewind", CallArgs::empty()) {
+                        death = Some(e);
+                    }
+                    while death.is_none() {
+                        match self.method_invoke(o.clone(), "valid", CallArgs::empty()) {
+                            Ok(v) if v.is_truthy() => {}
+                            Ok(_) => break,
+                            Err(e) => {
+                                death = Some(e);
+                                break;
+                            }
                         }
-                        let k = self
-                            .method_invoke(o.clone(), "key", CallArgs::empty())
-                            .unwrap_or(Value::Null);
-                        let val = self
-                            .method_invoke(o.clone(), "current", CallArgs::empty())
-                            .unwrap_or(Value::Null);
+                        let k = match self.method_invoke(o.clone(), "key", CallArgs::empty()) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                death = Some(e);
+                                break;
+                            }
+                        };
+                        let val = match self.method_invoke(o.clone(), "current", CallArgs::empty())
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                death = Some(e);
+                                break;
+                            }
+                        };
                         // Storage-backed iterators expose live cells:
                         // zend's materialization keeps IS_REFERENCE
                         // bindings (a by-ref foreach's marks re-bind,
@@ -857,22 +969,47 @@ impl<'a> Interp<'a> {
                         }
                         .unwrap_or_else(|| cell(val));
                         out.push((k, c));
-                        let _ = self.method_invoke(o.clone(), "next", CallArgs::empty())?;
+                        if let Err(e) = self.method_invoke(o.clone(), "next", CallArgs::empty()) {
+                            death = Some(e);
+                            break;
+                        }
                     }
-                    Ok(out)
+                    (out, death)
                 } else {
-                    self.fail(PhpError::uncaught(
-                        "TypeError",
-                        "Argument #1 must be of type Traversable|array",
-                        0,
-                    ))
+                    (
+                        Vec::new(),
+                        self.fail::<Value>(PhpError::uncaught(
+                            "TypeError",
+                            "Argument #1 must be of type Traversable|array",
+                            0,
+                        ))
+                        .err(),
+                    )
                 }
             }
-            _ => self.fail(PhpError::uncaught(
-                "TypeError",
-                "Argument #1 must be of type Traversable|array",
-                0,
-            )),
+            _ => (
+                Vec::new(),
+                self.fail::<Value>(PhpError::uncaught(
+                    "TypeError",
+                    "Argument #1 must be of type Traversable|array",
+                    0,
+                ))
+                .err(),
+            ),
         }
+    }
+
+    /// Internal materializers (iterator_to_array, iterator_count,
+    /// iterator_apply) drive the iteration under the internal-resume
+    /// flag — a deferred gen death inside renders the resume stack
+    /// without the `Generator->{method}()` pseudo-frame.
+    pub(crate) fn yield_from_collect_internal(
+        &mut self,
+        v: &Value,
+    ) -> (Vec<crate::value::GenItem>, Option<PhpError>) {
+        self.gen_internal_resume += 1;
+        let r = self.yield_from_collect(v);
+        self.gen_internal_resume -= 1;
+        r
     }
 }

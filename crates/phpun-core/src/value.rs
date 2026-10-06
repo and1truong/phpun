@@ -1709,8 +1709,20 @@ pub struct GenState {
     /// The body's terminal error, held until the consumer's next
     /// resume past the last collected item — Zend's lazy body dies
     /// inside `Generator->next()`/friends, after the bytes the
-    /// consumer already echoed between yields.
-    pub deferred_err: Option<crate::error::PhpError>,
+    /// consumer already echoed between yields. Carries the throwable
+    /// itself for Throw deaths (the ambient pending_exception slot is
+    /// transient — consumer calls between death and resume clobber
+    /// it) and the call-trace frames suspended between the throw site
+    /// and the gen body (eval()/include() pseudo-frames, userland
+    /// calls) so the resume render can prepend them.
+    pub deferred_err: Option<(crate::error::PhpError, Option<Value>, Vec<TraceFrame>)>,
+    /// The body died by error — getReturn() reports 'hasn't returned'
+    /// even after the deferred error was consumed.
+    pub dead: bool,
+    /// Killed by `Generator->throw()` — buffered items are dropped and
+    /// consumer reads behave like an exhausted generator (`valid()`
+    /// false, `current()`/`key()` null), like Zend's closed gen.
+    pub closed: bool,
 }
 
 pub enum GenSetup {

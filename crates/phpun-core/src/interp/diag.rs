@@ -460,6 +460,16 @@ impl<'a> Interp<'a> {
                 e.trace = Some(frames);
             }
         }
+        if self.gen_run_state.is_some() {
+            // A fatal inside a running gen body belongs to the dead
+            // resume, not the raise site: gen_start picks this up into
+            // deferred_err, so the display lands once — after the
+            // consumer's echoed bytes, with the resume-stack trace —
+            // instead of printing early at the raise site.
+            self.gen_pending_fatal = Some(e);
+            self.gen_raise_ctx = self.call_trace.clone();
+            return Flow::Exit(255);
+        }
         self.print_fatal(&e);
         Flow::Exit(255)
     }
