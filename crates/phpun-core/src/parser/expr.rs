@@ -1707,6 +1707,23 @@ impl<'a> Parser<'a> {
                 // the check to the using class, and closures defer it
                 // to invocation (catchable Error).
                 if let Expr::Const(n) = &e {
+                    // Inside a NAMED function there is no class scope at
+                    // all — `self::`/`static::`/`parent::` in any member
+                    // position is the 'Cannot use "X" when no class
+                    // scope is active' compile fatal (at top level the
+                    // same stays a runtime catchable Error).
+                    if matches!(
+                        n.to_ascii_lowercase().as_str(),
+                        "self" | "static" | "parent"
+                    ) && self.in_named_fn
+                        && self.class_ctx.is_empty()
+                        && !self.in_closure
+                    {
+                        return Err(PhpError::compile_fatal(
+                            format!("Cannot use \"{}\" when no class scope is active", n),
+                            self.line(),
+                        ));
+                    }
                     if n.eq_ignore_ascii_case("parent")
                         && self.class_ctx.last().map(|c| !c.1 && !c.0).unwrap_or(false)
                         && !self.in_closure
@@ -2277,6 +2294,22 @@ impl<'a> Parser<'a> {
                     // compile-time gate as `parent::` (p10new/ch3);
                     // inside a closure it defers to the runtime Error.
                     if let Expr::Const(n) = &class {
+                        // `new self()`/`new static()`/`new parent()`
+                        // inside a named function — no class scope:
+                        // 'Cannot use "X" when no class scope is active'
+                        // (k12). Same gate as the `X::` postfix.
+                        if matches!(
+                            n.to_ascii_lowercase().as_str(),
+                            "self" | "static" | "parent"
+                        ) && self.in_named_fn
+                            && self.class_ctx.is_empty()
+                            && !self.in_closure
+                        {
+                            return Err(PhpError::compile_fatal(
+                                format!("Cannot use \"{}\" when no class scope is active", n),
+                                self.line(),
+                            ));
+                        }
                         if n.eq_ignore_ascii_case("parent")
                             && self.class_ctx.last().map(|c| !c.1 && !c.0).unwrap_or(false)
                             && !self.in_closure

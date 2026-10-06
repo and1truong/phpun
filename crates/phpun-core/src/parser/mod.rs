@@ -65,6 +65,12 @@ pub struct Parser<'a> {
     /// the no-class-scope compile fatal doesn't apply
     /// (static_type_return's unbound `{closure:...}(): static`).
     in_closure: bool,
+    /// Inside a NAMED function's signature/body — zend compile-fatals
+    /// `self::`/`new self()`/`parent::$p` there even when the decl is
+    /// nested in a method ('Cannot use "self" when no class scope is
+    /// active'); at top level the same constructs are only runtime
+    /// errors, so the gate keys on this flag too.
+    in_named_fn: bool,
     /// Enclosing function/method/closure is declared `function &` —
     /// `return $o?->p` inside is the "Cannot take reference of a
     /// nullsafe chain" compile fatal.
@@ -192,6 +198,7 @@ impl<'a> Parser<'a> {
             first_stmt_slot: false,
             strict_slot: false,
             in_closure: false,
+            in_named_fn: false,
             ret_by_ref: false,
         }
     }
@@ -290,6 +297,7 @@ pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
         first_stmt_slot: false,
         strict_slot: false,
         in_closure: false,
+        in_named_fn: false,
         ret_by_ref: false,
     };
     let e = p.expr()?;

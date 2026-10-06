@@ -1870,6 +1870,15 @@ impl<'a> Parser<'a> {
             )
         })?;
         let prev_hook = self.hook_ctx.take();
+        // A named function's signature+body has NO class scope even
+        // when its decl is nested in a method — `self::`/`new self()`/
+        // `parent::$p` inside it are zend's whole-file compile fatal
+        // 'Cannot use "X" when no class scope is active'. Clearing
+        // class_ctx/in_closure for the parse makes the `X::` gates see
+        // that scope; closures/arrow fns re-set in_closure themselves.
+        let saved_ctx = std::mem::take(&mut self.class_ctx);
+        let saved_closure = std::mem::replace(&mut self.in_closure, false);
+        let saved_named = std::mem::replace(&mut self.in_named_fn, true);
         let params = self.params()?;
         // Return type declarations (: int).
         let ret = if self.eat_op(":") {
@@ -1883,6 +1892,9 @@ impl<'a> Parser<'a> {
         let end_line = self.prev_line();
         self.ret_by_ref = prev_ret_by_ref;
         self.hook_ctx = prev_hook;
+        self.class_ctx = saved_ctx;
+        self.in_closure = saved_closure;
+        self.in_named_fn = saved_named;
         let name = self.ns_qualify(&name);
         Ok(Stmt::Function(FunctionDecl {
             name,
