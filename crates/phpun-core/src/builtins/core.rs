@@ -367,7 +367,9 @@ pub(crate) fn dispatch(
 
         // ----- env/process -----
         "getenv" => {
-            if args.is_empty() {
+            // ?string $name = null — an explicit null means the default:
+            // the full environment array, same as a 0-arg call.
+            if args.is_empty() || matches!(arg(args, 0), Value::Null) {
                 let mut a = PhpArray::new();
                 for (k, v) in it.getenv_all_pub() {
                     a.set(ArrKey::Str(k.into()), Value::str(v));
