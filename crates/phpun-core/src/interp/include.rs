@@ -42,6 +42,7 @@ impl<'a> Interp<'a> {
             named_args: Vec::new(),
             internal: true,
             visible: true,
+            named_dispatch: false,
         });
         let inc_pop = |it: &mut Interp| {
             it.call_trace.pop();

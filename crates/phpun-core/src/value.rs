@@ -251,6 +251,7 @@ pub fn int_prop_index(k: &str) -> Option<i64> {
 pub fn trace_frame_hidden(fr: &TraceFrame) -> bool {
     !fr.visible
         || (fr.internal
+            && !fr.named_dispatch
             && matches!(
                 fr.function.as_str(),
                 "call_user_func"
@@ -1589,6 +1590,11 @@ pub struct TraceFrame {
     /// `sprintf` becomes rope-concat — no call exists, conversion
     /// errors trace `{main}` only).
     pub visible: bool,
+    /// A call_user_func* call carrying named args isn't trampoline-
+    /// inlined in Zend — it's a real internal frame: it shows in
+    /// traces (overriding the cufa transparency filter) and the
+    /// callee's call site attributes to `[internal function]`.
+    pub named_dispatch: bool,
 }
 
 /// Shared storage slot for spl array-objects — zend's `intern->array`

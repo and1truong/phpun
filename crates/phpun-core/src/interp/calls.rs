@@ -2086,6 +2086,7 @@ impl<'a> Interp<'a> {
                 named_args: targs_named.clone(),
                 internal: false,
                 visible: true,
+                named_dispatch: false,
             })
             .unwrap_or_else(|| TraceFrame {
                 function: decl.name.clone(),
@@ -2097,6 +2098,7 @@ impl<'a> Interp<'a> {
                 named_args: targs_named,
                 internal: false,
                 visible: true,
+                named_dispatch: false,
             });
         self.call_trace.push(fr);
         self.last_call_by_ref = decl.by_ref;
@@ -3338,17 +3340,9 @@ impl<'a> Interp<'a> {
             .call_trace
             .iter()
             .rev()
+            .filter(|f| !crate::value::trace_frame_hidden(f))
             .nth(caller_depth)
-            .map(|f| {
-                f.internal
-                    && !matches!(
-                        f.function.as_str(),
-                        "call_user_func"
-                            | "call_user_func_array"
-                            | "forward_static_call"
-                            | "forward_static_call_array"
-                    )
-            })
+            .map(|f| f.internal)
             .unwrap_or(false);
         if internal_driver {
             String::new()
@@ -4411,21 +4405,21 @@ fn zend_literal_no_frame(name: &str, args: &[Expr]) -> bool {
     if name != "sprintf" {
         return false;
     }
-    // Compile-time-constant format — a quoted literal is `Expr::Str`
-    // or an all-literal `Expr::Interp`.
-    let fmt: Vec<u8> = match args.first() {
-        Some(Expr::Str(s)) => s.as_bytes().to_vec(),
-        Some(Expr::Interp(parts)) => {
-            let mut v = Vec::new();
-            for p in parts {
-                match p {
-                    crate::lexer::StringPart::Lit(t) => v.extend_from_slice(t),
-                    _ => return false,
-                }
-            }
-            v
-        }
-        _ => return false,
+    // Named args make it a dynamic arg-bind (sprintf's '*' variadic
+    // rejects them anyway) — Zend emits a real call, not a rope.
+    if args
+        .iter()
+        .any(|a| matches!(a, Expr::Binary { op: "named", .. }))
+    {
+        return false;
+    }
+    // Compile-time-constant format — a quoted literal is `Expr::Str`,
+    // an all-literal `Expr::Interp`, or a foldable `"a" . "b"` concat
+    // chain (zend_compile const-folds literal concats before the
+    // sprintf check, so `"%" . "s"` specializes too).
+    let fmt: Vec<u8> = match args.first().and_then(const_str_fold) {
+        Some(v) => v,
+        None => return false,
     };
     let fmt = fmt.as_slice();
     if fmt.len() >= 256 {
@@ -4448,6 +4442,35 @@ fn zend_literal_no_frame(name: &str, args: &[Expr]) -> bool {
         i += 1;
     }
     n == args.len() - 1
+}
+
+/// Compile-time-constant string value of an expression node: a quoted
+/// literal, an all-literal interp, or a concat of folds. Mirrors the
+/// const-fold zend_compile performs before checking whether a call
+/// specializes — named consts/defines are NOT folded (they resolve at
+/// runtime).
+fn const_str_fold(e: &Expr) -> Option<Vec<u8>> {
+    match e {
+        Expr::Str(s) => Some(s.as_bytes().to_vec()),
+        Expr::Interp(parts) => {
+            let mut v = Vec::new();
+            for p in parts {
+                match p {
+                    crate::lexer::StringPart::Lit(t) => v.extend_from_slice(t),
+                    _ => return None,
+                }
+            }
+            Some(v)
+        }
+        Expr::Binary {
+            op: ".", l, r, ..
+        } => {
+            let mut v = const_str_fold(l)?;
+            v.extend(const_str_fold(r)?);
+            Some(v)
+        }
+        _ => None,
+    }
 }
 
 /// Zend's normalized union display for redundancy errors: iterable

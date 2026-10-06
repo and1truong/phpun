@@ -2507,20 +2507,43 @@ impl<'a> Interp<'a> {
         } else {
             (self.diag_file(), self.cur_line as u32)
         };
+        // Trace frame args mirror Zend's bound param array: named args
+        // that resolve to a declared fixed param merge into that
+        // positional slot (interior unbound slots materialize as NULL);
+        // names that don't match land in the variadic tail and keep
+        // their `name:` marker (`substr(string: 'x', length: 2)`
+        // renders `substr('x', NULL, 2)`).
+        let (frame_args, frame_named) = match builtins::builtin_params(name) {
+            Some(params) => Self::bind_frame_args(args, params),
+            None => (
+                args.to_vec(),
+                args.named
+                    .iter()
+                    .map(|(n, c, ..)| (n.clone(), c.clone()))
+                    .collect(),
+            ),
+        };
         self.call_trace.push(TraceFrame {
             function: name.to_string(),
             class: None,
             ty: String::new(),
             file: site_file,
             line: site_line,
-            args: args.to_vec(),
-            named_args: args
-                .named
-                .iter()
-                .map(|(n, c, ..)| (n.clone(), c.clone()))
-                .collect(),
+            args: frame_args,
+            named_args: frame_named,
             internal: true,
             visible,
+            // A cufa-family call with named args is a real frame, not
+            // a transparent trampoline (zend only inlines positional
+            // cufa calls).
+            named_dispatch: !args.named.is_empty()
+                && matches!(
+                    name,
+                    "call_user_func"
+                        | "call_user_func_array"
+                        | "forward_static_call"
+                        | "forward_static_call_array"
+                ),
         });
         if name == "assert" {
             // AssertionError message = `assert(<args>)` as written.
@@ -2565,6 +2588,9 @@ impl<'a> Interp<'a> {
                 ));
             };
             if fwd && args.named.iter().any(|(n, ..)| n != "callback") {
+                // '*' variadic: the reject fires after the arity
+                // checks — `forward_static_call(x:)` with no callback
+                // reports the missing param first.
                 self.call_trace.pop();
                 return self.fail(PhpError::uncaught(
                     "ArgumentCountError",
@@ -2621,6 +2647,26 @@ impl<'a> Interp<'a> {
                     "Cannot call forward_static_call() when no class scope is active",
                     0,
                 ));
+            }
+            // Forwarded names bind against the CALLEE's params at this
+            // frame's level in Zend (zend_call_function resolves the
+            // callee's arg array from the caller context): an unknown
+            // name on a non-variadic callee errors here —
+            // `call_user_func('strlen', x: 'a')` traces the
+            // call_user_func frame, not a strlen frame. Variadic
+            // callees collect every name into the tail.
+            if !ca.named.is_empty() {
+                if let Some(bad) = self.callee_unknown_named(&cb, &ca) {
+                    // The cufa frame itself is what traces — fail()
+                    // must capture before it pops.
+                    let r = self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Unknown named parameter ${bad}"),
+                        0,
+                    ));
+                    self.call_trace.pop();
+                    return r;
+                }
             }
             // Callbacks dispatched from inside an internal function
             // trace from `[internal function]` (closure_064).
@@ -2721,7 +2767,17 @@ impl<'a> Interp<'a> {
                 // (`array_multisort(: 1)` in call_user_func_array_variadic).
                 let r = match r {
                     Ok(v) => Ok(v),
-                    Err(e) => self.fail(e),
+                    Err(e) => {
+                        // Named-arg resolution errors raised while the
+                        // callee's param array is still being built
+                        // mean the frame never existed in Zend — the
+                        // trace shows `{main}` only (`substr('x',
+                        // bogus: 3)`, `sprintf('%s', format:)`).
+                        if Self::named_init_err(&e) {
+                            self.call_trace.pop();
+                        }
+                        self.fail(e)
+                    }
                 };
                 self.call_trace.pop();
                 self.emit_cmp_notices()?;
@@ -2731,12 +2787,13 @@ impl<'a> Interp<'a> {
             // names that aren't builtins at all fall through so the
             // userland invoke path sees them.
             None if builtins::is_builtin(name) && !args.named.is_empty() => {
+                // Same param-build-phase error: no frame in the trace.
+                self.call_trace.pop();
                 let r = self.fail(PhpError::uncaught(
                     "Error",
                     format!("Unknown named parameter ${}", args.named[0].0),
                     0,
                 ));
-                self.call_trace.pop();
                 r
             }
             None => {
@@ -2752,6 +2809,163 @@ impl<'a> Interp<'a> {
                 r
             }
         }
+    }
+
+    /// The first name in `args.named` that can't bind to a fixed param
+    /// of `cb`'s callee signature — used for the cufa-family rule that
+    /// forwarded named args resolve at the trampoline's level. None
+    /// when the callee is variadic (unknown names collect into the
+    /// tail) or its signature is unavailable.
+    fn callee_unknown_named(&mut self, cb: &Value, args: &CallArgs) -> Option<String> {
+        fn decl_sig(d: &crate::ast::FunctionDecl) -> (Vec<String>, bool) {
+            (
+                d.params.iter().map(|p| p.name.clone()).collect(),
+                d.params.iter().any(|p| p.variadic),
+            )
+        }
+        // (fixed param names, variadic tail?) for a named callable.
+        let name_sig = |interp: &mut Self, n: &str| -> Option<(Vec<String>, bool)> {
+            let lower = crate::value::lossy(n).to_lowercase();
+            let lower = lower.trim_start_matches('\\').to_string();
+            if let Some((cn, mn)) = lower.split_once("::") {
+                let key = interp.resolve_class(cn).unwrap_or_else(|| cn.to_string());
+                if let Some(cls) = interp.classes.get(&key.to_lowercase()).cloned() {
+                    return interp
+                        .find_method_in(&cls, mn)
+                        .map(|(m, _)| decl_sig(&m.decl));
+                }
+                return None;
+            }
+            if let Some(params) = builtins::builtin_params(&lower) {
+                let variadic = params.iter().any(|(_, d)| matches!(d, builtins::BDef::Var));
+                let names = params
+                    .iter()
+                    .take_while(|(_, d)| !matches!(d, builtins::BDef::Var))
+                    .map(|(pn, _)| pn.to_string())
+                    .collect();
+                return Some((names, variadic));
+            }
+            interp
+                .functions
+                .get(&lower)
+                .map(|d| decl_sig(d))
+        };
+        let sig: Option<(Vec<String>, bool)> = match cb {
+            Value::Str(s) => name_sig(self, &crate::value::lossy(s)),
+            Value::Callable(rc) => match &rc.kind {
+                crate::value::CallableKind::Closure(d) => Some(decl_sig(d)),
+                crate::value::CallableKind::Named(n) => name_sig(self, n),
+                crate::value::CallableKind::Method { obj, class, name } => {
+                    let cls = obj
+                        .as_ref()
+                        .map(|o| o.borrow().class.clone())
+                        .or_else(|| class.clone());
+                    cls.and_then(|c| {
+                        self.find_method_in(&c, &name.to_lowercase())
+                            .map(|(m, _)| decl_sig(&m.decl))
+                    })
+                }
+            },
+            Value::Array(a) => {
+                let arr = a.borrow();
+                let cn = arr.iter().find_map(|(k, v)| {
+                    if !matches!(k, crate::value::ArrKey::Int(0)) {
+                        return None;
+                    }
+                    match &*v.borrow() {
+                        Value::Object(o) => Some(o.borrow().class.name().to_string()),
+                        Value::Str(s) => Some(crate::value::lossy(s).into_owned()),
+                        _ => None,
+                    }
+                })?;
+                let mn = arr.iter().find_map(|(k, v)| {
+                    if !matches!(k, crate::value::ArrKey::Int(1)) {
+                        return None;
+                    }
+                    match &*v.borrow() {
+                        Value::Str(s) => Some(crate::value::lossy(s).to_lowercase()),
+                        _ => None,
+                    }
+                })?;
+                drop(arr);
+                let key = self.resolve_class(&cn).unwrap_or(cn);
+                self.classes.get(&key.to_lowercase()).cloned().and_then(|cls| {
+                    self.find_method_in(&cls, &mn).map(|(m, _)| decl_sig(&m.decl))
+                })
+            }
+            Value::Object(o) => {
+                let cls = o.borrow().class.clone();
+                self.find_method_in(&cls, "__invoke").map(|(m, _)| decl_sig(&m.decl))
+            }
+            _ => None,
+        };
+        let (names, variadic) = sig?;
+        if variadic {
+            return None;
+        }
+        args.named
+            .iter()
+            .map(|(n, ..)| n)
+            .find(|n| !names.iter().any(|p| p == *n))
+            .cloned()
+    }
+
+    /// Materialize the frame's display args the way Zend's bound param
+    /// array does: named args matching a fixed param occupy that slot
+    /// (unbound interior slots render as NULL, positional tail args
+    /// follow); names that match nothing stay in `named` so traces
+    /// render `name: value`. Pure display logic — rejection/overwrite
+    /// errors happen later in resolve_named_builtin.
+    fn bind_frame_args(
+        args: &CallArgs,
+        params: &[(&'static str, builtins::BDef)],
+    ) -> (Vec<Cell>, Vec<(String, Cell)>) {
+        use builtins::BDef;
+        let n_fixed = params
+            .iter()
+            .take_while(|(_, d)| !matches!(d, BDef::Var))
+            .count();
+        let mut slot: Vec<Option<Cell>> = vec![None; n_fixed];
+        for (i, c) in args.cells.iter().enumerate() {
+            if i < n_fixed {
+                slot[i] = Some(c.clone());
+            }
+        }
+        let mut named: Vec<(String, Cell)> = Vec::new();
+        for (n, c, ..) in &args.named {
+            match params[..n_fixed]
+                .iter()
+                .position(|(pn, _)| *pn == n.as_str())
+            {
+                Some(j) => slot[j] = Some(c.clone()),
+                None => named.push((n.clone(), c.clone())),
+            }
+        }
+        let last = slot
+            .iter()
+            .rposition(|s| s.is_some())
+            .map(|i| i + 1)
+            .unwrap_or(0)
+            .max(args.cells.len().min(n_fixed));
+        let mut out: Vec<Cell> = Vec::new();
+        for s in &slot[..last] {
+            out.push(match s {
+                Some(c) => c.clone(),
+                None => Rc::new(RefCell::new(Value::Null)),
+            });
+        }
+        out.extend(args.cells.iter().skip(n_fixed).cloned());
+        (out, named)
+    }
+
+    /// Named-arg binding errors that Zend raises while still building
+    /// the callee's param array — the call frame doesn't exist yet,
+    /// so traces drop it (`{main}` only). Everything else (arity,
+    /// '*' reject, execution) happens inside a live frame.
+    fn named_init_err(e: &PhpError) -> bool {
+        matches!(&e.kind, ErrorKind::Uncaught { class } if *class == "Error")
+            && (e.message.starts_with("Unknown named parameter")
+                || e.message.starts_with("Named parameter"))
     }
 
     /// Reorder named args to positional cells against an internal
@@ -2772,6 +2986,15 @@ impl<'a> Interp<'a> {
         const NAMED_REJECT: &[&str] = &[
             "array_merge",
             "array_merge_recursive",
+            "array_replace",
+            "array_replace_recursive",
+            "array_multisort",
+            "min",
+            "max",
+            "sprintf",
+            "printf",
+            "fprintf",
+            "fscanf",
             "array_diff",
             "array_diff_key",
             "array_diff_assoc",
@@ -2789,13 +3012,13 @@ impl<'a> Interp<'a> {
             "array_uintersect_assoc",
             "array_uintersect_uassoc",
         ];
-        if NAMED_REJECT.contains(&name) && !args.named.is_empty() {
-            return Err(PhpError::uncaught(
-                "ArgumentCountError",
-                format!("{}() does not accept unknown named parameters", name),
-                0,
-            ));
-        }
+        // '*' variadics defer their unknown-name rejection past the
+        // arity checks: `min(x: 1)` reports the missing required param
+        // ("expects at least 1 argument, 0 given") while
+        // `min(value: 1, x: 2)` rejects ("does not accept unknown named
+        // parameters"). Unknown names also don't count as "given".
+        let reject_named = NAMED_REJECT.contains(&name);
+        let mut pending_reject = 0usize;
         let variadic = params.iter().any(|(_, d)| matches!(d, BDef::Var));
         let n_fixed = params
             .iter()
@@ -2879,6 +3102,7 @@ impl<'a> Interp<'a> {
                     slot[j] = Some(c.clone());
                     given += 1;
                 }
+                None if variadic && reject_named => pending_reject += 1,
                 None if variadic => extra_pos.push(c.clone()),
                 None => {
                     return Err(PhpError::uncaught(
@@ -2936,6 +3160,13 @@ impl<'a> Interp<'a> {
                 None if i < last_bound => out.push(cell(params[i].1.val())),
                 None => break,
             }
+        }
+        if pending_reject > 0 {
+            return Err(PhpError::uncaught(
+                "ArgumentCountError",
+                format!("{}() does not accept unknown named parameters", name),
+                0,
+            ));
         }
         out.extend(extra_pos);
         Ok(out)
