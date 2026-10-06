@@ -325,19 +325,19 @@ impl<'a> Interp<'a> {
                     if c.arrow {
                         return self.fail(PhpError::compile_fatal(
                             "Constant expression contains invalid operations",
-                            self.cur_line,
+                            c.decl.line,
                         ));
                     }
                     if !c.is_static {
                         return self.fail(PhpError::compile_fatal(
                             "Closures in constant expressions must be static",
-                            self.cur_line,
+                            c.decl.line,
                         ));
                     }
                     if !c.uses.is_empty() {
                         return self.fail(PhpError::compile_fatal(
                             "Cannot use(...) variables in constant expression",
-                            self.cur_line,
+                            c.decl.line,
                         ));
                     }
                 }
@@ -355,8 +355,14 @@ impl<'a> Interp<'a> {
                 // nested (iterable_003, closure_065). Class-init
                 // initializers (prop/const/static-prop defaults) have no
                 // enclosing function — file-based name regardless of the
-                // runtime caller's frame.
-                let enclosing = if self.const_self.is_some() {
+                // runtime caller's frame. Param-default evals also set
+                // const_self (for `self::` binds) but DO name the
+                // enclosing callee — param_bind_ctx records the ambient
+                // class-init level and only counts while a nested
+                // initializer hasn't bumped it.
+                let enclosing = if self.const_self.is_some()
+                    && self.param_bind_ctx != Some(self.class_const_ctx)
+                {
                     String::new()
                 } else {
                     self.stack
@@ -395,6 +401,22 @@ impl<'a> Interp<'a> {
                     decl.file = cfile;
                 }
                 decl.name = fname.clone();
+                // A closure declared lexically inside a trait method
+                // keeps the trait as its __TRAIT__ origin; the decl is
+                // cloned per instance so the creating context stamps it
+                // here (closure_trait_const).
+                if decl.decl_in.is_none() {
+                    decl.decl_in = self
+                        .stack
+                        .last()
+                        .and_then(|f| f.trait_origin.clone())
+                        .or_else(|| {
+                            self.const_self
+                                .as_ref()
+                                .filter(|c| c.decl.kind == crate::ast::ClassKind::Trait)
+                                .map(|c| c.name().to_string())
+                        });
+                }
                 self.decl_type_checks(&fname, &decl, None)?;
                 let mut captures = Vec::new();
                 if c.arrow {
@@ -442,6 +464,11 @@ impl<'a> Interp<'a> {
                 // compiled defaults (closure_const_expr/static_variable).
                 let mut sv = Vec::new();
                 closure_static_vars(&decl.body, &mut sv);
+                let mut seed_frame = Frame::new(fname.clone());
+                seed_frame.fn_line = decl.line;
+                seed_frame.file = decl.file.clone();
+                seed_frame.ns = decl.ns.clone();
+                seed_frame.trait_origin = decl.decl_in.clone();
                 let callable = self.new_callable(PhpCallable {
                     id: std::cell::Cell::new(0),
                     kind: CallableKind::Closure(Rc::new(decl)),
@@ -464,21 +491,35 @@ impl<'a> Interp<'a> {
                 if !sv.is_empty() {
                     let key = format!("{}\u{0}c{}", fname, callable.id.get());
                     let mut table = std::collections::HashMap::new();
-                    for (n, d) in sv {
+                    // The seeded defaults compile against the CLOSURE's
+                    // own scope: __FUNCTION__/__METHOD__ name it and
+                    // __CLASS__ sees its bound scope — evaluating in
+                    // the enclosing frame would stamp the caller's
+                    // context in permanently.
+                    seed_frame.scope_class = callable.scope_class.clone();
+                    seed_frame.called_class = callable.called_class.clone();
+                    let saved_line = self.cur_line;
+                    self.stack.push(seed_frame);
+                    for (n, d, sline) in sv {
                         // Only literal-only defaults are bound at
                         // creation — consts, `new`, calls and anything
                         // needing a runtime env stay NULL until the
                         // `static` statement first executes
                         // (closure_const_expr/bug79778).
                         let Some(e) = d else { continue };
-                        if !literal_static_init(&e) {
+                        if !literal_static_init(&e, &self.engine_consts) {
                             continue;
                         }
+                        // __LINE__ resolves to the `static` statement's
+                        // line inside the body (probe_sv_line).
+                        self.cur_line = sline;
                         let Ok(v) = self.eval_const(&e) else {
                             continue;
                         };
                         table.insert(n, cell(v));
                     }
+                    self.stack.pop();
+                    self.cur_line = saved_line;
                     // Wholesale replace: a recycled handle id could
                     // otherwise expose a dead closure's stale table
                     // to this fresh instance.
@@ -1023,7 +1064,7 @@ impl<'a> Interp<'a> {
                     Ok(c) => c,
                     Err(_) => return Ok(None),
                 };
-                self.statics_init(&cls);
+                self.statics_init(&cls)?;
                 let v = cls.statics.borrow().get(&pn).map(|c| c.borrow().clone());
                 let ok = match self.find_static_prop_decl(&cls, &pn) {
                     Some((pd, dcls)) => match pd.visibility {
@@ -1802,7 +1843,7 @@ impl<'a> Interp<'a> {
             Expr::StaticProp { class, name } => {
                 let pn = self.prop_name(name)?;
                 let (cls, _t) = self.member_class_of(class)?;
-                self.statics_init(&cls);
+                self.statics_init(&cls)?;
                 let mut merged: Option<Vec<String>> = None;
                 if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pn) {
                     if pd.ty.is_some() {
@@ -4520,16 +4561,17 @@ fn bitwise_str(op: &str, a: &[u8], b: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `static` declarations anywhere in a body, with their default exprs —
-/// nested function/class bodies declare their own.
-fn closure_static_vars(stmts: &[Stmt], out: &mut Vec<(String, Option<Expr>)>) {
+/// `static` declarations anywhere in a body, with their default exprs
+/// and the `static` keyword's line — nested function/class bodies
+/// declare their own.
+fn closure_static_vars(stmts: &[Stmt], out: &mut Vec<(String, Option<Expr>, usize)>) {
     use crate::ast::Stmt;
     for st in stmts {
         match st {
-            Stmt::Static { vars, .. } => {
+            Stmt::Static { vars, line } => {
                 for (n, d) in vars {
-                    if !out.iter().any(|(x, _)| x == n) {
-                        out.push((n.clone(), d.clone()));
+                    if !out.iter().any(|(x, ..)| x == n) {
+                        out.push((n.clone(), d.clone(), *line));
                     }
                 }
             }
@@ -4566,10 +4608,11 @@ fn closure_static_vars(stmts: &[Stmt], out: &mut Vec<(String, Option<Expr>)>) {
 }
 
 /// Compile-time bindable `static` initializer: literals and ops on
-/// literals only. Zend resolves consts/`new`/calls when the `static`
-/// statement runs, not at closure creation (probe_sv3), so those
-/// stay NULL in the seeded table.
-fn literal_static_init(e: &Expr) -> bool {
+/// literals only. Zend resolves user consts/`new`/calls when the
+/// `static` statement runs, not at closure creation (probe_sv3), so
+/// those stay NULL in the seeded table — except engine consts
+/// (PHP_VERSION, ...), which Zend binds at creation (probe_sv_engine).
+fn literal_static_init(e: &Expr, engine: &std::collections::HashSet<String>) -> bool {
     match e {
         Expr::Null
         | Expr::Bool(_)
@@ -4577,21 +4620,29 @@ fn literal_static_init(e: &Expr) -> bool {
         | Expr::Float(_)
         | Expr::Str(_)
         | Expr::MagicConst(_) => true,
+        Expr::Const(n) => engine.contains(n.trim_start_matches('\\')),
         Expr::ArrayLit(items) => items.iter().all(|(k, v)| {
-            k.as_ref().map(literal_static_init).unwrap_or(true) && literal_static_init(v)
+            k.as_ref()
+                .map(|k| literal_static_init(k, engine))
+                .unwrap_or(true)
+                && literal_static_init(v, engine)
         }),
         Expr::Interp(parts) => parts
             .iter()
             .all(|p| matches!(p, crate::lexer::StringPart::Lit(_))),
         Expr::Paren(inner) | Expr::ByRef(inner) | Expr::Unary { e: inner, .. } => {
-            literal_static_init(inner)
+            literal_static_init(inner, engine)
         }
-        Expr::Cast { e: inner, .. } => literal_static_init(inner),
-        Expr::Binary { l, r, .. } => literal_static_init(l) && literal_static_init(r),
+        Expr::Cast { e: inner, .. } => literal_static_init(inner, engine),
+        Expr::Binary { l, r, .. } => {
+            literal_static_init(l, engine) && literal_static_init(r, engine)
+        }
         Expr::Ternary { c, t, f, .. } => {
-            literal_static_init(c)
-                && t.as_ref().map(|t| literal_static_init(t)).unwrap_or(true)
-                && literal_static_init(f)
+            literal_static_init(c, engine)
+                && t.as_ref()
+                    .map(|t| literal_static_init(t, engine))
+                    .unwrap_or(true)
+                && literal_static_init(f, engine)
         }
         _ => false,
     }

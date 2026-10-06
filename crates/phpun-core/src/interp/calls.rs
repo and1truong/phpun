@@ -654,6 +654,10 @@ impl<'a> Interp<'a> {
                                 decl_class: None,
                                 called_class: c.called_class.clone(),
                                 captures: c.captures.clone(),
+                                // Per-instance statics key off the
+                                // callable id — the generator frame
+                                // needs it like any closure frame.
+                                closure_rc: Some(c.clone()),
                             })));
                         }
                         let mut frame_args = Vec::new();
@@ -682,6 +686,7 @@ impl<'a> Interp<'a> {
                         frame.this_obj = c.this_obj.clone();
                         frame.scope_class = c.scope_class.clone();
                         frame.called_class = c.called_class.clone();
+                        frame.trait_origin = decl.decl_in.clone();
                         // $this binds like a normal method frame —
                         // closures defined in an object context auto-capture it.
                         if let Some(o) = &c.this_obj {
@@ -1079,6 +1084,7 @@ impl<'a> Interp<'a> {
         c: &PhpCallable,
         new_this: Option<Rc<RefCell<PhpObject>>>,
         scope_arg: Option<Value>,
+        share_statics: bool,
     ) -> Result<Option<Rc<PhpCallable>>, PhpError> {
         if new_this.is_some() && c.is_static {
             self.warn(
@@ -1217,21 +1223,27 @@ impl<'a> Interp<'a> {
         // A rebound closure is a new object (fresh handle id) that
         // SNAPSHOTS the source's static vars — the two tables evolve
         // independently afterwards (probe_bind: bindTo copies values).
+        // Closure::call's temporary rebind instead SHARES the table,
+        // like Zend's fake closure (call=2, then f()=3,4).
         let nc_rc = Rc::new(nc);
-        let id = self.next_callable_id(&nc_rc);
-        nc_rc.id.set(id);
-        if let CallableKind::Closure(d) = &nc_rc.kind {
-            let src_key = format!("{}\u{0}c{}", d.name, c.id.get());
-            if let Some(src) = self.statics.get(&src_key).cloned() {
-                let mut snap = std::collections::HashMap::new();
-                for (n, sc) in &src {
-                    let cc = cell(sc.borrow().clone());
-                    if self.is_ref_cell(sc) {
-                        self.mark_ref(&cc);
+        if share_statics {
+            nc_rc.id.set(c.id.get());
+        } else {
+            let id = self.next_callable_id(&nc_rc);
+            nc_rc.id.set(id);
+            if let CallableKind::Closure(d) = &nc_rc.kind {
+                let src_key = format!("{}\u{0}c{}", d.name, c.id.get());
+                if let Some(src) = self.statics.get(&src_key).cloned() {
+                    let mut snap = std::collections::HashMap::new();
+                    for (n, sc) in &src {
+                        let cc = cell(sc.borrow().clone());
+                        if self.is_ref_cell(sc) {
+                            self.mark_ref(&cc);
+                        }
+                        snap.insert(n.clone(), cc);
                     }
-                    snap.insert(n.clone(), cc);
+                    self.statics.insert(format!("{}\u{0}c{}", d.name, id), snap);
                 }
-                self.statics.insert(format!("{}\u{0}c{}", d.name, id), snap);
             }
         }
         Ok(Some(nc_rc))
@@ -3849,7 +3861,13 @@ impl<'a> Interp<'a> {
                         Some(c) => self.const_self.replace(c),
                         None => self.const_self.take(),
                     };
+                    // Param defaults name their enclosing function —
+                    // const_self serves `self::` binds but must not
+                    // blank the enclosing fn name the way class-init
+                    // const eval does ({closure:M::m():L}).
+                    let pb = self.param_bind_ctx.replace(self.class_const_ctx);
                     let r = self.eval_decl_const(d, &decl.file);
+                    self.param_bind_ctx = pb;
                     self.const_self = old;
                     self.cur_line = prev_line;
                     let mut dv = match r {
@@ -4221,15 +4239,17 @@ impl<'a> Interp<'a> {
                 decl_class: dc,
                 called_class: cc,
                 captures: Vec::new(),
+                closure_rc: None,
             })));
         }
         let dc = self.pending_decl_class.take();
         let cc = self.pending_called_class.take();
-        self.invoke_fn_run(decl, args, this_obj, scope_class, dc, cc)
+        self.invoke_fn_run(decl, args, this_obj, scope_class, dc, cc, None)
     }
 
     /// Frame push + body run — the part of invoke_fn the Generator
     /// start path also uses (the yield check must not re-trip here).
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::interp) fn invoke_fn_run(
         &mut self,
         decl: &Rc<FunctionDecl>,
@@ -4238,8 +4258,10 @@ impl<'a> Interp<'a> {
         scope_class: Option<Rc<PhpClass>>,
         decl_class: Option<Rc<PhpClass>>,
         called_class: Option<Rc<PhpClass>>,
+        closure_rc: Option<Rc<PhpCallable>>,
     ) -> Result<Value, PhpError> {
         let mut frame = Frame::new(decl.name.clone());
+        frame.closure_rc = closure_rc;
         frame.fn_line = decl.line;
         frame.file = decl.file.clone();
         frame.ns = decl.ns.clone();

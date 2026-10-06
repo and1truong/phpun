@@ -51,14 +51,16 @@ pub enum Flow {
 /// closures draw ids from the same vector, like Zend's EG(objects_store).
 enum ObjHandle {
     Obj(std::rc::Weak<RefCell<PhpObject>>),
-    Callable(std::rc::Weak<PhpCallable>),
+    /// Weak callable + its statics-table key prefix (the decl name in
+    /// `{name}\0c{id}`) — lets a dead slot's entry be GC'd on reuse.
+    Callable(std::rc::Weak<PhpCallable>, Option<String>),
 }
 
 impl ObjHandle {
     fn alive(&self) -> bool {
         match self {
             Self::Obj(w) => w.upgrade().is_some(),
-            Self::Callable(w) => w.upgrade().is_some(),
+            Self::Callable(w, _) => w.upgrade().is_some(),
         }
     }
 }
@@ -391,6 +393,14 @@ pub struct Interp<'a> {
     /// The class whose const/prop initializer is being evaluated —
     /// `self`/`parent` inside it bind to this class, not the caller.
     const_self: Option<Rc<PhpClass>>,
+    /// Ambient `class_const_ctx` level while a PARAM default is being
+    /// evaluated — stack-based closure names apply only while it still
+    /// matches (a nested class initializer bumps it out from under us).
+    param_bind_ctx: Option<u32>,
+    /// Engine-provided constants (PHP_VERSION, PHP_EOL, ...) — always
+    /// resolvable, so closure `static` defaults naming them bind at
+    /// creation like Zend (probe_sv_engine). User consts stay lazy.
+    engine_consts: std::collections::HashSet<String>,
     /// spl_autoload_register() callbacks, in registration order.
     pub autoload_fns: Vec<Value>,
     /// File currently executing — include resolution uses its directory
@@ -472,6 +482,16 @@ pub struct Interp<'a> {
     deadline_secs: i64,
     /// `-d` ini settings (e.g. short_open_tag=on).
     pub ini: HashMap<String, String>,
+}
+
+/// Mode for the compile-time const-closure scan: `Const` walks a
+/// const-expr slot (closures hit the shape gates; the carried line
+/// overrides the error line for attribute args), `Runtime` walks
+/// bodies where `function(){}` is legal but decl defaults inside
+/// stay gated.
+enum GateMode {
+    Const(Option<usize>),
+    Runtime,
 }
 
 /// Where a typed-slot owner lives — pruned when the named prop no
@@ -747,6 +767,7 @@ impl<'a> Interp<'a> {
         constants.insert("LC_MONETARY".into(), Value::Int(4));
         constants.insert("LC_MESSAGES".into(), Value::Int(5));
         constants.insert("LC_ALL".into(), Value::Int(6));
+        let engine_consts: std::collections::HashSet<String> = constants.keys().cloned().collect();
         let mut it = Self {
             file,
             globals: Frame::new(String::new()),
@@ -824,6 +845,8 @@ impl<'a> Interp<'a> {
             in_const_expr: 0,
             class_const_ctx: 0,
             const_self: None,
+            param_bind_ctx: None,
+            engine_consts,
             autoload_fns: Vec::new(),
             obj_handles: Vec::new(),
             fcc_fn_cache: HashMap::new(),
@@ -955,6 +978,356 @@ impl<'a> Interp<'a> {
         r
     }
 
+    /// zend_compile validates the closure-shape rules of every
+    /// const-expr slot in the file eagerly — prop/const/param defaults
+    /// and attribute args — even inside `if(false)` or a never-called
+    /// function body; `Stmt::Static` defaults are runtime inits and
+    /// stay exempt (closure_const_expr/*).
+    fn const_closure_gate(stmts: &[Stmt]) -> Result<(), PhpError> {
+        for s in stmts {
+            Self::gate_stmt(s)?;
+        }
+        Ok(())
+    }
+
+    fn gate_stmt(s: &Stmt) -> Result<(), PhpError> {
+        match s {
+            Stmt::Class(d) => Self::gate_class_decl(d),
+            Stmt::Function(d) => Self::gate_fn_decl(d),
+            Stmt::ConstDecl(v) => {
+                for (_, e) in v {
+                    Self::gate_expr(e, &GateMode::Const(None))?;
+                }
+                Ok(())
+            }
+            Stmt::Declare { value, .. } => Self::gate_expr(value, &GateMode::Const(None)),
+            Stmt::Expr(e) => Self::gate_expr(e, &GateMode::Runtime),
+            Stmt::Echo(es) => {
+                for e in es {
+                    Self::gate_expr(e, &GateMode::Runtime)?;
+                }
+                Ok(())
+            }
+            Stmt::Return(Some(e)) | Stmt::Break(Some(e)) | Stmt::Continue(Some(e)) => {
+                Self::gate_expr(e, &GateMode::Runtime)
+            }
+            Stmt::Block(b) => Self::const_closure_gate(b),
+            Stmt::If { cond, then, else_ } => {
+                Self::gate_expr(cond, &GateMode::Runtime)?;
+                Self::const_closure_gate(then)?;
+                Self::const_closure_gate(else_)
+            }
+            Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
+                Self::gate_expr(cond, &GateMode::Runtime)?;
+                Self::const_closure_gate(body)
+            }
+            Stmt::For {
+                init,
+                cond,
+                inc,
+                body,
+            } => {
+                for e in init.iter().chain(cond.iter()).chain(inc.iter()) {
+                    Self::gate_expr(e, &GateMode::Runtime)?;
+                }
+                Self::const_closure_gate(body)
+            }
+            Stmt::Foreach { arr, val, body, .. } => {
+                Self::gate_expr(arr, &GateMode::Runtime)?;
+                Self::gate_foreach_target(val)?;
+                Self::const_closure_gate(body)
+            }
+            Stmt::Switch { cond, cases } => {
+                Self::gate_expr(cond, &GateMode::Runtime)?;
+                for (c, b) in cases {
+                    if let Some(c) = c {
+                        Self::gate_expr(c, &GateMode::Runtime)?;
+                    }
+                    Self::const_closure_gate(b)?;
+                }
+                Ok(())
+            }
+            Stmt::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                Self::const_closure_gate(body)?;
+                for c in catches {
+                    Self::const_closure_gate(&c.body)?;
+                }
+                if let Some(f) = finally {
+                    Self::const_closure_gate(f)?;
+                }
+                Ok(())
+            }
+            // `static $x = ...` inside a body is a RUNTIME initializer —
+            // closure literals are legal there (probe_f4d).
+            Stmt::Static { vars, .. } => {
+                for (_, d) in vars {
+                    if let Some(e) = d {
+                        Self::gate_expr(e, &GateMode::Runtime)?;
+                    }
+                }
+                Ok(())
+            }
+            Stmt::Unset(v) | Stmt::Global(v) => {
+                for e in v {
+                    Self::gate_expr(e, &GateMode::Runtime)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn gate_foreach_target(t: &ForeachTarget) -> Result<(), PhpError> {
+        match t {
+            ForeachTarget::Lvalue(e) => Self::gate_expr(e, &GateMode::Runtime),
+            ForeachTarget::List(ts) => {
+                for t in ts.iter().flatten() {
+                    Self::gate_foreach_target(t)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Const slots shared by fn/method/closure decls: param defaults
+    /// and attributes gate eagerly; the body is runtime.
+    fn gate_fn_decl(d: &FunctionDecl) -> Result<(), PhpError> {
+        for p in &d.params {
+            if let Some(def) = &p.default {
+                Self::gate_expr(def, &GateMode::Const(None))?;
+            }
+            Self::gate_hooks(&p.hooks)?;
+        }
+        Self::gate_attrs(&d.attrs)?;
+        Self::const_closure_gate(&d.body)
+    }
+
+    fn gate_class_decl(d: &ClassDecl) -> Result<(), PhpError> {
+        Self::gate_attrs(&d.attrs)?;
+        for p in &d.props {
+            if let Some(def) = &p.default {
+                Self::gate_expr(def, &GateMode::Const(None))?;
+            }
+            Self::gate_attrs(&p.attrs)?;
+            Self::gate_hooks(&p.hooks)?;
+        }
+        for c in &d.consts {
+            Self::gate_expr(&c.value, &GateMode::Const(None))?;
+            Self::gate_attrs(&c.attrs)?;
+        }
+        for m in &d.methods {
+            Self::gate_fn_decl(&m.decl)?;
+        }
+        Ok(())
+    }
+
+    fn gate_hooks(hooks: &Option<Vec<PropHook>>) -> Result<(), PhpError> {
+        let Some(hs) = hooks else { return Ok(()) };
+        for h in hs {
+            for p in &h.params {
+                if let Some(d) = &p.default {
+                    Self::gate_expr(d, &GateMode::Const(None))?;
+                }
+            }
+            if let Some(b) = &h.body {
+                Self::const_closure_gate(b)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn gate_attrs(attrs: &[AttrDecl]) -> Result<(), PhpError> {
+        for a in attrs {
+            for arg in &a.args {
+                // Compile fatals inside attribute args attribute to the
+                // attributed declaration — Zend reports a line later
+                // than the `#[` token (see AttrDecl::line).
+                Self::gate_expr(arg, &GateMode::Const(Some(a.line + 1)))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Const-mode walks a const-expr slot (closures hit the shape
+    /// gates; `attr` overrides the error line); runtime mode walks
+    /// bodies where `function(){}` is legal but decl defaults inside
+    /// stay gated.
+    fn gate_expr(e: &Expr, m: &GateMode) -> Result<(), PhpError> {
+        match e {
+            Expr::Closure(c) => {
+                if let GateMode::Const(attr) = m {
+                    let line = attr.unwrap_or(c.decl.line);
+                    if c.arrow {
+                        return Err(PhpError::compile_fatal(
+                            "Constant expression contains invalid operations",
+                            line,
+                        ));
+                    }
+                    if !c.is_static {
+                        return Err(PhpError::compile_fatal(
+                            "Closures in constant expressions must be static",
+                            line,
+                        ));
+                    }
+                    if !c.uses.is_empty() {
+                        return Err(PhpError::compile_fatal(
+                            "Cannot use(...) variables in constant expression",
+                            line,
+                        ));
+                    }
+                }
+                Self::gate_fn_decl(&c.decl)
+            }
+            Expr::AnonClass(d) => Self::gate_class_decl(d),
+            Expr::Assign { target, value, .. } => {
+                Self::gate_expr(target, m)?;
+                Self::gate_expr(value, m)
+            }
+            Expr::Binary { l, r, .. } => {
+                Self::gate_expr(l, m)?;
+                Self::gate_expr(r, m)
+            }
+            Expr::Unary { e, .. }
+            | Expr::Clone(e)
+            | Expr::ByRef(e)
+            | Expr::PreInc(e)
+            | Expr::PreDec(e)
+            | Expr::PostInc(e)
+            | Expr::PostDec(e)
+            | Expr::Empty(e)
+            | Expr::Print(e)
+            | Expr::VarVar(e)
+            | Expr::Paren(e)
+            | Expr::Fcc(e)
+            | Expr::Unpack(e)
+            | Expr::Cast { e, .. }
+            | Expr::Throw(e)
+            | Expr::Include { e, .. } => Self::gate_expr(e, m),
+            Expr::Ternary { c, t, f } => {
+                Self::gate_expr(c, m)?;
+                if let Some(t) = t {
+                    Self::gate_expr(t, m)?;
+                }
+                Self::gate_expr(f, m)
+            }
+            Expr::Call { name, args } => {
+                Self::gate_expr(name, m)?;
+                for a in args {
+                    Self::gate_expr(a, m)?;
+                }
+                Ok(())
+            }
+            Expr::Index { e, i } => {
+                Self::gate_expr(e, m)?;
+                if let Some(i) = i {
+                    Self::gate_expr(i, m)?;
+                }
+                Ok(())
+            }
+            Expr::Isset(v) => {
+                for x in v {
+                    Self::gate_expr(x, m)?;
+                }
+                Ok(())
+            }
+            Expr::List(v) => {
+                for x in v.iter().flatten() {
+                    Self::gate_expr(x, m)?;
+                }
+                Ok(())
+            }
+            Expr::Exit(Some(e)) => Self::gate_expr(e, m),
+            Expr::Yield { key, val } => {
+                if let Some(k) = key {
+                    Self::gate_expr(k, m)?;
+                }
+                if let Some(v) = val {
+                    Self::gate_expr(v, m)?;
+                }
+                Ok(())
+            }
+            Expr::YieldFrom(e) => Self::gate_expr(e, m),
+            Expr::Match { subject, arms } => {
+                Self::gate_expr(subject, m)?;
+                for a in arms {
+                    for c in &a.conds {
+                        Self::gate_expr(c, m)?;
+                    }
+                    Self::gate_expr(&a.result, m)?;
+                }
+                Ok(())
+            }
+            Expr::MethodCall {
+                obj, name, args, ..
+            } => {
+                Self::gate_expr(obj, m)?;
+                if let PropName::Expr(e) = name {
+                    Self::gate_expr(e, m)?;
+                }
+                for a in args {
+                    Self::gate_expr(a, m)?;
+                }
+                Ok(())
+            }
+            Expr::StaticCall { class, args, .. } => {
+                Self::gate_expr(class, m)?;
+                for a in args {
+                    Self::gate_expr(a, m)?;
+                }
+                Ok(())
+            }
+            Expr::StaticCallDyn { class, name, args } => {
+                Self::gate_expr(class, m)?;
+                Self::gate_expr(name, m)?;
+                for a in args {
+                    Self::gate_expr(a, m)?;
+                }
+                Ok(())
+            }
+            Expr::StaticProp { class, name } => {
+                Self::gate_expr(class, m)?;
+                if let PropName::Expr(e) = name {
+                    Self::gate_expr(e, m)?;
+                }
+                Ok(())
+            }
+            Expr::Prop { obj, name, .. } => {
+                Self::gate_expr(obj, m)?;
+                if let PropName::Expr(e) = name {
+                    Self::gate_expr(e, m)?;
+                }
+                Ok(())
+            }
+            Expr::New { class, args } => {
+                Self::gate_expr(class, m)?;
+                for a in args {
+                    Self::gate_expr(a, m)?;
+                }
+                Ok(())
+            }
+            Expr::ClassConst { class, .. } => Self::gate_expr(class, m),
+            Expr::Instanceof { obj, class } => {
+                Self::gate_expr(obj, m)?;
+                Self::gate_expr(class, m)
+            }
+            Expr::ArrayLit(items) => {
+                for (k, v) in items {
+                    if let Some(k) = k {
+                        Self::gate_expr(k, m)?;
+                    }
+                    Self::gate_expr(v, m)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// PHP binds a compilation unit's unconditional top-level function
     /// decls before executing it (bug23279's later-declared handler).
     /// A name collision is PHP's compile-time "Cannot redeclare" fatal.
@@ -1022,7 +1395,7 @@ impl<'a> Interp<'a> {
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(ht as u64));
             self.deadline_secs = ht;
         }
-        if let Err(e) = self.hoist_funcs(stmts) {
+        if let Err(e) = Self::const_closure_gate(stmts).and_then(|_| self.hoist_funcs(stmts)) {
             let flow = self.err_flow(e);
             let result = self.finish(flow);
             self.run_shutdown();
@@ -1412,7 +1785,9 @@ impl<'a> Interp<'a> {
     pub fn run_source_ret(&mut self, src: &str) -> (RunResult, Option<Value>) {
         match parser::parse_source(src, self.ini_on("short_open_tag")) {
             Ok(stmts) => {
-                if let Err(e) = self.hoist_funcs(&stmts) {
+                if let Err(e) =
+                    Self::const_closure_gate(&stmts).and_then(|_| self.hoist_funcs(&stmts))
+                {
                     let flow = self.err_flow(e);
                     let res = self.finish(flow);
                     self.run_shutdown();

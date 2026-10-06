@@ -239,8 +239,9 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                 if let Some(nm) = ob.props.get("name") {
                     if let Value::Str(case) = &*nm.borrow() {
                         it.emit(&format!(
-                            "{}enum({}::{})\n",
+                            "{}{}enum({}::{})\n",
                             pad,
+                            r,
                             ob.class.name(),
                             crate::value::lossy(case)
                         ));
@@ -307,8 +308,9 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
                 " ".to_string()
             };
             it.emit(&format!(
-                "{}object({})#{} ({}){}{{\n",
+                "{}{}object({})#{} ({}){}{{\n",
                 pad,
+                r,
                 ob.class.name(),
                 ob.id,
                 live,
@@ -409,8 +411,9 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
             }
             let props = closure_debug_props(it, c);
             it.emit(&format!(
-                "{}object(Closure)#{} ({}) {{\n",
+                "{}{}object(Closure)#{} ({}) {{\n",
                 pad,
+                r,
                 c.id.get(),
                 props.len()
             ));
