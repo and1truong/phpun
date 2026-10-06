@@ -1573,9 +1573,37 @@ impl<'a> Interp<'a> {
                         if append {
                             arr.push(newv.clone());
                         } else {
-                            let key = key.map(|k| to_key(&k)).unwrap_or(to_key(&newv));
+                            let key = key.clone().map(|k| to_key(&k)).unwrap_or(to_key(&newv));
                             arr.set(key, newv.clone());
                         }
+                    }
+                }
+                if matches!(&*base.borrow(), Value::Str(_)) {
+                    // $o->p[k] = v on a string leaf:
+                    // zend_check_string_offset key validation then the
+                    // byte splice (never array-ified).
+                    let mut bytes = match &*base.borrow() {
+                        Value::Str(s) => s.to_vec(),
+                        _ => Vec::new(),
+                    };
+                    let off = self.str_offset_key(key.as_ref())?;
+                    if op != "=" {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            "Cannot use assign-op operators with string offsets",
+                            self.cur_line,
+                        ));
+                    }
+                    if let OffWrite::Stored(byte) =
+                        self.str_offset_write(&mut bytes, off, &newv)?
+                    {
+                        let mut b = base.borrow_mut();
+                        if let Value::Str(s) = &mut *b {
+                            *s = bytes.into();
+                        }
+                        return Ok(Value::str(
+                            String::from_utf8_lossy(&[byte]).into_owned(),
+                        ));
                     }
                 }
             }
@@ -1592,7 +1620,7 @@ impl<'a> Interp<'a> {
                 *c.borrow_mut() = nv;
             }
             Late::Keyed { e, keys } => {
-                newv = self.assign_index_path(&e, &keys, newv)?;
+                newv = self.assign_index_path(&e, &keys, newv, op != "=")?;
             }
             Late::None => match target_cell {
                 Some(c) => {
@@ -2285,6 +2313,7 @@ impl<'a> Interp<'a> {
         e: &Expr,
         keys: &[Option<Value>],
         v: Value,
+        op_assign: bool,
     ) -> Result<Value, PhpError> {
         self.last_fresh_cell = None;
         let mut c = self.eval_cell(e)?;
@@ -2306,6 +2335,47 @@ impl<'a> Interp<'a> {
                     _ => None,
                 }
             };
+            // A string dim goes through zend_check_string_offset, not
+            // index_into_key: the key validates first (TypeError / []
+            // / cast-warning parity), then a non-final dim is the
+            // 'Cannot use string offset as an array' Error, else the
+            // byte splices in. Compound assigns are refused outright.
+            if matches!(*c.borrow(), Value::Str(_)) {
+                let off = self.str_offset_key(k.as_ref())?;
+                if n != last {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        "Cannot use string offset as an array",
+                        self.cur_line,
+                    ));
+                }
+                if op_assign {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        "Cannot use assign-op operators with string offsets",
+                        self.cur_line,
+                    ));
+                }
+                let mut bytes = {
+                    let b = c.borrow();
+                    match &*b {
+                        Value::Str(s) => s.to_vec(),
+                        _ => Vec::new(),
+                    }
+                };
+                match self.str_offset_write(&mut bytes, off, &v)? {
+                    OffWrite::Skipped => return Ok(v),
+                    OffWrite::Stored(byte) => {
+                        let mut b = c.borrow_mut();
+                        if let Value::Str(s) = &mut *b {
+                            *s = bytes.into();
+                        }
+                        return Ok(Value::str(
+                            String::from_utf8_lossy(&[byte]).into_owned(),
+                        ));
+                    }
+                }
+            }
             // Illegal offset types must not fall into the string-offset
             // fallback — the key Error propagates
             // (closure_array_offset_error). ArrayAccess containers see
@@ -2376,55 +2446,9 @@ impl<'a> Interp<'a> {
                     c = nc;
                 }
                 Err(e2) => {
-                    let is_str = matches!(*c.borrow(), Value::Str(_));
-                    if is_str {
-                        // String offset write (final level only).
-                        let mut b = c.borrow_mut();
-                        let mut bytes = match &*b {
-                            Value::Str(s) => s.to_vec(),
-                            _ => Vec::new(),
-                        };
-                        if matches!(*b, Value::Str(_)) {
-                            // Raw bytes, not conv_str — a byte like \xff
-                            // must not round through UTF-8 lossiness.
-                            let vs = self.conv_bytes(&v).unwrap_or_default();
-                            let byte = vs.first().copied().unwrap_or(b' ');
-                            // PHP 8: negative offsets index from the end;
-                            // beyond -len stays illegal (bug22592).
-                            let idx_i =
-                                k.as_ref().map(|k| k.to_int()).unwrap_or(bytes.len() as i64);
-                            let idx_i = if idx_i < 0 {
-                                idx_i + bytes.len() as i64
-                            } else {
-                                idx_i
-                            };
-                            if idx_i < 0 {
-                                drop(b);
-                                let orig = k.as_ref().map(|k| k.to_int()).unwrap_or_default();
-                                self.warn(&format!("Illegal string offset {}", orig))?;
-                                return Ok(v);
-                            }
-                            let idx = idx_i as usize;
-                            if idx >= bytes.len() {
-                                bytes.resize(idx + 1, b' ');
-                            }
-                            bytes[idx] = byte;
-                            if vs.len() > 1 {
-                                drop(b);
-                                self.warn(
-                                    "Only the first byte will be assigned to the string offset",
-                                )?;
-                                b = c.borrow_mut();
-                            }
-                            if let Value::Str(s) = &mut *b {
-                                *s = bytes.clone().into();
-                            }
-                            return Ok(Value::str(String::from_utf8_lossy(&[byte]).into_owned()));
-                        }
-                        return Ok(v);
-                    }
                     // Scalar/object intermediate: the engine Error from
-                    // index_into_key is the real zend diagnostic — keep it.
+                    // index_into_key is the real zend diagnostic — keep
+                    // it. (String dims were handled above.)
                     return Err(e2);
                 }
             }
@@ -2450,6 +2474,93 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// zend_check_string_offset — validates a key used to offset into a
+    /// string: int passes through; a numeric string (leading ws/sign
+    /// ok) uses its value silently, a leading-int-with-junk string
+    /// warns 'Illegal string offset' and uses the int part; float,
+    /// bool and null cast with a 'String offset cast occurred'
+    /// warning; other types (incl. non-numeric strings) are a
+    /// TypeError naming the type *on string*. `None` (the `[]` dim)
+    /// is the '[] operator not supported for strings' Error.
+    fn str_offset_key(&mut self, k: Option<&Value>) -> Result<i64, PhpError> {
+        match k {
+            None => self.fail(PhpError::uncaught(
+                "Error",
+                "[] operator not supported for strings",
+                self.cur_line,
+            )),
+            Some(Value::Int(i)) => Ok(*i),
+            Some(Value::Str(s)) => match numeric(s) {
+                Numeric::Int(i) => Ok(i),
+                Numeric::Leading(f, true) => {
+                    let orig = crate::value::lossy(s).into_owned();
+                    self.warn(&format!("Illegal string offset \"{}\"", orig))?;
+                    Ok(f as i64)
+                }
+                _ => self.fail(PhpError::uncaught(
+                    "TypeError",
+                    "Cannot access offset of type string on string",
+                    self.cur_line,
+                )),
+            },
+            Some(v @ (Value::Float(_) | Value::Bool(_) | Value::Null)) => {
+                self.warn("String offset cast occurred")?;
+                Ok(v.to_int())
+            }
+            Some(v) => {
+                let ty = match v {
+                    Value::Array(_) => "array".to_string(),
+                    Value::Object(o) => o.borrow().class.name().to_string(),
+                    Value::Callable(_) => "Closure".to_string(),
+                    _ => "resource".to_string(),
+                };
+                self.fail(PhpError::uncaught(
+                    "TypeError",
+                    format!("Cannot access offset of type {} on string", ty),
+                    self.cur_line,
+                ))
+            }
+        }
+    }
+
+    /// The zend string-offset byte splice on an already-validated
+    /// offset: below -len warns 'Illegal string offset' and writes
+    /// nothing; the value converts byte-faithfully — empty is the
+    /// 'Cannot assign an empty string to a string offset' Error and a
+    /// multi-byte value warns 'Only the first byte...' then writes
+    /// byte 0. Past-the-end offsets space-pad.
+    fn str_offset_write(
+        &mut self,
+        s: &mut Vec<u8>,
+        off: i64,
+        v: &Value,
+    ) -> Result<OffWrite, PhpError> {
+        let len = s.len() as i64;
+        // The bounds check runs before the value checks — $s[-9] = ''
+        // warns Illegal only, no empty-string Error (oracle-verified).
+        if off < -len {
+            self.warn(&format!("Illegal string offset {}", off))?;
+            return Ok(OffWrite::Skipped);
+        }
+        let vs = self.conv_bytes(v)?;
+        if vs.is_empty() {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot assign an empty string to a string offset",
+                self.cur_line,
+            ));
+        }
+        if vs.len() > 1 {
+            self.warn("Only the first byte will be assigned to the string offset")?;
+        }
+        let idx = if off < 0 { off + len } else { off } as usize;
+        if idx >= s.len() {
+            s.resize(idx + 1, b' ');
+        }
+        s[idx] = vs[0];
+        Ok(OffWrite::Stored(vs[0]))
+    }
+
     /// `set_index` with an already-evaluated key.
     fn set_index_val(&mut self, e: &Expr, key: Option<Value>, v: Value) -> Result<(), PhpError> {
         if let Some(k) = &key {
@@ -2462,7 +2573,18 @@ impl<'a> Interp<'a> {
                 ),
                 _ => false,
             };
-            if !obj_container {
+            // A string container validates keys via
+            // zend_check_string_offset ('on string' errors), and nested
+            // containers through index_into_key's arm — the generic
+            // check would misname the error 'on array'.
+            let self_validating = match e {
+                Expr::Var(n) => matches!(
+                    self.var_cell_opt(n).map(|c| c.borrow().clone()),
+                    Some(Value::Str(_))
+                ),
+                _ => true,
+            };
+            if !obj_container && !self_validating {
                 self.check_offset_key(k)?;
             }
         }
@@ -2494,40 +2616,19 @@ impl<'a> Interp<'a> {
                             }
                         }
                     }
-                    Value::Str(s) => {
-                        let mut bytes = s.to_vec();
-                        match key {
-                            Some(k) => {
-                                // PHP 8: negative offsets index from the
-                                // end; beyond -len is illegal (bug22592).
-                                let orig = k.to_int();
-                                let idx = if orig < 0 {
-                                    orig + bytes.len() as i64
-                                } else {
-                                    orig
-                                };
-                                if idx < 0 {
-                                    drop(b);
-                                    self.warn(&format!("Illegal string offset {}", orig))?;
-                                    return Ok(());
-                                }
-                                let idx = idx as usize;
-                                let vs = self.conv_bytes(&v).unwrap_or_default();
-                                if idx >= bytes.len() {
-                                    bytes.resize(idx + 1, b' ');
-                                }
-                                bytes[idx] = vs.first().copied().unwrap_or(b' ');
-                                if vs.len() > 1 {
-                                    drop(b);
-                                    self.warn(
-                                        "Only the first byte will be assigned to the string offset",
-                                    )?;
-                                    return Ok(());
-                                }
-                            }
-                            None => bytes.extend_from_slice(v.to_php_string().as_bytes()),
+                    Value::Str(_) => {
+                        let mut bytes = match &*b {
+                            Value::Str(s) => s.to_vec(),
+                            _ => Vec::new(),
+                        };
+                        drop(b);
+                        let off = self.str_offset_key(key.as_ref())?;
+                        if let OffWrite::Stored(_) =
+                            self.str_offset_write(&mut bytes, off, &v)?
+                        {
+                            *arr_cell.borrow_mut() =
+                                Value::str(String::from_utf8_lossy(&bytes).into_owned());
                         }
-                        *b = Value::str(String::from_utf8_lossy(&bytes).into_owned());
                     }
                     _ => {
                         drop(b);
@@ -2552,36 +2653,32 @@ impl<'a> Interp<'a> {
                     // String offsets can't be cells — splice the byte in place.
                     Err(e2) => match self.eval_cell(e) {
                         Ok(bc) if matches!(*bc.borrow(), Value::Str(_)) => {
-                            let mut b = bc.borrow_mut();
-                            if let Value::Str(s) = &mut *b {
-                                let vs = self.conv_bytes(&v).unwrap_or_default();
-                                let mut bytes = s.to_vec();
-                                let orig = key
-                                    .as_ref()
-                                    .map(|k| k.to_int())
-                                    .unwrap_or(bytes.len() as i64);
-                                let idx = if orig < 0 {
-                                    orig + bytes.len() as i64
-                                } else {
-                                    orig
-                                };
-                                if idx < 0 {
-                                    drop(b);
-                                    self.warn(&format!("Illegal string offset {}", orig))?;
-                                    return Ok(());
-                                }
-                                let idx = idx as usize;
-                                if idx >= bytes.len() {
-                                    bytes.resize(idx + 1, b' ');
-                                }
-                                bytes[idx] = vs.first().copied().unwrap_or(b' ');
-                                let multi = vs.len() > 1;
-                                *s = bytes.clone().into();
-                                if multi {
-                                    drop(b);
-                                    self.warn(
-                                        "Only the first byte will be assigned to the string offset",
-                                    )?;
+                            // e's own dims may have consumed a string
+                            // offset mid-path ($a['k'][0]['j']): the
+                            // intermediate 'Cannot use string offset as
+                            // an array' is the zend diagnostic — key
+                            // never re-validates.
+                            let inner_str = match e {
+                                Expr::Index { e: inner, .. } => self
+                                    .eval_cell(inner)
+                                    .map(|ic| matches!(*ic.borrow(), Value::Str(_)))
+                                    .unwrap_or(false),
+                                _ => false,
+                            };
+                            if inner_str {
+                                return Err(e2);
+                            }
+                            let mut bytes = match &*bc.borrow() {
+                                Value::Str(s) => s.to_vec(),
+                                _ => Vec::new(),
+                            };
+                            let off = self.str_offset_key(key.as_ref())?;
+                            if let OffWrite::Stored(_) =
+                                self.str_offset_write(&mut bytes, off, &v)?
+                            {
+                                let mut b = bc.borrow_mut();
+                                if let Value::Str(s) = &mut *b {
+                                    *s = bytes.into();
                                 }
                             }
                             Ok(())
@@ -2678,8 +2775,10 @@ impl<'a> Interp<'a> {
     fn index_into_key(&mut self, c: Cell, key: Option<Value>) -> Result<Cell, PhpError> {
         if let Some(k) = &key {
             // Objects route to index_cell_object (ArrayAccess accepts
-            // any key); only true arrays reject object keys.
-            if !matches!(&*c.borrow(), Value::Object(_)) {
+            // any key); string containers validate keys via their own
+            // arm ('on string' errors); only true arrays reject object
+            // keys here.
+            if !matches!(&*c.borrow(), Value::Object(_) | Value::Str(_)) {
                 self.check_offset_key(k)?;
             }
         }
@@ -2724,18 +2823,16 @@ impl<'a> Interp<'a> {
             let is_str = matches!(*b, Value::Str(_));
             drop(b);
             if is_str {
-                match key.map(|k| to_key(&k)) {
-                    Some(ArrKey::Str(_)) => self.fail(PhpError::uncaught(
-                        "TypeError",
-                        "Cannot access offset of type string on string",
-                        self.cur_line,
-                    )),
-                    _ => self.fail(PhpError::uncaught(
-                        "Error",
-                        "Cannot use string offset as an array",
-                        self.cur_line,
-                    )),
-                }
+                // zend_check_string_offset validates the key first —
+                // bad keys throw 'on string' TypeErrors or the []
+                // Error; a valid offset on a non-final dim is
+                // 'Cannot use string offset as an array'.
+                self.str_offset_key(key.as_ref())?;
+                self.fail(PhpError::uncaught(
+                    "Error",
+                    "Cannot use string offset as an array",
+                    self.cur_line,
+                ))
             } else {
                 self.fail(PhpError::uncaught(
                     "Error",
@@ -2937,8 +3034,11 @@ impl<'a> Interp<'a> {
     }
 
     fn index_read_base(&mut self, base: Value, key: Value) -> Result<Value, PhpError> {
-        // ArrayAccess containers see any key type (offsetGet).
-        if !matches!(&base, Value::Object(o) if self.obj_is_a(o, "ArrayAccess")) {
+        // ArrayAccess containers see any key type (offsetGet); string
+        // bases validate keys via str_offset_key ('on string' errors).
+        if !matches!(&base, Value::Object(o) if self.obj_is_a(o, "ArrayAccess"))
+            && !matches!(&base, Value::Str(_))
+        {
             self.check_offset_key(&key)?;
         }
         match base {
@@ -2960,36 +3060,10 @@ impl<'a> Interp<'a> {
                 }
             }
             Value::Str(s) => {
-                // String offset keys: a leading int is used with an
-                // 'Illegal string offset' warning when followed by
-                // non-numeric junk; a key with no leading int (or a
-                // float-shaped one) is a TypeError (bug29566).
-                let idx = match &key {
-                    Value::Str(k) => {
-                        let b: &[u8] = k;
-                        let mut i = usize::from(b.first() == Some(&b'-'));
-                        let start = i;
-                        while i < b.len() && b[i].is_ascii_digit() {
-                            i += 1;
-                        }
-                        if i == b.len() && i > start {
-                            crate::value::lossy(&k[..]).parse::<i64>().unwrap_or(0)
-                        } else if i > start && matches!(numeric(k), Numeric::Leading(_, _)) {
-                            self.warn(&format!(
-                                "Illegal string offset \"{}\"",
-                                crate::value::lossy(&k[..])
-                            ))?;
-                            crate::value::lossy(&k[..i]).parse::<i64>().unwrap_or(0)
-                        } else {
-                            return self.fail(PhpError::uncaught(
-                                "TypeError",
-                                "Cannot access offset of type string on string",
-                                self.cur_line,
-                            ));
-                        }
-                    }
-                    _ => key.to_int(),
-                };
+                // zend_check_string_offset — same key matrix as the
+                // write path (' 2'/'+2' accepted, leading-int junk
+                // warns, casts warn, objects/arrays TypeError).
+                let idx = self.str_offset_key(Some(&key))?;
                 let bytes: &[u8] = &s[..];
                 let idx = if idx < 0 {
                     idx + bytes.len() as i64
@@ -3745,6 +3819,15 @@ impl<'a> Interp<'a> {
                     if self.obj_is_a(o, "ArrayAccess") {
                         return self.incdec_aa(o.clone(), key, delta, post);
                     }
+                }
+                if matches!(&base, Value::Str(_)) {
+                    // zend validates the key, then refuses the assign-op.
+                    self.str_offset_key(Some(&key))?;
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        "Cannot use assign-op operators with string offsets",
+                        self.cur_line,
+                    ));
                 }
                 self.index_read_base(base, key).unwrap_or(Value::Null)
             }
@@ -4758,4 +4841,11 @@ fn literal_static_init(e: &Expr, engine: &std::collections::HashSet<String>) -> 
         }
         _ => false,
     }
+}
+
+/// str_offset_write's outcome — the byte stored, or nothing when the
+/// 'Illegal string offset' warning fires (zend leaves the write out).
+enum OffWrite {
+    Stored(u8),
+    Skipped,
 }
