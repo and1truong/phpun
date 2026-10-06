@@ -441,7 +441,7 @@ impl<'a> Parser<'a> {
         self.pos += 1; // match
         self.expect_op("(")?;
         let subject = self.expr()?;
-        self.expect_op(")")?;
+        self.expect_group(")")?;
         self.expect_op("{")?;
         let mut arms = Vec::new();
         while !self.at_op("}") {
@@ -1369,7 +1369,7 @@ impl<'a> Parser<'a> {
             Some(Token::Op("(")) => {
                 self.pos += 1;
                 let e = self.expr()?;
-                self.expect_op(")")?;
+                self.expect_group(")")?;
                 // Mark parenthesized class-prop refs so `(X::$p)::m()`
                 // is not confused with the `X::$p::m()` hook syntax.
                 Ok(if matches!(e, Expr::StaticProp { .. }) {
@@ -1442,7 +1442,7 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     self.expect_op("(")?;
                     let e = self.expr()?;
-                    self.expect_op(")")?;
+                    self.expect_group(")")?;
                     Ok(Expr::Empty(Box::new(e)))
                 } else if self.ident_is("yield") {
                     self.pos += 1;
@@ -1571,7 +1571,7 @@ impl<'a> Parser<'a> {
                     let e = if kind == IncludeKind::Eval {
                         self.expect_op("(")?;
                         let e = self.expr()?;
-                        self.expect_op(")")?;
+                        self.expect_group(")")?;
                         e
                     } else {
                         self.expr()?

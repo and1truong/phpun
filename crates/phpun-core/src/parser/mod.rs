@@ -397,6 +397,40 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `expect_op` that never prints the ", expecting" clause — Zend's
+    /// yacc expected-set at a grouping or statement-condition close is
+    /// too large to report, so `if (`, `elseif`, `while`/`do-while`,
+    /// `switch (`, `match (`, `(expr`, `empty(`, `eval(` and casts all
+    /// stop at `unexpected token "X"`.
+    pub(in crate::parser) fn expect_group(&mut self, op: &str) -> Result<(), PhpError> {
+        if self.eat_op(op) {
+            Ok(())
+        } else {
+            Err(PhpError::parse(
+                format!("syntax error, unexpected {}", self.describe()),
+                self.line(),
+            ))
+        }
+    }
+
+    /// `expect_op` that always prints the clause — Zend DOES report the
+    /// single-token set at `for`-header separators (`expecting ";"`),
+    /// unlike a statement-end `;` which stays silent.
+    pub(in crate::parser) fn expect_op_full(&mut self, op: &str) -> Result<(), PhpError> {
+        if self.eat_op(op) {
+            Ok(())
+        } else {
+            Err(PhpError::parse(
+                format!(
+                    "syntax error, unexpected {}, expecting \"{}\"",
+                    self.describe(),
+                    op
+                ),
+                self.line(),
+            ))
+        }
+    }
+
     pub(in crate::parser) fn describe(&self) -> String {
         match self.peek() {
             None => "end of file".to_string(),
@@ -588,7 +622,7 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     self.expect_op("(")?;
                     let cond = self.expr()?;
-                    self.expect_op(")")?;
+                    self.expect_group(")")?;
                     let body = self.body_any("endwhile")?;
                     Ok(Stmt::While { cond, body })
                 } else if self.ident_is("do") {
@@ -602,7 +636,7 @@ impl<'a> Parser<'a> {
                     }
                     self.expect_op("(")?;
                     let cond = self.expr()?;
-                    self.expect_op(")")?;
+                    self.expect_group(")")?;
                     self.expect_op(";")?;
                     Ok(Stmt::DoWhile { body, cond })
                 } else if self.ident_is("for") {
