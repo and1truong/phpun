@@ -327,15 +327,16 @@ impl<'a> Interp<'a> {
                 }
                 Flow::Normal
             }
-            Stmt::Static { vars, line } => {
+            Stmt::Static { vars, .. } => {
                 let key = self.fn_statics_key();
-                // Site identity: (compile unit, line). A `static $a`
-                // redeclared at a different line in the same scope and
-                // unit is a compile fatal (static_basic_002), while
-                // re-executing the same statement (loops) or redeclaring
-                // in a different unit — a separate include/eval, which
-                // Zend keeps separate statics for — is not.
-                let site = (self.cur_file.clone(), *line);
+                // Site identity: (compile unit, stmt node). A `static $a`
+                // redeclared at a different statement in the same scope
+                // and unit is a compile fatal — even on the same line
+                // (static_basic_002) — while re-executing the same
+                // statement (loops) or redeclaring in a different unit
+                // — a separate include/eval, which Zend keeps separate
+                // statics for — is not.
+                let site = (self.cur_file.clone(), vars.as_ptr() as usize);
                 for (name, default) in vars {
                     // Every site is kept: a decl in a different unit is
                     // legal AND must not erase the same-unit record a
@@ -592,6 +593,12 @@ impl<'a> Interp<'a> {
                         let mut result = Flow::Throw(v.clone());
                         for c in catches {
                             if self.catch_matches(&v, &c.types) {
+                                // The throwable's raise-site stamp is
+                                // consumed here — a later engine error
+                                // must not inherit its file
+                                // (a caught include-time throwable
+                                // would otherwise poison attribution).
+                                self.last_err_file.clear();
                                 if let Some(var) = &c.var {
                                     // Binding the catch var is a normal
                                     // assign — a `&`-bound typed ref
