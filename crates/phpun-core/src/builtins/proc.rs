@@ -86,6 +86,23 @@ fn io_err_str(e: &std::io::Error) -> String {
     }
 }
 
+/// Children inherit the putenv() environment: zend's putenv mutates
+/// the real environ, which every spawned child picks up. Our
+/// overrides stand in for that — sets become env(), unsets become
+/// env_remove() on top of the inherited environ.
+fn apply_env_overrides(it: &Interp, cmd: &mut Command) {
+    for (k, v) in it.env_overrides_pub() {
+        match v {
+            Some(v) => {
+                cmd.env(k, v);
+            }
+            None => {
+                cmd.env_remove(k);
+            }
+        }
+    }
+}
+
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
@@ -566,6 +583,9 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
                 }
             }
         }
+    } else {
+        // $env = null → inherit (overridden by putenv() state).
+        apply_env_overrides(it, &mut cmd);
     }
     if let Some(dir) = &cwd {
         cmd.current_dir(to_os(trunc_nul(dir)));
@@ -923,13 +943,13 @@ fn php_exec(it: &mut Interp, fname: &str, args: &[Cell], ty: u8) -> Result<Value
             ),
         );
     }
-    let child = Command::new("/bin/sh")
-        .arg0("sh")
+    let mut c = Command::new("/bin/sh");
+    c.arg0("sh")
         .arg("-c")
         .arg(to_os(&cmd))
-        .stdout(Stdio::piped())
-        .spawn();
-    let mut child = match child {
+        .stdout(Stdio::piped());
+    apply_env_overrides(it, &mut c);
+    let mut child = match c.spawn() {
         Ok(c) => c,
         Err(_) => {
             if ty == 3 {
@@ -1041,13 +1061,13 @@ fn shell_exec(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
             "shell_exec(): Argument #1 ($command) must not contain any null bytes",
         );
     }
-    let child = Command::new("/bin/sh")
-        .arg0("sh")
+    let mut c = Command::new("/bin/sh");
+    c.arg0("sh")
         .arg("-c")
         .arg(to_os(&cmd))
-        .stdout(Stdio::piped())
-        .spawn();
-    match child {
+        .stdout(Stdio::piped());
+    apply_env_overrides(it, &mut c);
+    match c.spawn() {
         Ok(mut c) => {
             let mut out = Vec::new();
             if let Some(mut so) = c.stdout.take() {

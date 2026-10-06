@@ -350,8 +350,10 @@ pub struct Interp<'a> {
     exception_handler_stack: Vec<Value>,
     /// error_reporting() level mask (E_* bits).
     pub(crate) error_level: i64,
-    /// putenv() overrides read back by getenv() (no real process-env mutation).
-    env_overrides: HashMap<String, String>,
+    /// putenv() overrides read back by getenv() (no real process-env
+    /// mutation). `None` = tombstone from `putenv("KEY")` (unset),
+    /// which shadows a same-named var in the real environment.
+    env_overrides: HashMap<String, Option<String>>,
     /// Raw argv entries after the script path, for `getopt()`.
     pub script_args: Vec<String>,
     exception_handler: Option<Value>,
@@ -2467,18 +2469,23 @@ impl<'a> Interp<'a> {
         self.coerce_int(v)
     }
 
-    /// getenv(): putenv() overrides win over the process environment.
+    /// getenv(): putenv() overrides win over the process environment;
+    /// an unset tombstone makes the name read back as unset.
     pub fn getenv_pub(&self, name: &str) -> Option<String> {
-        self.env_overrides
-            .get(name)
-            .cloned()
-            .or_else(|| std::env::var(name).ok())
+        match self.env_overrides.get(name) {
+            Some(v) => v.clone(),
+            None => std::env::var(name).ok(),
+        }
     }
 
-    /// getenv() with no args: the whole environment as name → value.
+    /// getenv() with no args: the whole environment as name → value,
+    /// minus tombstoned names.
     pub fn getenv_all_pub(&self) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = std::env::vars().collect();
+        let mut out: Vec<(String, String)> = std::env::vars()
+            .filter(|(k, _)| !matches!(self.env_overrides.get(k), Some(None)))
+            .collect();
         for (k, v) in &self.env_overrides {
+            let Some(v) = v else { continue };
             match out.iter_mut().find(|(ek, _)| ek == k) {
                 Some(e) => e.1 = v.clone(),
                 None => out.push((k.clone(), v.clone())),
@@ -2487,15 +2494,24 @@ impl<'a> Interp<'a> {
         out
     }
 
-    /// putenv("K=V") → true on success.
+    /// putenv("K=V") sets, putenv("K") unsets (zend's unsetenv form) —
+    /// both return true.
     pub fn putenv_pub(&mut self, s: &str) -> bool {
         match s.split_once('=') {
             Some((k, v)) => {
-                self.env_overrides.insert(k.to_string(), v.to_string());
-                true
+                self.env_overrides.insert(k.to_string(), Some(v.to_string()));
             }
-            None => false,
+            None => {
+                self.env_overrides.insert(s.to_string(), None);
+            }
         }
+        true
+    }
+
+    /// putenv() state for spawning children: set/overrides/unset pairs
+    /// applied on top of the inherited process environment.
+    pub fn env_overrides_pub(&self) -> &HashMap<String, Option<String>> {
+        &self.env_overrides
     }
 
     /// Build a throwable object (used for internal errors).
