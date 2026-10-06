@@ -80,6 +80,7 @@ impl<'a> Parser<'a> {
                     self.deprecations.push((
                         "Case statements followed by a semicolon (;) are deprecated, use a colon (:) instead".into(),
                         cl,
+                        self.pos,
                     ));
                 }
                 cases.push((Some(e), Vec::new()));
@@ -95,6 +96,7 @@ impl<'a> Parser<'a> {
                     self.deprecations.push((
                         "Case statements followed by a semicolon (;) are deprecated, use a colon (:) instead".into(),
                         cl,
+                        self.pos,
                     ));
                 }
                 cases.push((None, Vec::new()));
@@ -1959,7 +1961,7 @@ impl<'a> Parser<'a> {
                                         _ => None,
                                     };
                                     if let Some(m) = w {
-                                        self.compile_warnings.push((m, self.line()));
+                                        self.compile_warnings.push((m, self.line(), self.pos));
                                     }
                                 }
                                 // `self`/`static`/`parent` need an

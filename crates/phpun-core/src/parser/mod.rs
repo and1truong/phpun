@@ -16,12 +16,16 @@ enum NsKind {
 pub struct Parser<'a> {
     toks: &'a [Lexed],
     pos: usize,
-    /// Compile-time deprecation diagnostics (msg, line) — PHP emits them
-    /// before execution; `parse_with` prepends them as `Stmt::Deprecated`.
-    deprecations: Vec<(String, usize)>,
-    /// Compile-time warnings (msg, line) — confusable type names
+    /// Compile-time deprecation diagnostics (msg, line, token pos) — PHP
+    /// emits them at their position while compiling; `parse_toks` binds
+    /// each to the stmt it was lexed/parsed inside as `Stmt::Diag`.
+    deprecations: Vec<(String, usize, usize)>,
+    /// Compile-time warnings (msg, line, pos) — confusable type names
     /// (confusable_type_warning). Drained into `Stmt::Diag`.
-    compile_warnings: Vec<(String, usize)>,
+    compile_warnings: Vec<(String, usize, usize)>,
+    /// Token index where each top-level stmt of `program()` began —
+    /// used to bind compile-time diagnostics to their source stmt.
+    stmt_starts: Vec<usize>,
     /// Enclosing class name while parsing members (hook error text).
     cur_class: String,
     /// (prop name, is_get) while inside a hook body — gates
@@ -109,22 +113,29 @@ pub fn parse_pure(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
 /// `eof_line` is Zend's scanner line at end-of-input (one past the
 /// last consumed newline) — where EOF-attributed errors are reported.
 fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> {
-    // Compile-time diagnostics ride the token stream; drain them and
-    // emit before execution (Zend emits compile warnings upfront).
-    let mut lex_diags: Vec<(String, &'static str, usize)> = Vec::new();
+    // Compile-time diagnostics ride the token stream; each records the
+    // index it would occupy in the filtered stream — its binding
+    // position for stmt attribution (Zend emits a diagnostic while
+    // compiling the stmt that produced it, so a compile-fatal on an
+    // earlier stmt suppresses later ones).
+    let mut lex_diags: Vec<(usize, String, &'static str, usize)> = Vec::new();
+    let mut kept = 0usize;
     let toks: Vec<Lexed> = toks
         .into_iter()
         .filter_map(|t| match t.token {
             Token::Diag(level, msg) => {
-                lex_diags.push((msg, level, t.line));
+                lex_diags.push((kept, msg, level, t.line));
                 None
             }
-            _ => Some(t),
+            _ => {
+                kept += 1;
+                Some(t)
+            }
         })
         .collect();
     let bracket_err = bracket_check(&toks, eof_line);
     let mut p = Parser::new(&toks);
-    let mut stmts = match p.program() {
+    let stmts = match p.program() {
         Ok(s) => s,
         Err(pe) => {
             // Zend reports the earliest error. The scanner dies at its
@@ -149,22 +160,43 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
     if let Some((be, _)) = bracket_err {
         return Err(be);
     }
-    let mut diags: Vec<(String, &'static str, usize)> = lex_diags;
+    // Bind each diagnostic to the stmt whose token span covers its
+    // position and park it directly before that stmt: `echo "${a}";
+    // break;` prints the Deprecated before the break fatal, while
+    // `break; echo "${a}";` dies on the break first and never emits it.
+    let mut diags: Vec<(usize, String, &'static str, usize)> = lex_diags;
     diags.extend(
         std::mem::take(&mut p.deprecations)
             .into_iter()
-            .map(|(msg, line)| (msg, "Deprecated", line)),
+            .map(|(msg, line, pos)| (pos, msg, "Deprecated", line)),
     );
     diags.extend(
         std::mem::take(&mut p.compile_warnings)
             .into_iter()
-            .map(|(msg, line)| (msg, "Warning", line)),
+            .map(|(msg, line, pos)| (pos, msg, "Warning", line)),
     );
-    diags.sort_by_key(|(_, _, line)| *line);
-    for (i, (msg, level, line)) in diags.into_iter().enumerate() {
-        stmts.insert(i, Stmt::Diag { level, msg, line });
+    diags.sort_by_key(|(pos, ..)| *pos);
+    let mut diags = diags.into_iter().peekable();
+    let mut stmt_idx = 0usize;
+    let mut out = Vec::with_capacity(stmts.len() + 8);
+    for s in stmts {
+        if !matches!(s, Stmt::Line(_)) {
+            let lo = p.stmt_starts.get(stmt_idx).copied().unwrap_or(usize::MAX);
+            let hi = p
+                .stmt_starts
+                .get(stmt_idx + 1)
+                .copied()
+                .unwrap_or(usize::MAX);
+            while let Some((_, msg, level, line)) =
+                diags.next_if(|(pos, ..)| *pos >= lo && *pos < hi)
+            {
+                out.push(Stmt::Diag { level, msg, line });
+            }
+            stmt_idx += 1;
+        }
+        out.push(s);
     }
-    Ok(stmts)
+    Ok(out)
 }
 
 impl<'a> Parser<'a> {
@@ -174,6 +206,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             deprecations: Vec::new(),
             compile_warnings: Vec::new(),
+            stmt_starts: Vec::new(),
             cur_class: String::new(),
             hook_ctx: None,
             pending_class_attrs: Vec::new(),
@@ -271,6 +304,7 @@ pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
         pos: 0,
         deprecations: Vec::new(),
         compile_warnings: Vec::new(),
+        stmt_starts: Vec::new(),
         cur_class: String::new(),
         hook_ctx: None,
         pending_class_attrs: Vec::new(),
@@ -411,6 +445,7 @@ impl<'a> Parser<'a> {
         let mut halted = false;
         while self.peek().is_some() {
             let stmt_line = self.line();
+            self.stmt_starts.push(self.pos);
             stmts.push(Stmt::Line(stmt_line));
             self.first_stmt_slot = !saw_any;
             let s = self.stmt()?;

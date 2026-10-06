@@ -43,7 +43,11 @@ struct ScanScope {
     /// Current source line from the last `Stmt::Line` marker — kept on
     /// the scope so it carries across the top-level per-stmt scans.
     line: usize,
-    warns: Vec<(String, usize)>,
+    /// Compile-time warnings and parked `Stmt::Diag` diagnostics
+    /// (level, msg, line) collected at their scan position — Zend
+    /// emits them while compiling, so an entry already collected
+    /// still prints when a later stmt's compile check fails.
+    warnings: Vec<(&'static str, String, usize)>,
 }
 
 struct GotoSite {
@@ -56,17 +60,21 @@ struct GotoSite {
 
 impl<'a> Interp<'a> {
     /// Run the compile-time flow checks on one freshly parsed unit
-    /// (main program, included file, eval'd code). Warnings collected
-    /// along the way emit in scan order, even when the scan itself
-    /// fails — Zend reports them while compiling.
+    /// (main program, included file, eval'd code). Warnings and diag
+    /// diagnostics collected along the way emit in scan order, even
+    /// when the scan itself fails — Zend reports them while compiling.
     pub(in crate::interp) fn flow_gate(&mut self, stmts: &[Stmt]) -> Result<(), PhpError> {
         let mut sc = ScanScope::default();
         let r = self
             .flow_unit(stmts, &mut sc)
             .and_then(|_| Self::flow_resolve_gotos(&sc));
-        for (msg, line) in sc.warns {
+        for (level, msg, line) in sc.warnings {
             self.cur_line = line;
-            let _ = self.warn(&msg);
+            match level {
+                "Warning" => self.warn(&msg)?,
+                "Notice" => self.notice(&msg)?,
+                _ => self.deprecated(&msg)?,
+            }
         }
         r
     }
@@ -148,14 +156,20 @@ impl<'a> Interp<'a> {
 
     /// A fresh scope for one function body — its own labels, statics
     /// and a reset loop depth — resolved before returning.
-    fn flow_fn(d: &FunctionDecl, warns_out: &mut Vec<(String, usize)>) -> Result<(), PhpError> {
+    fn flow_fn(
+        d: &FunctionDecl,
+        warns_out: &mut Vec<(&'static str, String, usize)>,
+    ) -> Result<(), PhpError> {
         let mut sc = ScanScope::default();
         let r = Self::flow_scope(&d.body, &mut sc);
-        warns_out.append(&mut sc.warns);
+        warns_out.append(&mut sc.warnings);
         r
     }
 
-    fn flow_class(d: &ClassDecl, warns_out: &mut Vec<(String, usize)>) -> Result<(), PhpError> {
+    fn flow_class(
+        d: &ClassDecl,
+        warns_out: &mut Vec<(&'static str, String, usize)>,
+    ) -> Result<(), PhpError> {
         for m in &d.methods {
             Self::flow_fn(&m.decl, warns_out)?;
         }
@@ -166,7 +180,7 @@ impl<'a> Interp<'a> {
                     if let Some(body) = &h.body {
                         let mut sc = ScanScope::default();
                         let r = Self::flow_scope(body, &mut sc);
-                        warns_out.append(&mut sc.warns);
+                        warns_out.append(&mut sc.warnings);
                         r?;
                     }
                 }
@@ -179,11 +193,17 @@ impl<'a> Interp<'a> {
         for s in stmts {
             match s {
                 Stmt::Line(l) => sc.line = *l,
+                // Parked compile-time diagnostic — emitted at this
+                // scan position, so a later stmt's compile-fatal
+                // still lets it print (exec is a no-op for it).
+                Stmt::Diag { level, msg, line } => {
+                    sc.warnings.push((*level, msg.clone(), *line));
+                }
                 Stmt::Function(d) => {
-                    Self::flow_fn(d, &mut sc.warns)?;
+                    Self::flow_fn(d, &mut sc.warnings)?;
                 }
                 Stmt::Class(d) => {
-                    Self::flow_class(d, &mut sc.warns)?;
+                    Self::flow_class(d, &mut sc.warnings)?;
                 }
                 Stmt::Break(op) => Self::flow_operand(op.as_ref(), sc.line, true, sc)?,
                 Stmt::Continue(op) => Self::flow_operand(op.as_ref(), sc.line, false, sc)?,
@@ -383,7 +403,7 @@ impl<'a> Interp<'a> {
                 if hint {
                     msg.push_str(&format!(". Did you mean to use \"continue {}\"?", n + 1));
                 }
-                sc.warns.push((msg, line));
+                sc.warnings.push(("Warning", msg, line));
             }
         }
         Ok(())
@@ -393,8 +413,8 @@ impl<'a> Interp<'a> {
     /// anonymous classes) — each is its own label/static scope.
     fn flow_expr(e: &Expr, sc: &mut ScanScope) -> Result<(), PhpError> {
         match e {
-            Expr::Closure(c) => Self::flow_fn(&c.decl, &mut sc.warns),
-            Expr::AnonClass(d) => Self::flow_class(d, &mut sc.warns),
+            Expr::Closure(c) => Self::flow_fn(&c.decl, &mut sc.warnings),
+            Expr::AnonClass(d) => Self::flow_class(d, &mut sc.warnings),
             Expr::Assign { target, value, .. } => {
                 Self::flow_expr(target, sc)?;
                 Self::flow_expr(value, sc)
