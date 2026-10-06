@@ -1,7 +1,7 @@
 //! Filesystem/stream builtins: file fns, stream resources, stat, glob.
 
 use super::crypto::base64_decode;
-use super::string::zpp_long;
+use super::string::{zpp_long, zpp_long_arg};
 use super::*;
 
 pub(crate) fn dispatch(
@@ -504,21 +504,46 @@ pub(crate) fn dispatch(
         }
         "fseek" => {
             stream_open_check(args, 0, name, 1, "stream")?;
+            // zend zpp: (resource, int offset, int whence = SEEK_SET).
+            let offset = zpp_long_arg(it, args, 1, name, 2, "$offset")?;
+            let whence = zpp_long_arg(it, args, 2, name, 3, "$whence")?;
             if let Some(c) = args.first() {
                 if let Value::Resource(r) = &*c.borrow() {
                     match &mut *r.borrow_mut() {
                         PhpResource::File { file, pos, eof, .. } => {
                             use std::io::Seek;
-                            *pos = arg(args, 1).to_int().max(0) as u64;
-                            *eof = false;
-                            // Keep the real fd offset in step so the fd
-                            // can be handed to a child (proc_open
-                            // descriptorspec) at the tracked position.
-                            let _ = file.seek(std::io::SeekFrom::Start(*pos));
+                            let len = file.metadata().map(|m| m.len()).unwrap_or(0) as i64;
+                            let new_pos = match whence {
+                                0 => Some(offset),
+                                1 => Some(*pos as i64 + offset),
+                                2 => Some(len + offset),
+                                _ => None,
+                            };
+                            match new_pos {
+                                // zend: lseek EINVAL → silent -1,
+                                // position unchanged.
+                                Some(np) if np >= 0 => {
+                                    *pos = np as u64;
+                                    *eof = false;
+                                    let _ = file.seek(std::io::SeekFrom::Start(*pos));
+                                }
+                                _ => return Ok(Some(Value::Int(-1))),
+                            }
                         }
-                        PhpResource::Mem { pos, eof, .. } => {
-                            *pos = arg(args, 1).to_int().max(0) as u64;
-                            *eof = false;
+                        PhpResource::Mem { buf, pos, eof, .. } => {
+                            let new_pos = match whence {
+                                0 => Some(offset),
+                                1 => Some(*pos as i64 + offset),
+                                2 => Some(buf.len() as i64 + offset),
+                                _ => None,
+                            };
+                            match new_pos {
+                                Some(np) if np >= 0 => {
+                                    *pos = np as u64;
+                                    *eof = false;
+                                }
+                                _ => return Ok(Some(Value::Int(-1))),
+                            }
                         }
                         PhpResource::Pipe { .. } => {
                             it.warn_pub(&format!("{}(): Stream does not support seeking", name))?;
@@ -1532,16 +1557,18 @@ fn read_resource(c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
                     _ => Ok(StreamRead::Ebadf(9, "Bad file descriptor".into())),
                 },
                 PhpResource::Input { body, pos, .. } => {
-                    let avail = body.len().saturating_sub(*pos as usize);
-                    let take = avail.min(n);
-                    let out = body[*pos as usize..*pos as usize + take].to_vec();
+                    // pos may sit past the end (fseek allows it) —
+                    // clamp the slice start instead of panicking.
+                    let start = (*pos as usize).min(body.len());
+                    let take = (body.len() - start).min(n);
+                    let out = body[start..start + take].to_vec();
                     *pos += take as u64;
                     Ok(StreamRead::Data(out))
                 }
                 PhpResource::Mem { buf, pos, eof, .. } => {
-                    let avail = buf.len().saturating_sub(*pos as usize);
-                    let take = avail.min(n);
-                    let out = buf[*pos as usize..*pos as usize + take].to_vec();
+                    let start = (*pos as usize).min(buf.len());
+                    let take = (buf.len() - start).min(n);
+                    let out = buf[start..start + take].to_vec();
                     *pos += take as u64;
                     if take < n {
                         *eof = true;
