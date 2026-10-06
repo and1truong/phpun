@@ -2141,17 +2141,26 @@ impl<'a> Interp<'a> {
             Some(s) => format!("scope {}", s.name()),
             None => "global scope".to_string(),
         };
-        PhpError::uncaught(
-            "Error",
+        // zend's ctor-access error drops the word "method": "Call to
+        // private U::__construct() from global scope".
+        let msg = if m.decl.name.eq_ignore_ascii_case("__construct") {
+            format!(
+                "Call to {} {}::{}() from {}",
+                vis,
+                dc.name(),
+                m.decl.name,
+                from
+            )
+        } else {
             format!(
                 "Call to {} method {}::{}() from {}",
                 vis,
                 dc.name(),
                 m.decl.name,
                 from
-            ),
-            0,
-        )
+            )
+        };
+        PhpError::uncaught("Error", msg, 0)
     }
 
     /// Calls a method by name through an object cell (magic methods, __call).
@@ -2159,7 +2168,7 @@ impl<'a> Interp<'a> {
         &mut self,
         obj: Rc<RefCell<PhpObject>>,
         name: &str,
-        args: CallArgs,
+        mut args: CallArgs,
     ) -> Result<Value, PhpError> {
         // Builtin exception methods implemented natively.
         if let Value::Object(_) = Value::Object(obj.clone()) {}
@@ -2169,6 +2178,17 @@ impl<'a> Interp<'a> {
                 || self.is_throwable_name(&ob.class.decl.name)
         };
         let cls = obj.borrow().class.clone();
+        // Internal-class ctor ZPP: Reflection*/Throwable/DateTime
+        // ctors are engine stubs whose decl.params carry the arginfo,
+        // so named args bind by param name and over/under arity throws
+        // ArgumentCountError before the native arm runs
+        // (`new ReflectionClass('C','x')` => "expects exactly 1
+        // argument, 2 given"). Subclasses inherit the stub's arity.
+        if name.eq_ignore_ascii_case("__construct") {
+            if let Some(bound) = self.ctor_zpp_args(&cls, &args)? {
+                args = bound;
+            }
+        }
         if is_throwable {
             // Native method only when the resolved method is a builtin
             // registration (line 0 — userland always runs, even an empty
@@ -2388,6 +2408,201 @@ impl<'a> Interp<'a> {
                 ))
             }
         }
+    }
+
+    /// `new X(...)`/manual `->__construct(...)` on an internal-stub
+    /// class: bind args against the ctor decl's arginfo params the way
+    /// zend's ZPP does — named args slot by param name, unknown names
+    /// and over/under arity throw before the ctor body runs. Returns
+    /// the bound CallArgs; None when the class's ctor is not an engine
+    /// stub (userland ctors tolerate extra args).
+    fn ctor_zpp_args(
+        &mut self,
+        cls: &Rc<PhpClass>,
+        args: &CallArgs,
+    ) -> Result<Option<CallArgs>, PhpError> {
+        let cn = cls.name().to_lowercase();
+        // is_a walks the object's own decl chain — classes.get on the
+        // name would miss synthesized names like anonymous classes.
+        let gated = cn.starts_with("reflection")
+            || self.is_a(cls, "throwable")
+            || self.is_a(cls, "datetime")
+            || self.is_a(cls, "datetimeimmutable")
+            || self.is_a(cls, "pdo");
+        if !gated {
+            return Ok(None);
+        }
+        let Some((m, dc)) = self.find_method_in(cls, "__construct") else {
+            return Ok(None);
+        };
+        // Native stubs only — a userland ctor (real file/line, or a
+        // declared body) opts out.
+        if !(m.decl.body.is_empty() && m.decl.line == 0 && m.decl.file.is_empty()) {
+            return Ok(None);
+        }
+        // Pre-eval param defaults outside the frame push below — the
+        // fill step can then never error while a frame is borrowed.
+        let mut defaults: Vec<Option<Cell>> = Vec::new();
+        for p in &m.decl.params {
+            defaults.push(match &p.default {
+                Some(d) => Some(cell(self.eval(d)?)),
+                None => None,
+            });
+        }
+        // The failed ctor call still owns a trace frame — zend shows
+        // `#0 file(L): Exception->__construct('a','b',...)` for a ZPP
+        // arity error. Pop it again only when the bind succeeds; the
+        // bind's errors snapshot call_trace inside fail().
+        self.call_trace.push(TraceFrame {
+            file: self.diag_file(),
+            line: self.send_line.unwrap_or(self.cur_line) as u32,
+            function: m.decl.name.clone(),
+            class: Some(dc.name().to_string()),
+            ty: "->".into(),
+            args: args.cells.clone(),
+            named_args: args
+                .named
+                .iter()
+                .map(|(n, c, ..)| (n.clone(), c.clone()))
+                .collect(),
+            internal: false,
+            visible: true,
+            named_dispatch: false,
+        });
+        let bound = self.ctor_zpp_bind(&dc, &m, args, &defaults)?;
+        self.call_trace.pop();
+        // zend 8.5 deprecates the one-positional-arg ReflectionMethod
+        // ctor form (the named form is exempt).
+        if dc.name().eq_ignore_ascii_case("reflectionmethod")
+            && args.cells.len() == 1
+            && args.named.is_empty()
+        {
+            self.deprecated(
+                "Calling ReflectionMethod::__construct() with 1 argument is deprecated, use ReflectionMethod::createFromMethodName() instead",
+            )?;
+        }
+        Ok(Some(bound))
+    }
+
+    /// The bind half of [`ctor_zpp_args`]: slot positional/named cells
+    /// against the ctor's arginfo params. Errors are built raw — the
+    /// caller wraps them through `self.fail` so the call frame it
+    /// pushed is on the recorded trace. The `?` marks `Ok` only; every
+    /// `Err` still propagates through `self.fail`.
+    fn ctor_zpp_bind(
+        &mut self,
+        dc: &Rc<PhpClass>,
+        m: &Rc<MethodDecl>,
+        args: &CallArgs,
+        defaults: &[Option<Cell>],
+    ) -> Result<CallArgs, PhpError> {
+        let params = &m.decl.params;
+        let label = format!("{}::{}", dc.name(), m.decl.name);
+        let variadic = params.iter().any(|p| p.variadic);
+        let n_fixed = params.iter().take_while(|p| !p.variadic).count();
+        let required = params[..n_fixed]
+            .iter()
+            .filter(|p| p.default.is_none())
+            .count();
+        let arity_err = |got: usize, over: bool| {
+            let (word, n) = if !variadic && over {
+                if required == n_fixed {
+                    ("exactly", n_fixed)
+                } else {
+                    ("at most", n_fixed)
+                }
+            } else if required == n_fixed && !variadic {
+                ("exactly", required)
+            } else {
+                ("at least", required)
+            };
+            PhpError::uncaught(
+                "ArgumentCountError",
+                format!(
+                    "{}() expects {} {} argument{}, {} given",
+                    label,
+                    word,
+                    n,
+                    if n == 1 { "" } else { "s" },
+                    got
+                ),
+                0,
+            )
+        };
+        let mut slot: Vec<Option<Cell>> = vec![None; n_fixed];
+        for (i, c) in args.cells.iter().enumerate().take(n_fixed) {
+            slot[i] = Some(c.clone());
+        }
+        // Named args bind before the arity check fires — zend reports
+        // an unknown name even when positionals already overflow.
+        let mut given = args.cells.len();
+        let mut variadic_extra: Vec<Cell> = Vec::new();
+        for (n, c, ..) in &args.named {
+            match params[..n_fixed].iter().position(|p| p.name == *n) {
+                Some(j) if slot[j].is_some() => {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Named parameter ${} overwrites previous argument", n),
+                        0,
+                    ));
+                }
+                Some(j) => {
+                    slot[j] = Some(c.clone());
+                    given += 1;
+                }
+                None if variadic => variadic_extra.push(c.clone()),
+                None => {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Unknown named parameter ${}", n),
+                        0,
+                    ));
+                }
+            }
+        }
+        if !variadic && args.cells.len() > n_fixed {
+            return self.fail(arity_err(given, true));
+        }
+        let last_bound = slot
+            .iter()
+            .rposition(|s| s.is_some())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let mut cells: Vec<Cell> = Vec::new();
+        for (i, s) in slot.iter().enumerate() {
+            match s {
+                Some(c) => cells.push(c.clone()),
+                None if params[i].default.is_none() => {
+                    if slot.iter().skip(i + 1).any(|s| s.is_some()) {
+                        return self.fail(PhpError::uncaught(
+                            "ArgumentCountError",
+                            format!(
+                                "{}(): Argument #{} (${}) not passed",
+                                label,
+                                i + 1,
+                                params[i].name
+                            ),
+                            0,
+                        ));
+                    }
+                    return self.fail(arity_err(given, false));
+                }
+                None if i < last_bound => {
+                    cells.push(defaults[i].clone().unwrap_or_else(|| cell(Value::Null)));
+                }
+                None => break,
+            }
+        }
+        if variadic {
+            cells.extend(args.cells.iter().skip(n_fixed).cloned());
+            cells.extend(variadic_extra);
+        }
+        Ok(CallArgs {
+            cells,
+            named: Vec::new(),
+            trav_cells: Vec::new(),
+            nonref_cells: Vec::new(),
+        })
     }
 
     /// Native implementations of Throwable methods.
