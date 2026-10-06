@@ -1957,7 +1957,14 @@ impl<'a> Interp<'a> {
         let from_builtin =
             self.internal_cb > 0 && self.call_trace.last().map(|f| f.internal).unwrap_or(true);
         let (site_file, site_line) = if from_builtin {
-            ("[internal function]".to_string(), 0)
+            match self.call_trace.last() {
+                // A hidden internal frame (call_user_func family) lends
+                // its own call site to the callee — zend renders
+                // `file(line): cb()` with the call_user_func call line,
+                // not `[internal function]` (probe9d vs oracle).
+                Some(f) if crate::value::trace_frame_hidden(f) => (f.file.clone(), f.line),
+                _ => ("[internal function]".to_string(), 0),
+            }
         } else {
             // Call-site file = the frame below the callee (the caller's
             // executing file); top-level calls report the file currently

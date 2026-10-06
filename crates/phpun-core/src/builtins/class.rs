@@ -220,11 +220,30 @@ pub(crate) fn dispatch(
         }
         "debug_backtrace" => {
             let mut arr = PhpArray::new();
-            for fr in it.backtrace() {
+            let frames = it.backtrace();
+            // The executing include frame carries no args in Zend's array
+            // (`function: 'require'` only); deeper includes emit their
+            // path args BEFORE the function key (probe9 vs oracle).
+            let bare = frames.iter().position(crate::value::include_frame);
+            for (pos, fr) in frames.iter().enumerate() {
                 let mut f = PhpArray::new();
                 if fr.file != "[internal function]" {
                     f.set(ArrKey::Str("file".into()), Value::str(fr.file.clone()));
                     f.set(ArrKey::Str("line".into()), Value::Int(fr.line as i64));
+                }
+                let incl = crate::value::include_frame(fr);
+                if incl && Some(pos) != bare {
+                    let mut a = PhpArray::new();
+                    for av in &fr.args {
+                        a.push(av.borrow().clone());
+                    }
+                    for (n, av) in &fr.named_args {
+                        a.set(ArrKey::Str(n.clone().into()), av.borrow().clone());
+                    }
+                    f.set(
+                        ArrKey::Str("args".into()),
+                        Value::Array(Rc::new(RefCell::new(a))),
+                    );
                 }
                 f.set(
                     ArrKey::Str("function".into()),
@@ -234,19 +253,21 @@ pub(crate) fn dispatch(
                     f.set(ArrKey::Str("class".into()), Value::str(c.clone()));
                     f.set(ArrKey::Str("type".into()), Value::str(fr.ty.clone()));
                 }
-                let mut a = PhpArray::new();
-                for av in &fr.args {
-                    a.push(av.borrow().clone());
+                if !incl {
+                    let mut a = PhpArray::new();
+                    for av in &fr.args {
+                        a.push(av.borrow().clone());
+                    }
+                    // Variadic-collected named args keep their string keys
+                    // (named_params/backtrace: `x`/`y` after the positionals).
+                    for (n, av) in &fr.named_args {
+                        a.set(ArrKey::Str(n.clone().into()), av.borrow().clone());
+                    }
+                    f.set(
+                        ArrKey::Str("args".into()),
+                        Value::Array(Rc::new(RefCell::new(a))),
+                    );
                 }
-                // Variadic-collected named args keep their string keys
-                // (named_params/backtrace: `x`/`y` after the positionals).
-                for (n, av) in &fr.named_args {
-                    a.set(ArrKey::Str(n.clone().into()), av.borrow().clone());
-                }
-                f.set(
-                    ArrKey::Str("args".into()),
-                    Value::Array(Rc::new(RefCell::new(a))),
-                );
                 arr.push(Value::Array(Rc::new(RefCell::new(f))));
             }
             Value::Array(Rc::new(RefCell::new(arr)))

@@ -2223,13 +2223,17 @@ impl<'a> Interp<'a> {
     }
 
     /// Zend backtrace text for debug_print_backtrace(): innermost-first
-    /// frames, no `{main}` line (bug28213).
+    /// frames, no `{main}` line (bug28213). The leading skip drops the
+    /// builtin's own frame and call_user_func-family helpers, but the
+    /// EXECUTING include pseudo-frame is a real backtrace frame in Zend
+    /// — it renders bare (`require()`) while deeper includes keep their
+    /// path argument (probe9 vs oracle).
     pub fn format_backtrace(&self) -> String {
         let frames: Vec<TraceFrame> = self
             .call_trace
             .iter()
             .rev()
-            .skip_while(|f| f.internal)
+            .skip_while(|f| f.internal && !crate::value::include_frame(f))
             .cloned()
             .collect();
         format_backtrace_frames(&frames)
@@ -2240,7 +2244,7 @@ impl<'a> Interp<'a> {
         self.call_trace
             .iter()
             .rev()
-            .skip_while(|f| f.internal)
+            .skip_while(|f| f.internal && !crate::value::include_frame(f))
             .cloned()
             .collect()
     }
