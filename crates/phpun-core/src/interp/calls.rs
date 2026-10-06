@@ -286,21 +286,17 @@ impl<'a> Interp<'a> {
                         let was = std::mem::replace(&mut self.dim_by_ref, true);
                         let rc = self.eval_cell(expr);
                         self.dim_by_ref = was;
-                        match rc {
-                            Ok(c) => {
-                                if let Some(n) = name {
-                                    out.named.push((n, c, true, false));
-                                    seen_named = true;
-                                } else {
-                                    out.cells.push(c);
-                                    pos += 1;
-                                }
-                            }
-                            // Cell-access errors (readonly/private
-                            // prop, string offsets, undeclared static)
-                            // are real catchable throwables — propagate
-                            // them, not the bogus by-ref compile fatal.
-                            Err(e) => return Err(e),
+                        // Cell-access errors (readonly/private prop,
+                        // string offsets, undeclared static) are real
+                        // catchable throwables — propagate them, not
+                        // the bogus by-ref compile fatal.
+                        let c = rc?;
+                        if let Some(n) = name {
+                            out.named.push((n, c, true, false));
+                            seen_named = true;
+                        } else {
+                            out.cells.push(c);
+                            pos += 1;
                         }
                     }
                     Expr::Assign {
