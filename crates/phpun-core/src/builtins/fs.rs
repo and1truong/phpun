@@ -594,17 +594,14 @@ pub(crate) fn dispatch(
                             uri,
                             spilled_fd,
                             srbuf,
-                            id,
                             ..
                         } => {
                             // temp_cast'd temp streams behave like the
                             // plain tmpfile they now wrap: real lseek(2)
                             // plus zend's in-buffer seek fast path.
                             if let Some(fd) = *spilled_fd {
-                                let chunk = stream_chunk(it, *id);
-                                let r = fd_stream_seek(
-                                    fd, pos, pos_broken, eof, srbuf, chunk, offset, whence,
-                                );
+                                let r =
+                                    fd_stream_seek(fd, pos, pos_broken, eof, srbuf, offset, whence);
                                 return Ok(Some(Value::Int(r)));
                             }
                             // zend _php_stream_seek + php_stream_memory_seek:
@@ -676,14 +673,11 @@ pub(crate) fn dispatch(
                             pos_broken,
                             spilled_fd,
                             srbuf,
-                            id,
                             ..
                         } => {
                             if let Some(fd) = *spilled_fd {
-                                let chunk = stream_chunk(it, *id);
-                                let r = fd_stream_seek(
-                                    fd, pos, pos_broken, eof, srbuf, chunk, offset, whence,
-                                );
+                                let r =
+                                    fd_stream_seek(fd, pos, pos_broken, eof, srbuf, offset, whence);
                                 return Ok(Some(Value::Int(r)));
                             }
                             // php://input rides zend's memory seek — same
@@ -1192,7 +1186,6 @@ pub(crate) fn dispatch(
                             pos_broken,
                             spilled_fd,
                             srbuf,
-                            id,
                             ..
                         }
                         | PhpResource::Input {
@@ -1201,14 +1194,10 @@ pub(crate) fn dispatch(
                             pos_broken,
                             spilled_fd,
                             srbuf,
-                            id,
                             ..
                         } => {
                             if let Some(fd) = *spilled_fd {
-                                let chunk = stream_chunk(it, *id);
-                                if fd_stream_seek(fd, pos, pos_broken, eof, srbuf, chunk, offset, 0)
-                                    < 0
-                                {
+                                if fd_stream_seek(fd, pos, pos_broken, eof, srbuf, offset, 0) < 0 {
                                     *pos = offset as u64;
                                     *pos_broken = false;
                                     *eof = false;
@@ -1269,7 +1258,6 @@ pub(crate) fn dispatch(
                             pos_broken,
                             spilled_fd,
                             srbuf,
-                            id,
                             ..
                         }
                         | PhpResource::Input {
@@ -1278,14 +1266,10 @@ pub(crate) fn dispatch(
                             pos_broken,
                             spilled_fd,
                             srbuf,
-                            id,
                             ..
                         } => {
                             if let Some(fd) = *spilled_fd {
-                                let chunk = stream_chunk(it, *id);
-                                if fd_stream_seek(fd, pos, pos_broken, eof, srbuf, chunk, offset, 0)
-                                    < 0
-                                {
+                                if fd_stream_seek(fd, pos, pos_broken, eof, srbuf, offset, 0) < 0 {
                                     *pos = offset as u64;
                                     *pos_broken = false;
                                     *eof = false;
@@ -2329,9 +2313,8 @@ fn fd_stream_read(
             out.extend_from_slice(&buf);
             continue;
         }
-        match fd_fill(fd, srbuf, rcap, chunk, eof) {
-            Err((errno, msg)) => return StreamRead::Ebadf(errno, msg),
-            Ok(()) => {}
+        if let Err((errno, msg)) = fd_fill(fd, srbuf, rcap, chunk, eof) {
+            return StreamRead::Ebadf(errno, msg);
         }
         let take = (n - out.len()).min(srbuf.len());
         out.extend(srbuf.drain(..take));
@@ -2386,9 +2369,8 @@ fn fd_line_read(
             }
             continue;
         }
-        match fd_fill(fd, srbuf, rcap, chunk, eof) {
-            Err((errno, msg)) => return StreamRead::Ebadf(errno, msg),
-            Ok(()) => {}
+        if let Err((errno, msg)) = fd_fill(fd, srbuf, rcap, chunk, eof) {
+            return StreamRead::Ebadf(errno, msg);
         }
         if srbuf.is_empty() && *eof {
             break;
@@ -2434,7 +2416,6 @@ fn fd_stream_seek(
     pos_broken: &mut bool,
     eof: &mut bool,
     srbuf: &mut std::collections::VecDeque<u8>,
-    chunk: usize,
     offset: i64,
     whence: i64,
 ) -> i64 {
@@ -2464,7 +2445,6 @@ fn fd_stream_seek(
         }
         _ => {}
     }
-    let _ = chunk;
     // generic layer: SEEK_CUR becomes SET against stream->position.
     let (target, w) = match whence {
         0 => (offset, libc::SEEK_SET),
