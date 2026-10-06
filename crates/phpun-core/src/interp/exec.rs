@@ -920,13 +920,13 @@ impl<'a> Interp<'a> {
                         }
                         match val {
                             ForeachTarget::Var(n) => {
-                            // Hoist the clone: after `as &$v` the var
-                            // slot can alias this same cell — an inline
-                            // `c.borrow()` would outlive var_set and
-                            // panic (probe12b).
-                            let v = c.borrow().clone();
-                            self.var_set(n, v)
-                        }
+                                // Hoist the clone: after `as &$v` the var
+                                // slot can alias this same cell — an inline
+                                // `c.borrow()` would outlive var_set and
+                                // panic (probe12b).
+                                let v = c.borrow().clone();
+                                self.var_set(n, v)
+                            }
                             ForeachTarget::ByRef(e) => {
                                 if let Some(f) = self.readonly_ref_error(&c) {
                                     break f;

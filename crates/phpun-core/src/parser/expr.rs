@@ -661,10 +661,7 @@ impl<'a> Parser<'a> {
     /// assign target. `Paren` nodes only survive for static-prop refs,
     /// so plain parens are recovered from the token stream.
     fn paren_wrapped_target(&self, start: usize, op_pos: usize) -> bool {
-        if !matches!(
-            self.toks.get(start).map(|l| &l.token),
-            Some(Token::Op("("))
-        ) {
+        if !matches!(self.toks.get(start).map(|l| &l.token), Some(Token::Op("("))) {
             return false;
         }
         let mut depth = 0usize;
@@ -1654,6 +1651,20 @@ impl<'a> Parser<'a> {
                     };
                 }
             } else if self.eat_op("::") {
+                // `parent::` inside a non-trait class with no parent is
+                // zend's compile-time fatal — the whole file fails
+                // before executing (p15/t/ch vs oracle). Traits defer
+                // the check to the using class.
+                if let Expr::Const(n) = &e {
+                    if n.eq_ignore_ascii_case("parent")
+                        && self.class_ctx.last().map(|c| !c.1 && !c.0).unwrap_or(false)
+                    {
+                        return Err(PhpError::compile_fatal(
+                            "Cannot use \"parent\" when current class scope has no parent",
+                            self.line(),
+                        ));
+                    }
+                }
                 if self.at_op("(") {
                     // `expr::(...)` first-class-callable-ish — unsupported
                     return Err(PhpError::parse("syntax error, unexpected (", self.line()));
@@ -2187,6 +2198,18 @@ impl<'a> Parser<'a> {
                 } else if self.ident_is("new") {
                     self.pos += 1;
                     let (class, mut ctor_args) = self.new_class_expr()?;
+                    // `new parent()` in a parentless class — same
+                    // compile-time gate as `parent::` (p10new/ch3).
+                    if let Expr::Const(n) = &class {
+                        if n.eq_ignore_ascii_case("parent")
+                            && self.class_ctx.last().map(|c| !c.1 && !c.0).unwrap_or(false)
+                        {
+                            return Err(PhpError::compile_fatal(
+                                "Cannot use \"parent\" when current class scope has no parent",
+                                self.line(),
+                            ));
+                        }
+                    }
                     if self.at_op("(") {
                         self.pos += 1;
                         ctor_args = self.args()?;

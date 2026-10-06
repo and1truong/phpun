@@ -2942,7 +2942,7 @@ impl<'a> Interp<'a> {
         match lw.as_str() {
             "self" => match scope {
                 None => Err(SiteErr::Msg(
-                    "Cannot access \"self\" when no class scope is active".to_string(),
+                    "cannot access \"self\" when no class scope is active".to_string(),
                 )),
                 Some(s) => {
                     if emit_dep {
@@ -2957,7 +2957,7 @@ impl<'a> Interp<'a> {
             },
             "parent" => match scope {
                 None => Err(SiteErr::Msg(
-                    "Cannot access \"parent\" when no class scope is active".to_string(),
+                    "cannot access \"parent\" when no class scope is active".to_string(),
                 )),
                 Some(s) => match s
                     .decl
@@ -2992,7 +2992,7 @@ impl<'a> Interp<'a> {
                     .or(scope);
                 match called {
                     None => Err(SiteErr::Msg(
-                        "Cannot access \"static\" when no class scope is active".to_string(),
+                        "cannot access \"static\" when no class scope is active".to_string(),
                     )),
                     Some(s) => {
                         if emit_dep {

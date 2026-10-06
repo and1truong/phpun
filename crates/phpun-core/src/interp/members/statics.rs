@@ -661,7 +661,10 @@ impl<'a> Interp<'a> {
                 "self" | "static" | "parent" => {
                     return self.fail(PhpError::uncaught(
                         "Error",
-                        format!("Cannot use \"{}\" in the global scope", cname.to_lowercase()),
+                        format!(
+                            "Cannot use \"{}\" in the global scope",
+                            cname.to_lowercase()
+                        ),
                         0,
                     ));
                 }
