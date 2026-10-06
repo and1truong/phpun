@@ -651,7 +651,7 @@ pub(crate) fn dispatch(
                 if name == "get_resource_id" {
                     Value::Int(r.borrow().id() as i64)
                 } else {
-                    Value::str("stream")
+                    Value::str(r.borrow().type_name())
                 }
             }
             _ => Value::Bool(false),

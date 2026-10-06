@@ -1,6 +1,6 @@
 //! Formatted output (printf family) and output-buffering (ob_*) builtins.
 
-use super::fs::write_resource;
+use super::fs::{stream_open_check, write_ebadf_notice, write_resource, StreamWrite};
 use super::*;
 
 pub(crate) fn dispatch(
@@ -68,10 +68,15 @@ pub(crate) fn dispatch(
                     ),
                 );
             }
-            stream_check(args, 0, "fprintf", 1)?;
+            stream_open_check(args, 0, name, 1, "stream")?;
             let fmt = fmt_string(it, args, 1, "fprintf", 2)?;
             let s = php_formatted_print(it, &fmt, &args[2.min(args.len())..], 2, "fprintf")?;
-            write_resource(it, args.first(), &s)?;
+            // Zend ignores php_stream_write's result — a failed write
+            // notices (plain wrapper) or discards (mem ro/input) and
+            // fprintf still returns the formatted length.
+            if let StreamWrite::Ebadf(errno, msg) = write_resource(it, args.first(), &s)? {
+                write_ebadf_notice(it, name, s.len(), errno, &msg)?;
+            }
             Value::Int(s.len() as i64)
         }
         "vfprintf" => {
@@ -85,7 +90,7 @@ pub(crate) fn dispatch(
                     ),
                 );
             }
-            stream_check(args, 0, "vfprintf", 1)?;
+            stream_open_check(args, 0, name, 1, "stream")?;
             let fmt = fmt_string(it, args, 1, "vfprintf", 2)?;
             let list = match arg(args, 2) {
                 Value::Array(a) => a
@@ -105,7 +110,9 @@ pub(crate) fn dispatch(
                 }
             };
             let s = php_formatted_print(it, &fmt, &list, -1, name)?;
-            write_resource(it, args.first(), &s)?;
+            if let StreamWrite::Ebadf(errno, msg) = write_resource(it, args.first(), &s)? {
+                write_ebadf_notice(it, name, s.len(), errno, &msg)?;
+            }
             Value::Int(s.len() as i64)
         }
         "sprintf_js" | "vsprintf_js" => Value::Null,
@@ -228,22 +235,6 @@ fn fmt_string(
             "TypeError",
             format!(
                 "{}(): Argument #{} ($format) must be of type string, {} given",
-                fname,
-                pnum,
-                zval_word(&v)
-            ),
-        ),
-    }
-}
-
-/// `Z_PARAM_RESOURCE` on the stream argument of fprintf/vfprintf.
-fn stream_check(args: &[Cell], i: usize, fname: &str, pnum: usize) -> Result<(), PhpError> {
-    match arg(args, i) {
-        Value::Resource(_) => Ok(()),
-        v => err(
-            "TypeError",
-            format!(
-                "{}(): Argument #{} ($stream) must be of type resource, {} given",
                 fname,
                 pnum,
                 zval_word(&v)

@@ -393,61 +393,84 @@ pub(crate) fn dispatch(
             }
         }
         "fclose" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            // zend_list_close marks the resource itself closed — every
+            // alias ($f2 = $f) sees `resource (closed)`, not just $f.
             if let Some(c) = args.first() {
-                *c.borrow_mut() = Value::Null;
+                if let Value::Resource(r) = &*c.borrow() {
+                    let mut rb = r.borrow_mut();
+                    let id = rb.id();
+                    *rb = PhpResource::Closed { id };
+                }
             }
             Value::Bool(true)
         }
         "fwrite" | "fputs" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
             let data = arg(args, 1).to_php_string();
-            let readonly = matches!(
-                args.first().map(|c| c.borrow().clone()),
-                Some(Value::Resource(r))
-                    if matches!(&*r.borrow(), PhpResource::Mem { write: false, .. })
-            );
-            if readonly {
-                Value::Bool(false)
-            } else {
-                match write_resource(it, args.first(), data.as_bytes()) {
-                    Ok(_) => Value::Int(data.len() as i64),
-                    Err(_) => Value::Bool(false),
+            match write_resource(it, args.first(), data.as_bytes())? {
+                StreamWrite::Written => Value::Int(data.len() as i64),
+                StreamWrite::Ebadf(errno, msg) => {
+                    write_ebadf_notice(it, name, data.len(), errno, &msg)?;
+                    Value::Bool(false)
                 }
+                StreamWrite::Discarded => Value::Bool(false),
             }
         }
         "fread" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
             let n = arg(args, 1).to_int().max(0) as usize;
-            match read_resource(args.first(), n) {
-                Ok(b) => Value::str(String::from_utf8_lossy(&b).into_owned()),
-                Err(_) => Value::Bool(false),
-            }
-        }
-        "fgets" => match read_line_resource(args.first()) {
-            Ok(b) => {
-                if b.is_empty() {
+            match read_resource(args.first(), n)? {
+                StreamRead::Data(b) => Value::str(String::from_utf8_lossy(&b).into_owned()),
+                StreamRead::Ebadf(errno, msg) => {
+                    read_ebadf_notice(it, name, errno, &msg)?;
                     Value::Bool(false)
-                } else {
-                    Value::str(String::from_utf8_lossy(&b).into_owned())
                 }
             }
-            Err(_) => Value::Bool(false),
-        },
-        "fgetc" => match read_resource(args.first(), 1) {
-            Ok(b) if b.is_empty() => Value::Bool(false),
-            Ok(b) => Value::str(String::from_utf8_lossy(&b).into_owned()),
-            Err(_) => Value::Bool(false),
-        },
-        "feof" => match args.first() {
-            Some(c) => match &*c.borrow() {
-                Value::Resource(r) => match &*r.borrow() {
-                    PhpResource::File { eof, .. } => Value::Bool(*eof),
-                    PhpResource::Mem { eof, .. } => Value::Bool(*eof),
+        }
+        "fgets" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            match read_line_resource(args.first())? {
+                StreamRead::Data(b) => {
+                    if b.is_empty() {
+                        Value::Bool(false)
+                    } else {
+                        Value::str(String::from_utf8_lossy(&b).into_owned())
+                    }
+                }
+                StreamRead::Ebadf(errno, msg) => {
+                    read_ebadf_notice(it, name, errno, &msg)?;
+                    Value::Bool(false)
+                }
+            }
+        }
+        "fgetc" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            match read_resource(args.first(), 1)? {
+                StreamRead::Data(b) if b.is_empty() => Value::Bool(false),
+                StreamRead::Data(b) => Value::str(String::from_utf8_lossy(&b).into_owned()),
+                StreamRead::Ebadf(errno, msg) => {
+                    read_ebadf_notice(it, name, errno, &msg)?;
+                    Value::Bool(false)
+                }
+            }
+        }
+        "feof" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            match args.first() {
+                Some(c) => match &*c.borrow() {
+                    Value::Resource(r) => match &*r.borrow() {
+                        PhpResource::File { eof, .. } => Value::Bool(*eof),
+                        PhpResource::Mem { eof, .. } => Value::Bool(*eof),
+                        _ => Value::Bool(true),
+                    },
                     _ => Value::Bool(true),
                 },
-                _ => Value::Bool(true),
-            },
-            None => Value::Bool(true),
-        },
+                None => Value::Bool(true),
+            }
+        }
         "fseek" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
             if let Some(c) = args.first() {
                 if let Value::Resource(r) = &*c.borrow() {
                     match &mut *r.borrow_mut() {
@@ -461,19 +484,23 @@ pub(crate) fn dispatch(
             }
             Value::Int(0)
         }
-        "ftell" => match args.first() {
-            Some(c) => match &*c.borrow() {
-                Value::Resource(r) => match &*r.borrow() {
-                    PhpResource::File { pos, .. } | PhpResource::Mem { pos, .. } => {
-                        Value::Int(*pos as i64)
-                    }
+        "ftell" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            match args.first() {
+                Some(c) => match &*c.borrow() {
+                    Value::Resource(r) => match &*r.borrow() {
+                        PhpResource::File { pos, .. } | PhpResource::Mem { pos, .. } => {
+                            Value::Int(*pos as i64)
+                        }
+                        _ => Value::Int(0),
+                    },
                     _ => Value::Int(0),
                 },
-                _ => Value::Int(0),
-            },
-            None => Value::Int(0),
-        },
+                None => Value::Int(0),
+            }
+        }
         "rewind" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
             if let Some(c) = args.first() {
                 if let Value::Resource(r) = &*c.borrow() {
                     match &mut *r.borrow_mut() {
@@ -488,6 +515,7 @@ pub(crate) fn dispatch(
             Value::Bool(true)
         }
         "ftruncate" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
             let size = arg(args, 1).to_int().max(0) as usize;
             match args.first() {
                 Some(c) => match &*c.borrow() {
@@ -509,20 +537,29 @@ pub(crate) fn dispatch(
                 None => Value::Bool(false),
             }
         }
-        "fflush" => Value::Bool(true),
-        "flock" => Value::Bool(true),
+        "fflush" | "flock" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            Value::Bool(true)
+        }
         "fpassthru" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
             let mut out = Vec::new();
+            let mut failed = false;
             loop {
-                match read_resource(args.first(), 8192) {
-                    Ok(b) if b.is_empty() => break,
-                    Ok(b) => out.extend_from_slice(&b),
-                    Err(_) => break,
+                match read_resource(args.first(), 8192)? {
+                    StreamRead::Data(b) if b.is_empty() => break,
+                    StreamRead::Data(b) => out.extend_from_slice(&b),
+                    StreamRead::Ebadf(errno, msg) => {
+                        read_ebadf_notice(it, name, errno, &msg)?;
+                        failed = true;
+                        break;
+                    }
                 }
             }
             let s = String::from_utf8_lossy(&out);
             it.emit(&s);
-            Value::Int(out.len() as i64)
+            // zend returns -1 when the passthrough read failed.
+            Value::Int(if failed { -1 } else { out.len() as i64 })
         }
         "fgetcsv" => {
             if args.is_empty() {
@@ -531,16 +568,8 @@ pub(crate) fn dispatch(
                     "fgetcsv() expects at least 1 argument, 0 given",
                 );
             }
-            // arg1 must be a stream resource.
-            if !matches!(&*args[0].borrow(), Value::Resource(_)) {
-                return err(
-                    "TypeError",
-                    format!(
-                        "fgetcsv(): Argument #1 ($stream) must be of type resource, {} given",
-                        zval_word(&arg(args, 0))
-                    ),
-                );
-            }
+            // arg1 must be an open stream resource.
+            stream_open_check(args, 0, name, 1, "stream")?;
             // Omitting $escape is deprecated since PHP 8.4 (emitted per call).
             if args.len() < 5 {
                 it.deprecated_pub(
@@ -593,7 +622,7 @@ pub(crate) fn dispatch(
                 }
                 e.first().copied()
             };
-            fgetcsv(&args[0], length as usize, sep[0], enc[0], esc)?
+            fgetcsv(it, name, &args[0], length as usize, sep[0], enc[0], esc)?
         }
         "file" => {
             let path = arg_str(it, args, 0);
@@ -675,6 +704,7 @@ pub(crate) fn dispatch(
         "disk_free_space" | "disk_total_space" => Value::Float(1e12),
         "fnmatch" => Value::Bool(false),
         "stream_get_contents" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
             // (resource, ?length = null, offset = -1): an explicit
             // offset seeks first — UnifiedDiffOutputBuilder writes a
             // php://memory buffer then reads it back from 0.
@@ -704,18 +734,23 @@ pub(crate) fn dispatch(
             };
             let mut out = Vec::new();
             while remaining > 0 {
-                match read_resource(args.first(), remaining.min(8192)) {
-                    Ok(b) if b.is_empty() => break,
-                    Ok(b) => {
+                match read_resource(args.first(), remaining.min(8192))? {
+                    StreamRead::Data(b) if b.is_empty() => break,
+                    StreamRead::Data(b) => {
                         remaining = remaining.saturating_sub(b.len());
                         out.extend_from_slice(&b);
                     }
-                    Err(_) => break,
+                    StreamRead::Ebadf(errno, msg) => {
+                        read_ebadf_notice(it, name, errno, &msg)?;
+                        break;
+                    }
                 }
             }
             Value::str(String::from_utf8_lossy(&out).into_owned())
         }
         "stream_copy_to_stream" => {
+            stream_open_check(args, 0, name, 1, "from")?;
+            stream_open_check(args, 1, name, 2, "to")?;
             let maxlen = args.get(2).map(|c| c.borrow().to_int()).unwrap_or(-1);
             let offset = args.get(3).map(|c| c.borrow().to_int()).unwrap_or(0);
             if offset > 0 {
@@ -737,17 +772,26 @@ pub(crate) fn dispatch(
             let mut ok = true;
             while remaining > 0 {
                 let want = remaining.min(8192) as usize;
-                match read_resource(args.first(), want) {
-                    Ok(b) if b.is_empty() => break,
-                    Ok(b) => {
+                match read_resource(args.first(), want)? {
+                    StreamRead::Data(b) if b.is_empty() => break,
+                    StreamRead::Data(b) => {
                         total += b.len() as i64;
                         remaining -= b.len() as i64;
-                        if write_resource(it, args.get(1), &b).is_err() {
-                            ok = false;
-                            break;
+                        match write_resource(it, args.get(1), &b)? {
+                            StreamWrite::Written => {}
+                            StreamWrite::Ebadf(errno, msg) => {
+                                write_ebadf_notice(it, name, b.len(), errno, &msg)?;
+                                ok = false;
+                                break;
+                            }
+                            StreamWrite::Discarded => {
+                                ok = false;
+                                break;
+                            }
                         }
                     }
-                    Err(_) => {
+                    StreamRead::Ebadf(errno, msg) => {
+                        read_ebadf_notice(it, name, errno, &msg)?;
                         ok = false;
                         break;
                     }
@@ -767,42 +811,57 @@ pub(crate) fn dispatch(
         }
         "stream_context_set_option" | "stream_context_get_options" => Value::Bool(true),
         "stream_wrapper_register" | "stream_wrapper_unregister" => Value::Bool(false),
-        "stream_isatty" | "posix_isatty" => Value::Bool(false),
+        "stream_isatty" | "posix_isatty" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            Value::Bool(false)
+        }
         "stream_set_timeout"
         | "stream_set_blocking"
         | "stream_set_read_buffer"
         | "stream_set_write_buffer"
-        | "stream_set_chunk_size" => Value::Bool(true),
-        "stream_get_meta_data" | "stream_get_filters" | "stream_get_wrappers" => {
+        | "stream_set_chunk_size" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            Value::Bool(true)
+        }
+        "stream_get_meta_data" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            Value::Array(Rc::new(RefCell::new(PhpArray::new())))
+        }
+        "stream_get_filters" | "stream_get_wrappers" => {
             Value::Array(Rc::new(RefCell::new(PhpArray::new())))
         }
         "stream_filter_register" | "stream_filter_append" | "stream_filter_prepend" => {
             Value::Bool(false)
         }
-        "fstat" => match arg(args, 0) {
-            Value::Resource(r) => {
-                let meta = {
-                    let res = r.borrow();
-                    match &*res {
-                        crate::value::PhpResource::File { file, .. } => file.metadata().ok(),
-                        crate::value::PhpResource::Stdio { which, .. } => {
-                            std::fs::metadata(match which {
-                                0 => "/dev/stdin",
-                                1 => "/dev/stdout",
-                                _ => "/dev/stderr",
-                            })
-                            .ok()
+        "fstat" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            match arg(args, 0) {
+                Value::Resource(r) => {
+                    let meta = {
+                        let res = r.borrow();
+                        match &*res {
+                            crate::value::PhpResource::File { file, .. } => {
+                                file.metadata().ok()
+                            }
+                            crate::value::PhpResource::Stdio { which, .. } => {
+                                std::fs::metadata(match which {
+                                    0 => "/dev/stdin",
+                                    1 => "/dev/stdout",
+                                    _ => "/dev/stderr",
+                                })
+                                .ok()
+                            }
+                            _ => None,
                         }
-                        _ => None,
+                    };
+                    match meta {
+                        Some(m) => Value::Array(Rc::new(RefCell::new(stat_array(&m)))),
+                        None => Value::Bool(false),
                     }
-                };
-                match meta {
-                    Some(m) => Value::Array(Rc::new(RefCell::new(stat_array(&m)))),
-                    None => Value::Bool(false),
                 }
+                _ => Value::Bool(false),
             }
-            _ => Value::Bool(false),
-        },
+        }
         "fdopen" | "popen" | "pclose" => Value::Bool(false),
         _ => return Ok(None),
     }))
@@ -873,6 +932,96 @@ fn mode_flags(mode: &str) -> (bool, bool) {
     }
 }
 
+/// `PHP_Z_PARAM_STREAM` shared by every stream builtin: the argument
+/// must be a resource holding an *open stream* — a plain zval gets the
+/// "must be of type resource, T given" TypeError while a closed handle
+/// or a non-stream resource (stream-context) gets "must be an open
+/// stream resource" (zend `php_stream_from_zval` failure).
+pub(in crate::builtins) fn stream_open_check(
+    args: &[Cell],
+    i: usize,
+    fname: &str,
+    pnum: usize,
+    pname: &str,
+) -> Result<(), PhpError> {
+    match arg(args, i) {
+        Value::Resource(r) => match &*r.borrow() {
+            PhpResource::Closed { .. } | PhpResource::Other { .. } => err(
+                "TypeError",
+                format!(
+                    "{}(): Argument #{} (${}) must be an open stream resource",
+                    fname, pnum, pname
+                ),
+            ),
+            _ => Ok(()),
+        },
+        v => err(
+            "TypeError",
+            format!(
+                "{}(): Argument #{} (${}) must be of type resource, {} given",
+                fname,
+                pnum,
+                pname,
+                zval_word(&v)
+            ),
+        ),
+    }
+}
+
+/// Outcome of a `php_stream_write` attempt. The plain wrapper reports
+/// failures as `Ebadf` (caller raises the "Write of N bytes failed with
+/// errno=E STR" E_NOTICE); read-only php://memory|temp and php://input
+/// discard silently (no write op → -1/0 with no diagnostic).
+pub(in crate::builtins) enum StreamWrite {
+    Written,
+    Ebadf(i32, String),
+    Discarded,
+}
+
+/// Outcome of a `php_stream_read` attempt — same E_NOTICE contract on
+/// a descriptor not open for reading.
+pub(in crate::builtins) enum StreamRead {
+    Data(Vec<u8>),
+    Ebadf(i32, String),
+}
+
+/// errno + strerror() pair for a plain-wrapper IO failure; Rust's
+/// `io::Error` Display is "STR (os error N)" — strip the suffix.
+fn io_errno_str(e: &std::io::Error) -> (i32, String) {
+    let n = e.raw_os_error().unwrap_or(9);
+    let msg = e.to_string();
+    let suffix = format!(" (os error {})", n);
+    (
+        n,
+        msg.strip_suffix(&suffix).unwrap_or(&msg).to_string(),
+    )
+}
+
+/// `<fn>(): Write of N bytes failed with errno=E STR` E_NOTICE (the
+/// plain stdio wrapper's diagnostic in `php_stream_stdio_write`).
+pub(in crate::builtins) fn write_ebadf_notice(
+    it: &mut Interp,
+    fname: &str,
+    len: usize,
+    errno: i32,
+    msg: &str,
+) -> Result<(), PhpError> {
+    it.notice_pub(&format!(
+        "{}(): Write of {} bytes failed with errno={} {}",
+        fname, len, errno, msg
+    ))
+}
+
+/// `<fn>(): Read of 8192 bytes failed with errno=E STR` E_NOTICE —
+/// reads go through 8192-byte stream chunks regardless of the
+/// requested length.
+pub(in crate::builtins) fn read_ebadf_notice(it: &mut Interp, fname: &str, errno: i32, msg: &str) -> Result<(), PhpError> {
+    it.notice_pub(&format!(
+        "{}(): Read of 8192 bytes failed with errno={} {}",
+        fname, errno, msg
+    ))
+}
+
 fn fopen(path: &str, mode: &str) -> std::io::Result<std::fs::File> {
     let path = fs_path(path);
     use std::fs::OpenOptions;
@@ -921,7 +1070,7 @@ pub(in crate::builtins) fn write_resource(
     it: &mut Interp,
     c: Option<&Cell>,
     data: &[u8],
-) -> Result<(), PhpError> {
+) -> Result<StreamWrite, PhpError> {
     use std::io::{Seek, Write};
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
@@ -936,11 +1085,11 @@ pub(in crate::builtins) fn write_resource(
                         } else {
                             it.out.extend_from_slice(data);
                         }
-                        Ok(())
+                        Ok(StreamWrite::Written)
                     }
                     3 => {
                         it.emit_bytes(data);
-                        Ok(())
+                        Ok(StreamWrite::Written)
                     }
                     2 => {
                         if it.live_io {
@@ -948,23 +1097,35 @@ pub(in crate::builtins) fn write_resource(
                         } else {
                             it.err_buf.push_str(&String::from_utf8_lossy(data));
                         }
-                        Ok(())
+                        Ok(StreamWrite::Written)
                     }
-                    _ => Err(PhpError::fatal("not writable", 0)),
+                    // STDIN: the fd exists but isn't open for writing —
+                    // write(2) returns EBADF.
+                    _ => Ok(StreamWrite::Ebadf(9, "Bad file descriptor".into())),
                 },
                 PhpResource::File {
                     file, pos, write, ..
                 } => {
                     if !*write {
-                        return Err(PhpError::fatal("not writable", 0));
+                        return Ok(StreamWrite::Ebadf(9, "Bad file descriptor".into()));
                     }
                     let _ = file.seek(std::io::SeekFrom::Start(*pos));
-                    file.write_all(data)
-                        .map_err(|e| PhpError::fatal(e.to_string(), 0))?;
+                    if let Err(e) = file.write_all(data) {
+                        let (errno, msg) = io_errno_str(&e);
+                        return Ok(StreamWrite::Ebadf(errno, msg));
+                    }
                     *pos += data.len() as u64;
-                    Ok(())
+                    Ok(StreamWrite::Written)
                 }
-                PhpResource::Mem { buf, pos, eof, .. } => {
+                PhpResource::Mem {
+                    buf, pos, eof, write, ..
+                } => {
+                    // TEMP_STREAM_READONLY → php_stream_memory_write
+                    // returns -1 and the bytes are silently dropped
+                    // (no E_NOTICE — only plain stdio notices).
+                    if !*write {
+                        return Ok(StreamWrite::Discarded);
+                    }
                     let start = *pos as usize;
                     if start > buf.len() {
                         buf.resize(start, 0);
@@ -976,8 +1137,9 @@ pub(in crate::builtins) fn write_resource(
                     buf.extend_from_slice(&data[end - start..]);
                     *pos += data.len() as u64;
                     *eof = false;
-                    Ok(())
+                    Ok(StreamWrite::Written)
                 }
+                PhpResource::Input { .. } => Ok(StreamWrite::Discarded),
                 _ => Err(PhpError::fatal("bad resource", 0)),
             }
         }
@@ -985,19 +1147,24 @@ pub(in crate::builtins) fn write_resource(
     }
 }
 
-fn read_resource(c: Option<&Cell>, n: usize) -> Result<Vec<u8>, PhpError> {
+fn read_resource(c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
     use std::io::{Read, Seek};
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
             let mut rb = r.borrow_mut();
             match &mut *rb {
-                PhpResource::Stdio { .. } => Ok(Vec::new()),
+                PhpResource::Stdio { which, .. } => match *which {
+                    // STDIN reads are not modeled; STDOUT/STDERR/
+                    // php://output are write-only fds → read(2) EBADF.
+                    0 => Ok(StreamRead::Data(Vec::new())),
+                    _ => Ok(StreamRead::Ebadf(9, "Bad file descriptor".into())),
+                },
                 PhpResource::Input { body, pos, .. } => {
                     let avail = body.len().saturating_sub(*pos as usize);
                     let take = avail.min(n);
                     let out = body[*pos as usize..*pos as usize + take].to_vec();
                     *pos += take as u64;
-                    Ok(out)
+                    Ok(StreamRead::Data(out))
                 }
                 PhpResource::Mem { buf, pos, eof, .. } => {
                     let avail = buf.len().saturating_sub(*pos as usize);
@@ -1007,7 +1174,7 @@ fn read_resource(c: Option<&Cell>, n: usize) -> Result<Vec<u8>, PhpError> {
                     if take < n {
                         *eof = true;
                     }
-                    Ok(out)
+                    Ok(StreamRead::Data(out))
                 }
                 PhpResource::File {
                     file,
@@ -1016,8 +1183,11 @@ fn read_resource(c: Option<&Cell>, n: usize) -> Result<Vec<u8>, PhpError> {
                     eof,
                     ..
                 } => {
-                    if !*read || *eof {
-                        return Ok(Vec::new());
+                    if !*read {
+                        return Ok(StreamRead::Ebadf(9, "Bad file descriptor".into()));
+                    }
+                    if *eof {
+                        return Ok(StreamRead::Data(Vec::new()));
                     }
                     let _ = file.seek(std::io::SeekFrom::Start(*pos));
                     let mut buf = vec![0u8; n];
@@ -1028,29 +1198,35 @@ fn read_resource(c: Option<&Cell>, n: usize) -> Result<Vec<u8>, PhpError> {
                             if got < n {
                                 *eof = true;
                             }
-                            Ok(buf)
+                            Ok(StreamRead::Data(buf))
                         }
-                        Err(e) => Err(PhpError::fatal(e.to_string(), 0)),
+                        Err(e) => {
+                            let (errno, msg) = io_errno_str(&e);
+                            Ok(StreamRead::Ebadf(errno, msg))
+                        }
                     }
                 }
-                _ => Ok(Vec::new()),
+                _ => Ok(StreamRead::Data(Vec::new())),
             }
         }
         _ => Err(PhpError::fatal("not a resource", 0)),
     }
 }
 
-fn read_line_resource(c: Option<&Cell>) -> Result<Vec<u8>, PhpError> {
+fn read_line_resource(c: Option<&Cell>) -> Result<StreamRead, PhpError> {
     use std::io::{Read, Seek};
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
             let mut rb = r.borrow_mut();
             match &mut *rb {
-                PhpResource::Stdio { .. } => Ok(Vec::new()),
+                PhpResource::Stdio { which, .. } => match *which {
+                    0 => Ok(StreamRead::Data(Vec::new())),
+                    _ => Ok(StreamRead::Ebadf(9, "Bad file descriptor".into())),
+                },
                 PhpResource::Input { body, pos, .. } => {
                     let start = *pos as usize;
                     if start >= body.len() {
-                        Ok(Vec::new())
+                        Ok(StreamRead::Data(Vec::new()))
                     } else {
                         let nl = body[start..]
                             .iter()
@@ -1059,14 +1235,14 @@ fn read_line_resource(c: Option<&Cell>) -> Result<Vec<u8>, PhpError> {
                             .unwrap_or(body.len());
                         let out = body[start..nl].to_vec();
                         *pos = nl as u64;
-                        Ok(out)
+                        Ok(StreamRead::Data(out))
                     }
                 }
                 PhpResource::Mem { buf, pos, eof, .. } => {
                     let start = *pos as usize;
                     if start >= buf.len() {
                         *eof = true;
-                        Ok(Vec::new())
+                        Ok(StreamRead::Data(Vec::new()))
                     } else {
                         let nl = buf[start..]
                             .iter()
@@ -1075,7 +1251,7 @@ fn read_line_resource(c: Option<&Cell>) -> Result<Vec<u8>, PhpError> {
                             .unwrap_or(buf.len());
                         let out = buf[start..nl].to_vec();
                         *pos = nl as u64;
-                        Ok(out)
+                        Ok(StreamRead::Data(out))
                     }
                 }
                 PhpResource::File {
@@ -1085,8 +1261,11 @@ fn read_line_resource(c: Option<&Cell>) -> Result<Vec<u8>, PhpError> {
                     eof,
                     ..
                 } => {
-                    if !*read || *eof {
-                        return Ok(Vec::new());
+                    if !*read {
+                        return Ok(StreamRead::Ebadf(9, "Bad file descriptor".into()));
+                    }
+                    if *eof {
+                        return Ok(StreamRead::Data(Vec::new()));
                     }
                     let _ = file.seek(std::io::SeekFrom::Start(*pos));
                     let mut out = Vec::new();
@@ -1104,12 +1283,15 @@ fn read_line_resource(c: Option<&Cell>) -> Result<Vec<u8>, PhpError> {
                                     break;
                                 }
                             }
-                            Err(e) => return Err(PhpError::fatal(e.to_string(), 0)),
+                            Err(e) => {
+                                let (errno, msg) = io_errno_str(&e);
+                                return Ok(StreamRead::Ebadf(errno, msg));
+                            }
                         }
                     }
-                    Ok(out)
+                    Ok(StreamRead::Data(out))
                 }
-                _ => Ok(Vec::new()),
+                _ => Ok(StreamRead::Data(Vec::new())),
             }
         }
         _ => Err(PhpError::fatal("not a resource", 0)),
@@ -1118,7 +1300,7 @@ fn read_line_resource(c: Option<&Cell>) -> Result<Vec<u8>, PhpError> {
 
 /// php_stream_gets: read up to `limit` bytes, stopping after '\n'.
 /// Returns an empty vec at EOF (or on a non-readable stream).
-fn csv_gets(c: &Cell, limit: usize) -> Result<Vec<u8>, PhpError> {
+fn csv_gets(c: &Cell, limit: usize) -> Result<StreamRead, PhpError> {
     use std::io::{Read, Seek};
     match c.borrow().clone() {
         Value::Resource(r) => {
@@ -1131,8 +1313,11 @@ fn csv_gets(c: &Cell, limit: usize) -> Result<Vec<u8>, PhpError> {
                     eof,
                     ..
                 } => {
-                    if !*read || *eof {
-                        return Ok(Vec::new());
+                    if !*read {
+                        return Ok(StreamRead::Ebadf(9, "Bad file descriptor".into()));
+                    }
+                    if *eof {
+                        return Ok(StreamRead::Data(Vec::new()));
                     }
                     let _ = file.seek(std::io::SeekFrom::Start(*pos));
                     let mut out = Vec::new();
@@ -1150,16 +1335,19 @@ fn csv_gets(c: &Cell, limit: usize) -> Result<Vec<u8>, PhpError> {
                                     break;
                                 }
                             }
-                            Err(e) => return Err(PhpError::fatal(e.to_string(), 0)),
+                            Err(e) => {
+                                let (errno, msg) = io_errno_str(&e);
+                                return Ok(StreamRead::Ebadf(errno, msg));
+                            }
                         }
                     }
-                    Ok(out)
+                    Ok(StreamRead::Data(out))
                 }
                 PhpResource::Mem { buf, pos, eof, .. } => {
                     let start = *pos as usize;
                     if start >= buf.len() {
                         *eof = true;
-                        Ok(Vec::new())
+                        Ok(StreamRead::Data(Vec::new()))
                     } else {
                         let mut end = start;
                         while end < buf.len() && end - start < limit {
@@ -1170,13 +1358,13 @@ fn csv_gets(c: &Cell, limit: usize) -> Result<Vec<u8>, PhpError> {
                             }
                         }
                         *pos = end as u64;
-                        Ok(buf[start..end].to_vec())
+                        Ok(StreamRead::Data(buf[start..end].to_vec()))
                     }
                 }
                 PhpResource::Input { body, pos, .. } => {
                     let start = *pos as usize;
                     if start >= body.len() {
-                        Ok(Vec::new())
+                        Ok(StreamRead::Data(Vec::new()))
                     } else {
                         let mut end = start;
                         while end < body.len() && end - start < limit {
@@ -1187,21 +1375,23 @@ fn csv_gets(c: &Cell, limit: usize) -> Result<Vec<u8>, PhpError> {
                             }
                         }
                         *pos = end as u64;
-                        Ok(body[start..end].to_vec())
+                        Ok(StreamRead::Data(body[start..end].to_vec()))
                     }
                 }
-                _ => Ok(Vec::new()),
+                _ => Ok(StreamRead::Data(Vec::new())),
             }
         }
-        _ => Ok(Vec::new()),
+        _ => Ok(StreamRead::Data(Vec::new())),
     }
 }
 
 /// php_stream_get_line equivalent: read the rest of the current line
 /// (through '\n' inclusive), unbounded. Returns None at EOF.
-fn csv_get_line(c: &Cell) -> Result<Option<Vec<u8>>, PhpError> {
-    let out = csv_gets(c, usize::MAX)?;
-    Ok(if out.is_empty() { None } else { Some(out) })
+fn csv_get_line(c: &Cell) -> Result<StreamRead, PhpError> {
+    match csv_gets(c, usize::MAX)? {
+        StreamRead::Data(out) if out.is_empty() => Ok(StreamRead::Data(Vec::new())),
+        other => Ok(other),
+    }
 }
 
 /// C isspace() for the byte domain (space, \t, \n, \v, \f, \r).
@@ -1234,6 +1424,8 @@ fn rtrim_len(field: &[u8]) -> usize {
 /// in whole further lines, embedding each buffer's trailing whitespace.
 /// Escape only acts inside enclosures and is kept literally.
 fn fgetcsv(
+    it: &mut Interp,
+    name: &str,
     stream: &Cell,
     length: usize,
     sep: u8,
@@ -1241,7 +1433,13 @@ fn fgetcsv(
     esc: Option<u8>,
 ) -> Result<Value, PhpError> {
     let limit = if length == 0 { usize::MAX } else { length };
-    let mut buf = csv_gets(stream, limit)?;
+    let mut buf = match csv_gets(stream, limit)? {
+        StreamRead::Data(b) => b,
+        StreamRead::Ebadf(errno, msg) => {
+            read_ebadf_notice(it, name, errno, &msg)?;
+            return Ok(Value::Bool(false));
+        }
+    };
     if buf.is_empty() {
         return Ok(Value::Bool(false));
     }
@@ -1293,13 +1491,17 @@ fn fgetcsv(
                             // Embed this buffer's trailing whitespace.
                             tptr.extend_from_slice(&buf[limit_i..]);
                             match csv_get_line(stream)? {
-                                None => break 'enc,
-                                Some(nb) => {
+                                StreamRead::Data(nb) if nb.is_empty() => break 'enc,
+                                StreamRead::Data(nb) => {
                                     buf = nb;
                                     bptr = 0;
                                     hunk = 0;
                                     limit_i = trailing_spaces_limit(&buf);
                                     st = 0;
+                                }
+                                StreamRead::Ebadf(errno, msg) => {
+                                    read_ebadf_notice(it, name, errno, &msg)?;
+                                    return Ok(Value::Bool(false));
                                 }
                             }
                         }

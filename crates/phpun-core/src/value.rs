@@ -445,7 +445,13 @@ impl Value {
             Value::Str(_) => "string",
             Value::Array(_) => "array",
             Value::Object(_) | Value::Callable(_) => "object",
-            Value::Resource(_) => "resource",
+            Value::Resource(r) => {
+                if matches!(&*r.borrow(), PhpResource::Closed { .. }) {
+                    "resource (closed)"
+                } else {
+                    "resource"
+                }
+            }
         }
     }
 
@@ -461,7 +467,13 @@ impl Value {
             Value::Array(_) => "array".to_string(),
             Value::Object(o) => o.borrow().class.name().to_string(),
             Value::Callable(_) => "Closure".to_string(),
-            Value::Resource(_) => "resource".to_string(),
+            Value::Resource(r) => {
+                if matches!(&*r.borrow(), PhpResource::Closed { .. }) {
+                    "resource (closed)".to_string()
+                } else {
+                    "resource".to_string()
+                }
+            }
         }
     }
 
@@ -1756,6 +1768,11 @@ pub enum PhpResource {
         /// (zend php_stream_printf bypasses the check).
         write: bool,
     },
+    /// A resource closed via fclose()/fclose-aliased wrappers — Zend
+    /// keeps the zval `resource (closed)` (gettype "resource (closed)",
+    /// var_dump "of type (Unknown)", is_resource() false) and every
+    /// stream function on it throws "must be an open stream resource".
+    Closed { id: u64 },
     /// curl/db handles etc. — opaque placeholder.
     Other { id: u64, kind: &'static str },
 }
@@ -1767,7 +1784,18 @@ impl PhpResource {
             PhpResource::Stdio { id, .. } => *id,
             PhpResource::Input { id, .. } => *id,
             PhpResource::Mem { id, .. } => *id,
+            PhpResource::Closed { id, .. } => *id,
             PhpResource::Other { id, .. } => *id,
+        }
+    }
+
+    /// Zend's `zend_rsrc_list_get_rsrc_type` name for var_dump's
+    /// `of type (..)` and `get_resource_type()`.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            PhpResource::Closed { .. } => "Unknown",
+            PhpResource::Other { kind, .. } => kind,
+            _ => "stream",
         }
     }
 }
