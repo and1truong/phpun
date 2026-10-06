@@ -1814,6 +1814,13 @@ pub enum PhpResource {
         /// tmpfile() the stream then KEEPS — later casts reuse it and
         /// flock(2)/fstat(2) see it).
         spilled_fd: Option<std::os::unix::io::RawFd>,
+        /// zend stream->readbuf over the spilled fd — read(2) fills
+        /// land here and reads/seeks drain it before touching the fd.
+        /// Used only while spilled_fd is set.
+        srbuf: std::collections::VecDeque<u8>,
+        /// zend stream->readbuflen for srbuf — grows one chunk_size
+        /// whenever a fill finds less than a chunk of free space.
+        rcap: usize,
     },
     /// php://memory / php://temp — an in-memory byte buffer that is
     /// always read/write, seekable (Composer's BufferIO).
@@ -1840,6 +1847,13 @@ pub enum PhpResource {
         /// the stream then KEEPS (later casts reuse it and
         /// flock(2)/fstat(2) see it). php://memory is not castable.
         spilled_fd: Option<std::os::unix::io::RawFd>,
+        /// zend stream->readbuf over the spilled fd — read(2) fills
+        /// land here and reads/seeks drain it before touching the fd.
+        /// Used only while spilled_fd is set.
+        srbuf: std::collections::VecDeque<u8>,
+        /// zend stream->readbuflen for srbuf — grows one chunk_size
+        /// whenever a fill finds less than a chunk of free space.
+        rcap: usize,
     },
     /// A resource closed via fclose()/fclose-aliased wrappers — Zend
     /// keeps the zval `resource (closed)` (gettype "resource (closed)",
@@ -1943,6 +1957,16 @@ impl Drop for PhpResource {
         };
         if let Some(fd) = fd {
             unsafe {
+                // A spilled temp stream maps a real filesystem entry
+                // (zend php_stream_temp_cast unlinks it only when the
+                // stream closes): remove it via the procfs link target
+                // before dropping the last descriptor we own.
+                if let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{fd}")) {
+                    let t = target.to_string_lossy();
+                    if !t.ends_with(" (deleted)") {
+                        let _ = std::fs::remove_file(&*t);
+                    }
+                }
                 libc::close(fd);
             }
         }

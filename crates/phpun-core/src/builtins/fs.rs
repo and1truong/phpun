@@ -205,7 +205,13 @@ pub(crate) fn dispatch(
         }
         "tmpfile" => {
             let name = std::env::temp_dir().join(format!("phpun-{}", std::process::id()));
-            match std::fs::File::create(&name) {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&name)
+            {
                 Ok(f) => {
                     let id = it.next_res_id();
                     Value::Resource(Rc::new(RefCell::new(PhpResource::File {
@@ -343,6 +349,8 @@ pub(crate) fn dispatch(
                     uri: path.clone(),
                     mode: "rb".into(),
                     spilled_fd: None,
+                    srbuf: Default::default(),
+                    rcap: 0,
                 })))
             } else if let Some(body) = parse_data_uri(&path) {
                 // `data:[mediatype][;base64],payload` — zend's RFC2397
@@ -358,6 +366,8 @@ pub(crate) fn dispatch(
                     uri: path.clone(),
                     mode: mode.clone(),
                     spilled_fd: None,
+                    srbuf: Default::default(),
+                    rcap: 0,
                 })))
             } else if path == "php://memory"
                 || path == "php://temp"
@@ -392,6 +402,8 @@ pub(crate) fn dispatch(
                     uri: path.clone(),
                     mode: meta_mode.to_string(),
                     spilled_fd: None,
+                    srbuf: Default::default(),
+                    rcap: 0,
                 })))
             } else if let Some(which) = match path.as_str() {
                 "php://stdin" => Some(0u8),
@@ -478,7 +490,7 @@ pub(crate) fn dispatch(
         "fread" => {
             stream_open_check(args, 0, name, 1, "stream")?;
             let n = arg(args, 1).to_int().max(0) as usize;
-            match read_resource(args.first(), n)? {
+            match read_resource(it, args.first(), n)? {
                 StreamRead::Data(b) => Value::bytes(b),
                 StreamRead::FailSilent => Value::Bool(false),
                 StreamRead::Ebadf(errno, msg) => {
@@ -503,7 +515,7 @@ pub(crate) fn dispatch(
                 }
                 (n - 1) as usize
             };
-            match read_line_resource(args.first(), limit)? {
+            match read_line_resource(it, args.first(), limit)? {
                 StreamRead::FailSilent => return Ok(Some(Value::Bool(false))),
                 StreamRead::Data(b) => {
                     if b.is_empty() {
@@ -520,7 +532,7 @@ pub(crate) fn dispatch(
         }
         "fgetc" => {
             stream_open_check(args, 0, name, 1, "stream")?;
-            match read_resource(args.first(), 1)? {
+            match read_resource(it, args.first(), 1)? {
                 StreamRead::Data(b) if b.is_empty() => Value::Bool(false),
                 StreamRead::Data(b) => Value::bytes(b),
                 StreamRead::FailSilent => Value::Bool(false),
@@ -580,8 +592,28 @@ pub(crate) fn dispatch(
                             eof,
                             pos_broken,
                             uri,
+                            spilled_fd,
+                            srbuf,
+                            id,
                             ..
                         } => {
+                            // temp_cast'd temp streams behave like the
+                            // plain tmpfile they now wrap: real lseek(2)
+                            // plus zend's in-buffer seek fast path.
+                            if let Some(fd) = *spilled_fd {
+                                let chunk = stream_chunk(it, *id);
+                                let r = fd_stream_seek(
+                                    fd,
+                                    pos,
+                                    pos_broken,
+                                    eof,
+                                    srbuf,
+                                    chunk,
+                                    offset,
+                                    whence,
+                                );
+                                return Ok(Some(Value::Int(r)));
+                            }
                             // zend _php_stream_seek + php_stream_memory_seek:
                             // literal SEEK_SET<0 fails in the generic layer
                             // BEFORE ops->seek — position untouched; a CUR/END
@@ -649,8 +681,25 @@ pub(crate) fn dispatch(
                             pos,
                             eof,
                             pos_broken,
+                            spilled_fd,
+                            srbuf,
+                            id,
                             ..
                         } => {
+                            if let Some(fd) = *spilled_fd {
+                                let chunk = stream_chunk(it, *id);
+                                let r = fd_stream_seek(
+                                    fd,
+                                    pos,
+                                    pos_broken,
+                                    eof,
+                                    srbuf,
+                                    chunk,
+                                    offset,
+                                    whence,
+                                );
+                                return Ok(Some(Value::Int(r)));
+                            }
                             // php://input rides zend's memory seek — same
                             // broken-position marker as php://memory, and
                             // the same wrapped ZEND_LONG_MAX saturation.
@@ -818,17 +867,27 @@ pub(crate) fn dispatch(
                             pos,
                             eof,
                             pos_broken,
+                            spilled_fd,
+                            srbuf,
                             ..
                         }
                         | PhpResource::Input {
                             pos,
                             eof,
                             pos_broken,
+                            spilled_fd,
+                            srbuf,
                             ..
                         } => {
                             *pos = 0;
                             *pos_broken = false;
                             *eof = false;
+                            if let Some(fd) = *spilled_fd {
+                                srbuf.clear();
+                                unsafe {
+                                    libc::lseek(fd, 0, libc::SEEK_SET);
+                                }
+                            }
                         }
                         PhpResource::Pipe { .. } => {
                             it.warn_pub(&format!("{}(): Stream does not support seeking", name))?;
@@ -852,13 +911,45 @@ pub(crate) fn dispatch(
             match args.first() {
                 Some(c) => match &*c.borrow() {
                     Value::Resource(r) => match &mut *r.borrow_mut() {
-                        PhpResource::Mem { buf, pos, .. } => {
-                            buf.resize(size, 0);
-                            if (*pos as usize) > size {
-                                *pos = size as u64;
+                        PhpResource::Mem {
+                            buf,
+                            pos,
+                            spilled_fd,
+                            ..
+                        } => Value::Bool(match spilled_fd {
+                            // post-cast the buffer is inert — ftruncate(2)
+                            // hits the real tmpfile (fd offset untouched).
+                            Some(fd) => unsafe {
+                                libc::ftruncate(*fd, size as libc::off_t) == 0
+                            },
+                            None => {
+                                buf.resize(size, 0);
+                                if (*pos as usize) > size {
+                                    *pos = size as u64;
+                                }
+                                true
                             }
-                            Value::Bool(true)
-                        }
+                        }),
+                        PhpResource::Input {
+                            body,
+                            pos,
+                            spilled_fd,
+                            ..
+                        } => Value::Bool(match spilled_fd {
+                            Some(fd) => unsafe {
+                                libc::ftruncate(*fd, size as libc::off_t) == 0
+                            },
+                            // data:/php://input are memory-backed streams —
+                            // zend's temp set_option truncates the buffer.
+                            None => {
+                                let body = Rc::make_mut(body);
+                                body.resize(size, 0);
+                                if (*pos as usize) > size {
+                                    *pos = size as u64;
+                                }
+                                true
+                            }
+                        }),
                         PhpResource::File { file, .. } => {
                             Value::Bool(file.set_len(size as u64).is_ok())
                         }
@@ -933,7 +1024,7 @@ pub(crate) fn dispatch(
             let mut out = Vec::new();
             let mut failed = false;
             loop {
-                match read_resource(args.first(), 8192)? {
+                match read_resource(it, args.first(), 8192)? {
                     StreamRead::Data(b) if b.is_empty() => break,
                     StreamRead::Data(b) => out.extend_from_slice(&b),
                     StreamRead::FailSilent => {
@@ -1112,21 +1203,35 @@ pub(crate) fn dispatch(
                             pos,
                             eof,
                             pos_broken,
+                            spilled_fd,
+                            srbuf,
+                            id,
                             ..
-                        } => {
-                            *pos = offset as u64;
-                            *pos_broken = false;
-                            *eof = false;
                         }
-                        PhpResource::Input {
+                        | PhpResource::Input {
                             pos,
                             eof,
                             pos_broken,
+                            spilled_fd,
+                            srbuf,
+                            id,
                             ..
                         } => {
-                            *pos = offset as u64;
-                            *pos_broken = false;
-                            *eof = false;
+                            if let Some(fd) = *spilled_fd {
+                                let chunk = stream_chunk(it, *id);
+                                if fd_stream_seek(
+                                    fd, pos, pos_broken, eof, srbuf, chunk, offset, 0,
+                                ) < 0
+                                {
+                                    *pos = offset as u64;
+                                    *pos_broken = false;
+                                    *eof = false;
+                                }
+                            } else {
+                                *pos = offset as u64;
+                                *pos_broken = false;
+                                *eof = false;
+                            }
                         }
                         _ => {}
                     }
@@ -1143,7 +1248,7 @@ pub(crate) fn dispatch(
             };
             let mut out = Vec::new();
             while remaining > 0 {
-                match read_resource(args.first(), remaining.min(8192))? {
+                match read_resource(it, args.first(), remaining.min(8192))? {
                     StreamRead::Data(b) if b.is_empty() => break,
                     StreamRead::Data(b) => {
                         remaining = remaining.saturating_sub(b.len());
@@ -1176,21 +1281,35 @@ pub(crate) fn dispatch(
                             pos,
                             eof,
                             pos_broken,
+                            spilled_fd,
+                            srbuf,
+                            id,
                             ..
-                        } => {
-                            *pos = offset as u64;
-                            *pos_broken = false;
-                            *eof = false;
                         }
-                        PhpResource::Input {
+                        | PhpResource::Input {
                             pos,
                             eof,
                             pos_broken,
+                            spilled_fd,
+                            srbuf,
+                            id,
                             ..
                         } => {
-                            *pos = offset as u64;
-                            *pos_broken = false;
-                            *eof = false;
+                            if let Some(fd) = *spilled_fd {
+                                let chunk = stream_chunk(it, *id);
+                                if fd_stream_seek(
+                                    fd, pos, pos_broken, eof, srbuf, chunk, offset, 0,
+                                ) < 0
+                                {
+                                    *pos = offset as u64;
+                                    *pos_broken = false;
+                                    *eof = false;
+                                }
+                            } else {
+                                *pos = offset as u64;
+                                *pos_broken = false;
+                                *eof = false;
+                            }
                         }
                         _ => {}
                     }
@@ -1201,7 +1320,7 @@ pub(crate) fn dispatch(
             let mut ok = true;
             while remaining > 0 {
                 let want = remaining.min(8192) as usize;
-                match read_resource(args.first(), want)? {
+                match read_resource(it, args.first(), want)? {
                     StreamRead::Data(b) if b.is_empty() => break,
                     StreamRead::Data(b) => {
                         total += b.len() as i64;
@@ -1506,6 +1625,8 @@ pub(crate) fn dispatch(
                                 }),
                             ));
                             base.push(("mode", Value::str(mode.clone())));
+                            // outer temp streams are NO_BUFFER — zend's
+                            // unread_bytes (outer writepos-readpos) is 0.
                             base.push(("unread_bytes", Value::Int(0)));
                             base.push(("seekable", Value::Bool(true)));
                             base.push(("uri", Value::str(uri.clone())));
@@ -2005,8 +2126,16 @@ pub(in crate::builtins) fn write_resource(
                     pos,
                     eof,
                     write,
+                    spilled_fd,
                     ..
                 } => {
+                    // Once temp_cast spills the buffer the stream io
+                    // hits the inner r+b tmpfile — writes land even on
+                    // 'r'-mode php://temp (the write flag only gates
+                    // the in-buffer op).
+                    if let Some(fd) = *spilled_fd {
+                        return Ok(fd_stream_write(fd, pos, eof, data));
+                    }
                     // TEMP_STREAM_READONLY → php_stream_memory_write
                     // returns -1 and the bytes are silently dropped
                     // (no E_NOTICE — only plain stdio notices).
@@ -2037,40 +2166,283 @@ pub(in crate::builtins) fn write_resource(
     }
 }
 
-/// Read up to `n` bytes from a pipe fd — a single read(2) capped at
-/// zend's 8192 chunk size (php_stream_read does one fill_read_buffer,
-/// so fread($p, 200000) returns at most 8192). EOF (read 0) latches
-/// `eof`; EAGAIN on a nonblocking stream reads "" silently — zend
-/// returns "" there rather than retrying.
+/// zend's pipe fill size — the per-stream chunk from
+/// stream_set_chunk_size(), default 8192.
+fn stream_chunk(it: &Interp, id: u64) -> usize {
+    it.stream_chunk_sizes
+        .get(&id)
+        .copied()
+        .unwrap_or(8192)
+        .max(1) as usize
+}
+
+/// php_stream_read on a pipe — zend's buffered model for non-file
+/// streams: the call drains the read buffer and performs AT MOST one
+/// fill_read_buffer of chunk_size bytes (so fread($p, 200000)
+/// returns at most the chunk). A chunk_size of 1 makes the stream
+/// unbuffered — one raw read of the whole remaining request. EOF
+/// (fill 0) latches `eof`; EAGAIN on a nonblocking stream reads
+/// "" silently.
 fn read_pipe(
     file: &mut std::fs::File,
     eof: &mut bool,
     nonblock: bool,
     pos: &mut u64,
+    rbuf: &mut std::collections::VecDeque<u8>,
+    chunk: usize,
     n: usize,
 ) -> Result<StreamRead, PhpError> {
     use std::io::Read;
-    if *eof {
-        return Ok(StreamRead::Data(Vec::new()));
+    let mut out: Vec<u8> = Vec::with_capacity(n.min(8192));
+    out.extend(rbuf.drain(..n.min(rbuf.len())));
+    if out.len() < n && !*eof {
+        let want = if chunk == 1 { n - out.len() } else { chunk };
+        let mut buf = vec![0u8; want];
+        match file.read(&mut buf) {
+            Ok(0) => *eof = true,
+            Ok(got) => {
+                buf.truncate(got);
+                rbuf.extend(buf);
+                let more = (n - out.len()).min(rbuf.len());
+                out.extend(rbuf.drain(..more));
+            }
+            Err(e) if nonblock && e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => {
+                let (errno, msg) = io_errno_str(&e);
+                return Ok(StreamRead::Ebadf(errno, msg));
+            }
+        }
     }
-    let mut buf = vec![0u8; n.min(8192)];
-    match file.read(&mut buf) {
-        Ok(0) => {
-            *eof = true;
-            Ok(StreamRead::Data(Vec::new()))
+    *pos += out.len() as u64;
+    Ok(StreamRead::Data(out))
+}
+
+/// One fill_read_buffer on a spilled (temp_cast'd) stream: the outer
+/// readbuf grows one chunk_size whenever free space drops below the
+/// chunk (zend's `readbuflen += chunk_size` after compaction), then
+/// takes a single read(2) of the free span — the inner stdio stream
+/// is transparent because it loops internally until it delivers the
+/// whole outer request. A 0-byte fill latches eof; buffered bytes
+/// already read keep serving after it.
+fn fd_fill(
+    fd: std::os::unix::io::RawFd,
+    srbuf: &mut std::collections::VecDeque<u8>,
+    rcap: &mut usize,
+    chunk: usize,
+    eof: &mut bool,
+) -> Result<(), (i32, String)> {
+    let mut free = rcap.saturating_sub(srbuf.len());
+    if free < chunk {
+        *rcap = rcap.saturating_add(chunk);
+        free += chunk;
+    }
+    let mut buf = vec![0u8; free];
+    let got = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, free) };
+    if got < 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(io_errno_str(&e));
+    }
+    if got == 0 {
+        *eof = true;
+    }
+    buf.truncate(got as usize);
+    srbuf.extend(&buf);
+    Ok(())
+}
+
+/// php_stream_read on a spilled stream: drain the outer readbuf, then
+/// fill+drain until the request is met or the fd reports EOF
+/// (temp/memory ops are exempt from zend's single-fill break, so the
+/// loop is greedy). A chunk_size of 1 flips zend's NO_BUFFER flag —
+/// reads then bypass the readbuf entirely (stale bytes just sit).
+fn fd_stream_read(
+    fd: std::os::unix::io::RawFd,
+    pos: &mut u64,
+    eof: &mut bool,
+    srbuf: &mut std::collections::VecDeque<u8>,
+    rcap: &mut usize,
+    chunk: usize,
+    n: usize,
+) -> StreamRead {
+    let mut out: Vec<u8> = Vec::with_capacity(n.min(8192));
+    if chunk != 1 {
+        out.extend(srbuf.drain(..n.min(srbuf.len())));
+    }
+    while out.len() < n && !*eof {
+        if chunk == 1 {
+            let mut buf = vec![0u8; n - out.len()];
+            let got = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if got <= 0 {
+                if got < 0 {
+                    let e = std::io::Error::last_os_error();
+                    let (errno, msg) = io_errno_str(&e);
+                    return StreamRead::Ebadf(errno, msg);
+                }
+                *eof = true;
+                break;
+            }
+            buf.truncate(got as usize);
+            out.extend_from_slice(&buf);
+            continue;
         }
-        Ok(got) => {
-            buf.truncate(got);
-            *pos += got as u64;
-            Ok(StreamRead::Data(buf))
+        match fd_fill(fd, srbuf, rcap, chunk, eof) {
+            Err((errno, msg)) => return StreamRead::Ebadf(errno, msg),
+            Ok(()) => {}
         }
-        Err(e) if nonblock && e.kind() == std::io::ErrorKind::WouldBlock => {
-            Ok(StreamRead::Data(Vec::new()))
+        let take = (n - out.len()).min(srbuf.len());
+        out.extend(srbuf.drain(..take));
+    }
+    *pos += out.len() as u64;
+    StreamRead::Data(out)
+}
+
+/// php_stream_gets on a spilled stream — drains the outer readbuf and
+/// fills in chunk_size spans until '\n', `limit`, or EOF.
+fn fd_line_read(
+    fd: std::os::unix::io::RawFd,
+    pos: &mut u64,
+    eof: &mut bool,
+    srbuf: &mut std::collections::VecDeque<u8>,
+    rcap: &mut usize,
+    chunk: usize,
+    limit: usize,
+) -> StreamRead {
+    let mut out = Vec::new();
+    while out.len() < limit {
+        if chunk != 1 {
+            if let Some(b) = srbuf.pop_front() {
+                out.push(b);
+                if b == b'\n' {
+                    break;
+                }
+                continue;
+            }
         }
-        Err(e) => {
-            let (errno, msg) = io_errno_str(&e);
-            Ok(StreamRead::Ebadf(errno, msg))
+        if *eof {
+            break;
         }
+        if chunk == 1 {
+            // unbuffered — zend reads one byte at a time, rbuf bypassed
+            let mut byte = [0u8; 1];
+            match unsafe { libc::read(fd, byte.as_mut_ptr() as *mut _, 1) } {
+                0 => {
+                    *eof = true;
+                }
+                n if n < 0 => {
+                    let e = std::io::Error::last_os_error();
+                    let (errno, msg) = io_errno_str(&e);
+                    return StreamRead::Ebadf(errno, msg);
+                }
+                _ => {
+                    out.push(byte[0]);
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        match fd_fill(fd, srbuf, rcap, chunk, eof) {
+            Err((errno, msg)) => return StreamRead::Ebadf(errno, msg),
+            Ok(()) => {}
+        }
+        if srbuf.is_empty() && *eof {
+            break;
+        }
+    }
+    *pos += out.len() as u64;
+    StreamRead::Data(out)
+}
+
+/// php_stream_write on a spilled stream — write(2) at the fd's own
+/// offset (the tmpfile innerstream is r+b stdio: even 'r'-mode
+/// php://temp accepts writes once cast).
+fn fd_stream_write(
+    fd: std::os::unix::io::RawFd,
+    pos: &mut u64,
+    eof: &mut bool,
+    data: &[u8],
+) -> StreamWrite {
+    let n = unsafe { libc::write(fd, data.as_ptr() as *const _, data.len()) };
+    if n < 0 {
+        let e = std::io::Error::last_os_error();
+        let (errno, msg) = io_errno_str(&e);
+        return StreamWrite::Ebadf(errno, msg);
+    }
+    *pos += n as u64;
+    *eof = false;
+    if n as usize == data.len() {
+        StreamWrite::Written
+    } else {
+        StreamWrite::Partial(n as usize)
+    }
+}
+
+/// fseek on a spilled stream — zend's _php_stream_seek: first the
+/// in-buffer fast path (CUR/SET targets already inside the readbuf
+/// consume bytes without touching the fd — no lseek at all), else the
+/// generic layer converts CUR to an absolute SET on stream->position
+/// (saturating, <0 fails untouched) and the inner stdio seek lseek(2)s
+/// the fd — position becomes the new offset and the readbuf resets.
+fn fd_stream_seek(
+    fd: std::os::unix::io::RawFd,
+    pos: &mut u64,
+    pos_broken: &mut bool,
+    eof: &mut bool,
+    srbuf: &mut std::collections::VecDeque<u8>,
+    chunk: usize,
+    offset: i64,
+    whence: i64,
+) -> i64 {
+    let buffered = srbuf.len() as i64;
+    let tell = if *pos_broken { *pos as i64 - 1 } else { *pos as i64 };
+    // in-buffer fast path (the buffer lives in the inner stream,
+    // which is always buffered — zend checks the flag, not chunk)
+    match whence {
+        1 if offset > 0 && offset <= buffered => {
+            srbuf.drain(..offset as usize);
+            *pos = tell.wrapping_add(offset) as u64;
+            *pos_broken = false;
+            *eof = false;
+            return 0;
+        }
+        0 if offset > tell && offset <= tell + buffered => {
+            let adv = (offset - tell) as usize;
+            srbuf.drain(..adv.min(srbuf.len()));
+            *pos = offset as u64;
+            *pos_broken = false;
+            *eof = false;
+            return 0;
+        }
+        _ => {}
+    }
+    let _ = chunk;
+    // generic layer: SEEK_CUR becomes SET against stream->position.
+    let (target, w) = match whence {
+        0 => (offset, libc::SEEK_SET),
+        1 => {
+            let t = if offset > i64::MAX.wrapping_sub(tell) {
+                i64::MAX
+            } else {
+                tell.wrapping_add(offset)
+            };
+            (t, libc::SEEK_SET)
+        }
+        2 => (offset, libc::SEEK_END),
+        _ => return -1,
+    };
+    if w == libc::SEEK_SET && target < 0 {
+        return -1;
+    }
+    let r = unsafe { libc::lseek(fd, target as libc::off_t, w) };
+    if r < 0 {
+        -1
+    } else {
+        *pos = r as u64;
+        *pos_broken = false;
+        *eof = false;
+        srbuf.clear();
+        0
     }
 }
 
@@ -2199,10 +2571,11 @@ fn read_line_pipe(
             }
         }
     }
+    *pos += out.len() as u64;
     Ok(StreamRead::Data(out))
 }
 
-fn read_resource(c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
+fn read_resource(it: &Interp, c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
     use std::io::Read;
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
@@ -2223,7 +2596,22 @@ fn read_resource(c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
                     _ if *which > 2 => Ok(StreamRead::FailSilent),
                     _ => Ok(StreamRead::Ebadf(9, "Bad file descriptor".into())),
                 },
-                PhpResource::Input { body, pos, eof, .. } => {
+                PhpResource::Input {
+                    body,
+                    pos,
+                    eof,
+                    spilled_fd,
+                    srbuf,
+                    rcap,
+                    id,
+                    ..
+                } => {
+                    // After a temp_cast spill all io hits the shared fd
+                    // through zend's outer readbuf.
+                    if let Some(fd) = *spilled_fd {
+                        let chunk = stream_chunk(it, *id);
+                        return Ok(fd_stream_read(fd, pos, eof, srbuf, rcap, chunk, n));
+                    }
                     // pos may sit past the end (fseek allows it) —
                     // clamp the slice start instead of panicking.
                     let start = (*pos as usize).min(body.len());
@@ -2235,7 +2623,20 @@ fn read_resource(c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
                     }
                     Ok(StreamRead::Data(out))
                 }
-                PhpResource::Mem { buf, pos, eof, .. } => {
+                PhpResource::Mem {
+                    buf,
+                    pos,
+                    eof,
+                    spilled_fd,
+                    srbuf,
+                    rcap,
+                    id,
+                    ..
+                } => {
+                    if let Some(fd) = *spilled_fd {
+                        let chunk = stream_chunk(it, *id);
+                        return Ok(fd_stream_read(fd, pos, eof, srbuf, rcap, chunk, n));
+                    }
                     let start = (*pos as usize).min(buf.len());
                     let take = (buf.len() - start).min(n);
                     let out = buf[start..start + take].to_vec();
@@ -2285,7 +2686,11 @@ fn read_resource(c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
     }
 }
 
-fn read_line_resource(c: Option<&Cell>, limit: usize) -> Result<StreamRead, PhpError> {
+fn read_line_resource(
+    it: &Interp,
+    c: Option<&Cell>,
+    limit: usize,
+) -> Result<StreamRead, PhpError> {
     use std::io::Read;
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
@@ -2296,14 +2701,29 @@ fn read_line_resource(c: Option<&Cell>, limit: usize) -> Result<StreamRead, PhpE
                     pos,
                     eof,
                     nonblock,
+                    id,
+                    rbuf,
                     ..
-                } => read_line_pipe(file, eof, *nonblock, pos, limit),
+                } => read_line_pipe(file, eof, *nonblock, pos, rbuf, stream_chunk(it, *id), limit),
                 PhpResource::Stdio { which, .. } => match *which {
                     0 => Ok(StreamRead::Data(Vec::new())),
                     _ if *which > 2 => Ok(StreamRead::FailSilent),
                     _ => Ok(StreamRead::Ebadf(9, "Bad file descriptor".into())),
                 },
-                PhpResource::Input { body, pos, eof, .. } => {
+                PhpResource::Input {
+                    body,
+                    pos,
+                    eof,
+                    spilled_fd,
+                    srbuf,
+                    rcap,
+                    id,
+                    ..
+                } => {
+                    if let Some(fd) = *spilled_fd {
+                        let chunk = stream_chunk(it, *id);
+                        return Ok(fd_line_read(fd, pos, eof, srbuf, rcap, chunk, limit));
+                    }
                     let start = *pos as usize;
                     if start >= body.len() {
                         *eof = true;
@@ -2320,7 +2740,20 @@ fn read_line_resource(c: Option<&Cell>, limit: usize) -> Result<StreamRead, PhpE
                         Ok(StreamRead::Data(out))
                     }
                 }
-                PhpResource::Mem { buf, pos, eof, .. } => {
+                PhpResource::Mem {
+                    buf,
+                    pos,
+                    eof,
+                    spilled_fd,
+                    srbuf,
+                    rcap,
+                    id,
+                    ..
+                } => {
+                    if let Some(fd) = *spilled_fd {
+                        let chunk = stream_chunk(it, *id);
+                        return Ok(fd_line_read(fd, pos, eof, srbuf, rcap, chunk, limit));
+                    }
                     let start = *pos as usize;
                     if start >= buf.len() {
                         *eof = true;
@@ -2382,7 +2815,7 @@ fn read_line_resource(c: Option<&Cell>, limit: usize) -> Result<StreamRead, PhpE
 
 /// php_stream_gets: read up to `limit` bytes, stopping after '\n'.
 /// Returns an empty vec at EOF (or on a non-readable stream).
-fn csv_gets(c: &Cell, limit: usize) -> Result<StreamRead, PhpError> {
+fn csv_gets(it: &Interp, c: &Cell, limit: usize) -> Result<StreamRead, PhpError> {
     use std::io::Read;
     match c.borrow().clone() {
         Value::Resource(r) => {
@@ -2431,7 +2864,20 @@ fn csv_gets(c: &Cell, limit: usize) -> Result<StreamRead, PhpError> {
                     }
                     Ok(StreamRead::Data(out))
                 }
-                PhpResource::Mem { buf, pos, eof, .. } => {
+                PhpResource::Mem {
+                    buf,
+                    pos,
+                    eof,
+                    spilled_fd,
+                    srbuf,
+                    rcap,
+                    id,
+                    ..
+                } => {
+                    if let Some(fd) = *spilled_fd {
+                        let chunk = stream_chunk(it, *id);
+                        return Ok(fd_line_read(fd, pos, eof, srbuf, rcap, chunk, limit));
+                    }
                     let start = *pos as usize;
                     if start >= buf.len() {
                         *eof = true;
@@ -2449,7 +2895,20 @@ fn csv_gets(c: &Cell, limit: usize) -> Result<StreamRead, PhpError> {
                         Ok(StreamRead::Data(buf[start..end].to_vec()))
                     }
                 }
-                PhpResource::Input { body, pos, eof, .. } => {
+                PhpResource::Input {
+                    body,
+                    pos,
+                    eof,
+                    spilled_fd,
+                    srbuf,
+                    rcap,
+                    id,
+                    ..
+                } => {
+                    if let Some(fd) = *spilled_fd {
+                        let chunk = stream_chunk(it, *id);
+                        return Ok(fd_line_read(fd, pos, eof, srbuf, rcap, chunk, limit));
+                    }
                     let start = *pos as usize;
                     if start >= body.len() {
                         *eof = true;
@@ -2476,8 +2935,8 @@ fn csv_gets(c: &Cell, limit: usize) -> Result<StreamRead, PhpError> {
 
 /// php_stream_get_line equivalent: read the rest of the current line
 /// (through '\n' inclusive), unbounded. Returns None at EOF.
-fn csv_get_line(c: &Cell) -> Result<StreamRead, PhpError> {
-    match csv_gets(c, usize::MAX)? {
+fn csv_get_line(it: &Interp, c: &Cell) -> Result<StreamRead, PhpError> {
+    match csv_gets(it, c, usize::MAX)? {
         StreamRead::Data(out) if out.is_empty() => Ok(StreamRead::Data(Vec::new())),
         other => Ok(other),
     }
@@ -2522,7 +2981,7 @@ fn fgetcsv(
     esc: Option<u8>,
 ) -> Result<Value, PhpError> {
     let limit = if length == 0 { usize::MAX } else { length };
-    let mut buf = match csv_gets(stream, limit)? {
+    let mut buf = match csv_gets(it, stream, limit)? {
         StreamRead::Data(b) => b,
         StreamRead::FailSilent => return Ok(Value::Bool(false)),
         StreamRead::Ebadf(errno, msg) => {
@@ -2580,7 +3039,7 @@ fn fgetcsv(
                             hunk = bptr;
                             // Embed this buffer's trailing whitespace.
                             tptr.extend_from_slice(&buf[limit_i..]);
-                            match csv_get_line(stream)? {
+                            match csv_get_line(it, stream)? {
                                 StreamRead::Data(nb) if nb.is_empty() => break 'enc,
                                 StreamRead::Data(nb) => {
                                     buf = nb;
@@ -3119,33 +3578,38 @@ fn select_throw_last(it: &mut Interp, chain: Vec<Value>) -> PhpError {
     }
 }
 
-/// php_stream_temp_cast: spill a php://temp buffer into a tmpfile()
-/// and seek it to the stream's current position; the returned fd is
-/// the claimable descriptor. Returns None when tmpfile() fails.
+/// php_stream_temp_cast: spill a php://temp buffer into a real
+/// filesystem temp file (zend's php_open_temporary_fd → mkstemp
+/// "<tmpdir>/phpXXXXXX", which stays LINKED — fstat reports nlink 1 —
+/// until the stream closes) positioned at the stream's offset. The
+/// returned fd is the stream's claimable descriptor; its file is
+/// removed when the last owner closes (PhpResource::Drop). None on
+/// failure.
 pub(in crate::builtins) fn temp_spill_fd(buf: &[u8], pos: u64) -> Option<std::os::unix::io::RawFd> {
+    let mut tmpl = std::env::temp_dir()
+        .join("phpXXXXXX\0")
+        .to_string_lossy()
+        .into_owned()
+        .into_bytes();
     unsafe {
-        let f = libc::tmpfile();
-        if f.is_null() {
+        let fd = libc::mkstemp(tmpl.as_mut_ptr() as *mut libc::c_char);
+        if fd < 0 {
             return None;
         }
-        let fd = libc::fileno(f);
         let mut off = 0usize;
         while off < buf.len() {
             let n = libc::write(fd, buf.as_ptr().add(off) as *const _, buf.len() - off);
             if n <= 0 {
-                libc::fclose(f);
+                libc::close(fd);
+                let _ = std::fs::remove_file(&*String::from_utf8_lossy(
+                    &tmpl[..tmpl.len() - 1],
+                ));
                 return None;
             }
             off += n as usize;
         }
         libc::lseek(fd, pos as libc::off_t, libc::SEEK_SET);
-        let d = libc::dup(fd);
-        libc::fclose(f);
-        if d < 0 {
-            None
-        } else {
-            Some(d)
-        }
+        Some(fd)
     }
 }
 
