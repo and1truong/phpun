@@ -1349,7 +1349,7 @@ impl<'a> Interp<'a> {
                 pn: String,
             },
             Keyed {
-                e: Box<Expr>,
+                base: Cell,
                 keys: Vec<Option<Cell>>,
             },
             None,
@@ -1405,9 +1405,12 @@ impl<'a> Interp<'a> {
                 }
             }
             Expr::Index { .. } => {
-                // Zend evaluates dim exprs BEFORE the RHS (innermost first)
-                // but traverses the container only at write time — so the
-                // write lands on the variable's CURRENT value
+                // Zend evaluates the container expr FIRST — once — then
+                // the dim exprs eagerly (innermost first), the RHS, and
+                // only then traverses for the fetch/write
+                // (cont()[dk()] += rhs() prints container,dimkey,RHS).
+                // For a variable base eval_cell returns the live slot,
+                // so the write still lands on its CURRENT value
                 // (engine_assignExecutionOrder_003 mod() case).
                 let mut dims = Vec::new();
                 let mut base = target;
@@ -1416,21 +1419,23 @@ impl<'a> Interp<'a> {
                     base = e;
                 }
                 dims.reverse();
-                let mut keys = Vec::with_capacity(dims.len());
-                for d in dims {
-                    match d {
-                        Some(ie) => match self.dim_key(ie) {
-                            Ok(k) => keys.push(k),
-                            Err(_) => keys.push(None),
-                        },
-                        None => keys.push(None),
+                match self.eval_cell(base) {
+                    Ok(c) => {
+                        let mut keys = Vec::with_capacity(dims.len());
+                        for d in dims {
+                            match d {
+                                Some(ie) => match self.dim_key(ie) {
+                                    Ok(k) => keys.push(k),
+                                    Err(_) => keys.push(None),
+                                },
+                                None => keys.push(None),
+                            }
+                        }
+                        late = Late::Keyed { base: c, keys };
+                        None
                     }
+                    Err(e) => return Err(e),
                 }
-                late = Late::Keyed {
-                    e: Box::new(base.clone()),
-                    keys,
-                };
-                None
             }
             Expr::StaticProp { class, name } => {
                 // Static prop names evaluate BEFORE the RHS with their own
@@ -1449,50 +1454,64 @@ impl<'a> Interp<'a> {
             Expr::List(_) => None,
             _ => self.eval_cell(target).ok(),
         };
-        // Compound ops fetch the dim BEFORE the RHS runs (zend
-        // ASSIGN_DIM_OP order) — warnings attached to the read must
-        // precede any output the RHS produces.
-        let cur = if needs_read {
-            match &target_cell {
-                Some(c) => c.borrow().clone(),
-                None => {
-                    // `??=` reads with isset() semantics (no undefined
-                    // warnings); every other compound op warns
-                    // (typed_properties_103). Dim targets read through
-                    // compound_dim_read: zend's fetch-for-write emits
-                    // per-level `Undefined array key` warnings on
-                    // missing/null levels but stays silent when the
-                    // write itself will throw (bug29893) — and never
-                    // re-evaluates the dim key exprs.
-                    match &late {
-                        Late::Keyed { e, keys } => {
-                            let keys = keys.clone();
-                            let c = self.eval_cell(e.as_ref())?;
-                            self.compound_dim_read(c, &keys, op == "??=")?
-                        }
-                        Late::Index { base, key, .. } => {
-                            let c = base.clone();
-                            let keys = [key.clone()];
-                            self.compound_dim_read(c, &keys, op == "??=")?
-                        }
-                        _ => {
-                            let quiet = op == "??=";
-                            if quiet {
-                                self.silence += 1;
+        // Zend's ASSIGN_DIM_OP order: dim exprs eager (above) → the
+        // RHS → the dim fetch (its `Undefined array key` warnings and
+        // auto-vivification print AFTER any output the RHS produced) →
+        // the write. `??=` is the exception: it isset()-checks BEFORE
+        // the RHS, and a set key skips the RHS entirely — the value is
+        // the fetched one.
+        macro_rules! dim_read {
+            ($quiet:expr) => {
+                match &target_cell {
+                    Some(c) => c.borrow().clone(),
+                    None => {
+                        // Dim targets read through compound_dim_read:
+                        // zend's fetch-for-write emits per-level
+                        // `Undefined array key` warnings on missing/null
+                        // levels but stays silent when the write itself
+                        // will throw (bug29893) — and never re-evaluates
+                        // the dim key exprs. `??=` reads with isset()
+                        // semantics (no warnings; typed_properties_103).
+                        match &late {
+                            Late::Keyed { base, keys } => {
+                                self.compound_dim_read(base.clone(), keys, $quiet)?
                             }
-                            let c = self.eval(target);
-                            if quiet {
-                                self.silence -= 1;
+                            Late::Index { base, key, .. } => {
+                                let keys = [key.clone()];
+                                self.compound_dim_read(base.clone(), &keys, $quiet)?
                             }
-                            c.unwrap_or(Value::Null)
+                            _ => {
+                                if $quiet {
+                                    self.silence += 1;
+                                }
+                                let c = self.eval(target);
+                                if $quiet {
+                                    self.silence -= 1;
+                                }
+                                c.unwrap_or(Value::Null)
+                            }
                         }
                     }
                 }
+            };
+        }
+        if needs_read && op == "??=" {
+            let cur = dim_read!(true);
+            if !matches!(cur, Value::Null) {
+                return Ok(cur);
+            }
+        }
+        let rhs = self.eval(value)?;
+        let cur = if needs_read {
+            if op == "??=" {
+                // Reaching here means the isset read found null/missing.
+                Value::Null
+            } else {
+                dim_read!(false)
             }
         } else {
             Value::Null
         };
-        let rhs = self.eval(value)?;
         let newv = match op {
             "=" => rhs,
             "+=" => self.arith("+", cur, rhs)?,
@@ -1639,8 +1658,8 @@ impl<'a> Interp<'a> {
                 let nv = self.typed_slot_store(&c, newv.clone())?;
                 *c.borrow_mut() = nv;
             }
-            Late::Keyed { e, keys } => {
-                newv = self.assign_index_path(&e, &keys, newv, needs_read)?;
+            Late::Keyed { base, keys } => {
+                newv = self.assign_index_path(base, &keys, newv, needs_read)?;
             }
             Late::None => match target_cell {
                 Some(c) => {
@@ -2396,13 +2415,12 @@ impl<'a> Interp<'a> {
     /// `$a[i] = $a[j] = $s` only warns for the first write).
     fn assign_index_path(
         &mut self,
-        e: &Expr,
+        mut c: Cell,
         keys: &[Option<Cell>],
         v: Value,
         compound: bool,
     ) -> Result<Value, PhpError> {
         self.last_fresh_cell = None;
-        let mut c = self.eval_cell(e)?;
         let last = keys.len() - 1;
         for (n, k) in keys.iter().enumerate() {
             // Auto-init gate: writing through a typed slot that is
