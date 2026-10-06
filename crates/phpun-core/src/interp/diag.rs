@@ -307,6 +307,7 @@ impl<'a> Interp<'a> {
         if let Value::Object(o) = v {
             let o = o.borrow();
             let class = o.class.name().to_string();
+            let is_parse_err = self.is_a(&o.class, "ParseError");
             let msg = o
                 .props
                 .get("message")
@@ -355,6 +356,24 @@ impl<'a> Interp<'a> {
                 self.emit(&format!(
                     "\nParse error: {} in {}({}) : eval()'d code on line {}\n",
                     msg, file, line, eval_ctx
+                ));
+            } else if is_parse_err {
+                // Any uncaught ParseError renders Zend's plain
+                // `Parse error:` form — the message carries its own
+                // position and the in-clause attributes to the bad
+                // file — never the 'Uncaught ParseError:' block.
+                let log_errors = self.ini.get("log_errors").is_none_or(|v| {
+                    matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
+                });
+                if log_errors {
+                    self.diag_stderr(&format!(
+                        "PHP Parse error:  {} in {} on line {}\n",
+                        msg, file, line
+                    ));
+                }
+                self.emit(&format!(
+                    "\nParse error: {} in {} on line {}\n",
+                    msg, file, line
                 ));
             } else if self.error_level & 1 != 0 {
                 // error_reporting masks the uncaught display too

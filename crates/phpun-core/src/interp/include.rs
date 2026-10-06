@@ -158,7 +158,40 @@ impl<'a> Interp<'a> {
             Ok(s) => s,
             Err(e) => {
                 match e.kind {
-                    ErrorKind::Parse => self.print_parse_at(&e, &fname),
+                    ErrorKind::Parse => {
+                        // A parse error in the included file raises a
+                        // catchable ParseError in Zend — attributed to
+                        // the included file — like eval()'d code does.
+                        let msg = e.message.clone();
+                        let v = self.exception("ParseError", &msg);
+                        if let Value::Object(o) = &v {
+                            if let Some(ObjectInternal::Exception {
+                                file,
+                                line,
+                                thrown,
+                                ..
+                            }) = &mut o.borrow_mut().internal
+                            {
+                                // getFile() is the bad file; getLine()
+                                // is the parse error's own line inside
+                                // it (the EOF line for unclosed
+                                // brackets — Zend quirk).
+                                *file = fname.clone();
+                                *line = e.line as u32;
+                                *thrown = e.line as u32;
+                            }
+                        }
+                        inc_pop(self);
+                        self.pending_exception = Some(v);
+                        return Err(PhpError {
+                            trace: None,
+                            thrown_line: None,
+                            display_msg: None,
+                            kind: ErrorKind::Throw,
+                            message: "include".into(),
+                            line: 0,
+                        });
+                    }
                     // Non-parse fatals raised while compiling the included
                     // file still attribute to the included file.
                     _ => {
@@ -290,23 +323,6 @@ impl<'a> Interp<'a> {
             // Exit/Throw — no remaining variants.
             Flow::Break(_) | Flow::Continue(_) | Flow::Goto(_) => unreachable!(),
         }
-    }
-
-    fn print_parse_at(&mut self, e: &PhpError, file: &str) {
-        let log_errors = self
-            .ini
-            .get("log_errors")
-            .is_none_or(|v| matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes"));
-        if log_errors {
-            self.diag_stderr(&format!(
-                "PHP Parse error:  {} in {} on line {}\n",
-                e.message, file, e.line
-            ));
-        }
-        self.emit(&format!(
-            "\nParse error: {} in {} on line {}\n",
-            e.message, file, e.line
-        ));
     }
 
     pub(in crate::interp) fn eval_code(&mut self, code: &str) -> Result<Value, PhpError> {
