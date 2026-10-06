@@ -25,6 +25,7 @@ mod classes;
 mod diag;
 mod exec;
 mod expr;
+mod flow;
 mod gen;
 mod include;
 mod members;
@@ -1437,7 +1438,10 @@ impl<'a> Interp<'a> {
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(ht as u64));
             self.deadline_secs = ht;
         }
-        if let Err(e) = Self::const_closure_gate(stmts).and_then(|_| self.hoist_funcs(stmts)) {
+        if let Err(e) = Self::const_closure_gate(stmts)
+            .and_then(|_| self.flow_gate(stmts))
+            .and_then(|_| self.hoist_funcs(stmts))
+        {
             let flow = self.err_flow(e);
             let mut result = self.finish(flow);
             if let Some(c) = self.run_shutdown() {
@@ -1584,8 +1588,7 @@ impl<'a> Interp<'a> {
                 .is_some()
                 && self.mark_destructed(&o)
             {
-                if let Err(e) = self.method_invoke(o.clone(), "__destruct", CallArgs::empty())
-                {
+                if let Err(e) = self.method_invoke(o.clone(), "__destruct", CallArgs::empty()) {
                     shutdown_code = Some(match self.err_flow(e) {
                         Flow::Exit(c) => c,
                         Flow::Throw(v) => {
@@ -1900,8 +1903,9 @@ impl<'a> Interp<'a> {
         match parser::parse_source(src, self.ini_on("short_open_tag")) {
             Ok(stmts) => {
                 self.begin_unit();
-                if let Err(e) =
-                    Self::const_closure_gate(&stmts).and_then(|_| self.hoist_funcs(&stmts))
+                if let Err(e) = Self::const_closure_gate(&stmts)
+                    .and_then(|_| self.flow_gate(&stmts))
+                    .and_then(|_| self.hoist_funcs(&stmts))
                 {
                     let flow = self.err_flow(e);
                     let mut res = self.finish(flow);
