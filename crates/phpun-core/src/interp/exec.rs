@@ -460,7 +460,10 @@ impl<'a> Interp<'a> {
                         }
                         if matches!(
                             e,
-                            Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. }
+                            Expr::Call { .. }
+                                | Expr::MethodCall { .. }
+                                | Expr::StaticCall { .. }
+                                | Expr::StaticCallDyn { .. }
                         ) {
                             // `return &f()` chains through when callee returns
                             // by reference (returnByReference.006/009).
@@ -910,14 +913,16 @@ impl<'a> Interp<'a> {
                         }
                         match val {
                             ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
-                            ForeachTarget::ByRef(n) => {
+                            ForeachTarget::ByRef(e) => {
                                 if let Some(f) = self.readonly_ref_error(&c) {
                                     break f;
                                 }
                                 // zend leaves the element IS_REFERENCE
                                 // — post-loop copies re-bind it.
-                                self.mark_ref(&c);
-                                self.cur().vars.insert(n.clone(), c);
+                                match self.bind_cell(e, c) {
+                                    Ok(()) => {}
+                                    Err(e2) => break self.err_flow(e2),
+                                }
                             }
                             ForeachTarget::Lvalue(e) => {
                                 let _ = self.store(e, c.borrow().clone());
@@ -957,11 +962,14 @@ impl<'a> Interp<'a> {
                     }
                     match val {
                         ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
-                        ForeachTarget::ByRef(n) => {
+                        ForeachTarget::ByRef(e) => {
                             if let Some(f) = self.readonly_ref_error(&c) {
                                 return f;
                             }
-                            self.cur().vars.insert(n.clone(), c);
+                            match self.bind_cell(e, c) {
+                                Ok(()) => {}
+                                Err(e2) => return self.err_flow(e2),
+                            }
                         }
                         ForeachTarget::Lvalue(e) => {
                             let _ = self.store(e, c.borrow().clone());
@@ -1218,10 +1226,10 @@ impl<'a> Interp<'a> {
                     }
                     match val {
                         ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
-                        ForeachTarget::ByRef(n) => {
-                            self.mark_ref(&c);
-                            self.cur().vars.insert(n.clone(), c.clone());
-                        }
+                        ForeachTarget::ByRef(e) => match self.bind_cell(e, c.clone()) {
+                            Ok(()) => {}
+                            Err(e2) => return self.err_flow(e2),
+                        },
                         ForeachTarget::Lvalue(e) => {
                             let _ = self.store(e, c.borrow().clone());
                         }
@@ -1353,8 +1361,10 @@ impl<'a> Interp<'a> {
                     if let Some(f) = self.readonly_ref_error(&c) {
                         return f;
                     }
-                    self.mark_ref(&c);
-                    self.cur().vars.insert(n.clone(), c);
+                    match self.bind_cell(n, c) {
+                        Ok(()) => {}
+                        Err(e2) => return self.err_flow(e2),
+                    }
                 }
                 ForeachTarget::Lvalue(e) => {
                     let _ = self.store(e, v);
@@ -1389,7 +1399,9 @@ impl<'a> Interp<'a> {
                         ForeachTarget::Lvalue(e) => {
                             let _ = self.store(e, iv);
                         }
-                        ForeachTarget::ByRef(n) => self.var_set(n, iv),
+                        ForeachTarget::ByRef(e) => {
+                            let _ = self.bind_cell(e, cell(iv));
+                        }
                         ForeachTarget::List(sub) => {
                             self.foreach_list(sub, &iv)?;
                         }

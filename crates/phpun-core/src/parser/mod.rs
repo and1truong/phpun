@@ -65,6 +65,10 @@ pub struct Parser<'a> {
     /// the no-class-scope compile fatal doesn't apply
     /// (static_type_return's unbound `{closure:...}(): static`).
     in_closure: bool,
+    /// Enclosing function/method/closure is declared `function &` —
+    /// `return $o?->p` inside is the "Cannot take reference of a
+    /// nullsafe chain" compile fatal.
+    ret_by_ref: bool,
 }
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
@@ -188,6 +192,7 @@ impl<'a> Parser<'a> {
             first_stmt_slot: false,
             strict_slot: false,
             in_closure: false,
+            ret_by_ref: false,
         }
     }
 }
@@ -285,6 +290,7 @@ pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
         first_stmt_slot: false,
         strict_slot: false,
         in_closure: false,
+        ret_by_ref: false,
     };
     let e = p.expr()?;
     Ok((e, diags))
@@ -581,6 +587,12 @@ impl<'a> Parser<'a> {
                         Ok(Stmt::Return(None))
                     } else {
                         let e = self.expr()?;
+                        if self.ret_by_ref && Self::has_nullsafe(&e) {
+                            return Err(PhpError::compile_fatal(
+                                "Cannot take reference of a nullsafe chain",
+                                self.line(),
+                            ));
+                        }
                         self.expect_op(";")?;
                         Ok(Stmt::Return(Some(e)))
                     }

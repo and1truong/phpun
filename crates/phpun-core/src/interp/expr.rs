@@ -1253,10 +1253,20 @@ impl<'a> Interp<'a> {
             }
             // By-reference assignment: bind cells.
             let src = match value {
-                Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. } => {
+                Expr::Call { .. }
+                | Expr::MethodCall { .. }
+                | Expr::StaticCall { .. }
+                | Expr::StaticCallDyn { .. } => {
                     let (c, was_ref) = self.eval_call_cell(value)?;
                     if !was_ref {
+                        // Non-ref callee: zend warns and falls back to
+                        // a plain assignment INTO the target's cell —
+                        // the target keeps its identity (bug20175's
+                        // `static $v = &f()`).
                         self.notice("Only variables should be assigned by reference")?;
+                        let v = c.borrow().clone();
+                        self.store(target, v.clone())?;
+                        return Ok(v);
                     }
                     c
                 }
@@ -1331,7 +1341,7 @@ impl<'a> Interp<'a> {
             },
             Index {
                 base: Cell,
-                key: Option<Value>,
+                key: Option<Cell>,
                 append: bool,
             },
             Static {
@@ -1340,7 +1350,7 @@ impl<'a> Interp<'a> {
             },
             Keyed {
                 e: Box<Expr>,
-                keys: Vec<Option<Value>>,
+                keys: Vec<Option<Cell>>,
             },
             None,
         }
@@ -1381,7 +1391,7 @@ impl<'a> Interp<'a> {
                 match self.eval_cell(e) {
                     Ok(c) => {
                         let key = match i.as_deref() {
-                            Some(ie) => self.eval(ie).ok(),
+                            Some(ie) => self.dim_key(ie).ok().flatten(),
                             None => None,
                         };
                         late = Late::Index {
@@ -1409,8 +1419,8 @@ impl<'a> Interp<'a> {
                 let mut keys = Vec::with_capacity(dims.len());
                 for d in dims {
                     match d {
-                        Some(ie) => match self.eval(ie) {
-                            Ok(k) => keys.push(Some(k)),
+                        Some(ie) => match self.dim_key(ie) {
+                            Ok(k) => keys.push(k),
                             Err(_) => keys.push(None),
                         },
                         None => keys.push(None),
@@ -1439,28 +1449,50 @@ impl<'a> Interp<'a> {
             Expr::List(_) => None,
             _ => self.eval_cell(target).ok(),
         };
-        let rhs = self.eval(value)?;
+        // Compound ops fetch the dim BEFORE the RHS runs (zend
+        // ASSIGN_DIM_OP order) — warnings attached to the read must
+        // precede any output the RHS produces.
         let cur = if needs_read {
             match &target_cell {
                 Some(c) => c.borrow().clone(),
                 None => {
                     // `??=` reads with isset() semantics (no undefined
                     // warnings); every other compound op warns
-                    // (typed_properties_103).
-                    let quiet = op == "??=";
-                    if quiet {
-                        self.silence += 1;
+                    // (typed_properties_103). Dim targets read through
+                    // compound_dim_read: zend's fetch-for-write emits
+                    // per-level `Undefined array key` warnings on
+                    // missing/null levels but stays silent when the
+                    // write itself will throw (bug29893) — and never
+                    // re-evaluates the dim key exprs.
+                    match &late {
+                        Late::Keyed { e, keys } => {
+                            let keys = keys.clone();
+                            let c = self.eval_cell(e.as_ref())?;
+                            self.compound_dim_read(c, &keys, op == "??=")?
+                        }
+                        Late::Index { base, key, .. } => {
+                            let c = base.clone();
+                            let keys = [key.clone()];
+                            self.compound_dim_read(c, &keys, op == "??=")?
+                        }
+                        _ => {
+                            let quiet = op == "??=";
+                            if quiet {
+                                self.silence += 1;
+                            }
+                            let c = self.eval(target);
+                            if quiet {
+                                self.silence -= 1;
+                            }
+                            c.unwrap_or(Value::Null)
+                        }
                     }
-                    let c = self.eval(target);
-                    if quiet {
-                        self.silence -= 1;
-                    }
-                    c.unwrap_or(Value::Null)
                 }
             }
         } else {
             Value::Null
         };
+        let rhs = self.eval(value)?;
         let newv = match op {
             "=" => rhs,
             "+=" => self.arith("+", cur, rhs)?,
@@ -1539,7 +1571,10 @@ impl<'a> Interp<'a> {
                 };
                 if let Some(o) = aa_obj {
                     // `$o[k] = v` on ArrayAccess -> offsetSet.
-                    let kv = key.clone().unwrap_or_else(|| newv.clone());
+                    let kv = key
+                        .as_ref()
+                        .map(|kc| kc.borrow().clone())
+                        .unwrap_or_else(|| newv.clone());
                     match self.method_invoke(
                         o,
                         "offsetSet",
@@ -1557,6 +1592,16 @@ impl<'a> Interp<'a> {
                         *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
                     }
                 }
+                if append && matches!(&*base.borrow(), Value::Str(_)) {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        "[] operator not supported for strings",
+                        self.cur_line,
+                    ));
+                }
+                if needs_read {
+                    self.compound_dim_gate(&base, &key)?;
+                }
                 {
                     let mut b = base.borrow_mut();
                     if let Value::Array(_) = &mut *b {
@@ -1573,7 +1618,10 @@ impl<'a> Interp<'a> {
                         if append {
                             arr.push(newv.clone());
                         } else {
-                            let key = key.map(|k| to_key(&k)).unwrap_or(to_key(&newv));
+                            let key = key
+                                .as_ref()
+                                .map(|k| to_key(&k.borrow()))
+                                .unwrap_or(to_key(&newv));
                             arr.set(key, newv.clone());
                         }
                     }
@@ -1592,7 +1640,7 @@ impl<'a> Interp<'a> {
                 *c.borrow_mut() = nv;
             }
             Late::Keyed { e, keys } => {
-                newv = self.assign_index_path(&e, &keys, newv)?;
+                newv = self.assign_index_path(&e, &keys, newv, needs_read)?;
             }
             Late::None => match target_cell {
                 Some(c) => {
@@ -1622,9 +1670,10 @@ impl<'a> Interp<'a> {
                 Ok(self.var_cell(&name))
             }
             Expr::StaticProp { class, name } => self.static_prop_cell(class, name),
-            Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. } => {
-                Ok(self.eval_call_cell(e)?.0)
-            }
+            Expr::Call { .. }
+            | Expr::MethodCall { .. }
+            | Expr::StaticCall { .. }
+            | Expr::StaticCallDyn { .. } => Ok(self.eval_call_cell(e)?.0),
             _ => {
                 // Function calls returning by-ref, etc.: evaluate to temp cell.
                 let v = self.eval(e)?;
@@ -1657,55 +1706,87 @@ impl<'a> Interp<'a> {
     }
 
     /// `$target =& $cell`
-    fn bind_cell(&mut self, target: &Expr, src: Cell) -> Result<(), PhpError> {
+    pub(in crate::interp) fn bind_cell(
+        &mut self,
+        target: &Expr,
+        src: Cell,
+    ) -> Result<(), PhpError> {
         // `=&` creates Zend's IS_REFERENCE — writes through it say
         // "a reference held by property", not "property" (034/078).
         self.mark_ref(&src);
         match target {
             Expr::Var(n) => {
-                self.cur().vars.insert(n.clone(), src);
+                // Global scope: a synced name's $GLOBALS slot must
+                // re-point to the bound cell too — the two are one
+                // symbol table (030's `$x =& $y` alias survives sync).
+                let synced = self.stack.is_empty() && self.globals_synced.contains(n.as_str());
+                self.cur().vars.insert(n.clone(), src.clone());
+                if synced {
+                    if let Some(a) = &self.globals_arr {
+                        a.borrow_mut().bind_cell(ArrKey::Str(n.clone().into()), src);
+                    }
+                }
                 Ok(())
             }
+            Expr::Paren(inner) => self.bind_cell(inner, src),
             Expr::Index { e, i } => {
                 let key = match i {
                     Some(ie) => Some(self.eval(ie)?),
                     None => None,
                 };
-                match &**e {
-                    Expr::Var(n) => {
-                        let arr_cell = self.var_cell(n);
-                        let mut b = arr_cell.borrow_mut();
-                        match &mut *b {
-                            Value::Null => {
-                                let mut arr = PhpArray::new();
-                                match key {
-                                    Some(k) => arr.bind_cell(to_key(&k), src),
-                                    None => arr.bind_cell(ArrKey::Int(arr.next), src),
-                                }
-                                *b = Value::Array(Rc::new(RefCell::new(arr)));
-                            }
-                            Value::Array(rc) => {
-                                let mut arr = rc.borrow_mut();
-                                match key {
-                                    Some(k) => arr.bind_cell(to_key(&k), src),
-                                    None => {
-                                        let k = ArrKey::Int(arr.next);
-                                        arr.bind_cell(k, src);
-                                    }
-                                }
-                            }
-                            _ => {
-                                drop(b);
-                                return self.fail(PhpError::fatal(
-                                    "Cannot use scalar value as an array",
-                                    0,
-                                ));
+                // The container can be any lvalue — `$o->p[k]`,
+                // `$a[0][1]`, `$GLOBALS['x']` all bind into the slot's
+                // array.
+                let slot = self.eval_cell(e)?;
+                let gk = if matches!(&**e, Expr::Var(n) if n == "GLOBALS") {
+                    match &key {
+                        Some(Value::Str(s)) => Some(String::from_utf8_lossy(s).into_owned()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let mut b = slot.borrow_mut();
+                match &mut *b {
+                    Value::Null => {
+                        let mut arr = PhpArray::new();
+                        match &key {
+                            Some(k) => arr.bind_cell(to_key(k), src),
+                            None => arr.bind_cell(ArrKey::Int(arr.next), src),
+                        }
+                        *b = Value::Array(Rc::new(RefCell::new(arr)));
+                    }
+                    Value::Array(rc) => {
+                        let is_globals = self
+                            .globals_arr
+                            .as_ref()
+                            .map(|g| Rc::ptr_eq(g, rc))
+                            .unwrap_or(false);
+                        let mut arr = rc.borrow_mut();
+                        match &key {
+                            Some(k) => arr.bind_cell(to_key(k), src.clone()),
+                            None => {
+                                let k = ArrKey::Int(arr.next);
+                                arr.bind_cell(k, src.clone());
                             }
                         }
-                        Ok(())
+                        drop(arr);
+                        // `$GLOBALS['x'] =& y` — keep the vars table
+                        // entry pointed at the bound cell too.
+                        if is_globals {
+                            if let Some(n) = gk {
+                                self.globals.vars.insert(n.clone(), src);
+                                self.globals_synced.insert(n);
+                            }
+                        }
                     }
-                    _ => self.fail(PhpError::fatal("Cannot create reference to expression", 0)),
+                    _ => {
+                        drop(b);
+                        return self
+                            .fail(PhpError::fatal("Cannot use scalar value as an array", 0));
+                    }
                 }
+                Ok(())
             }
             Expr::Prop { obj, name, .. } => {
                 // `=&` on a hooked prop without `&get` — the engine
@@ -1883,9 +1964,12 @@ impl<'a> Interp<'a> {
                 }
                 Ok(())
             }
-            Expr::VarVar(..) => {
-                let c = self.eval_cell(target)?;
-                *c.borrow_mut() = src.borrow().clone();
+            Expr::VarVar(inner) => {
+                // `$$v =& $x` rebinds the NAMED variable's cell —
+                // write-through semantics like `Expr::Var`.
+                let n = self.eval(inner)?;
+                let name = self.conv_str(&n)?;
+                self.cur().vars.insert(name, src);
                 Ok(())
             }
             _ => self.fail(PhpError::fatal("Cannot create reference to expression", 0)),
@@ -2299,14 +2383,23 @@ impl<'a> Interp<'a> {
     /// time (Zend ASSIGN_DIM semantics): intermediate scalar levels produce
     /// "Cannot use T as array" warnings; a scalar base for a single-level
     /// write throws "Cannot use a scalar value as an array".
+    /// `compound` marks assign-op writes (Zend ASSIGN_DIM_OP): the same
+    /// failures then throw catchable `Error`s at EVERY level — scalar
+    /// "Cannot use a scalar value as an array", object "Cannot use
+    /// object of type C as array" — string containers refuse the op
+    /// entirely ("Cannot use assign-op operators with string offsets"
+    /// or the `Cannot access offset of type K on string` TypeError for
+    /// illegal key types), and array/object keys on an array container
+    /// become `Cannot access offset of type K on array` (bug29893).
     /// Returns the effective stored value: string-offset writes return the
     /// byte actually stored, everything else echoes `v` (bug22592: chained
     /// `$a[i] = $a[j] = $s` only warns for the first write).
     fn assign_index_path(
         &mut self,
         e: &Expr,
-        keys: &[Option<Value>],
+        keys: &[Option<Cell>],
         v: Value,
+        compound: bool,
     ) -> Result<Value, PhpError> {
         self.last_fresh_cell = None;
         let mut c = self.eval_cell(e)?;
@@ -2318,6 +2411,11 @@ impl<'a> Interp<'a> {
             // unless its type accepts an array (typed_properties_083).
             if matches!(&*c.borrow(), Value::Null) {
                 self.auto_init_gate(&c)?;
+            }
+            if compound {
+                // Container/key checks fire BEFORE the dim write in a
+                // compound assign — zend throws at whatever level fails.
+                self.compound_dim_gate(&c, k)?;
             }
             // ArrayAccess object offset path: `$o[k]` dispatches to
             // offsetSet/offsetGet instead of writing through a cell.
@@ -2334,34 +2432,31 @@ impl<'a> Interp<'a> {
             // any key type — offsetSet receives it raw.
             if let Some(kv) = k {
                 if as_obj.is_none() {
-                    self.check_offset_key(kv)?;
+                    self.check_offset_key(&kv.borrow())?;
                 }
             }
             if let Some(o) = as_obj {
+                let kval = k
+                    .as_ref()
+                    .map(|kc| kc.borrow().clone())
+                    .unwrap_or(Value::Null);
                 if n == last {
                     match self.method_invoke(
                         o,
                         "offsetSet",
-                        CallArgs::positional(vec![
-                            cell(k.clone().unwrap_or(Value::Null)),
-                            cell(v.clone()),
-                        ]),
+                        CallArgs::positional(vec![cell(kval), cell(v.clone())]),
                     ) {
                         Ok(_) => return Ok(v),
                         Err(e) => return Err(e),
                     }
                 }
                 let iv = self
-                    .method_invoke(
-                        o,
-                        "offsetGet",
-                        CallArgs::positional(vec![cell(k.clone().unwrap_or(Value::Null))]),
-                    )
+                    .method_invoke(o, "offsetGet", CallArgs::positional(vec![cell(kval)]))
                     .unwrap_or(Value::Null);
                 c = cell(iv);
                 continue;
             }
-            match self.index_into_key(c.clone(), k.clone()) {
+            match self.index_into_key(c.clone(), k.as_ref().map(|kc| kc.borrow().clone())) {
                 Ok(nc) => {
                     if n == last {
                         // `$ref[k] = v` where the element cell is bound to
@@ -2375,6 +2470,15 @@ impl<'a> Interp<'a> {
                 Err(_) => {
                     let is_str = matches!(*c.borrow(), Value::Str(_));
                     if is_str {
+                        // `$s[] = v` — strings have no append (zend
+                        // throws a catchable Error).
+                        if k.is_none() {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                "[] operator not supported for strings",
+                                self.cur_line,
+                            ));
+                        }
                         // String offset write (final level only).
                         let mut b = c.borrow_mut();
                         let mut bytes = match &*b {
@@ -2388,8 +2492,10 @@ impl<'a> Interp<'a> {
                             let byte = vs.first().copied().unwrap_or(b' ');
                             // PHP 8: negative offsets index from the end;
                             // beyond -len stays illegal (bug22592).
-                            let idx_i =
-                                k.as_ref().map(|k| k.to_int()).unwrap_or(bytes.len() as i64);
+                            let idx_i = k
+                                .as_ref()
+                                .map(|k| k.borrow().to_int())
+                                .unwrap_or(bytes.len() as i64);
                             let idx_i = if idx_i < 0 {
                                 idx_i + bytes.len() as i64
                             } else {
@@ -2397,7 +2503,8 @@ impl<'a> Interp<'a> {
                             };
                             if idx_i < 0 {
                                 drop(b);
-                                let orig = k.as_ref().map(|k| k.to_int()).unwrap_or_default();
+                                let orig =
+                                    k.as_ref().map(|k| k.borrow().to_int()).unwrap_or_default();
                                 self.warn(&format!("Illegal string offset {}", orig))?;
                                 return Ok(v);
                             }
@@ -2434,6 +2541,235 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(v)
+    }
+
+    /// Zend's compound-assign write gate (`ASSIGN_DIM_OP`): the
+    /// container/key failures that throw catchable Errors before the
+    /// dim write — scalar "Cannot use a scalar value as an array",
+    /// object "Cannot use object of type C as array", string
+    /// "Cannot use assign-op operators with string offsets" (or the
+    /// `Cannot access offset of type K on string` TypeError for illegal
+    /// key types), and `Cannot access offset of type K on array` for
+    /// array/object keys on an array (or to-be-vivified null)
+    /// container (bug29893).
+    fn compound_dim_gate(&mut self, c: &Cell, k: &Option<Cell>) -> Result<(), PhpError> {
+        let bad = {
+            let b = c.borrow();
+            match &*b {
+                Value::Object(o) if !self.obj_is_a(o, "ArrayAccess") => {
+                    Some(format!("object of type {}", o.borrow().class.name()))
+                }
+                Value::Callable(_) => Some("object of type Closure".to_string()),
+                Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Resource(_) => {
+                    Some("scalar".to_string())
+                }
+                _ => None,
+            }
+        };
+        if let Some(t) = bad {
+            let msg = if t == "scalar" {
+                "Cannot use a scalar value as an array".to_string()
+            } else {
+                format!("Cannot use {} as array", t)
+            };
+            return self.fail(PhpError::uncaught("Error", msg, self.cur_line));
+        }
+        if matches!(&*c.borrow(), Value::Str(_)) {
+            // Non-numeric string keys (and the always-illegal kinds)
+            // name the offset TypeError; numeric strings coerce to int
+            // offsets and hit the op gate like ints (`$s['x']` vs
+            // `$s['5']`).
+            let kt = k.as_ref().and_then(|kv| match &*kv.borrow() {
+                Value::Str(_) => match to_key(&kv.borrow()) {
+                    ArrKey::Str(_) => Some("string".to_string()),
+                    _ => None,
+                },
+                v => Self::illegal_offset_ty(v),
+            });
+            let (class, msg) = if let Some(kt) = kt {
+                (
+                    "TypeError",
+                    format!("Cannot access offset of type {} on string", kt),
+                )
+            } else {
+                (
+                    "Error",
+                    "Cannot use assign-op operators with string offsets".to_string(),
+                )
+            };
+            return self.fail(PhpError::uncaught(class, msg, self.cur_line));
+        }
+        // A null container auto-vivifies to an array in the write, so
+        // the key check reports `on array`.
+        if matches!(&*c.borrow(), Value::Null | Value::Array(_)) {
+            if let Some(kt) = k
+                .as_ref()
+                .and_then(|kc| Self::illegal_offset_ty(&kc.borrow()))
+            {
+                return self.fail(PhpError::uncaught(
+                    "TypeError",
+                    format!("Cannot access offset of type {} on array", kt),
+                    self.cur_line,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Zend's compound-assign dim fetch (`ASSIGN_DIM_OP`): descends a
+    /// container with already-evaluated keys — missing levels warn
+    /// `Undefined array key K` (a null container auto-vivifies, so every
+    /// key reports), ArrayAccess reads through offsetGet, and a level
+    /// whose write will throw (scalar, string, plain object, illegal
+    /// key) yields Null silently — the error comes from the write path
+    /// instead (bug29893). `quiet` is `??=`'s isset-style read.
+    fn compound_dim_read(
+        &mut self,
+        mut c: Cell,
+        keys: &[Option<Cell>],
+        quiet: bool,
+    ) -> Result<Value, PhpError> {
+        for k in keys {
+            enum Step {
+                Cell(Cell),
+                Missing,
+                Stop,
+            }
+            // The fetch-for-write auto-vivifies a null container BEFORE
+            // the key is read — an aliased key (`$v[$v]`) then reports
+            // the post-viv type (illegal-key TypeError, no warning).
+            // `??=`'s isset fetch stays non-mutating.
+            if !quiet && matches!(&*c.borrow(), Value::Null) {
+                self.auto_init_gate(&c)?;
+                *c.borrow_mut() = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+            }
+            let (step, key_v) = {
+                let b = c.borrow();
+                match &*b {
+                    Value::Array(rc) => {
+                        // Illegal keys throw in the write — the dim is
+                        // never read.
+                        if k.as_ref()
+                            .is_some_and(|k| Self::illegal_offset_ty(&k.borrow()).is_some())
+                        {
+                            (Step::Stop, None)
+                        } else {
+                            let key = k.as_ref().map(|kc| to_key(&kc.borrow()));
+                            match key {
+                                Some(ArrKey::Int(_)) | Some(ArrKey::Str(_)) => {
+                                    let key = key.unwrap();
+                                    match rc.borrow().get_cell(&key) {
+                                        Some(nc) => (Step::Cell(nc), None),
+                                        None => (Step::Missing, Some(key)),
+                                    }
+                                }
+                                _ => (Step::Stop, None),
+                            }
+                        }
+                    }
+                    Value::Null => {
+                        if k.as_ref()
+                            .is_some_and(|k| Self::illegal_offset_ty(&k.borrow()).is_some())
+                        {
+                            // Auto-viv turns the write's container into
+                            // an array, which then throws the
+                            // illegal-offset TypeError — no read.
+                            (Step::Stop, None)
+                        } else {
+                            (
+                                Step::Missing,
+                                k.as_ref()
+                                    .map(|kc| to_key(&kc.borrow()))
+                                    .filter(|k| !matches!(k, ArrKey::Tomb)),
+                            )
+                        }
+                    }
+                    Value::Object(o) if self.obj_is_a(o, "ArrayAccess") => {
+                        let o = o.clone();
+                        drop(b);
+                        let kv = k
+                            .as_ref()
+                            .map(|kc| kc.borrow().clone())
+                            .unwrap_or(Value::Null);
+                        let iv = self
+                            .method_invoke(o, "offsetGet", CallArgs::positional(vec![cell(kv)]))
+                            .unwrap_or(Value::Null);
+                        c = cell(iv);
+                        continue;
+                    }
+                    _ => (Step::Stop, None),
+                }
+            };
+            match step {
+                Step::Cell(nc) => c = nc,
+                Step::Missing => {
+                    if !quiet {
+                        if let Some(key) = key_v {
+                            match key {
+                                ArrKey::Str(s) => self.warn(&format!(
+                                    "Undefined array key \"{}\"",
+                                    crate::value::lossy(&*s)
+                                ))?,
+                                ArrKey::Int(i) => {
+                                    self.warn(&format!("Undefined array key {}", i))?
+                                }
+                                ArrKey::Tomb => {}
+                            }
+                        }
+                    }
+                    c = cell(Value::Null);
+                }
+                Step::Stop => return Ok(Value::Null),
+            }
+        }
+        Ok(c.borrow().clone())
+    }
+
+    /// A dim key evaluates eagerly (zend orders dims before the RHS)
+    /// but a variable key keeps its cell — the write lands on the key's
+    /// CURRENT value, so an auto-vivified container that shares a name
+    /// with its key (`$v[$v] -= 1`) throws the illegal-key TypeError.
+    fn dim_key(&mut self, ie: &Expr) -> Result<Option<Cell>, PhpError> {
+        let mut ie = ie;
+        while let Expr::Paren(inner) = ie {
+            ie = inner.as_ref();
+        }
+        match ie {
+            Expr::Var(n) => match self.var_lookup(n) {
+                Some(c) => Ok(Some(c)),
+                None => {
+                    if self.silence == 0 {
+                        self.warn(&format!("Undefined variable ${}", n))?;
+                    }
+                    Ok(Some(cell(Value::Null)))
+                }
+            },
+            Expr::VarVar(inner) => {
+                let v = self.eval(inner)?;
+                let name = self.conv_str(&v)?;
+                match self.var_lookup(&name) {
+                    Some(c) => Ok(Some(c)),
+                    None => {
+                        if self.silence == 0 {
+                            self.warn(&format!("Undefined variable ${}", name))?;
+                        }
+                        Ok(Some(cell(Value::Null)))
+                    }
+                }
+            }
+            _ => self.eval(ie).map(|v| Some(cell(v))),
+        }
+    }
+
+    /// Zend type name for keys that are illegal array offsets — the
+    /// `Cannot access offset of type K on T` TypeError wording.
+    fn illegal_offset_ty(v: &Value) -> Option<String> {
+        match v {
+            Value::Array(_) => Some("array".to_string()),
+            Value::Object(o) => Some(o.borrow().class.name().to_string()),
+            Value::Callable(_) => Some("Closure".to_string()),
+            _ => None,
+        }
     }
 
     /// `$a[$k]` keys: object/closure keys are a catchable Error

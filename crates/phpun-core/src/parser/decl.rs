@@ -322,16 +322,9 @@ impl<'a> Parser<'a> {
 
     pub(in crate::parser) fn foreach_target(&mut self) -> Result<ForeachTarget, PhpError> {
         if self.eat_op("&") {
-            return match self.next() {
-                Some(Token::Variable(n)) => Ok(ForeachTarget::ByRef(n)),
-                t => Err(PhpError::parse(
-                    format!(
-                        "syntax error, unexpected {}, expecting variable",
-                        desc_t(t.as_ref())
-                    ),
-                    self.line(),
-                )),
-            };
+            // `&$v`, `&$o->p`, `&$a[i]` — a write-context `new_variable`
+            // chain (call roots and `?->` are compile fatals).
+            return Ok(ForeachTarget::ByRef(Box::new(self.ref_variable(true)?)));
         }
         if self.at_op("[") {
             self.pos += 1;
@@ -1318,6 +1311,8 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let prev_ret_by_ref = self.ret_by_ref;
+        self.ret_by_ref = by_ref;
         let (body, end_line) = if self.eat_op(";") {
             (Vec::new(), line)
         } else {
@@ -1325,6 +1320,7 @@ impl<'a> Parser<'a> {
             let e = self.prev_line();
             (b, e)
         };
+        self.ret_by_ref = prev_ret_by_ref;
         self.hook_ctx = prev_hook;
         Ok(MethodDecl {
             decl: FunctionDecl {
@@ -1744,8 +1740,11 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let prev_ret_by_ref = self.ret_by_ref;
+        self.ret_by_ref = by_ref;
         let body = self.body()?;
         let end_line = self.prev_line();
+        self.ret_by_ref = prev_ret_by_ref;
         self.hook_ctx = prev_hook;
         let name = self.ns_qualify(&name);
         Ok(Stmt::Function(FunctionDecl {

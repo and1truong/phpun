@@ -282,7 +282,8 @@ pub enum ForeachKey {
 #[derive(Debug, Clone)]
 pub enum ForeachTarget {
     Var(String),
-    ByRef(String),
+    /// `&$v` / `&$o->p` / `&$a[i]` — a `new_variable` chain bound by ref.
+    ByRef(Box<Expr>),
     /// Any other assignable lvalue (`$b[0]`, `$o->p`, ...).
     Lvalue(Box<Expr>),
     List(Vec<Option<ForeachTarget>>),

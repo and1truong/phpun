@@ -41,7 +41,7 @@ impl<'a> Interp<'a> {
             }
             Stmt::Foreach { arr, val, body, .. } => {
                 Self::expr_contains_yield(arr)
-                    || matches!(val, ForeachTarget::Lvalue(e) if Self::expr_contains_yield(e))
+                    || matches!(val, ForeachTarget::Lvalue(e) | ForeachTarget::ByRef(e) if Self::expr_contains_yield(e))
                     || Self::decl_contains_yield(body)
             }
             Stmt::Switch { cond, cases } => {

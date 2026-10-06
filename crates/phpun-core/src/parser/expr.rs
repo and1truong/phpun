@@ -85,6 +85,8 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let prev_ret_by_ref = self.ret_by_ref;
+        self.ret_by_ref = by_ref;
         let (body, end_line) = if arrow {
             self.expect_op("=>")?;
             let e = self.expr()?;
@@ -97,6 +99,7 @@ impl<'a> Parser<'a> {
             let el = self.prev_line();
             (b, el)
         };
+        self.ret_by_ref = prev_ret_by_ref;
         self.hook_ctx = prev_hook;
         Ok(Expr::Closure(ClosureExpr {
             decl: FunctionDecl {
@@ -944,7 +947,226 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn postfix(&mut self) -> Result<Expr, PhpError> {
-        let mut e = self.primary()?;
+        let e = self.primary()?;
+        self.postfix_rest(e)
+    }
+
+    /// The RHS of `=&` / `foreach (.. as &..)` / `[&..]`: Zend's
+    /// `new_variable` grammar — a variable/call root followed by any
+    /// `->x`/`[x]`/`::x`/`(...)` links. Anything else is a parse error
+    /// (`unexpected integer`, `expecting "->"`, ...) and call roots in a
+    /// write context (foreach `&`) are a compile fatal.
+    pub(in crate::parser) fn ref_variable(&mut self, write_ctx: bool) -> Result<Expr, PhpError> {
+        use crate::ast::Expr::*;
+        const KW_REJECT: &[&str] = &[
+            "clone",
+            "function",
+            "fn",
+            "match",
+            "throw",
+            "print",
+            "echo",
+            "foreach",
+            "if",
+            "else",
+            "elseif",
+            "while",
+            "do",
+            "for",
+            "switch",
+            "return",
+            "global",
+            "unset",
+            "include",
+            "include_once",
+            "require",
+            "require_once",
+            "isset",
+            "empty",
+            "list",
+            "array",
+            "eval",
+            "exit",
+            "die",
+            "try",
+            "catch",
+            "finally",
+            "class",
+            "interface",
+            "trait",
+            "enum",
+            "extends",
+            "implements",
+            "use",
+            "namespace",
+            "declare",
+            "var",
+            "const",
+            "public",
+            "private",
+            "protected",
+            "abstract",
+            "final",
+            "readonly",
+            "instanceof",
+            "insteadof",
+            "or",
+            "and",
+            "xor",
+            "yield",
+            "goto",
+            "continue",
+            "break",
+        ];
+        let starter_ok = match self.peek() {
+            Some(Token::Variable(_))
+            | Some(Token::SimpleString(_))
+            | Some(Token::InterpString(_)) => true,
+            Some(Token::Op(o)) => matches!(*o, "$" | "$${" | "(" | "["),
+            Some(Token::Ident(n)) => !KW_REJECT.contains(&n.as_str()),
+            _ => false,
+        };
+        if !starter_ok {
+            let desc = match self.peek().cloned() {
+                Some(Token::Int(n)) => format!("integer \"{}\"", n),
+                Some(Token::Float(n)) => format!("floating-point number \"{}\"", n),
+                Some(Token::Ident(n)) => format!("token \"{}\"", n),
+                t => desc_t(t.as_ref()),
+            };
+            return Err(PhpError::parse(
+                format!("syntax error, unexpected {}", desc),
+                self.line(),
+            ));
+        }
+        let e = self.postfix()?;
+        // Deepest chain root: container of `x[...]`/`x->y`/`x->m()`.
+        // Parens are transparent; a Call node is itself a legal root
+        // (`=& f()`, `=& ($f)()`), so call names are NOT unwrapped.
+        // `linked` = a real deref link was consumed — a parenthesized
+        // expr alone is NOT a `new_variable` (`=& (1)` stays a parse
+        // error, not the temporary-expression fatal).
+        let mut leaf: &Expr = &e;
+        let mut linked = false;
+        loop {
+            leaf = match leaf {
+                Index { e: c, .. } => {
+                    linked = true;
+                    c.as_ref()
+                }
+                Prop { obj, .. } => {
+                    linked = true;
+                    obj.as_ref()
+                }
+                MethodCall { obj, .. } => {
+                    linked = true;
+                    obj.as_ref()
+                }
+                Paren(inner) => inner.as_ref(),
+                _ => break,
+            };
+        }
+        let callish = |x: &Expr| -> Option<&'static str> {
+            match x {
+                MethodCall { .. } => Some("method"),
+                Call { .. } | StaticCall { .. } | StaticCallDyn { .. } | Fcc(_) => Some("function"),
+                _ => None,
+            }
+        };
+        if !linked {
+            // No deref link — the leaf IS the whole expr (mod parens).
+            match leaf {
+                Var(_) | VarVar(_) | StaticProp { .. } => {}
+                Call { .. }
+                | MethodCall { .. }
+                | StaticCall { .. }
+                | StaticCallDyn { .. }
+                | Fcc(_) => {
+                    if write_ctx {
+                        return Err(PhpError::compile_fatal(
+                            format!(
+                                "Can't use {} return value in write context",
+                                callish(leaf).unwrap_or("function")
+                            ),
+                            self.line(),
+                        ));
+                    }
+                }
+                New { .. } => {
+                    // `new C` wants `(`, `new C()` wants a deref link.
+                    let had_parens = matches!(
+                        self.toks.get(self.pos.wrapping_sub(1)).map(|l| &l.token),
+                        Some(Token::Op(")"))
+                    );
+                    return Err(PhpError::parse(
+                        if had_parens {
+                            "syntax error, unexpected token \";\", expecting \"->\" or \"?->\" or \"[\""
+                        } else {
+                            "syntax error, unexpected token \";\", expecting \"(\""
+                        },
+                        self.line(),
+                    ));
+                }
+                _ => {
+                    return Err(PhpError::parse(
+                        "syntax error, unexpected token \";\", expecting \"->\" or \"?->\" or \"[\"",
+                        self.line(),
+                    ));
+                }
+            }
+        } else {
+            // A chain consumed at least one link — the ROOT must be a
+            // variable/call/string family; literal and const-expr roots
+            // (`true[0]`, `C::CONST[0]`, `new C()->x`) are a compile
+            // fatal.
+            match leaf {
+                Var(_)
+                | VarVar(_)
+                | Call { .. }
+                | MethodCall { .. }
+                | StaticCall { .. }
+                | StaticCallDyn { .. }
+                | Fcc(_)
+                | Paren(_)
+                | Str(_)
+                | Interp(_)
+                | StaticProp { .. } => {}
+                _ => {
+                    return Err(PhpError::compile_fatal(
+                        "Cannot use temporary expression in write context",
+                        self.line(),
+                    ));
+                }
+            }
+            // In write context (foreach `&`) a call-shaped OUTER node
+            // dies too — `&f()`, `&$o->m()`. A callish root under a
+            // deref (`&f()->x`) survives the leaf check but still dies.
+            let mut kind = callish(&e);
+            if kind.is_none() {
+                kind = callish(leaf);
+            }
+            if write_ctx {
+                if let Some(kind) = kind {
+                    return Err(PhpError::compile_fatal(
+                        format!("Can't use {} return value in write context", kind),
+                        self.line(),
+                    ));
+                }
+            }
+        }
+        if Self::has_nullsafe(&e) {
+            return Err(PhpError::compile_fatal(
+                if write_ctx {
+                    "Can't use nullsafe operator in write context"
+                } else {
+                    "Cannot take reference of a nullsafe chain"
+                },
+                self.line(),
+            ));
+        }
+        Ok(e)
+    }
+
+    pub(in crate::parser) fn postfix_rest(&mut self, mut e: Expr) -> Result<Expr, PhpError> {
         loop {
             if self.eat_op("++") {
                 if matches!(
@@ -1188,6 +1410,19 @@ impl<'a> Parser<'a> {
                         ))
                     }
                 }
+            } else if self.at_op("=") && matches!(self.peek2(), Some(Token::Op("&"))) {
+                // `expr =& variable` — the `&` binds tighter than any
+                // op that can follow (`?`, `??`, binary ops keep going
+                // on the Assign node). The RHS is Zend's restricted
+                // `new_variable` grammar, not a full expression.
+                self.pos += 2;
+                let rhs = self.ref_variable(false)?;
+                let target = self.list_target(e)?;
+                e = Expr::Assign {
+                    target: Box::new(target),
+                    op: "=&",
+                    value: Box::new(rhs),
+                };
             } else {
                 return Ok(e);
             }
@@ -1200,6 +1435,15 @@ impl<'a> Parser<'a> {
         match e {
             Expr::MethodCall { obj, nullsafe, .. } => *nullsafe || Self::has_nullsafe(obj),
             Expr::Prop { obj, nullsafe, .. } => *nullsafe || Self::has_nullsafe(obj),
+            // Chain positions only — arg lists are independent exprs.
+            Expr::Index { e, .. } => Self::has_nullsafe(e),
+            Expr::Paren(inner) => Self::has_nullsafe(inner),
+            Expr::Call { name, .. } => Self::has_nullsafe(name),
+            Expr::StaticCall { class, .. }
+            | Expr::StaticCallDyn { class, .. }
+            | Expr::StaticProp { class, .. }
+            | Expr::ClassConst { class, .. } => Self::has_nullsafe(class),
+            Expr::Fcc(inner) => Self::has_nullsafe(inner),
             _ => false,
         }
     }
@@ -1724,7 +1968,7 @@ impl<'a> Parser<'a> {
         if self.eat_op("...") {
             Ok(Expr::Unpack(Box::new(self.expr()?)))
         } else if self.eat_op("&") {
-            Ok(Expr::ByRef(Box::new(self.expr()?)))
+            Ok(Expr::ByRef(Box::new(self.ref_variable(false)?)))
         } else {
             self.expr()
         }

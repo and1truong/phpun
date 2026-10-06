@@ -1117,7 +1117,9 @@ impl<'a> Interp<'a> {
 
     fn gate_foreach_target(t: &ForeachTarget) -> Result<(), PhpError> {
         match t {
-            ForeachTarget::Lvalue(e) => Self::gate_expr(e, &GateMode::Runtime),
+            ForeachTarget::ByRef(e) | ForeachTarget::Lvalue(e) => {
+                Self::gate_expr(e, &GateMode::Runtime)
+            }
             ForeachTarget::List(ts) => {
                 for t in ts.iter().flatten() {
                     Self::gate_foreach_target(t)?;
@@ -2237,7 +2239,19 @@ impl<'a> Interp<'a> {
             for n in names {
                 if let Some(c) = self.globals.vars.get(&n).cloned() {
                     self.mark_ref(&c);
-                    a.set_cell(ArrKey::Str(n.clone().into()), c);
+                    let key = ArrKey::Str(n.clone().into());
+                    // The var's cell may have been rebound (`$x =& $y`)
+                    // — the table slot follows it rather than having
+                    // the new value written into the stale slot cell
+                    // (030's aliasing must survive a sync).
+                    if a.get_cell(&key)
+                        .map(|s| !Rc::ptr_eq(&s, &c))
+                        .unwrap_or(false)
+                    {
+                        a.bind_cell(key, c);
+                    } else {
+                        a.set_cell(key, c);
+                    }
                     self.globals_synced.insert(n);
                 }
             }
