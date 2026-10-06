@@ -915,21 +915,33 @@ impl<'a> Interp<'a> {
                 }
                 if pos > 0 || dead {
                     if dead {
-                        if !engine || pos < len {
-                            // Explicit rewind is a silent no-op; a
-                            // dead-but-not-exhausted gen delivers its
-                            // buffered items first — the death
-                            // surfaces at the NEXT resume past them.
+                        if pos == 0 {
+                            // Dead while still at the first item:
+                            // rewind is a silent no-op — the buffered
+                            // items serve, the death surfaces at the
+                            // resume past them.
                             return Ok(Some(Value::Null));
                         }
-                        // Engine-driven consume of an exhausted dead
-                        // gen surfaces the body's deferred death —
-                        // or reports 'closed' once consumed.
-                        self.gen_raise_deferred(&state, "rewind", &args.cells)?;
+                        if engine && pos >= len {
+                            // Engine-driven consume of an exhausted
+                            // dead gen surfaces the body's deferred
+                            // death — or reports 'closed' once
+                            // consumed.
+                            self.gen_raise_deferred(&state, "rewind", &args.cells)?;
+                            return Err(self.gen_method_throw(
+                                "rewind",
+                                &args.cells,
+                                "Cannot traverse an already closed generator",
+                            ));
+                        }
+                        // Dead mid-buffer — an explicit ->rewind() or
+                        // a foreach re-init both hit Zend's 'already
+                        // run' gate; the silent continue only ever
+                        // applied at pos==0.
                         return Err(self.gen_method_throw(
                             "rewind",
                             &args.cells,
-                            "Cannot traverse an already closed generator",
+                            "Cannot rewind a generator that was already run",
                         ));
                     }
                     let msg = if engine && pos >= len {
@@ -1099,17 +1111,12 @@ impl<'a> Interp<'a> {
                 Err(self.throw(e))
             }
             "getreturn" => {
-                // getReturn() never runs the body: Zend throws
-                // 'hasn't returned' for unstarted, still-running, or
-                // dead generators — it only reports the stored return
-                // once the consumer exhausted the gen cleanly.
-                if !state.borrow().started {
-                    return Err(self.gen_method_throw(
-                        "getReturn",
-                        &args.cells,
-                        "Cannot get return value of a generator that hasn't returned",
-                    ));
-                }
+                // getReturn() starts the body first (zend_generator
+                // _ensure_initialized) — a `{ return; yield; }` gen
+                // completes and reports NULL, while one that yielded
+                // throws 'hasn't returned' once the run proves it
+                // unfinished.
+                self.gen_start(&state)?;
                 self.gen_flush_out(&state, usize::MAX);
                 self.gen_raise_deferred(&state, "getReturn", &args.cells)?;
                 let st = state.borrow();
