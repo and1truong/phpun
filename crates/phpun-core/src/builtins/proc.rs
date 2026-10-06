@@ -23,10 +23,13 @@ pub(crate) fn dispatch(
         "proc_get_status" => proc_get_status(it, args)?,
         "proc_terminate" => proc_terminate(it, args)?,
         "proc_nice" => {
-            if args.is_empty() {
+            if args.len() != 1 {
                 return err(
                     "ArgumentCountError",
-                    "proc_nice() expects exactly 1 argument, 0 given",
+                    format!(
+                        "proc_nice() expects exactly 1 argument, {} given",
+                        args.len()
+                    ),
                 );
             }
             let n = zpp_long_arg(it, args, 0, "proc_nice", 1, "$priority")? as i32;
@@ -397,6 +400,13 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
                     "proc_open(): Argument #1 ($command) must not be empty",
                 );
             }
+            // zend rejects an empty argv[0] before the NUL scan.
+            if elems[0].is_empty() {
+                return err(
+                    "ValueError",
+                    "First element must contain a non-empty program name",
+                );
+            }
             // zend checks every element for NUL before exec and throws
             // "Command array element N contains a null byte" (1-based).
             for (i, e) in elems.iter().enumerate() {
@@ -414,13 +424,9 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
             )
         }
         v => {
+            // An empty string is legal — zend runs /bin/sh -c ''
+            // (the shell exits 0, proc_close reports 0).
             let b = it.to_bytes_of(v);
-            if b.is_empty() {
-                return err(
-                    "ValueError",
-                    "proc_open(): Argument #1 ($command) must not be empty",
-                );
-            }
             (None, String::from_utf8_lossy(&b).into_owned(), b)
         }
     };
@@ -1155,6 +1161,15 @@ fn mb_len(b: &[u8], i: usize) -> i32 {
     };
     if i + n > b.len() || !b[i + 1..i + n].iter().all(|&x| x & 0xC0 == 0x80) {
         return -1;
+    }
+    // zend php_mblen rejects overlong encodings and UTF-16 surrogates
+    // via the second byte (E0 → >=0xA0, ED → <=0x9F, F0 → >=0x90).
+    // F4's upper bound is NOT checked — >U+10FFFF sequences are kept.
+    match (c, b[i + 1]) {
+        (0xE0, s) if s < 0xA0 => return -1,
+        (0xED, s) if s > 0x9F => return -1,
+        (0xF0, s) if s < 0x90 => return -1,
+        _ => {}
     }
     n as i32
 }

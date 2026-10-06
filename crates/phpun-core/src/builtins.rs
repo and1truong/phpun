@@ -496,6 +496,7 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "pow"
             | "proc_close"
             | "proc_get_status"
+            | "proc_nice"
             | "proc_open"
             | "proc_terminate"
             | "preg_jit"
@@ -879,7 +880,8 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
             ("seconds", Req),
             ("microseconds", Null)
         ),
-        "stream_set_blocking" => bp!(("stream", Req), ("mode", Bool(true))),
+        // oracle takes exactly 2 args — zend's $mode has no default.
+        "stream_set_blocking" => bp!(("stream", Req), ("mode", Req)),
         "stream_get_meta_data" => bp!(("stream", Req)),
         "header" => bp!(
             ("header", Req),
