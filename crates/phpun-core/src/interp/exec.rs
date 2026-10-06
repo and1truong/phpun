@@ -292,13 +292,16 @@ impl<'a> Interp<'a> {
                     return self.err_flow(e);
                 }
                 let key = d.name.to_lowercase();
-                if let Some(prev) = self.functions.get(&key) {
-                    // Early-bound decls are compile-time registered —
-                    // reaching their own stmt is a no-op, not a collision.
-                    let self_decl = prev.line == d.line
-                        && prev.file == self.cur_file
-                        && self.early_bound_funcs.contains(&key);
-                    if !self_decl {
+                let site = std::ptr::from_ref(d) as usize;
+                // The decl site early-bound at compile no-ops on
+                // execution; a DIFFERENT decl (a conditional decl in an
+                // if/loop, or a decl in another unit) claiming the
+                // occupied name is the 'Cannot redeclare' fatal — a
+                // line+file match is not enough, two decls can share
+                // a line.
+                let self_decl = self.early_bound_funcs.get(&key) == Some(&(self.cur_unit_id, site));
+                if !self_decl {
+                    if let Some(prev) = self.functions.get(&key) {
                         let e = self.decl_fatal_ctx(PhpError::fatal(
                             format!(
                                 "Cannot redeclare function {}() (previously declared in {}:{})",

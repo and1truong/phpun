@@ -40,6 +40,9 @@ struct ScanScope {
     gotos: Vec<GotoSite>,
     /// static var name → first decl line (dup-decl detection).
     statics: HashMap<String, usize>,
+    /// Current source line from the last `Stmt::Line` marker — kept on
+    /// the scope so it carries across the top-level per-stmt scans.
+    line: usize,
     warns: Vec<(String, usize)>,
 }
 
@@ -58,7 +61,9 @@ impl<'a> Interp<'a> {
     /// fails — Zend reports them while compiling.
     pub(in crate::interp) fn flow_gate(&mut self, stmts: &[Stmt]) -> Result<(), PhpError> {
         let mut sc = ScanScope::default();
-        let r = Self::flow_scope(stmts, &mut sc);
+        let r = self
+            .flow_unit(stmts, &mut sc)
+            .and_then(|_| Self::flow_resolve_gotos(&sc));
         for (msg, line) in sc.warns {
             self.cur_line = line;
             let _ = self.warn(&msg);
@@ -66,12 +71,48 @@ impl<'a> Interp<'a> {
         r
     }
 
+    /// Top level of a unit (or a `namespace {}` body): unconditional
+    /// `function` decls early-bind AT THEIR POSITION in Zend's compile
+    /// (the function-table insert runs per statement, not after the
+    /// unit), so a collision fatal can fire before a later stmt's flow
+    /// error — `function a(){} function a(){} break;` reports the
+    /// redeclare, `break; function a(){} function a(){}` the break.
+    /// Classes are different: their redeclare check stays deferred in
+    /// hoist_funcs (`class A{} class A{} break` reports the break).
+    fn flow_unit(&mut self, stmts: &[Stmt], sc: &mut ScanScope) -> Result<(), PhpError> {
+        for s in stmts {
+            if let Stmt::Function(d) = s {
+                self.hoist_func(d)?;
+            }
+            if let Stmt::Block(v) = s {
+                if matches!(v.first(), Some(Stmt::Namespace(_))) {
+                    // `namespace X { stmts }` — decls inside are still
+                    // unconditional top-level for early binding (ns_085).
+                    for inner in &v[1..] {
+                        if let Stmt::Block(b) = inner {
+                            self.flow_unit(b, sc)?;
+                        } else {
+                            Self::flow_scan(std::slice::from_ref(inner), sc)?;
+                        }
+                    }
+                    continue;
+                }
+            }
+            Self::flow_scan(std::slice::from_ref(s), sc)?;
+        }
+        Ok(())
+    }
+
     /// Scan one label/goto scope: the unit's top level or one function
     /// body (labels and `static` declarations bind per function).
     fn flow_scope(stmts: &[Stmt], sc: &mut ScanScope) -> Result<(), PhpError> {
         Self::flow_scan(stmts, sc)?;
-        // Zend resolves a function's gotos when its op_array finishes
-        // compiling — after every label in it was collected.
+        Self::flow_resolve_gotos(sc)
+    }
+
+    /// Zend resolves a function's gotos when its op_array finishes
+    /// compiling — after every label in it was collected.
+    fn flow_resolve_gotos(sc: &ScanScope) -> Result<(), PhpError> {
         for g in &sc.gotos {
             match sc.labels.get(&g.name) {
                 None => {
@@ -135,21 +176,20 @@ impl<'a> Interp<'a> {
     }
 
     fn flow_scan(stmts: &[Stmt], sc: &mut ScanScope) -> Result<(), PhpError> {
-        let mut line = 0usize;
         for s in stmts {
             match s {
-                Stmt::Line(l) => line = *l,
+                Stmt::Line(l) => sc.line = *l,
                 Stmt::Function(d) => {
                     Self::flow_fn(d, &mut sc.warns)?;
                 }
                 Stmt::Class(d) => {
                     Self::flow_class(d, &mut sc.warns)?;
                 }
-                Stmt::Break(op) => Self::flow_operand(op.as_ref(), line, true, sc)?,
-                Stmt::Continue(op) => Self::flow_operand(op.as_ref(), line, false, sc)?,
+                Stmt::Break(op) => Self::flow_operand(op.as_ref(), sc.line, true, sc)?,
+                Stmt::Continue(op) => Self::flow_operand(op.as_ref(), sc.line, false, sc)?,
                 Stmt::Goto(n) => sc.gotos.push(GotoSite {
                     name: n.clone(),
-                    line,
+                    line: sc.line,
                     loops: sc.ctxs.iter().map(|c| c.id()).collect(),
                     fin: sc.fin,
                 }),
@@ -158,7 +198,7 @@ impl<'a> Interp<'a> {
                     if sc.labels.insert(n.clone(), site).is_some() {
                         return Err(PhpError::compile_fatal(
                             format!("Label '{}' already defined", n),
-                            line,
+                            sc.line,
                         ));
                     }
                 }

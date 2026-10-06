@@ -255,7 +255,7 @@ impl<'a> Interp<'a> {
         let saved_su = self
             .stack
             .last_mut()
-            .map(|f| std::mem::replace(&mut f.statics_unit, Some(self.cur_unit_id)));
+            .map(|f| f.statics_unit.replace(self.cur_unit_id));
         let flow = match Self::const_closure_gate(&stmts)
             .and_then(|_| self.flow_gate(&stmts))
             .and_then(|_| self.hoist_funcs(&stmts))
@@ -376,7 +376,7 @@ impl<'a> Interp<'a> {
                 let saved_su = self
                     .stack
                     .last_mut()
-                    .map(|f| std::mem::replace(&mut f.statics_unit, Some(self.cur_unit_id)));
+                    .map(|f| f.statics_unit.replace(self.cur_unit_id));
                 // Zend traces through eval'd code carry a `FILE(N):
                 // eval()` frame at the call site (rendered bare — the
                 // eval'd source is not an arg in backtraces).
@@ -390,19 +390,24 @@ impl<'a> Interp<'a> {
                     named_args: Vec::new(),
                     internal: true,
                 });
-                let flow =
-                    match Self::const_closure_gate(&stmts).and_then(|_| self.flow_gate(&stmts)) {
-                        Err(mut e) => {
-                            // Gate errors are compile fatals of the eval'd
-                            // unit — attribute to the eval()'d-code context
-                            // and carry the live backtrace (Zend compiles
-                            // eval'd code at the call site).
-                            self.last_err_file = self.cur_file.clone();
-                            e.trace = Some(self.compile_err_frames());
-                            self.err_flow(e)
-                        }
-                        Ok(()) => self.exec_block(&stmts),
-                    };
+                let flow = match Self::const_closure_gate(&stmts)
+                    .and_then(|_| self.flow_gate(&stmts))
+                    // eval'd code early-binds its unconditional decls
+                    // like any compile unit (`eval('a(); function a(){}')`
+                    // works; a collision is a compile fatal here).
+                    .and_then(|_| self.hoist_funcs(&stmts))
+                {
+                    Err(mut e) => {
+                        // Gate errors are compile fatals of the eval'd
+                        // unit — attribute to the eval()'d-code context
+                        // and carry the live backtrace (Zend compiles
+                        // eval'd code at the call site).
+                        self.last_err_file = self.cur_file.clone();
+                        e.trace = Some(self.compile_err_frames());
+                        self.err_flow(e)
+                    }
+                    Ok(()) => self.exec_block(&stmts),
+                };
                 self.loop_depth = saved_depth;
                 self.cur_unit_id = saved_unit;
                 if let Some(su) = saved_su {

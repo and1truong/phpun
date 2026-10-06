@@ -245,10 +245,12 @@ pub struct Interp<'a> {
     /// no-ops on execution — a different decl site claiming the name
     /// still hits the 'Cannot redeclare' check (namespaces/ns_060).
     early_bound_classes: HashMap<String, usize>,
-    /// Functions registered by hoisting; their decl stmt no-ops like
-    /// PHP's early binding (the redeclare fatal only fires when a
-    /// DIFFERENT decl claims an existing name).
-    early_bound_funcs: HashSet<String>,
+    /// Function decl sites early-bound at compile: lname →
+    /// (compile unit, decl node ptr) — reaching that same site at
+    /// runtime is a no-op, any OTHER decl into the occupied name is
+    /// 'Cannot redeclare'. The unit guards against a freed AST Vec
+    /// recycling the node ptr across re-parses.
+    early_bound_funcs: HashMap<String, (u64, usize)>,
     /// Per-include top-level namespace: `(stack depth at include,
     /// file's current ns)`. An included file's `namespace` decl governs
     /// ITS top-level code, not the calling frame's (php-parser's
@@ -827,7 +829,7 @@ impl<'a> Interp<'a> {
             consts_linked: std::collections::HashSet::new(),
             decl_aliases: Vec::new(),
             early_bound_classes: HashMap::new(),
-            early_bound_funcs: HashSet::new(),
+            early_bound_funcs: HashMap::new(),
             include_ns: Vec::new(),
             constants,
             out: Vec::new(),
@@ -1363,29 +1365,36 @@ impl<'a> Interp<'a> {
     /// PHP binds a compilation unit's unconditional top-level function
     /// decls before executing it (bug23279's later-declared handler).
     /// A name collision is PHP's compile-time "Cannot redeclare" fatal.
+    /// Early-bind one unconditional top-level `function` decl — Zend
+    /// inserts into the function table while compiling the stmt, so a
+    /// name collision is the compile-time 'Cannot redeclare' fatal.
+    /// Called from the flow gate at the decl's position (flow.rs).
+    fn hoist_func(&mut self, d: &FunctionDecl) -> Result<(), PhpError> {
+        let _ = self.decl_type_checks(&d.name, d, None);
+        let key = d.name.to_lowercase();
+        if let Some(prev) = self.functions.get(&key) {
+            // Early binding dies at compile time in Zend —
+            // the include/eval arms attach the compile-
+            // context backtrace to this error.
+            return Err(PhpError::compile_fatal(
+                format!(
+                    "Cannot redeclare function {}() (previously declared in {}:{})",
+                    d.name, prev.file, prev.line
+                ),
+                d.line,
+            ));
+        }
+        let site = std::ptr::from_ref(d) as usize;
+        let mut d = d.clone();
+        d.file = self.cur_file.clone();
+        self.functions.insert(key.clone(), Rc::new(d));
+        self.early_bound_funcs.insert(key, (self.cur_unit_id, site));
+        Ok(())
+    }
+
     fn hoist_funcs(&mut self, stmts: &[Stmt]) -> Result<(), PhpError> {
         for s in stmts {
             match s {
-                Stmt::Function(d) => {
-                    let _ = self.decl_type_checks(&d.name, d, None);
-                    let key = d.name.to_lowercase();
-                    if let Some(prev) = self.functions.get(&key) {
-                        // Early binding dies at compile time in Zend —
-                        // the include/eval arms attach the compile-
-                        // context backtrace to this error.
-                        return Err(PhpError::compile_fatal(
-                            format!(
-                                "Cannot redeclare function {}() (previously declared in {}:{})",
-                                d.name, prev.file, prev.line
-                            ),
-                            d.line,
-                        ));
-                    }
-                    let mut d = d.clone();
-                    d.file = self.cur_file.clone();
-                    self.functions.insert(key.clone(), Rc::new(d));
-                    self.early_bound_funcs.insert(key);
-                }
                 // `namespace X { stmts }` parses as
                 // Block[Namespace, Block[stmts]] — decls inside are still
                 // unconditional top-level for early binding (ns_085).
