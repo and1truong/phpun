@@ -3861,7 +3861,13 @@ impl<'a> Interp<'a> {
                         Some(c) => self.const_self.replace(c),
                         None => self.const_self.take(),
                     };
+                    // Param defaults name their enclosing function —
+                    // const_self serves `self::` binds but must not
+                    // blank the enclosing fn name the way class-init
+                    // const eval does ({closure:M::m():L}).
+                    let pb = self.param_bind_ctx.replace(self.class_const_ctx);
                     let r = self.eval_decl_const(d, &decl.file);
+                    self.param_bind_ctx = pb;
                     self.const_self = old;
                     self.cur_line = prev_line;
                     let mut dv = match r {

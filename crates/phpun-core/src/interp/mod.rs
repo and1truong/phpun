@@ -391,6 +391,10 @@ pub struct Interp<'a> {
     /// The class whose const/prop initializer is being evaluated —
     /// `self`/`parent` inside it bind to this class, not the caller.
     const_self: Option<Rc<PhpClass>>,
+    /// Ambient `class_const_ctx` level while a PARAM default is being
+    /// evaluated — stack-based closure names apply only while it still
+    /// matches (a nested class initializer bumps it out from under us).
+    param_bind_ctx: Option<u32>,
     /// spl_autoload_register() callbacks, in registration order.
     pub autoload_fns: Vec<Value>,
     /// File currently executing — include resolution uses its directory
@@ -834,6 +838,7 @@ impl<'a> Interp<'a> {
             in_const_expr: 0,
             class_const_ctx: 0,
             const_self: None,
+            param_bind_ctx: None,
             autoload_fns: Vec::new(),
             obj_handles: Vec::new(),
             fcc_fn_cache: HashMap::new(),

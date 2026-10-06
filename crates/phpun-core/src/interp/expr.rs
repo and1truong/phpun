@@ -355,8 +355,14 @@ impl<'a> Interp<'a> {
                 // nested (iterable_003, closure_065). Class-init
                 // initializers (prop/const/static-prop defaults) have no
                 // enclosing function — file-based name regardless of the
-                // runtime caller's frame.
-                let enclosing = if self.const_self.is_some() {
+                // runtime caller's frame. Param-default evals also set
+                // const_self (for `self::` binds) but DO name the
+                // enclosing callee — param_bind_ctx records the ambient
+                // class-init level and only counts while a nested
+                // initializer hasn't bumped it.
+                let enclosing = if self.const_self.is_some()
+                    && self.param_bind_ctx != Some(self.class_const_ctx)
+                {
                     String::new()
                 } else {
                     self.stack
