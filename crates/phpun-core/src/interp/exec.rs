@@ -772,7 +772,8 @@ impl<'a> Interp<'a> {
             match self.exec_loop_body(body) {
                 Flow::Break(0) | Flow::Break(1) => return Flow::Normal,
                 Flow::Break(n) => return Flow::Break(n - 1),
-                Flow::Normal | Flow::Continue(_) => {}
+                Flow::Normal | Flow::Continue(0) | Flow::Continue(1) => {}
+                Flow::Continue(n) => return Flow::Continue(n - 1),
                 f => return f,
             }
         }
