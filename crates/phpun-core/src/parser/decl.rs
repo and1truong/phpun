@@ -838,6 +838,11 @@ impl<'a> Parser<'a> {
                     self.expect_op("(")?;
                     match self.args() {
                         Ok(list) => {
+                            // Attribute args aren't evaluated through
+                            // the call machinery — drop the `argline`
+                            // call-site line markers.
+                            let list: Vec<Expr> =
+                                list.into_iter().map(Self::unmark_argline).collect();
                             // Duplicate named args are a compile-time
                             // fatal for attribute args (unlike calls,
                             // which warn at bind time).

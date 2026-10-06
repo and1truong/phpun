@@ -548,9 +548,11 @@ impl<'a> Parser<'a> {
                     .collect(),
             )),
             Expr::Call { name, args, site } => match *name {
-                Expr::Str(n) if n.eq_ignore_ascii_case("list") => {
-                    Ok(Expr::List(args.into_iter().map(Some).collect()))
-                }
+                Expr::Str(n) if n.eq_ignore_ascii_case("list") => Ok(Expr::List(
+                    args.into_iter()
+                        .map(|a| Some(Self::unmark_argline(a)))
+                        .collect(),
+                )),
                 other => Ok(Expr::Call {
                     name: Box::new(other),
                     args,
@@ -1277,9 +1279,12 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// Parses `(arg, ...)`: returns the arg exprs, the last wrapped in
-    /// an `argline` marker carrying that arg's own line (call-site
-    /// attribution for pushed frames — zend's last-SEND line).
+    /// Parses `(arg, ...)`: each returned arg is wrapped in an
+    /// `argline` marker carrying that arg's own first-token line —
+    /// diagnostics raised while evaluating an argument attribute to
+    /// the arg's line, like zend's per-op line info (a warning inside
+    /// a multi-line call's argument reports the arg's line, not the
+    /// call's).
     pub(in crate::parser) fn args(&mut self) -> Result<Vec<Expr>, PhpError> {
         let mut args: Vec<(Expr, usize)> = Vec::new();
         let mut unpacked = false;
@@ -1343,7 +1348,28 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op(")")?;
-        Ok(args.into_iter().map(|(e, _)| e).collect())
+        // Every arg carries its own line — the interpreter sites
+        // arg-eval diagnostics there (zend's per-op lines).
+        Ok(args
+            .into_iter()
+            .map(|(e, l)| Expr::Binary {
+                op: "argline",
+                l: Box::new(Expr::Int(l as i64)),
+                r: Box::new(e),
+            })
+            .collect())
+    }
+
+    /// Inverse of the `argline` wrapper — for consumers whose arg
+    /// lists are not evaluated by the call machinery (attribute args,
+    /// `list()` destructuring targets).
+    pub(in crate::parser) fn unmark_argline(e: Expr) -> Expr {
+        match e {
+            Expr::Binary {
+                op: "argline", r, ..
+            } => *r,
+            e => e,
+        }
     }
 
     pub(in crate::parser) fn prop_name(&mut self) -> Result<PropName, PhpError> {

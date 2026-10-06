@@ -175,6 +175,17 @@ impl<'a> Interp<'a> {
         self.call_named(&fname, args, site)
     }
 
+    /// Sees through the parser's `argline` per-arg line marker (every
+    /// call arg) to the argument expression itself.
+    pub(in crate::interp) fn unmark_arg(e: &Expr) -> &Expr {
+        match e {
+            Expr::Binary {
+                op: "argline", r, ..
+            } => r,
+            _ => e,
+        }
+    }
+
     /// Evaluate args into cells (by-ref params alias caller storage).
     /// `named` params collected as (name, cell) too. `site` is the
     /// call's own source line — recorded as the frame's call site once
@@ -192,7 +203,20 @@ impl<'a> Interp<'a> {
         // args don't advance it (they bind by name at call time).
         let mut pos = 0usize;
         let mut seen_named = false;
+        let saved_line = self.cur_line;
         for a in args {
+            // `argline` (each arg's own first-token line): Zend
+            // attributes a diagnostic raised while evaluating an
+            // argument to that arg's line, not the call's.
+            if let Expr::Binary {
+                op: "argline", l, ..
+            } = a
+            {
+                if let Expr::Int(n) = l.as_ref() {
+                    self.cur_line = *n as usize;
+                }
+            }
+            let a = Self::unmark_arg(a);
             let (name, expr): (Option<String>, &Expr) = match a {
                 Expr::Binary {
                     op: "named", l, r, ..
@@ -399,7 +423,10 @@ impl<'a> Interp<'a> {
             }
         }
         // All args evaluated — the enclosing call's own line is the
-        // frame's site (nested calls inside the args set their own).
+        // frame's site (nested calls inside the args set their own),
+        // and post-eval call diagnostics (arity, dispatch failures)
+        // site at the call itself, zend's DO_FCALL line.
+        self.cur_line = site.unwrap_or(saved_line);
         if let Some(s) = site {
             self.send_line = Some(s);
         }
@@ -631,7 +658,9 @@ impl<'a> Interp<'a> {
                 && matches!(lname.as_str(), "min" | "max")
                 && argvals.cells.len() == 2
                 && argvals.named.is_empty()
-                && !args.iter().any(|a| matches!(a, Expr::Unpack(_)))
+                && !args
+                    .iter()
+                    .any(|a| matches!(Self::unmark_arg(a), Expr::Unpack(_)))
                 && (fname.starts_with('\\') || (unqualified && self.caller_ns().is_empty()))
             {
                 let lhs = argvals.cells[0].borrow().clone();
@@ -669,7 +698,9 @@ impl<'a> Interp<'a> {
             // Zend can't specialize them — the frame is real.
             let literal = fname.starts_with('\\')
                 || (fname.starts_with('\u{1}') && self.caller_ns().is_empty());
-            let visible = args.iter().any(|a| matches!(a, Expr::Unpack(_)))
+            let visible = args
+                .iter()
+                .any(|a| matches!(Self::unmark_arg(a), Expr::Unpack(_)))
                 || !(literal && zend_literal_no_frame(&lname, args));
             if let Some(v) = self.call_builtin(&lname, &argvals, visible)? {
                 return Ok(v);
@@ -4479,7 +4510,7 @@ fn zend_literal_no_frame(name: &str, args: &[Expr]) -> bool {
     // rejects them anyway) — Zend emits a real call, not a rope.
     if args
         .iter()
-        .any(|a| matches!(a, Expr::Binary { op: "named", .. }))
+        .any(|a| matches!(Interp::unmark_arg(a), Expr::Binary { op: "named", .. }))
     {
         return false;
     }
@@ -4487,7 +4518,11 @@ fn zend_literal_no_frame(name: &str, args: &[Expr]) -> bool {
     // an all-literal `Expr::Interp`, or a foldable `"a" . "b"` concat
     // chain (zend_compile const-folds literal concats before the
     // sprintf check, so `"%" . "s"` specializes too).
-    let fmt: Vec<u8> = match args.first().and_then(const_str_fold) {
+    let fmt: Vec<u8> = match args
+        .first()
+        .map(Interp::unmark_arg)
+        .and_then(const_str_fold)
+    {
         Some(v) => v,
         None => return false,
     };

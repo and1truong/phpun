@@ -1217,8 +1217,19 @@ impl<'a> Interp<'a> {
         };
         let argvals = {
             let mut vs: Vec<Value> = Vec::new();
+            let saved_line = self.cur_line;
             for a in args {
-                match a {
+                // `argline` per-arg line marker — same per-arg
+                // attribution arg_cells applies (zend's arg-op lines).
+                if let Expr::Binary {
+                    op: "argline", l, ..
+                } = a
+                {
+                    if let Expr::Int(n) = l.as_ref() {
+                        self.cur_line = *n as usize;
+                    }
+                }
+                match Self::unmark_arg(a) {
                     Expr::Binary {
                         op: "named", l, r, ..
                     } => {
@@ -1242,9 +1253,11 @@ impl<'a> Interp<'a> {
                             }
                         }
                     }
-                    _ => vs.push(self.eval(a)?),
+                    e => vs.push(self.eval(e)?),
                 }
             }
+            // Post-eval call diagnostics site at the call itself.
+            self.cur_line = site.unwrap_or(saved_line);
             vs
         };
         // Arg eval may have pushed nested frames — restore this call's

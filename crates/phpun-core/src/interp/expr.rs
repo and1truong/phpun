@@ -4066,6 +4066,14 @@ impl<'a> Interp<'a> {
                 self.compare_op(op, l, r, &lv, &rv)
             }
             "named" => self.eval(r), // named-arg marker: value passthrough
+            // `argline` (call-arg line marker): diagnostics during the
+            // arg's eval attribute to its own line (zend per-op lines).
+            "argline" => {
+                if let Expr::Int(n) = l {
+                    self.cur_line = *n as usize;
+                }
+                self.eval(r)
+            }
             _ => {
                 let (lv, rv) = self.binary_operands(l, r)?;
                 self.arith(op, lv, rv)
