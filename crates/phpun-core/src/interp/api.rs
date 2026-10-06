@@ -268,6 +268,15 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// get_class() (no args): the executing class scope — the current
+    /// method's DECLARING class, None outside a class context.
+    pub fn executed_scope_name(&self) -> Option<String> {
+        self.stack
+            .last()
+            .and_then(|f| f.scope_class.as_ref().or(f.decl_class.as_ref()).cloned())
+            .map(|c| c.name().to_string())
+    }
+
     /// property_exists(): instance prop declared on the class or any
     /// ancestor (property002).
     pub fn class_has_prop(&self, c: &Rc<PhpClass>, name: &str) -> bool {
