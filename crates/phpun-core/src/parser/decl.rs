@@ -1498,6 +1498,7 @@ impl<'a> Parser<'a> {
                             }),
                             op: "=",
                             value: Box::new(e),
+                            line,
                         }),
                     ])
                 }

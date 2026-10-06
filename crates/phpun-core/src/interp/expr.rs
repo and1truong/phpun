@@ -52,7 +52,9 @@ impl<'a> Interp<'a> {
             | Expr::YieldFrom(e)
             | Expr::Empty(e) => Self::inner_end_line(e),
             Expr::Unary { e, .. } | Expr::Cast { e, .. } => Self::inner_end_line(e),
-            Expr::Assign { value, .. } => Self::inner_end_line(value),
+            // Zend emits the ASSIGN op at the assignment node's own
+            // line (the target's first token) — not the value's end.
+            Expr::Assign { line, .. } => Some(*line),
             _ => None,
         }
     }
@@ -142,11 +144,16 @@ impl<'a> Interp<'a> {
             Expr::Var(name) => self.var_get(name),
             Expr::VarVar(inner) => {
                 let n = self.eval(inner)?;
-                // The name-conversion + variable read site at the
-                // inner expr's last evaluated line (zend's post-eval
-                // lineno) — same re-site as the `{$...}` re-parse
-                // path above.
-                if let Some(l) = Self::inner_end_line(inner) {
+                if is_compile_const(inner) {
+                    // A compile-folded name emits no zend ops — the
+                    // varname read sites at the enclosing statement's
+                    // line (not even the inner's own line).
+                    self.cur_line = self.stmt_line;
+                } else if let Some(l) = Self::inner_end_line(inner) {
+                    // The name-conversion + variable read site at the
+                    // inner expr's last evaluated line (zend's
+                    // post-eval lineno) — same re-site as the
+                    // `{$...}` re-parse path above.
                     self.cur_line = l;
                 }
                 self.send_line = Some(self.cur_line);
@@ -216,7 +223,9 @@ impl<'a> Interp<'a> {
                 Ok(v)
             }
             Expr::List(_) => self.fail(PhpError::fatal("Cannot use list() as value", 0)),
-            Expr::Assign { target, op, value } => self.assign(target, op, value),
+            Expr::Assign {
+                target, op, value, ..
+            } => self.assign(target, op, value),
             Expr::Binary { op, l, r } => self.binary(op, l, r),
             Expr::Unary { op, e } => self.unary(op, e),
             Expr::Ternary { c, t, f } => {
@@ -230,9 +239,12 @@ impl<'a> Interp<'a> {
                     self.eval(f)
                 }
             }
-            Expr::Call { name, args, site } => {
-                self.scoped_send(|s| s.call(name, args, Some(*site)))
-            }
+            Expr::Call {
+                name,
+                args,
+                site,
+                callee,
+            } => self.scoped_send(|s| s.call(name, args, Some(*site), Some(*callee))),
             Expr::Fcc(inner) => self.fcc(inner),
             Expr::Unpack(_) | Expr::FccMark => {
                 self.fail(PhpError::fatal("argument unpacking/FCC outside of call", 0))

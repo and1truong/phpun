@@ -218,6 +218,11 @@ pub(crate) fn builtin_param_ty(f: &str, p: &str) -> Option<Vec<String>> {
 }
 
 pub(crate) fn is_builtin(n: &str) -> bool {
+    // `fastcgi_finish_request`/`print` are real function-table
+    // entries callable by name even though they aren't arity-typed.
+    if matches!(n, "fastcgi_finish_request" | "print") {
+        return true;
+    }
     matches!(
         n,
         "abs"

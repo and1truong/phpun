@@ -371,6 +371,10 @@ pub enum Expr {
         target: Box<Expr>,
         op: &'static str,
         value: Box<Expr>,
+        /// The assignment node's own line — the target's first-token
+        /// line, where zend emits the ASSIGN op (post-eval lineno for
+        /// `${expr}`/`->{expr}` name diagnostics).
+        line: usize,
     },
     Binary {
         op: &'static str,
@@ -393,6 +397,10 @@ pub enum Expr {
         /// line for `name(...)`, the `(` line for `callable_expr(...)`
         /// (zend_compile_call_common's `lineno`).
         site: usize,
+        /// The callee expression's first-token line — zend's
+        /// INIT_DYNAMIC_CALL lineno, where resolution errors
+        /// (undefined function, not-callable) site before args run.
+        callee: usize,
     },
     Index {
         e: Box<Expr>,

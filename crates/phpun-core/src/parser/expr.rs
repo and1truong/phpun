@@ -527,6 +527,7 @@ impl<'a> Parser<'a> {
             let e = self.assign()?;
             return Ok(Expr::Throw(Box::new(Self::markline(e, tl))));
         }
+        let tl = self.line();
         let e = self.ternary()?;
 
         if let Some(Token::Op(op)) = self.peek() {
@@ -543,6 +544,7 @@ impl<'a> Parser<'a> {
                     target: Box::new(target),
                     op,
                     value: Box::new(Self::markline(rhs, rl)),
+                    line: tl,
                 });
             }
         }
@@ -561,7 +563,12 @@ impl<'a> Parser<'a> {
                     })
                     .collect(),
             )),
-            Expr::Call { name, args, site } => match *name {
+            Expr::Call {
+                name,
+                args,
+                site,
+                callee,
+            } => match *name {
                 Expr::Str(n) if n.eq_ignore_ascii_case("list") => Ok(Expr::List(
                     args.into_iter()
                         .map(|a| Some(Self::unmark_argline(a)))
@@ -571,6 +578,7 @@ impl<'a> Parser<'a> {
                     name: Box::new(other),
                     args,
                     site,
+                    callee,
                 }),
             },
             // Lvalue targets can't carry the arg's line marker —
@@ -985,6 +993,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        let tl = self.line();
         let mut e = self.postfix()?;
         // `instanceof` binds between unary and relational ops.
         while self.ident_is("instanceof") {
@@ -1022,6 +1031,7 @@ impl<'a> Parser<'a> {
                     target: Box::new(target),
                     op,
                     value: Box::new(rhs),
+                    line: tl,
                 });
             }
         }
@@ -1029,6 +1039,9 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn postfix(&mut self) -> Result<Expr, PhpError> {
+        // The expression's first token — zend's callee-node line for a
+        // `(...)` dispatch built in this loop (INIT_DYNAMIC_CALL).
+        let callee_line = self.line();
         let mut e = self.primary()?;
         loop {
             if self.eat_op("++") {
@@ -1083,6 +1096,7 @@ impl<'a> Parser<'a> {
                     name: Box::new(e),
                     args,
                     site: paren_line,
+                    callee: callee_line,
                 })?;
             } else if self.at_op("->") || self.at_op("?->") {
                 let nullsafe = self.at_op("?->");
@@ -1395,12 +1409,12 @@ impl<'a> Parser<'a> {
             }
             let named = matches!(self.peek(), Some(Token::Ident(_)))
                 && matches!(self.peek2(), Some(Token::Op(":")));
-            let vline = self.line();
+            let vline = self.arg_line();
             if named {
                 // named arguments `name:` — name recorded via Str marker
                 let n = self.ident().unwrap();
                 self.pos += 1; // :
-                let vline = self.line();
+                let vline = self.arg_line();
                 let v = self.expr()?;
                 args.push((
                     Expr::Binary {
@@ -1513,6 +1527,44 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// An arg's marker line — the arg's first token, except a
+    /// `<<<`/nowdoc token counts from the line UNDER its opener:
+    /// zend's arg lineno is the heredoc body's first line (an empty
+    /// body still takes the closer's line — also opener+1).
+    fn arg_line(&self) -> usize {
+        match self.toks.get(self.pos) {
+            Some(t)
+                if matches!(t.token, Token::InterpString(_) | Token::SimpleString(_))
+                    && t.start != usize::MAX
+                    && {
+                        let s = self.src.as_bytes();
+                        s[t.start..].starts_with(b"<<<") || s[t.start..].starts_with(b"b<<<")
+                    } =>
+            {
+                t.line + 1
+            }
+            _ => self.line(),
+        }
+    }
+
+    /// Literal text of a non-interpolating `"..."`/heredoc source
+    /// string — `None` when any part interpolates.
+    fn interp_lit(e: &Expr) -> Option<String> {
+        match Self::unmark_argline_r(e) {
+            Expr::Interp(parts) => {
+                let mut s = Vec::new();
+                for p in parts {
+                    match p {
+                        crate::lexer::StringPart::Lit(t) => s.extend_from_slice(t),
+                        _ => return None,
+                    }
+                }
+                Some(String::from_utf8_lossy(&s).into_owned())
+            }
+            _ => None,
+        }
+    }
+
     /// `expr(...)` callee literalness for arg send lines: only a
     /// source string literal naming a plain function (`'g'()`,
     /// `('g')()`, `"g"()`) resolves like `g()` — a `Cls::m` string
@@ -1521,6 +1573,7 @@ impl<'a> Parser<'a> {
     fn literal_dyn_callee(e: &Expr) -> bool {
         match Self::unmark_argline_r(e) {
             Expr::Str(s) => !s.contains("::"),
+            Expr::Interp(_) => Self::interp_lit(e).is_some_and(|t| !t.contains("::")),
             _ => false,
         }
     }
@@ -1537,6 +1590,7 @@ impl<'a> Parser<'a> {
                     && !n.eq_ignore_ascii_case("static")
             }
             Expr::Str(_) => true,
+            Expr::Interp(_) => Self::interp_lit(e).is_some(),
             _ => false,
         }
     }
@@ -1635,18 +1689,22 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 match self.peek().cloned() {
                     Some(Token::Variable(n)) => {
+                        let il = self.line();
                         self.pos += 1;
-                        Ok(Expr::VarVar(Box::new(Expr::Var(n))))
+                        Ok(Expr::VarVar(Box::new(Self::markline(Expr::Var(n), il))))
                     }
                     Some(Token::Op("{")) => {
                         self.pos += 1;
+                        let il = self.line();
                         let e = self.expr()?;
                         self.expect_op("}")?;
-                        Ok(Expr::VarVar(Box::new(e)))
+                        Ok(Expr::VarVar(Box::new(Self::markline(e, il))))
                     }
                     Some(Token::Op("$")) => {
+                        self.pos += 1;
+                        let il = self.line();
                         let e = self.primary()?;
-                        Ok(Expr::VarVar(Box::new(e)))
+                        Ok(Expr::VarVar(Box::new(Self::markline(e, il))))
                     }
                     t => Err(PhpError::parse(
                         format!("syntax error, unexpected {}", desc_t(t.as_ref())),
@@ -1889,6 +1947,7 @@ impl<'a> Parser<'a> {
                             name: Box::new(Expr::Str(resolved)),
                             args,
                             site,
+                            callee: site,
                         })
                     } else if self.at_op("::") {
                         // `X::…` — a class name in every form.
@@ -1924,6 +1983,7 @@ impl<'a> Parser<'a> {
                         name: Box::new(Expr::Str(name)),
                         args,
                         site,
+                        callee: site,
                     })
                 } else {
                     // `\true`/`\false`/`\null` are literals, not const

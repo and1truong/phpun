@@ -68,6 +68,7 @@ impl<'a> Interp<'a> {
         match s {
             Stmt::Line(l) => {
                 self.cur_line = *l;
+                self.stmt_line = *l;
                 self.send_line = None;
                 Flow::Normal
             }

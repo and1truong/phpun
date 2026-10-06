@@ -66,6 +66,7 @@ impl<'a> Interp<'a> {
         name: &Expr,
         args: &[Expr],
         site: Option<usize>,
+        callee: Option<usize>,
     ) -> Result<Value, PhpError> {
         // The call's own site covers frames pushed during callee
         // resolution (autoload); arg_cells re-sets it after arg eval so
@@ -73,6 +74,10 @@ impl<'a> Interp<'a> {
         if let Some(s) = site {
             self.send_line = Some(s);
         }
+        // Resolution-phase errors (undefined function, not-callable,
+        // class-not-found) fire at zend's INIT_DYNAMIC_CALL — sited at
+        // the callee's first-token line, before any arg op runs.
+        let res = callee.or(site);
         // Resolve callee name/value.
         let fname = match name {
             Expr::Str(s) => {
@@ -82,6 +87,9 @@ impl<'a> Interp<'a> {
                 let lit = s.trim_start_matches('\u{1}').trim_start_matches('\\');
                 if let Some((cn, mn)) = lit.rsplit_once("::") {
                     let Some(cls) = self.str_callable_class(cn)? else {
+                        if let Some(l) = res {
+                            self.send_line = Some(l);
+                        }
                         return self.fail(PhpError::uncaught(
                             "Error",
                             format!("Class \"{}\" not found", cn),
@@ -103,29 +111,6 @@ impl<'a> Interp<'a> {
                 }
                 s.to_string()
             }
-            Expr::Var(_) | Expr::VarVar(_) => {
-                let v = self.eval(name)?;
-                match v {
-                    Value::Callable(_) | Value::Object(_) => {
-                        // $closure() / $obj->__invoke()
-                        let params = self.callable_params(&v);
-                        let ctx = format!("{}()", self.callable_ctx_name(&v));
-                        let vals = self.arg_cells(args, &params, &ctx, false, site)?;
-                        return self.call_value(&v, vals);
-                    }
-                    Value::Array(_) => {
-                        // `[obj,'m']` / `[$closure,'__invoke']` array
-                        // callables (bug78689).
-                        let c = self.fcc_val(&v)?;
-                        let params = self.callable_params(&c);
-                        let ctx = format!("{}()", self.callable_ctx_name(&c));
-                        let vals = self.arg_cells(args, &params, &ctx, false, site)?;
-                        return self.call_value(&c, vals);
-                    }
-                    _ => self.conv_str(&v).unwrap_or_default(),
-                }
-            }
-
             Expr::StaticProp { class, name } => {
                 // `C::$var()` — dynamic static method call.
                 let cls = self.class_of(class)?;
@@ -138,41 +123,78 @@ impl<'a> Interp<'a> {
                 let fwd = matches!(&**class, Expr::Const(_) | Expr::Str(_) | Expr::AnonClass(_));
                 return self.static_invoke_vis(cls, &mn, vals, None, fwd);
             }
-            Expr::Prop { .. } | Expr::MethodCall { .. } | Expr::Index { .. } => {
-                let v = self.eval(name)?;
-                if let Value::Str(s) = &v {
-                    // `($this->cb)()` — a dynamic string callable like
-                    // `$f()`: literal class, $this never forwards.
-                    let n = crate::value::lossy(s).to_string();
-                    return self.call_named(&n, args, site);
-                }
-                let params = self.callable_params(&v);
-                let ctx = format!("{}()", self.callable_ctx_name(&v));
-                let vals = self.arg_cells(args, &params, &ctx, false, site)?;
-                return self.call_value(&v, vals);
-            }
             _ => {
+                // `$f()`, `($f)()`, `($o->p)()`, `g()()`, `$arr[0]()`,
+                // `['Cb','m']()` — the callee is any value expression;
+                // its resolution is the INIT op, before any arg op.
                 let v = self.eval(name)?;
-                match v {
-                    // `(expr)()` — IIFE on a closure/invokable value.
-                    Value::Callable(_) | Value::Object(_) => {
+                match &v {
+                    Value::Callable(_) => {
+                        let params = self.callable_params(&v);
+                        let ctx = format!("{}()", self.callable_ctx_name(&v));
+                        let vals = self.arg_cells(args, &params, &ctx, false, site)?;
+                        return self.call_value(&v, vals);
+                    }
+                    Value::Object(o) => {
+                        // The __invoke check resolves at INIT — a miss
+                        // errors before args evaluate.
+                        let icls = o.borrow().class.clone();
+                        if self.find_method_in(&icls, "__invoke").is_none() {
+                            if let Some(l) = res {
+                                self.send_line = Some(l);
+                            }
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Object of type {} is not callable",
+                                    o.borrow().class.name()
+                                ),
+                                0,
+                            ));
+                        }
                         let params = self.callable_params(&v);
                         let ctx = format!("{}()", self.callable_ctx_name(&v));
                         let vals = self.arg_cells(args, &params, &ctx, false, site)?;
                         return self.call_value(&v, vals);
                     }
                     Value::Array(_) => {
+                        // `[obj,'m']` / `[$closure,'__invoke']` array
+                        // callables resolve at INIT (bug78689).
+                        if let Some(l) = res {
+                            self.send_line = Some(l);
+                        }
                         let c = self.fcc_val(&v)?;
+                        if let Some(s) = site {
+                            self.send_line = Some(s);
+                        }
                         let params = self.callable_params(&c);
                         let ctx = format!("{}()", self.callable_ctx_name(&c));
                         let vals = self.arg_cells(args, &params, &ctx, false, site)?;
                         return self.call_value(&c, vals);
                     }
-                    _ => self.conv_str(&v).unwrap_or_default(),
+                    Value::Str(_) => self.conv_str(&v).unwrap_or_default(),
+                    _ => {
+                        if let Some(l) = res {
+                            self.send_line = Some(l);
+                        }
+                        let tn = match &v {
+                            Value::Null => "null",
+                            Value::Bool(_) => "bool",
+                            Value::Int(_) => "int",
+                            Value::Float(_) => "float",
+                            Value::Resource(_) => "resource",
+                            _ => "value",
+                        };
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!("Value of type {} is not callable", tn),
+                            0,
+                        ));
+                    }
                 }
             }
         };
-        self.call_named(&fname, args, site)
+        self.call_named(&fname, args, site, callee)
     }
 
     /// The `(file, line)` a pushed call frame or call diagnostic
@@ -577,10 +599,14 @@ impl<'a> Interp<'a> {
         fname: &str,
         args: &[Expr],
         site: Option<usize>,
+        callee: Option<usize>,
     ) -> Result<Value, PhpError> {
         if let Some(s) = site {
             self.send_line = Some(s);
         }
+        // Resolution-phase errors site at the callee's first-token
+        // line (zend's INIT op lineno), fired before args evaluate.
+        let res = callee.or(site);
         // `\u{1}f` marks a source-literal unqualified call — only it may
         // fall back `ns\f` -> `f`; dynamic names are fully qualified.
         let (unqualified, lname) = match fname.strip_prefix('\u{1}') {
@@ -605,6 +631,9 @@ impl<'a> Interp<'a> {
         let raw_name = fname.trim_start_matches('\u{1}').trim_start_matches('\\');
         if let Some((cn, mn)) = raw_name.rsplit_once("::") {
             let Some(cls) = self.str_callable_class(cn)? else {
+                if let Some(l) = res {
+                    self.send_line = Some(l);
+                }
                 return self.fail(PhpError::uncaught(
                     "Error",
                     format!("Class \"{}\" not found", cn),
@@ -644,6 +673,22 @@ impl<'a> Interp<'a> {
                     miss_name = format!("{}\\{}", ns, fname.trim_start_matches('\u{1}'));
                 }
             }
+        }
+        // Zend resolves the callee at INIT — before any arg op — so an
+        // unresolvable name aborts the call before args ever evaluate.
+        if decl.is_none()
+            && !crate::builtins::is_builtin(&lname)
+            && crate::builtins::builtin_params(&lname).is_none()
+            && builtin_byref(&lname).is_none()
+        {
+            if let Some(l) = res {
+                self.send_line = Some(l);
+            }
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!("Call to undefined function {}()", miss_name),
+                0,
+            ));
         }
         // Synthetic params carrying builtin by-ref flags so call results in
         // by-ref slots emit "Only variables should be passed by reference"

@@ -364,6 +364,11 @@ pub struct Interp<'a> {
     in_handler: bool,
     /// Current line estimate for error messages (best-effort).
     pub cur_line: usize,
+    /// Line of the last `Stmt::Line` marker — the enclosing
+    /// statement's own line, where zend attributes ops on
+    /// compile-folded operands that emit no ops of their own
+    /// (`${'a' . 'b'}` reads the enclosing statement's lineno).
+    pub(in crate::interp) stmt_line: usize,
     /// Source line of the innermost call currently dispatching — Zend
     /// sites a pushed frame at the call's own line (the DO_FCALL op
     /// line: callee-name/`(` token for `f(...)`, member-name for
@@ -876,6 +881,7 @@ impl<'a> Interp<'a> {
             exception_handler: None,
             in_handler: false,
             cur_line: 1,
+            stmt_line: 1,
             send_line: None,
             gen_sink: None,
             pending_gen_captures: Vec::new(),

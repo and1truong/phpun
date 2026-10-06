@@ -15,6 +15,9 @@ enum NsKind {
 
 pub struct Parser<'a> {
     toks: &'a [Lexed],
+    /// Source the tokens were lexed from — Lexed start/end offsets
+    /// index it (raw token text for shape checks like `<<<`).
+    src: &'a str,
     pos: usize,
     /// Compile-time deprecation diagnostics (msg, line) — PHP emits them
     /// before execution; `parse_with` prepends them as `Stmt::Deprecated`.
@@ -78,7 +81,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
 /// `parse` honoring `short_open_tag` (INI `short_open_tag=On`).
 pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
     let toks = lex_with(src, short_open)?;
-    parse_toks(toks, 1 + src.bytes().filter(|&b| b == b'\n').count())
+    parse_toks(toks, 1 + src.bytes().filter(|&b| b == b'\n').count(), src)
 }
 
 /// phpun source mode: PHP code from byte 0, no `<?php` required (a
@@ -107,12 +110,12 @@ pub fn parse_source(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> 
 /// eval()'d code, which in PHP is always tag-free source.
 pub fn parse_pure(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
     let toks = crate::lexer::lex_php_source(src, short_open)?;
-    parse_toks(toks, 1 + src.bytes().filter(|&b| b == b'\n').count())
+    parse_toks(toks, 1 + src.bytes().filter(|&b| b == b'\n').count(), src)
 }
 
 /// `eof_line` is Zend's scanner line at end-of-input (one past the
 /// last consumed newline) — where EOF-attributed errors are reported.
-fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> {
+fn parse_toks(toks: Vec<Lexed>, eof_line: usize, src: &str) -> Result<Vec<Stmt>, PhpError> {
     // Compile-time diagnostics ride the token stream; drain them and
     // emit before execution (Zend emits compile warnings upfront).
     let mut lex_diags: Vec<(String, &'static str, usize)> = Vec::new();
@@ -127,7 +130,7 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
         })
         .collect();
     let bracket_err = bracket_check(&toks, eof_line);
-    let mut p = Parser::new(&toks);
+    let mut p = Parser::new(&toks, src);
     let mut stmts = match p.program() {
         Ok(s) => s,
         Err(pe) => {
@@ -139,7 +142,7 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
             // an end-of-input error there means the parser was simply
             // still waiting for the dead token).
             if let Some((be, bpos)) = bracket_err {
-                let mut p2 = Parser::new(&toks[..bpos]);
+                let mut p2 = Parser::new(&toks[..bpos], src);
                 match p2.program() {
                     Err(pe2) if !pe2.message.starts_with("syntax error, unexpected end of") => {
                         return Err(pe2);
@@ -172,9 +175,10 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
 }
 
 impl<'a> Parser<'a> {
-    fn new(toks: &'a [Lexed]) -> Self {
+    fn new(toks: &'a [Lexed], src: &'a str) -> Self {
         Self {
             toks,
+            src,
             pos: 0,
             deprecations: Vec::new(),
             compile_warnings: Vec::new(),
@@ -298,6 +302,7 @@ pub fn parse_expr_src(src: &str, base: usize) -> Result<(Expr, SrcDiags), PhpErr
         .collect();
     let mut p = Parser {
         toks: &toks,
+        src: &wrapped,
         pos: 0,
         deprecations: Vec::new(),
         compile_warnings: Vec::new(),

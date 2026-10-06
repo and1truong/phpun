@@ -482,6 +482,7 @@ impl<'a> Interp<'a> {
                                 &format!("{}::{}", cn, mn),
                                 &[],
                                 None,
+                                None,
                             )?))
                         }
                         _ => Ok(Some(Value::Null)),
