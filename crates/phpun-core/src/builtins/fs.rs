@@ -2113,11 +2113,29 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
                                 match &*rb {
                                     PhpResource::File { file, .. }
                                     | PhpResource::Pipe { file, .. } => file.as_raw_fd(),
-                                    PhpResource::Stdio { which, .. } => *which as i32,
+                                    PhpResource::Stdio { which, .. } if *which <= 2 => {
+                                        *which as i32
+                                    }
+                                    // Closed resources and non-stream
+                                    // elements are skipped silently;
+                                    // non-fd streams warn with zend's
+                                    // stream type name.
+                                    PhpResource::Closed { .. } => continue,
                                     other => {
-                                        let ty = other.type_name();
+                                        let ty = match other {
+                                            PhpResource::Mem { uri, .. } => {
+                                                if uri == "php://memory" {
+                                                    "MEMORY"
+                                                } else {
+                                                    "TEMP"
+                                                }
+                                            }
+                                            PhpResource::Input { .. } => "Input",
+                                            PhpResource::Stdio { .. } => "Output",
+                                            o => o.type_name(),
+                                        };
                                         it.warn_pub(&format!(
-                                            "{}(): cannot represent a stream of type {} as a File Descriptor",
+                                            "{}(): Cannot represent a stream of type {} as a select()able descriptor",
                                             fname, ty
                                         ))?;
                                         continue;
@@ -2126,13 +2144,7 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
                             };
                             sets[ai].push((k.clone(), item, fd));
                         }
-                        other => {
-                            it.warn_pub(&format!(
-                                "{}(): cannot represent a stream of type {} as a File Descriptor",
-                                fname,
-                                other.gettype()
-                            ))?;
-                        }
+                        _ => {}
                     }
                 }
             }
