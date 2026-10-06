@@ -4016,7 +4016,11 @@ impl<'a> Interp<'a> {
         // Zend decrefs the frame's CVs at unwind — the popped frame
         // is handed to bind_and_run, which runs its __destruct pass
         // after the call-trace pop so the dtor's trace attributes to
-        // the caller's site (bug52361).
+        // the caller's site (bug52361). Its declaring file is kept:
+        // a body-level compile fatal (stray break/continue/goto)
+        // attributes to the declaring unit, not the caller frame
+        // `diag_file()` would now see.
+        let popped_file = popped.as_ref().map(|f| f.file.clone());
         self.last_popped_frame = popped;
         match flow {
             Flow::Return(v) => {
@@ -4115,13 +4119,19 @@ impl<'a> Interp<'a> {
             }),
             Flow::Break(_) => {
                 // Compile fatal in Zend (function bodies are compiled
-                // eagerly) — carry the compile-context backtrace.
+                // eagerly) — carry the compile-context backtrace and
+                // attribute to the declaring file, whose unit died at
+                // compile.
                 let mut e = PhpError::compile_fatal(
                     "'break' not in the 'loop' or 'switch' context",
                     self.cur_line,
                 );
                 e.trace = Some(self.compile_err_frames());
-                self.fail(e)
+                let r = self.fail(e);
+                if let Some(f) = &popped_file {
+                    self.last_err_file = f.clone();
+                }
+                r
             }
             Flow::Continue(_) => {
                 let mut e = PhpError::compile_fatal(
@@ -4129,7 +4139,11 @@ impl<'a> Interp<'a> {
                     self.cur_line,
                 );
                 e.trace = Some(self.compile_err_frames());
-                self.fail(e)
+                let r = self.fail(e);
+                if let Some(f) = &popped_file {
+                    self.last_err_file = f.clone();
+                }
+                r
             }
             Flow::Goto(l) => {
                 let mut e = PhpError::compile_fatal(
@@ -4137,7 +4151,11 @@ impl<'a> Interp<'a> {
                     self.cur_line,
                 );
                 e.trace = Some(self.compile_err_frames());
-                self.fail(e)
+                let r = self.fail(e);
+                if let Some(f) = &popped_file {
+                    self.last_err_file = f.clone();
+                }
+                r
             }
             Flow::Normal => {
                 // Falling off the end of a typed function still checks
