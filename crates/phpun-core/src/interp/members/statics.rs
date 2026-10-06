@@ -372,7 +372,7 @@ impl<'a> Interp<'a> {
                 let n = args.cells.len();
                 if n != 1 {
                     return self.fail(PhpError::uncaught(
-                        "Error",
+                        "ArgumentCountError",
                         format!(
                             "WeakReference::create() expects exactly 1 argument, {} given",
                             n
@@ -382,11 +382,12 @@ impl<'a> Interp<'a> {
                 }
                 let v = args.cells[0].borrow().clone();
                 let Value::Object(o) = v else {
+                    let tn = self.zval_type_name(&v);
                     let e = self.exception(
                         "TypeError",
                         &format!(
                             "WeakReference::create(): Argument #1 ($object) must be of type object, {} given",
-                            v.gettype()
+                            tn
                         ),
                     );
                     return Err(self.throw(e));
