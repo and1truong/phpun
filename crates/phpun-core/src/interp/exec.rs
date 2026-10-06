@@ -347,9 +347,7 @@ impl<'a> Interp<'a> {
                         .or_default()
                         .entry(name.clone())
                         .or_default();
-                    let dup = sites
-                        .iter()
-                        .any(|(u, l)| u == &site.0 && *l != site.1);
+                    let dup = sites.iter().any(|(u, l)| u == &site.0 && *l != site.1);
                     sites.insert(site.clone());
                     if dup {
                         // A compile fatal in Zend — carry the compile-
