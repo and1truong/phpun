@@ -239,6 +239,9 @@ impl<'a> Interp<'a> {
         // `break`/`continue` operands in it count only ITS enclosing
         // loop/switch contexts, not the includer's.
         let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
+        // ...and it is a fresh op_array — a new compile-unit serial
+        // for `static` decl site identity.
+        let saved_unit = self.begin_unit();
         let flow = match Self::const_closure_gate(&stmts).and_then(|_| self.hoist_funcs(&stmts)) {
             Err(mut e) => {
                 // Compile fatals raised while compiling the included file
@@ -256,6 +259,7 @@ impl<'a> Interp<'a> {
             Ok(()) => self.exec_block(&stmts),
         };
         self.loop_depth = saved_depth;
+        self.cur_unit_id = saved_unit;
         self.include_ns.pop();
         // break/continue/goto leaking out of the unit are compile fatals
         // in Zend too: same compile-context backtrace (needs our
@@ -342,6 +346,8 @@ impl<'a> Interp<'a> {
                 // eval'd code is its own compile unit — `break`/`continue`
                 // operands count only ITS enclosing loop/switch contexts.
                 let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
+                // ...a fresh op_array: its own unit serial too.
+                let saved_unit = self.begin_unit();
                 let flow = match Self::const_closure_gate(&stmts) {
                     Err(mut e) => {
                         // Gate errors are compile fatals of the eval'd
@@ -355,6 +361,7 @@ impl<'a> Interp<'a> {
                     Ok(()) => self.exec_block(&stmts),
                 };
                 self.loop_depth = saved_depth;
+                self.cur_unit_id = saved_unit;
                 // break/continue/goto leaking out of the eval'd unit are
                 // compile fatals in Zend, attributed to the eval()'d-code
                 // context (cur_file/cur_line still hold it here) with the

@@ -356,9 +356,11 @@ impl<'a> Interp<'a> {
                 // and unit is a compile fatal — even on the same line
                 // (static_basic_002) — while re-executing the same
                 // statement (loops) or redeclaring in a different unit
-                // — a separate include/eval, which Zend keeps separate
-                // statics for — is not.
-                let site = (self.cur_file.clone(), vars.as_ptr() as usize);
+                // — a separate include/eval/run, which Zend compiles to
+                // a fresh op_array — is not. The serial (not the file
+                // string) keys the unit: a re-parsed unit may recycle
+                // the freed Vec's stmt ptr and must still count as new.
+                let site = (self.cur_unit_id, vars.as_ptr() as usize);
                 for (name, default) in vars {
                     // Every site is kept: a decl in a different unit is
                     // legal AND must not erase the same-unit record a

@@ -313,9 +313,16 @@ pub struct Interp<'a> {
     /// Global static vars (`static` at top level).
     global_statics: HashMap<String, Cell>,
     /// static-decl sites per function scope (fn key → var → decl
-    /// (file, stmt ptr)) — PHP fatals on a same-unit redeclaration at a
-    /// different statement site.
-    static_decls: HashMap<String, HashMap<String, std::collections::HashSet<(String, usize)>>>,
+    /// (unit serial, stmt ptr)) — PHP fatals on a same-unit
+    /// redeclaration at a different statement site. The unit serial is
+    /// bumped at every parse boundary (include/eval/run) since Zend
+    /// compiles each into a fresh op_array — a freed Vec may recycle
+    /// the same stmt ptr across re-parses.
+    static_decls: HashMap<String, HashMap<String, std::collections::HashSet<(u64, usize)>>>,
+    /// Serial of the compile unit currently executing (see static_decls).
+    cur_unit_id: u64,
+    /// Next unit serial to hand out — bumps monotonically.
+    next_unit_id: u64,
     /// include_once/require_once registry (canonical paths).
     included: HashSet<std::path::PathBuf>,
     /// Pending exception carried across an Err(Throw) return.
@@ -828,6 +835,8 @@ impl<'a> Interp<'a> {
             statics: HashMap::new(),
             global_statics: HashMap::new(),
             static_decls: HashMap::new(),
+            cur_unit_id: 0,
+            next_unit_id: 1,
             included: HashSet::new(),
             pending_exception: None,
             call_trace: Vec::new(),
@@ -1410,7 +1419,17 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// Stamp a fresh compile-unit serial (a separate Zend op_array —
+    /// include/eval/another run) and return the previous one so the
+    /// caller can restore it after the unit finishes.
+    fn begin_unit(&mut self) -> u64 {
+        let id = self.next_unit_id;
+        self.next_unit_id += 1;
+        std::mem::replace(&mut self.cur_unit_id, id)
+    }
+
     pub fn run(&mut self, stmts: &[Stmt]) -> RunResult {
+        self.begin_unit();
         // hard_timeout ini is the absolute deadline (045).
         let ht = self.ini_bytes("hard_timeout");
         if ht > 0 {
@@ -1880,6 +1899,7 @@ impl<'a> Interp<'a> {
     pub fn run_source_ret(&mut self, src: &str) -> (RunResult, Option<Value>) {
         match parser::parse_source(src, self.ini_on("short_open_tag")) {
             Ok(stmts) => {
+                self.begin_unit();
                 if let Err(e) =
                     Self::const_closure_gate(&stmts).and_then(|_| self.hoist_funcs(&stmts))
                 {
