@@ -352,7 +352,7 @@ pub(crate) fn dispatch(
                 // php://memory and php://temp are always read/write
                 // internally; fwrite still honors the fopen mode.
                 let id = it.next_res_id();
-                let (_, w) = mode_flags(&mode);
+                let w = mem_writeable(&mode);
                 Value::Resource(Rc::new(RefCell::new(PhpResource::Mem {
                     id,
                     buf: Vec::new(),
@@ -372,23 +372,35 @@ pub(crate) fn dispatch(
                 let id = it.next_res_id();
                 Value::Resource(Rc::new(RefCell::new(PhpResource::Stdio { id, which })))
             } else {
-                match fopen(&path, &mode) {
-                    Ok(f) => {
-                        let id = it.next_res_id();
-                        let (r, w) = mode_flags(&mode);
-                        Value::Resource(Rc::new(RefCell::new(PhpResource::File {
-                            id,
-                            file: f,
-                            read: r,
-                            write: w,
-                            pos: 0,
-                            eof: false,
-                        })))
-                    }
-                    Err(e) => {
-                        it.warn_pub(&format!("fopen({}): Failed to open stream: {}", path, e))?;
+                match fopen_mode(&mode) {
+                    None => {
+                        it.warn_pub(&format!(
+                            "fopen({}): Failed to open stream: `{}' is not a valid mode for fopen",
+                            path, mode
+                        ))?;
                         Value::Bool(false)
                     }
+                    Some(spec) => match open_file(&path, &spec) {
+                        Ok(f) => {
+                            let id = it.next_res_id();
+                            Value::Resource(Rc::new(RefCell::new(PhpResource::File {
+                                id,
+                                file: f,
+                                read: spec.read,
+                                write: spec.write,
+                                pos: 0,
+                                eof: false,
+                            })))
+                        }
+                        Err(e) => {
+                            it.warn_pub(&format!(
+                                "fopen({}): Failed to open stream: {}",
+                                path,
+                                io_errno_str(&e).1
+                            ))?;
+                            Value::Bool(false)
+                        }
+                    },
                 }
             }
         }
@@ -922,14 +934,69 @@ fn percent_decode(b: &[u8]) -> Vec<u8> {
     out
 }
 
-fn mode_flags(mode: &str) -> (bool, bool) {
-    let m = mode.chars().next().unwrap_or('r');
+/// php_stream_parse_fopen_modes: `mode[0]` must be r/w/a/x/c
+/// (anything else — 'br', 'tr', '', ... — is an invalid-mode warning
+/// + false) and '+' anywhere in the string adds O_RDWR.
+struct FopenSpec {
+    read: bool,
+    write: bool,
+    append: bool,
+    create: bool,
+    truncate: bool,
+    exclusive: bool,
+}
+
+fn fopen_mode(mode: &str) -> Option<FopenSpec> {
     let plus = mode.contains('+');
-    match m {
-        'r' => (true, plus),
-        'w' | 'a' | 'x' | 'c' => (plus, true),
-        _ => (true, true),
-    }
+    Some(match mode.as_bytes().first().copied()? {
+        b'r' => FopenSpec {
+            read: true,
+            write: plus,
+            append: false,
+            create: false,
+            truncate: false,
+            exclusive: false,
+        },
+        b'w' => FopenSpec {
+            read: plus,
+            write: true,
+            append: false,
+            create: true,
+            truncate: true,
+            exclusive: false,
+        },
+        b'a' => FopenSpec {
+            read: plus,
+            write: true,
+            append: true,
+            create: true,
+            truncate: false,
+            exclusive: false,
+        },
+        b'x' => FopenSpec {
+            read: plus,
+            write: true,
+            append: false,
+            create: true,
+            truncate: false,
+            exclusive: true,
+        },
+        b'c' => FopenSpec {
+            read: plus,
+            write: true,
+            append: false,
+            create: true,
+            truncate: false,
+            exclusive: false,
+        },
+        _ => return None,
+    })
+}
+
+/// php_stream_mode_from_str (strpbrk) — the mode parser for
+/// php://memory|temp only: 'w', 'a' or '+' anywhere → writeable.
+fn mem_writeable(mode: &str) -> bool {
+    mode.bytes().any(|b| matches!(b, b'w' | b'a' | b'+'))
 }
 
 /// `PHP_Z_PARAM_STREAM` shared by every stream builtin: the argument
@@ -1022,47 +1089,19 @@ pub(in crate::builtins) fn read_ebadf_notice(it: &mut Interp, fname: &str, errno
     ))
 }
 
-fn fopen(path: &str, mode: &str) -> std::io::Result<std::fs::File> {
+fn open_file(path: &str, spec: &FopenSpec) -> std::io::Result<std::fs::File> {
     let path = fs_path(path);
     use std::fs::OpenOptions;
-    let m = mode.chars().next().unwrap_or('r');
-    let plus = mode.contains('+');
     let mut o = OpenOptions::new();
-    match m {
-        'r' => {
-            o.read(true);
-            if plus {
-                o.write(true);
-            }
-        }
-        'w' => {
-            o.write(true).create(true).truncate(true);
-            if plus {
-                o.read(true);
-            }
-        }
-        'a' => {
-            o.append(true).create(true);
-            if plus {
-                o.read(true);
-            }
-        }
-        'x' => {
-            o.write(true).create_new(true);
-            if plus {
-                o.read(true);
-            }
-        }
-        'c' => {
-            o.write(true).create(true);
-            if plus {
-                o.read(true);
-            }
-        }
-        _ => {
-            o.read(true);
+    o.read(spec.read).write(spec.write);
+    if spec.create {
+        if spec.exclusive {
+            o.create_new(true);
+        } else {
+            o.create(true);
         }
     }
+    o.truncate(spec.truncate).append(spec.append);
     o.open(path)
 }
 
