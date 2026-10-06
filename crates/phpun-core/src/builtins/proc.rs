@@ -277,6 +277,12 @@ fn proc_get_status(_it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
 
 fn proc_terminate(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
     let r = proc_handle(args, "proc_terminate")?;
+    // zend zpp: arg1 resource type, then arg2 signal int type, and only
+    // then the valid-process-resource check.
+    let sig = match args.get(1) {
+        Some(_) => zpp_long_arg(it, args, 1, "proc_terminate", 2, "$signal")? as i32,
+        None => libc::SIGTERM,
+    };
     let rb = r.borrow();
     let PhpResource::Proc { pid, closed, .. } = &*rb else {
         return err(
@@ -290,10 +296,6 @@ fn proc_terminate(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
             "proc_terminate(): supplied resource is not a valid process resource",
         );
     }
-    let sig = match args.get(1) {
-        Some(_) => zpp_long_arg(it, args, 1, "proc_terminate", 2, "$signal")? as i32,
-        None => libc::SIGTERM,
-    };
     Ok(Value::Bool(unsafe { libc::kill(*pid, sig) } == 0))
 }
 
