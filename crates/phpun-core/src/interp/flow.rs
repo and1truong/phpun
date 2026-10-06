@@ -143,10 +143,9 @@ impl<'a> Interp<'a> {
                 for q in &d.params[..i] {
                     if q.default.is_some()
                         && !implicit_nullable(q)
-                        && self.dep_seen.insert(format!(
-                            "{}\0{}\0{}\0opt",
-                            dep_file, d.line, q.name
-                        ))
+                        && self
+                            .dep_seen
+                            .insert(format!("{}\0{}\0{}\0opt", dep_file, d.line, q.name))
                     {
                         self.cur_line = d.line;
                         self.deprecated(&format!(
@@ -738,7 +737,11 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn flow_foreach_target(&mut self, t: &ForeachTarget, sc: &mut ScanScope) -> Result<(), PhpError> {
+    fn flow_foreach_target(
+        &mut self,
+        t: &ForeachTarget,
+        sc: &mut ScanScope,
+    ) -> Result<(), PhpError> {
         match t {
             ForeachTarget::Lvalue(e) => self.flow_expr(e, sc),
             ForeachTarget::Var(_) | ForeachTarget::ByRef(_) => Ok(()),

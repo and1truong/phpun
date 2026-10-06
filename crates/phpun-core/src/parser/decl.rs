@@ -602,8 +602,11 @@ impl<'a> Parser<'a> {
         // zend_resolve_non_class_name check, use_collision_*).
         let (hit, tag) = match kind {
             NsKind::Class => (self.use_map.contains_key(&alias.to_lowercase()), ""),
-            NsKind::Func => (self.use_fn_map.contains_key(&alias.to_lowercase()), "function "),
-            NsKind::Const => (self.use_const_map.contains_key(&alias.to_string()), "const "),
+            NsKind::Func => (
+                self.use_fn_map.contains_key(&alias.to_lowercase()),
+                "function ",
+            ),
+            NsKind::Const => (self.use_const_map.contains_key(alias), "const "),
         };
         if hit || (kind == NsKind::Class && self.declared_types.contains(&alias.to_lowercase())) {
             return Err(PhpError::compile_fatal(

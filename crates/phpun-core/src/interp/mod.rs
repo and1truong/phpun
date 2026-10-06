@@ -407,13 +407,12 @@ pub struct Interp<'a> {
     gen_fin_depth: u32,
     /// The running gen's fin_q (mirrors its GenState.fin_q; a stack-
     /// style save/restore like gen_sink).
-    gen_fin_q: Option<Rc<RefCell<Vec<(usize, Vec<u8>, bool)>>>>,
+    gen_fin_q: Option<crate::value::FinQueue>,
     /// Every generator object minted this run, as (weak state, fin_q).
     /// A dead weak means the object was released (unset()/overwrite) —
     /// Zend then runs the suspended body's finally chains, replayed
     /// from fin_q; a sweep at unit end models the shutdown GC.
-    live_gens:
-        Vec<(std::rc::Weak<RefCell<crate::value::GenState>>, Rc<RefCell<Vec<(usize, Vec<u8>, bool)>>>)>,
+    live_gens: Vec<(std::rc::Weak<RefCell<crate::value::GenState>>, crate::value::FinQueue)>,
     /// Declaring class of the method about to be invoked (set by
     /// invoke_method, consumed by invoke_fn to fill Frame::decl_class).
     pending_decl_class: Option<Rc<PhpClass>>,

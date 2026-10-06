@@ -260,9 +260,7 @@ impl<'a> Interp<'a> {
         let saved_sends = std::mem::replace(&mut self.gen_sends, sends.into_iter().collect());
         let saved_auto = std::mem::replace(&mut self.gen_auto, 0);
         let saved_run = self.gen_run_state.replace(state.clone());
-        let saved_fin_q = self
-            .gen_fin_q
-            .replace(state.borrow().fin_q.clone());
+        let saved_fin_q = self.gen_fin_q.replace(state.borrow().fin_q.clone());
         let saved_fin_depth = std::mem::replace(&mut self.gen_fin_depth, 0);
         self.gen_pending_fatal = None;
         // The body frame lands at call_trace[trace_base] — everything
@@ -766,13 +764,20 @@ impl<'a> Interp<'a> {
                 self.gen_raise_deferred(&state, "rewind")?;
                 let st = state.borrow();
                 // Zend throws once the gen ran past its first yield —
-                // a still-positioned-at-first-item rewind is a no-op,
-                // and a closed/dead gen reports 'already run'.
+                // a still-positioned-at-first-item rewind is a no-op.
+                // foreach's initiation rewind reports the closed /
+                // exhausted state ('Cannot traverse an already closed
+                // generator'); an explicit ->rewind() reports
+                // 'already run' whenever it ran past yield 0.
                 if st.pos > 0 || st.closed || st.dead {
-                    let v = self.exception(
-                        "Exception",
-                        "Cannot rewind a generator that was already run",
-                    );
+                    let msg = if self.iter_calls > 0
+                        && (st.closed || st.dead || st.pos >= st.items.len())
+                    {
+                        "Cannot traverse an already closed generator"
+                    } else {
+                        "Cannot rewind a generator that was already run"
+                    };
+                    let v = self.exception("Exception", msg);
                     return Err(self.throw(v));
                 }
                 Ok(Some(Value::Null))
@@ -938,8 +943,7 @@ impl<'a> Interp<'a> {
             ),
             Value::Object(o) => {
                 if self.obj_is_a(o, "IteratorAggregate") {
-                    let it = match self.method_invoke(o.clone(), "getIterator", CallArgs::empty())
-                    {
+                    let it = match self.method_invoke(o.clone(), "getIterator", CallArgs::empty()) {
                         Ok(it) => it,
                         Err(e) => return (Vec::new(), Some(e)),
                     };

@@ -1680,6 +1680,10 @@ pub type GenItem = (Value, Cell);
 
 /// Generator internal state (object internal behind the `Generator`
 /// class, which implements `Iterator`).
+/// A generator's buffered finally-region output shared with the
+/// interpreter's GC sweep (yield-tag, bytes, is_err).
+pub type FinQueue = Rc<RefCell<Vec<(usize, Vec<u8>, bool)>>>;
+
 pub struct GenState {
     /// Everything needed to re-enter the function frame later.
     pub setup: GenSetup,
@@ -1716,7 +1720,7 @@ pub struct GenState {
     /// registry) so a GC'd generator's finally still replays.
     /// (yield-tag, bytes, is_err); entries are dropped as normal
     /// flushes cover them.
-    pub fin_q: Rc<RefCell<Vec<(usize, Vec<u8>, bool)>>>,
+    pub fin_q: FinQueue,
     /// The body's terminal error, held until the consumer's next
     /// resume past the last collected item — Zend's lazy body dies
     /// inside `Generator->next()`/friends, after the bytes the

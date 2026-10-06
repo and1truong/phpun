@@ -257,9 +257,9 @@ impl<'a> Interp<'a> {
             .last_mut()
             .map(|f| f.statics_unit.replace(self.cur_unit_id));
         // A compile diagnostic's handler runs at THIS include's callsite.
-        let saved_callsite =
-            self.compile_callsite
-                .replace((saved_file.clone(), saved_line as u32));
+        let saved_callsite = self
+            .compile_callsite
+            .replace((saved_file.clone(), saved_line as u32));
         let flow = match Self::const_closure_gate(&stmts)
             .and_then(|_| self.flow_gate(&stmts))
             .and_then(|_| self.hoist_funcs(&stmts))
@@ -403,9 +403,9 @@ impl<'a> Interp<'a> {
                     internal: true,
                 });
                 // A compile diagnostic's handler runs at THIS eval()'s callsite.
-                let saved_callsite =
-                    self.compile_callsite
-                        .replace((saved_file.clone(), saved_line as u32));
+                let saved_callsite = self
+                    .compile_callsite
+                    .replace((saved_file.clone(), saved_line as u32));
                 let flow = match Self::const_closure_gate(&stmts)
                     .and_then(|_| self.flow_gate(&stmts))
                     // eval'd code early-binds its unconditional decls
