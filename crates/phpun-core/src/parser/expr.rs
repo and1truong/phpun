@@ -89,13 +89,22 @@ impl<'a> Parser<'a> {
         self.ret_by_ref = by_ref;
         let (body, end_line) = if arrow {
             self.expect_op("=>")?;
-            let e = self.expr()?;
+            // An arrow body inside a const slot is validated as part of
+            // the enclosing constant expression — scope keywords there
+            // are 'Constant expression contains invalid operations'.
+            let saved_const = self.const_ctx;
+            if self.const_ctx == ConstCtx::Slot {
+                self.const_ctx = ConstCtx::ArrowSlot;
+            }
+            let e = self.expr();
+            self.const_ctx = saved_const;
+            let e = e?;
             let el = self.prev_line();
             // A call inside the arrow expr needs a line marker — the
             // body has no statements to set cur_line (closure_064).
             (vec![Stmt::Line(line), Stmt::Return(Some(e))], el)
         } else {
-            let b = self.body()?;
+            let b = self.runtime_body()?;
             let el = self.prev_line();
             (b, el)
         };
@@ -1707,31 +1716,55 @@ impl<'a> Parser<'a> {
                 // the check to the using class, and closures defer it
                 // to invocation (catchable Error).
                 if let Expr::Const(n) = &e {
-                    // Inside a NAMED function there is no class scope at
-                    // all — `self::`/`static::`/`parent::` in any member
-                    // position is the 'Cannot use "X" when no class
-                    // scope is active' compile fatal (at top level the
-                    // same stays a runtime catchable Error).
-                    if matches!(
-                        n.to_ascii_lowercase().as_str(),
-                        "self" | "static" | "parent"
-                    ) && self.in_named_fn
-                        && self.class_ctx.is_empty()
-                        && !self.in_closure
+                    if self.const_ctx == ConstCtx::ArrowSlot
+                        && matches!(
+                            n.to_ascii_lowercase().as_str(),
+                            "self" | "static" | "parent"
+                        )
                     {
                         return Err(PhpError::compile_fatal(
-                            format!("Cannot use \"{}\" when no class scope is active", n),
+                            "Constant expression contains invalid operations",
                             self.line(),
                         ));
                     }
-                    if n.eq_ignore_ascii_case("parent")
-                        && self.class_ctx.last().map(|c| !c.1 && !c.0).unwrap_or(false)
-                        && !self.in_closure
-                    {
-                        return Err(PhpError::compile_fatal(
-                            "Cannot use \"parent\" when current class scope has no parent",
-                            self.line(),
-                        ));
+                    if self.const_ctx == ConstCtx::Slot {
+                        // Compile-time constants: `static::` is the
+                        // const-expr compile fatal; `self::`/`parent::`
+                        // defer scope checks to the slot's runtime eval
+                        // (catchable `Cannot access "X" ...` at call/init).
+                        if n.eq_ignore_ascii_case("static") {
+                            return Err(PhpError::compile_fatal(
+                                "\"static::\" is not allowed in compile-time constants",
+                                self.line(),
+                            ));
+                        }
+                    } else if self.const_ctx == ConstCtx::Runtime {
+                        // Inside a NAMED function there is no class scope at
+                        // all — `self::`/`static::`/`parent::` in any member
+                        // position is the 'Cannot use "X" when no class
+                        // scope is active' compile fatal (at top level the
+                        // same stays a runtime catchable Error).
+                        if matches!(
+                            n.to_ascii_lowercase().as_str(),
+                            "self" | "static" | "parent"
+                        ) && self.in_named_fn
+                            && self.class_ctx.is_empty()
+                            && !self.in_closure
+                        {
+                            return Err(PhpError::compile_fatal(
+                                format!("Cannot use \"{}\" when no class scope is active", n),
+                                self.line(),
+                            ));
+                        }
+                        if n.eq_ignore_ascii_case("parent")
+                            && self.class_ctx.last().map(|c| !c.1 && !c.0).unwrap_or(false)
+                            && !self.in_closure
+                        {
+                            return Err(PhpError::compile_fatal(
+                                "Cannot use \"parent\" when current class scope has no parent",
+                                self.line(),
+                            ));
+                        }
                     }
                 }
                 if self.at_op("(") {
@@ -2294,30 +2327,53 @@ impl<'a> Parser<'a> {
                     // compile-time gate as `parent::` (p10new/ch3);
                     // inside a closure it defers to the runtime Error.
                     if let Expr::Const(n) = &class {
-                        // `new self()`/`new static()`/`new parent()`
-                        // inside a named function — no class scope:
-                        // 'Cannot use "X" when no class scope is active'
-                        // (k12). Same gate as the `X::` postfix.
-                        if matches!(
-                            n.to_ascii_lowercase().as_str(),
-                            "self" | "static" | "parent"
-                        ) && self.in_named_fn
-                            && self.class_ctx.is_empty()
-                            && !self.in_closure
+                        if self.const_ctx == ConstCtx::ArrowSlot
+                            && matches!(
+                                n.to_ascii_lowercase().as_str(),
+                                "self" | "static" | "parent"
+                            )
                         {
                             return Err(PhpError::compile_fatal(
-                                format!("Cannot use \"{}\" when no class scope is active", n),
+                                "Constant expression contains invalid operations",
                                 self.line(),
                             ));
                         }
-                        if n.eq_ignore_ascii_case("parent")
-                            && self.class_ctx.last().map(|c| !c.1 && !c.0).unwrap_or(false)
-                            && !self.in_closure
-                        {
-                            return Err(PhpError::compile_fatal(
-                                "Cannot use \"parent\" when current class scope has no parent",
-                                self.line(),
-                            ));
+                        if self.const_ctx == ConstCtx::Slot {
+                            // `new static` in a const slot — the
+                            // const-expr compile fatal (no `::`); `new
+                            // self()`/`new parent()` defer to runtime.
+                            if n.eq_ignore_ascii_case("static") {
+                                return Err(PhpError::compile_fatal(
+                                    "\"static\" is not allowed in compile-time constants",
+                                    self.line(),
+                                ));
+                            }
+                        } else if self.const_ctx == ConstCtx::Runtime {
+                            // `new self()`/`new static()`/`new parent()`
+                            // inside a named function — no class scope:
+                            // 'Cannot use "X" when no class scope is active'
+                            // (k12). Same gate as the `X::` postfix.
+                            if matches!(
+                                n.to_ascii_lowercase().as_str(),
+                                "self" | "static" | "parent"
+                            ) && self.in_named_fn
+                                && self.class_ctx.is_empty()
+                                && !self.in_closure
+                            {
+                                return Err(PhpError::compile_fatal(
+                                    format!("Cannot use \"{}\" when no class scope is active", n),
+                                    self.line(),
+                                ));
+                            }
+                            if n.eq_ignore_ascii_case("parent")
+                                && self.class_ctx.last().map(|c| !c.1 && !c.0).unwrap_or(false)
+                                && !self.in_closure
+                            {
+                                return Err(PhpError::compile_fatal(
+                                    "Cannot use \"parent\" when current class scope has no parent",
+                                    self.line(),
+                                ));
+                            }
                         }
                     }
                     let mut ctor_parens = false;

@@ -563,7 +563,7 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let name = self.ident().unwrap_or_default();
         self.expect_op("=")?;
-        let value = self.expr()?;
+        let value = self.const_expr()?;
         self.expect_op(")")?;
         let is_strict = name.eq_ignore_ascii_case("strict_types");
         // `declare(strict_types=1)` is legal only as the very first
@@ -941,7 +941,10 @@ impl<'a> Parser<'a> {
                     }
                     self.pos -= 1;
                     self.expect_op("(")?;
-                    match self.args() {
+                    let saved_const = std::mem::replace(&mut self.const_ctx, ConstCtx::Slot);
+                    let args_r = self.args();
+                    self.const_ctx = saved_const;
+                    match args_r {
                         Ok(list) => {
                             // Duplicate named args are a compile-time
                             // fatal for attribute args (unlike calls,
@@ -1042,8 +1045,10 @@ impl<'a> Parser<'a> {
             .insert(name.rsplit('\\').next().unwrap_or(&name).to_lowercase());
         self.cur_class = name.clone();
         // enum backing type `enum X: int`
+        let mut enum_backed = false;
         if self.eat_op(":") {
             self.skip_type()?;
+            enum_backed = kind == ClassKind::Enum;
         }
         let mut parent = None;
         let mut implements = Vec::new();
@@ -1203,7 +1208,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect_op("=")?;
-                    let cv = self.expr()?;
+                    let cv = self.const_expr()?;
                     // A const name redeclared inside the same class body
                     // is a compile fatal — the body compiles wherever the
                     // decl sits (`if (0)`, a dead function), and Zend
@@ -1323,9 +1328,25 @@ impl<'a> Parser<'a> {
                 // enum cases
                 self.pos += 1;
                 let cname = self.ident().unwrap_or_default();
+                let cline = self.line();
                 let cv = if self.eat_op("=") {
-                    self.expr()?
+                    if !enum_backed {
+                        return Err(PhpError::compile_fatal(
+                            format!(
+                                "Case {} of non-backed enum {} must not have a value",
+                                cname, name
+                            ),
+                            cline,
+                        ));
+                    }
+                    self.const_expr()?
                 } else {
+                    if enum_backed {
+                        return Err(PhpError::compile_fatal(
+                            format!("Case {} of backed enum {} must have a value", cname, name),
+                            cline,
+                        ));
+                    }
                     Expr::Null
                 };
                 consts.push(crate::ast::ConstDecl {
@@ -1370,7 +1391,7 @@ impl<'a> Parser<'a> {
                     }
                 };
                 let default = if self.eat_op("=") {
-                    Some(self.expr()?)
+                    Some(self.const_expr()?)
                 } else {
                     None
                 };
@@ -1453,7 +1474,7 @@ impl<'a> Parser<'a> {
         let (body, end_line) = if self.eat_op(";") {
             (Vec::new(), line)
         } else {
-            let b = self.body()?;
+            let b = self.runtime_body()?;
             let e = self.prev_line();
             (b, e)
         };
@@ -1591,7 +1612,10 @@ impl<'a> Parser<'a> {
             let line = self.line();
             let prev_hook = self.hook_ctx.replace((pname.to_string(), is_get));
             let body = if self.eat_op("=>") {
-                let e = self.expr()?;
+                let saved_const = std::mem::replace(&mut self.const_ctx, ConstCtx::Runtime);
+                let e = self.expr();
+                self.const_ctx = saved_const;
+                let e = e?;
                 self.expect_op(";")?;
                 if is_get {
                     Some(vec![Stmt::Line(line), Stmt::Return(Some(e))])
@@ -1611,7 +1635,7 @@ impl<'a> Parser<'a> {
                     ])
                 }
             } else if self.at_op("{") {
-                Some(self.body()?)
+                Some(self.runtime_body()?)
             } else if self.eat_op(";") {
                 None
             } else {
@@ -1656,6 +1680,29 @@ impl<'a> Parser<'a> {
         } else {
             false
         }
+    }
+
+    /// Parse a compile-time-constant slot (param defaults, const/prop
+    /// inits, attribute args, enum cases): scope-keyword checks defer
+    /// to the slot's runtime eval — `self::`/`parent::`/`new self()`
+    /// become catchable `Cannot access "X" ...` Errors at call/init,
+    /// while `static` stays the compile fatal
+    /// '"static::" is not allowed in compile-time constants'.
+    pub(in crate::parser) fn const_expr(&mut self) -> Result<Expr, PhpError> {
+        let saved = std::mem::replace(&mut self.const_ctx, ConstCtx::Slot);
+        let r = self.expr();
+        self.const_ctx = saved;
+        r
+    }
+
+    /// Clear the const-slot flag around a runtime body (closure/method/
+    /// hook bodies nested inside a const slot): scope-keyword gates
+    /// apply to those bodies as ordinary runtime expressions.
+    pub(in crate::parser) fn runtime_body(&mut self) -> Result<Vec<Stmt>, PhpError> {
+        let saved = std::mem::replace(&mut self.const_ctx, ConstCtx::Runtime);
+        let r = self.body();
+        self.const_ctx = saved;
+        r
     }
 
     pub(in crate::parser) fn params(&mut self) -> Result<Vec<Param>, PhpError> {
@@ -1739,7 +1786,7 @@ impl<'a> Parser<'a> {
                 }
             };
             let default = if self.eat_op("=") {
-                Some(self.expr()?)
+                Some(self.const_expr()?)
             } else {
                 None
             };

@@ -13,6 +13,14 @@ enum NsKind {
     Const,
 }
 
+/// Compile-time-constant context — see `Parser::const_ctx`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ConstCtx {
+    Runtime,
+    Slot,
+    ArrowSlot,
+}
+
 pub struct Parser<'a> {
     toks: &'a [Lexed],
     pos: usize,
@@ -71,6 +79,16 @@ pub struct Parser<'a> {
     /// active'); at top level the same constructs are only runtime
     /// errors, so the gate keys on this flag too.
     in_named_fn: bool,
+    /// Compile-time-constant context (param defaults, const/prop inits,
+    /// attribute args, enum cases, `declare()` values): `Slot` lets
+    /// `self::`/`parent::`/`new self()` defer scope checks to the slot's
+    /// runtime eval (catchable `Cannot access "X" ...` at call/init) and
+    /// keeps only `static` a compile fatal. `ArrowSlot` — inside an
+    /// arrow-fn body nested in a const slot — validates as part of the
+    /// enclosing constant expression, so every scope keyword there is
+    /// 'Constant expression contains invalid operations'. `Runtime` for
+    /// closure/method bodies nested inside such a slot.
+    const_ctx: ConstCtx,
     /// Enclosing function/method/closure is declared `function &` —
     /// `return $o?->p` inside is the "Cannot take reference of a
     /// nullsafe chain" compile fatal.
@@ -199,6 +217,7 @@ impl<'a> Parser<'a> {
             strict_slot: false,
             in_closure: false,
             in_named_fn: false,
+            const_ctx: ConstCtx::Runtime,
             ret_by_ref: false,
         }
     }
@@ -298,6 +317,7 @@ pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
         strict_slot: false,
         in_closure: false,
         in_named_fn: false,
+        const_ctx: ConstCtx::Runtime,
         ret_by_ref: false,
     };
     let e = p.expr()?;
@@ -799,7 +819,7 @@ impl<'a> Parser<'a> {
                             .to_string();
                         let n = self.ns_qualify(&n);
                         self.expect_op("=")?;
-                        defs.push((n, self.expr()?));
+                        defs.push((n, self.const_expr()?));
                         if !self.eat_op(",") {
                             break;
                         }

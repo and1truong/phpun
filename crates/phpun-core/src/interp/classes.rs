@@ -2918,12 +2918,22 @@ impl<'a> Interp<'a> {
         props.insert("name".to_string(), Value::str(case));
         let is_unit = matches!(cd.value, Expr::Null);
         if !is_unit {
-            let file = self
-                .classes
-                .get(&cls.to_lowercase())
+            let ecls = self.classes.get(&cls.to_lowercase()).cloned();
+            let file = ecls
+                .as_ref()
                 .map(|c| c.decl.file.clone())
                 .unwrap_or_default();
-            let v = self.eval_decl_const(&cd.value, &file)?;
+            // Case values are const slots scoped to the enum —
+            // `self::K` resolves to it and `parent::` gets the
+            // 'no parent' catchable Error like any class scope.
+            let old = ecls.map(|c| self.const_self.replace(c));
+            self.class_const_ctx += 1;
+            let r = self.eval_decl_const(&cd.value, &file);
+            self.class_const_ctx -= 1;
+            if let Some(o) = old {
+                self.const_self = o;
+            }
+            let v = r?;
             props.insert("value".to_string(), v);
         }
         let o = self.instantiate(cls, &[])?;
