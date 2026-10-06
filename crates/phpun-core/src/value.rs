@@ -1798,6 +1798,13 @@ pub enum PhpResource {
         id: u64,
         body: std::rc::Rc<Vec<u8>>,
         pos: u64,
+        eof: bool,
+        /// zend's stream->position = -1 marker after a failed seek:
+        /// ftell reports pos-1 (false) while IO resumes at pos=0.
+        pos_broken: bool,
+        /// The URI the stream was opened with ("php://input", "data:...")
+        /// — reported verbatim in stream_get_meta_data()'s 'uri' key.
+        uri: String,
     },
     /// php://memory / php://temp — an in-memory byte buffer that is
     /// always read/write, seekable (Composer's BufferIO).
@@ -1806,6 +1813,10 @@ pub enum PhpResource {
         buf: Vec<u8>,
         pos: u64,
         eof: bool,
+        /// zend's stream->position = -1 marker after a failed
+        /// CUR/END-below-zero seek: ftell reports pos-1 (false) while
+        /// IO resumes at pos=0; a successful seek clears it.
+        pos_broken: bool,
         /// fwrite honors the fopen mode ('r' → false); fprintf does not
         /// (zend php_stream_printf bypasses the check).
         write: bool,
