@@ -1395,6 +1395,9 @@ impl<'a> Interp<'a> {
             }
         }
         let mut late = Late::None;
+        // Dynamic-prop slots materialized below record themselves so
+        // the read side can replay zend's 'Undefined property' warns.
+        self.fresh_dyn_props.clear();
         let target_cell = match target {
             Expr::Prop { obj, name, .. } => {
                 match self.eval(obj) {
@@ -1500,6 +1503,14 @@ impl<'a> Interp<'a> {
                         // will throw (bug29893) — and never re-evaluates
                         // the dim key exprs. `??=` reads with isset()
                         // semantics (no warnings; typed_properties_103).
+                        // Slots this write-fetch materialized warn
+                        // 'Undefined property' first (finding 13).
+                        if !$quiet {
+                            let ws = std::mem::take(&mut self.fresh_dyn_props);
+                            for (_, cn, pn) in ws {
+                                self.warn(&format!("Undefined property: {}::${}", cn, pn))?;
+                            }
+                        }
                         match &late {
                             Late::Keyed { base, keys } => {
                                 self.compound_dim_read(base.clone(), keys, $quiet)?

@@ -1710,6 +1710,15 @@ impl<'a> Interp<'a> {
                         return Ok(cell(Value::Null));
                     }
                 }
+                // Declared-but-invisible with no __get intercept dies
+                // with zend's access Error — it must not fall through
+                // to the dynamic-prop materialization below and shadow
+                // the declaration (finding 11).
+                if key.is_none() {
+                    if let Some(e) = self.hidden_decl_error(&o, &pn) {
+                        return self.fail(e);
+                    }
+                }
                 let key = key.unwrap_or_else(|| pn.clone());
                 // An RW fetch of an undeclared prop materializes a
                 // dynamic one — E_DEPRECATED on non-exempt classes
@@ -1721,6 +1730,7 @@ impl<'a> Interp<'a> {
                         cn, pn
                     ))?;
                 }
+                let undeclared = self.decl_prop(&o, &pn).is_none();
                 let mut ob = o.borrow_mut();
                 if !ob.props.contains_key(&key) {
                     if !ob.prop_order.contains(&key) {
@@ -1728,6 +1738,17 @@ impl<'a> Interp<'a> {
                     }
                     let nc = cell(Value::Null);
                     self.last_fresh_cell = Some(Rc::as_ptr(&nc) as usize);
+                    if undeclared {
+                        // The compound read warns 'Undefined property'
+                        // for a slot this write-fetch just created
+                        // (finding 13) — only for genuinely dynamic
+                        // props; declared-but-uninit slots stay silent.
+                        self.fresh_dyn_props.push((
+                            Rc::as_ptr(&nc) as usize,
+                            ob.class.name().to_string(),
+                            pn.clone(),
+                        ));
+                    }
                     ob.props.insert(key.clone(), nc);
                 }
                 let slot = ob.props.get(&key).unwrap().clone();
@@ -1825,7 +1846,18 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let cls = o.borrow().class.clone();
-                if let Some(k) = self.obj_prop_key(&o, &pn) {
+                // A declared prop the scope can't see is zend's access
+                // Error — `__unset` intercepts it like any overload
+                // first (finding 11: unset($a->protected)).
+                let hidden = if self.prop_visible(&cls, &pn) {
+                    None
+                } else {
+                    self.hidden_decl_error(&o, &pn)
+                };
+                if let Some(k) = self
+                    .obj_prop_key(&o, &pn)
+                    .filter(|_| hidden.is_none())
+                {
                     let mut ob = o.borrow_mut();
                     let prune = if let Some(c) = ob.props.remove(&k) {
                         // unset() severs the typed slot: refs bound to it
@@ -1854,6 +1886,25 @@ impl<'a> Interp<'a> {
                     drop(ob);
                     if let Some(ptr) = prune {
                         self.prune_typed_slot(ptr);
+                    }
+                } else if let Some(e) = hidden {
+                    // __unset overloads the invisible decl like a
+                    // missing prop; without it the access Error wins.
+                    if self.find_method_in(&cls, "__unset").is_some()
+                        && self
+                            .magic_guards
+                            .insert((Rc::as_ptr(&o) as usize, 3u8, pn.clone()))
+                    {
+                        let res = self.method_invoke(
+                            o.clone(),
+                            "__unset",
+                            CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
+                        );
+                        self.magic_guards
+                            .remove(&(Rc::as_ptr(&o) as usize, 3u8, pn.clone()));
+                        res?;
+                    } else {
+                        return self.fail(e);
                     }
                 } else if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
                     // unset() on an uninitialized declared prop still

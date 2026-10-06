@@ -302,6 +302,11 @@ pub struct Interp<'a> {
     /// it for the typed-prop decl lookup without re-evaluating the
     /// receiver expr — `$x =& $o->m()->p` must call m() once).
     last_prop_ov: Option<Value>,
+    /// Dynamic prop slots materialized by the CURRENT lvalue chain's
+    /// write-fetch — (cell ptr, class, name). The compound read then
+    /// emits zend's per-level 'Undefined property: C::$p' warning
+    /// (finding 13); cleared at the start of each assign target.
+    fresh_dyn_props: Vec<(usize, String, String)>,
     /// The last invoked function was declared `&name()` (returns by ref).
     last_call_by_ref: bool,
     /// Set just before invoking `[$closure,'__invoke']` so the callee
@@ -805,6 +810,7 @@ impl<'a> Interp<'a> {
             globals: Frame::new(String::new()),
             last_ret_cell: None,
             last_prop_ov: None,
+            fresh_dyn_props: Vec::new(),
             last_call_by_ref: false,
             pending_call_alias: None,
             globals_order: Vec::new(),
