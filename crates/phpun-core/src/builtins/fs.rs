@@ -1642,19 +1642,22 @@ pub(crate) fn dispatch(
                             // no timed_out/blocked/eof, but the header
                             // mediatype/base64 keys lead the array and
                             // wrapper_type/stream_type are RFC2397.
-                            base.clear();
-                            let (mediatype, b64) = data_uri_meta(uri);
+                            let mut a = PhpArray::new();
+                            let (mediatype, params, b64) = data_uri_meta(uri);
                             if let Some(mt) = mediatype {
-                                base.push(("mediatype", Value::str(mt)));
+                                a.set(ArrKey::Str("mediatype".into()), Value::str(mt));
                             }
-                            base.push(("base64", Value::Bool(b64)));
-                            base.push(("wrapper_type", Value::str("RFC2397")));
-                            base.push(("stream_type", Value::str("RFC2397")));
-                            base.push(("mode", Value::str(mode.clone())));
-                            base.push(("unread_bytes", Value::Int(0)));
-                            base.push(("seekable", Value::Bool(true)));
-                            base.push(("uri", Value::str(uri.clone())));
-                            mk(base)
+                            for (k, v) in params {
+                                a.set(ArrKey::Str(k.into()), Value::str(v));
+                            }
+                            a.set(ArrKey::Str("base64".into()), Value::Bool(b64));
+                            a.set(ArrKey::Str("wrapper_type".into()), Value::str("RFC2397"));
+                            a.set(ArrKey::Str("stream_type".into()), Value::str("RFC2397"));
+                            a.set(ArrKey::Str("mode".into()), Value::str(mode.clone()));
+                            a.set(ArrKey::Str("unread_bytes".into()), Value::Int(0));
+                            a.set(ArrKey::Str("seekable".into()), Value::Bool(true));
+                            a.set(ArrKey::Str("uri".into()), Value::str(uri.clone()));
+                            Value::Array(Rc::new(RefCell::new(a)))
                         }
                         PhpResource::Input { eof, uri, .. } => {
                             base.push(("eof", Value::Bool(*eof)));
@@ -1762,29 +1765,48 @@ fn fs_path(p: &str) -> &str {
     }
 }
 
-/// The RFC2397 header of a data: URI — (mediatype, base64 flag) —
-/// reported verbatim by zend in stream_get_meta_data().
-fn data_uri_meta(path: &str) -> (Option<String>, bool) {
+/// The RFC2397 header of a data: URI as zend reports it in
+/// stream_get_meta_data(): (mediatype — text before the first ';',
+/// None when empty —, the ';'-separated `attr=val` params in order
+/// as their own meta keys, the base64 flag). Only an exact `;base64`
+/// sets the flag; a `mediatype=` param never surfaces (zend skips it),
+/// and `base64=…` params collapse into the bool zend appends last.
+fn data_uri_meta(path: &str) -> (Option<String>, Vec<(String, String)>, bool) {
     let rest = path
         .strip_prefix("data:")
         .or_else(|| path.strip_prefix("data://"))
         .unwrap_or("");
     let rest = rest.strip_prefix("//").unwrap_or(rest);
     let meta = rest.split(',').next().unwrap_or("");
-    let parts: Vec<&str> = meta.split(';').collect();
-    let b64 = parts.iter().any(|m| m.eq_ignore_ascii_case("base64"));
-    let mediatype = parts
-        .iter()
-        .filter(|m| !m.eq_ignore_ascii_case("base64"))
-        .copied()
-        .collect::<Vec<&str>>()
-        .join(";");
+    let mut segs = meta.split(';');
+    let mediatype = segs.next().unwrap_or("");
+    let mut params = Vec::new();
+    let mut b64 = false;
+    for seg in segs {
+        match seg.split_once('=') {
+            Some((k, v)) => {
+                // zend assoc_adds each param verbatim except one
+                // literally named 'mediatype'; 'base64=v' is later
+                // overwritten by the appended bool — same net effect
+                // as skipping it here.
+                if k != "mediatype" && k != "base64" {
+                    params.push((k.to_string(), v.to_string()));
+                }
+            }
+            None => {
+                if seg == "base64" {
+                    b64 = true;
+                }
+            }
+        }
+    }
     (
         if mediatype.is_empty() {
             None
         } else {
-            Some(mediatype)
+            Some(mediatype.to_string())
         },
+        params,
         b64,
     )
 }
