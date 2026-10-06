@@ -313,7 +313,7 @@ impl<'a> Interp<'a> {
                 // (isset/print/eval) are not functions.
                 if obj.borrow().class.name().to_lowercase().as_str() == "reflectionfunction" {
                     if args.is_empty() {
-                        return Err(PhpError::uncaught(
+                        return self.fail(PhpError::uncaught(
                             "ArgumentCountError",
                             "ReflectionFunction::__construct() expects exactly 1 argument, 0 given",
                             0,
@@ -332,7 +332,7 @@ impl<'a> Interp<'a> {
                             Some(self.conv_str(&a)?.to_string())
                         }
                         other => {
-                            return Err(PhpError::uncaught(
+                            return self.fail(PhpError::uncaught(
                                 "TypeError",
                                 format!(
                                     "ReflectionFunction::__construct(): Argument #1 ($function) must be of type Closure|string, {} given",
@@ -351,7 +351,7 @@ impl<'a> Interp<'a> {
                         {
                             key.clone()
                         } else {
-                            return Err(PhpError::uncaught(
+                            return self.fail(PhpError::uncaught(
                                 "ReflectionException",
                                 format!("Function {}() does not exist", s),
                                 0,
