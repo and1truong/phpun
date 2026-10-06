@@ -803,7 +803,13 @@ pub(crate) fn dispatch(
                 let offset = args.get(2).map(|c| c.borrow().to_int()).unwrap_or(-1);
                 if offset >= 0 {
                     match &mut *r.borrow_mut() {
-                        PhpResource::File { pos, eof, .. } | PhpResource::Mem { pos, eof, .. } => {
+                        PhpResource::File { file, pos, eof, .. } => {
+                            use std::io::Seek;
+                            *pos = offset as u64;
+                            *eof = false;
+                            let _ = file.seek(std::io::SeekFrom::Start(*pos));
+                        }
+                        PhpResource::Mem { pos, eof, .. } => {
                             *pos = offset as u64;
                             *eof = false;
                         }
@@ -847,7 +853,13 @@ pub(crate) fn dispatch(
             if offset > 0 {
                 if let Some(Value::Resource(r)) = args.first().map(|c| c.borrow().clone()) {
                     match &mut *r.borrow_mut() {
-                        PhpResource::File { pos, eof, .. } | PhpResource::Mem { pos, eof, .. } => {
+                        PhpResource::File { file, pos, eof, .. } => {
+                            use std::io::Seek;
+                            *pos = offset as u64;
+                            *eof = false;
+                            let _ = file.seek(std::io::SeekFrom::Start(*pos));
+                        }
+                        PhpResource::Mem { pos, eof, .. } => {
                             *pos = offset as u64;
                             *eof = false;
                         }
@@ -1356,7 +1368,7 @@ pub(in crate::builtins) fn write_resource(
     c: Option<&Cell>,
     data: &[u8],
 ) -> Result<StreamWrite, PhpError> {
-    use std::io::{Seek, Write};
+    use std::io::Write;
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
             let mut rb = r.borrow_mut();
@@ -1422,7 +1434,8 @@ pub(in crate::builtins) fn write_resource(
                     if !*write {
                         return Ok(StreamWrite::Ebadf(9, "Bad file descriptor".into()));
                     }
-                    let _ = file.seek(std::io::SeekFrom::Start(*pos));
+                    // Writes land at the real fd offset (shared with
+                    // dup'd child ends), like zend's fwrite(3).
                     if let Err(e) = file.write_all(data) {
                         let (errno, msg) = io_errno_str(&e);
                         return Ok(StreamWrite::Ebadf(errno, msg));
@@ -1538,7 +1551,7 @@ fn read_line_pipe(
 }
 
 fn read_resource(c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
-    use std::io::{Read, Seek};
+    use std::io::Read;
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
             let mut rb = r.borrow_mut();
@@ -1588,7 +1601,10 @@ fn read_resource(c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
                     if *eof {
                         return Ok(StreamRead::Data(Vec::new()));
                     }
-                    let _ = file.seek(std::io::SeekFrom::Start(*pos));
+                    // zend reads at the real fd offset — an fd dup'd to
+                    // a proc_open child shares it, so a child draining
+                    // the descriptor moves our reads to EOF too. `pos`
+                    // is the PHP-side ftell counter (+= bytes read).
                     let mut buf = vec![0u8; n];
                     match file.read(&mut buf) {
                         Ok(got) => {
@@ -1613,7 +1629,7 @@ fn read_resource(c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
 }
 
 fn read_line_resource(c: Option<&Cell>, limit: usize) -> Result<StreamRead, PhpError> {
-    use std::io::{Read, Seek};
+    use std::io::Read;
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
             let mut rb = r.borrow_mut();
@@ -1675,7 +1691,6 @@ fn read_line_resource(c: Option<&Cell>, limit: usize) -> Result<StreamRead, PhpE
                     if *eof {
                         return Ok(StreamRead::Data(Vec::new()));
                     }
-                    let _ = file.seek(std::io::SeekFrom::Start(*pos));
                     let mut out = Vec::new();
                     let mut byte = [0u8; 1];
                     while out.len() < limit {
@@ -1709,7 +1724,7 @@ fn read_line_resource(c: Option<&Cell>, limit: usize) -> Result<StreamRead, PhpE
 /// php_stream_gets: read up to `limit` bytes, stopping after '\n'.
 /// Returns an empty vec at EOF (or on a non-readable stream).
 fn csv_gets(c: &Cell, limit: usize) -> Result<StreamRead, PhpError> {
-    use std::io::{Read, Seek};
+    use std::io::Read;
     match c.borrow().clone() {
         Value::Resource(r) => {
             let mut rb = r.borrow_mut();
@@ -1734,7 +1749,6 @@ fn csv_gets(c: &Cell, limit: usize) -> Result<StreamRead, PhpError> {
                     if *eof {
                         return Ok(StreamRead::Data(Vec::new()));
                     }
-                    let _ = file.seek(std::io::SeekFrom::Start(*pos));
                     let mut out = Vec::new();
                     let mut byte = [0u8; 1];
                     while out.len() < limit {
