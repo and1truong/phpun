@@ -1592,6 +1592,15 @@ impl<'a> Interp<'a> {
             return result;
         }
         let flow = self.exec_block(stmts);
+        // A generator destroyed by the unwind (last ref dropped as
+        // the error propagated) replays its finally before the fatal
+        // renders — Zend tears objects down between diagnosing and
+        // displaying it. Gens still referenced stay for the
+        // shutdown pass (run_shutdown replays them AFTER the
+        // display, in reverse creation order).
+        if !matches!(flow, Flow::Normal | Flow::Return(_) | Flow::Exit(_)) {
+            let _ = self.gen_gc_sweep(false);
+        }
         // Generators still suspended at request end replay their
         // enclosing finally chains during shutdown — Zend renders a
         // terminal error first, then tears objects down (shutdown
