@@ -1854,10 +1854,7 @@ impl<'a> Interp<'a> {
                 } else {
                     self.hidden_decl_error(&o, &pn)
                 };
-                if let Some(k) = self
-                    .obj_prop_key(&o, &pn)
-                    .filter(|_| hidden.is_none())
-                {
+                if let Some(k) = self.obj_prop_key(&o, &pn).filter(|_| hidden.is_none()) {
                     let mut ob = o.borrow_mut();
                     let prune = if let Some(c) = ob.props.remove(&k) {
                         // unset() severs the typed slot: refs bound to it

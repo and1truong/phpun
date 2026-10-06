@@ -1555,10 +1555,7 @@ impl<'a> Interp<'a> {
                                 // write throws zend's assign Error and
                                 // the read never runs — no 'Attempt to
                                 // read property' warning first (probe4i).
-                                if matches!(
-                                    &late,
-                                    Late::Prop { .. } | Late::PropStr { .. }
-                                ) {
+                                if matches!(&late, Late::Prop { .. } | Late::PropStr { .. }) {
                                     Value::Null
                                 } else {
                                     if $quiet {
@@ -2251,9 +2248,7 @@ impl<'a> Interp<'a> {
 
     /// Any `&` element in a destructure — nested lists count
     /// (`list(list(&$x))` and `[[$x, &$y]]` bind references too).
-    pub(in crate::interp) fn list_has_ref(
-        items: &[Option<(Option<Expr>, Expr)>],
-    ) -> bool {
+    pub(in crate::interp) fn list_has_ref(items: &[Option<(Option<Expr>, Expr)>]) -> bool {
         items.iter().flatten().any(|(_, t)| match t {
             Expr::ByRef(_) => true,
             Expr::List(sub) => Self::list_has_ref(sub),

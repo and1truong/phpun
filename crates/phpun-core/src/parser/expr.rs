@@ -712,10 +712,7 @@ impl<'a> Parser<'a> {
     /// call/method results die with the return-value fatals, and
     /// everything else (nullsafe chains included) is
     /// `Assignments can only happen to writable values` (p13 l*).
-    pub(in crate::parser) fn list_writable(
-        &self,
-        e: &Expr,
-    ) -> Result<(), PhpError> {
+    pub(in crate::parser) fn list_writable(&self, e: &Expr) -> Result<(), PhpError> {
         use crate::ast::Expr::*;
         let writable = || {
             Err(PhpError::compile_fatal(
@@ -786,10 +783,9 @@ impl<'a> Parser<'a> {
                             Expr::Null => None,
                             // `list('k' => $v)` — args_flags encodes the
                             // keyed pair as a transient `=>` binary.
-                            Expr::Binary { op: "=>", l, r } => Some((
-                                Some(*l),
-                                self.list_target(*r)?,
-                            )),
+                            Expr::Binary { op: "=>", l, r } => {
+                                Some((Some(*l), self.list_target(*r)?))
+                            }
                             other => Some((None, self.list_target(other)?)),
                         });
                     }
@@ -1191,10 +1187,7 @@ impl<'a> Parser<'a> {
 
     /// Zend rejects `['k' => $a, $b]`/`[$a, 'k' => $b]` — keyed and
     /// unkeyed destructuring elements can't mix in one list.
-    fn list_mix_check(
-        &self,
-        items: &[Option<(Option<Expr>, Expr)>],
-    ) -> Result<(), PhpError> {
+    fn list_mix_check(&self, items: &[Option<(Option<Expr>, Expr)>]) -> Result<(), PhpError> {
         let mut keyed = false;
         let mut unkeyed = false;
         for it in items.iter().flatten() {

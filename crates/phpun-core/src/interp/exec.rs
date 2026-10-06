@@ -870,10 +870,7 @@ impl<'a> Interp<'a> {
         let cell_src = Self::foreach_target_by_ref(val)
             && matches!(
                 arr_e,
-                Expr::Prop { .. }
-                    | Expr::StaticProp { .. }
-                    | Expr::Index { .. }
-                    | Expr::VarVar(_)
+                Expr::Prop { .. } | Expr::StaticProp { .. } | Expr::Index { .. } | Expr::VarVar(_)
             );
         let src = if cell_src {
             match self.eval_cell(arr) {
