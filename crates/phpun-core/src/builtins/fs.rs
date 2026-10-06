@@ -685,9 +685,7 @@ pub(crate) fn dispatch(
                                             return Ok(Some(Value::Int(-1)))
                                         }
                                         StreamRead::Data(b) => remaining -= b.len() as i64,
-                                        StreamRead::FailSilent => {
-                                            return Ok(Some(Value::Int(-1)))
-                                        }
+                                        StreamRead::FailSilent => return Ok(Some(Value::Int(-1))),
                                         StreamRead::Ebadf(errno, msg) => {
                                             read_ebadf_notice(it, name, errno, &msg)?;
                                             return Ok(Some(Value::Int(-1)));
@@ -2549,7 +2547,12 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
         // Zend throws the ValueError ON TOP of the collected
         // element TypeErrors and returns before select — the by-ref
         // arrays keep their original contents.
-        return Err(select_throw(it, chain, "ValueError", "No stream arrays were passed"));
+        return Err(select_throw(
+            it,
+            chain,
+            "ValueError",
+            "No stream arrays were passed",
+        ));
     }
     // $seconds/$microseconds are ?long zpp params; negatives are
     // ValueErrors thrown AFTER the empty-sets check. A non-null usec
@@ -2790,10 +2793,7 @@ fn select_throw_last(it: &mut Interp, chain: Vec<Value>) -> PhpError {
 /// php_stream_temp_cast: spill a php://temp buffer into a tmpfile()
 /// and seek it to the stream's current position; the returned fd is
 /// the claimable descriptor. Returns None when tmpfile() fails.
-pub(in crate::builtins) fn temp_spill_fd(
-    buf: &[u8],
-    pos: u64,
-) -> Option<std::os::unix::io::RawFd> {
+pub(in crate::builtins) fn temp_spill_fd(buf: &[u8], pos: u64) -> Option<std::os::unix::io::RawFd> {
     unsafe {
         let f = libc::tmpfile();
         if f.is_null() {
