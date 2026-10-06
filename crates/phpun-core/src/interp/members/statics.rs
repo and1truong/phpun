@@ -544,7 +544,11 @@ impl<'a> Interp<'a> {
                                 || self.is_throwable_name(&ob.class.decl.name)
                         };
                         if is_throwable {
-                            if let Some(v) = self.throwable_method(o, name, &args.cells) {
+                            if name.eq_ignore_ascii_case("__construct") {
+                                if let Some(v) = self.throwable_ctor(o, &args)? {
+                                    return Ok(v);
+                                }
+                            } else if let Some(v) = self.throwable_method(o, name, &args.cells) {
                                 return Ok(v);
                             }
                         }

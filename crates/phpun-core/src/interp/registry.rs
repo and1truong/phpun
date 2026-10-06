@@ -1989,8 +1989,18 @@ impl<'a> Interp<'a> {
             },
             false,
         );
+        // ErrorException overrides Exception's ctor (6-arg signature)
+        // and adds protected $severity + getSeverity().
+        {
+            let mut d = throwable_class(
+                "ErrorException",
+                Some("Exception"),
+                &["message", "code", "file", "line", "severity"],
+            );
+            d.methods.push(method("getSeverity", &[]));
+            reg(d, false);
+        }
         for (name, parent) in [
-            ("ErrorException", "Exception"),
             ("RuntimeException", "Exception"),
             ("LogicException", "Exception"),
             ("InvalidArgumentException", "LogicException"),

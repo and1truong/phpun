@@ -2175,7 +2175,11 @@ impl<'a> Interp<'a> {
                 .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
                 .unwrap_or(false);
             if stub {
-                if let Some(v) = self.throwable_method(&obj, name, &args) {
+                if name.eq_ignore_ascii_case("__construct") {
+                    if let Some(v) = self.throwable_ctor(&obj, &args)? {
+                        return Ok(v);
+                    }
+                } else if let Some(v) = self.throwable_method(&obj, name, &args.cells) {
                     return Ok(v);
                 }
             }
@@ -2505,32 +2509,278 @@ impl<'a> Interp<'a> {
                     trace
                 )))
             }
-            "__construct" => {
-                // Builtin ctor: props from args message/code; arg 3
-                // (`previous`) chains under the new throwable and
-                // surfaces via getPrevious()/'Next X:' uncaught blocks.
-                drop(ob);
-                let mut ob = obj.borrow_mut();
-                let msg = _args
-                    .first()
-                    .map(|c| c.borrow().to_php_string())
-                    .unwrap_or_default();
-                let code = _args.get(1).map(|c| c.borrow().to_int()).unwrap_or(0);
-                ob.props.insert("message".into(), cell(Value::str(msg)));
-                ob.props.insert("code".into(), cell(Value::Int(code)));
-                if let Some(prev @ Value::Object(_)) = _args.get(2).map(|c| c.borrow().clone()) {
-                    if let Some(ObjectInternal::Exception { previous, .. }) = &mut ob.internal {
-                        *previous = Some(prev);
-                    }
-                }
-                if !ob.prop_order.contains(&"message".into()) {
-                    ob.prop_order.push("message".into());
-                    ob.prop_order.push("code".into());
-                }
-                Some(Value::Null)
-            }
+            // __construct is dispatched to throwable_ctor() ahead of
+            // this table — it needs arginfo errors (TypeError/
+            // ArgumentCountError/named args), not Option<Value>.
+            "getseverity" => Some(
+                ob.props
+                    .get("severity")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Int(1)),
+            ),
             _ => None,
         }
+    }
+
+    /// `Ctor::__construct(): Argument #N` TypeError for throwable
+    /// arginfo checks — names the DECLARING class.
+    fn arg_tyerr(
+        &self,
+        dname: &str,
+        n: usize,
+        pname: &str,
+        ty: &str,
+        v: &Value,
+    ) -> PhpError {
+        PhpError::uncaught(
+            "TypeError",
+            format!(
+                "{}::__construct(): Argument #{} (${}) must be of type {}, {} given",
+                dname,
+                n,
+                pname,
+                ty,
+                self.zval_type_name(v)
+            ),
+            0,
+        )
+    }
+
+    /// Deprecated 'Passing null to parameter #N' for non-nullable
+    /// throwable-ctor params.
+    fn arg_null_dep(
+        &mut self,
+        dname: &str,
+        n: usize,
+        pname: &str,
+        ty: &str,
+    ) -> Result<(), PhpError> {
+        self.deprecated(&format!(
+            "{}::__construct(): Passing null to parameter #{} (${}) of type {} is deprecated",
+            dname, n, pname, ty
+        ))
+    }
+
+    /// Builtin throwable ctor — zend exposes real arginfo here:
+    /// Exception/Error take `(string $message = "", int $code = 0,
+    /// ?Throwable $previous = null)`; ErrorException inserts
+    /// severity/filename/line before previous. Errors name the
+    /// DECLARING class (RuntimeException arg errors read
+    /// 'Exception::__construct()'; ErrorException overrides its own).
+    pub(in crate::interp) fn throwable_ctor(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        args: &crate::interp::CallArgs,
+    ) -> Result<Option<Value>, PhpError> {
+        let is_ee = self.obj_is_a(obj, "errorexception");
+        let dname = if is_ee {
+            "ErrorException"
+        } else if self.obj_is_a(obj, "error") {
+            "Error"
+        } else {
+            "Exception"
+        };
+        const EX_PARAMS: [(&str, &str); 3] = [
+            ("message", "string"),
+            ("code", "int"),
+            ("previous", "?Throwable"),
+        ];
+        const EE_PARAMS: [(&str, &str); 6] = [
+            ("message", "string"),
+            ("code", "int"),
+            ("severity", "int"),
+            ("filename", "?string"),
+            ("line", "?int"),
+            ("previous", "?Throwable"),
+        ];
+        let params: &[(&str, &str)] = if is_ee { &EE_PARAMS } else { &EX_PARAMS };
+        let total = args.cells.len() + args.named.len();
+        if total > params.len() {
+            return self.fail(PhpError::uncaught(
+                "ArgumentCountError",
+                format!(
+                    "{}::__construct() expects at most {} arguments, {} given",
+                    dname,
+                    params.len(),
+                    total
+                ),
+                0,
+            ));
+        }
+        let mut slots: Vec<Option<Cell>> =
+            args.cells.iter().cloned().map(Some).collect();
+        slots.resize(params.len(), None);
+        for (n, c, _, _) in &args.named {
+            match params.iter().position(|(p, _)| p == n) {
+                Some(i) => {
+                    if slots[i].is_some() {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Named parameter ${} overwrites previous argument",
+                                n
+                            ),
+                            0,
+                        ));
+                    }
+                    slots[i] = Some(c.clone());
+                }
+                None => {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Unknown named parameter ${}", n),
+                        0,
+                    ));
+                }
+            }
+        }
+        // Per-param zend type checks. Internal-fn coercion rules: array/
+        // object reject with a TypeError naming the DECLARING method;
+        // null into a non-nullable scalar is deprecated, not fatal;
+        // float->int truncates with a precision deprecation.
+        let mut bound: Vec<Value> = Vec::with_capacity(params.len());
+        for (i, (pname, pty)) in params.iter().enumerate() {
+            let v = match &slots[i] {
+                Some(c) => c.borrow().clone(),
+                None => {
+                    // zend defaults: message "", code 0, severity
+                    // E_ERROR, filename/line/previous null.
+                    bound.push(if *pname == "severity" {
+                        Value::Int(1)
+                    } else {
+                        Value::Null
+                    });
+                    continue;
+                }
+            };
+            let n = i + 1;
+            let bv = match *pty {
+                "string" => match &v {
+                    Value::Null => {
+                        self.arg_null_dep(dname, n, pname, "string")?;
+                        Value::str("")
+                    }
+                    Value::Array(_) | Value::Callable(_) | Value::Resource(_) => {
+                        return self.fail(self.arg_tyerr(dname, n, pname, "string", &v));
+                    }
+                    Value::Object(o) => {
+                        if self.find_method_in(&o.borrow().class.clone(), "__tostring").is_some() {
+                            Value::str(self.conv_str(&v)?)
+                        } else {
+                            return self.fail(self.arg_tyerr(dname, n, pname, "string", &v));
+                        }
+                    }
+                    _ => Value::str(self.conv_str(&v)?),
+                },
+                "int" | "?int" => {
+                    let nullable = *pty == "?int";
+                    match &v {
+                        Value::Null if !nullable => {
+                            self.arg_null_dep(dname, n, pname, "int")?;
+                            Value::Int(0)
+                        }
+                        Value::Null => Value::Null,
+                        Value::Float(f) => {
+                            if f.fract() != 0.0 {
+                                self.deprecated(&format!(
+                                    "Implicit conversion from float {} to int loses precision",
+                                    crate::value::format_float(*f)
+                                ))?;
+                            }
+                            Value::Int(*f as i64)
+                        }
+                        Value::Str(s) => match crate::value::numeric(s) {
+                            crate::value::Numeric::Int(iv) => Value::Int(iv),
+                            crate::value::Numeric::Float(f) => {
+                                if f.fract() != 0.0 {
+                                    self.deprecated(&format!(
+                                        "Implicit conversion from float {} to int loses precision",
+                                        crate::value::format_float(f)
+                                    ))?;
+                                }
+                                Value::Int(f as i64)
+                            }
+                            crate::value::Numeric::Leading(f, _) => Value::Int(f as i64),
+                            crate::value::Numeric::NonNumeric => {
+                                return self.fail(self.arg_tyerr(dname, n, pname, pty, &v));
+                            }
+                        },
+                        Value::Int(_) | Value::Bool(_) => Value::Int(v.to_int()),
+                        _ => return self.fail(self.arg_tyerr(dname, n, pname, pty, &v)),
+                    }
+                }
+                "?string" => match &v {
+                    Value::Null => Value::Null,
+                    Value::Array(_) | Value::Callable(_) | Value::Resource(_) => {
+                        return self.fail(self.arg_tyerr(dname, n, pname, "?string", &v));
+                    }
+                    Value::Object(o) => {
+                        if self.find_method_in(&o.borrow().class.clone(), "__tostring").is_some() {
+                            Value::str(self.conv_str(&v)?)
+                        } else {
+                            return self.fail(self.arg_tyerr(dname, n, pname, "?string", &v));
+                        }
+                    }
+                    _ => Value::str(self.conv_str(&v)?),
+                },
+                "?Throwable" => match &v {
+                    Value::Null => Value::Null,
+                    Value::Object(o)
+                        if self.is_throwable_name(&o.borrow().class.decl.name) =>
+                    {
+                        v.clone()
+                    }
+                    _ => return self.fail(self.arg_tyerr(dname, n, pname, "?Throwable", &v)),
+                },
+                _ => v.clone(),
+            };
+            bound.push(bv);
+        }
+        drop(obj.borrow());
+        let mut ob = obj.borrow_mut();
+        let msg = bound[0].to_php_string();
+        let code = bound[1].to_int();
+        ob.props.insert("message".into(), cell(Value::str(msg)));
+        ob.props.insert("code".into(), cell(Value::Int(code)));
+        if !ob.prop_order.contains(&"message".into()) {
+            ob.prop_order.push("message".into());
+            ob.prop_order.push("code".into());
+        }
+        let (prev_i, file_v, line_v, sev_v) = if is_ee {
+            // severity/file/line live between code and previous.
+            let sev = bound[2].to_int();
+            let fv = bound[3].clone();
+            let lv = bound[4].clone();
+            (5, Some(fv), Some(lv), Some(sev))
+        } else {
+            (2, None, None, None)
+        };
+        if let Some(sev) = sev_v {
+            ob.props.insert("severity".into(), cell(Value::Int(sev)));
+            if !ob.prop_order.contains(&"severity".into()) {
+                ob.prop_order.push("severity".into());
+            }
+        }
+        if let Some(fv) = file_v {
+            if let Value::Str(_) = &fv {
+                if let Some(ObjectInternal::Exception { file, .. }) = &mut ob.internal {
+                    *file = fv.to_php_string();
+                }
+            }
+        }
+        if let Some(lv) = line_v {
+            if let Value::Int(l) = lv {
+                if let Some(ObjectInternal::Exception { line, .. }) = &mut ob.internal {
+                    *line = l as u32;
+                }
+            }
+        }
+        if let prev @ Value::Object(_) = bound[prev_i].clone() {
+            if let Some(ObjectInternal::Exception { previous, .. }) = &mut ob.internal {
+                *previous = Some(prev);
+            }
+        }
+        Ok(Some(Value::Null))
     }
 
     /// `X::` member access where X may be a trait: traits resolve to a
