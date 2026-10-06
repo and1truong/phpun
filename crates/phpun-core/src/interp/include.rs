@@ -357,6 +357,19 @@ impl<'a> Interp<'a> {
                 let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
                 // ...a fresh op_array: its own unit serial too.
                 let saved_unit = self.begin_unit();
+                // Zend traces through eval'd code carry a `FILE(N):
+                // eval()` frame at the call site (rendered bare — the
+                // eval'd source is not an arg in backtraces).
+                self.call_trace.push(TraceFrame {
+                    function: "eval".to_string(),
+                    class: None,
+                    ty: String::new(),
+                    file: saved_file.clone(),
+                    line: saved_line as u32,
+                    args: Vec::new(),
+                    named_args: Vec::new(),
+                    internal: true,
+                });
                 let flow =
                     match Self::const_closure_gate(&stmts).and_then(|_| self.flow_gate(&stmts)) {
                         Err(mut e) => {
@@ -398,6 +411,7 @@ impl<'a> Interp<'a> {
                     }
                     f => f,
                 };
+                self.call_trace.pop();
                 self.cur_line = saved_line;
                 self.cur_file = saved_file;
                 match flow {

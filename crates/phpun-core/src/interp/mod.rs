@@ -1543,6 +1543,10 @@ impl<'a> Interp<'a> {
     /// override the script's exit code (a shutdown `exit` rewrites even
     /// a main-path fatal's code).
     fn run_shutdown(&mut self) -> Option<i32> {
+        // Shutdown functions and the deferred dtor sweep are invoked by
+        // the engine — their callees' trace callsites are `[internal
+        // function]`, like callbacks inside builtins.
+        self.internal_cb += 1;
         let fns = std::mem::take(&mut self.shutdown_fns);
         let mut shutdown_code = None;
         for (f, args) in fns {
@@ -1653,6 +1657,7 @@ impl<'a> Interp<'a> {
         if !self.mem_exceeded {
             self.flush_ob_all();
         }
+        self.internal_cb -= 1;
         shutdown_code
     }
 
@@ -1717,7 +1722,15 @@ impl<'a> Interp<'a> {
                 .is_some()
                 && self.mark_destructed(&o)
             {
-                let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                // A fatal/throw inside the dtor aborts the script
+                // (Zend). While another exception unwinds Zend chains
+                // the dtor error as `Next ...` — not yet modelled, so
+                // it stays swallowed there (bug52361).
+                if self.pending_exception.is_some() {
+                    let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                } else {
+                    self.method_invoke(o.clone(), "__destruct", CallArgs::empty())?;
+                }
             }
         }
         Ok(())
@@ -1760,10 +1773,17 @@ impl<'a> Interp<'a> {
             {
                 self.mark_destructed(&o);
                 // A throw inside the dtor must not clobber the
-                // in-flight exception being unwound (bug52361).
+                // in-flight exception being unwound (bug52361) — Zend
+                // chains it as `Next ...` (not yet modelled). On a
+                // clean frame exit the dtor's error propagates and
+                // aborts the script instead.
                 let saved = self.pending_exception.take();
-                let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                let r = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                let was_unwinding = saved.is_some();
                 self.pending_exception = saved.or(self.pending_exception.take());
+                if !was_unwinding {
+                    r?;
+                }
             }
         }
         Ok(())

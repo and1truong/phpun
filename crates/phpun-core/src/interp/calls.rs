@@ -1948,9 +1948,11 @@ impl<'a> Interp<'a> {
         // (internal_cb: ob handlers, sort callbacks) has call site
         // `[internal function]`; engine callbacks like the error handler
         // invoked mid-eval instead report the builtin's own call site
-        // (bug32828 vs bug28213).
+        // (bug32828 vs bug28213). At shutdown the trace is empty — the
+        // engine itself is the caller, which is also `[internal
+        // function]` (registered shutdown fns, the dtor sweep).
         let from_builtin =
-            self.internal_cb > 0 && self.call_trace.last().map(|f| f.internal).unwrap_or(false);
+            self.internal_cb > 0 && self.call_trace.last().map(|f| f.internal).unwrap_or(true);
         let (site_file, site_line) = if from_builtin {
             ("[internal function]".to_string(), 0)
         } else {
@@ -2074,9 +2076,15 @@ impl<'a> Interp<'a> {
         self.cur_line = saved_line;
         // Zend decrefs the frame's CVs at unwind — a local object
         // whose last strong refs are that frame's cells runs its
-        // __destruct now (bug52361).
+        // __destruct now (bug52361). A dtor error on a clean return
+        // replaces the result and aborts; during unwind it chains —
+        // destruct_frame_objs guards that itself.
         if let Some(f) = self.last_popped_frame.take() {
-            let _ = self.destruct_frame_objs(&f);
+            let dtor_err = self.destruct_frame_objs(&f).err();
+            match (r, dtor_err) {
+                (Ok(_), Some(e)) => return Err(e),
+                (r, _) => return r,
+            }
         }
         r
     }

@@ -449,21 +449,18 @@ impl<'a> Interp<'a> {
     }
 
     /// Frames for a compile-family fatal's `Stack trace` block: Zend
-    /// reports these while the unit is being *compiled*, when the
-    /// runtime stack is only the include/require chain — the innermost
-    /// include/require pseudo-frame (the compiling context) and any
-    /// frames pushed inside the unit are excluded. Inside eval'd code
-    /// there is no pseudo-frame — the live stack itself is the
-    /// compiling context's caller chain.
+    /// reports these while the unit is being *compiled* — the compiling
+    /// context's own frame (the innermost include/require pseudo-frame,
+    /// or the `eval()` frame of the eval'd unit) is excluded, together
+    /// with anything pushed above it. An eval'd unit's own compile
+    /// fatal drops its eval frame (`#0 {main}` at top level); a unit
+    /// included FROM eval'd code keeps it (`#0 FILE(N): eval()`).
     pub(crate) fn compile_err_frames(&self) -> Vec<String> {
-        let upto = if self.cur_file.contains("eval()'d code") {
-            self.call_trace.len()
-        } else {
-            self.call_trace
-                .iter()
-                .rposition(crate::value::include_frame)
-                .unwrap_or(0)
-        };
+        let upto = self
+            .call_trace
+            .iter()
+            .rposition(|f| crate::value::include_frame(f) || (f.internal && f.function == "eval"))
+            .unwrap_or(self.call_trace.len());
         self.call_trace[..upto]
             .iter()
             .rev()
