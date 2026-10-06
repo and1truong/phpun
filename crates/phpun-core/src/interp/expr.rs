@@ -39,7 +39,6 @@ impl<'a> Interp<'a> {
                 .and_then(Self::inner_end_line)
                 .or_else(|| Self::inner_end_line(e)),
             Expr::Paren(e)
-            | Expr::VarVar(e)
             | Expr::PreInc(e)
             | Expr::PreDec(e)
             | Expr::PostInc(e)
@@ -52,9 +51,28 @@ impl<'a> Interp<'a> {
             | Expr::YieldFrom(e)
             | Expr::Empty(e) => Self::inner_end_line(e),
             Expr::Unary { e, .. } | Expr::Cast { e, .. } => Self::inner_end_line(e),
+            // A folded varvar ends at its `}` line (the non-folded
+            // inner's own end otherwise).
+            Expr::VarVar(inner, end) => {
+                if is_compile_const(inner) {
+                    Some(*end)
+                } else {
+                    Self::inner_end_line(inner)
+                }
+            }
             // Zend emits the ASSIGN op at the assignment node's own
             // line (the target's first token) — not the value's end.
-            Expr::Assign { line, .. } => Some(*line),
+            // A `list()`/`[]` destructure ends at its last element's
+            // own store line instead (zend's post-eval lineno).
+            Expr::Assign { target, line, .. } => match target.as_ref() {
+                Expr::List(_) => Self::inner_end_line(target).or(Some(*line)),
+                _ => Some(*line),
+            },
+            Expr::List(items) => items
+                .iter()
+                .rev()
+                .find_map(|i| i.as_ref())
+                .and_then(Self::inner_end_line),
             _ => None,
         }
     }
@@ -126,10 +144,15 @@ impl<'a> Interp<'a> {
                             let (expr, _) = parser::parse_expr_src(src, *base)
                                 .map_err(|e| PhpError::parse(e.message, e.line))?;
                             let nv = self.eval(&expr)?;
-                            // The name-conversion + variable read site
-                            // at the inner expr's last evaluated line
-                            // (same re-site as StringPart::Expr above).
-                            if let Some(l) = Self::inner_end_line(&expr) {
+                            // A folded name sites at the part's `}`
+                            // (base plus the snippet's own newlines);
+                            // otherwise the name-conversion + variable
+                            // read site at the inner expr's last
+                            // evaluated line (same re-site as
+                            // StringPart::Expr above).
+                            if is_compile_const(&expr) {
+                                self.cur_line = *base + src.matches('\n').count();
+                            } else if let Some(l) = Self::inner_end_line(&expr) {
                                 self.cur_line = l;
                             }
                             self.send_line = Some(self.cur_line);
@@ -142,13 +165,15 @@ impl<'a> Interp<'a> {
                 Ok(Value::bytes(s))
             }
             Expr::Var(name) => self.var_get(name),
-            Expr::VarVar(inner) => {
+            Expr::VarVar(inner, end) => {
                 let n = self.eval(inner)?;
                 if is_compile_const(inner) {
                     // A compile-folded name emits no zend ops — the
-                    // varname read sites at the enclosing statement's
-                    // line (not even the inner's own line).
-                    self.cur_line = self.stmt_line;
+                    // varname read sites at the `${...}`'s `}` line,
+                    // or at the enclosing `=`'s own line when the
+                    // varvar IS its direct value (zend's delayed
+                    // compile gives the RHS the ASSIGN's lineno).
+                    self.cur_line = self.vv_rhs_site.take().unwrap_or(*end);
                 } else if let Some(l) = Self::inner_end_line(inner) {
                     // The name-conversion + variable read site at the
                     // inner expr's last evaluated line (zend's
@@ -224,8 +249,11 @@ impl<'a> Interp<'a> {
             }
             Expr::List(_) => self.fail(PhpError::fatal("Cannot use list() as value", 0)),
             Expr::Assign {
-                target, op, value, ..
-            } => self.assign(target, op, value),
+                target,
+                op,
+                value,
+                line,
+            } => self.assign(target, op, value, *line),
             Expr::Binary { op, l, r } => self.binary(op, l, r),
             Expr::Unary { op, e } => self.unary(op, e),
             Expr::Ternary { c, t, f } => {
@@ -1385,7 +1413,28 @@ impl<'a> Interp<'a> {
         })
     }
 
-    fn assign(&mut self, target: &Expr, op: &'static str, value: &Expr) -> Result<Value, PhpError> {
+    /// Strip `argline` markers and parens from an assign's value to
+    /// its root node — transparent wrappers don't break zend's
+    /// direct-RHS folding rules.
+    fn unmark_rhs(mut e: &Expr) -> &Expr {
+        loop {
+            e = match e {
+                Expr::Paren(inner) => inner,
+                Expr::Binary {
+                    op: "argline", r, ..
+                } => r,
+                _ => return e,
+            };
+        }
+    }
+
+    fn assign(
+        &mut self,
+        target: &Expr,
+        op: &'static str,
+        value: &Expr,
+        aline: usize,
+    ) -> Result<Value, PhpError> {
         // `$this` may never be an assignment target (compile fatal,
         // bug24573); plain and compound assigns both route here.
         if let Expr::Var(n) = target {
@@ -1598,7 +1647,22 @@ impl<'a> Interp<'a> {
             Expr::List(_) => None,
             _ => self.eval_cell(target).ok(),
         };
-        let rhs = self.eval(value)?;
+        // A folded `${expr}` that IS the plain `=` value reads at the
+        // assign node's own line — zend's delayed-compile RHS takes
+        // the ASSIGN op's lineno. Only the direct (paren/marker-stripped)
+        // root counts; operands, compound ops and nested exprs site at
+        // the varvar's own `}` line instead.
+        let prev_vv = self.vv_rhs_site;
+        self.vv_rhs_site = if op == "="
+            && matches!(Self::unmark_rhs(value), Expr::VarVar(inner, _) if is_compile_const(inner))
+        {
+            Some(aline)
+        } else {
+            None
+        };
+        let rhs_r = self.eval(value);
+        self.vv_rhs_site = prev_vv;
+        let rhs = rhs_r?;
         let cur = if needs_read {
             match &target_cell {
                 Some(c) => c.borrow().clone(),
@@ -1758,7 +1822,16 @@ impl<'a> Interp<'a> {
                     let nv = self.typed_slot_store(&c, newv.clone())?;
                     *c.borrow_mut() = nv;
                 }
-                None => self.store(target, newv.clone())?,
+                None => {
+                    // `list()`/`[]` destructure: zend's FETCH_LIST ops
+                    // emit at the list node's own line — this assign's
+                    // line (its `[`/`list(` first token).
+                    if matches!(target, Expr::List(_)) {
+                        self.cur_line = aline;
+                        self.send_line = Some(aline);
+                    }
+                    self.store(target, newv.clone())?
+                }
             },
         }
         Ok(newv)
@@ -1789,7 +1862,7 @@ impl<'a> Interp<'a> {
                 nullsafe,
                 site,
             } => self.prop_cell(obj, name, *nullsafe, *site),
-            Expr::VarVar(inner) => {
+            Expr::VarVar(inner, _) => {
                 let n = self.eval(inner)?;
                 let name = self.conv_str(&n)?;
                 Ok(self.var_cell(&name))
@@ -2066,6 +2139,30 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn store(&mut self, target: &Expr, v: Value) -> Result<(), PhpError> {
+        // Destructure elements keep their `argline` mark — zend sites
+        // each element's store op at the element's own line (a nested
+        // list keeps the running line; its own elements re-site as
+        // they store).
+        let (mark, target) = match target {
+            Expr::Binary {
+                op: "argline",
+                l,
+                r,
+            } => {
+                let ml = match l.as_ref() {
+                    Expr::Int(n) => Some(*n as usize),
+                    _ => None,
+                };
+                (ml, r.as_ref())
+            }
+            _ => (None, target),
+        };
+        if let Some(l) = mark {
+            if !matches!(target, Expr::List(_)) {
+                self.cur_line = l;
+                self.send_line = Some(l);
+            }
+        }
         match target {
             Expr::Var(name) => {
                 // `$this = x` is a compile-time fatal in Zend (bug24573).
@@ -2075,7 +2172,7 @@ impl<'a> Interp<'a> {
                 self.var_set(name, v);
                 Ok(())
             }
-            Expr::VarVar(inner) => {
+            Expr::VarVar(inner, _) => {
                 let n = self.eval(inner)?;
                 let name = self.conv_str(&n)?;
                 self.var_set(&name, v);
@@ -2100,35 +2197,29 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
             Expr::List(items) => {
-                // PHP reads each [i] positionally — a missing key warns
-                // "Undefined array key i" (engine_assignExecutionOrder_002).
-                let mut vals: Vec<Value> = Vec::with_capacity(items.len());
+                // Zend interleaves FETCH_LIST[i] + element ASSIGN per
+                // slot: the fetch reads [i] positionally (a missing key
+                // warns "Undefined array key i", a non-array warns
+                // "Cannot use T as array" — engine_assignExecutionOrder_002)
+                // at the running op line, then the element's own store
+                // re-sites it via the element's mark.
                 for (i, slot) in items.iter().enumerate() {
+                    let Some(t) = slot else { continue };
                     let vi = match &v {
                         Value::Array(a) => match a.borrow().get(&ArrKey::Int(i as i64)) {
                             Some(v) => v,
                             None => {
-                                if slot.is_some() {
-                                    self.warn(&format!("Undefined array key {}", i))?;
-                                }
+                                self.warn(&format!("Undefined array key {}", i))?;
                                 Value::Null
                             }
                         },
+                        Value::Null => Value::Null,
                         other => {
-                            if items[i].is_some() {
-                                // list() on a non-array warns "Cannot use T
-                                // as array" (engine_assignExecutionOrder_002).
-                                self.warn(&format!("Cannot use {} as array", other.debug_type()))?;
-                            }
+                            self.warn(&format!("Cannot use {} as array", other.debug_type()))?;
                             Value::Null
                         }
                     };
-                    vals.push(vi);
-                }
-                for (i, t) in items.iter().enumerate() {
-                    if let Some(t) = t {
-                        self.store(t, vals[i].clone())?;
-                    }
+                    self.store(t, vi)?;
                 }
                 Ok(())
             }
@@ -2973,7 +3064,7 @@ impl<'a> Interp<'a> {
                 let c = self.static_prop_cell(class, name)?;
                 self.index_into_key(c, key)
             }
-            Expr::VarVar(inner) => {
+            Expr::VarVar(inner, _) => {
                 let n = self.eval(inner)?;
                 let name = self.conv_str(&n)?;
                 let c = self.var_cell(&name);
@@ -3016,7 +3107,7 @@ impl<'a> Interp<'a> {
         });
         let delayed = matches!(
             e,
-            Expr::Var(_) | Expr::VarVar(_) | Expr::Prop { .. } | Expr::StaticProp { .. }
+            Expr::Var(_) | Expr::VarVar(..) | Expr::Prop { .. } | Expr::StaticProp { .. }
         );
         if delayed && dim_simple != Some(true) {
             // Complex dim: its ops run first (inner warnings at their
@@ -3228,7 +3319,7 @@ impl<'a> Interp<'a> {
                 site,
             } => Some(self.prop_cell(obj, name, *nullsafe, *site)?),
             Expr::StaticProp { class, name } => Some(self.static_prop_cell(class, name)?),
-            Expr::VarVar(inner) => {
+            Expr::VarVar(inner, _) => {
                 let n = self.eval(inner)?;
                 let name = self.conv_str(&n)?;
                 Some(self.var_cell(&name))
@@ -3892,7 +3983,7 @@ impl<'a> Interp<'a> {
             // ++/-- reads through __get first — its exceptions
             // propagate (the __set is never reached, bug38624).
             Expr::Prop { .. } => self.prop_read_loose(target)?,
-            Expr::VarVar(inner) => {
+            Expr::VarVar(inner, _) => {
                 let n = self.eval(inner)?;
                 let name = self.conv_str(&n)?;
                 self.var_get(&name).unwrap_or(Value::Null)

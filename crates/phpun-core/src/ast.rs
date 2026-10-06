@@ -505,8 +505,12 @@ pub enum Expr {
     },
     /// Magic constant resolved at eval time (__LINE__ handled in parser).
     MagicConst(MagicConst),
-    /// `$$x` / `${expr}` — variable variable.
-    VarVar(Box<Expr>),
+    /// `$$x` / `${expr}` — variable variable. Second field is the
+    /// construct's own end line (the `}`'s line for `${expr}`; the
+    /// last token's line for `$$x`): a folded (`${expr}` with a
+    /// compile-const inner) read sites there, or at the enclosing
+    /// `=`'s own line when it is the assign's direct value.
+    VarVar(Box<Expr>, usize),
     /// `expr(...)` — first-class callable syntax (PHP 8.1): wraps the
     /// call node whose arg list was the bare `...` (Call/MethodCall/
     /// StaticCall/StaticCallDyn, args emptied at parse time).

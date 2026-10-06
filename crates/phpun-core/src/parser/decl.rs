@@ -233,7 +233,7 @@ impl<'a> Parser<'a> {
             let writable = matches!(
                 root,
                 Expr::Var(_)
-                    | Expr::VarVar(_)
+                    | Expr::VarVar(..)
                     | Expr::Prop { .. }
                     | Expr::StaticProp { .. }
                     | Expr::Call { .. }

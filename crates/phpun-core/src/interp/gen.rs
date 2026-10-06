@@ -95,7 +95,7 @@ impl<'a> Interp<'a> {
             | Expr::PostDec(e)
             | Expr::Empty(e)
             | Expr::Print(e)
-            | Expr::VarVar(e)
+            | Expr::VarVar(e, _)
             | Expr::Paren(e)
             | Expr::Fcc(e)
             | Expr::Unpack(e)

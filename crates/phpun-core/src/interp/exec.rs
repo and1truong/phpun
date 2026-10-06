@@ -68,7 +68,6 @@ impl<'a> Interp<'a> {
         match s {
             Stmt::Line(l) => {
                 self.cur_line = *l;
-                self.stmt_line = *l;
                 self.send_line = None;
                 Flow::Normal
             }
@@ -449,7 +448,7 @@ impl<'a> Interp<'a> {
                             Expr::Var(_)
                                 | Expr::Index { .. }
                                 | Expr::Prop { .. }
-                                | Expr::VarVar(_)
+                                | Expr::VarVar(..)
                                 | Expr::StaticProp { .. }
                         );
                         if is_lval {
@@ -506,7 +505,7 @@ impl<'a> Interp<'a> {
                     let name = match e {
                         Expr::Var(n) => n.clone(),
                         // `global $$b` — the global name is $b's value.
-                        Expr::VarVar(inner) => match self.eval(inner) {
+                        Expr::VarVar(inner, _) => match self.eval(inner) {
                             Ok(v) => match self.conv_str(&v) {
                                 Ok(s) => s,
                                 Err(e) => return self.err_flow(e),
@@ -563,7 +562,7 @@ impl<'a> Interp<'a> {
                                 }
                             }
                         }
-                        Expr::VarVar(inner) => {
+                        Expr::VarVar(inner, _) => {
                             if let Ok(n) = self.eval(inner) {
                                 if let Ok(name) = self.conv_str(&n) {
                                     self.cur().vars.remove(&name);

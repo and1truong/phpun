@@ -364,11 +364,12 @@ pub struct Interp<'a> {
     in_handler: bool,
     /// Current line estimate for error messages (best-effort).
     pub cur_line: usize,
-    /// Line of the last `Stmt::Line` marker — the enclosing
-    /// statement's own line, where zend attributes ops on
-    /// compile-folded operands that emit no ops of their own
-    /// (`${'a' . 'b'}` reads the enclosing statement's lineno).
-    pub(in crate::interp) stmt_line: usize,
+    /// Site a pending `=`'s folded `${expr}` value reads at — zend's
+    /// delayed-compile RHS takes the ASSIGN op's own lineno instead of
+    /// the varvar's `}` line. Set in `assign()` only when the paren/
+    /// marker-stripped value root is a folded VarVar; consumed by the
+    /// VarVar eval arm.
+    pub(in crate::interp) vv_rhs_site: Option<usize>,
     /// Source line of the innermost call currently dispatching — Zend
     /// sites a pushed frame at the call's own line (the DO_FCALL op
     /// line: callee-name/`(` token for `f(...)`, member-name for
@@ -881,7 +882,7 @@ impl<'a> Interp<'a> {
             exception_handler: None,
             in_handler: false,
             cur_line: 1,
-            stmt_line: 1,
+            vv_rhs_site: None,
             send_line: None,
             gen_sink: None,
             pending_gen_captures: Vec::new(),
@@ -1255,7 +1256,7 @@ impl<'a> Interp<'a> {
             | Expr::PostDec(e)
             | Expr::Empty(e)
             | Expr::Print(e)
-            | Expr::VarVar(e)
+            | Expr::VarVar(e, _)
             | Expr::Paren(e)
             | Expr::Fcc(e)
             | Expr::Unpack(e)

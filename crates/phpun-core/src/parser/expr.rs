@@ -552,16 +552,15 @@ impl<'a> Parser<'a> {
     }
 
     /// `[a, b]` / `list(a, b)` on the left of `=` is destructuring.
+    /// Elements keep their `argline` marks — zend sites each
+    /// element's own store op at the element's line.
     pub(in crate::parser) fn list_target(&mut self, e: Expr) -> Result<Expr, PhpError> {
         match e {
             Expr::ArrayLit(items) => Ok(Expr::List(
                 items
                     .into_iter()
-                    .map(|(_, v)| match Self::unmark_argline(v) {
-                        Expr::Null => None,
-                        other => Some(other),
-                    })
-                    .collect(),
+                    .map(|(_, v)| Self::list_elem(v))
+                    .collect::<Result<_, _>>()?,
             )),
             Expr::Call {
                 name,
@@ -571,8 +570,8 @@ impl<'a> Parser<'a> {
             } => match *name {
                 Expr::Str(n) if n.eq_ignore_ascii_case("list") => Ok(Expr::List(
                     args.into_iter()
-                        .map(|a| Some(Self::unmark_argline(a)))
-                        .collect(),
+                        .map(Self::list_elem)
+                        .collect::<Result<_, _>>()?,
                 )),
                 other => Ok(Expr::Call {
                     name: Box::new(other),
@@ -581,9 +580,61 @@ impl<'a> Parser<'a> {
                     callee,
                 }),
             },
+            // The primary `list(...)` parse path reaches here as an
+            // already-built List — still normalize its elements.
+            Expr::List(items) => Ok(Expr::List(
+                items
+                    .into_iter()
+                    .map(|v| v.map_or(Ok(None), Self::list_elem))
+                    .collect::<Result<_, _>>()?,
+            )),
             // Lvalue targets can't carry the arg's line marker —
             // `($x) = 1` must still resolve to a Var target.
             other => Ok(Self::unmark_argline(other)),
+        }
+    }
+
+    /// One `list()`/`[]` destructure element: `Null` is a skipped
+    /// slot; nested `[...]`/`list(...)` destructures recursively;
+    /// the element's `argline` mark stays wrapped around the result
+    /// (zend sites each element's own store op at the element's line).
+    fn list_elem(e: Expr) -> Result<Option<Expr>, PhpError> {
+        match e {
+            Expr::Binary {
+                op: "argline",
+                l,
+                r,
+            } => Ok(Self::list_elem(*r)?.map(|u| Expr::Binary {
+                op: "argline",
+                l,
+                r: Box::new(u),
+            })),
+            Expr::Null => Ok(None),
+            Expr::ArrayLit(items) => Ok(Some(Expr::List(
+                items
+                    .into_iter()
+                    .map(|(_, v)| Self::list_elem(v))
+                    .collect::<Result<_, _>>()?,
+            ))),
+            Expr::Call {
+                name,
+                args,
+                site,
+                callee,
+            } => match *name {
+                Expr::Str(n) if n.eq_ignore_ascii_case("list") => Ok(Some(Expr::List(
+                    args.into_iter()
+                        .map(Self::list_elem)
+                        .collect::<Result<_, _>>()?,
+                ))),
+                other => Ok(Some(Expr::Call {
+                    name: Box::new(other),
+                    args,
+                    site,
+                    callee,
+                })),
+            },
+            e => Ok(Some(e)),
         }
     }
 
@@ -1614,14 +1665,20 @@ impl<'a> Parser<'a> {
                     let el = self.line();
                     let e = self.expr()?;
                     self.expect_op("}")?;
-                    Ok(PropName::Expr(Box::new(Expr::VarVar(Box::new(
-                        Self::markline(e, el),
-                    )))))
+                    let end = self.prev_line();
+                    Ok(PropName::Expr(Box::new(Expr::VarVar(
+                        Box::new(Self::markline(e, el)),
+                        end,
+                    ))))
                 } else {
                     match self.next() {
-                        Some(Token::Variable(n)) => Ok(PropName::Expr(Box::new(Expr::VarVar(
-                            Box::new(Expr::Var(n)),
-                        )))),
+                        Some(Token::Variable(n)) => {
+                            let end = self.prev_line();
+                            Ok(PropName::Expr(Box::new(Expr::VarVar(
+                                Box::new(Expr::Var(n)),
+                                end,
+                            ))))
+                        }
                         t => Err(PhpError::parse(
                             format!(
                                 "syntax error, unexpected {}, expecting identifier",
@@ -1691,20 +1748,26 @@ impl<'a> Parser<'a> {
                     Some(Token::Variable(n)) => {
                         let il = self.line();
                         self.pos += 1;
-                        Ok(Expr::VarVar(Box::new(Self::markline(Expr::Var(n), il))))
+                        let end = self.prev_line();
+                        Ok(Expr::VarVar(
+                            Box::new(Self::markline(Expr::Var(n), il)),
+                            end,
+                        ))
                     }
                     Some(Token::Op("{")) => {
                         self.pos += 1;
                         let il = self.line();
                         let e = self.expr()?;
                         self.expect_op("}")?;
-                        Ok(Expr::VarVar(Box::new(Self::markline(e, il))))
+                        let end = self.prev_line();
+                        Ok(Expr::VarVar(Box::new(Self::markline(e, il)), end))
                     }
                     Some(Token::Op("$")) => {
                         // `$$$a` — primary() consumes the nested `$`.
                         let il = self.line();
                         let e = self.primary()?;
-                        Ok(Expr::VarVar(Box::new(Self::markline(e, il))))
+                        let end = self.prev_line();
+                        Ok(Expr::VarVar(Box::new(Self::markline(e, il)), end))
                     }
                     t => Err(PhpError::parse(
                         format!("syntax error, unexpected {}", desc_t(t.as_ref())),
@@ -1845,7 +1908,8 @@ impl<'a> Parser<'a> {
                             self.pos += 1;
                             continue;
                         }
-                        items.push(Some(self.expr()?));
+                        let el = self.line();
+                        items.push(Some(Self::markline(self.expr()?, el)));
                         if !self.eat_op(",") {
                             break;
                         }

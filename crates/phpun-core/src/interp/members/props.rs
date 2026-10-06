@@ -338,7 +338,7 @@ impl<'a> Interp<'a> {
             | Expr::PostDec(e)
             | Expr::Empty(e)
             | Expr::Print(e)
-            | Expr::VarVar(e)
+            | Expr::VarVar(e, _)
             | Expr::Cast { e, .. }
             | Expr::Throw(e)
             | Expr::Include { e, .. } => Self::expr_uses_this_prop(e, pn),
