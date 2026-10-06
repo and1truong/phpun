@@ -25,7 +25,7 @@ impl<'a> Parser<'a> {
                             "syntax error, unexpected {}, expecting variable",
                             desc_t(t.as_ref())
                         ),
-                        self.line(),
+                        var_line,
                     ))
                 }
             };
@@ -325,6 +325,7 @@ impl<'a> Parser<'a> {
 
     pub(in crate::parser) fn foreach_target(&mut self) -> Result<ForeachTarget, PhpError> {
         if self.eat_op("&") {
+            let l = self.line();
             return match self.next() {
                 Some(Token::Variable(n)) => Ok(ForeachTarget::ByRef(n)),
                 t => Err(PhpError::parse(
@@ -332,7 +333,7 @@ impl<'a> Parser<'a> {
                         "syntax error, unexpected {}, expecting variable",
                         desc_t(t.as_ref())
                     ),
-                    self.line(),
+                    l,
                 )),
             };
         }
@@ -370,6 +371,7 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             return Ok(ForeachTarget::List(items));
         }
+        let l = self.line();
         match self.next() {
             Some(Token::Variable(n)) => {
                 // Lvalue targets: `$b[0]`, `$o->p`, ...
@@ -398,7 +400,7 @@ impl<'a> Parser<'a> {
                     "syntax error, unexpected {}, expecting variable",
                     desc_t(t.as_ref())
                 ),
-                self.line(),
+                l,
             )),
         }
     }
@@ -1239,6 +1241,7 @@ impl<'a> Parser<'a> {
             };
             self.check_prop_ty(&pty, pline)?;
             loop {
+                let pl = self.line();
                 let pname = match self.next() {
                     Some(Token::Variable(n)) => n,
                     t => {
@@ -1247,7 +1250,7 @@ impl<'a> Parser<'a> {
                                 "syntax error, unexpected {}, expecting variable",
                                 desc_t(t.as_ref())
                             ),
-                            self.line(),
+                            pl,
                         ))
                     }
                 };
@@ -1601,6 +1604,7 @@ impl<'a> Parser<'a> {
             };
             let by_ref = self.eat_op("&");
             let variadic = self.eat_op("...");
+            let pl = self.line();
             let pname = match self.next() {
                 Some(Token::Variable(n)) => n,
                 t => {
@@ -1609,7 +1613,7 @@ impl<'a> Parser<'a> {
                             "syntax error, unexpected {}, expecting variable",
                             desc_t(t.as_ref())
                         ),
-                        self.line(),
+                        pl,
                     ))
                 }
             };

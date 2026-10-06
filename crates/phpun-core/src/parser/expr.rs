@@ -36,6 +36,7 @@ impl<'a> Parser<'a> {
             self.expect_op("(")?;
             while !self.at_op(")") {
                 let by_ref = self.eat_op("&");
+                let l = self.line();
                 match self.next() {
                     Some(Token::Variable(n)) => uses.push((n, by_ref)),
                     t => {
@@ -44,7 +45,7 @@ impl<'a> Parser<'a> {
                                 "syntax error, unexpected {}, expecting variable",
                                 desc_t(t.as_ref())
                             ),
-                            self.line(),
+                            l,
                         ))
                     }
                 }
@@ -293,6 +294,7 @@ impl<'a> Parser<'a> {
                 };
                 self.check_prop_ty(&pty, pline)?;
                 loop {
+                    let pl = self.line();
                     let pname = match self.next() {
                         Some(Token::Variable(n)) => n,
                         t => {
@@ -301,7 +303,7 @@ impl<'a> Parser<'a> {
                                     "syntax error, unexpected {}, expecting variable",
                                     desc_t(t.as_ref())
                                 ),
-                                self.line(),
+                                pl,
                             ))
                         }
                     };
@@ -1320,23 +1322,27 @@ impl<'a> Parser<'a> {
                     self.expect_op("}")?;
                     Ok(PropName::Expr(Box::new(Expr::VarVar(Box::new(e)))))
                 } else {
+                    // The offending token's own line, not the EOF
+                    // sentinel line (eof_line applies to end-of-input
+                    // errors only).
+                    let l = self.line();
                     match self.next() {
                         Some(Token::Variable(n)) => Ok(PropName::Expr(Box::new(Expr::VarVar(
                             Box::new(Expr::Var(n)),
                         )))),
                         t => Err(PhpError::parse(
                             format!(
-                                "syntax error, unexpected {}, expecting identifier",
+                                "syntax error, unexpected {}, expecting variable or \"{{\" or \"$\"",
                                 desc_t(t.as_ref())
                             ),
-                            self.line(),
+                            l,
                         )),
                     }
                 }
             }
             t => Err(PhpError::parse(
                 format!(
-                    "syntax error, unexpected {}, expecting identifier",
+                    "syntax error, unexpected {}, expecting identifier or variable or \"{{\" or \"$\"",
                     desc_t(t.as_ref())
                 ),
                 self.line(),
