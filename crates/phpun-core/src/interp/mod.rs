@@ -291,6 +291,10 @@ pub struct Interp<'a> {
     /// Real upload tmp paths created this request — is_uploaded_file()
     /// and move_uploaded_file() check membership.
     pub uploads: Vec<std::path::PathBuf>,
+    /// Per-stream chunk size set by stream_set_chunk_size(), keyed by
+    /// resource id — the function returns the PREVIOUS size (zend
+    /// default 8192).
+    pub stream_chunk_sizes: std::collections::HashMap<u64, i64>,
     /// Output buffer stack for ob_*().
     ob_stack: Vec<ObLevel>,
     /// While >0, warnings are suppressed (implements `??`, `isset`,
@@ -898,6 +902,7 @@ impl<'a> Interp<'a> {
             valid_utf8: std::collections::HashMap::new(),
             php_input: std::rc::Rc::new(Vec::new()),
             uploads: Vec::new(),
+            stream_chunk_sizes: std::collections::HashMap::new(),
             ob_stack: Vec::new(),
             silence: 0,
             statics: HashMap::new(),

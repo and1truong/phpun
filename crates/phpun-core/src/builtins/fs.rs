@@ -468,6 +468,10 @@ pub(crate) fn dispatch(
                     write_ebadf_notice(it, name, data.len(), errno, &msg)?;
                     Value::Bool(false)
                 }
+                StreamWrite::NotWritable => {
+                    it.notice_pub(&format!("{}(): Stream is not writable", name))?;
+                    Value::Bool(false)
+                }
                 StreamWrite::Discarded => Value::Bool(false),
             }
         }
@@ -598,12 +602,25 @@ pub(crate) fn dispatch(
                             };
                             // CUR is converted to SET against stream->position
                             // (tell) in the generic layer, then the ops seek
-                            // runs on ms->fpos (pos).
+                            // runs on ms->fpos (pos). zend's own formula
+                            // `offset > ZEND_LONG_MAX - position ? MAX :
+                            // position + offset` — NOT checked_add: with a
+                            // broken position (-1) `MAX - (-1)` wraps to
+                            // MIN, so EVERY CUR offset lands on MAX.
+                            let len = buf.len() as i64;
                             let new_pos = match whence {
                                 0 if offset < 0 => None,
                                 0 => Some(offset),
-                                1 => Some(tell + offset),
-                                2 => Some(buf.len() as i64 + offset),
+                                1 => Some(if offset > i64::MAX.wrapping_sub(tell) {
+                                    i64::MAX
+                                } else {
+                                    tell.wrapping_add(offset)
+                                }),
+                                2 => Some(if offset > i64::MAX.wrapping_sub(len) {
+                                    i64::MAX
+                                } else {
+                                    len.wrapping_add(offset)
+                                }),
                                 _ => None,
                             };
                             match new_pos {
@@ -635,17 +652,27 @@ pub(crate) fn dispatch(
                             ..
                         } => {
                             // php://input rides zend's memory seek — same
-                            // broken-position marker as php://memory.
+                            // broken-position marker as php://memory, and
+                            // the same wrapped ZEND_LONG_MAX saturation.
                             let tell = if *pos_broken {
                                 *pos as i64 - 1
                             } else {
                                 *pos as i64
                             };
+                            let len = body.len() as i64;
                             let new_pos = match whence {
                                 0 if offset < 0 => None,
                                 0 => Some(offset),
-                                1 => Some(tell + offset),
-                                2 => Some(body.len() as i64 + offset),
+                                1 => Some(if offset > i64::MAX.wrapping_sub(tell) {
+                                    i64::MAX
+                                } else {
+                                    tell.wrapping_add(offset)
+                                }),
+                                2 => Some(if offset > i64::MAX.wrapping_sub(len) {
+                                    i64::MAX
+                                } else {
+                                    len.wrapping_add(offset)
+                                }),
                                 _ => None,
                             };
                             match new_pos {
@@ -842,9 +869,65 @@ pub(crate) fn dispatch(
                 None => Value::Bool(false),
             }
         }
-        "fflush" | "flock" => {
+        "fflush" => {
             stream_open_check(args, 0, name, 1, "stream")?;
             Value::Bool(true)
+        }
+        "flock" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            // zend: flock(2) exists only on fd-backed streams — real
+            // files, proc_open pipe ends, stdio — plus TEMP/RFC2397
+            // streams AFTER a select/proc cast spilled them to a
+            // tmpfile. Buffer-backed streams (php://memory, php://input,
+            // php://output, pre-spill temp/data) have no lock support
+            // and return false. PHP's LOCK_* constants are NOT libc's:
+            // LOCK_SH/EX/UN/NB = 1/2/3/4 and zend accepts the op iff a
+            // lock-mode bit (op & 3) is present — LOCK_UN(3) alone is
+            // legal, stray bits (-1, 99) pass through, a bare NB(4)
+            // or empty flags are ValueError.
+            let op = zpp_long_arg(it, args, 1, name, 2, "$operation")?;
+            if op & 3 == 0 {
+                return err(
+                    "ValueError",
+                    format!(
+                        "{}(): Argument #2 ($operation) must be one of LOCK_SH, LOCK_EX, or LOCK_UN",
+                        name
+                    ),
+                );
+            }
+            let mut lop = if op & 3 == 3 {
+                libc::LOCK_UN
+            } else {
+                (if op & 1 != 0 { libc::LOCK_SH } else { 0 })
+                    | (if op & 2 != 0 { libc::LOCK_EX } else { 0 })
+            };
+            if op & 4 != 0 {
+                lop |= libc::LOCK_NB;
+            }
+            let v = arg(args, 0);
+            let fd = match &v {
+                Value::Resource(r) => existing_fd(&r.borrow()),
+                _ => None,
+            };
+            // &$wouldblock: 0 on success and on no-lock-support
+            // streams, 1 only when the lock call itself would block.
+            let (ret, wouldblock) = match fd {
+                Some(fd) => {
+                    let ok = unsafe { libc::flock(fd, lop) } == 0;
+                    let wb = if ok {
+                        0
+                    } else {
+                        (unsafe { *libc::__errno_location() } == libc::EWOULDBLOCK)
+                            as i64
+                    };
+                    (ok, wb)
+                }
+                None => (false, 0),
+            };
+            if let Some(c) = args.get(2) {
+                *c.borrow_mut() = Value::Int(wouldblock);
+            }
+            Value::Bool(ret)
         }
         "fpassthru" => {
             stream_open_check(args, 0, name, 1, "stream")?;
@@ -1131,6 +1214,14 @@ pub(crate) fn dispatch(
                                 ok = false;
                                 break;
                             }
+                            StreamWrite::NotWritable => {
+                                it.notice_pub(&format!(
+                                    "{}(): Stream is not writable",
+                                    name
+                                ))?;
+                                ok = false;
+                                break;
+                            }
                             StreamWrite::Discarded => {
                                 ok = false;
                                 break;
@@ -1163,8 +1254,77 @@ pub(crate) fn dispatch(
         "stream_context_set_option" | "stream_context_get_options" => Value::Bool(true),
         "stream_wrapper_register" | "stream_wrapper_unregister" => Value::Bool(false),
         "stream_isatty" | "posix_isatty" => {
-            stream_open_check(args, 0, name, 1, "stream")?;
-            Value::Bool(false)
+            let v = arg(args, 0);
+            if name == "posix_isatty" {
+                // posix_isatty takes `resource|int $file_descriptor` —
+                // a raw fd answers isatty directly; scalars coerce to
+                // int; everything else warns (not throws) and fails.
+                let as_int = match &v {
+                    Value::Int(i) => Some(*i),
+                    Value::Bool(b) => Some(*b as i64),
+                    Value::Float(f) => Some(*f as i64),
+                    Value::Str(s) => match crate::value::numeric(s) {
+                        crate::value::Numeric::Int(i) => Some(i),
+                        crate::value::Numeric::Float(f) => Some(f as i64),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match (as_int, &v) {
+                    (Some(i), _) => {
+                        return Ok(Some(Value::Bool(
+                            unsafe { libc::isatty(i as i32) } == 1,
+                        )))
+                    }
+                    (_, Value::Resource(_)) => {}
+                    (_, other) => {
+                        it.warn_pub(&format!(
+                            "{}(): Argument #1 ($file_descriptor) must be of type int|resource, {} given",
+                            name,
+                            zval_word(other)
+                        ))?;
+                        return Ok(Some(Value::Bool(false)));
+                    }
+                }
+            } else {
+                stream_open_check(args, 0, name, 1, "stream")?;
+            }
+            // zend: isatty(3) on the stream's descriptor — true only
+            // for fd-backed streams sitting on a tty (pty pipe ends,
+            // real tty stdio). Buffer-backed streams are false.
+            let (fd, label) = match &v {
+                Value::Resource(r) => {
+                    let rb = r.borrow();
+                    match &*rb {
+                        PhpResource::Proc { .. }
+                        | PhpResource::Closed { .. }
+                        | PhpResource::Other { .. } => {
+                            // posix_isatty's own fetch failure message.
+                            return err(
+                                "TypeError",
+                                format!(
+                                    "{}(): supplied resource is not a valid stream resource",
+                                    name
+                                ),
+                            );
+                        }
+                        _ => (existing_fd(&rb), stream_ops_label(&rb)),
+                    }
+                }
+                _ => (None, ""),
+            };
+            match fd {
+                Some(fd) => Value::Bool(unsafe { libc::isatty(fd) } == 1),
+                None => {
+                    if name == "posix_isatty" {
+                        it.warn_pub(&format!(
+                            "{}(): Could not use stream of type '{}'",
+                            name, label
+                        ))?;
+                    }
+                    Value::Bool(false)
+                }
+            }
         }
         "stream_set_blocking" => {
             stream_open_check(args, 0, name, 1, "stream")?;
@@ -1190,12 +1350,53 @@ pub(crate) fn dispatch(
             }
         }
         "stream_select" => return stream_select(it, name, args),
-        "stream_set_timeout"
-        | "stream_set_read_buffer"
-        | "stream_set_write_buffer"
-        | "stream_set_chunk_size" => {
+        "stream_set_timeout" => {
             stream_open_check(args, 0, name, 1, "stream")?;
-            Value::Bool(true)
+            if args.len() > 1 {
+                zpp_long_arg(it, args, 1, name, 2, "$seconds")?;
+            }
+            if args.len() > 2 {
+                zpp_long_arg(it, args, 2, name, 3, "$microseconds")?;
+            }
+            // zend's socket_set_option stub: only socket-backed
+            // streams honor a timeout; every other stream returns
+            // false.
+            let ok = match arg(args, 0) {
+                Value::Resource(r) => {
+                    matches!(&*r.borrow(), PhpResource::Pipe { socket: true, .. })
+                }
+                _ => false,
+            };
+            Value::Bool(ok)
+        }
+        "stream_set_read_buffer" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            if args.len() > 1 {
+                zpp_long_arg(it, args, 1, name, 2, "$size")?;
+            }
+            Value::Int(0)
+        }
+        "stream_set_write_buffer" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            if args.len() > 1 {
+                zpp_long_arg(it, args, 1, name, 2, "$size")?;
+            }
+            Value::Int(-1)
+        }
+        "stream_set_chunk_size" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            let new = zpp_long_arg(it, args, 1, name, 2, "$size")?;
+            // zend returns the PREVIOUS chunk size (default 8192) and
+            // installs the new one per stream.
+            let (id, prev) = match arg(args, 0) {
+                Value::Resource(r) => {
+                    let id = r.borrow().id();
+                    (id, it.stream_chunk_sizes.get(&id).copied().unwrap_or(8192))
+                }
+                _ => (0, 8192),
+            };
+            it.stream_chunk_sizes.insert(id, new);
+            Value::Int(prev)
         }
         "stream_get_meta_data" => {
             stream_open_check(args, 0, name, 1, "stream")?;
@@ -1316,6 +1517,27 @@ pub(crate) fn dispatch(
                             base.push(("uri", Value::str(uri.clone())));
                             mk(base)
                         }
+                        PhpResource::Input {
+                            eof, uri, mode, ..
+                        } if is_data_uri(uri) => {
+                            // zend's RFC2397 meta: like TEMP there is
+                            // no timed_out/blocked/eof, but the header
+                            // mediatype/base64 keys lead the array and
+                            // wrapper_type/stream_type are RFC2397.
+                            base.clear();
+                            let (mediatype, b64) = data_uri_meta(uri);
+                            if let Some(mt) = mediatype {
+                                base.push(("mediatype", Value::str(mt)));
+                            }
+                            base.push(("base64", Value::Bool(b64)));
+                            base.push(("wrapper_type", Value::str("RFC2397")));
+                            base.push(("stream_type", Value::str("RFC2397")));
+                            base.push(("mode", Value::str(mode.clone())));
+                            base.push(("unread_bytes", Value::Int(0)));
+                            base.push(("seekable", Value::Bool(true)));
+                            base.push(("uri", Value::str(uri.clone())));
+                            mk(base)
+                        }
                         PhpResource::Input { eof, uri, .. } => {
                             base.push(("eof", Value::Bool(*eof)));
                             base.push(("wrapper_type", Value::str("PHP")));
@@ -1342,23 +1564,57 @@ pub(crate) fn dispatch(
             stream_open_check(args, 0, name, 1, "stream")?;
             match arg(args, 0) {
                 Value::Resource(r) => {
-                    let meta = {
+                    let arr = {
                         let res = r.borrow();
                         match &*res {
-                            crate::value::PhpResource::File { file, .. } => file.metadata().ok(),
-                            crate::value::PhpResource::Pipe { file, .. } => file.metadata().ok(),
+                            crate::value::PhpResource::File { file, .. } => {
+                                file.metadata().ok().map(|m| stat_array(&m))
+                            }
+                            crate::value::PhpResource::Pipe { file, .. } => {
+                                file.metadata().ok().map(|m| stat_array(&m))
+                            }
                             crate::value::PhpResource::Stdio { which, .. } => match which {
-                                0 => std::fs::metadata("/dev/stdin").ok(),
-                                1 => std::fs::metadata("/dev/stdout").ok(),
-                                2 => std::fs::metadata("/dev/stderr").ok(),
+                                0 => std::fs::metadata("/dev/stdin").ok().map(|m| stat_array(&m)),
+                                1 => std::fs::metadata("/dev/stdout").ok().map(|m| stat_array(&m)),
+                                2 => std::fs::metadata("/dev/stderr").ok().map(|m| stat_array(&m)),
                                 // php://output has no fd — fstat fails.
                                 _ => None,
                             },
+                            // Buffer-backed streams answer zend's
+                            // synthetic statbuf; after a FOR_SELECT cast
+                            // spilled them to a tmpfile the REAL inode
+                            // shows up (dev/ino of the spool file).
+                            crate::value::PhpResource::Mem {
+                                buf, spilled_fd, ..
+                            } => Some(match spilled_fd {
+                                Some(fd) => std::fs::metadata(
+                                    format!("/proc/self/fd/{}", fd),
+                                )
+                                .ok()
+                                .map(|m| stat_array(&m))
+                                .unwrap_or_else(|| buf_stat_array(buf.len())),
+                                None => buf_stat_array(buf.len()),
+                            }),
+                            crate::value::PhpResource::Input {
+                                uri,
+                                body,
+                                spilled_fd,
+                                ..
+                            } if is_data_uri(uri) => Some(match spilled_fd {
+                                Some(fd) => std::fs::metadata(
+                                    format!("/proc/self/fd/{}", fd),
+                                )
+                                .ok()
+                                .map(|m| stat_array(&m))
+                                .unwrap_or_else(|| buf_stat_array(body.len())),
+                                None => buf_stat_array(body.len()),
+                            }),
+                            // php://input is not stat-able in zend.
                             _ => None,
                         }
                     };
-                    match meta {
-                        Some(m) => Value::Array(Rc::new(RefCell::new(stat_array(&m)))),
+                    match arr {
+                        Some(a) => Value::Array(Rc::new(RefCell::new(a))),
                         None => Value::Bool(false),
                     }
                 }
@@ -1386,6 +1642,33 @@ fn fs_path(p: &str) -> &str {
         Some(rest) => rest.strip_prefix("localhost").unwrap_or(rest),
         None => p,
     }
+}
+
+/// The RFC2397 header of a data: URI — (mediatype, base64 flag) —
+/// reported verbatim by zend in stream_get_meta_data().
+fn data_uri_meta(path: &str) -> (Option<String>, bool) {
+    let rest = path
+        .strip_prefix("data:")
+        .or_else(|| path.strip_prefix("data://"))
+        .unwrap_or("");
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let meta = rest.split(',').next().unwrap_or("");
+    let parts: Vec<&str> = meta.split(';').collect();
+    let b64 = parts.iter().any(|m| m.eq_ignore_ascii_case("base64"));
+    let mediatype = parts
+        .iter()
+        .filter(|m| !m.eq_ignore_ascii_case("base64"))
+        .copied()
+        .collect::<Vec<&str>>()
+        .join(";");
+    (
+        if mediatype.is_empty() {
+            None
+        } else {
+            Some(mediatype)
+        },
+        b64,
+    )
 }
 
 /// `data:[mediatype][;base64],payload` wrapper — returns the decoded
@@ -1563,6 +1846,9 @@ pub(in crate::builtins) enum StreamWrite {
     /// one): php_stream_write returns the count, fwrite reports it.
     Partial(usize),
     Ebadf(i32, String),
+    /// Write refused by a stream that notices it isn't writable
+    /// (zend's "Stream is not writable" E_NOTICE — RFC2397).
+    NotWritable,
     Discarded,
 }
 
@@ -1747,6 +2033,11 @@ pub(in crate::builtins) fn write_resource(
                     *pos += data.len() as u64;
                     *eof = false;
                     Ok(StreamWrite::Written)
+                }
+                // RFC2397 streams notice like a plain fd failing the
+                // writable check; php://input drops silently.
+                PhpResource::Input { uri, .. } if is_data_uri(uri) => {
+                    Ok(StreamWrite::NotWritable)
                 }
                 PhpResource::Input { .. } => Ok(StreamWrite::Discarded),
                 _ => Err(PhpError::fatal("bad resource", 0)),
@@ -2405,7 +2696,7 @@ fn glob_to_regex(pat: &str) -> regex::Regex {
 #[cfg(unix)]
 fn stat_array(m: &std::fs::Metadata) -> PhpArray {
     use std::os::unix::fs::MetadataExt;
-    let vals = [
+    stat_from_vals([
         m.dev() as i64,
         m.ino() as i64,
         m.mode() as i64,
@@ -2419,7 +2710,10 @@ fn stat_array(m: &std::fs::Metadata) -> PhpArray {
         m.ctime(),
         m.blksize() as i64,
         m.blocks() as i64,
-    ];
+    ])
+}
+
+fn stat_from_vals(vals: [i64; 13]) -> PhpArray {
     let mut a = PhpArray::new();
     for (i, v) in vals.iter().enumerate() {
         a.set(ArrKey::Int(i as i64), Value::Int(*v));
@@ -2434,6 +2728,29 @@ fn stat_array(m: &std::fs::Metadata) -> PhpArray {
         a.set(to_key(&Value::str(*name)), Value::Int(*v));
     }
     a
+}
+
+/// zend's synthetic statbuf for buffer-backed streams — fstat() on
+/// php://memory, unspilled php://temp and RFC2397 returns this fixed
+/// 26-element array: dev=12 (a virtual tmpfs-ish device), ino=0,
+/// mode=0100666, nlink=1, uid=gid=0, rdev=-1, size=buffer length,
+/// atime=mtime=ctime=0, blksize=blocks=-1.
+fn buf_stat_array(len: usize) -> PhpArray {
+    stat_from_vals([
+        12,
+        0,
+        33206,
+        1,
+        0,
+        0,
+        -1,
+        len as i64,
+        0,
+        0,
+        0,
+        -1,
+        -1,
+    ])
 }
 
 /// stream_select(&$read, &$write, &$except, ?$seconds, ?$usec): libc

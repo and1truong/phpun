@@ -883,6 +883,11 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         // oracle takes exactly 2 args — zend's $mode has no default.
         "stream_set_blocking" => bp!(("stream", Req), ("mode", Req)),
         "stream_get_meta_data" => bp!(("stream", Req)),
+        "flock" => bp!(
+            ("stream", Req),
+            ("operation", Req),
+            ("would_block", Null)
+        ),
         "header" => bp!(
             ("header", Req),
             ("replace", Bool(true)),

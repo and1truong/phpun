@@ -4367,6 +4367,7 @@ fn builtin_byref(name: &str) -> Option<&'static [bool]> {
         "passthru" | "system" => &[false, true],
         "proc_open" => &[false, false, true],
         "stream_select" => &[true, true, true, false, false],
+        "flock" => &[false, false, true],
         "preg_grep" => &[false],
         _ => return None,
     })
