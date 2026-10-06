@@ -6,6 +6,13 @@ use super::*;
 
 impl<'a> Interp<'a> {
     pub fn exec_block(&mut self, stmts: &[Stmt]) -> Flow {
+        self.exec_block_from(stmts, 0)
+    }
+
+    /// `exec_block` starting partway down the list — used when a
+    /// `goto` lands on a label inside it (the label stmt itself is a
+    /// no-op; control resumes at the stmt after it).
+    fn exec_block_from(&mut self, stmts: &[Stmt], mut i: usize) -> Flow {
         // goto labels bind at the statement-list scope they appear in —
         // a goto bubbling up from nested control flow lands here.
         let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
@@ -14,7 +21,6 @@ impl<'a> Interp<'a> {
                 labels.entry(n.as_str()).or_insert(i);
             }
         }
-        let mut i = 0;
         while i < stmts.len() {
             let s = &stmts[i];
             i += 1;
@@ -45,14 +51,89 @@ impl<'a> Interp<'a> {
             }
             match self.exec(s) {
                 Flow::Normal => {}
-                Flow::Goto(l) => match labels.get(l.as_str()) {
-                    Some(&t) => i = t + 1,
-                    None => return Flow::Goto(l),
+                Flow::Goto(mut l) => loop {
+                    if let Some(&t) = labels.get(l.as_str()) {
+                        i = t + 1;
+                        break;
+                    }
+                    match self.exec_label_in(stmts, &l) {
+                        // The landing ran to this list's end, or ended
+                        // in another goto — the latter loops so it
+                        // resolves against this scope's labels too.
+                        Some(Flow::Goto(l2)) => l = l2,
+                        Some(out) => return out,
+                        None => return Flow::Goto(l),
+                    }
                 },
                 f => return f,
             }
         }
         Flow::Normal
+    }
+
+    /// A `goto` landing inside this list's nested structure — Zend
+    /// binds labels to the whole function op-array, so a label under a
+    /// bare block, an `if`/`else` arm, or a try/catch/finally body is
+    /// a legal target: control enters that list at the label and runs
+    /// to its end, then resumes after the enclosing statement. The
+    /// flow gate already rejected landings into loops and switches,
+    /// so those bodies are not searched.
+    fn exec_label_in(&mut self, stmts: &[Stmt], name: &str) -> Option<Flow> {
+        for (idx, s) in stmts.iter().enumerate() {
+            if let Stmt::Label(n) = s {
+                if n == name {
+                    return Some(self.exec_block_from(stmts, idx + 1));
+                }
+                continue;
+            }
+            let inner = match s {
+                Stmt::Block(b) => self.exec_label_in(b, name),
+                Stmt::If { then, else_, .. } => self
+                    .exec_label_in(then, name)
+                    .or_else(|| self.exec_label_in(else_, name)),
+                Stmt::Try {
+                    body,
+                    catches,
+                    finally,
+                } => {
+                    if let Some(flow) = self.exec_label_in(body, name) {
+                        // A landing inside the try arms its catches —
+                        // Zend's catch op-ranges cover the target too.
+                        let out = self.try_dispatch(flow, catches);
+                        Some(self.try_finally(out, finally))
+                    } else {
+                        let mut hit = None;
+                        for c in catches {
+                            if let f @ Some(_) = self.exec_label_in(&c.body, name) {
+                                hit = f;
+                                break;
+                            }
+                        }
+                        if hit.is_some() {
+                            // A catch body runs unguarded; the finally
+                            // region still runs after it.
+                            hit.map(|out| self.try_finally(out, finally))
+                        } else if let Some(fb) = finally {
+                            // Landing inside the finally region itself:
+                            // its tail only — the region does not re-run.
+                            self.exec_label_in(fb, name)
+                        } else {
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            if let Some(f) = inner {
+                // The nested landing consumed control through the
+                // ancestor's end; resume this list after it.
+                return match f {
+                    Flow::Normal => Some(self.exec_block_from(stmts, idx + 1)),
+                    other => Some(other),
+                };
+            }
+        }
+        None
     }
 
     /// A loop/switch body: one enclosing context for `break`/`continue`
@@ -619,45 +700,8 @@ impl<'a> Interp<'a> {
                 finally,
             } => {
                 let flow = self.exec_block(body);
-                let out = match flow {
-                    Flow::Throw(v) => {
-                        let mut result = Flow::Throw(v.clone());
-                        for c in catches {
-                            if self.catch_matches(&v, &c.types) {
-                                // The throwable's raise-site stamp is
-                                // consumed here — a later engine error
-                                // must not inherit its file
-                                // (a caught include-time throwable
-                                // would otherwise poison attribution).
-                                self.last_err_file.clear();
-                                if let Some(var) = &c.var {
-                                    // Binding the catch var is a normal
-                                    // assign — a `&`-bound typed ref
-                                    // gates it and the TypeError
-                                    // propagates out of the try
-                                    // (typed_properties_108).
-                                    match self.var_set_gated(var, v.clone(), true) {
-                                        Ok(_) => result = self.exec_block(&c.body),
-                                        Err(e) => result = self.err_flow(e),
-                                    }
-                                } else {
-                                    result = self.exec_block(&c.body);
-                                }
-                                break;
-                            }
-                        }
-                        result
-                    }
-                    f => f,
-                };
-                if let Some(fb) = finally {
-                    match self.exec_block(fb) {
-                        Flow::Normal => out,
-                        f => f,
-                    }
-                } else {
-                    out
-                }
+                let out = self.try_dispatch(flow, catches);
+                self.try_finally(out, finally)
             }
             Stmt::Namespace(n) => {
                 // Top-level scope follows `namespace` declarations —
@@ -716,6 +760,55 @@ impl<'a> Interp<'a> {
                 }
                 Flow::Normal
             }
+        }
+    }
+
+    /// The Throw half of `Stmt::Try` exec — dispatch to the first
+    /// matching catch and run its body. Shared with the `goto`
+    /// landing path: control jumping into the middle of a try body is
+    /// still covered by its catch op-ranges.
+    fn try_dispatch(&mut self, flow: Flow, catches: &[Catch]) -> Flow {
+        match flow {
+            Flow::Throw(v) => {
+                let mut result = Flow::Throw(v.clone());
+                for c in catches {
+                    if self.catch_matches(&v, &c.types) {
+                        // The throwable's raise-site stamp is consumed
+                        // here — a later engine error must not inherit
+                        // its file (a caught include-time throwable
+                        // would otherwise poison attribution).
+                        self.last_err_file.clear();
+                        if let Some(var) = &c.var {
+                            // Binding the catch var is a normal
+                            // assign — a `&`-bound typed ref gates it
+                            // and the TypeError propagates out of the
+                            // try (typed_properties_108).
+                            match self.var_set_gated(var, v.clone(), true) {
+                                Ok(_) => result = self.exec_block(&c.body),
+                                Err(e) => result = self.err_flow(e),
+                            }
+                        } else {
+                            result = self.exec_block(&c.body);
+                        }
+                        break;
+                    }
+                }
+                result
+            }
+            f => f,
+        }
+    }
+
+    /// The finally half of `Stmt::Try` exec — the region runs after
+    /// the body/catches flow and supersedes it unless that flow was
+    /// Normal.
+    fn try_finally(&mut self, out: Flow, finally: &Option<Vec<Stmt>>) -> Flow {
+        match finally {
+            Some(fb) => match self.exec_block(fb) {
+                Flow::Normal => out,
+                f => f,
+            },
+            None => out,
         }
     }
 
