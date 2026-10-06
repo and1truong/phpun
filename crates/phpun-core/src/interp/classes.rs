@@ -10,13 +10,19 @@ impl<'a> Interp<'a> {
 
     /// Class-ish name already registered — (prev-kind word, file,
     /// line) for 'Cannot redeclare' diagnostics. Zend's message names
-    /// the previously declared kind (an enum counts as a class).
+    /// the previously declared kind — an enum entry names 'enum'
+    /// (ev_enum_dup: `enum W {} enum W {}` → 'Cannot redeclare enum W').
     pub(in crate::interp) fn existing_class_site(
         &self,
         key: &str,
     ) -> Option<(&'static str, String, usize)> {
         if let Some(c) = self.classes.get(key) {
-            return Some(("class", c.decl.file.clone(), c.decl.line));
+            let kind = if c.decl.kind == ClassKind::Enum {
+                "enum"
+            } else {
+                "class"
+            };
+            return Some((kind, c.decl.file.clone(), c.decl.line));
         }
         if let Some(c) = self.interfaces.get(key) {
             return Some(("interface", c.file.clone(), c.line));

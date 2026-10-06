@@ -338,16 +338,10 @@ impl<'a> Interp<'a> {
                 if self.early_bound_classes.get(&key) == Some(&(Rc::as_ptr(d) as usize)) {
                     return Flow::Normal;
                 }
-                if let Some((_, file, line)) = self.existing_class_site(&key) {
-                    // The message names the NEW decl's kind (ev_enum_dup:
-                    // 'Cannot redeclare enum E', 'class F' for
-                    // `enum F {}; class F {}`).
-                    let kind = match d.kind {
-                        crate::ast::ClassKind::Interface => "interface",
-                        crate::ast::ClassKind::Trait => "trait",
-                        crate::ast::ClassKind::Enum => "enum",
-                        crate::ast::ClassKind::Class => "class",
-                    };
+                if let Some((kind, file, line)) = self.existing_class_site(&key) {
+                    // The message names the EXISTING decl's kind
+                    // (`interface I {} class I {}` → 'Cannot redeclare
+                    // interface I').
                     let e = self.decl_fatal_ctx(PhpError::fatal(
                         Self::redeclare_class_msg(kind, &d.name, &file, line),
                         self.cur_line,

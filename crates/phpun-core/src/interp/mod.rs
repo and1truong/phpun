@@ -1424,26 +1424,25 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                // Early binding: unconditional top-level classes with no
-                // parent/interfaces/traits register before execution
-                // (namespaces/ns_060).
+                // Early binding: unconditional top-level non-enum
+                // classes with no parent/interfaces/traits register
+                // before execution (namespaces/ns_060). Enums are
+                // exec-bound in Zend — `enum A {} class A {}` lets the
+                // class win early binding so the ENUM's exec site is
+                // where the redeclare fatal lands.
                 Stmt::Class(d)
-                    if d.parent.is_none() && d.implements.is_empty() && d.traits.is_empty() =>
+                    if d.parent.is_none()
+                        && d.implements.is_empty()
+                        && d.traits.is_empty()
+                        && d.kind != crate::ast::ClassKind::Enum =>
                 {
                     let key = d.name.to_lowercase();
-                    if let Some((_, file, line)) = self.existing_class_site(&key) {
+                    if let Some((kind, file, line)) = self.existing_class_site(&key) {
                         // Class-kind redeclares bind at EXEC phase in
                         // Zend (unlike function redeclares, which die
                         // inside the unit's compile) — the backtrace
                         // keeps the live include/eval frames. The
-                        // message names the NEW decl's kind ('class F'
-                        // for `enum F {}; class F {}`).
-                        let kind = match d.kind {
-                            crate::ast::ClassKind::Interface => "interface",
-                            crate::ast::ClassKind::Trait => "trait",
-                            crate::ast::ClassKind::Enum => "enum",
-                            crate::ast::ClassKind::Class => "class",
-                        };
+                        // message names the EXISTING decl's kind.
                         let e = self.decl_fatal_ctx(PhpError::fatal(
                             Self::redeclare_class_msg(kind, &d.name, &file, line),
                             d.line,
