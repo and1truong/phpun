@@ -748,12 +748,15 @@ pub(crate) fn dispatch(
                             pos,
                             eof,
                             nonblock,
+                            id,
+                            rbuf,
                             ..
                         } => {
                             if whence == 1 && offset >= 0 {
                                 // _php_stream_seek emulates forward SEEK_CUR
                                 // on unseekable streams by read-and-discard;
                                 // EOF/error mid-discard → silent -1.
+                                let chunk = stream_chunk(it, *id);
                                 let mut remaining = offset;
                                 while remaining > 0 {
                                     match read_pipe(
@@ -761,7 +764,9 @@ pub(crate) fn dispatch(
                                         eof,
                                         *nonblock,
                                         pos,
-                                        remaining.min(8192) as usize,
+                                        rbuf,
+                                        chunk,
+                                        (remaining as usize).min(chunk),
                                     )? {
                                         StreamRead::Data(b) if b.is_empty() => {
                                             return Ok(Some(Value::Int(-1)))
@@ -2536,33 +2541,38 @@ fn stdio_fseek(
     Ok(StdioSeek::Fail)
 }
 
-/// php_stream_gets on a pipe: byte-wise reads up to `limit` bytes,
-/// stopping after '\n'.
+/// php_stream_gets on a pipe: drains the read buffer and refills it
+/// in chunk_size fills until '\n', `limit`, or EOF.
 fn read_line_pipe(
     file: &mut std::fs::File,
     eof: &mut bool,
     nonblock: bool,
     pos: &mut u64,
+    rbuf: &mut std::collections::VecDeque<u8>,
+    chunk: usize,
     limit: usize,
 ) -> Result<StreamRead, PhpError> {
     use std::io::Read;
-    if *eof {
-        return Ok(StreamRead::Data(Vec::new()));
-    }
     let mut out = Vec::new();
-    let mut byte = [0u8; 1];
     while out.len() < limit {
-        match file.read(&mut byte) {
-            Ok(0) => {
-                *eof = true;
+        if let Some(b) = rbuf.pop_front() {
+            out.push(b);
+            if b == b'\n' {
                 break;
             }
-            Ok(_) => {
-                out.push(byte[0]);
-                *pos += 1;
-                if byte[0] == b'\n' {
-                    break;
-                }
+            continue;
+        }
+        if *eof {
+            break;
+        }
+        let mut buf = vec![0u8; chunk.max(1)];
+        match file.read(&mut buf) {
+            Ok(0) => {
+                *eof = true;
+            }
+            Ok(got) => {
+                buf.truncate(got);
+                rbuf.extend(buf);
             }
             Err(e) if nonblock && e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) => {
@@ -2586,8 +2596,10 @@ fn read_resource(it: &Interp, c: Option<&Cell>, n: usize) -> Result<StreamRead, 
                     pos,
                     eof,
                     nonblock,
+                    id,
+                    rbuf,
                     ..
-                } => read_pipe(file, eof, *nonblock, pos, n),
+                } => read_pipe(file, eof, *nonblock, pos, rbuf, stream_chunk(it, *id), n),
                 PhpResource::Stdio { which, .. } => match *which {
                     // STDIN reads are not modeled; php://output has no
                     // read op at all (silent false); STDOUT/STDERR are
@@ -2826,8 +2838,10 @@ fn csv_gets(it: &Interp, c: &Cell, limit: usize) -> Result<StreamRead, PhpError>
                     pos,
                     eof,
                     nonblock,
+                    id,
+                    rbuf,
                     ..
-                } => read_line_pipe(file, eof, *nonblock, pos, limit),
+                } => read_line_pipe(file, eof, *nonblock, pos, rbuf, stream_chunk(it, *id), limit),
                 PhpResource::File {
                     file,
                     pos,

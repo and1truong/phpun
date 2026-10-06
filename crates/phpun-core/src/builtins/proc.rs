@@ -718,6 +718,7 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
                         nonblock: false,
                         pos: 0,
                         eof: false,
+                        rbuf: Default::default(),
                     }));
                     proc_pipes.push(res.clone());
                     pipes_arr.set(ArrKey::Int(d.index as i64), Value::Resource(res));

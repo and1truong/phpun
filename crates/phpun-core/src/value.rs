@@ -1878,6 +1878,10 @@ pub enum PhpResource {
         nonblock: bool,
         pos: u64,
         eof: bool,
+        /// read-buffered but unconsumed bytes (zend's readbuf/writepos/
+        /// readpos): a php_stream_read() call drains this and performs
+        /// at most ONE underlying fill of stream_set_chunk_size() bytes.
+        rbuf: std::collections::VecDeque<u8>,
     },
     /// proc_open() process handle — type "process" in zend.
     Proc {
