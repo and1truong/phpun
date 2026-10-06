@@ -339,6 +339,32 @@ impl<'a> Interp<'a> {
                     Ok(()) => self.exec_block(&stmts),
                 };
                 self.loop_depth = saved_depth;
+                // break/continue/goto leaking out of the eval'd unit are
+                // compile fatals in Zend, attributed to the eval()'d-code
+                // context (cur_file/cur_line still hold it here) with the
+                // compile-context backtrace — same arm as include().
+                let flow = match flow {
+                    Flow::Break(_) | Flow::Continue(_) | Flow::Goto(_) => {
+                        self.last_err_file = self.cur_file.clone();
+                        let mut e = match &flow {
+                            Flow::Goto(l) => PhpError::compile_fatal(
+                                format!("'goto' to undefined label '{}'", l),
+                                self.cur_line,
+                            ),
+                            Flow::Continue(_) => PhpError::compile_fatal(
+                                "'continue' not in the 'loop' or 'switch' context",
+                                self.cur_line,
+                            ),
+                            _ => PhpError::compile_fatal(
+                                "'break' not in the 'loop' or 'switch' context",
+                                self.cur_line,
+                            ),
+                        };
+                        e.trace = Some(self.compile_err_frames());
+                        self.err_flow(e)
+                    }
+                    f => f,
+                };
                 self.cur_line = saved_line;
                 self.cur_file = saved_file;
                 match flow {
@@ -363,15 +389,7 @@ impl<'a> Interp<'a> {
                             line: 0,
                         })
                     }
-                    Flow::Break(_) | Flow::Continue(_) => Ok(Value::Null),
-                    Flow::Goto(l) => Err(PhpError {
-                        trace: None,
-                        thrown_line: None,
-                        display_msg: None,
-                        kind: ErrorKind::Fatal,
-                        message: format!("'goto' to undefined label '{}'", l),
-                        line: 0,
-                    }),
+                    Flow::Break(_) | Flow::Continue(_) | Flow::Goto(_) => unreachable!(),
                 }
             }
             Err(e) => {
