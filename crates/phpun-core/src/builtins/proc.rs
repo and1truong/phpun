@@ -549,9 +549,16 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
             .map(|(k, c)| (k.clone(), it.to_bytes_of(&c.borrow())))
             .collect();
         for (k, v) in items {
-            if v.is_empty() || v.contains(&0) {
+            // zend builds the envp entry as a C string "K=v": an empty
+            // value produces nothing, but a NUL inside truncates at the
+            // byte ("\0x" still lands as "K=" → empty, set).
+            if v.is_empty() {
                 continue;
             }
+            let v = match v.iter().position(|&b| b == 0) {
+                Some(p) => &v[..p],
+                None => &v[..],
+            };
             match k {
                 ArrKey::Str(ks) if !ks.is_empty() && !ks.contains('\0') => {
                     // Keys containing '=' are injected verbatim by zend's
@@ -561,12 +568,12 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
                         Some(p) if p > 0 => {
                             let mut joined = ks.as_bytes()[p + 1..].to_vec();
                             joined.push(b'=');
-                            joined.extend_from_slice(&v);
+                            joined.extend_from_slice(v);
                             cmd.env(to_os(ks[..p].as_bytes()), to_os(&joined));
                         }
                         Some(_) => {}
                         None => {
-                            cmd.env(to_os(ks.as_bytes()), to_os(&v));
+                            cmd.env(to_os(ks.as_bytes()), to_os(v));
                         }
                     }
                 }
