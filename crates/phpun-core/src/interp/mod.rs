@@ -703,7 +703,12 @@ impl<'a> Interp<'a> {
             ("SIG_SETMASK", 2),
             ("SIG_DFL", 0),
             ("SIG_IGN", 1),
+            ("SIG_ERR", -1),
+            ("SIGBABY", 31),
             ("WNOHANG", 1),
+            ("WUNTRACED", 2),
+            ("WCONTINUED", 8),
+            ("PRIO_PROCESS", 0),
         ] {
             constants.insert(name.into(), Value::Int(n));
         }
