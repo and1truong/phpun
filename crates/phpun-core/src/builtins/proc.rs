@@ -1153,22 +1153,33 @@ fn mb_len(b: &[u8], i: usize) -> i32 {
     if c < 0x80 {
         return 1;
     }
+    // glibc mbrlen follows the RFC-2279 (original UTF-8) lead-byte
+    // table: F1-F7 are 4-byte leads, F8-FB 5-byte, FC-FD 6-byte — the
+    // upper bounds on each class are enforced via the second byte
+    // (F0 needs >=0x90, F8-FB >=0x88, FC/FD >=0x84) like the E0/ED
+    // special cases below.
     let n = match c {
         0xC2..=0xDF => 2,
         0xE0..=0xEF => 3,
-        0xF0..=0xF4 => 4,
+        0xF0..=0xF7 => 4,
+        0xF8..=0xFB => 5,
+        0xFC..=0xFD => 6,
         _ => return -1,
     };
     if i + n > b.len() || !b[i + 1..i + n].iter().all(|&x| x & 0xC0 == 0x80) {
         return -1;
     }
-    // zend php_mblen rejects overlong encodings and UTF-16 surrogates
-    // via the second byte (E0 → >=0xA0, ED → <=0x9F, F0 → >=0x90).
-    // F4's upper bound is NOT checked — >U+10FFFF sequences are kept.
+    // glibc mbrlen rejects overlong encodings and UTF-16 surrogates
+    // via the second byte, only on the FIRST lead of each class
+    // (E0 → >=0xA0, ED → <=0x9F, F0 → >=0x90, F8 → >=0x88, FC → >=0x84);
+    // the rest of each class (F1-F7, F9-FB, FD) is unbounded, so
+    // >U+10FFFF sequences are kept.
     match (c, b[i + 1]) {
         (0xE0, s) if s < 0xA0 => return -1,
         (0xED, s) if s > 0x9F => return -1,
         (0xF0, s) if s < 0x90 => return -1,
+        (0xF8, s) if s < 0x88 => return -1,
+        (0xFC, s) if s < 0x84 => return -1,
         _ => {}
     }
     n as i32
