@@ -852,9 +852,7 @@ pub(crate) fn dispatch(
                     let meta = {
                         let res = r.borrow();
                         match &*res {
-                            crate::value::PhpResource::File { file, .. } => {
-                                file.metadata().ok()
-                            }
+                            crate::value::PhpResource::File { file, .. } => file.metadata().ok(),
                             crate::value::PhpResource::Stdio { which, .. } => {
                                 std::fs::metadata(match which {
                                     0 => "/dev/stdin",
@@ -1058,10 +1056,7 @@ fn io_errno_str(e: &std::io::Error) -> (i32, String) {
     let n = e.raw_os_error().unwrap_or(9);
     let msg = e.to_string();
     let suffix = format!(" (os error {})", n);
-    (
-        n,
-        msg.strip_suffix(&suffix).unwrap_or(&msg).to_string(),
-    )
+    (n, msg.strip_suffix(&suffix).unwrap_or(&msg).to_string())
 }
 
 /// `<fn>(): Write of N bytes failed with errno=E STR` E_NOTICE (the
@@ -1082,7 +1077,12 @@ pub(in crate::builtins) fn write_ebadf_notice(
 /// `<fn>(): Read of 8192 bytes failed with errno=E STR` E_NOTICE —
 /// reads go through 8192-byte stream chunks regardless of the
 /// requested length.
-pub(in crate::builtins) fn read_ebadf_notice(it: &mut Interp, fname: &str, errno: i32, msg: &str) -> Result<(), PhpError> {
+pub(in crate::builtins) fn read_ebadf_notice(
+    it: &mut Interp,
+    fname: &str,
+    errno: i32,
+    msg: &str,
+) -> Result<(), PhpError> {
     it.notice_pub(&format!(
         "{}(): Read of 8192 bytes failed with errno={} {}",
         fname, errno, msg
@@ -1157,7 +1157,11 @@ pub(in crate::builtins) fn write_resource(
                     Ok(StreamWrite::Written)
                 }
                 PhpResource::Mem {
-                    buf, pos, eof, write, ..
+                    buf,
+                    pos,
+                    eof,
+                    write,
+                    ..
                 } => {
                     // TEMP_STREAM_READONLY → php_stream_memory_write
                     // returns -1 and the bytes are silently dropped
