@@ -241,10 +241,13 @@ pub struct Interp<'a> {
     /// Classes whose const initializers were already link-evaluated.
     consts_linked: std::collections::HashSet<String>,
     /// Top-level parentless classes registered by hoisting (early
-    /// binding): name → AST decl ptr, so only the SAME decl stmt
-    /// no-ops on execution — a different decl site claiming the name
-    /// still hits the 'Cannot redeclare' check (namespaces/ns_060).
-    early_bound_classes: HashMap<String, usize>,
+    /// binding): name → (compile unit, AST decl ptr), so only the SAME
+    /// decl site in the SAME unit no-ops on execution — a different
+    /// decl site claiming the name still hits the 'Cannot redeclare'
+    /// check (namespaces/ns_060). The unit guards against a freed AST
+    /// Vec recycling the node ptr across re-parses (a second eval's
+    /// decl can land on the freed allocation of the first's).
+    early_bound_classes: HashMap<String, (u64, usize)>,
     /// Function decl sites early-bound at compile: lname →
     /// (compile unit, decl node ptr) — reaching that same site at
     /// runtime is a no-op, any OTHER decl into the occupied name is
@@ -1412,14 +1415,16 @@ impl<'a> Interp<'a> {
                     if d.parent.is_none() && d.implements.is_empty() && d.traits.is_empty() =>
                 {
                     let key = d.name.to_lowercase();
-                    if let Some((kind, file, line)) = self.existing_class_site(&key) {
-                        // A second unconditional decl of an occupied
-                        // name is Zend's compile-time 'Cannot
-                        // redeclare' fatal.
-                        return Err(PhpError::compile_fatal(
-                            Self::redeclare_class_msg(kind, &d.name, &file, line),
-                            d.line,
-                        ));
+                    if self.existing_class_site(&key).is_some() {
+                        // A second decl claiming an occupied name is
+                        // Zend's 'Cannot redeclare' fatal — but it fires
+                        // at the decl's EXEC position with the live
+                        // trace (`class A{} class A{}` still runs
+                        // earlier stmts first, and inside an include
+                        // the trace shows the include() frame), so
+                        // leave the decl for the exec arm's runtime
+                        // check instead of fataling here.
+                        continue;
                     }
                     let site = Rc::as_ptr(d) as usize;
                     let mut d = (**d).clone();
@@ -1429,7 +1434,7 @@ impl<'a> Interp<'a> {
                         *m = Rc::new(mm);
                     }
                     if self.register_class(Rc::new(d)).is_ok() {
-                        self.early_bound_classes.insert(key, site);
+                        self.early_bound_classes.insert(key, (self.cur_unit_id, site));
                     }
                 }
                 _ => {}

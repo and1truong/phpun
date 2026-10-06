@@ -328,10 +328,13 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let key = d.name.to_lowercase();
-                // The same decl site early-bound at compile time is a
+                // The same decl site early-bound for THIS unit is a
                 // no-op; a DIFFERENT decl claiming an occupied name is
-                // the 'Cannot redeclare' fatal.
-                if self.early_bound_classes.get(&key) == Some(&(Rc::as_ptr(d) as usize)) {
+                // the 'Cannot redeclare' fatal. The unit key guards a
+                // freed AST allocation recycled by a later unit's decl.
+                if self.early_bound_classes.get(&key)
+                    == Some(&(self.cur_unit_id, Rc::as_ptr(d) as usize))
+                {
                     return Flow::Normal;
                 }
                 if let Some((kind, file, line)) = self.existing_class_site(&key) {
