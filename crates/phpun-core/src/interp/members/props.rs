@@ -174,6 +174,27 @@ impl<'a> Interp<'a> {
         None
     }
 
+    /// Would creating dynamic prop `key`/`pn` on `o` emit the
+    /// E_DEPRECATED? True when no declared prop exists and the class
+    /// isn't exempt (stdClass / #[AllowDynamicProperties]).
+    pub(in crate::interp) fn dyn_prop_deprecated(
+        &mut self,
+        o: &Rc<RefCell<PhpObject>>,
+        pn: &str,
+        key: &str,
+    ) -> bool {
+        !o.borrow().props.contains_key(key)
+            && self.decl_prop(o, pn).is_none()
+            && !self.obj_is_a(o, "stdclass")
+            && !o.borrow().class.decl.attrs.iter().any(|a| {
+                a.name
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(&a.name)
+                    .eq_ignore_ascii_case("AllowDynamicProperties")
+            })
+    }
+
     /// Backedness of the *merged* runtime prop: any merged hook body
     /// referencing `$this->prop`, or any plain (unhooked) decl for it
     /// anywhere in the chain — a hooked redecl over a plain parent prop
@@ -1691,17 +1712,7 @@ impl<'a> Interp<'a> {
                 // An RW fetch of an undeclared prop materializes a
                 // dynamic one — E_DEPRECATED on non-exempt classes
                 // (stdClass / #[AllowDynamicProperties]).
-                if !o.borrow().props.contains_key(&key)
-                    && self.decl_prop(&o, &pn).is_none()
-                    && !self.obj_is_a(&o, "stdclass")
-                    && !o.borrow().class.decl.attrs.iter().any(|a| {
-                        a.name
-                            .rsplit('\\')
-                            .next()
-                            .unwrap_or(&a.name)
-                            .eq_ignore_ascii_case("AllowDynamicProperties")
-                    })
-                {
+                if self.dyn_prop_deprecated(&o, &pn, &key) {
                     let cn = o.borrow().class.name().to_string();
                     self.deprecated(&format!(
                         "Creation of dynamic property {}::${} is deprecated",

@@ -913,7 +913,15 @@ impl<'a> Interp<'a> {
                                 Err(e) => Err(e),
                             }
                         } else {
-                            Ok(None)
+                            // `isset($o[k])`/`$o[k] ?? x` on a plain
+                            // object still throws zend's catchable
+                            // Error — isset doesn't exempt objects.
+                            let cn = o.borrow().class.name().to_string();
+                            self.fail(PhpError::uncaught(
+                                "Error",
+                                format!("Cannot use object of type {} as array", cn),
+                                self.cur_line,
+                            ))
                         }
                     }
                     _ => Ok(None),
@@ -3622,11 +3630,15 @@ impl<'a> Interp<'a> {
                         Err(e) => Err(e),
                     };
                 }
-                if self.silence == 0 {
-                    let cn = o.borrow().class.name().to_string();
-                    self.warn(&format!("Cannot use object of type {} as array", cn))?;
-                }
-                Ok(Value::Null)
+                // A plain-object dim fetch throws zend's catchable
+                // `Error: Cannot use object of type C as array` — even
+                // inside isset()/empty()/`@` (probe_r3).
+                let cn = o.borrow().class.name().to_string();
+                self.fail(PhpError::uncaught(
+                    "Error",
+                    format!("Cannot use object of type {} as array", cn),
+                    self.cur_line,
+                ))
             }
             _ => {
                 if self.silence == 0 {
@@ -4344,7 +4356,9 @@ impl<'a> Interp<'a> {
                         return self.incdec_aa(o.clone(), key, delta, post);
                     }
                 }
-                self.index_read_base(base, key).unwrap_or(Value::Null)
+                // Errors from the read propagate — a plain-object dim
+                // is zend's catchable Error, not a silent null.
+                self.index_read_base(base, key)?
             }
             // ++/-- reads through __get first — its exceptions
             // propagate (the __set is never reached, bug38624).
@@ -4364,7 +4378,39 @@ impl<'a> Interp<'a> {
                         self.cur_line,
                     ));
                 }
-                self.prop_read_loose(target)?
+                // zend's rw prop fetch materializes the dynamic slot
+                // first, so on a plain missing prop 'Creation of
+                // dynamic property' precedes 'Undefined property'
+                // (probe_r2). Magic __get props keep loose-read.
+                if let Value::Object(o) = &ov {
+                    let pn = self.prop_name(name)?;
+                    let cls = o.borrow().class.clone();
+                    if self.decl_prop(o, &pn).is_none()
+                        && !o.borrow().props.contains_key(&pn)
+                        && self.find_method_in(&cls, "__get").is_none()
+                    {
+                        let cn = o.borrow().class.name().to_string();
+                        if self.dyn_prop_deprecated(o, &pn, &pn) {
+                            self.deprecated(&format!(
+                                "Creation of dynamic property {}::${} is deprecated",
+                                cn, pn
+                            ))?;
+                        }
+                        self.warn(&format!("Undefined property: {}::${}", cn, pn))?;
+                        let mut ob = o.borrow_mut();
+                        if !ob.prop_order.contains(&pn) {
+                            ob.prop_order.push(pn.clone());
+                        }
+                        ob.props
+                            .entry(pn.clone())
+                            .or_insert_with(|| cell(Value::Null));
+                        Value::Null
+                    } else {
+                        self.prop_read_loose(target)?
+                    }
+                } else {
+                    self.prop_read_loose(target)?
+                }
             }
             Expr::VarVar(inner) => {
                 let n = self.eval(inner)?;

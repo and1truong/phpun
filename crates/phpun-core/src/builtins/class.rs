@@ -222,9 +222,13 @@ pub(crate) fn dispatch(
             let mut arr = PhpArray::new();
             let frames = it.backtrace();
             // The executing include frame carries no args in Zend's array
-            // (`function: 'require'` only); deeper includes emit their
-            // path args BEFORE the function key (probe9 vs oracle).
-            let bare = frames.iter().position(crate::value::include_frame);
+            // (`function: 'require'` only) — but only when it's the
+            // innermost frame; deeper includes emit their path args
+            // BEFORE the function key (probe9 vs oracle).
+            let bare = frames
+                .iter()
+                .position(|f| !crate::value::trace_frame_hidden(f))
+                .filter(|&pos| crate::value::include_frame(&frames[pos]));
             for (pos, fr) in frames.iter().enumerate() {
                 let mut f = PhpArray::new();
                 if fr.file != "[internal function]" {

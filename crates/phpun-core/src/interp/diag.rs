@@ -357,7 +357,18 @@ impl<'a> Interp<'a> {
                 // ParseError inside eval'd code prints the plain
                 // `Parse error:` form (tests/lang/019) — `file` is
                 // already the `FILE(N) : eval()'d code` composite and
-                // eval_ctx the line inside the eval string.
+                // eval_ctx the line inside the eval string. The CLI
+                // SAPI still logs the `PHP Parse error:` header to
+                // stderr first, same as a top-level parse error.
+                let log_errors = self.ini.get("log_errors").is_none_or(|v| {
+                    matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
+                });
+                if log_errors {
+                    self.diag_stderr(&format!(
+                        "PHP Parse error:  {} in {} on line {}\n",
+                        msg, file, eval_ctx
+                    ));
+                }
                 self.emit(&format!(
                     "\nParse error: {} in {} on line {}\n",
                     msg, file, eval_ctx

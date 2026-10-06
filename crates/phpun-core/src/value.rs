@@ -270,7 +270,14 @@ pub fn format_trace(frames: &[TraceFrame]) -> String {
 pub fn format_backtrace_frames(frames: &[TraceFrame]) -> String {
     let mut t = String::new();
     let mut i = 0;
-    let bare_incl = frames.iter().position(include_frame);
+    // Only the innermost surviving include frame renders bare
+    // (`require()`); once a call frame sits above it, the executing
+    // include renders like any call — `require('/path/trunc...')`
+    // (probe9, d9).
+    let bare_incl = frames
+        .iter()
+        .position(|f| !trace_frame_hidden(f))
+        .filter(|&pos| include_frame(&frames[pos]));
     for (pos, fr) in frames.iter().enumerate() {
         if trace_frame_hidden(fr) {
             continue;

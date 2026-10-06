@@ -374,12 +374,14 @@ impl<'a> Parser<'a> {
         }
         // `new self` / `new static` / `new parent`
         if self.ident_is("self") || self.ident_is("static") || self.ident_is("parent") {
-            return Ok((Expr::Const(self.ident().unwrap()), Vec::new()));
+            let ce = Expr::Const(self.ident().unwrap());
+            return Ok((self.new_dcolon(ce)?, Vec::new()));
         }
         match self.peek().cloned() {
             Some(Token::Ident(_)) | Some(Token::Op("\\")) => {
                 let n = self.name_path().unwrap_or_default();
-                Ok((Expr::Const(self.ns_resolve(&n, NsKind::Class)), Vec::new()))
+                let ce = Expr::Const(self.ns_resolve(&n, NsKind::Class));
+                Ok((self.new_dcolon(ce)?, Vec::new()))
             }
             Some(Token::Variable(n)) => {
                 self.pos += 1;
@@ -437,6 +439,65 @@ impl<'a> Parser<'a> {
                 ),
                 self.line(),
             )),
+        }
+    }
+
+    /// `new X::...` — zend's new_expr only allows a class-name
+    /// variable after `::` (`new C::$v` instantiates the class named
+    /// by the static prop); `X::CONST`, `X::class` and `X::method()`
+    /// are parse errors `expecting variable or "$"` (p10v/y, probe10b).
+    fn new_dcolon(&mut self, ce: Expr) -> Result<Expr, PhpError> {
+        if !self.at_op("::") {
+            return Ok(ce);
+        }
+        self.pos += 1;
+        match self.next() {
+            Some(Token::Variable(n)) => Ok(Expr::StaticProp {
+                class: Box::new(ce),
+                name: PropName::Name(n),
+            }),
+            Some(Token::Op("$")) => {
+                // `X::$$v` / `X::${e}` — also a class-name variable.
+                let inner = if self.at_op("{") {
+                    self.pos += 1;
+                    let inner = self.expr()?;
+                    self.expect_op("}")?;
+                    inner
+                } else {
+                    match self.next() {
+                        Some(Token::Variable(n)) => Expr::Var(n),
+                        t => {
+                            return Err(PhpError::parse(
+                                format!(
+                                    "syntax error, unexpected {}, expecting variable or \"$\"",
+                                    desc_t(t.as_ref())
+                                ),
+                                self.line(),
+                            ))
+                        }
+                    }
+                };
+                Ok(Expr::StaticProp {
+                    class: Box::new(ce),
+                    name: PropName::Expr(Box::new(inner)),
+                })
+            }
+            t => {
+                let desc = match &t {
+                    Some(Token::Ident(n)) if crate::lexer::is_keyword(n) => {
+                        format!("token \"{}\"", n)
+                    }
+                    Some(Token::Ident(n)) => format!("identifier \"{}\"", n),
+                    other => desc_t(other.as_ref()),
+                };
+                Err(PhpError::parse(
+                    format!(
+                        "syntax error, unexpected {}, expecting variable or \"$\"",
+                        desc
+                    ),
+                    self.line(),
+                ))
+            }
         }
     }
 
@@ -831,35 +892,16 @@ impl<'a> Parser<'a> {
             });
         }
         if self.eat_op("++") {
-            let e = self.unary()?;
-            if matches!(
-                e,
-                Expr::Call { .. }
-                    | Expr::MethodCall { .. }
-                    | Expr::StaticCall { .. }
-                    | Expr::StaticCallDyn { .. }
-            ) {
-                return Err(PhpError::fatal(
-                    "Can't use method return value in write context",
-                    self.line(),
-                ));
-            }
+            // `++`'s operand is zend's `new_variable` — the same write
+            // context grammar as foreach `&` (`++1` → `unexpected
+            // integer`, `++(x)` → expecting `->`, `++f()`/`++$o->m()`
+            // → return-value fatal, `++"s"[0]`/`++new C()->x` →
+            // temporary-expression fatal, `++$x?->y` → nullsafe fatal).
+            let e = self.ref_variable(true)?;
             return Ok(Expr::PreInc(Box::new(e)));
         }
         if self.eat_op("--") {
-            let e = self.unary()?;
-            if matches!(
-                e,
-                Expr::Call { .. }
-                    | Expr::MethodCall { .. }
-                    | Expr::StaticCall { .. }
-                    | Expr::StaticCallDyn { .. }
-            ) {
-                return Err(PhpError::fatal(
-                    "Can't use method return value in write context",
-                    self.line(),
-                ));
-            }
+            let e = self.ref_variable(true)?;
             return Ok(Expr::PreDec(Box::new(e)));
         }
         if self.eat_op("@") {
@@ -977,8 +1019,9 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn postfix(&mut self) -> Result<Expr, PhpError> {
+        let start = self.pos;
         let e = self.primary()?;
-        self.postfix_rest(e)
+        self.postfix_rest(e, start)
     }
 
     /// The RHS of `=&` / `foreach (.. as &..)` / `[&..]`: Zend's
@@ -1124,8 +1167,8 @@ impl<'a> Parser<'a> {
         }
         let callish = |x: &Expr| -> Option<&'static str> {
             match x {
-                MethodCall { .. } => Some("method"),
-                Call { .. } | StaticCall { .. } | StaticCallDyn { .. } | Fcc(_) => Some("function"),
+                MethodCall { .. } | StaticCall { .. } | StaticCallDyn { .. } => Some("method"),
+                Call { .. } | Fcc(_) => Some("function"),
                 _ => None,
             }
         };
@@ -1225,35 +1268,136 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
-    pub(in crate::parser) fn postfix_rest(&mut self, mut e: Expr) -> Result<Expr, PhpError> {
+    /// `e++`/`e--` operand gate — zend's `new_variable` write context:
+    /// a whole-parenthesized operand (`($x)++`, `(f())++`) and any
+    /// other non-variable expression parse-error `unexpected token
+    /// "++"`; call/method results are compile fatals (`Can't use
+    /// function/method return value in write context`); string,
+    /// literal and `new` chain roots are `Cannot use temporary
+    /// expression in write context`; nullsafe chains `Can't use
+    /// nullsafe operator in write context`.
+    fn incdec_operand(&self, e: Expr, op: &str, start: usize) -> Result<Expr, PhpError> {
+        use crate::ast::Expr::*;
+        // Whole operand wrapped in parens — the start `(` matches the
+        // token right before the operator (`self.pos - 1` is `++`/`--`
+        // itself at this point).
+        if matches!(self.toks.get(start).map(|l| &l.token), Some(Token::Op("("))) {
+            let mut depth = 0usize;
+            let mut matched = None;
+            for (i, t) in self.toks.iter().enumerate().skip(start) {
+                match &t.token {
+                    Token::Op("(") => depth += 1,
+                    Token::Op(")") => {
+                        depth -= 1;
+                        if depth == 0 {
+                            matched = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if matched == Some(self.pos - 2) {
+                return Err(PhpError::parse(
+                    format!("syntax error, unexpected token \"{}\"", op),
+                    self.line(),
+                ));
+            }
+        }
+        if Self::has_nullsafe(&e) {
+            return Err(PhpError::compile_fatal(
+                "Can't use nullsafe operator in write context",
+                self.line(),
+            ));
+        }
+        // `++$x++` / `++$o->m()++` — the operand is already a
+        // composite `expr`, so the trailing operator can't reduce:
+        // zend yacc errors `unexpected token "++"`.
+        if start > 0
+            && matches!(
+                self.toks.get(start - 1).map(|l| &l.token),
+                Some(Token::Op("++")) | Some(Token::Op("--"))
+            )
+        {
+            return Err(PhpError::parse(
+                format!("syntax error, unexpected token \"{}\"", op),
+                self.line(),
+            ));
+        }
+        let linked = matches!(&e, Index { .. } | Prop { .. } | MethodCall { .. });
+        // `$o->m()++` — the ++ targets a method result directly:
+        // zend's write-context check rejects it.
+        if matches!(&e, MethodCall { .. }) {
+            return Err(PhpError::compile_fatal(
+                "Can't use method return value in write context",
+                self.line(),
+            ));
+        }
+        if linked {
+            let mut leaf = &e;
+            loop {
+                leaf = match leaf {
+                    Index { e: c, .. } | Prop { obj: c, .. } | MethodCall { obj: c, .. } => {
+                        c.as_ref()
+                    }
+                    Paren(inner) => inner.as_ref(),
+                    _ => break,
+                };
+            }
+            match leaf {
+                Var(_)
+                | VarVar(_)
+                | Call { .. }
+                | MethodCall { .. }
+                | StaticCall { .. }
+                | StaticCallDyn { .. }
+                | Fcc(_)
+                | Paren(_)
+                | StaticProp { .. } => {}
+                _ => {
+                    return Err(PhpError::compile_fatal(
+                        "Cannot use temporary expression in write context",
+                        self.line(),
+                    ))
+                }
+            }
+        } else {
+            match &e {
+                Var(_) | VarVar(_) | StaticProp { .. } => {}
+                Call { .. } | Fcc(_) => {
+                    return Err(PhpError::compile_fatal(
+                        "Can't use function return value in write context",
+                        self.line(),
+                    ))
+                }
+                MethodCall { .. } | StaticCall { .. } | StaticCallDyn { .. } => {
+                    return Err(PhpError::compile_fatal(
+                        "Can't use method return value in write context",
+                        self.line(),
+                    ))
+                }
+                _ => {
+                    return Err(PhpError::parse(
+                        format!("syntax error, unexpected token \"{}\"", op),
+                        self.line(),
+                    ))
+                }
+            }
+        }
+        Ok(e)
+    }
+
+    pub(in crate::parser) fn postfix_rest(
+        &mut self,
+        mut e: Expr,
+        start: usize,
+    ) -> Result<Expr, PhpError> {
         loop {
             if self.eat_op("++") {
-                if matches!(
-                    e,
-                    Expr::Call { .. }
-                        | Expr::MethodCall { .. }
-                        | Expr::StaticCall { .. }
-                        | Expr::StaticCallDyn { .. }
-                ) {
-                    return Err(PhpError::fatal(
-                        "Can't use method return value in write context",
-                        self.line(),
-                    ));
-                }
+                e = self.incdec_operand(e, "++", start)?;
                 e = Expr::PostInc(Box::new(e));
             } else if self.eat_op("--") {
-                if matches!(
-                    e,
-                    Expr::Call { .. }
-                        | Expr::MethodCall { .. }
-                        | Expr::StaticCall { .. }
-                        | Expr::StaticCallDyn { .. }
-                ) {
-                    return Err(PhpError::fatal(
-                        "Can't use method return value in write context",
-                        self.line(),
-                    ));
-                }
+                e = self.incdec_operand(e, "--", start)?;
                 e = Expr::PostDec(Box::new(e));
             } else if self.eat_op("[") {
                 let i = if self.at_op("]") {
