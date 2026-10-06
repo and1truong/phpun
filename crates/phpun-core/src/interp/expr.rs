@@ -233,7 +233,7 @@ impl<'a> Interp<'a> {
                         // into THIS gen's deferred queue at `base` —
                         // a live emit would echo inner output before
                         // the consumer reached it (yield-from order).
-                        let saved_cbase = std::mem::replace(&mut self.gen_collect_base, Some(base));
+                        let saved_cbase = self.gen_collect_base.replace(base);
                         let (items, death) = self.yield_from_collect(&v);
                         self.gen_collect_base = saved_cbase;
                         self.iter_calls -= 1;

@@ -707,7 +707,7 @@ impl<'a> Interp<'a> {
                 // A released generator replays its suspended
                 // finally chains now — unset() is its GC moment.
                 match self.gen_gc_sweep(false) {
-                    Err(e) => return self.err_flow(e),
+                    Err(e) => self.err_flow(e),
                     Ok(()) => Flow::Normal,
                 }
             }
