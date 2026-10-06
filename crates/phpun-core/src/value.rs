@@ -274,7 +274,7 @@ pub fn format_backtrace_frames(frames: &[TraceFrame]) -> String {
         if trace_frame_hidden(fr) {
             continue;
         }
-        t.push_str(&format!("#{} {}\n", i, trace_frame_str(fr)));
+        t.push_str(&format!("#{} {}\n", i, trace_frame_str_at(fr, i)));
         i += 1;
     }
     t
@@ -344,6 +344,38 @@ pub fn trace_frame_str(fr: &TraceFrame) -> String {
         arg_strs.push(format!("{}: {}", n, trace_arg(&c.borrow())));
     }
     format!("{}: {}({})", site, callee, arg_strs.join(", "))
+}
+
+/// The `include`/`require` pseudo-frame the interpreter pushes around an
+/// included file's execution — Zend's `require`/`include` backtrace
+/// entries (the *_once kinds share these names).
+pub fn include_frame(fr: &TraceFrame) -> bool {
+    fr.internal
+        && matches!(
+            fr.function.as_str(),
+            "include" | "include_once" | "require" | "require_once"
+        )
+}
+
+/// Frame body with call args suppressed (`fn()` — no arg list).
+fn trace_frame_str_noargs(fr: &TraceFrame) -> String {
+    let mut f = fr.clone();
+    f.args.clear();
+    f.named_args.clear();
+    trace_frame_str(&f)
+}
+
+/// Frame body for the `idx`-th frame of an innermost-first live
+/// backtrace. The innermost include/require pseudo-frame renders bare
+/// (`require()` — the include op_array's own executing context carries
+/// no call args in Zend); deeper include frames keep their path
+/// argument (`require('/tmp/x/inc....')`).
+pub fn trace_frame_str_at(fr: &TraceFrame, idx: usize) -> String {
+    if idx == 0 && include_frame(fr) {
+        trace_frame_str_noargs(fr)
+    } else {
+        trace_frame_str(fr)
+    }
 }
 
 /// Lossy UTF-8 view of a byte string — for APIs/names that are

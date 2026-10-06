@@ -4109,14 +4109,24 @@ impl<'a> Interp<'a> {
                 message: format!("\u{1}exit:{}", c),
                 line: 0,
             }),
-            Flow::Break(_) | Flow::Continue(_) => self.fail(PhpError::fatal(
-                "'break' or 'continue' outside of loop or switch context",
-                0,
-            )),
-            Flow::Goto(l) => self.fail(PhpError::fatal(
-                format!("'goto' to undefined label '{}'", l),
-                0,
-            )),
+            Flow::Break(_) | Flow::Continue(_) => {
+                // Compile fatal in Zend (function bodies are compiled
+                // eagerly) — carry the compile-context backtrace.
+                let mut e = PhpError::compile_fatal(
+                    "'break' not in the 'loop' or 'switch' context",
+                    self.cur_line,
+                );
+                e.trace = Some(self.compile_err_frames());
+                self.fail(e)
+            }
+            Flow::Goto(l) => {
+                let mut e = PhpError::compile_fatal(
+                    format!("'goto' to undefined label '{}'", l),
+                    self.cur_line,
+                );
+                e.trace = Some(self.compile_err_frames());
+                self.fail(e)
+            }
             Flow::Normal => {
                 // Falling off the end of a typed function still checks
                 // the return type: `none returned` TypeError for real

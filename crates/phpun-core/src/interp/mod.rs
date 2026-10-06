@@ -310,9 +310,10 @@ pub struct Interp<'a> {
     pub(crate) statics: HashMap<String, HashMap<String, Cell>>,
     /// Global static vars (`static` at top level).
     global_statics: HashMap<String, Cell>,
-    /// static-decl sites per function scope (fn key → var → source line) —
-    /// PHP fatals on a same-scope redeclaration at a different site.
-    static_decls: HashMap<String, HashMap<String, usize>>,
+    /// static-decl sites per function scope (fn key → var → decl
+    /// (file, stmt ptr)) — PHP fatals on a same-unit redeclaration at a
+    /// different statement site.
+    static_decls: HashMap<String, HashMap<String, (String, usize)>>,
     /// include_once/require_once registry (canonical paths).
     included: HashSet<std::path::PathBuf>,
     /// Pending exception carried across an Err(Throw) return.
@@ -1342,7 +1343,10 @@ impl<'a> Interp<'a> {
                     let _ = self.decl_type_checks(&d.name, d, None);
                     let key = d.name.to_lowercase();
                     if let Some(prev) = self.functions.get(&key) {
-                        return Err(PhpError::fatal(
+                        // Early binding dies at compile time in Zend —
+                        // the include/eval arms attach the compile-
+                        // context backtrace to this error.
+                        return Err(PhpError::compile_fatal(
                             format!(
                                 "Cannot redeclare function {}() (previously declared in {}:{})",
                                 d.name, prev.file, prev.line
@@ -1451,9 +1455,22 @@ impl<'a> Interp<'a> {
                     fatal: Some(PhpError::fatal("uncaught exception", 0)),
                 }
             }
-            Flow::Break(_) | Flow::Continue(_) => {
-                let e =
-                    PhpError::fatal("'break' or 'continue' outside of loop or switch context", 0);
+            Flow::Break(_) => {
+                let e = PhpError::compile_fatal(
+                    "'break' not in the 'loop' or 'switch' context",
+                    self.cur_line,
+                );
+                self.print_fatal(&e);
+                RunResult {
+                    exit_code: 255,
+                    fatal: Some(e),
+                }
+            }
+            Flow::Continue(_) => {
+                let e = PhpError::compile_fatal(
+                    "'continue' not in the 'loop' or 'switch' context",
+                    self.cur_line,
+                );
                 self.print_fatal(&e);
                 RunResult {
                     exit_code: 255,
@@ -1461,7 +1478,10 @@ impl<'a> Interp<'a> {
                 }
             }
             Flow::Goto(l) => {
-                let e = PhpError::fatal(format!("'goto' to undefined label '{}'", l), 0);
+                let e = PhpError::compile_fatal(
+                    format!("'goto' to undefined label '{}'", l),
+                    self.cur_line,
+                );
                 self.print_fatal(&e);
                 RunResult {
                     exit_code: 255,

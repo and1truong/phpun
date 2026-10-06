@@ -320,19 +320,28 @@ impl<'a> Interp<'a> {
             }
             Stmt::Static { vars, line } => {
                 let key = self.fn_statics_key();
+                // Site identity: (compile unit, line). A `static $a`
+                // redeclared at a different line in the same scope and
+                // unit is a compile fatal (static_basic_002), while
+                // re-executing the same statement (loops) or redeclaring
+                // in a different unit — a separate include/eval, which
+                // Zend keeps separate statics for — is not.
+                let site = (self.cur_file.clone(), *line);
                 for (name, default) in vars {
-                    // `static $a` redeclared at a different site in the same
-                    // scope is a compile fatal (tests/lang/static_basic_002).
                     let prev = self
                         .static_decls
                         .entry(key.clone())
                         .or_default()
-                        .insert(name.clone(), *line);
-                    if prev.is_some_and(|l| l != *line) {
-                        return self.err_flow(PhpError::fatal(
+                        .insert(name.clone(), site.clone());
+                    if prev.is_some_and(|(pu, ps)| pu == site.0 && ps != site.1) {
+                        // A compile fatal in Zend — carry the compile-
+                        // context backtrace (include chain minus context).
+                        let mut e = PhpError::compile_fatal(
                             format!("Duplicate declaration of static variable ${}", name),
                             self.cur_line,
-                        ));
+                        );
+                        e.trace = Some(self.compile_err_frames());
+                        return self.err_flow(e);
                     }
                     // Statics live per-function-decl: inside a function
                     // they never fall back to the top-level table
@@ -642,10 +651,12 @@ impl<'a> Interp<'a> {
                     // compile-time fatal (namespaces/ns_075).
                     let short = n.rsplit('\\').next().unwrap_or(n);
                     if matches!(short.to_uppercase().as_str(), "TRUE" | "FALSE" | "NULL") {
-                        return self.err_flow(PhpError::fatal(
+                        let mut e = PhpError::compile_fatal(
                             format!("Cannot redeclare constant '{}'", short),
                             self.cur_line,
-                        ));
+                        );
+                        e.trace = Some(self.compile_err_frames());
+                        return self.err_flow(e);
                     }
                     match self.eval_const(e) {
                         Ok(v) => self.define_const(n, v),
@@ -717,10 +728,11 @@ impl<'a> Interp<'a> {
         body: &[Stmt],
     ) -> Flow {
         if matches!(key, Some(ForeachKey::ByRef)) {
-            return self.err_flow(PhpError::fatal(
-                "Key element cannot be a reference",
-                self.cur_line,
-            ));
+            // A compile fatal in Zend (`foreach as &$k => $v` dies at
+            // compile time with a `{main}`-or-chain backtrace).
+            let mut e = PhpError::compile_fatal("Key element cannot be a reference", self.cur_line);
+            e.trace = Some(self.compile_err_frames());
+            return self.err_flow(e);
         }
         let src = match self.eval(arr) {
             Ok(v) => v,

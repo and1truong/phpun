@@ -175,10 +175,6 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn print_parse(&mut self, e: &PhpError) {
-        self.emit(&format!(
-            "\nParse error: {} in {} on line {}\n",
-            e.message, self.file, e.line
-        ));
         let log_errors = self
             .ini
             .get("log_errors")
@@ -189,6 +185,10 @@ impl<'a> Interp<'a> {
                 e.message, self.file, e.line
             ));
         }
+        self.emit(&format!(
+            "\nParse error: {} in {} on line {}\n",
+            e.message, self.file, e.line
+        ));
     }
 
     pub(in crate::interp) fn print_fatal(&mut self, e: &PhpError) {
@@ -385,21 +385,67 @@ impl<'a> Interp<'a> {
 
     /// Turn an eval error into control flow. `\u{1}exit:N` is the exit
     /// sentinel; `ErrorKind::Throw` carries pending_exception.
-    pub(in crate::interp) fn err_flow(&mut self, e: PhpError) -> Flow {
+    pub(in crate::interp) fn err_flow(&mut self, mut e: PhpError) -> Flow {
         if let Some(code) = e.message.strip_prefix("\u{1}exit:") {
             return Flow::Exit(code.parse().unwrap_or(0));
         }
         if e.kind == ErrorKind::Throw {
             return Flow::Throw(self.pending_exception.take().unwrap_or(Value::Null));
         }
+        // Raise sites that never passed fail() leave last_err_file unset
+        // — attribute the fatal to the executing code unit (the frame's
+        // file, else the file being included/eval'd) like Zend instead
+        // of falling back to the main script.
+        if self.last_err_file.is_empty() {
+            self.last_err_file = self.diag_file();
+        }
+        // Zend attaches the live backtrace to runtime fatals: uncaught
+        // throwables and compile fatals carry one even when it's just
+        // `{main}`; plain E_ERRORs only when a real frame remains.
+        if e.trace.is_none() {
+            let frames = self.fatal_frames();
+            if e.kind != ErrorKind::Fatal || !frames.is_empty() {
+                e.trace = Some(frames);
+            }
+        }
         self.print_fatal(&e);
         Flow::Exit(255)
+    }
+
+    /// Frames for a compile-family fatal's `Stack trace` block: Zend
+    /// reports these while the unit is being *compiled*, when the
+    /// runtime stack is only the include/require chain — the innermost
+    /// include/require pseudo-frame (the compiling context) and any
+    /// frames pushed inside the unit are excluded. Inside eval'd code
+    /// there is no pseudo-frame — the live stack itself is the
+    /// compiling context's caller chain.
+    pub(crate) fn compile_err_frames(&self) -> Vec<String> {
+        let upto = if self.cur_file.contains("eval()'d code") {
+            self.call_trace.len()
+        } else {
+            self.call_trace
+                .iter()
+                .rposition(crate::value::include_frame)
+                .unwrap_or(0)
+        };
+        self.call_trace[..upto]
+            .iter()
+            .rev()
+            .filter(|f| !crate::value::trace_frame_hidden(f))
+            .enumerate()
+            .map(|(i, f)| crate::value::trace_frame_str_at(f, i))
+            .collect()
     }
 
     /// File diagnostics attribute to: the executing frame's declaring
     /// file, else the file currently being included/run (warnings inside
     /// autoloaded/library code report the library file, not the caller).
+    /// Inside eval'd code cur_file is the `FILE(N) : eval()'d code`
+    /// context — Zend attributes every diagnostic there.
     pub(in crate::interp) fn diag_file(&self) -> String {
+        if self.cur_file.contains("eval()'d code") {
+            return self.cur_file.clone();
+        }
         self.stack
             .last()
             .map(|f| f.file.clone())

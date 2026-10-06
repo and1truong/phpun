@@ -4,7 +4,7 @@
 
 use super::util::*;
 use super::*;
-use crate::value::{trace_frame_hidden, trace_frame_str};
+use crate::value::{trace_frame_hidden, trace_frame_str_at};
 
 impl<'a> Interp<'a> {
     /// Flush all output buffers at script end, innermost first so each
@@ -308,7 +308,8 @@ impl<'a> Interp<'a> {
             .iter()
             .rev()
             .filter(|f| !trace_frame_hidden(f))
-            .map(trace_frame_str)
+            .enumerate()
+            .map(|(i, f)| trace_frame_str_at(f, i))
             .collect()
     }
 
