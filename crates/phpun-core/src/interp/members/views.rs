@@ -306,6 +306,70 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
+                // ReflectionFunction's ctor validates through its
+                // Closure|string ZPP: scalars coerce (null is
+                // deprecated), other values TypeError, and an unknown
+                // name throws ReflectionException — language constructs
+                // (isset/print/eval) are not functions.
+                if obj.borrow().class.name().to_lowercase().as_str() == "reflectionfunction" {
+                    if args.is_empty() {
+                        return Err(PhpError::uncaught(
+                            "ArgumentCountError",
+                            "ReflectionFunction::__construct() expects exactly 1 argument, 0 given",
+                            0,
+                        ));
+                    }
+                    let a = args[0].borrow().clone();
+                    let sname = match &a {
+                        Value::Callable(_) => None,
+                        Value::Null => {
+                            self.deprecated(
+                                "ReflectionFunction::__construct(): Passing null to parameter #1 ($function) of type Closure|string is deprecated",
+                            )?;
+                            Some(String::new())
+                        }
+                        Value::Str(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) => {
+                            Some(self.conv_str(&a)?.to_string())
+                        }
+                        other => {
+                            return Err(PhpError::uncaught(
+                                "TypeError",
+                                format!(
+                                    "ReflectionFunction::__construct(): Argument #1 ($function) must be of type Closure|string, {} given",
+                                    self.zval_type_name(other)
+                                ),
+                                0,
+                            ));
+                        }
+                    };
+                    if let Some(s) = sname {
+                        let key = s.trim_start_matches('\\').to_lowercase();
+                        let canon = if let Some(d) = self.functions.get(&key) {
+                            d.name.clone()
+                        } else if crate::builtins::is_builtin(&key)
+                            || crate::builtins::builtin_params(&key).is_some()
+                        {
+                            key.clone()
+                        } else {
+                            return Err(PhpError::uncaught(
+                                "ReflectionException",
+                                format!("Function {}() does not exist", s),
+                                0,
+                            ));
+                        };
+                        let mut ob = obj.borrow_mut();
+                        ob.props
+                            .insert("\0rc\0class".into(), cell(Value::str(&canon)));
+                        ob.props.insert("\0rc\0prop".into(), cell(Value::Null));
+                        ob.props.insert("name".into(), cell(Value::str(&canon)));
+                        if !ob.prop_order.contains(&"name".into()) {
+                            ob.prop_order.push("name".into());
+                        }
+                        return Ok(Some(Value::Null));
+                    }
+                    // Callable arg falls through to the generic prop
+                    // setup, which derives `name` from its kind.
+                }
                 let mut ob = obj.borrow_mut();
                 let cls = args
                     .first()
@@ -939,38 +1003,112 @@ impl<'a> Interp<'a> {
                         .unwrap_or(Value::Null);
                     self.callable_decl(&cb)
                 };
-                let mut arr = PhpArray::default();
-                if let Some(d) = decl {
-                    for p in &d.params {
-                        let rp = self.instantiate("reflectionparameter", &[])?;
-                        if let Value::Object(o) = &rp {
-                            o.borrow_mut()
-                                .props
-                                .insert("\0rp\0name".into(), cell(Value::str(&p.name)));
-                            // Zend's ReflectionParameter exposes the name
-                            // as a public prop rendered by var_dump.
-                            let mut ob = o.borrow_mut();
-                            ob.props.insert("name".into(), cell(Value::str(&p.name)));
-                            if !ob.prop_order.contains(&"name".into()) {
-                                ob.prop_order.push("name".into());
+                // (name, variadic, has-default, default, type members)
+                // — userland decls read Param, internal functions
+                // synthesize from arginfo (builtin_params).
+                let mut prs: Vec<(String, bool, bool, Value, Vec<String>, bool)> = Vec::new();
+                let bp: Option<&'static [(&'static str, crate::builtins::BDef)]> = if is_method {
+                    None
+                } else {
+                    match obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null)
+                    {
+                        Value::Str(s) => {
+                            let n = String::from_utf8_lossy(&s).to_lowercase();
+                            if !self.functions.contains_key(&n) {
+                                crate::builtins::builtin_params(&n)
+                            } else {
+                                None
                             }
-                            drop(ob);
-                            o.borrow_mut()
-                                .props
-                                .insert("\0rp\0variadic".into(), cell(Value::Bool(p.variadic)));
-                            let mut ta = PhpArray::default();
-                            if let Some(ty) = &p.ty {
-                                for m in ty {
-                                    ta.push(Value::str(m));
-                                }
-                            }
-                            o.borrow_mut().props.insert(
-                                "\0rp\0ty".into(),
-                                cell(Value::Array(Rc::new(RefCell::new(ta)))),
-                            );
                         }
-                        arr.push(rp);
+                        _ => None,
                     }
+                };
+                if let Some(params) = bp {
+                    for (pn, d) in params.iter() {
+                        let var = matches!(d, crate::builtins::BDef::Var);
+                        // Unk/OptReq params are optional but carry no
+                        // default (Zend arginfo opt/dva flags).
+                        let has = !matches!(
+                            d,
+                            crate::builtins::BDef::Req
+                                | crate::builtins::BDef::Unk
+                                | crate::builtins::BDef::OptReq
+                                | crate::builtins::BDef::Var
+                        );
+                        let opt = has
+                            || var
+                            || matches!(
+                                d,
+                                crate::builtins::BDef::Unk | crate::builtins::BDef::OptReq
+                            );
+                        prs.push((pn.to_string(), var, has, d.val(), Vec::new(), opt));
+                    }
+                } else if let Some(d) = &decl {
+                    let req = d
+                        .params
+                        .iter()
+                        .rposition(|p| p.default.is_none() && !p.variadic)
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    for (i, p) in d.params.iter().enumerate() {
+                        // Zend erases the default on a param its
+                        // optional-before-required rule makes required.
+                        let has = p.default.is_some() && i >= req;
+                        let dv = if has {
+                            self.eval_decl_const(p.default.as_ref().unwrap(), &d.file)
+                                .unwrap_or(Value::Null)
+                        } else {
+                            Value::Null
+                        };
+                        prs.push((
+                            p.name.clone(),
+                            p.variadic,
+                            has,
+                            dv,
+                            p.ty.clone().unwrap_or_default(),
+                            has || p.variadic,
+                        ));
+                    }
+                }
+                let mut arr = PhpArray::default();
+                for (pos, (pn, variadic, has_def, dv, ty, opt)) in prs.iter().enumerate() {
+                    let rp = self.instantiate("reflectionparameter", &[])?;
+                    if let Value::Object(o) = &rp {
+                        o.borrow_mut()
+                            .props
+                            .insert("\0rp\0name".into(), cell(Value::str(pn)));
+                        // Zend's ReflectionParameter exposes the name
+                        // as a public prop rendered by var_dump.
+                        let mut ob = o.borrow_mut();
+                        ob.props.insert("name".into(), cell(Value::str(pn)));
+                        if !ob.prop_order.contains(&"name".into()) {
+                            ob.prop_order.push("name".into());
+                        }
+                        drop(ob);
+                        let mut ob = o.borrow_mut();
+                        ob.props
+                            .insert("\0rp\0variadic".into(), cell(Value::Bool(*variadic)));
+                        ob.props
+                            .insert("\0rp\0pos".into(), cell(Value::Int(pos as i64)));
+                        ob.props
+                            .insert("\0rp\0hasdef".into(), cell(Value::Bool(*has_def)));
+                        ob.props.insert("\0rp\0opt".into(), cell(Value::Bool(*opt)));
+                        ob.props.insert("\0rp\0def".into(), cell(dv.clone()));
+                        let mut ta = PhpArray::default();
+                        for m in ty {
+                            ta.push(Value::str(m));
+                        }
+                        ob.props.insert(
+                            "\0rp\0ty".into(),
+                            cell(Value::Array(Rc::new(RefCell::new(ta)))),
+                        );
+                    }
+                    arr.push(rp);
                 }
                 Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
             }
@@ -980,6 +1118,50 @@ impl<'a> Interp<'a> {
                     .get("\0rp\0variadic")
                     .is_some_and(|c| c.borrow().is_truthy()),
             ))),
+            "getposition" => Ok(Some(Value::Int(
+                obj.borrow()
+                    .props
+                    .get("\0rp\0pos")
+                    .map(|c| c.borrow().to_int())
+                    .unwrap_or(0),
+            ))),
+            // Optional = has a usable default or is the variadic tail;
+            // a param the optional-before-required rule made required
+            // reports no default (zend erases it at compile time).
+            "isoptional" => Ok(Some(Value::Bool(
+                obj.borrow()
+                    .props
+                    .get("\0rp\0opt")
+                    .is_some_and(|c| c.borrow().is_truthy()),
+            ))),
+            "isdefaultvalueavailable" => Ok(Some(Value::Bool(
+                obj.borrow()
+                    .props
+                    .get("\0rp\0hasdef")
+                    .is_some_and(|c| c.borrow().is_truthy()),
+            ))),
+            "getdefaultvalue" => {
+                let ob = obj.borrow();
+                if ob
+                    .props
+                    .get("\0rp\0hasdef")
+                    .is_some_and(|c| c.borrow().is_truthy())
+                {
+                    Ok(Some(
+                        ob.props
+                            .get("\0rp\0def")
+                            .map(|c| c.borrow().clone())
+                            .unwrap_or(Value::Null),
+                    ))
+                } else {
+                    drop(ob);
+                    self.fail(PhpError::uncaught(
+                        "ReflectionException",
+                        "Internal error: Failed to retrieve the default value",
+                        0,
+                    ))
+                }
+            }
             "hastype" => {
                 // ReflectionParameter::hasType() — \0rp\0ty members
                 // populated by getParameters().
@@ -1219,6 +1401,7 @@ impl<'a> Interp<'a> {
                 };
                 let mut arr = PhpArray::default();
                 for e in exprs.iter() {
+                    let e = Self::unmark_arg(e);
                     if let Expr::Binary { op: "named", l, r } = e {
                         if let Expr::Str(n) = l.as_ref() {
                             let v = self.eval_const(r)?;
@@ -1286,7 +1469,7 @@ impl<'a> Interp<'a> {
                         .args
                         .iter()
                         .find_map(|a| {
-                            if let Expr::Binary { op: "named", l, r } = a {
+                            if let Expr::Binary { op: "named", l, r } = Self::unmark_arg(a) {
                                 if matches!(l.as_ref(), Expr::Str(n) if n == "flags") {
                                     return Some(r.as_ref());
                                 }
@@ -1337,6 +1520,7 @@ impl<'a> Interp<'a> {
                     let mut cells = Vec::new();
                     let mut named = Vec::new();
                     for e in aexprs.iter() {
+                        let e = Self::unmark_arg(e);
                         if let Expr::Binary { op: "named", l, r } = e {
                             if let Expr::Str(n) = l.as_ref() {
                                 named.push((n.clone(), cell(self.eval_const(r)?), true, false));
@@ -2467,6 +2651,8 @@ impl Interp<'_> {
         let n = name.trim_start_matches('\\').to_lowercase();
         if let Some(params) = crate::builtins::builtin_params(&n) {
             let total = params.len() as i64;
+            // OptReq params are arginfo-optional (rand reports 0
+            // required); their arity rule lives in the call path.
             let required = params
                 .iter()
                 .filter(|(_, d)| matches!(d, crate::builtins::BDef::Req))
@@ -2475,12 +2661,17 @@ impl Interp<'_> {
         }
         // builtin_sig's catch-all answers (0,0) for every name — only
         // consult it for names that actually are builtins so userland
-        // decls still resolve below.
+        // decls still resolve below. A builtin with no known signature
+        // reports NULL rather than a bogus (0,0).
         if crate::builtins::is_builtin(&n) {
-            let sig = crate::builtins::builtin_sig(&n).unwrap_or_default();
-            let total = sig.len() as i64;
-            let required = sig.iter().filter(|(_, req)| *req).count() as i64;
-            return Some((total, required));
+            return crate::builtins::builtin_sig(&n).and_then(|sig| {
+                if sig.is_empty() {
+                    return None;
+                }
+                let total = sig.len() as i64;
+                let required = sig.iter().filter(|(_, req)| *req).count() as i64;
+                Some((total, required))
+            });
         }
         self.functions.get(&n).map(|d| reflect_decl_arity(d))
     }
@@ -2522,13 +2713,17 @@ impl Interp<'_> {
 }
 
 /// Total and required param counts for a function/method decl — a
-/// variadic tail is a declared slot but not required.
+/// variadic tail is a declared slot but not required. Zend counts as
+/// required every param up to and including the last one without a
+/// default, so an optional declared before a required param is required
+/// too (`function f($a = 1, $b)` reflects 2/2).
 fn reflect_decl_arity(d: &crate::ast::FunctionDecl) -> (i64, i64) {
     (
         d.params.len() as i64,
         d.params
             .iter()
-            .filter(|p| p.default.is_none() && !p.variadic)
-            .count() as i64,
+            .rposition(|p| p.default.is_none() && !p.variadic)
+            .map(|i| i as i64 + 1)
+            .unwrap_or(0),
     )
 }
