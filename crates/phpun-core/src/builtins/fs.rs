@@ -603,14 +603,7 @@ pub(crate) fn dispatch(
                             if let Some(fd) = *spilled_fd {
                                 let chunk = stream_chunk(it, *id);
                                 let r = fd_stream_seek(
-                                    fd,
-                                    pos,
-                                    pos_broken,
-                                    eof,
-                                    srbuf,
-                                    chunk,
-                                    offset,
-                                    whence,
+                                    fd, pos, pos_broken, eof, srbuf, chunk, offset, whence,
                                 );
                                 return Ok(Some(Value::Int(r)));
                             }
@@ -689,14 +682,7 @@ pub(crate) fn dispatch(
                             if let Some(fd) = *spilled_fd {
                                 let chunk = stream_chunk(it, *id);
                                 let r = fd_stream_seek(
-                                    fd,
-                                    pos,
-                                    pos_broken,
-                                    eof,
-                                    srbuf,
-                                    chunk,
-                                    offset,
-                                    whence,
+                                    fd, pos, pos_broken, eof, srbuf, chunk, offset, whence,
                                 );
                                 return Ok(Some(Value::Int(r)));
                             }
@@ -924,9 +910,7 @@ pub(crate) fn dispatch(
                         } => Value::Bool(match spilled_fd {
                             // post-cast the buffer is inert — ftruncate(2)
                             // hits the real tmpfile (fd offset untouched).
-                            Some(fd) => unsafe {
-                                libc::ftruncate(*fd, size as libc::off_t) == 0
-                            },
+                            Some(fd) => unsafe { libc::ftruncate(*fd, size as libc::off_t) == 0 },
                             None => {
                                 buf.resize(size, 0);
                                 if (*pos as usize) > size {
@@ -941,9 +925,7 @@ pub(crate) fn dispatch(
                             spilled_fd,
                             ..
                         } => Value::Bool(match spilled_fd {
-                            Some(fd) => unsafe {
-                                libc::ftruncate(*fd, size as libc::off_t) == 0
-                            },
+                            Some(fd) => unsafe { libc::ftruncate(*fd, size as libc::off_t) == 0 },
                             // data:/php://input are memory-backed streams —
                             // zend's temp set_option truncates the buffer.
                             None => {
@@ -1224,9 +1206,8 @@ pub(crate) fn dispatch(
                         } => {
                             if let Some(fd) = *spilled_fd {
                                 let chunk = stream_chunk(it, *id);
-                                if fd_stream_seek(
-                                    fd, pos, pos_broken, eof, srbuf, chunk, offset, 0,
-                                ) < 0
+                                if fd_stream_seek(fd, pos, pos_broken, eof, srbuf, chunk, offset, 0)
+                                    < 0
                                 {
                                     *pos = offset as u64;
                                     *pos_broken = false;
@@ -1302,9 +1283,8 @@ pub(crate) fn dispatch(
                         } => {
                             if let Some(fd) = *spilled_fd {
                                 let chunk = stream_chunk(it, *id);
-                                if fd_stream_seek(
-                                    fd, pos, pos_broken, eof, srbuf, chunk, offset, 0,
-                                ) < 0
+                                if fd_stream_seek(fd, pos, pos_broken, eof, srbuf, chunk, offset, 0)
+                                    < 0
                                 {
                                     *pos = offset as u64;
                                     *pos_broken = false;
@@ -1384,9 +1364,8 @@ pub(crate) fn dispatch(
                 // Incompatible (or out-of-i64-range) values fall to the
                 // "int|resource, T given" warning; a coerced int outside
                 // 0..=2147483647 warns "must be between" and fails.
-                let long_ok = |f: f64| {
-                    f.is_finite() && f >= i64::MIN as f64 && f < -(i64::MIN as f64)
-                };
+                let long_ok =
+                    |f: f64| f.is_finite() && f >= i64::MIN as f64 && f < -(i64::MIN as f64);
                 let as_int: Option<i64> = match &v {
                     Value::Int(i) => Some(*i),
                     Value::Bool(b) => Some(*b as i64),
@@ -1430,7 +1409,7 @@ pub(crate) fn dispatch(
                             ))?;
                             return Ok(Some(Value::Bool(false)));
                         }
-                        return Ok(Some(Value::Bool(unsafe { libc::isatty(i as i32) } == 1)))
+                        return Ok(Some(Value::Bool(unsafe { libc::isatty(i as i32) } == 1)));
                     }
                     (_, Value::Resource(_)) => {}
                     (_, other) => {
@@ -2460,7 +2439,11 @@ fn fd_stream_seek(
     whence: i64,
 ) -> i64 {
     let buffered = srbuf.len() as i64;
-    let tell = if *pos_broken { *pos as i64 - 1 } else { *pos as i64 };
+    let tell = if *pos_broken {
+        *pos as i64 - 1
+    } else {
+        *pos as i64
+    };
     // in-buffer fast path (the buffer lives in the inner stream,
     // which is always buffered — zend checks the flag, not chunk)
     match whence {
@@ -2758,11 +2741,7 @@ fn read_resource(it: &Interp, c: Option<&Cell>, n: usize) -> Result<StreamRead, 
     }
 }
 
-fn read_line_resource(
-    it: &Interp,
-    c: Option<&Cell>,
-    limit: usize,
-) -> Result<StreamRead, PhpError> {
+fn read_line_resource(it: &Interp, c: Option<&Cell>, limit: usize) -> Result<StreamRead, PhpError> {
     use std::io::Read;
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
@@ -2776,7 +2755,15 @@ fn read_line_resource(
                     id,
                     rbuf,
                     ..
-                } => read_line_pipe(file, eof, *nonblock, pos, rbuf, stream_chunk(it, *id), limit),
+                } => read_line_pipe(
+                    file,
+                    eof,
+                    *nonblock,
+                    pos,
+                    rbuf,
+                    stream_chunk(it, *id),
+                    limit,
+                ),
                 PhpResource::Stdio { which, .. } => match *which {
                     0 => Ok(StreamRead::Data(Vec::new())),
                     _ if *which > 2 => Ok(StreamRead::FailSilent),
@@ -2901,7 +2888,15 @@ fn csv_gets(it: &Interp, c: &Cell, limit: usize) -> Result<StreamRead, PhpError>
                     id,
                     rbuf,
                     ..
-                } => read_line_pipe(file, eof, *nonblock, pos, rbuf, stream_chunk(it, *id), limit),
+                } => read_line_pipe(
+                    file,
+                    eof,
+                    *nonblock,
+                    pos,
+                    rbuf,
+                    stream_chunk(it, *id),
+                    limit,
+                ),
                 PhpResource::File {
                     file,
                     pos,
@@ -3675,9 +3670,7 @@ pub(in crate::builtins) fn temp_spill_fd(buf: &[u8], pos: u64) -> Option<std::os
             let n = libc::write(fd, buf.as_ptr().add(off) as *const _, buf.len() - off);
             if n <= 0 {
                 libc::close(fd);
-                let _ = std::fs::remove_file(&*String::from_utf8_lossy(
-                    &tmpl[..tmpl.len() - 1],
-                ));
+                let _ = std::fs::remove_file(&*String::from_utf8_lossy(&tmpl[..tmpl.len() - 1]));
                 return None;
             }
             off += n as usize;
