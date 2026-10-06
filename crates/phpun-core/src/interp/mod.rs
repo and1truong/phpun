@@ -363,6 +363,11 @@ pub struct Interp<'a> {
     included: HashSet<std::path::PathBuf>,
     /// Pending exception carried across an Err(Throw) return.
     pending_exception: Option<Value>,
+    /// zend's `class@anonymous` name table: decl-site (Rc ptr) →
+    /// mangled `base@anonymous\0FILE:LINE$SEQ` name.
+    anon_class_names: HashMap<usize, String>,
+    /// Process-wide anonymous-class sequence (`$0`, `$1`, ...).
+    anon_class_seq: u64,
     /// Live call stack (user + builtin) for getTrace() snapshots.
     call_trace: Vec<TraceFrame>,
     /// Pending fatal error message for exceptions raised as PhpError.
@@ -837,6 +842,8 @@ impl<'a> Interp<'a> {
             dim_by_ref: false,
             foreach_by_ref: false,
             in_unset: false,
+            anon_class_names: HashMap::new(),
+            anon_class_seq: 0,
             callable_probe_err: None,
             stack: Vec::new(),
             functions: HashMap::new(),

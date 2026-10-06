@@ -77,7 +77,9 @@ pub(crate) fn dispatch(
             _ => Value::Bool(false),
         },
         "get_class" => match arg(args, 0) {
-            Value::Object(o) => Value::str(o.borrow().class.name().to_string()),
+            // zend returns the INTERNAL class name — anon classes keep
+            // their `\0file:line$seq` mangled suffix.
+            Value::Object(o) => Value::str(o.borrow().class.decl.name.clone()),
             _ => Value::Bool(false),
         },
         "get_parent_class" => match arg(args, 0) {

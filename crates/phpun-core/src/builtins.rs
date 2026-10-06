@@ -312,7 +312,6 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "die"
             | "divmod"
             | "dl"
-            | "each"
             | "end"
             | "enum_exists"
             | "error_reporting"
@@ -668,7 +667,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
             ("string", Req),
             ("limit", Int(i64::MAX))
         ),
-        "implode" | "join" => bp!(("separator", Str("")), ("array", Req)),
+        "implode" | "join" => bp!(("separator", Req), ("array", Null)),
         "ucwords" => bp!(("string", Req), ("separators", Str(" \t\r\n\u{c}\u{b}"))),
         "wordwrap" => bp!(
             ("string", Req),
@@ -759,6 +758,9 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
             bp!(("array", Req), ("...", Var))
         }
         "array_push" | "array_unshift" => bp!(("array", Req), ("...", Var)),
+        "reset" | "end" | "next" | "prev" | "current" | "pos" | "shuffle" => {
+            bp!(("array", Req))
+        }
         "max" | "min" => bp!(("value", Req), ("...", Var)),
         "compact" => bp!(("var_name", Req), ("...", Var)),
         "array_column" => bp!(("array", Req), ("column_key", Req), ("index_key", Null)),

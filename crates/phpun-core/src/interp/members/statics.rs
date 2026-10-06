@@ -144,6 +144,30 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// zend's static assign-ops (`C::$a .= expr`, `&=`, `+=`, …) gate
+    /// the private(set)/protected(set) write BEFORE the RHS evaluates —
+    /// 'Cannot indirectly modify' fires without expr's side effects
+    /// (instance props evaluate first, gating at the store).
+    pub(in crate::interp) fn static_prop_indirect_gate(
+        &mut self,
+        class: &Expr,
+        name: &str,
+    ) -> Result<(), PhpError> {
+        let (cls, _tname) = self.member_class_of(class)?;
+        self.statics_init(&cls)?;
+        self.static_prop_vis(&cls, name)?;
+        if !self.in_unset {
+            if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
+                if let Some(sv) = pd.set_vis {
+                    if self.set_vis_scope_denied(&dcls, sv) {
+                        return self.set_visibility_indirect_error(&dcls, &pd.name, sv);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::interp) fn static_prop_cell(
         &mut self,
         class: &Expr,

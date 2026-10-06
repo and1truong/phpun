@@ -1678,9 +1678,7 @@ impl<'a> Interp<'a> {
                         if !self.in_unset {
                             if let Some(sv) = pd.set_vis {
                                 if !self.hook_scope_allows(&o, &dcls, &pn, sv) {
-                                    return self.set_visibility_indirect_error(
-                                        &dcls, &pd.name, sv,
-                                    );
+                                    return self.set_visibility_indirect_error(&dcls, &pd.name, sv);
                                 }
                             }
                         }

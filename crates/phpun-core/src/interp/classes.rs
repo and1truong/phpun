@@ -3206,10 +3206,7 @@ impl<'a> Interp<'a> {
             Expr::Const(n) => Ok(self.resolve_class_name(n)),
             Expr::Str(s) => Ok(s.trim_start_matches('\\').to_string()),
             Expr::Paren(inner) => self.class_name_of(inner),
-            Expr::AnonClass(d) => {
-                self.register_class(d.clone())?;
-                Ok(d.name.clone())
-            }
+            Expr::AnonClass(d) => Ok(self.anon_class_name(d)?),
             _ => {
                 let v = self.eval(e)?;
                 match v {
@@ -3218,6 +3215,41 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+    }
+
+    /// zend's anonymous-class name: `{base}@anonymous\0FILE:LINE$SEQ`
+    /// — stable per decl site (a `new class` in a loop reuses the
+    /// registered name) and counted process-wide.
+    pub(in crate::interp) fn anon_class_name(
+        &mut self,
+        decl: &Rc<ClassDecl>,
+    ) -> Result<String, PhpError> {
+        let key = Rc::as_ptr(decl) as usize;
+        if let Some(n) = self.anon_class_names.get(&key) {
+            return Ok(n.clone());
+        }
+        let base = decl
+            .name
+            .rsplit_once('$')
+            .map(|(b, _)| b)
+            .unwrap_or(&decl.name);
+        let file = self
+            .decl_file_ctx
+            .clone()
+            .or_else(|| {
+                self.stack
+                    .last()
+                    .map(|f| f.file.clone())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| self.cur_file.clone());
+        let n = format!("{}\0{}:{}${}", base, file, decl.line, self.anon_class_seq);
+        self.anon_class_seq += 1;
+        let mut d = (**decl).clone();
+        d.name = n.clone();
+        self.register_class(Rc::new(d))?;
+        self.anon_class_names.insert(key, n.clone());
+        Ok(n)
     }
 
     /// `self`/`static`/`parent`/leading-\ name resolution → concrete name.

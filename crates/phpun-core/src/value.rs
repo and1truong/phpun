@@ -465,6 +465,21 @@ impl Value {
         }
     }
 
+    /// zend's operand type word for 'Unsupported operand types' —
+    /// objects report their CLASS name (anon-class names truncate at
+    /// the \0 file:line$N suffix), scalars report zend_type_name.
+    pub fn operand_type_name(&self) -> String {
+        match self {
+            Value::Object(o) => {
+                let n = o.borrow().class.name().to_string();
+                n.split('\0').next().unwrap_or(&n).to_string()
+            }
+            Value::Callable(_) => "Closure".into(),
+            Value::Null => "null".into(),
+            _ => self.type_name().into(),
+        }
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Null => "NULL",
@@ -1538,12 +1553,14 @@ pub struct PhpClass {
 
 impl PhpClass {
     pub fn name(&self) -> &str {
-        // Anonymous classes carry a `$LINE` uniquifier internally;
-        // Zend's public name is `{Base}@anonymous`.
-        if let Some(pos) = self.decl.name.find("@anonymous$") {
-            &self.decl.name[..pos + "@anonymous".len()]
+        // Anonymous classes carry a `\0FILE:LINE$SEQ` mangled suffix
+        // (or the older `$LINE` uniquifier) internally; the public
+        // display name truncates at the marker.
+        let n = self.decl.name.split('\0').next().unwrap_or(&self.decl.name);
+        if let Some(pos) = n.find("@anonymous$") {
+            &n[..pos + "@anonymous".len()]
         } else {
-            &self.decl.name
+            n
         }
     }
 

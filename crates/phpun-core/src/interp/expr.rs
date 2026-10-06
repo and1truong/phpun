@@ -626,10 +626,7 @@ impl<'a> Interp<'a> {
                     _ => Ok(Value::Bool(false)),
                 }
             }
-            Expr::AnonClass(decl) => {
-                self.register_class(decl.clone())?;
-                Ok(Value::str(decl.name.clone()))
-            }
+            Expr::AnonClass(decl) => Ok(Value::str(self.anon_class_name(decl)?)),
         }
     }
 
@@ -1509,6 +1506,15 @@ impl<'a> Interp<'a> {
                 return Ok(cur);
             }
         }
+        // A static-prop compound assign gates set-visibility BEFORE the
+        // RHS evaluates — `C::$a .= expr` on private(set) dies 'Cannot
+        // indirectly modify' with no side effects from expr; instance
+        // props evaluate first and gate at the write.
+        if needs_read && op != "??=" {
+            if let Late::Static { class, pn } = &late {
+                self.static_prop_indirect_gate(class, pn)?;
+            }
+        }
         let rhs = self.eval(value)?;
         let cur = if needs_read {
             if op == "??=" {
@@ -2061,9 +2067,7 @@ impl<'a> Interp<'a> {
                         if let Some((pd, dcls)) = self.decl_prop(o, &pn) {
                             if let Some(sv) = pd.set_vis {
                                 if !self.hook_scope_allows(o, &dcls, &pn, sv) {
-                                    return self.set_visibility_indirect_error(
-                                        &dcls, &pd.name, sv,
-                                    );
+                                    return self.set_visibility_indirect_error(&dcls, &pd.name, sv);
                                 }
                             }
                         }
@@ -4918,9 +4922,7 @@ impl<'a> Interp<'a> {
                         if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pn) {
                             if let Some(sv) = pd.set_vis {
                                 if self.set_vis_scope_denied(&dcls, sv) {
-                                    return self.set_visibility_indirect_error(
-                                        &dcls, &pd.name, sv,
-                                    );
+                                    return self.set_visibility_indirect_error(&dcls, &pd.name, sv);
                                 }
                             }
                         }
@@ -5284,7 +5286,10 @@ impl<'a> Interp<'a> {
                         Numeric::NonNumeric => {
                             return self.fail(PhpError::uncaught(
                                 "TypeError",
-                                format!("Unsupported operand types: {} * int", other.type_name()),
+                                format!(
+                                    "Unsupported operand types: {} * int",
+                                    other.operand_type_name()
+                                ),
                                 0,
                             ))
                         }
@@ -5444,11 +5449,11 @@ impl<'a> Interp<'a> {
                 if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
                     return Ok(Value::bytes(bitwise_str(op, a, b)));
                 }
-                let li = match self.bit_operand(op, &l, &r) {
+                let li = match self.bit_operand(op, &l, &r, false) {
                     Ok(i) => i,
                     Err(e) => return self.fail(e),
                 };
-                let ri = match self.bit_operand(op, &r, &l) {
+                let ri = match self.bit_operand(op, &r, &l, true) {
                     Ok(i) => i,
                     Err(e) => return self.fail(e),
                 };
@@ -5461,11 +5466,11 @@ impl<'a> Interp<'a> {
             // PHP: shift < 0 → ArithmeticError; >= 64 → 0.
             "<<" | ">>" => {
                 // PHP checks operand types left-to-right before shifting.
-                let v = match self.bit_operand(op, &l, &r) {
+                let v = match self.bit_operand(op, &l, &r, false) {
                     Ok(i) => i,
                     Err(e) => return self.fail(e),
                 };
-                let s = match self.bit_operand(op, &r, &l) {
+                let s = match self.bit_operand(op, &r, &l, true) {
                     Ok(i) => i,
                     Err(e) => return self.fail(e),
                 };
@@ -5518,9 +5523,9 @@ impl<'a> Interp<'a> {
                     "TypeError",
                     format!(
                         "Unsupported operand types: {} {} {}",
-                        l.type_name(),
+                        l.operand_type_name(),
                         op,
-                        r.type_name()
+                        r.operand_type_name()
                     ),
                     0,
                 ))
@@ -5628,7 +5633,28 @@ impl<'a> Interp<'a> {
     /// Operand coercion for integer-only binary ops (`& | ^ << >>`):
     /// leading-numeric strings warn "A non-numeric value encountered";
     /// non-numeric strings raise a catchable TypeError.
-    fn bit_operand(&mut self, op: &str, v: &Value, other: &Value) -> Result<i64, PhpError> {
+    fn bit_operand(
+        &mut self,
+        op: &str,
+        v: &Value,
+        other: &Value,
+        swapped: bool,
+    ) -> Result<i64, PhpError> {
+        // 'Unsupported operand types' always prints in source order —
+        // for the right-operand check the args arrive swapped.
+        let operand_err = |v: &Value, other: &Value| {
+            let (a, b) = if swapped { (other, v) } else { (v, other) };
+            PhpError::uncaught(
+                "TypeError",
+                format!(
+                    "Unsupported operand types: {} {} {}",
+                    a.operand_type_name(),
+                    op,
+                    b.operand_type_name()
+                ),
+                0,
+            )
+        };
         if let Value::Str(s) = v {
             match numeric(s) {
                 Numeric::Int(i) => return Ok(i),
@@ -5641,6 +5667,12 @@ impl<'a> Interp<'a> {
                     });
                     if let Some(e) = werr {
                         return Err(e);
+                    }
+                    if f.fract() != 0.0 {
+                        self.deprecated(&format!(
+                            "Implicit conversion from float-string \"{}\" to int loses precision",
+                            String::from_utf8_lossy(s)
+                        ))?;
                     }
                     return Ok(i);
                 }
@@ -5655,21 +5687,34 @@ impl<'a> Interp<'a> {
                     if let Some(e) = werr {
                         return Err(e);
                     }
+                    if f.fract() != 0.0 {
+                        self.deprecated(&format!(
+                            "Implicit conversion from float-string \"{}\" to int loses precision",
+                            String::from_utf8_lossy(s)
+                        ))?;
+                    }
                     return Ok(i);
                 }
                 Numeric::NonNumeric => {
-                    return Err(PhpError::uncaught(
-                        "TypeError",
-                        format!(
-                            "Unsupported operand types: {} {} {}",
-                            v.type_name(),
-                            op,
-                            other.type_name()
-                        ),
-                        0,
-                    ));
+                    return Err(operand_err(v, other));
                 }
             }
+        }
+        if let Value::Float(f) = v {
+            if f.fract() != 0.0 && f.is_finite() && *f < i64::MAX as f64 && *f > i64::MIN as f64 {
+                self.deprecated(&format!(
+                    "Implicit conversion from float {} to int loses precision",
+                    format_float_repr(*f)
+                ))?;
+            }
+        }
+        // Bitwise ops take int|string only: arrays, objects and other
+        // containers are zend's 'Unsupported operand types' TypeError.
+        match v {
+            Value::Array(_) | Value::Object(_) | Value::Callable(_) => {
+                return Err(operand_err(v, other));
+            }
+            _ => {}
         }
         Ok(self.coerce_int(v))
     }

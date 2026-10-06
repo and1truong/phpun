@@ -528,6 +528,17 @@ impl<'a> Interp<'a> {
                 self.arg_cells(args, &params, &format!("{}::{}()", cls.name(), mn), false)?;
             return self.static_invoke_vis(cls, mn, vals, None, false);
         }
+        // zend_forbid_dynamic_call: compact() rejects any call that did
+        // not come from a compile-time literal (the `\u{1}` marker or a
+        // `\`-qualified name) — `$f()`, `($this->cb)()`, reflection and
+        // call_user_func all hit 'Cannot call compact() dynamically'.
+        if lname == "compact" && !unqualified && !fname.starts_with('\\') {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot call compact() dynamically",
+                self.cur_line,
+            ));
+        }
         let mut decl = self.functions.get(&lname).cloned();
         // A namespaced user function outranks the global/builtin one for
         // unqualified calls (namespaces/ns_013).
@@ -717,6 +728,15 @@ impl<'a> Interp<'a> {
                     }
                     CallableKind::Named(n) => {
                         let n = n.trim_start_matches('\\');
+                        // zend_forbid_dynamic_call — every callable
+                        // dispatch is a dynamic call.
+                        if n.eq_ignore_ascii_case("compact") {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                "Cannot call compact() dynamically",
+                                self.cur_line,
+                            ));
+                        }
                         if let Some(v) = self.call_builtin(&n.to_lowercase(), &args)? {
                             return Ok(v);
                         }
@@ -4428,8 +4448,8 @@ fn builtin_byref(name: &str) -> Option<&'static [bool]> {
     Some(match name {
         "array_pop" | "array_shift" | "array_walk" | "sort" | "rsort" | "asort" | "arsort"
         | "ksort" | "krsort" | "usort" | "uasort" | "uksort" | "natsort" | "natcasesort"
-        | "shuffle" | "reset" | "end" | "next" | "prev" | "current" | "pos" | "each"
-        | "array_push" | "array_unshift" | "array_splice" => &[true],
+        | "shuffle" | "reset" | "end" | "next" | "prev" | "array_push" | "array_unshift"
+        | "array_splice" => &[true],
         "preg_match" | "preg_match_all" => &[false, false, true],
         "preg_replace"
         | "preg_replace_callback"
