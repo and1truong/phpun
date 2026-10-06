@@ -397,7 +397,11 @@ pub(crate) fn dispatch(
                 _ => None,
             } {
                 let id = it.next_res_id();
-                Value::Resource(Rc::new(RefCell::new(PhpResource::Stdio { id, which })))
+                Value::Resource(Rc::new(RefCell::new(PhpResource::Stdio {
+                    id,
+                    which,
+                    pos: 0,
+                })))
             } else {
                 match fopen_mode(&mode) {
                     None => {
@@ -466,6 +470,7 @@ pub(crate) fn dispatch(
             let n = arg(args, 1).to_int().max(0) as usize;
             match read_resource(args.first(), n)? {
                 StreamRead::Data(b) => Value::bytes(b),
+                StreamRead::FailSilent => Value::Bool(false),
                 StreamRead::Ebadf(errno, msg) => {
                     read_ebadf_notice(it, name, errno, &msg)?;
                     Value::Bool(false)
@@ -489,6 +494,7 @@ pub(crate) fn dispatch(
                 (n - 1) as usize
             };
             match read_line_resource(args.first(), limit)? {
+                StreamRead::FailSilent => return Ok(Some(Value::Bool(false))),
                 StreamRead::Data(b) => {
                     if b.is_empty() {
                         Value::Bool(false)
@@ -507,6 +513,7 @@ pub(crate) fn dispatch(
             match read_resource(args.first(), 1)? {
                 StreamRead::Data(b) if b.is_empty() => Value::Bool(false),
                 StreamRead::Data(b) => Value::bytes(b),
+                StreamRead::FailSilent => Value::Bool(false),
                 StreamRead::Ebadf(errno, msg) => {
                     read_ebadf_notice(it, name, errno, &msg)?;
                     Value::Bool(false)
@@ -572,7 +579,11 @@ pub(crate) fn dispatch(
                             // fpos=0 while stream->position becomes -1
                             // (pos_broken): ftell→false, next IO at 0.
                             // php://temp delegates to its inner FILE stream —
-                            // a failed inner lseek keeps the position.
+                            // only a SEEK_END underflow reaches the inner
+                            // memory seek and breaks the position; a CUR
+                            // underflow early-fails in the generic layer
+                            // (position untouched). php://memory breaks on
+                            // either.
                             let memory = uri == "php://memory";
                             let tell = if *pos_broken {
                                 *pos as i64 - 1
@@ -596,7 +607,13 @@ pub(crate) fn dispatch(
                                     *eof = false;
                                 }
                                 _ => {
-                                    if memory && whence != 0 {
+                                    // Only a real CUR/END underflow reaches
+                                    // the ops seek; an invalid whence (or a
+                                    // SET<0) fails in the generic layer
+                                    // first — position untouched. php://temp
+                                    // breaks only on END; php://memory on
+                                    // both CUR and END.
+                                    if whence == 2 || (whence == 1 && memory) {
                                         *pos = 0;
                                         *pos_broken = true;
                                     }
@@ -632,7 +649,11 @@ pub(crate) fn dispatch(
                                     *eof = false;
                                 }
                                 _ => {
-                                    if whence != 0 {
+                                    // Only a SEEK_END underflow reaches the
+                                    // inner seek and breaks the position;
+                                    // CUR/SET/invalid-whence failures leave
+                                    // it untouched.
+                                    if whence == 2 {
                                         *pos = 0;
                                         *pos_broken = true;
                                     }
@@ -664,6 +685,9 @@ pub(crate) fn dispatch(
                                             return Ok(Some(Value::Int(-1)))
                                         }
                                         StreamRead::Data(b) => remaining -= b.len() as i64,
+                                        StreamRead::FailSilent => {
+                                            return Ok(Some(Value::Int(-1)))
+                                        }
                                         StreamRead::Ebadf(errno, msg) => {
                                             read_ebadf_notice(it, name, errno, &msg)?;
                                             return Ok(Some(Value::Int(-1)));
@@ -727,7 +751,7 @@ pub(crate) fn dispatch(
                                 Value::Int(*pos as i64 - 1)
                             }
                         }
-                        PhpResource::Stdio { which, .. } => match *which {
+                        PhpResource::Stdio { which, pos, .. } => match *which {
                             // ftell = lseek(fd,0,SEEK_CUR): ESPIPE on a
                             // pipe/socket → bool(false).
                             0..=2 => {
@@ -738,7 +762,8 @@ pub(crate) fn dispatch(
                                     Value::Int(r as i64)
                                 }
                             }
-                            _ => Value::Bool(false),
+                            // php://output counts bytes written.
+                            _ => Value::Int(*pos as i64),
                         },
                         _ => Value::Int(0),
                     },
@@ -825,6 +850,10 @@ pub(crate) fn dispatch(
                 match read_resource(args.first(), 8192)? {
                     StreamRead::Data(b) if b.is_empty() => break,
                     StreamRead::Data(b) => out.extend_from_slice(&b),
+                    StreamRead::FailSilent => {
+                        failed = true;
+                        break;
+                    }
                     StreamRead::Ebadf(errno, msg) => {
                         read_ebadf_notice(it, name, errno, &msg)?;
                         failed = true;
@@ -1034,6 +1063,7 @@ pub(crate) fn dispatch(
                         remaining = remaining.saturating_sub(b.len());
                         out.extend_from_slice(&b);
                     }
+                    StreamRead::FailSilent => break,
                     StreamRead::Ebadf(errno, msg) => {
                         read_ebadf_notice(it, name, errno, &msg)?;
                         break;
@@ -1105,6 +1135,10 @@ pub(crate) fn dispatch(
                     }
                     StreamRead::Ebadf(errno, msg) => {
                         read_ebadf_notice(it, name, errno, &msg)?;
+                        ok = false;
+                        break;
+                    }
+                    StreamRead::FailSilent => {
                         ok = false;
                         break;
                     }
@@ -1222,7 +1256,7 @@ pub(crate) fn dispatch(
                             base.push(("uri", Value::str(path.clone())));
                             mk(base)
                         }
-                        PhpResource::Stdio { which, .. } => {
+                        PhpResource::Stdio { which, .. } if *which <= 2 => {
                             base.push(("eof", Value::Bool(false)));
                             base.push(("wrapper_type", Value::str("PHP")));
                             base.push(("stream_type", Value::str("STDIO")));
@@ -1238,10 +1272,20 @@ pub(crate) fn dispatch(
                                 "uri",
                                 Value::str(match which {
                                     0 => "php://stdin",
-                                    1 => "php://stdout",
-                                    _ => "php://stderr",
+                                    _ => "php://stdout",
                                 }),
                             ));
+                            mk(base)
+                        }
+                        PhpResource::Stdio { .. } => {
+                            // php://output — the Output stream type.
+                            base.push(("eof", Value::Bool(false)));
+                            base.push(("wrapper_type", Value::str("PHP")));
+                            base.push(("stream_type", Value::str("Output")));
+                            base.push(("mode", Value::str("wb")));
+                            base.push(("unread_bytes", Value::Int(0)));
+                            base.push(("seekable", Value::Bool(false)));
+                            base.push(("uri", Value::str("php://output")));
                             mk(base)
                         }
                         PhpResource::Mem { eof, uri, mode, .. } => {
@@ -1299,14 +1343,13 @@ pub(crate) fn dispatch(
                         match &*res {
                             crate::value::PhpResource::File { file, .. } => file.metadata().ok(),
                             crate::value::PhpResource::Pipe { file, .. } => file.metadata().ok(),
-                            crate::value::PhpResource::Stdio { which, .. } => {
-                                std::fs::metadata(match which {
-                                    0 => "/dev/stdin",
-                                    1 => "/dev/stdout",
-                                    _ => "/dev/stderr",
-                                })
-                                .ok()
-                            }
+                            crate::value::PhpResource::Stdio { which, .. } => match which {
+                                0 => std::fs::metadata("/dev/stdin").ok(),
+                                1 => std::fs::metadata("/dev/stdout").ok(),
+                                2 => std::fs::metadata("/dev/stderr").ok(),
+                                // php://output has no fd — fstat fails.
+                                _ => None,
+                            },
                             _ => None,
                         }
                     };
@@ -1524,6 +1567,9 @@ pub(in crate::builtins) enum StreamWrite {
 pub(in crate::builtins) enum StreamRead {
     Data(Vec<u8>),
     Ebadf(i32, String),
+    /// zend's 'no read op' streams (php://output): the read just
+    /// returns failure with no diagnostic.
+    FailSilent,
 }
 
 /// errno + strerror() pair for a plain-wrapper IO failure; Rust's
@@ -1600,7 +1646,7 @@ pub(in crate::builtins) fn write_resource(
         Some(Value::Resource(r)) => {
             let mut rb = r.borrow_mut();
             match &mut *rb {
-                PhpResource::Stdio { which, .. } => match *which {
+                PhpResource::Stdio { which, pos, .. } => match *which {
                     1 => {
                         if it.live_io {
                             let mut so = std::io::stdout().lock();
@@ -1613,6 +1659,8 @@ pub(in crate::builtins) fn write_resource(
                     }
                     3 => {
                         it.emit_bytes(data);
+                        // zend tracks bytes written for ftell().
+                        *pos += data.len() as u64;
                         Ok(StreamWrite::Written)
                     }
                     2 => {
@@ -1883,9 +1931,11 @@ fn read_resource(c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
                     ..
                 } => read_pipe(file, eof, *nonblock, pos, n),
                 PhpResource::Stdio { which, .. } => match *which {
-                    // STDIN reads are not modeled; STDOUT/STDERR/
-                    // php://output are write-only fds → read(2) EBADF.
+                    // STDIN reads are not modeled; php://output has no
+                    // read op at all (silent false); STDOUT/STDERR are
+                    // write-only fds → read(2) EBADF.
                     0 => Ok(StreamRead::Data(Vec::new())),
+                    _ if *which > 2 => Ok(StreamRead::FailSilent),
                     _ => Ok(StreamRead::Ebadf(9, "Bad file descriptor".into())),
                 },
                 PhpResource::Input { body, pos, eof, .. } => {
@@ -1965,6 +2015,7 @@ fn read_line_resource(c: Option<&Cell>, limit: usize) -> Result<StreamRead, PhpE
                 } => read_line_pipe(file, eof, *nonblock, pos, limit),
                 PhpResource::Stdio { which, .. } => match *which {
                     0 => Ok(StreamRead::Data(Vec::new())),
+                    _ if *which > 2 => Ok(StreamRead::FailSilent),
                     _ => Ok(StreamRead::Ebadf(9, "Bad file descriptor".into())),
                 },
                 PhpResource::Input { body, pos, eof, .. } => {
@@ -2188,6 +2239,7 @@ fn fgetcsv(
     let limit = if length == 0 { usize::MAX } else { length };
     let mut buf = match csv_gets(stream, limit)? {
         StreamRead::Data(b) => b,
+        StreamRead::FailSilent => return Ok(Value::Bool(false)),
         StreamRead::Ebadf(errno, msg) => {
             read_ebadf_notice(it, name, errno, &msg)?;
             return Ok(Value::Bool(false));
@@ -2256,6 +2308,7 @@ fn fgetcsv(
                                     read_ebadf_notice(it, name, errno, &msg)?;
                                     return Ok(Value::Bool(false));
                                 }
+                                StreamRead::FailSilent => return Ok(Value::Bool(false)),
                             }
                         }
                     }
@@ -2383,17 +2436,22 @@ fn stat_array(m: &std::fs::Metadata) -> PhpArray {
 /// select() over the fd of each resource in the input arrays, then the
 /// arrays are rewritten to only the ready entries. NULL $seconds waits
 /// forever (zend's NULL timeval).
-/// zend stream_select: per-element validation — a non-resource element
-/// or a resource that isn't a stream raises a (zend-chained) TypeError;
-/// a real stream with no descriptor warns with its stream-type name and
-/// is skipped. When no usable stream remains at all the function throws
-/// ValueError instead. The thrown TypeError is the LAST bad element's
-/// (zend chains them; phpun keeps the outermost only).
+/// zend stream_select: per-element validation runs THREE fetch passes
+/// per array — the fd_set build, stream_array_emulate_read_fd_set
+/// (read array only, keeps buffered streams readable), and the
+/// stream_array_from_fd_set rewrite. Each bad element chains a
+/// TypeError via Exception::$previous on EVERY pass (oracle: 2 bad
+/// elements in the read array → depth 6); a real stream with no
+/// descriptor warns its stream-type name on the build and rewrite
+/// passes only. With no usable stream left, the ValueError is thrown
+/// ON TOP of the chain and no rewrite happens; otherwise select still
+/// runs and the by-ref arrays are rewritten before the chain surfaces
+/// at return.
 fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<Value>, PhpError> {
     use std::os::fd::AsRawFd;
     let param_names = ["read", "write", "except"];
     let mut sets: [Vec<(ArrKey, Value, i32)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    let mut pending: Option<String> = None;
+    let mut chain: Vec<Value> = Vec::new();
     for (ai, arg_c) in args.iter().take(3).enumerate() {
         let v = arg_c.borrow().clone();
         match v {
@@ -2401,10 +2459,15 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
                 for (k, c) in a.borrow().iter() {
                     let item = c.borrow().clone();
                     let Value::Resource(ref r) = item else {
-                        pending = Some(format!(
-                            "{}(): supplied argument is not a valid stream resource",
-                            fname
-                        ));
+                        select_chain(
+                            it,
+                            &mut chain,
+                            "TypeError",
+                            format!(
+                                "{}(): supplied argument is not a valid stream resource",
+                                fname
+                            ),
+                        );
                         continue;
                     };
                     let fd = {
@@ -2414,6 +2477,21 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
                                 file.as_raw_fd()
                             }
                             PhpResource::Stdio { which, .. } if *which <= 2 => *which as i32,
+                            // php://temp is fd-claimable: zend's cast
+                            // spills the buffer into a tmpfile() and
+                            // seeks it to the stream position.
+                            PhpResource::Mem { uri, buf, pos, .. } if uri == "php://temp" => {
+                                match temp_spill_fd(buf, *pos) {
+                                    Some(fd) => fd,
+                                    None => {
+                                        it.warn_pub(&format!(
+                                            "{}(): Cannot represent a stream of type TEMP as a select()able descriptor",
+                                            fname
+                                        ))?;
+                                        continue;
+                                    }
+                                }
+                            }
                             // Resources that aren't streams (closed,
                             // process, ...) → zend's stream le fetch
                             // fails → TypeError.
@@ -2421,22 +2499,21 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
                             | PhpResource::Proc { .. }
                             | PhpResource::Other { .. } => {
                                 drop(rb);
-                                pending = Some(format!(
-                                    "{}(): supplied resource is not a valid stream resource",
-                                    fname
-                                ));
+                                select_chain(
+                                    it,
+                                    &mut chain,
+                                    "TypeError",
+                                    format!(
+                                        "{}(): supplied resource is not a valid stream resource",
+                                        fname
+                                    ),
+                                );
                                 continue;
                             }
                             // Real streams without a select()able fd warn.
                             other => {
                                 let ty = match other {
-                                    PhpResource::Mem { uri, .. } => {
-                                        if uri == "php://memory" {
-                                            "MEMORY"
-                                        } else {
-                                            "TEMP"
-                                        }
-                                    }
+                                    PhpResource::Mem { .. } => "MEMORY",
                                     PhpResource::Input { .. } => "Input",
                                     PhpResource::Stdio { .. } => "Output",
                                     o => o.type_name(),
@@ -2469,7 +2546,10 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
     }
     let sets_count = sets.iter().filter(|s| !s.is_empty()).count();
     if sets_count == 0 {
-        return err("ValueError", "No stream arrays were passed");
+        // Zend throws the ValueError ON TOP of the collected
+        // element TypeErrors and returns before select — the by-ref
+        // arrays keep their original contents.
+        return Err(select_throw(it, chain, "ValueError", "No stream arrays were passed"));
     }
     // $seconds/$microseconds are ?long zpp params; negatives are
     // ValueErrors thrown AFTER the empty-sets check. A non-null usec
@@ -2522,11 +2602,41 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
             );
         }
     }
-    // Element TypeErrors surface only once a usable stream exists
-    // (zend throws them inside fd-set building; the outermost is the
-    // last bad element).
-    if let Some(msg) = pending {
-        return err("TypeError", msg);
+    // zend's stream_array_emulate_read_fd_set re-fetches every
+    // read-array element (keeps streams with buffered reads
+    // select-readable): bad elements chain ANOTHER TypeError — real
+    // streams fetch fine and add nothing.
+    if let Some(c0) = args.first() {
+        if let Value::Array(a) = &*c0.borrow() {
+            for (_, c) in a.borrow().iter() {
+                let item = c.borrow().clone();
+                match item {
+                    Value::Resource(r) => match &*r.borrow() {
+                        PhpResource::Closed { .. }
+                        | PhpResource::Proc { .. }
+                        | PhpResource::Other { .. } => select_chain(
+                            it,
+                            &mut chain,
+                            "TypeError",
+                            format!(
+                                "{}(): supplied resource is not a valid stream resource",
+                                fname
+                            ),
+                        ),
+                        _ => {}
+                    },
+                    _ => select_chain(
+                        it,
+                        &mut chain,
+                        "TypeError",
+                        format!(
+                            "{}(): supplied argument is not a valid stream resource",
+                            fname
+                        ),
+                    ),
+                }
+            }
+        }
     }
     let mut fds = [
         unsafe { std::mem::zeroed::<libc::fd_set>() },
@@ -2572,32 +2682,60 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
         ))?;
         return Ok(Some(Value::Bool(false)));
     }
-    // Rewrite each input array to the ready entries only — zend
-    // re-casts every element here, so uncastable streams warn AGAIN
-    // (the build pass already warned once).
+    // Rewrite each input array to the ready entries only — zend's
+    // from_fd_set pass re-fetches every element: bad elements chain a
+    // third TypeError and uncastable streams warn AGAIN (the build
+    // pass already warned once).
     for (i, s) in sets.iter().enumerate() {
         let mut ready = PhpArray::new();
         if let Some(c) = args.get(i) {
             if let Value::Array(a) = &*c.borrow() {
-                for (_, item) in a.borrow().iter() {
-                    if let Value::Resource(r) = &*item.borrow() {
-                        let rb = r.borrow();
-                        let ty = match &*rb {
-                            PhpResource::Mem { uri, .. } => Some(if uri == "php://memory" {
-                                "MEMORY"
-                            } else {
-                                "TEMP"
-                            }),
-                            PhpResource::Input { .. } => Some("Input"),
-                            PhpResource::Stdio { which, .. } if *which > 2 => Some("Output"),
-                            _ => None,
-                        };
-                        if let Some(ty) = ty {
-                            it.warn_pub(&format!(
-                                "{}(): Cannot represent a stream of type {} as a select()able descriptor",
-                                fname, ty
-                            ))?;
+                for (_, item_c) in a.borrow().iter() {
+                    let item = item_c.borrow().clone();
+                    match item {
+                        Value::Resource(r) => {
+                            let rb = r.borrow();
+                            match &*rb {
+                                PhpResource::Closed { .. }
+                                | PhpResource::Proc { .. }
+                                | PhpResource::Other { .. } => select_chain(
+                                    it,
+                                    &mut chain,
+                                    "TypeError",
+                                    format!(
+                                        "{}(): supplied resource is not a valid stream resource",
+                                        fname
+                                    ),
+                                ),
+                                _ => {
+                                    let ty = match &*rb {
+                                        PhpResource::Mem { uri, .. } => {
+                                            (uri == "php://memory").then_some("MEMORY")
+                                        }
+                                        PhpResource::Input { .. } => Some("Input"),
+                                        PhpResource::Stdio { which, .. } if *which > 2 => {
+                                            Some("Output")
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some(ty) = ty {
+                                        it.warn_pub(&format!(
+                                            "{}(): Cannot represent a stream of type {} as a select()able descriptor",
+                                            fname, ty
+                                        ))?;
+                                    }
+                                }
+                            }
                         }
+                        _ => select_chain(
+                            it,
+                            &mut chain,
+                            "TypeError",
+                            format!(
+                                "{}(): supplied argument is not a valid stream resource",
+                                fname
+                            ),
+                        ),
                     }
                 }
             }
@@ -2611,7 +2749,75 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
             *c.borrow_mut() = Value::Array(Rc::new(RefCell::new(ready)));
         }
     }
+    // A collected chain surfaces only now — select already ran and
+    // the arrays were rewritten, exactly like zend propagating the
+    // pending exception at function return.
+    if !chain.is_empty() {
+        return Err(select_throw_last(it, chain));
+    }
     Ok(Some(Value::Int(n as i64)))
+}
+
+/// Append a throwable to the zend-style previous-chain and keep it as
+/// the new chain tail.
+fn select_chain(it: &mut Interp, chain: &mut Vec<Value>, class: &str, msg: String) {
+    let e = it.exception(class, &msg);
+    if let (Value::Object(o), Some(p)) = (&e, chain.last().cloned()) {
+        let mut ob = o.borrow_mut();
+        ob.props.insert("previous".into(), cell(p));
+        if !ob.prop_order.iter().any(|k| k == "previous") {
+            ob.prop_order.push("previous".into());
+        }
+    }
+    chain.push(e);
+}
+
+/// Throw the chain tail — zend rethrows the pending exception, which
+/// is the LAST error recorded (the optional ValueError `class_msg`
+/// lands on top when given).
+fn select_throw(it: &mut Interp, mut chain: Vec<Value>, class: &str, msg: &str) -> PhpError {
+    select_chain(it, &mut chain, class, msg.to_string());
+    select_throw_last(it, chain)
+}
+
+fn select_throw_last(it: &mut Interp, chain: Vec<Value>) -> PhpError {
+    match chain.into_iter().last() {
+        Some(v) => it.throw_value(v),
+        None => PhpError::uncaught("ValueError", "No stream arrays were passed", 0),
+    }
+}
+
+/// php_stream_temp_cast: spill a php://temp buffer into a tmpfile()
+/// and seek it to the stream's current position; the returned fd is
+/// the claimable descriptor. Returns None when tmpfile() fails.
+pub(in crate::builtins) fn temp_spill_fd(
+    buf: &[u8],
+    pos: u64,
+) -> Option<std::os::unix::io::RawFd> {
+    unsafe {
+        let f = libc::tmpfile();
+        if f.is_null() {
+            return None;
+        }
+        let fd = libc::fileno(f);
+        let mut off = 0usize;
+        while off < buf.len() {
+            let n = libc::write(fd, buf.as_ptr().add(off) as *const _, buf.len() - off);
+            if n <= 0 {
+                libc::fclose(f);
+                return None;
+            }
+            off += n as usize;
+        }
+        libc::lseek(fd, pos as libc::off_t, libc::SEEK_SET);
+        let d = libc::dup(fd);
+        libc::fclose(f);
+        if d < 0 {
+            None
+        } else {
+            Some(d)
+        }
+    }
 }
 
 /// zend_zval_type_name for the `?array` TypeError: objects render as

@@ -32,7 +32,7 @@ pub(crate) mod var;
 
 pub(crate) use url::urldecode;
 
-fn cell(v: Value) -> Cell {
+pub(in crate::builtins) fn cell(v: Value) -> Cell {
     Rc::new(RefCell::new(v))
 }
 

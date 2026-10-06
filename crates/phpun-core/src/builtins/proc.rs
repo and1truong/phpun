@@ -336,12 +336,36 @@ fn resource_child_fd(
 ) -> Result<Option<RawFd>, PhpError> {
     let fd = match r {
         PhpResource::File { file, .. } | PhpResource::Pipe { file, .. } => file.as_raw_fd(),
-        PhpResource::Stdio { which, .. } => *which as RawFd,
+        PhpResource::Stdio { which, .. } => {
+            if *which > 2 {
+                // php://output has no descriptor to hand the child.
+                spec_err(
+                    it,
+                    "Cannot represent a stream of type Output as a File Descriptor",
+                )?;
+                return Ok(None);
+            }
+            *which as RawFd
+        }
         PhpResource::Proc { .. } | PhpResource::Closed { .. } => {
             return err(
                 "TypeError",
                 "proc_open(): supplied resource is not a valid stream resource",
             )
+        }
+        // php://temp is claimable — php_stream_temp_cast spills the
+        // buffer to a tmpfile() positioned at the stream offset.
+        PhpResource::Mem { uri, buf, pos, .. } if uri == "php://temp" => {
+            match crate::builtins::fs::temp_spill_fd(buf, *pos) {
+                Some(fd) => return Ok(Some(fd)),
+                None => {
+                    spec_err(
+                        it,
+                        "Cannot represent a stream of type TEMP as a File Descriptor",
+                    )?;
+                    return Ok(None);
+                }
+            }
         }
         PhpResource::Mem { .. } => {
             spec_err(

@@ -588,6 +588,7 @@ impl<'a> Interp<'a> {
                 Value::Resource(Rc::new(RefCell::new(crate::value::PhpResource::Stdio {
                     id: which as u64 + 1,
                     which,
+                    pos: 0,
                 }))),
             );
         }

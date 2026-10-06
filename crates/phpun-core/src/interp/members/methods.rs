@@ -2471,7 +2471,12 @@ impl<'a> Interp<'a> {
                 }
                 _ => Some(Value::str("#0 {main}")),
             },
-            "getprevious" => Some(Value::Null),
+            "getprevious" => Some(
+                ob.props
+                    .get("previous")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null),
+            ),
             "__tostring" => {
                 let msg = ob
                     .props
