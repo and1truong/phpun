@@ -1701,7 +1701,7 @@ impl<'a> Parser<'a> {
                         Ok(Expr::VarVar(Box::new(Self::markline(e, il))))
                     }
                     Some(Token::Op("$")) => {
-                        self.pos += 1;
+                        // `$$$a` — primary() consumes the nested `$`.
                         let il = self.line();
                         let e = self.primary()?;
                         Ok(Expr::VarVar(Box::new(Self::markline(e, il))))
