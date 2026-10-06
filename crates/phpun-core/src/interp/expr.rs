@@ -2430,6 +2430,16 @@ impl<'a> Interp<'a> {
             if matches!(&*c.borrow(), Value::Null) {
                 self.auto_init_gate(&c)?;
             }
+            // `$s[] op= v`: zend's append gate precedes the compound
+            // offset gate — `[] operator not supported for strings`
+            // wins over the assign-op string-offset check.
+            if k.is_none() && matches!(&*c.borrow(), Value::Str(_)) {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    "[] operator not supported for strings",
+                    self.cur_line,
+                ));
+            }
             if compound {
                 // Container/key checks fire BEFORE the dim write in a
                 // compound assign — zend throws at whatever level fails.
@@ -2709,6 +2719,23 @@ impl<'a> Interp<'a> {
                             .as_ref()
                             .map(|kc| kc.borrow().clone())
                             .unwrap_or(Value::Null);
+                        if quiet {
+                            // `??=` is isset()-based: offsetExists gates
+                            // — a hit fetches via offsetGet, a miss is a
+                            // Null read so the RHS/write path runs; zend
+                            // never calls offsetGet for the check.
+                            let exists = self
+                                .method_invoke(
+                                    o.clone(),
+                                    "offsetExists",
+                                    CallArgs::positional(vec![cell(kv.clone())]),
+                                )
+                                .map(|v| v.is_truthy())
+                                .unwrap_or(false);
+                            if !exists {
+                                return Ok(Value::Null);
+                            }
+                        }
                         let iv = self
                             .method_invoke(o, "offsetGet", CallArgs::positional(vec![cell(kv)]))
                             .unwrap_or(Value::Null);
