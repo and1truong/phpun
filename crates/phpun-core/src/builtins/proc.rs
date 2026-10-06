@@ -484,17 +484,24 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
 
     let mut descs: Vec<Desc> = Vec::new();
     let mut pty_pair: Option<(RawFd, RawFd)> = None;
+    // Error paths must release the fds already allocated for earlier
+    // spec entries (and any pty pair) — `?` would leak them.
+    macro_rules! cleanup {
+        () => {{
+            if let Some((m, s)) = pty_pair {
+                unsafe {
+                    libc::close(m);
+                    libc::close(s);
+                }
+            }
+            close_descs(&mut descs);
+        }};
+    }
     for (k, v) in &spec_items {
         let index = match k {
             ArrKey::Int(i) => *i as i32,
             _ => {
-                if let Some((m, s)) = pty_pair {
-                    unsafe {
-                        libc::close(m);
-                        libc::close(s);
-                    }
-                }
-                close_descs(&mut descs);
+                cleanup!();
                 return err(
                     "ValueError",
                     "proc_open(): Argument #2 ($descriptor_spec) must be an integer indexed array",
@@ -504,23 +511,31 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
         let res = match v {
             Value::Resource(r) => {
                 let rb = r.borrow();
-                resource_child_fd(it, &rb, index as i64)?.map(|fd| Desc {
-                    index,
-                    child: fd,
-                    parent: -1,
-                    pipe_rw: None,
-                    socket: false,
-                })
-            }
-            Value::Array(a) => spec_array(it, a.clone(), index, &descs, &mut pty_pair)?,
-            _ => {
-                if let Some((m, s)) = pty_pair {
-                    unsafe {
-                        libc::close(m);
-                        libc::close(s);
+                match resource_child_fd(it, &rb, index as i64) {
+                    Ok(f) => f.map(|fd| Desc {
+                        index,
+                        child: fd,
+                        parent: -1,
+                        pipe_rw: None,
+                        socket: false,
+                        pty: false,
+                    }),
+                    Err(e) => {
+                        drop(rb);
+                        cleanup!();
+                        return Err(e);
                     }
                 }
-                close_descs(&mut descs);
+            }
+            Value::Array(a) => match spec_array(it, a.clone(), index, &descs, &mut pty_pair) {
+                Ok(d) => d,
+                Err(e) => {
+                    cleanup!();
+                    return Err(e);
+                }
+            },
+            _ => {
+                cleanup!();
                 return err(
                     "ValueError",
                     "proc_open(): Argument #2 ($descriptor_spec) must only contain arrays and streams",
@@ -530,13 +545,7 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
         match res {
             Some(d) => descs.push(d),
             None => {
-                if let Some((m, s)) = pty_pair {
-                    unsafe {
-                        libc::close(m);
-                        libc::close(s);
-                    }
-                }
-                close_descs(&mut descs);
+                cleanup!();
                 return Ok(Value::Bool(false));
             }
         }
