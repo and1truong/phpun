@@ -34,6 +34,7 @@ impl<'a> Interp<'a> {
                 .map(|(n, c, ..)| (n.clone(), c.clone()))
                 .collect(),
             internal: true,
+            visible: true,
         });
         let r = self.array_iter_body(obj, name, args);
         self.call_trace.pop();
@@ -695,6 +696,7 @@ impl<'a> Interp<'a> {
                     args: frame_args,
                     named_args: Vec::new(),
                     internal: true,
+                    visible: true,
                 });
                 self.internal_cb += 1;
                 let (sorted, deep, conv_err) = crate::builtins::array::zend_sort_flags(
@@ -760,6 +762,7 @@ impl<'a> Interp<'a> {
                     args: vec![cell(Value::Array(arr.clone())), cell(cb.clone())],
                     named_args: Vec::new(),
                     internal: true,
+                    visible: true,
                 });
                 self.internal_cb += 1;
                 let (sorted, cb_err) = crate::builtins::array::zend_sort_user(
@@ -2195,6 +2198,7 @@ impl<'a> Interp<'a> {
                     args: Vec::new(),
                     named_args: Vec::new(),
                     internal: false,
+                    visible: true,
                 });
                 let r = self.reflection_method(&obj, name, &args);
                 self.call_trace.pop();
@@ -2416,7 +2420,13 @@ impl<'a> Interp<'a> {
                 };
                 // PHP orders innermost call first (tests/lang/038);
                 // internal-function call sites carry no file/line.
+                // call_user_func* trampolines are omitted like in
+                // format_backtrace (oracle: cufa-wrapped sprintf shows
+                // only the callee frame).
                 for fr in frames.iter().rev() {
+                    if crate::value::trace_frame_hidden(fr) {
+                        continue;
+                    }
                     let mut f = PhpArray::new();
                     if fr.file != "[internal function]" {
                         f.set(ArrKey::Str("file".into()), Value::str(fr.file.clone()));

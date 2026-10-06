@@ -896,22 +896,23 @@ fn zval_str(it: &mut Interp, v: &Value) -> Result<Vec<u8>, PhpError> {
             Err(e) => {
                 if e.kind == crate::error::ErrorKind::Throw {
                     if let Some(x) = it.take_pending_exception() {
-                        // Zend's backtrace shows the innermost internal
-                        // frame (`#0 sprintf(...)`) but no deeper ones
-                        // — call_user_func_array's frame is gone once
-                        // it delegates. Keep every PHP frame plus only
-                        // the last internal frame.
+                        // Zend drops the innermost internal frame
+                        // when the call was compile-specialized away
+                        // (const-format literal `sprintf` → rope-concat
+                        // — sprintf_rope_optimization_002); every real
+                        // call keeps it. PHP frames above the internal
+                        // one don't change that.
                         if let Value::Object(o) = &x {
                             if let Some(crate::value::ObjectInternal::Exception {
                                 frames, ..
                             }) = &mut o.borrow_mut().internal
                             {
-                                if frames.last().map(|fr| fr.internal) == Some(true) {
-                                    let mut f = (**frames).clone();
-                                    let top = f.pop().unwrap();
-                                    f.retain(|fr| !fr.internal);
-                                    f.push(top);
-                                    *frames = Rc::new(f);
+                                if let Some(pos) = frames.iter().rposition(|fr| fr.internal) {
+                                    if !frames[pos].visible {
+                                        let mut f = (**frames).clone();
+                                        f.remove(pos);
+                                        *frames = Rc::new(f);
+                                    }
                                 }
                             }
                         }
