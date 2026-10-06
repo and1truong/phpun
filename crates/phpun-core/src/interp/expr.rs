@@ -2541,7 +2541,7 @@ impl<'a> Interp<'a> {
                 no.borrow_mut().props.insert(k.clone(), c);
                 if let Some(a) = self.slot_anchor.get_mut(&ptr) {
                     if let SlotAnchor::Obj(w, sk) = a {
-                        if sk == &k && w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, &o)) {
+                        if sk == &k && w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, o)) {
                             *a = SlotAnchor::Obj(Rc::downgrade(no), k.clone());
                         }
                     }
@@ -2552,7 +2552,7 @@ impl<'a> Interp<'a> {
                         // the SOURCE object's prop to
                         // the clone's slot.
                         if let SlotAnchor::Obj(w, sk) = a {
-                            if sk == &k && w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, &o)) {
+                            if sk == &k && w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, o)) {
                                 *a = SlotAnchor::Obj(Rc::downgrade(no), k.clone());
                             }
                         }
