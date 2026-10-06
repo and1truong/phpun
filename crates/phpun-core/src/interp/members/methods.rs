@@ -541,7 +541,11 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let k = self.ao_dim_key(obj, &raw_k);
-                arr.borrow_mut().unset(&k);
+                // The evicted payload's last ref dies with the
+                // cell — held objects/gens destruct now.
+                if let Some(v) = arr.borrow_mut().unset(&k) {
+                    self.destruct_dying_value(&v)?;
+                }
                 // Object-backed storage mirrors props — the unset
                 // removes the backing prop as well (spl backing has
                 // no props; the arr.unset above already hit storage).
@@ -1359,7 +1363,9 @@ impl<'a> Interp<'a> {
             .collect();
         drop(so);
         for k in stale {
-            arr.borrow_mut().unset(&k);
+            if let Some(v) = arr.borrow_mut().unset(&k) {
+                let _ = self.destruct_dying_value(&v);
+            }
         }
     }
 

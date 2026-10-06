@@ -112,22 +112,18 @@ impl<'a> Interp<'a> {
         // Inside a generator run, stderr diag bytes defer with
         // stdout's — Zend emits both at the resume that produced
         // them, so they must not overtake consumer output.
-        if let Some(run) = &self.gen_run_state {
+        if self.gen_run_state.is_some() {
             let done = self
                 .gen_sink
                 .as_ref()
                 .map(|s| s.borrow().len())
                 .unwrap_or(0);
+            if self.gen_replay_horizon.is_some_and(|k| done <= k) {
+                return;
+            }
             if done > 0 {
                 let is_fin = self.gen_fin_depth > 0;
-                run.borrow_mut()
-                    .pending_out
-                    .push((done - 1, s.as_bytes().to_vec(), true, is_fin));
-                if is_fin {
-                    if let Some(q) = &self.gen_fin_q {
-                        q.borrow_mut().push((done - 1, s.as_bytes().to_vec(), true));
-                    }
-                }
+                self.gen_buf_out(done - 1, s.as_bytes(), true, is_fin);
                 return;
             }
         }

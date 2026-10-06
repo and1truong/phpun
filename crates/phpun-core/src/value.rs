@@ -121,14 +121,17 @@ impl PhpArray {
     }
 
     /// Remove a key (unset). The bucket is tombstoned — position kept,
-    /// value gone (see ArrKey::Tomb). Returns whether it existed.
-    pub fn unset(&mut self, k: &ArrKey) -> bool {
+    /// value released (see ArrKey::Tomb). Returns the evicted payload
+    /// when the table owned the cell outright — an aliased (by-ref)
+    /// slot keeps sharing its value with the other holders.
+    pub fn unset(&mut self, k: &ArrKey) -> Option<Value> {
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| ek == k) {
             slot.0 = ArrKey::Tomb;
-            true
-        } else {
-            false
+            if Rc::strong_count(&slot.1) == 1 {
+                return Some(std::mem::replace(&mut *slot.1.borrow_mut(), Value::Null));
+            }
         }
+        None
     }
 
     /// First live (non-tombstone) index at or after `i`.
@@ -1680,9 +1683,45 @@ pub type GenItem = (Value, Cell);
 
 /// Generator internal state (object internal behind the `Generator`
 /// class, which implements `Iterator`).
-/// A generator's buffered finally-region output shared with the
-/// interpreter's GC sweep (yield-tag, bytes, is_err).
-pub type FinQueue = Rc<RefCell<Vec<(usize, Vec<u8>, bool)>>>;
+/// A generator's suspended-finally journal — shared between the gen
+/// state and the interpreter's `live_gens` GC registry, so a dead
+/// weak can still replay it after the object is gone. Beyond the
+/// buffered finally bytes it carries the destruction-time markers
+/// the object can no longer answer once dropped: yields recorded
+/// inside `finally` regions (a force-close unwinding into one dies
+/// 'Cannot yield from finally in a force-closed generator'), the
+/// body's error when it died inside `finally` (replayed as a raise),
+/// a `$gen->throw()` parked at a finally-yield, and a mirror of the
+/// consumer cursor plus the body's identity for the
+/// destruction-site trace.
+#[derive(Default, Clone)]
+pub struct GenFinData {
+    /// (yield-tag, bytes, is_err) — finally-region output buffered
+    /// for destruction replay; entries drop as normal flushes cover
+    /// them.
+    pub bytes: Vec<(usize, Vec<u8>, bool)>,
+    /// (item idx, line) of each `yield` emitted while a `finally`
+    /// region ran.
+    pub yields: Vec<(usize, usize)>,
+    /// The body's terminal error when it died inside a `finally`
+    /// region — (err, throwable), mirrors `GenState::deferred_err`'s
+    /// finally component so a dead weak still surfaces it.
+    pub fin_err: Option<(crate::error::PhpError, Option<Value>)>,
+    /// `$gen->throw()` parked at a yield inside `finally`:
+    /// (throwable, item idx parked at) — re-raised verbatim once
+    /// the consumer resumes past it.
+    pub injected: Option<(Value, usize)>,
+    /// Mirrored `GenState::pos` — the object is gone when a dead
+    /// weak's entry replays.
+    pub pos: usize,
+    /// The body's function name and file — destruction-site frames
+    /// attribute the raise (`FILE(n): g()` at an unset/overwrite
+    /// point, `[internal function]: g()` at request shutdown).
+    pub fn_name: String,
+    pub file: String,
+}
+
+pub type FinQueue = Rc<RefCell<GenFinData>>;
 
 pub struct GenState {
     /// Everything needed to re-enter the function frame later.
@@ -1729,8 +1768,10 @@ pub struct GenState {
     /// transient — consumer calls between death and resume clobber
     /// it) and the call-trace frames suspended between the throw site
     /// and the gen body (eval()/include() pseudo-frames, userland
-    /// calls) so the resume render can prepend them.
-    pub deferred_err: Option<(crate::error::PhpError, Option<Value>, Vec<TraceFrame>)>,
+    /// calls) so the resume render can prepend them. The last flag
+    /// marks a death that originated inside a `finally` region — a
+    /// force-close then surfaces it at destruction instead.
+    pub deferred_err: Option<(crate::error::PhpError, Option<Value>, Vec<TraceFrame>, bool)>,
     /// The body died by error — getReturn() reports 'hasn't returned'
     /// even after the deferred error was consumed.
     pub dead: bool,
@@ -1738,6 +1779,16 @@ pub struct GenState {
     /// consumer reads behave like an exhausted generator (`valid()`
     /// false, `current()`/`key()` null), like Zend's closed gen.
     pub closed: bool,
+}
+
+impl GenState {
+    /// Advance the consumer cursor, mirroring it into the shared
+    /// finally journal so a dead weak's destruction check can still
+    /// gate on the suspension point.
+    pub fn set_pos(&mut self, pos: usize) {
+        self.pos = pos;
+        self.fin_q.borrow_mut().pos = pos;
+    }
 }
 
 pub enum GenSetup {

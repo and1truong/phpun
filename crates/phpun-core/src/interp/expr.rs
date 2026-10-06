@@ -196,6 +196,16 @@ impl<'a> Interp<'a> {
                 match &self.gen_sink {
                     Some(sink) => {
                         sink.borrow_mut().push((k, vc));
+                        // A yield inside a `finally` region marks the
+                        // force-close fatal — destruction replay
+                        // raises 'Cannot yield from finally in a
+                        // force-closed generator' here.
+                        if self.gen_fin_depth > 0 {
+                            if let Some(q) = &self.gen_fin_q {
+                                let idx = sink.borrow().len() - 1;
+                                q.borrow_mut().yields.push((idx, self.cur_line));
+                            }
+                        }
                         Ok(self.gen_sends.pop_front().unwrap_or(Value::Null))
                     }
                     None => self.fail(PhpError::fatal(
@@ -218,9 +228,40 @@ impl<'a> Interp<'a> {
                         // the sink, and the death becomes this body's
                         // own (deferred-raising) death.
                         self.iter_calls += 1;
+                        let base = sink.borrow().len();
+                        // The inner drain's flushed stream bytes retag
+                        // into THIS gen's deferred queue at `base` —
+                        // a live emit would echo inner output before
+                        // the consumer reached it (yield-from order).
+                        let saved_cbase = std::mem::replace(&mut self.gen_collect_base, Some(base));
                         let (items, death) = self.yield_from_collect(&v);
+                        self.gen_collect_base = saved_cbase;
                         self.iter_calls -= 1;
                         sink.borrow_mut().extend(items);
+                        // A gen suspended inside `yield from` shares
+                        // the OUTER gen's destruction: its destruction
+                        // journal (snapshotted at its start, before
+                        // the drain pruned it) merges into the
+                        // parent's, retagged into the parent's item
+                        // space — oracle replays inner+outer finally
+                        // together at the outer's unset/shutdown.
+                        if let Some(inner_fin) = self.gen_yield_from_fin.take() {
+                            if let Some(q) = &self.gen_fin_q {
+                                let mut pq = q.borrow_mut();
+                                for (t, b, e) in inner_fin.bytes {
+                                    pq.bytes.push((base + t, b, e));
+                                }
+                                for (t, l) in inner_fin.yields {
+                                    pq.yields.push((base + t, l));
+                                }
+                                if pq.fin_err.is_none() {
+                                    pq.fin_err = inner_fin.fin_err;
+                                }
+                                if pq.injected.is_none() {
+                                    pq.injected = inner_fin.injected.map(|(v, i)| (v, base + i));
+                                }
+                            }
+                        }
                         match death {
                             Some(e) => Err(e),
                             None => Ok(Value::Null),
@@ -3077,7 +3118,9 @@ impl<'a> Interp<'a> {
                         return self.fail(e);
                     }
                     if let Some(k) = &key {
-                        cur_arr.borrow_mut().unset(&to_key(k));
+                        if let Some(v) = cur_arr.borrow_mut().unset(&to_key(k)) {
+                            self.destruct_dying_value(&v)?;
+                        }
                     }
                     return Ok(());
                 }
@@ -3205,7 +3248,15 @@ impl<'a> Interp<'a> {
                     self.cow_split(&mut b);
                     if let (Value::Array(rc), Some(k)) = (&*b, &key) {
                         let k = to_key(k);
-                        rc.borrow_mut().unset(&k);
+                        let rc = rc.clone();
+                        drop(b);
+                        // The evicted payload's last ref dies with
+                        // the cell — held objects/gens destruct now
+                        // (zend destroys the zval's contents).
+                        if let Some(v) = rc.borrow_mut().unset(&k) {
+                            self.destruct_dying_value(&v)?;
+                        }
+                        return Ok(());
                     }
                     return Ok(());
                 }

@@ -54,9 +54,14 @@ impl<'a> Interp<'a> {
                     // Generators that died at this statement (unset(),
                     // overwrite, foreach abandon) replay their
                     // suspended finally chains here — Zend destroys
-                    // them at last-ref drop.
+                    // them at last-ref drop. A destruction-time raise
+                    // (force-closed finally yield, parked throwable,
+                    // finally-region death) becomes this statement's
+                    // error.
                     if !self.live_gens.is_empty() {
-                        self.gen_gc_sweep(false);
+                        if let Err(e) = self.gen_gc_sweep(false) {
+                            return self.err_flow(e);
+                        }
                     }
                 }
                 Flow::Goto(mut l) => loop {
@@ -626,7 +631,13 @@ impl<'a> Interp<'a> {
                             // table entry too.
                             if self.stack.is_empty() {
                                 if let Some(arr) = self.globals_arr.clone() {
-                                    arr.borrow_mut().unset(&ArrKey::Str(Rc::from(n.as_str())));
+                                    if let Some(v) =
+                                        arr.borrow_mut().unset(&ArrKey::Str(Rc::from(n.as_str())))
+                                    {
+                                        if let Err(e) = self.destruct_dying_value(&v) {
+                                            return self.err_flow(e);
+                                        }
+                                    }
                                 }
                                 self.globals_synced.remove(n);
                             }
@@ -695,8 +706,10 @@ impl<'a> Interp<'a> {
                 }
                 // A released generator replays its suspended
                 // finally chains now — unset() is its GC moment.
-                self.gen_gc_sweep(false);
-                Flow::Normal
+                match self.gen_gc_sweep(false) {
+                    Err(e) => return self.err_flow(e),
+                    Ok(()) => Flow::Normal,
+                }
             }
             Stmt::Try {
                 body,
@@ -812,17 +825,26 @@ impl<'a> Interp<'a> {
                 // Output of a finally region inside a generator body
                 // is death-time output (Zend replays it when the
                 // suspended gen is destroyed) — tag it for fin_q.
-                if self.gen_run_state.is_some() {
+                let fin = self.gen_run_state.is_some();
+                if fin {
                     self.gen_fin_depth += 1;
                 }
-                let f = match self.exec_block(fb) {
+                let fr = self.exec_block(fb);
+                if fin {
+                    self.gen_fin_depth -= 1;
+                    // A body error raised inside the region is the
+                    // force-close terminal error — destruction
+                    // replays it (fin_err) rather than the deferred
+                    // resume. (Return/Break inside finally are not
+                    // deaths.)
+                    if matches!(fr, Flow::Throw(_) | Flow::Exit(_)) && self.gen_fin_depth == 0 {
+                        self.gen_fin_err = true;
+                    }
+                }
+                match fr {
                     Flow::Normal => out,
                     f => f,
-                };
-                if self.gen_run_state.is_some() {
-                    self.gen_fin_depth -= 1;
                 }
-                f
             }
             None => out,
         }
@@ -1390,7 +1412,7 @@ impl<'a> Interp<'a> {
         if Rc::strong_count(&it) == 2 && self.expr_temps.iter().any(|o| Rc::ptr_eq(o, &it)) {
             self.expr_temps.retain(|o| !Rc::ptr_eq(o, &it));
             let key = Rc::as_ptr(&it) as usize;
-            if !self.destructed.contains_key(&key)
+            if !self.was_destructed(key)
                 && self
                     .find_method_in(&it.borrow().class, "__destruct")
                     .is_some()

@@ -176,6 +176,11 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn make_generator(&mut self, setup: GenSetup) -> Rc<RefCell<PhpObject>> {
         let GenSetup::Invoke { decl, .. } = &setup;
         let by_ref = decl.by_ref;
+        let fin_q = Rc::new(RefCell::new(crate::value::GenFinData {
+            fn_name: decl.name.clone(),
+            file: decl.file.clone(),
+            ..Default::default()
+        }));
         let state = Rc::new(RefCell::new(GenState {
             setup,
             items: Vec::new(),
@@ -187,7 +192,7 @@ impl<'a> Interp<'a> {
             auto_key: 0,
             sends: Vec::new(),
             pending_out: Vec::new(),
-            fin_q: Rc::new(RefCell::new(Vec::new())),
+            fin_q,
             deferred_err: None,
             dead: false,
             closed: false,
@@ -262,7 +267,18 @@ impl<'a> Interp<'a> {
         let saved_run = self.gen_run_state.replace(state.clone());
         let saved_fin_q = self.gen_fin_q.replace(state.borrow().fin_q.clone());
         let saved_fin_depth = std::mem::replace(&mut self.gen_fin_depth, 0);
-        self.gen_pending_fatal = None;
+        // Nested gen_start (a gen inside a running gen's body):
+        // save/restore the outer run's slots like the other gen_*s —
+        // an unconditional clear dropped an outer gen's pending
+        // fatal/raise context.
+        let saved_pf = self.gen_pending_fatal.take();
+        let saved_ctx = std::mem::take(&mut self.gen_raise_ctx);
+        let saved_fin_err = std::mem::replace(&mut self.gen_fin_err, false);
+        // gen_replay_horizon is NOT saved: a send() re-run installs it
+        // around this call specifically so the re-run's prefix bytes
+        // are suppressed.
+        let saved_cbase = self.gen_collect_base.take();
+        let saved_yff = self.gen_yield_from_fin.take();
         // The body frame lands at call_trace[trace_base] — everything
         // above it at death time (eval()/include() pseudo-frames,
         // userland calls) is the suspended raise context the deferred
@@ -287,6 +303,10 @@ impl<'a> Interp<'a> {
         self.gen_run_state = saved_run;
         self.gen_fin_q = saved_fin_q;
         self.gen_fin_depth = saved_fin_depth;
+        let run_fin_err = self.gen_fin_err;
+        self.gen_fin_err = saved_fin_err;
+        self.gen_collect_base = saved_cbase;
+        self.gen_yield_from_fin = saved_yff;
         let collected = std::mem::take(&mut *items.borrow_mut());
         {
             let mut st = state.borrow_mut();
@@ -295,6 +315,8 @@ impl<'a> Interp<'a> {
         }
         match r {
             Ok(rv) => {
+                self.gen_pending_fatal = saved_pf;
+                self.gen_raise_ctx = saved_ctx;
                 state.borrow_mut().return_val = rv;
                 Ok(())
             }
@@ -308,6 +330,7 @@ impl<'a> Interp<'a> {
                 // err_flow inside the body is the real error behind
                 // the exit:N sentinel that propagated out.
                 let e = self.gen_pending_fatal.take().unwrap_or(e);
+                self.gen_pending_fatal = saved_pf;
                 // Throw deaths need their throwable here — the ambient
                 // pending_exception slot gets clobbered by consumer
                 // calls between death and resume.
@@ -318,16 +341,28 @@ impl<'a> Interp<'a> {
                 };
                 // call_trace is already unwound past the body frame —
                 // the suspended raise context was snapshotted at the
-                // last throw()/fail()/err_flow inside the body; slice
-                // out everything at/below the gen's own frame.
+                // last throw()/fail()/err_flow inside the body; an
+                // error that bypassed them (a raw Err propagation)
+                // falls back to whatever stack remains.
+                if self.gen_raise_ctx.is_empty() {
+                    self.gen_raise_ctx = self.call_trace.clone();
+                }
+                // Slice out everything at/below the gen's own frame.
                 let raise_frames = self
                     .gen_raise_ctx
                     .get(trace_base + 1..)
                     .unwrap_or_default()
                     .to_vec();
-                self.gen_raise_ctx.clear();
+                self.gen_raise_ctx = saved_ctx;
                 let mut st = state.borrow_mut();
-                st.deferred_err = Some((e, throwable, raise_frames));
+                // A death that happened inside a `finally` region
+                // surfaces at the gen's destruction instead of the
+                // deferred resume — mirror it into the shared
+                // journal so a dead weak still raises it.
+                if run_fin_err {
+                    st.fin_q.borrow_mut().fin_err = Some((e.clone(), throwable.clone()));
+                }
+                st.deferred_err = Some((e, throwable, raise_frames, run_fin_err));
                 st.dead = true;
                 Ok(())
             }
@@ -645,7 +680,33 @@ impl<'a> Interp<'a> {
         &mut self,
         state: &Rc<RefCell<GenState>>,
         method: &str,
+        args: &[crate::value::Cell],
     ) -> Result<(), PhpError> {
+        // A `$gen->throw()` parked at a yield inside `finally`: the
+        // unwind continues at each resume — suspending again on the
+        // next finally-yield, surfacing the throwable verbatim once
+        // the consumer passes the parked point.
+        {
+            let st = state.borrow();
+            let fq = st.fin_q.clone();
+            let mut fq = fq.borrow_mut();
+            if let Some((v, i)) = fq.injected.take() {
+                let parked = fq.yields.iter().any(|(y, _)| *y == st.pos);
+                if parked {
+                    fq.injected = Some((v, st.pos));
+                } else if st.pos > i {
+                    drop(fq);
+                    drop(st);
+                    // The injected death is the gen's own — the body's
+                    // pending error never ran past that yield.
+                    state.borrow_mut().deferred_err = None;
+                    state.borrow().fin_q.borrow_mut().fin_err = None;
+                    return Err(self.throw(v));
+                } else {
+                    fq.injected = Some((v, i));
+                }
+            }
+        }
         let dead = {
             let st = state.borrow();
             st.pos >= st.items.len() && st.deferred_err.is_some()
@@ -657,8 +718,13 @@ impl<'a> Interp<'a> {
         self.gen_flush_out(state, usize::MAX);
         // The error unwind already ran the body's finally chains —
         // the queue drains with them so shutdown doesn't replay.
-        state.borrow().fin_q.borrow_mut().clear();
-        let (mut e, throwable, raise_frames) = state.borrow_mut().deferred_err.take().unwrap();
+        {
+            let st = state.borrow();
+            let mut fin = st.fin_q.borrow_mut();
+            fin.bytes.clear();
+            fin.fin_err = None;
+        }
+        let (mut e, throwable, raise_frames, _) = state.borrow_mut().deferred_err.take().unwrap();
         if e.kind == crate::error::ErrorKind::Throw {
             // Restore the throwable captured at death — consumer calls
             // since then may have overwritten the ambient slot.
@@ -667,12 +733,40 @@ impl<'a> Interp<'a> {
             }
         }
         // Foreach-internal resume: the body dies under the iteration
-        // machinery, keeping its original call frame; a userland
-        // `Generator->{m}()` resume renders the engine stack instead.
+        // machinery — its raise carries the gen's own call frame
+        // (`FILE(call_line): g()`) under the consumer's stack, while a
+        // userland `Generator->{m}()` resume renders the engine
+        // stack instead.
         if self.iter_calls > 0 {
+            let fn_name = {
+                let st = state.borrow();
+                match &st.setup {
+                    GenSetup::Invoke { decl, .. } => decl.name.clone(),
+                }
+            };
+            // The resume frame cites the consumer's current site —
+            // the foreach header driving the iteration, not the
+            // `g()` that minted the generator.
+            let mut frames = vec![format!(
+                "{}({}): {}()",
+                self.diag_file(),
+                self.cur_line,
+                fn_name
+            )];
+            for fr in self.call_trace.iter().rev() {
+                if crate::value::trace_frame_hidden(fr) {
+                    continue;
+                }
+                frames.push(crate::value::trace_frame_str(fr));
+            }
+            if e.kind == crate::error::ErrorKind::Throw {
+                self.rewrite_throwable_trace(&frames);
+            } else {
+                e.trace = Some(frames);
+            }
             return Err(e);
         }
-        let mut frames = self.gen_resume_frames(state, method, self.gen_internal_resume == 0);
+        let mut frames = self.gen_resume_frames(state, method, args, self.gen_internal_resume == 0);
         if e.kind == crate::error::ErrorKind::Throw {
             // Frames suspended between the throw site and the gen body
             // — eval()/include() pseudo-frames and userland calls —
@@ -688,19 +782,7 @@ impl<'a> Interp<'a> {
             }
             // The uncaught render reads the Throwable's own trace —
             // swap it for the resume stack.
-            if let Some(Value::Object(o)) = &self.pending_exception {
-                let mut obj = o.borrow_mut();
-                if let Some(crate::value::ObjectInternal::Exception { trace, .. }) =
-                    &mut obj.internal
-                {
-                    let mut t = String::new();
-                    for (i, fr) in frames.iter().enumerate() {
-                        t.push_str(&format!("#{} {}\n", i, fr));
-                    }
-                    t.push_str(&format!("#{} {{main}}", frames.len()));
-                    *trace = t;
-                }
-            }
+            self.rewrite_throwable_trace(&frames);
         } else {
             e.trace = Some(frames);
         }
@@ -715,6 +797,7 @@ impl<'a> Interp<'a> {
         &mut self,
         state: &Rc<RefCell<GenState>>,
         method: &str,
+        args: &[crate::value::Cell],
         include_method: bool,
     ) -> Vec<String> {
         let fn_name = {
@@ -725,11 +808,18 @@ impl<'a> Interp<'a> {
         };
         let mut frames = vec![format!("[internal function]: {}()", fn_name)];
         if include_method {
+            // Zend renders the resume-call args (`Generator->send(5)`).
+            let args_str = args
+                .iter()
+                .map(|c| crate::value::trace_arg(&c.borrow()))
+                .collect::<Vec<_>>()
+                .join(", ");
             frames.push(format!(
-                "{}({}): Generator->{}()",
+                "{}({}): Generator->{}({})",
                 self.diag_file(),
                 self.cur_line,
-                method
+                method,
+                args_str
             ));
         }
         for fr in self.call_trace.iter().rev() {
@@ -739,6 +829,36 @@ impl<'a> Interp<'a> {
             frames.push(crate::value::trace_frame_str(fr));
         }
         frames
+    }
+
+    /// Raise at a `Generator->{m}()` call. Userland calls carry the
+    /// `Generator->{m}(args)` pseudo-frame Zend stamps (`#0
+    /// FILE(n): Generator->send(5)`); engine-driven resumes
+    /// (foreach / iterator_*) report from the real frame instead.
+    fn gen_method_throw(
+        &mut self,
+        method: &str,
+        args: &[crate::value::Cell],
+        msg: &str,
+    ) -> PhpError {
+        let userland = self.iter_calls == 0 && self.gen_internal_resume == 0;
+        if userland {
+            self.call_trace.push(TraceFrame {
+                function: method.to_string(),
+                class: Some("Generator".into()),
+                ty: "->".into(),
+                file: self.diag_file(),
+                line: self.cur_line as u32,
+                args: args.to_vec(),
+                named_args: Vec::new(),
+                internal: false,
+            });
+        }
+        let v = self.exception("Exception", msg);
+        if userland {
+            self.call_trace.pop();
+        }
+        self.throw(v)
     }
 
     /// Native dispatch for the `Generator` class (Iterator + send/throw/
@@ -758,39 +878,61 @@ impl<'a> Interp<'a> {
             "rewind" => {
                 if !state.borrow().started {
                     self.gen_start(&state)?;
-                    self.gen_raise_deferred(&state, "rewind")?;
+                    self.gen_raise_deferred(&state, "rewind", &args.cells)?;
                     return Ok(Some(Value::Null));
                 }
-                self.gen_raise_deferred(&state, "rewind")?;
-                let st = state.borrow();
-                // Zend throws once the gen ran past its first yield —
-                // a still-positioned-at-first-item rewind is a no-op.
-                // foreach's initiation rewind reports the closed /
-                // exhausted state ('Cannot traverse an already closed
-                // generator'); an explicit ->rewind() reports
-                // 'already run' whenever it ran past yield 0.
-                if st.pos > 0 || st.closed || st.dead {
-                    let msg = if self.iter_calls > 0
-                        && (st.closed || st.dead || st.pos >= st.items.len())
-                    {
+                let (pos, len, dead, closed) = {
+                    let st = state.borrow();
+                    (st.pos, st.items.len(), st.dead, st.closed)
+                };
+                let engine = self.iter_calls > 0 || self.gen_internal_resume > 0;
+                if closed {
+                    // Engine-driven consume reports the closed state;
+                    // an explicit ->rewind() reports 'already run'.
+                    let msg = if engine {
                         "Cannot traverse an already closed generator"
                     } else {
                         "Cannot rewind a generator that was already run"
                     };
-                    let v = self.exception("Exception", msg);
-                    return Err(self.throw(v));
+                    return Err(self.gen_method_throw("rewind", &args.cells, msg));
+                }
+                if pos > 0 || dead {
+                    if dead {
+                        if !engine || pos < len {
+                            // Explicit rewind is a silent no-op; a
+                            // dead-but-not-exhausted gen delivers its
+                            // buffered items first — the death
+                            // surfaces at the NEXT resume past them.
+                            return Ok(Some(Value::Null));
+                        }
+                        // Engine-driven consume of an exhausted dead
+                        // gen surfaces the body's deferred death —
+                        // or reports 'closed' once consumed.
+                        self.gen_raise_deferred(&state, "rewind", &args.cells)?;
+                        return Err(self.gen_method_throw(
+                            "rewind",
+                            &args.cells,
+                            "Cannot traverse an already closed generator",
+                        ));
+                    }
+                    let msg = if engine && pos >= len {
+                        "Cannot traverse an already closed generator"
+                    } else {
+                        "Cannot rewind a generator that was already run"
+                    };
+                    return Err(self.gen_method_throw("rewind", &args.cells, msg));
                 }
                 Ok(Some(Value::Null))
             }
             "valid" => {
                 self.gen_start(&state)?;
-                self.gen_raise_deferred(&state, "valid")?;
+                self.gen_raise_deferred(&state, "valid", &args.cells)?;
                 let st = state.borrow();
                 Ok(Some(Value::Bool(st.pos < st.items.len())))
             }
             "current" => {
                 self.gen_start(&state)?;
-                self.gen_raise_deferred(&state, "current")?;
+                self.gen_raise_deferred(&state, "current", &args.cells)?;
                 let st = state.borrow();
                 Ok(Some(
                     st.items
@@ -801,7 +943,7 @@ impl<'a> Interp<'a> {
             }
             "key" => {
                 self.gen_start(&state)?;
-                self.gen_raise_deferred(&state, "key")?;
+                self.gen_raise_deferred(&state, "key", &args.cells)?;
                 let st = state.borrow();
                 Ok(Some(
                     st.items.get(st.pos).map(|(k, _)| k.clone()).unwrap_or(Value::Null),
@@ -809,10 +951,14 @@ impl<'a> Interp<'a> {
             }
             "next" => {
                 self.gen_start(&state)?;
-                state.borrow_mut().pos += 1;
-                let pos = state.borrow().pos;
+                let pos = {
+                    let mut st = state.borrow_mut();
+                    let p = st.pos + 1;
+                    st.set_pos(p);
+                    p
+                };
                 self.gen_flush_out(&state, pos);
-                self.gen_raise_deferred(&state, "next")?;
+                self.gen_raise_deferred(&state, "next", &args.cells)?;
                 Ok(Some(Value::Null))
             }
             "send" => {
@@ -821,33 +967,51 @@ impl<'a> Interp<'a> {
                     // send() on a killed gen is a silent no-op.
                     return Ok(Some(Value::Null));
                 }
-                {
+                let (prev_pos, restart) = {
                     let mut st = state.borrow_mut();
                     st.sends.push(v);
-                    if st.started {
+                    // A gen resumed past its end carries the body's
+                    // death — Zend re-raises it at this call rather
+                    // than re-running the body; a clean exhausted
+                    // gen takes send() as a silent NULL.
+                    (st.pos, st.started && st.pos < st.items.len())
+                };
+                if restart {
+                    {
+                        let mut st = state.borrow_mut();
                         // Eager model: re-run the body so queued sends
-                        // reach their yield expressions (the k-th send
-                        // feeds the k-th yield expr).
+                        // reach their yield expressions (the k-th
+                        // send feeds the k-th yield expr).
                         st.started = false;
                         st.finished = false;
                         st.items.clear();
-                        st.pos = 0;
+                        st.set_pos(0);
                         st.pending_out.clear();
-                        st.fin_q.borrow_mut().clear();
+                        st.fin_q.borrow_mut().bytes.clear();
                         st.deferred_err = None;
                         st.dead = false;
-                        st.closed = false;
                     }
+                    // The re-run replays the prefix the consumer
+                    // already echoed — suppress its bytes (Zend only
+                    // produces the resume segment).
+                    self.gen_replay_horizon = Some(prev_pos);
+                    let r = self.gen_start(&state);
+                    self.gen_replay_horizon = None;
+                    r?;
+                } else {
+                    self.gen_start(&state)?;
                 }
-                self.gen_start(&state)?;
-                // The k-th send resumes at item k.
                 {
                     let mut st = state.borrow_mut();
-                    st.pos = st.sends.len();
+                    // This send resumes one step past what the
+                    // consumer had — a send() burst can outpace the
+                    // cursor further.
+                    let n = st.sends.len();
+                    st.set_pos((prev_pos + 1).max(n));
                 }
                 let pos = state.borrow().pos;
                 self.gen_flush_out(&state, pos);
-                self.gen_raise_deferred(&state, "send")?;
+                self.gen_raise_deferred(&state, "send", &args.cells)?;
                 let st = state.borrow();
                 Ok(Some(
                     st.items
@@ -862,14 +1026,41 @@ impl<'a> Interp<'a> {
                 // first yield first — its body (and queued finally
                 // output) exists before the kill.
                 self.gen_start(&state)?;
+                // Suspended on a yield inside `finally`: Zend
+                // delivers that item to throw() and parks the
+                // injected throwable — the unwind continues on the
+                // next resume (gen_raise_deferred).
+                let parked = {
+                    let st = state.borrow();
+                    if st
+                        .fin_q
+                        .borrow()
+                        .yields
+                        .iter()
+                        .any(|(y, _)| *y == st.pos)
+                    {
+                        Some((
+                            st.items
+                                .get(st.pos)
+                                .map(|(_, v)| v.borrow().clone())
+                                .unwrap_or(Value::Null),
+                            st.pos,
+                        ))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((v, pos)) = parked {
+                    state.borrow().fin_q.borrow_mut().injected = Some((e, pos));
+                    return Ok(Some(v));
+                }
                 {
                     // Closing a suspended generator runs the finally
                     // chains of the try-regions enclosing its
                     // suspension point BEFORE the throwable
                     // propagates — replay the queued finally bytes.
                     let fq = state.borrow().fin_q.clone();
-                    let bytes: Vec<(usize, Vec<u8>, bool)> =
-                        std::mem::take(&mut *fq.borrow_mut());
+                    let bytes = std::mem::take(&mut fq.borrow_mut().bytes);
                     for (_, b, is_err) in &bytes {
                         if *is_err {
                             self.diag_stderr(&String::from_utf8_lossy(b));
@@ -896,21 +1087,19 @@ impl<'a> Interp<'a> {
                 // dead generators — it only reports the stored return
                 // once the consumer exhausted the gen cleanly.
                 if !state.borrow().started {
-                    let v = self.exception(
-                        "Exception",
+                    return Err(self.gen_method_throw(
+                        "getReturn",
+                        &args.cells,
                         "Cannot get return value of a generator that hasn't returned",
-                    );
-                    return Err(self.throw(v));
+                    ));
                 }
                 self.gen_flush_out(&state, usize::MAX);
-                self.gen_raise_deferred(&state, "getReturn")?;
+                self.gen_raise_deferred(&state, "getReturn", &args.cells)?;
                 let st = state.borrow();
                 if st.pos < st.items.len() || st.closed || st.dead {
-                    let v = self.exception(
-                        "Exception",
-                        "Cannot get return value of a generator that hasn't returned",
-                    );
-                    return Err(self.throw(v));
+                    let msg = "Cannot get return value of a generator that hasn't returned";
+                    drop(st);
+                    return Err(self.gen_method_throw("getReturn", &args.cells, msg));
                 }
                 Ok(Some(st.return_val.clone()))
             }
@@ -956,6 +1145,17 @@ impl<'a> Interp<'a> {
                     let mut death = None;
                     if let Err(e) = self.method_invoke(o.clone(), "rewind", CallArgs::empty()) {
                         death = Some(e);
+                    }
+                    // A gen inner's destruction journal, snapshotted
+                    // right after its start — the drain below prunes
+                    // it, but the OUTER gen's force-close replays the
+                    // regions the inner was suspended inside.
+                    if death.is_none() {
+                        if let Some(crate::value::ObjectInternal::Generator(ist)) =
+                            &o.borrow().internal
+                        {
+                            self.gen_yield_from_fin = Some((*ist.borrow().fin_q.borrow()).clone());
+                        }
                     }
                     while death.is_none() {
                         match self.method_invoke(o.clone(), "valid", CallArgs::empty()) {
