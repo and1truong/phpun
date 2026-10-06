@@ -2547,13 +2547,29 @@ impl<'a> Interp<'a> {
                         _ => false,
                     };
                     if !ok {
-                        // zend names the ctor's DECLARING scope (the
-                        // builtin ancestor — Exception for a userland
-                        // subclass), not the constructed class.
-                        let cls_name = self
-                            .find_method_in(&ob.class, "__construct")
-                            .map(|(_, c)| c.name().to_string())
-                            .unwrap_or_else(|| ob.class.name().to_string());
+                        // zend names the ctor's DECLARING scope — the
+                        // ROOT builtin throwable ancestor whose internal
+                        // __construct stub the method descends from
+                        // (Exception for the Exception tree, Error for
+                        // the Error tree). A userland override in the
+                        // middle of the chain does not relabel it.
+                        let mut cls_name = ob.class.name().to_string();
+                        let mut cur = Some(ob.class.clone());
+                        while let Some(c) = cur {
+                            let internal = c.decl.methods.iter().any(|m| {
+                                m.decl.name.eq_ignore_ascii_case("__construct")
+                                    && m.decl.body.is_empty()
+                                    && m.decl.line == 0
+                            });
+                            if internal {
+                                cls_name = c.name().to_string();
+                            }
+                            cur = c
+                                .decl
+                                .parent
+                                .as_ref()
+                                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                        }
                         let tn = self.zval_type_name(&pv);
                         return Err(self.spl_throw(
                             "TypeError",
