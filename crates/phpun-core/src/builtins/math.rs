@@ -184,8 +184,13 @@ pub(crate) fn dispatch(
         "hypot" => Value::Float(arg(args, 0).to_float().hypot(arg(args, 1).to_float())),
         "rand" | "mt_rand" | "random_int" => {
             use std::time::{SystemTime, UNIX_EPOCH};
-            let lo = arg(args, 0).to_int();
-            let hi = arg(args, 1).to_int();
+            // OptReq stub is all-or-none — zero args = full mt range
+            // (partial binding is rejected in resolve_named_builtin).
+            let (lo, hi) = if args.is_empty() {
+                (0, 2147483647)
+            } else {
+                (arg(args, 0).to_int(), arg(args, 1).to_int())
+            };
             let seed = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
