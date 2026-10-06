@@ -125,10 +125,15 @@ impl<'a> Interp<'a> {
                     .any(|m| m.eq_ignore_ascii_case("null") || m.eq_ignore_ascii_case("mixed"))
         };
         for (i, p) in d.params.iter().enumerate() {
+            // Dedup is per compile unit — a re-include/re-eval of
+            // the same file re-emits the deprecation (zend compiles
+            // each unit fresh), while a unit's own decl sites stay
+            // deduped against exec-time re-checks.
             if implicit_nullable(p)
-                && self
-                    .dep_seen
-                    .insert(format!("{}\0{}\0{}", dep_file, d.line, p.name))
+                && self.dep_seen.insert(format!(
+                    "{}\0{}\0{}\0{}",
+                    self.cur_unit_id, dep_file, d.line, p.name
+                ))
             {
                 self.cur_line = d.line;
                 self.deprecated(&format!(
@@ -143,9 +148,10 @@ impl<'a> Interp<'a> {
                 for q in &d.params[..i] {
                     if q.default.is_some()
                         && !implicit_nullable(q)
-                        && self
-                            .dep_seen
-                            .insert(format!("{}\0{}\0{}\0opt", dep_file, d.line, q.name))
+                        && self.dep_seen.insert(format!(
+                            "{}\0{}\0{}\0{}\0opt",
+                            self.cur_unit_id, dep_file, d.line, q.name
+                        ))
                     {
                         self.cur_line = d.line;
                         self.deprecated(&format!(
