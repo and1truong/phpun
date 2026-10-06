@@ -307,7 +307,10 @@ impl<'a> Interp<'a> {
         if let Value::Object(o) = v {
             let o = o.borrow();
             let class = o.class.name().to_string();
-            let is_parse_err = self.is_a(&o.class, "ParseError");
+            // Only the exact builtin ParseError class takes the plain
+            // `Parse error:` render — subclasses (and any other
+            // Throwable) render the `Uncaught X:` block.
+            let is_parse_err = class == "ParseError";
             let msg = o
                 .props
                 .get("message")
@@ -352,10 +355,12 @@ impl<'a> Interp<'a> {
             drop(o);
             if eval_ctx > 0 {
                 // ParseError inside eval'd code prints the plain
-                // `Parse error:` form (tests/lang/019).
+                // `Parse error:` form (tests/lang/019) — `file` is
+                // already the `FILE(N) : eval()'d code` composite and
+                // eval_ctx the line inside the eval string.
                 self.emit(&format!(
-                    "\nParse error: {} in {}({}) : eval()'d code on line {}\n",
-                    msg, file, line, eval_ctx
+                    "\nParse error: {} in {} on line {}\n",
+                    msg, file, eval_ctx
                 ));
             } else if is_parse_err {
                 // Any uncaught ParseError renders Zend's plain
@@ -471,11 +476,21 @@ impl<'a> Interp<'a> {
     /// Declaration/linking-time fatals (Cannot redeclare, abstract
     /// method, class-const redefinition, variance, ...) are
     /// compile-class errors in Zend: they always print a `Stack
-    /// trace:` block with the live frames — `#0 {main}` at top level —
-    /// unlike plain runtime E_ERRORs which show no trace.
+    /// trace:` block — unlike plain runtime E_ERRORs which show no
+    /// trace. These sites all fire at EXEC time (conditional decls),
+    /// so the block carries the live call chain — `#0 {main}` at top
+    /// level, the real frames inside a function call.
     pub(in crate::interp) fn decl_fatal_ctx(&mut self, mut e: PhpError) -> PhpError {
         if matches!(e.kind, ErrorKind::Fatal) {
-            e.trace = Some(self.compile_err_frames());
+            e.trace = Some(
+                self.call_trace
+                    .iter()
+                    .rev()
+                    .filter(|f| !crate::value::trace_frame_hidden(f))
+                    .enumerate()
+                    .map(|(i, f)| crate::value::trace_frame_str_at(f, i))
+                    .collect(),
+            );
         }
         e
     }

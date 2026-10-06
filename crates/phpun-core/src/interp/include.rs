@@ -134,6 +134,12 @@ impl<'a> Interp<'a> {
             }
         };
         let canon = path.canonicalize().unwrap_or(path);
+        // Zend's include/require backtrace entries carry the RESOLVED
+        // canonical path as their arg (trace_arg truncates it to 15
+        // chars at render).
+        if let Some(f) = self.call_trace.last_mut() {
+            f.args[0] = cell(Value::str(canon.display().to_string()));
+        }
         if matches!(kind, IncludeKind::IncludeOnce | IncludeKind::RequireOnce) {
             if self.included.contains(&canon) {
                 inc_pop(self);
@@ -163,13 +169,14 @@ impl<'a> Interp<'a> {
                         // catchable ParseError in Zend — attributed to
                         // the included file — like eval()'d code does.
                         let msg = e.message.clone();
+                        // The throwable's own trace omits the include
+                        // pseudo-frame (Zend: `#0 file(N): deep()
+                        // #1 {main}` — include frames are internal).
+                        inc_pop(self);
                         let v = self.exception("ParseError", &msg);
                         if let Value::Object(o) = &v {
                             if let Some(ObjectInternal::Exception {
-                                file,
-                                line,
-                                thrown,
-                                ..
+                                file, line, thrown, ..
                             }) = &mut o.borrow_mut().internal
                             {
                                 // getFile() is the bad file; getLine()
@@ -181,7 +188,6 @@ impl<'a> Interp<'a> {
                                 *thrown = e.line as u32;
                             }
                         }
-                        inc_pop(self);
                         self.pending_exception = Some(v);
                         return Err(PhpError {
                             trace: None,
@@ -242,7 +248,10 @@ impl<'a> Interp<'a> {
         // ...and it is a fresh op_array — a new compile-unit serial
         // for `static` decl site identity.
         let saved_unit = self.begin_unit();
-        let flow = match Self::const_closure_gate(&stmts).and_then(|_| self.hoist_funcs(&stmts)) {
+        let flow = match Self::const_closure_gate(&stmts)
+            .and_then(|_| self.flow_gate(&stmts))
+            .and_then(|_| self.hoist_funcs(&stmts))
+        {
             Err(mut e) => {
                 // Compile fatals raised while compiling the included file
                 // attribute to the included file (cur_file still holds it
@@ -348,18 +357,19 @@ impl<'a> Interp<'a> {
                 let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
                 // ...a fresh op_array: its own unit serial too.
                 let saved_unit = self.begin_unit();
-                let flow = match Self::const_closure_gate(&stmts) {
-                    Err(mut e) => {
-                        // Gate errors are compile fatals of the eval'd
-                        // unit — attribute to the eval()'d-code context
-                        // and carry the live backtrace (Zend compiles
-                        // eval'd code at the call site).
-                        self.last_err_file = self.cur_file.clone();
-                        e.trace = Some(self.compile_err_frames());
-                        self.err_flow(e)
-                    }
-                    Ok(()) => self.exec_block(&stmts),
-                };
+                let flow =
+                    match Self::const_closure_gate(&stmts).and_then(|_| self.flow_gate(&stmts)) {
+                        Err(mut e) => {
+                            // Gate errors are compile fatals of the eval'd
+                            // unit — attribute to the eval()'d-code context
+                            // and carry the live backtrace (Zend compiles
+                            // eval'd code at the call site).
+                            self.last_err_file = self.cur_file.clone();
+                            e.trace = Some(self.compile_err_frames());
+                            self.err_flow(e)
+                        }
+                        Ok(()) => self.exec_block(&stmts),
+                    };
                 self.loop_depth = saved_depth;
                 self.cur_unit_id = saved_unit;
                 // break/continue/goto leaking out of the eval'd unit are
@@ -419,9 +429,22 @@ impl<'a> Interp<'a> {
                 let msg = e.message.clone();
                 let v = self.exception("ParseError", &msg);
                 if let Value::Object(o) = &v {
-                    if let Some(ObjectInternal::Exception { eval_ctx, .. }) =
-                        &mut o.borrow_mut().internal
+                    if let Some(ObjectInternal::Exception {
+                        file,
+                        line,
+                        thrown,
+                        eval_ctx,
+                        ..
+                    }) = &mut o.borrow_mut().internal
                     {
+                        // getFile() is the composite eval context
+                        // (`FILE(N) : eval()'d code`); getLine() is
+                        // the error's own line inside the eval
+                        // string. eval_ctx stays >0 as the marker the
+                        // uncaught render keys on.
+                        *file = format!("{}({}) : eval()'d code", self.cur_file, self.cur_line);
+                        *line = e.line as u32;
+                        *thrown = e.line as u32;
                         *eval_ctx = e.line as u32;
                     }
                 }

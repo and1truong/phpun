@@ -122,7 +122,7 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
             _ => Some(t),
         })
         .collect();
-    let bracket_err = bracket_check(&toks, eof_line).err();
+    let bracket_err = bracket_check(&toks, eof_line);
     let mut p = Parser::new(&toks);
     let mut stmts = match p.program() {
         Ok(s) => s,
@@ -137,11 +137,7 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
             if let Some((be, bpos)) = bracket_err {
                 let mut p2 = Parser::new(&toks[..bpos]);
                 match p2.program() {
-                    Err(pe2)
-                        if !pe2
-                            .message
-                            .starts_with("syntax error, unexpected end of") =>
-                    {
+                    Err(pe2) if !pe2.message.starts_with("syntax error, unexpected end of") => {
                         return Err(pe2);
                     }
                     _ => return Err(be),
@@ -202,10 +198,7 @@ impl<'a> Parser<'a> {
 /// back with the token index where the scanner would have died
 /// (`toks.len()` for an EOF-unclosed bracket) so the caller can order
 /// it against parser errors by position.
-fn bracket_check(
-    toks: &[crate::lexer::Lexed],
-    eof_line: usize,
-) -> Result<(), (PhpError, usize)> {
+fn bracket_check(toks: &[crate::lexer::Lexed], eof_line: usize) -> Option<(PhpError, usize)> {
     let mut stack: Vec<(&'static str, usize)> = Vec::new();
     for (i, t) in toks.iter().enumerate() {
         let Token::Op(op) = &t.token else { continue };
@@ -226,10 +219,10 @@ fn bracket_check(
                         } else {
                             format!("Unclosed '{}' does not match '{}'", o, op)
                         };
-                        return Err((PhpError::parse(msg, t.line), i));
+                        return Some((PhpError::parse(msg, t.line), i));
                     }
                     None => {
-                        return Err((PhpError::parse(format!("Unmatched '{}'", op), t.line), i));
+                        return Some((PhpError::parse(format!("Unmatched '{}'", op), t.line), i));
                     }
                 }
             }
@@ -246,9 +239,9 @@ fn bracket_check(
         } else {
             format!("Unclosed '{}'", o)
         };
-        return Err((PhpError::parse(msg, eof_line), toks.len()));
+        return Some((PhpError::parse(msg, eof_line), toks.len()));
     }
-    Ok(())
+    None
 }
 
 /// A compile-time diagnostic produced while re-lexing an embedded

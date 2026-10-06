@@ -372,7 +372,7 @@ impl<'a> Interp<'a> {
                         .entry(name.clone())
                         .or_default();
                     let dup = sites.iter().any(|(u, l)| u == &site.0 && *l != site.1);
-                    sites.insert(site.clone());
+                    sites.insert(site);
                     if dup {
                         // A compile fatal in Zend — carry the compile-
                         // context backtrace (include chain minus context).
