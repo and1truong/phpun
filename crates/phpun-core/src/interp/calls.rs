@@ -1947,6 +1947,37 @@ impl<'a> Interp<'a> {
         // Callee `Stmt::Line` markers must not leak into the caller:
         // diagnostics after the call report the call-site line.
         let saved_line = self.cur_line;
+        let fr = self.call_site_frame(decl, &args);
+        self.call_trace.push(fr);
+        self.last_call_by_ref = decl.by_ref;
+        let r = self.bind_and_run_inner(decl, args, unused);
+        // Overwrite (don't restore): the flag must describe THIS callee even
+        // though nested calls overwrote it during the body.
+        self.last_call_by_ref = decl.by_ref;
+        self.call_trace.pop();
+        self.cur_line = saved_line;
+        // Zend decrefs the frame's CVs at unwind — a local object
+        // whose last strong refs are that frame's cells runs its
+        // __destruct now (bug52361). A dtor error on a clean return
+        // replaces the result and aborts; during unwind it chains —
+        // destruct_frame_objs guards that itself.
+        if let Some(f) = self.last_popped_frame.take() {
+            let dtor_err = self.destruct_frame_objs(&f).err();
+            match (r, dtor_err) {
+                (Ok(_), Some(e)) => return Err(e),
+                (r, _) => return r,
+            }
+        }
+        r
+    }
+
+    /// The callee's call-trace frame for a call about to be dispatched —
+    /// call-site file/line resolved like zend (internal callback drivers
+    /// render `[internal function]`, hidden trampolines like
+    /// call_user_func lend their own site) plus trace-format args.
+    /// Arity/binding failures reuse this so a callee that never ran a
+    /// body still appears in the exception's trace (probe11).
+    fn call_site_frame(&mut self, decl: &FunctionDecl, args: &CallArgs) -> TraceFrame {
         // A callback invoked from inside a builtin's own machinery
         // (internal_cb: ob handlers, sort callbacks) has call site
         // `[internal function]`; engine callbacks like the error handler
@@ -1977,7 +2008,7 @@ impl<'a> Interp<'a> {
                 .map(|f| f.file.clone())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| self.cur_file.clone());
-            (sf, saved_line as u32)
+            (sf, self.cur_line as u32)
         };
         // Trace args are the send list normalized through the last
         // bound slot (unbound params render null; named args appear in
@@ -2031,8 +2062,7 @@ impl<'a> Interp<'a> {
             }
             t
         };
-        let fr = self
-            .stack
+        self.stack
             .last()
             .map(|f| TraceFrame {
                 // fn_name is already the Zend scope name —
@@ -2075,28 +2105,7 @@ impl<'a> Interp<'a> {
                 args: targs,
                 named_args: targs_named,
                 internal: false,
-            });
-        self.call_trace.push(fr);
-        self.last_call_by_ref = decl.by_ref;
-        let r = self.bind_and_run_inner(decl, args, unused);
-        // Overwrite (don't restore): the flag must describe THIS callee even
-        // though nested calls overwrote it during the body.
-        self.last_call_by_ref = decl.by_ref;
-        self.call_trace.pop();
-        self.cur_line = saved_line;
-        // Zend decrefs the frame's CVs at unwind — a local object
-        // whose last strong refs are that frame's cells runs its
-        // __destruct now (bug52361). A dtor error on a clean return
-        // replaces the result and aborts; during unwind it chains —
-        // destruct_frame_objs guards that itself.
-        if let Some(f) = self.last_popped_frame.take() {
-            let dtor_err = self.destruct_frame_objs(&f).err();
-            match (r, dtor_err) {
-                (Ok(_), Some(e)) => return Err(e),
-                (r, _) => return r,
-            }
-        }
-        r
+            })
     }
 
     /// PHP's compile-time checks on typed params (tests/lang/type_hints_*):
@@ -3535,7 +3544,7 @@ impl<'a> Interp<'a> {
         // is the positional-only form.
         if args.named.is_empty() && args.len() < required {
             self.stack.pop();
-            return self.fail(PhpError::uncaught(
+            let mut e = PhpError::uncaught(
                 "ArgumentCountError",
                 format!(
                     "Too few arguments to function {}(), {} passed{} and {} {} expected",
@@ -3550,7 +3559,9 @@ impl<'a> Interp<'a> {
                     required
                 ),
                 0,
-            ));
+            );
+            e.thrown_line = Some(decl.line);
+            return self.fail(e);
         }
         // Named arguments resolve against decl.params by name
         // (Zend/tests/named_params): unknown names land in a trailing
@@ -3992,11 +4003,13 @@ impl<'a> Interp<'a> {
                     // args (the positional count check runs earlier).
                     let fname = self.decl_fname(decl);
                     self.stack.pop();
-                    return self.fail(PhpError::uncaught(
+                    let mut e = PhpError::uncaught(
                         "ArgumentCountError",
                         format!("{}(): Argument #{} (${}) not passed", fname, i + 1, p.name),
                         0,
-                    ));
+                    );
+                    e.thrown_line = Some(decl.line);
+                    return self.fail(e);
                 }
             }
             let frame = self.stack.last_mut().unwrap();
@@ -4288,13 +4301,31 @@ impl<'a> Interp<'a> {
             .filter(|p| p.default.is_none() && !p.variadic)
             .count();
         if args.named.is_empty() && args.len() < required {
-            return self.fail(PhpError::uncaught(
+            // Zend verifies arity inside the callee's call frame — the
+            // thrown ArgumentCountError still lists the callee
+            // ([internal function] for builtin-driven callbacks) and
+            // attributes the throw to the declaration line
+            // (probe11/probe11c). A minimal exec frame gives
+            // call_site_frame the callee identity (C->m vs plain f()).
+            let mut frame = Frame::new(decl.name.clone());
+            frame.this_obj = this_obj.clone();
+            frame.scope_class = scope_class.clone();
+            frame.decl_class = self
+                .pending_decl_class
+                .clone()
+                .or_else(|| scope_class.clone());
+            self.stack.push(frame);
+            let fr = self.call_site_frame(decl, &args);
+            self.call_trace.push(fr);
+            let fname = self.decl_fname(decl);
+            self.stack.pop();
+            let mut e = PhpError::uncaught(
                 "ArgumentCountError",
                 format!(
                     "Too few arguments to function {}(), {} passed{} and {} {} expected",
-                    self.decl_fname(decl),
+                    fname,
                     args.len(),
-                    self.arg_err_in(0),
+                    self.arg_err_in(1),
                     if required == decl.params.len() {
                         "exactly"
                     } else {
@@ -4303,7 +4334,11 @@ impl<'a> Interp<'a> {
                     required
                 ),
                 0,
-            ));
+            );
+            e.thrown_line = Some(decl.line);
+            let r = self.fail(e);
+            self.call_trace.pop();
+            return r;
         }
         // A `yield`-bearing body makes the call a Generator factory:
         // the caller gets a Generator object immediately and the body
