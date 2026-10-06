@@ -65,7 +65,14 @@ impl<'a> Interp<'a> {
         &mut self,
         name: &Expr,
         args: &[Expr],
+        site: Option<usize>,
     ) -> Result<Value, PhpError> {
+        // The call's own site covers frames pushed during callee
+        // resolution (autoload); arg_cells re-sets it after arg eval so
+        // nested calls inside the args can't clobber it.
+        if let Some(s) = site {
+            self.send_line = Some(s);
+        }
         // Resolve callee name/value.
         let fname = match name {
             Expr::Str(s) => {
@@ -85,8 +92,13 @@ impl<'a> Interp<'a> {
                         .find_method_in(&cls, mn)
                         .map(|(m, _)| m.decl.params.clone())
                         .unwrap_or_default();
-                    let vals =
-                        self.arg_cells(args, &params, &format!("{}::{}()", cls.name(), mn), false)?;
+                    let vals = self.arg_cells(
+                        args,
+                        &params,
+                        &format!("{}::{}()", cls.name(), mn),
+                        false,
+                        site,
+                    )?;
                     return self.static_invoke_vis(cls, mn, vals, None, true);
                 }
                 s.to_string()
@@ -98,7 +110,7 @@ impl<'a> Interp<'a> {
                         // $closure() / $obj->__invoke()
                         let params = self.callable_params(&v);
                         let ctx = format!("{}()", self.callable_ctx_name(&v));
-                        let vals = self.arg_cells(args, &params, &ctx, false)?;
+                        let vals = self.arg_cells(args, &params, &ctx, false, site)?;
                         return self.call_value(&v, vals);
                     }
                     Value::Array(_) => {
@@ -107,7 +119,7 @@ impl<'a> Interp<'a> {
                         let c = self.fcc_val(&v)?;
                         let params = self.callable_params(&c);
                         let ctx = format!("{}()", self.callable_ctx_name(&c));
-                        let vals = self.arg_cells(args, &params, &ctx, false)?;
+                        let vals = self.arg_cells(args, &params, &ctx, false, site)?;
                         return self.call_value(&c, vals);
                     }
                     _ => self.conv_str(&v).unwrap_or_default(),
@@ -122,7 +134,7 @@ impl<'a> Interp<'a> {
                     .find_method_in(&cls, &mn)
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
-                let vals = self.arg_cells(args, &params, &format!("{}()", mn), false)?;
+                let vals = self.arg_cells(args, &params, &format!("{}()", mn), false, site)?;
                 let fwd = matches!(&**class, Expr::Const(_) | Expr::Str(_) | Expr::AnonClass(_));
                 return self.static_invoke_vis(cls, &mn, vals, None, fwd);
             }
@@ -132,11 +144,11 @@ impl<'a> Interp<'a> {
                     // `($this->cb)()` — a dynamic string callable like
                     // `$f()`: literal class, $this never forwards.
                     let n = crate::value::lossy(s).to_string();
-                    return self.call_named(&n, args);
+                    return self.call_named(&n, args, site);
                 }
                 let params = self.callable_params(&v);
                 let ctx = format!("{}()", self.callable_ctx_name(&v));
-                let vals = self.arg_cells(args, &params, &ctx, false)?;
+                let vals = self.arg_cells(args, &params, &ctx, false, site)?;
                 return self.call_value(&v, vals);
             }
             _ => {
@@ -146,42 +158,34 @@ impl<'a> Interp<'a> {
                     Value::Callable(_) | Value::Object(_) => {
                         let params = self.callable_params(&v);
                         let ctx = format!("{}()", self.callable_ctx_name(&v));
-                        let vals = self.arg_cells(args, &params, &ctx, false)?;
+                        let vals = self.arg_cells(args, &params, &ctx, false, site)?;
                         return self.call_value(&v, vals);
                     }
                     Value::Array(_) => {
                         let c = self.fcc_val(&v)?;
                         let params = self.callable_params(&c);
                         let ctx = format!("{}()", self.callable_ctx_name(&c));
-                        let vals = self.arg_cells(args, &params, &ctx, false)?;
+                        let vals = self.arg_cells(args, &params, &ctx, false, site)?;
                         return self.call_value(&c, vals);
                     }
                     _ => self.conv_str(&v).unwrap_or_default(),
                 }
             }
         };
-        self.call_named(&fname, args)
-    }
-
-    /// Sees through the parser's `argline` call-site marker (last arg)
-    /// to the arg expression itself.
-    pub(in crate::interp) fn unmark_arg(e: &Expr) -> &Expr {
-        match e {
-            Expr::Binary {
-                op: "argline", r, ..
-            } => r,
-            _ => e,
-        }
+        self.call_named(&fname, args, site)
     }
 
     /// Evaluate args into cells (by-ref params alias caller storage).
-    /// `named` params collected as (name, cell) too.
+    /// `named` params collected as (name, cell) too. `site` is the
+    /// call's own source line — recorded as the frame's call site once
+    /// arg evaluation (which may push nested frames) has finished.
     pub(in crate::interp) fn arg_cells(
         &mut self,
         args: &[Expr],
         decl: &[Param],
         ctx: &str,
         internal: bool,
+        site: Option<usize>,
     ) -> Result<CallArgs, PhpError> {
         let mut out = CallArgs::empty();
         // Position of the *next positional* arg for by-ref lookup — named
@@ -189,18 +193,6 @@ impl<'a> Interp<'a> {
         let mut pos = 0usize;
         let mut seen_named = false;
         for a in args {
-            // The parser marks the LAST arg with its line — Zend
-            // attributes a frame's call-site to the last evaluated
-            // argument (multi-line calls).
-            if let Expr::Binary {
-                op: "argline", l, ..
-            } = a
-            {
-                if let Expr::Int(n) = l.as_ref() {
-                    self.send_line = Some(*n as usize);
-                }
-            }
-            let a = Self::unmark_arg(a);
             let (name, expr): (Option<String>, &Expr) = match a {
                 Expr::Binary {
                     op: "named", l, r, ..
@@ -406,6 +398,11 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        // All args evaluated — the enclosing call's own line is the
+        // frame's site (nested calls inside the args set their own).
+        if let Some(s) = site {
+            self.send_line = Some(s);
+        }
         Ok(out)
     }
 
@@ -502,7 +499,11 @@ impl<'a> Interp<'a> {
         &mut self,
         fname: &str,
         args: &[Expr],
+        site: Option<usize>,
     ) -> Result<Value, PhpError> {
+        if let Some(s) = site {
+            self.send_line = Some(s);
+        }
         // `\u{1}f` marks a source-literal unqualified call — only it may
         // fall back `ns\f` -> `f`; dynamic names are fully qualified.
         let (unqualified, lname) = match fname.strip_prefix('\u{1}') {
@@ -537,8 +538,13 @@ impl<'a> Interp<'a> {
                 .find_method_in(&cls, mn)
                 .map(|(m, _)| m.decl.params.clone())
                 .unwrap_or_default();
-            let vals =
-                self.arg_cells(args, &params, &format!("{}::{}()", cls.name(), mn), false)?;
+            let vals = self.arg_cells(
+                args,
+                &params,
+                &format!("{}::{}()", cls.name(), mn),
+                false,
+                site,
+            )?;
             return self.static_invoke_vis(cls, mn, vals, None, false);
         }
         let mut decl = self.functions.get(&lname).cloned();
@@ -608,6 +614,7 @@ impl<'a> Interp<'a> {
                 fname.trim_start_matches('\u{1}').trim_start_matches('\\')
             ),
             decl.is_none(),
+            site,
         )?;
         if !ns_resolved {
             // zend's ZEND_FRAMELESS_FUNCTION for a compile-time-bound
@@ -624,9 +631,7 @@ impl<'a> Interp<'a> {
                 && matches!(lname.as_str(), "min" | "max")
                 && argvals.cells.len() == 2
                 && argvals.named.is_empty()
-                && !args
-                    .iter()
-                    .any(|a| matches!(Self::unmark_arg(a), Expr::Unpack(_)))
+                && !args.iter().any(|a| matches!(a, Expr::Unpack(_)))
                 && (fname.starts_with('\\') || (unqualified && self.caller_ns().is_empty()))
             {
                 let lhs = argvals.cells[0].borrow().clone();
@@ -664,9 +669,7 @@ impl<'a> Interp<'a> {
             // Zend can't specialize them — the frame is real.
             let literal = fname.starts_with('\\')
                 || (fname.starts_with('\u{1}') && self.caller_ns().is_empty());
-            let visible = args
-                .iter()
-                .any(|a| matches!(Self::unmark_arg(a), Expr::Unpack(_)))
+            let visible = args.iter().any(|a| matches!(a, Expr::Unpack(_)))
                 || !(literal && zend_literal_no_frame(&lname, args));
             if let Some(v) = self.call_builtin(&lname, &argvals, visible)? {
                 return Ok(v);
@@ -4474,10 +4477,10 @@ fn zend_literal_no_frame(name: &str, args: &[Expr]) -> bool {
     }
     // Named args make it a dynamic arg-bind (sprintf's '*' variadic
     // rejects them anyway) — Zend emits a real call, not a rope.
-    if args.iter().any(|a| {
-        matches!(a, Expr::Binary { op: "named", .. })
-            || matches!(Interp::unmark_arg(a), Expr::Binary { op: "named", .. })
-    }) {
+    if args
+        .iter()
+        .any(|a| matches!(a, Expr::Binary { op: "named", .. }))
+    {
         return false;
     }
     // Compile-time-constant format — a quoted literal is `Expr::Str`,

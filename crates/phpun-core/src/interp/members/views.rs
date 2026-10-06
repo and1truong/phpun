@@ -477,7 +477,11 @@ impl<'a> Interp<'a> {
                                 .map(|c| c.borrow().clone())
                                 .unwrap_or(Value::Null);
                             let cn = self.conv_str(&cn)?.to_string();
-                            Ok(Some(self.call_named(&format!("{}::{}", cn, mn), &[])?))
+                            Ok(Some(self.call_named(
+                                &format!("{}::{}", cn, mn),
+                                &[],
+                                None,
+                            )?))
                         }
                         _ => Ok(Some(Value::Null)),
                     }
@@ -1401,7 +1405,6 @@ impl<'a> Interp<'a> {
                 };
                 let mut arr = PhpArray::default();
                 for e in exprs.iter() {
-                    let e = Self::unmark_arg(e);
                     if let Expr::Binary { op: "named", l, r } = e {
                         if let Expr::Str(n) = l.as_ref() {
                             let v = self.eval_const(r)?;
@@ -1469,7 +1472,7 @@ impl<'a> Interp<'a> {
                         .args
                         .iter()
                         .find_map(|a| {
-                            if let Expr::Binary { op: "named", l, r } = Self::unmark_arg(a) {
+                            if let Expr::Binary { op: "named", l, r } = a {
                                 if matches!(l.as_ref(), Expr::Str(n) if n == "flags") {
                                     return Some(r.as_ref());
                                 }
@@ -1520,7 +1523,6 @@ impl<'a> Interp<'a> {
                     let mut cells = Vec::new();
                     let mut named = Vec::new();
                     for e in aexprs.iter() {
-                        let e = Self::unmark_arg(e);
                         if let Expr::Binary { op: "named", l, r } = e {
                             if let Expr::Str(n) = l.as_ref() {
                                 named.push((n.clone(), cell(self.eval_const(r)?), true, false));

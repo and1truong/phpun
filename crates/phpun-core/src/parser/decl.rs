@@ -843,14 +843,6 @@ impl<'a> Parser<'a> {
                             // which warn at bind time).
                             let mut seen = std::collections::HashSet::new();
                             for a in &list {
-                                // See through the last-arg `argline`
-                                // call-site marker.
-                                let a = match a {
-                                    Expr::Binary {
-                                        op: "argline", r, ..
-                                    } => r.as_ref(),
-                                    _ => a,
-                                };
                                 if let Expr::Binary { op: "named", l, .. } = a {
                                     if let Expr::Str(n) = l.as_ref() {
                                         if !seen.insert(n.clone()) {

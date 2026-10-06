@@ -358,11 +358,12 @@ pub struct Interp<'a> {
     in_handler: bool,
     /// Current line estimate for error messages (best-effort).
     pub cur_line: usize,
-    /// Line of the most recently evaluated call argument — Zend
-    /// attributes a pushed frame's call site to the line of its last
-    /// SEND op, not the call's first token (`f(\n g()\n)` sites at
-    /// the arg line). Set by the parser's `argline` arg wrapper and
-    /// cleared at each `Stmt::Line`.
+    /// Source line of the innermost call currently dispatching — Zend
+    /// sites a pushed frame at the call's own line (the DO_FCALL op
+    /// line: callee-name/`(` token for `f(...)`, member-name for
+    /// `->m(...)`/`::m(...)`, class expr for `new X(...)`). Set by the
+    /// call dispatchers right after their args evaluate, cleared at
+    /// each `Stmt::Line`.
     pub(in crate::interp) send_line: Option<usize>,
     /// Active generator body's yield collector — `Expr::Yield` pushes
     /// (key, value) here while a generator function's body runs.
@@ -1256,7 +1257,7 @@ impl<'a> Interp<'a> {
                 }
                 Self::gate_expr(f, m)
             }
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, .. } => {
                 Self::gate_expr(name, m)?;
                 for a in args {
                     Self::gate_expr(a, m)?;
@@ -1322,7 +1323,9 @@ impl<'a> Interp<'a> {
                 }
                 Ok(())
             }
-            Expr::StaticCallDyn { class, name, args } => {
+            Expr::StaticCallDyn {
+                class, name, args, ..
+            } => {
                 Self::gate_expr(class, m)?;
                 Self::gate_expr(name, m)?;
                 for a in args {
@@ -1344,7 +1347,7 @@ impl<'a> Interp<'a> {
                 }
                 Ok(())
             }
-            Expr::New { class, args } => {
+            Expr::New { class, args, .. } => {
                 Self::gate_expr(class, m)?;
                 for a in args {
                     Self::gate_expr(a, m)?;
@@ -2458,9 +2461,9 @@ impl<'a> Interp<'a> {
             o.props.insert("code".into(), cell(Value::Int(0)));
             o.internal = Some(ObjectInternal::Exception {
                 file: self.diag_file(),
-                line: self.cur_line as u32,
+                line: self.send_line.unwrap_or(self.cur_line) as u32,
                 trace: String::new(),
-                thrown: self.cur_line as u32,
+                thrown: self.send_line.unwrap_or(self.cur_line) as u32,
                 full_msg: String::new(),
                 eval_ctx: 0,
                 frames: Rc::new(self.call_trace.clone()),

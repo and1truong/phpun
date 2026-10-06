@@ -389,6 +389,10 @@ pub enum Expr {
     Call {
         name: Box<Expr>,
         args: Vec<Expr>,
+        /// Line the call's pushed frames are sited at: the name token's
+        /// line for `name(...)`, the `(` line for `callable_expr(...)`
+        /// (zend_compile_call_common's `lineno`).
+        site: usize,
     },
     Index {
         e: Box<Expr>,
@@ -430,6 +434,9 @@ pub enum Expr {
     New {
         class: Box<Expr>,
         args: Vec<Expr>,
+        /// Trace site: the class expression's first-token line
+        /// (ZEND_AST_NEW inherits child0's lineno).
+        site: usize,
     },
     /// `$obj->prop` / `$obj->method()` / `?->`.
     Prop {
@@ -442,6 +449,9 @@ pub enum Expr {
         name: PropName,
         args: Vec<Expr>,
         nullsafe: bool,
+        /// Trace site: the member-name token's line
+        /// (zend_ast_get_lineno(method_ast)).
+        site: usize,
     },
     /// `ClassName::CONST` / `::method()` / `::$prop` / `className::class`.
     StaticProp {
@@ -455,12 +465,16 @@ pub enum Expr {
         class: Box<Expr>,
         name: String,
         args: Vec<Expr>,
+        /// Trace site: the member-name token's line.
+        site: usize,
     },
     /// `C::$var(...)` — static call whose method name is an expression.
     StaticCallDyn {
         class: Box<Expr>,
         name: Box<Expr>,
         args: Vec<Expr>,
+        /// Trace site: the member-name expression's first-token line.
+        site: usize,
     },
     ClassConst {
         class: Box<Expr>,

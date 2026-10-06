@@ -444,7 +444,7 @@ impl<'a> Interp<'a> {
                 Self::flow_expr(obj, sc)?;
                 Self::flow_expr(class, sc)
             }
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, .. } => {
                 Self::flow_expr(name, sc)?;
                 for a in args {
                     Self::flow_expr(a, sc)?;
@@ -490,7 +490,7 @@ impl<'a> Interp<'a> {
                 }
                 Ok(())
             }
-            Expr::New { class, args } => {
+            Expr::New { class, args, .. } => {
                 Self::flow_expr(class, sc)?;
                 for a in args {
                     Self::flow_expr(a, sc)?;
@@ -530,7 +530,9 @@ impl<'a> Interp<'a> {
                 }
                 Ok(())
             }
-            Expr::StaticCallDyn { class, name, args } => {
+            Expr::StaticCallDyn {
+                class, name, args, ..
+            } => {
                 Self::flow_expr(class, sc)?;
                 Self::flow_expr(name, sc)?;
                 for a in args {

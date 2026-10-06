@@ -347,11 +347,13 @@ impl<'a> Interp<'a> {
                     || t.as_ref().is_some_and(|t| Self::expr_uses_this_prop(t, pn))
                     || Self::expr_uses_this_prop(f, pn)
             }
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, .. } => {
                 Self::expr_uses_this_prop(name, pn)
                     || args.iter().any(|a| Self::expr_uses_this_prop(a, pn))
             }
-            Expr::StaticCallDyn { class, name, args } => {
+            Expr::StaticCallDyn {
+                class, name, args, ..
+            } => {
                 Self::expr_uses_this_prop(class, pn)
                     || Self::expr_uses_this_prop(name, pn)
                     || args.iter().any(|a| Self::expr_uses_this_prop(a, pn))
@@ -385,7 +387,7 @@ impl<'a> Interp<'a> {
                     .any(|e| Self::expr_uses_this_prop(e, pn))
                     || Self::stmts_use_this_prop(&c.decl.body, pn)
             }
-            Expr::New { class, args } => {
+            Expr::New { class, args, .. } => {
                 Self::expr_uses_this_prop(class, pn)
                     || args.iter().any(|a| Self::expr_uses_this_prop(a, pn))
             }
@@ -1100,7 +1102,11 @@ impl<'a> Interp<'a> {
         pn: &str,
         is_get: bool,
         args: &[Expr],
+        site: Option<usize>,
     ) -> Result<Value, PhpError> {
+        if let Some(s) = site {
+            self.send_line = Some(s);
+        }
         let kind = if is_get { "get" } else { "set" };
         // Borrow-free snapshot of the caller frame's hook context (the
         // outside/different-prop/different-kind rules are parse-time).
@@ -1241,6 +1247,11 @@ impl<'a> Interp<'a> {
             }
             vs
         };
+        // Arg eval may have pushed nested frames — restore this call's
+        // own site for the hook frame.
+        if let Some(s) = site {
+            self.send_line = Some(s);
+        }
         if let Some((h, c)) = hook {
             return self.run_hook(&o, &c, pn, &h, argvals.into_iter().next().map(cell));
         }

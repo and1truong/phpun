@@ -542,13 +542,14 @@ impl<'a> Parser<'a> {
                     })
                     .collect(),
             )),
-            Expr::Call { name, args } => match *name {
+            Expr::Call { name, args, site } => match *name {
                 Expr::Str(n) if n.eq_ignore_ascii_case("list") => {
                     Ok(Expr::List(args.into_iter().map(Some).collect()))
                 }
                 other => Ok(Expr::Call {
                     name: Box::new(other),
                     args,
+                    site,
                 }),
             },
             other => Ok(other),
@@ -993,15 +994,22 @@ impl<'a> Parser<'a> {
                 };
                 self.expect_op("]")?;
                 e = Expr::Index { e: Box::new(e), i };
-            } else if self.eat_op("(") {
+            } else if self.at_op("(") {
+                // `callable_expr(...)` — Zend sites the frame at the `(`.
+                let site = self.line();
+                self.pos += 1;
                 let args = self.args()?;
                 e = Self::fcc_wrap(Expr::Call {
                     name: Box::new(e),
                     args,
+                    site,
                 })?;
             } else if self.at_op("->") || self.at_op("?->") {
                 let nullsafe = self.at_op("?->");
                 self.pos += 1;
+                // Zend sites the frame at the member-name token's line
+                // (zend_ast_get_lineno(method_ast)).
+                let site = self.line();
                 let name = self.prop_name()?;
                 if self.at_op("(") {
                     self.pos += 1;
@@ -1011,6 +1019,7 @@ impl<'a> Parser<'a> {
                         name,
                         args,
                         nullsafe,
+                        site,
                     })?;
                 } else {
                     e = Expr::Prop {
@@ -1024,6 +1033,8 @@ impl<'a> Parser<'a> {
                     // `expr::(...)` first-class-callable-ish — unsupported
                     return Err(PhpError::parse("syntax error, unexpected (", self.line()));
                 }
+                // Member-name token line — the trace site for `C::m(...)`.
+                let site = self.line();
                 match self.next() {
                     Some(Token::Ident(n)) => {
                         if n == "class" {
@@ -1108,6 +1119,7 @@ impl<'a> Parser<'a> {
                                 class: Box::new(e),
                                 name: n,
                                 args,
+                                site,
                             })?;
                         } else {
                             e = Expr::ClassConst {
@@ -1127,6 +1139,7 @@ impl<'a> Parser<'a> {
                                 class: Box::new(e),
                                 name: Box::new(Expr::Var(n)),
                                 args,
+                                site,
                             })?;
                         } else {
                             // `C::$name` — a literal static prop name
@@ -1139,6 +1152,9 @@ impl<'a> Parser<'a> {
                     }
                     // `Cls::{expr}` / `Cls::${expr}` — dynamic name or call.
                     Some(Token::Op("{")) => {
+                        // `Cls::{expr}(...)` — member name = the inner
+                        // expr's first-token line.
+                        let site = self.line();
                         let inner = self.expr()?;
                         self.expect_op("}")?;
                         if self.at_op("(") {
@@ -1149,6 +1165,7 @@ impl<'a> Parser<'a> {
                                 name: PropName::Expr(Box::new(inner)),
                                 args,
                                 nullsafe: false,
+                                site,
                             };
                         } else {
                             e = Expr::StaticProp {
@@ -1159,15 +1176,17 @@ impl<'a> Parser<'a> {
                     }
                     Some(Token::Op("$")) => {
                         // `C::$${x}` / `C::${expr}` — name by expression.
-                        let inner = if self.at_op("{") {
+                        let (inner, isite) = if self.at_op("{") {
                             self.pos += 1;
+                            let il = self.line();
                             let inner = self.expr()?;
                             self.expect_op("}")?;
-                            inner
+                            (inner, il)
                         } else {
                             // `C::$$x` — name read from variable $x.
+                            let il = self.line();
                             match self.next() {
-                                Some(Token::Variable(n)) => Expr::Var(n),
+                                Some(Token::Variable(n)) => (Expr::Var(n), il),
                                 t => {
                                     return Err(PhpError::parse(
                                         format!("syntax error, unexpected {}", desc_t(t.as_ref())),
@@ -1184,6 +1203,7 @@ impl<'a> Parser<'a> {
                                 name: PropName::Expr(Box::new(inner)),
                                 args,
                                 nullsafe: false,
+                                site: isite,
                             };
                         } else {
                             e = Expr::StaticProp {
@@ -1318,16 +1338,6 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op(")")?;
-        // Zend attributes a call's pushed frames to the line of the last
-        // SEND op — the last argument's own line. Mark it for the interp.
-        if let Some((last, l)) = args.last_mut() {
-            let e = std::mem::replace(last, Expr::Null);
-            *last = Expr::Binary {
-                op: "argline",
-                l: Box::new(Expr::Int(*l as i64)),
-                r: Box::new(e),
-            };
-        }
         Ok(args.into_iter().map(|(e, _)| e).collect())
     }
 
@@ -1538,6 +1548,10 @@ impl<'a> Parser<'a> {
                     self.closure_expr()
                 } else if self.ident_is("new") {
                     self.pos += 1;
+                    // Trace site: the class expression's first-token
+                    // line (`new\nC(...)` sites at C, `new class` at
+                    // `class`).
+                    let site = self.line();
                     let (class, mut ctor_args) = self.new_class_expr()?;
                     if self.at_op("(") {
                         self.pos += 1;
@@ -1547,6 +1561,7 @@ impl<'a> Parser<'a> {
                     Ok(Expr::New {
                         class: Box::new(class),
                         args: ctor_args,
+                        site,
                     })
                 } else if self.ident_is("match") && matches!(self.peek2(), Some(Token::Op("("))) {
                     self.match_expr()
@@ -1641,6 +1656,8 @@ impl<'a> Parser<'a> {
                 } else {
                     // Bare identifier: constant or function name target. Qualified
                     // names (A\B) and function call args go through here.
+                    // Zend sites `name(...)` frames at the name's line.
+                    let site = self.line();
                     let name = self.name_path().unwrap_or_default();
                     if self.at_op("(") {
                         self.pos += 1;
@@ -1657,6 +1674,7 @@ impl<'a> Parser<'a> {
                         Self::fcc_wrap(Expr::Call {
                             name: Box::new(Expr::Str(resolved)),
                             args,
+                            site,
                         })
                     } else if self.at_op("::") {
                         // `X::…` — a class name in every form.
@@ -1677,6 +1695,7 @@ impl<'a> Parser<'a> {
                 // Fully-qualified name: \PHP_EOL, \Foo\Bar::baz, \func().
                 // The `\` marker is kept — downstream lookups treat a
                 // backslash-prefixed name as exact (no ns fallback).
+                let site = self.line();
                 let name = self.name_path().unwrap_or_default();
                 if name.is_empty() {
                     return Err(PhpError::parse(
@@ -1690,6 +1709,7 @@ impl<'a> Parser<'a> {
                     Self::fcc_wrap(Expr::Call {
                         name: Box::new(Expr::Str(name)),
                         args,
+                        site,
                     })
                 } else {
                     // `\true`/`\false`/`\null` are literals, not const

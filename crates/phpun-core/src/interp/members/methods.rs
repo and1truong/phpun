@@ -23,7 +23,7 @@ impl<'a> Interp<'a> {
         // traces (arg repr truncates at 15 chars via trace_arg).
         self.call_trace.push(TraceFrame {
             file: self.diag_file(),
-            line: self.cur_line as u32,
+            line: self.send_line.unwrap_or(self.cur_line) as u32,
             function: name.to_string(),
             class: Some(obj.borrow().class.name().to_string()),
             ty: "->".into(),
@@ -1709,7 +1709,11 @@ impl<'a> Interp<'a> {
         name: &PropName,
         args: &[Expr],
         nullsafe: bool,
+        site: Option<usize>,
     ) -> Result<Value, PhpError> {
+        if let Some(s) = site {
+            self.send_line = Some(s);
+        }
         let mn = Self::nul_trunc(&self.prop_name(name)?);
         let ov = self.eval(obj)?;
         match ov {
@@ -1719,7 +1723,7 @@ impl<'a> Interp<'a> {
                     .find_method_in(&o.borrow().class.clone(), &mn)
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
-                let argvals = self.arg_cells(args, &params, &format!("{}()", mn), false)?;
+                let argvals = self.arg_cells(args, &params, &format!("{}()", mn), false, site)?;
                 // method_invoke handles builtin (Throwable), __call, undefined.
                 self.method_invoke_vis(o.clone(), &mn, argvals)
             }
@@ -1740,7 +1744,7 @@ impl<'a> Interp<'a> {
                     CallableKind::Closure(d) => d.params.clone(),
                     _ => vec![],
                 };
-                let argvals = self.arg_cells(args, &params, &format!("{}()", mn), false)?;
+                let argvals = self.arg_cells(args, &params, &format!("{}()", mn), false, site)?;
                 // `$f->__invoke()` runs the internal Closure::__invoke —
                 // diagnostics name `Closure::__invoke` and drop the
                 // ", called in" suffix (closure_059).
@@ -1753,7 +1757,7 @@ impl<'a> Interp<'a> {
                 // `$fn->call($newThis, ...$args)`: bind with an omitted
                 // scope then invoke — previous scope preserved when the
                 // new instance is compatible (closure_036/038).
-                let argvals = self.arg_cells(args, &[], &format!("{}()", mn), false)?;
+                let argvals = self.arg_cells(args, &[], &format!("{}()", mn), false, site)?;
                 let mut ca = argvals;
                 let newthis = ca
                     .cells
@@ -1776,7 +1780,7 @@ impl<'a> Interp<'a> {
                 self.call_value(&Value::Callable(c), ca)
             }
             Value::Callable(c) if mn.eq_ignore_ascii_case("bindto") => {
-                let argvals = self.arg_cells(args, &[], &format!("{}()", mn), false)?;
+                let argvals = self.arg_cells(args, &[], &format!("{}()", mn), false, site)?;
                 let this = argvals.cells.first().map(|c| c.borrow().clone());
                 let scope = argvals.cells.get(1).map(|c| c.borrow().clone());
                 let new_this = match &this {
@@ -2194,7 +2198,7 @@ impl<'a> Interp<'a> {
                 // uncaught traces (named_params/attributes_named_flags).
                 self.call_trace.push(TraceFrame {
                     file: self.diag_file(),
-                    line: self.cur_line as u32,
+                    line: self.send_line.unwrap_or(self.cur_line) as u32,
                     function: name.to_string(),
                     class: Some(cls.name().to_string()),
                     ty: "->".into(),

@@ -3495,9 +3495,9 @@ impl<'a> Interp<'a> {
         let internal = if self.is_throwable_name(&cls.decl.name) {
             Some(ObjectInternal::Exception {
                 file: self.diag_file(),
-                line: self.cur_line as u32,
+                line: self.send_line.unwrap_or(self.cur_line) as u32,
                 trace: String::new(),
-                thrown: self.cur_line as u32,
+                thrown: self.send_line.unwrap_or(self.cur_line) as u32,
                 full_msg: String::new(),
                 eval_ctx: 0,
                 frames: Rc::new(self.call_trace.clone()),

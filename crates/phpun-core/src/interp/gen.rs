@@ -107,7 +107,7 @@ impl<'a> Interp<'a> {
                     || t.as_ref().is_some_and(|t| Self::expr_contains_yield(t))
                     || Self::expr_contains_yield(f)
             }
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, .. } => {
                 Self::expr_contains_yield(name) || args.iter().any(Self::expr_contains_yield)
             }
             Expr::MethodCall {
@@ -120,7 +120,9 @@ impl<'a> Interp<'a> {
             Expr::StaticCall { class, args, .. } => {
                 Self::expr_contains_yield(class) || args.iter().any(Self::expr_contains_yield)
             }
-            Expr::StaticCallDyn { class, name, args } => {
+            Expr::StaticCallDyn {
+                class, name, args, ..
+            } => {
                 Self::expr_contains_yield(class)
                     || Self::expr_contains_yield(name)
                     || args.iter().any(Self::expr_contains_yield)
@@ -150,7 +152,7 @@ impl<'a> Interp<'a> {
                             || Self::expr_contains_yield(&a.result)
                     })
             }
-            Expr::New { class, args } => {
+            Expr::New { class, args, .. } => {
                 Self::expr_contains_yield(class) || args.iter().any(Self::expr_contains_yield)
             }
             Expr::ClassConst { class, .. } => Self::expr_contains_yield(class),

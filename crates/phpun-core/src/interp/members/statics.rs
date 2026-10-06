@@ -220,7 +220,12 @@ impl<'a> Interp<'a> {
         class: &Expr,
         name: &str,
         args: &[Expr],
+        site: Option<usize>,
     ) -> Result<Value, PhpError> {
+        // member_class_of may autoload — site those frames at this call.
+        if let Some(s) = site {
+            self.send_line = Some(s);
+        }
         let (cls, tname) = self.member_class_of(class)?;
         if let Some(t) = tname {
             self.deprecated(&format!(
@@ -232,7 +237,7 @@ impl<'a> Interp<'a> {
             .find_method_in(&cls, name)
             .map(|m| m.0.decl.params.clone())
             .unwrap_or_default();
-        let argvals = self.arg_cells(args, &params, &format!("{}()", name), false)?;
+        let argvals = self.arg_cells(args, &params, &format!("{}()", name), false, site)?;
         // Only a syntactic class ref (self/parent/static/Foo) is a
         // forwarding call; `$x::m()` is not (bug48533).
         let fwd = matches!(class, Expr::Const(_) | Expr::Str(_) | Expr::AnonClass(_));

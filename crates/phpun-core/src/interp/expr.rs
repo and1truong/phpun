@@ -124,7 +124,7 @@ impl<'a> Interp<'a> {
                     self.eval(f)
                 }
             }
-            Expr::Call { name, args } => self.call(name, args),
+            Expr::Call { name, args, site } => self.call(name, args, Some(*site)),
             Expr::Fcc(inner) => self.fcc(inner),
             Expr::Unpack(_) | Expr::FccMark => {
                 self.fail(PhpError::fatal("argument unpacking/FCC outside of call", 0))
@@ -529,7 +529,10 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Callable(callable))
             }
-            Expr::New { class, args } => {
+            Expr::New { class, args, site } => {
+                // Autoload inside class_name_of may push frames — they
+                // site at this `new` (the class expr's first token).
+                self.send_line = Some(*site);
                 let name = self.class_name_of(class)?;
                 let params = self
                     .classes
@@ -538,8 +541,13 @@ impl<'a> Interp<'a> {
                     .and_then(|c| self.find_method_in(&c, "__construct"))
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
-                let argvals =
-                    self.arg_cells(args, &params, &format!("{}::__construct()", name), false)?;
+                let argvals = self.arg_cells(
+                    args,
+                    &params,
+                    &format!("{}::__construct()", name),
+                    false,
+                    Some(*site),
+                )?;
                 self.new_instance(&name, argvals)
             }
             Expr::Prop {
@@ -552,10 +560,16 @@ impl<'a> Interp<'a> {
                 name,
                 args,
                 nullsafe,
-            } => self.method_call(obj, name, args, *nullsafe),
+                site,
+            } => self.method_call(obj, name, args, *nullsafe, Some(*site)),
             Expr::Paren(e) => self.eval(e),
             Expr::StaticProp { class, name } => self.static_prop_read(class, name),
-            Expr::StaticCall { class, name, args } => {
+            Expr::StaticCall {
+                class,
+                name,
+                args,
+                site,
+            } => {
                 // `parent::$prop::get()` — parent property hook call.
                 if let Expr::StaticProp {
                     class: pc,
@@ -571,13 +585,22 @@ impl<'a> Interp<'a> {
                                 pn,
                                 name.eq_ignore_ascii_case("get"),
                                 args,
+                                Some(*site),
                             );
                         }
                     }
                 }
-                self.static_call(class, name, args)
+                self.static_call(class, name, args, Some(*site))
             }
-            Expr::StaticCallDyn { class, name, args } => {
+            Expr::StaticCallDyn {
+                class,
+                name,
+                args,
+                site,
+            } => {
+                // Class-name resolution may autoload — site those
+                // frames at this call.
+                self.send_line = Some(*site);
                 // `C::$var(...)`: class resolves first, then the name.
                 // Non-string names are a catchable Error
                 // (call_static_004).
@@ -594,8 +617,13 @@ impl<'a> Interp<'a> {
                     }
                 };
                 let fwd = matches!(&**class, Expr::Const(_) | Expr::Str(_) | Expr::AnonClass(_));
-                let argvals =
-                    self.arg_cells(args, &[], &format!("{}::{{closure}}()", cls.name()), false)?;
+                let argvals = self.arg_cells(
+                    args,
+                    &[],
+                    &format!("{}::{{closure}}()", cls.name()),
+                    false,
+                    Some(*site),
+                )?;
                 self.static_invoke_vis(cls, &n, argvals, None, fwd)
             }
             Expr::ClassConst { class, name } => self.class_const(class, name),
@@ -4019,16 +4047,6 @@ impl<'a> Interp<'a> {
                 self.compare_op(op, l, r, &lv, &rv)
             }
             "named" => self.eval(r), // named-arg marker: value passthrough
-            // Call-site line marker on the last argument: the frame's
-            // site is the arg's own line (zend's SEND op line). Set
-            // AFTER evaluating so nested calls inside it can't clobber.
-            "argline" => {
-                let v = self.eval(r)?;
-                if let Expr::Int(n) = l {
-                    self.send_line = Some(*n as usize);
-                }
-                Ok(v)
-            }
             _ => {
                 let (lv, rv) = self.binary_operands(l, r)?;
                 self.arith(op, lv, rv)
