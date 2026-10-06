@@ -2551,9 +2551,7 @@ impl<'a> Interp<'a> {
                 // order instead of echoing raw at replay.
                 if let Some(l) = self.ob_stack.last_mut() {
                     let owns = match (&l.gen_q, &self.gen_run_state) {
-                        (Some(q), Some(s)) => {
-                            std::rc::Rc::ptr_eq(q, &s.borrow().fin_q)
-                        }
+                        (Some(q), Some(s)) => std::rc::Rc::ptr_eq(q, &s.borrow().fin_q),
                         _ => false,
                     };
                     if owns {
@@ -2605,15 +2603,11 @@ impl<'a> Interp<'a> {
         let mut i = 0;
         while i < self.suspended_obs.len() {
             let l = &self.suspended_obs[i];
-            let ready = l.gen_open.is_some_and(|t| {
-                l.gen_q
-                    .as_ref()
-                    .is_some_and(|q| q.borrow().pos >= t)
-            }) && l.gen_close.is_none_or(|c| {
-                l.gen_q
-                    .as_ref()
-                    .is_some_and(|q| q.borrow().pos < c)
-            });
+            let ready = l
+                .gen_open
+                .is_some_and(|t| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos >= t))
+                && l.gen_close
+                    .is_none_or(|c| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos < c));
             if ready {
                 let l = self.suspended_obs.remove(i);
                 self.ob_stack.push(l);
