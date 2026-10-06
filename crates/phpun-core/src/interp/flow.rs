@@ -411,17 +411,10 @@ impl<'a> Interp<'a> {
                 line,
             ));
         }
-        // A resolved target pushed before the innermost enclosing
-        // `finally` means the jump leaves it — Zend compile-fatals any
-        // such break/continue (break on an inner switch is fine).
-        if let Some(d) = sc.fin_depth {
-            if len - n < d {
-                return Err(PhpError::compile_fatal(
-                    "jump out of a finally block is disallowed",
-                    line,
-                ));
-            }
-        }
+        // Zend resolves the operand target before applying
+        // zend_check_finally_breakout — a continue landing on a switch
+        // reports the equivalence warning even when the jump then
+        // fatals for leaving a finally (breakout_finally_*).
         if !is_break {
             if let Ctx::Switch(_) = sc.ctxs[len - n] {
                 // The operand lands on a switch — equivalent to break.
@@ -440,6 +433,17 @@ impl<'a> Interp<'a> {
                     msg.push_str(&format!(". Did you mean to use \"continue {}\"?", n + 1));
                 }
                 sc.warnings.push(("Warning", msg, line));
+            }
+        }
+        // A resolved target pushed before the innermost enclosing
+        // `finally` means the jump leaves it — Zend compile-fatals any
+        // such break/continue (break on an inner switch is fine).
+        if let Some(d) = sc.fin_depth {
+            if len - n < d {
+                return Err(PhpError::compile_fatal(
+                    "jump out of a finally block is disallowed",
+                    line,
+                ));
             }
         }
         Ok(())
