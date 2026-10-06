@@ -847,7 +847,154 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
             ("replace", Bool(true)),
             ("response_code", Int(0))
         ),
-        "setcookie" => bp!(("...", Var)),
+        "setcookie" => bp!(
+            ("name", Req),
+            ("value", Str("")),
+            ("expires_or_options", Unk),
+            ("path", Str("")),
+            ("domain", Str("")),
+            ("secure", Bool(false)),
+            ("httponly", Bool(false))
+        ),
+        // fs / stream arginfo — names + requiredness mirror Zend stubs
+        // so reflection arity and named-arg binding match (fwrite
+        // (stream,data,length) → 3/2).
+        "fwrite" | "fputs" => bp!(("stream", Req), ("data", Req), ("length", Null)),
+        "fread" => bp!(("stream", Req), ("length", Req)),
+        "fseek" => bp!(
+            ("stream", Req),
+            ("offset", Req),
+            ("whence", Int(0))
+        ),
+        "ftell" | "fclose" | "feof" | "fgetc" | "fpassthru" | "rewind" | "fflush" | "pclose"
+        | "fstat" => bp!(("stream", Req)),
+        "fgets" => bp!(("stream", Req), ("length", Null)),
+        "fgetcsv" => bp!(
+            ("stream", Req),
+            ("length", Null),
+            ("separator", Str(",")),
+            ("enclosure", Str("\"")),
+            ("escape", Str("\\"))
+        ),
+        "fputcsv" => bp!(
+            ("stream", Req),
+            ("fields", Req),
+            ("separator", Str(",")),
+            ("enclosure", Str("\"")),
+            ("escape", Str("\\")),
+            ("eol", Str("\n"))
+        ),
+        "fscanf" => bp!(("stream", Req), ("format", Req), ("vars", Var)),
+        "flock" => bp!(
+            ("stream", Req),
+            ("operation", Req),
+            ("would_block", Null)
+        ),
+        "fopen" => bp!(
+            ("filename", Req),
+            ("mode", Req),
+            ("use_include_path", Bool(false)),
+            ("context", Null)
+        ),
+        "ftruncate" => bp!(("stream", Req), ("size", Req)),
+        "popen" => bp!(("command", Req), ("mode", Req)),
+        "unlink" => bp!(("filename", Req), ("context", Null)),
+        "rename" => bp!(("from", Req), ("to", Req), ("context", Null)),
+        "copy" => bp!(("from", Req), ("to", Req), ("context", Null)),
+        "mkdir" => bp!(
+            ("directory", Req),
+            ("permissions", Int(493)),
+            ("recursive", Bool(false)),
+            ("context", Null)
+        ),
+        "rmdir" => bp!(("directory", Req), ("context", Null)),
+        "umask" => bp!(("mask", Null)),
+        "chmod" => bp!(("filename", Req), ("permissions", Req)),
+        "chown" | "chgrp" => bp!(("filename", Req), ("user", Unk)),
+        "touch" => bp!(("filename", Req), ("mtime", Null), ("atime", Null)),
+        "symlink" | "link" => bp!(("target", Req), ("link", Req)),
+        "linkinfo" | "readlink" => bp!(("path", Req)),
+        "stat" | "lstat" | "fileatime" | "filectime" | "filemtime" | "filesize" | "filetype"
+        | "fileperms" | "fileinode" | "fileowner" | "filegroup" => {
+            bp!(("filename", Req))
+        }
+        "is_file" | "is_dir" | "is_link" | "is_readable" | "is_writable" | "is_writeable"
+        | "is_executable" | "file_exists" | "is_uploaded_file" => {
+            bp!(("filename", Req))
+        }
+        "basename" => bp!(("path", Req), ("suffix", Str(""))),
+        "dirname" | "pathinfo_dirname" => bp!(("path", Req), ("levels", Int(1))),
+        "pathinfo" => bp!(("path", Req), ("flags", Int(15))),
+        "realpath" => bp!(("path", Req)),
+        "glob" => bp!(("pattern", Req), ("flags", Int(0))),
+        "scandir" => bp!(
+            ("directory", Req),
+            ("sorting_order", Int(0)),
+            ("context", Null)
+        ),
+        "file" => bp!(
+            ("filename", Req),
+            ("flags", Int(0)),
+            ("context", Null)
+        ),
+        "readfile" => bp!(
+            ("filename", Req),
+            ("use_include_path", Bool(false)),
+            ("context", Null)
+        ),
+        "parse_ini_file" => bp!(
+            ("filename", Req),
+            ("process_sections", Bool(false)),
+            ("scanner_mode", Int(0))
+        ),
+        "parse_ini_string" => bp!(
+            ("ini_string", Req),
+            ("process_sections", Bool(false)),
+            ("scanner_mode", Int(0))
+        ),
+        "fnmatch" => bp!(
+            ("pattern", Req),
+            ("filename", Req),
+            ("flags", Int(0))
+        ),
+        "disk_free_space" | "disk_total_space" | "diskfreespace" => {
+            bp!(("directory", Req))
+        }
+        "tempnam" => bp!(("directory", Req), ("prefix", Req)),
+        "chdir" => bp!(("directory", Req)),
+        "clearstatcache" => bp!(
+            ("clear_realpath_cache", Bool(false)),
+            ("filename", Str(""))
+        ),
+        "move_uploaded_file" => bp!(("from", Req), ("to", Req)),
+        "stream_get_contents" => bp!(
+            ("stream", Req),
+            ("length", Null),
+            ("offset", Int(-1))
+        ),
+        "stream_get_meta_data" => bp!(("stream", Req)),
+        "stream_copy_to_stream" => bp!(
+            ("from", Req),
+            ("to", Req),
+            ("length", Null),
+            ("offset", Int(0))
+        ),
+        "stream_context_create" => bp!(("options", Null), ("params", Null)),
+        "stream_context_get_default" => bp!(("options", Null)),
+        "stream_context_get_options" => bp!(("context", Req)),
+        "stream_context_set_option" => bp!(
+            ("context", Req),
+            ("wrapper_or_options", Unk),
+            ("option_name", Null),
+            ("value", Null)
+        ),
+        "stream_filter_prepend" | "stream_filter_append" => bp!(
+            ("stream", Req),
+            ("filter_name", Req),
+            ("mode", Null),
+            ("params", Null)
+        ),
+        "headers_sent" => bp!(("filename", Null), ("line", Null)),
         _ => return None,
     })
 }

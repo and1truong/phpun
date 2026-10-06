@@ -1381,33 +1381,68 @@ impl<'a> Interp<'a> {
             // covers the non-optional, non-variadic prefix (fprintf
             // arginfo stream/format/values → 2 of 3).
             "getnumberofparameters" | "getnumberofrequiredparameters" => {
-                let stored = obj
+                // ReflectionMethod stores its CLASS name in \0rc\0class
+                // and its method name in \0rc\0prop (the one-arg
+                // `new ReflectionMethod('K::m')` form packs both into
+                // \0rc\0class); every other reflector stores its
+                // subject (fn name string or a Callable) in \0rc\0class.
+                let arity = if obj
                     .borrow()
-                    .props
-                    .get("\0rc\0class")
-                    .map(|c| c.borrow().clone())
-                    .unwrap_or(Value::Null);
-                let arity = match &stored {
-                    Value::Callable(c) => match &c.kind {
-                        CallableKind::Closure(d) => Some(reflect_decl_arity(d)),
-                        CallableKind::Named(n) => self.name_arity(n),
-                        CallableKind::Method {
-                            obj: mo,
-                            class,
-                            name,
-                        } => {
-                            let cls = class
-                                .clone()
-                                .or_else(|| mo.as_ref().map(|o| o.borrow().class.clone()));
-                            cls.and_then(|ce| {
-                                self.find_method_in(&ce, name)
-                                    .map(|(m, _)| reflect_decl_arity(&m.decl))
-                            })
+                    .class
+                    .name()
+                    .eq_ignore_ascii_case("reflectionmethod")
+                {
+                    let cn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let cn = self.conv_str(&cn)?.to_string();
+                    let mn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0prop")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let mn = self.conv_str(&mn)?.to_string();
+                    let (cn, mn) = if mn.is_empty() {
+                        cn.rsplit_once("::")
+                            .map(|(c, m)| (c.to_string(), m.to_string()))
+                            .unwrap_or((cn, mn))
+                    } else {
+                        (cn, mn)
+                    };
+                    self.method_arity(&cn, &mn)
+                } else {
+                    let stored = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    match &stored {
+                        Value::Callable(c) => match &c.kind {
+                            CallableKind::Closure(d) => Some(reflect_decl_arity(d)),
+                            CallableKind::Named(n) => self.name_arity(n),
+                            CallableKind::Method {
+                                obj: mo,
+                                class,
+                                name,
+                            } => {
+                                let cls = class
+                                    .clone()
+                                    .or_else(|| mo.as_ref().map(|o| o.borrow().class.clone()));
+                                cls.and_then(|ce| {
+                                    self.find_method_in(&ce, name)
+                                        .map(|(m, _)| reflect_decl_arity(&m.decl))
+                                })
+                            }
+                        },
+                        _ => {
+                            let n = self.conv_str(&stored)?.to_string();
+                            self.name_arity(&n)
                         }
-                    },
-                    _ => {
-                        let n = self.conv_str(&stored)?.to_string();
-                        self.name_arity(&n)
                     }
                 };
                 let pick = if lname == "getnumberofparameters" {
@@ -2438,12 +2473,51 @@ impl Interp<'_> {
                 .count() as i64;
             return Some((total, required));
         }
-        if let Some(sig) = crate::builtins::builtin_sig(&n) {
+        // builtin_sig's catch-all answers (0,0) for every name — only
+        // consult it for names that actually are builtins so userland
+        // decls still resolve below.
+        if crate::builtins::is_builtin(&n) {
+            let sig = crate::builtins::builtin_sig(&n).unwrap_or_default();
             let total = sig.len() as i64;
             let required = sig.iter().filter(|(_, req)| *req).count() as i64;
             return Some((total, required));
         }
         self.functions.get(&n).map(|d| reflect_decl_arity(d))
+    }
+
+    /// Arity of a class/interface method for ReflectionMethod —
+    /// `find_method_in` walks the parent chain; interfaces hold their
+    /// own decl table (with their own `extends` parents).
+    fn method_arity(&mut self, cn: &str, mn: &str) -> Option<(i64, i64)> {
+        let key = self
+            .resolve_class(cn)
+            .unwrap_or_else(|| cn.trim_start_matches('\\').to_string())
+            .to_lowercase();
+        if let Some(cls) = self.classes.get(&key).cloned() {
+            return self
+                .find_method_in(&cls, mn)
+                .map(|(m, _)| reflect_decl_arity(&m.decl));
+        }
+        // Interfaces record their (possibly several) parents in
+        // `implements` — BFS the extends graph for the method decl.
+        let lname = mn.to_lowercase();
+        let mut seen = std::collections::HashSet::new();
+        let mut todo: Vec<Rc<crate::ast::ClassDecl>> =
+            self.interfaces.get(&key).into_iter().cloned().collect();
+        while let Some(id) = todo.pop() {
+            if !seen.insert(id.name.to_lowercase()) {
+                continue;
+            }
+            if let Some(m) = id.find_method(&lname) {
+                return Some(reflect_decl_arity(&m.decl));
+            }
+            for p in &id.implements {
+                if let Some(pd) = self.interfaces.get(&p.to_lowercase()).cloned() {
+                    todo.push(pd);
+                }
+            }
+        }
+        None
     }
 }
 
