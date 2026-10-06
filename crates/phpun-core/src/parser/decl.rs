@@ -39,7 +39,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        self.expect_op(";")?;
+        self.expect_op_list_end()?;
         Ok(Stmt::Static { vars, line })
     }
 
@@ -583,7 +583,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        self.expect_op(";")?;
+        self.expect_op_list_end()?;
         Ok(Stmt::Use(names))
     }
 

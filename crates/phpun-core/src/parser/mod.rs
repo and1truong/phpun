@@ -61,6 +61,10 @@ pub struct Parser<'a> {
     /// `declare(strict_types=1)` can't claim the slot
     /// (scalar_strict_declaration_placement_*, strict_nested).
     first_stmt_slot: bool,
+    /// Zend's scanner line at end-of-input (one past the last
+    /// consumed newline) — where `unexpected end of file` reports,
+    /// not the last token's line.
+    eof_line: usize,
     /// True only while the literal first statement is a
     /// `declare` — the only place `strict_types` is legal.
     strict_slot: bool,
@@ -134,7 +138,7 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
         })
         .collect();
     let bracket_err = bracket_check(&toks, eof_line);
-    let mut p = Parser::new(&toks);
+    let mut p = Parser::new(&toks, eof_line);
     let stmts = match p.program() {
         Ok(s) => s,
         Err(pe) => {
@@ -146,7 +150,10 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
             // an end-of-input error there means the parser was simply
             // still waiting for the dead token).
             if let Some((be, bpos)) = bracket_err {
-                let mut p2 = Parser::new(&toks[..bpos]);
+                let mut p2 = Parser::new(
+                    &toks[..bpos],
+                    toks.get(bpos).map(|t| t.line).unwrap_or(eof_line),
+                );
                 match p2.program() {
                     Err(pe2) if !pe2.message.starts_with("syntax error, unexpected end of") => {
                         return Err(pe2);
@@ -200,10 +207,11 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
 }
 
 impl<'a> Parser<'a> {
-    fn new(toks: &'a [Lexed]) -> Self {
+    fn new(toks: &'a [Lexed], eof_line: usize) -> Self {
         Self {
             toks,
             pos: 0,
+            eof_line,
             deprecations: Vec::new(),
             compile_warnings: Vec::new(),
             stmt_starts: Vec::new(),
@@ -302,6 +310,7 @@ pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
     let mut p = Parser {
         toks: &toks,
         pos: 0,
+        eof_line: toks.last().map(|t| t.line).unwrap_or(1),
         deprecations: Vec::new(),
         compile_warnings: Vec::new(),
         stmt_starts: Vec::new(),
@@ -341,7 +350,7 @@ impl<'a> Parser<'a> {
         self.toks
             .get(self.pos)
             .map(|l| l.line)
-            .unwrap_or_else(|| self.toks.last().map(|l| l.line).unwrap_or(1))
+            .unwrap_or(self.eof_line)
     }
 
     pub(in crate::parser) fn next(&mut self) -> Option<Token> {
@@ -431,10 +440,71 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Stmt-end of a comma-separated list — `echo` args and the
+    /// `global`/`static`/`const`/`use` declarator lists: Zend's yacc
+    /// expected-set there is exactly `"," or ";"` (syntax_errors).
+    pub(in crate::parser) fn expect_op_list_end(&mut self) -> Result<(), PhpError> {
+        if self.eat_op(";") {
+            Ok(())
+        } else {
+            Err(PhpError::parse(
+                format!(
+                    "syntax error, unexpected {}, expecting \",\" or \";\"",
+                    self.describe()
+                ),
+                self.line(),
+            ))
+        }
+    }
+
+    /// The optional operand of `return`/`break`/`continue`: when the
+    /// operand fails to start at all Zend reports the yacc state whose
+    /// expected-set is just `";"` (`return ::` → `expecting ";"`), but
+    /// an operand that started and failed mid-expression keeps the
+    /// inner error (`return 1 +` → bare `unexpected end of file`).
+    pub(in crate::parser) fn expr_semi_operand(&mut self) -> Result<Expr, PhpError> {
+        let start = self.pos;
+        self.expr().map_err(|mut e| {
+            if self.pos == start
+                && e.message.starts_with("syntax error, unexpected ")
+                && !e.message.contains(", expecting ")
+            {
+                e.message.push_str(", expecting \";\"");
+            }
+            e
+        })
+    }
+
     pub(in crate::parser) fn describe(&self) -> String {
         match self.peek() {
             None => "end of file".to_string(),
-            Some(Token::Ident(s)) => format!("identifier \"{}\"", s),
+            Some(Token::Ident(s)) => {
+                // A qualified name is one T_NAME_QUALIFIED in Zend —
+                // `unexpected namespaced name "A\B"`.
+                if matches!(
+                    self.toks.get(self.pos + 1).map(|l| &l.token),
+                    Some(Token::Op(o)) if *o == "\\"
+                ) {
+                    let mut n = s.clone();
+                    let mut i = self.pos + 1;
+                    loop {
+                        match (
+                            self.toks.get(i).map(|l| &l.token),
+                            self.toks.get(i + 1).map(|l| &l.token),
+                        ) {
+                            (Some(Token::Op(o)), Some(Token::Ident(seg))) if *o == "\\" => {
+                                n.push('\\');
+                                n.push_str(seg);
+                                i += 2;
+                            }
+                            _ => break,
+                        }
+                    }
+                    format!("namespaced name \"{}\"", n)
+                } else {
+                    format!("identifier \"{}\"", s)
+                }
+            }
             Some(Token::Variable(s)) => format!("variable \"${}\"", s),
             Some(Token::Int(v)) => format!("integer \"{}\"", v),
             Some(Token::Float(v)) => format!("float {}", v),
@@ -607,14 +677,14 @@ impl<'a> Parser<'a> {
             Some(Token::Echo) => {
                 self.pos += 1;
                 let args = self.expr_list()?;
-                self.eat_op(";");
+                self.expect_op_list_end()?;
                 Ok(Stmt::Echo(args))
             }
             Some(Token::Ident(_)) => {
                 if self.ident_is("echo") {
                     self.pos += 1;
                     let args = self.expr_list()?;
-                    self.expect_op(";")?;
+                    self.expect_op_list_end()?;
                     Ok(Stmt::Echo(args))
                 } else if self.ident_is("if") {
                     self.if_stmt()
@@ -649,8 +719,8 @@ impl<'a> Parser<'a> {
                         self.pos += 1;
                         Ok(Stmt::Return(None))
                     } else {
-                        let e = self.expr()?;
-                        self.expect_op(";")?;
+                        let e = self.expr_semi_operand()?;
+                        self.expect_op_full(";")?;
                         Ok(Stmt::Return(Some(e)))
                     }
                 } else if self.ident_is("break") || self.ident_is("continue") {
@@ -659,9 +729,9 @@ impl<'a> Parser<'a> {
                     let arg = if self.at_op(";") {
                         None
                     } else {
-                        Some(self.expr()?)
+                        Some(self.expr_semi_operand()?)
                     };
-                    self.expect_op(";")?;
+                    self.expect_op_full(";")?;
                     Ok(if is_break {
                         Stmt::Break(arg)
                     } else {
@@ -677,7 +747,10 @@ impl<'a> Parser<'a> {
                             }
                             _ => {
                                 return Err(PhpError::parse(
-                                    "syntax error, unexpected token, expecting variable",
+                                    format!(
+                                        "syntax error, unexpected {}, expecting variable or \"$\"",
+                                        self.describe()
+                                    ),
                                     self.line(),
                                 ))
                             }
@@ -686,7 +759,7 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
-                    self.expect_op(";")?;
+                    self.expect_op_list_end()?;
                     Ok(Stmt::Global(names))
                 } else if self.ident_is("static")
                     && matches!(self.peek2(), Some(Token::Variable(_)))
@@ -714,7 +787,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect_op(")")?;
-                    self.expect_op(";")?;
+                    self.expect_op_full(";")?;
                     Ok(Stmt::Unset(xs))
                 } else if self.ident_is("try") {
                     self.try_stmt()
@@ -853,7 +926,7 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
-                    self.expect_op(";")?;
+                    self.expect_op_list_end()?;
                     Ok(Stmt::ConstDecl(defs))
                 } else if self.ident_is("use")
                     && matches!(self.peek2(), Some(Token::Ident(_)) | Some(Token::Op("\\")))
@@ -871,7 +944,7 @@ impl<'a> Parser<'a> {
                         }
                     };
                     self.pos += 1;
-                    self.expect_op(";")?;
+                    self.expect_op_full(";")?;
                     Ok(Stmt::Goto(label))
                 } else if matches!(self.peek2(), Some(Token::Op(":"))) {
                     // `name:` — a goto label; can't start any expression.
