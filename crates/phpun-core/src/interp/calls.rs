@@ -4003,7 +4003,11 @@ impl<'a> Interp<'a> {
                 let _ = self.store_prop(Value::Object(obj), &pname, v)?;
             }
         }
+        // The body is its own compile unit — loop/switch depth for
+        // `break N` operand checks restarts here, not at the caller's.
+        let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
         let flow = self.exec_block(&decl.body);
+        self.loop_depth = saved_depth;
         let ret_fname = self.decl_fname(decl);
         // `static` resolves against THIS frame's called class — after
         // the pop, `stack.last()` is the caller (static_type_return).
@@ -4109,11 +4113,19 @@ impl<'a> Interp<'a> {
                 message: format!("\u{1}exit:{}", c),
                 line: 0,
             }),
-            Flow::Break(_) | Flow::Continue(_) => {
+            Flow::Break(_) => {
                 // Compile fatal in Zend (function bodies are compiled
                 // eagerly) — carry the compile-context backtrace.
                 let mut e = PhpError::compile_fatal(
                     "'break' not in the 'loop' or 'switch' context",
+                    self.cur_line,
+                );
+                e.trace = Some(self.compile_err_frames());
+                self.fail(e)
+            }
+            Flow::Continue(_) => {
+                let mut e = PhpError::compile_fatal(
+                    "'continue' not in the 'loop' or 'switch' context",
                     self.cur_line,
                 );
                 e.trace = Some(self.compile_err_frames());

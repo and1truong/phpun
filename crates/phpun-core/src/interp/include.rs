@@ -202,6 +202,10 @@ impl<'a> Interp<'a> {
         // Compile-error flows pop the include pseudo-frame themselves so
         // the backtrace fill sees the same stack Zend prints.
         let mut inc_frame_popped = false;
+        // The included unit is compiled separately in Zend —
+        // `break`/`continue` operands in it count only ITS enclosing
+        // loop/switch contexts, not the includer's.
+        let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
         let flow = match Self::const_closure_gate(&stmts).and_then(|_| self.hoist_funcs(&stmts)) {
             Err(mut e) => {
                 // Compile fatals raised while compiling the included file
@@ -218,6 +222,7 @@ impl<'a> Interp<'a> {
             }
             Ok(()) => self.exec_block(&stmts),
         };
+        self.loop_depth = saved_depth;
         self.include_ns.pop();
         // break/continue/goto leaking out of the unit are compile fatals
         // in Zend too: same compile-context backtrace (needs our
@@ -321,6 +326,9 @@ impl<'a> Interp<'a> {
                 // cur_file (a nested eval composes the context).
                 let eval_ctx = format!("{}({}) : eval()'d code", self.cur_file, self.cur_line);
                 let saved_file = std::mem::replace(&mut self.cur_file, eval_ctx);
+                // eval'd code is its own compile unit — `break`/`continue`
+                // operands count only ITS enclosing loop/switch contexts.
+                let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
                 let flow = match Self::const_closure_gate(&stmts) {
                     Err(mut e) => {
                         // Gate errors are compile fatals of the eval'd
@@ -333,6 +341,7 @@ impl<'a> Interp<'a> {
                     }
                     Ok(()) => self.exec_block(&stmts),
                 };
+                self.loop_depth = saved_depth;
                 self.cur_line = saved_line;
                 self.cur_file = saved_file;
                 match flow {

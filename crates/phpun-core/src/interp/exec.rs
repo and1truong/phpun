@@ -55,6 +55,15 @@ impl<'a> Interp<'a> {
         Flow::Normal
     }
 
+    /// A loop/switch body: one enclosing context for `break`/`continue`
+    /// level counting (zend's loop_var_stack depth).
+    fn exec_loop_body(&mut self, stmts: &[Stmt]) -> Flow {
+        self.loop_depth += 1;
+        let f = self.exec_block(stmts);
+        self.loop_depth -= 1;
+        f
+    }
+
     fn exec(&mut self, s: &Stmt) -> Flow {
         match s {
             Stmt::Line(l) => {
@@ -182,7 +191,7 @@ impl<'a> Interp<'a> {
                             _ => {}
                         }
                     }
-                    match self.exec_block(body) {
+                    match self.exec_loop_body(body) {
                         Flow::Break(0) | Flow::Break(1) => break,
                         Flow::Break(n) => return Flow::Break(n - 1),
                         Flow::Continue(0) | Flow::Continue(1) => {}
@@ -259,7 +268,7 @@ impl<'a> Interp<'a> {
                 if let Some(si) = start {
                     // Run all cases from `start`, stopping at Break.
                     for (_, body) in &cases[si..] {
-                        match self.exec_block(body) {
+                        match self.exec_loop_body(body) {
                             Flow::Break(0) | Flow::Break(1) => return Flow::Normal,
                             Flow::Break(n) => return Flow::Break(n - 1),
                             Flow::Normal => {}
@@ -443,20 +452,8 @@ impl<'a> Interp<'a> {
                 };
                 Flow::Return(v)
             }
-            Stmt::Break(e) => {
-                let n = match e {
-                    Some(e) => self.eval(e).map(|v| v.to_int()).unwrap_or(1).max(1) as u32,
-                    None => 1,
-                };
-                Flow::Break(n)
-            }
-            Stmt::Continue(e) => {
-                let n = match e {
-                    Some(e) => self.eval(e).map(|v| v.to_int()).unwrap_or(1).max(1) as u32,
-                    None => 1,
-                };
-                Flow::Continue(n)
-            }
+            Stmt::Break(e) => self.exec_break_continue(e, true),
+            Stmt::Continue(e) => self.exec_break_continue(e, false),
             Stmt::Goto(l) => Flow::Goto(l.clone()),
             Stmt::Label(_) => Flow::Normal,
             Stmt::Global(names) => {
@@ -693,9 +690,73 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `break`/`continue` — Zend checks the operand (a literal positive
+    /// int) and the enclosing loop/switch depth at compile time, so the
+    /// operand errors are fatals, not runtime values; escaping the last
+    /// context surfaces later as `not in the 'loop' or 'switch' context`
+    /// at the unit boundary.
+    fn exec_break_continue(&mut self, e: &Option<Expr>, is_break: bool) -> Flow {
+        let kw = if is_break { "break" } else { "continue" };
+        let operand_fatal = |interp: &mut Self, msg: String| -> Flow {
+            let mut e = PhpError::compile_fatal(msg, interp.cur_line);
+            e.trace = Some(interp.compile_err_frames());
+            interp.err_flow(e)
+        };
+        let n = match e {
+            Some(e) => {
+                // `break (2)` is a parenthesized literal — still valid;
+                // variables/arithmetic are not supported operands.
+                let mut inner = e;
+                while let Expr::Paren(p) = inner {
+                    inner = p;
+                }
+                match inner {
+                    Expr::Int(i) if *i > 0 => *i as u32,
+                    // Any scalar literal that isn't a positive int:
+                    // `'break' operator accepts only positive integers`
+                    // (zend checks the literal zval's type at compile).
+                    Expr::Int(_) | Expr::Float(_) | Expr::Str(_) => {
+                        return operand_fatal(
+                            self,
+                            format!("'{}' operator accepts only positive integers", kw),
+                        );
+                    }
+                    Expr::Interp(parts)
+                        if parts
+                            .iter()
+                            .all(|p| matches!(p, crate::lexer::StringPart::Lit(_))) =>
+                    {
+                        return operand_fatal(
+                            self,
+                            format!("'{}' operator accepts only positive integers", kw),
+                        );
+                    }
+                    _ => {
+                        return operand_fatal(
+                            self,
+                            format!(
+                                "'{}' operator with non-integer operand is no longer supported",
+                                kw
+                            ),
+                        );
+                    }
+                }
+            }
+            None => 1,
+        };
+        if self.loop_depth > 0 && n > self.loop_depth {
+            return operand_fatal(self, format!("Cannot '{}' {} levels", kw, n));
+        }
+        if is_break {
+            Flow::Break(n)
+        } else {
+            Flow::Continue(n)
+        }
+    }
+
     fn exec_while(&mut self, cond: &Expr, body: &[Stmt], do_first: bool) -> Flow {
         if do_first {
-            match self.exec_block(body) {
+            match self.exec_loop_body(body) {
                 Flow::Break(0) | Flow::Break(1) => return Flow::Normal,
                 Flow::Break(n) => return Flow::Break(n - 1),
                 Flow::Normal | Flow::Continue(_) => {}
@@ -708,7 +769,7 @@ impl<'a> Interp<'a> {
                 Err(e) => return self.err_flow(e),
                 _ => {}
             }
-            match self.exec_block(body) {
+            match self.exec_loop_body(body) {
                 Flow::Break(0) | Flow::Break(1) => break,
                 Flow::Break(n) => return Flow::Break(n - 1),
                 Flow::Continue(0) | Flow::Continue(1) => continue,
@@ -817,7 +878,7 @@ impl<'a> Interp<'a> {
                                 if self.foreach_list(items, &c.borrow().clone()).is_err() {}
                             }
                         }
-                        match self.exec_block(body) {
+                        match self.exec_loop_body(body) {
                             Flow::Break(0) | Flow::Break(1) => break Flow::Normal,
                             Flow::Break(n) => break Flow::Break(n - 1),
                             Flow::Continue(0) | Flow::Continue(1) => continue,
@@ -861,7 +922,7 @@ impl<'a> Interp<'a> {
                             if self.foreach_list(items, &c.borrow().clone()).is_err() {}
                         }
                     }
-                    match self.exec_block(body) {
+                    match self.exec_loop_body(body) {
                         Flow::Break(0) | Flow::Break(1) => break,
                         Flow::Break(n) => return Flow::Break(n - 1),
                         Flow::Continue(0) | Flow::Continue(1) => continue,
@@ -1120,7 +1181,7 @@ impl<'a> Interp<'a> {
                             let _ = self.foreach_list(items, &c.borrow().clone());
                         }
                     }
-                    match self.exec_block(body) {
+                    match self.exec_loop_body(body) {
                         Flow::Break(0) | Flow::Break(1) => break,
                         Flow::Break(n) => return Flow::Break(n - 1),
                         Flow::Normal | Flow::Continue(0) | Flow::Continue(1) => {}
@@ -1254,7 +1315,7 @@ impl<'a> Interp<'a> {
                     let _ = self.foreach_list(items, &v);
                 }
             }
-            match self.exec_block(body) {
+            match self.exec_loop_body(body) {
                 Flow::Break(0) | Flow::Break(1) => break,
                 Flow::Break(n) => return Flow::Break(n - 1),
                 Flow::Continue(0) | Flow::Continue(1) => {}

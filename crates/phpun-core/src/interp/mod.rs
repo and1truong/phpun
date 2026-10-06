@@ -462,6 +462,11 @@ pub struct Interp<'a> {
     /// File the last `fail()` was raised in (uncaught-print attribution
     /// for engine errors — `self.file` is always the entry script).
     last_err_file: String,
+    /// Enclosing loop/switch contexts in the current compile unit
+    /// (zend's loop_var_stack depth) — a `break`/`continue` operand
+    /// larger than this is the `Cannot 'break' N levels` compile fatal;
+    /// reset at function/include/eval boundaries.
+    loop_depth: u32,
     /// Rendered arg list of the current `assert()` call — the
     /// AssertionError message shows `assert(<args>)` as written
     /// (named_params/assert's `assert(assertion: false)`).
@@ -870,6 +875,7 @@ impl<'a> Interp<'a> {
             builtin_ifaces: std::collections::HashSet::new(),
             dep_seen: std::collections::HashSet::new(),
             last_err_file: String::new(),
+            loop_depth: 0,
             assert_src: String::new(),
             mem_used: 0,
             mem_last: 0,
@@ -1855,6 +1861,7 @@ impl<'a> Interp<'a> {
         self.pending_exception = None;
         self.call_trace.clear();
         self.deadline = None;
+        self.loop_depth = 0;
     }
 
     /// Record an object as destructed: true iff newly marked.
