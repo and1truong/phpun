@@ -1334,7 +1334,7 @@ impl<'a> Interp<'a> {
         }
         if op == "=" {
             if let Expr::List(items) = target {
-                if items.iter().flatten().any(|t| matches!(t, Expr::ByRef(_))) {
+                if Self::list_has_ref(items) {
                     // `[$a, &$b] = $src` — `&` elements bind the source's
                     // real cells; literal sources already compile-fataled
                     // in the parser and other temps get zend's
@@ -1348,7 +1348,7 @@ impl<'a> Interp<'a> {
                             | Expr::VarVar(_)
                     );
                     let v = self.eval(value)?;
-                    return self.store_list_byref(items, v, refable);
+                    return self.store_list(items, v, refable);
                 }
             }
         }
@@ -2189,73 +2189,9 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
             Expr::List(items) => {
-                // PHP reads each [i] positionally — a missing key warns
-                // "Undefined array key i" (engine_assignExecutionOrder_002).
-                let mut vals: Vec<Value> = Vec::with_capacity(items.len());
-                for (i, slot) in items.iter().enumerate() {
-                    let vi = match &v {
-                        Value::Array(a) => match a.borrow().get(&ArrKey::Int(i as i64)) {
-                            Some(v) => v,
-                            None => {
-                                if slot.is_some() {
-                                    self.warn(&format!("Undefined array key {}", i))?;
-                                }
-                                Value::Null
-                            }
-                        },
-                        other => {
-                            if items[i].is_none() {
-                                Value::Null
-                            } else {
-                                match other {
-                                    // `[$a] = null` is silent (probe5s).
-                                    Value::Null => Value::Null,
-                                    Value::Object(o) if self.obj_is_a(o, "ArrayAccess") => {
-                                        // ArrayAccess destructures via
-                                        // offsetGet (probe5t).
-                                        self.method_invoke(
-                                            o.clone(),
-                                            "offsetGet",
-                                            CallArgs::positional(vec![cell(Value::Int(i as i64))]),
-                                        )?
-                                    }
-                                    Value::Object(o) => {
-                                        let cn = o.borrow().class.name().to_string();
-                                        return self.fail(PhpError::uncaught(
-                                            "Error",
-                                            format!("Cannot use object of type {} as array", cn),
-                                            self.cur_line,
-                                        ));
-                                    }
-                                    Value::Callable(_) => {
-                                        return self.fail(PhpError::uncaught(
-                                            "Error",
-                                            "Cannot use object of type Closure as array",
-                                            self.cur_line,
-                                        ));
-                                    }
-                                    // list() on a scalar warns "Cannot
-                                    // use T as array"
-                                    // (engine_assignExecutionOrder_002).
-                                    _ => {
-                                        self.warn(&format!(
-                                            "Cannot use {} as array",
-                                            other.type_name()
-                                        ))?;
-                                        Value::Null
-                                    }
-                                }
-                            }
-                        }
-                    };
-                    vals.push(vi);
-                }
-                for (i, t) in items.iter().enumerate() {
-                    if let Some(t) = t {
-                        self.store(t, vals[i].clone())?;
-                    }
-                }
-                Ok(())
+                // Destructuring shares the by-ref machinery — a `&`
+                // anywhere (nested included) binds real source cells.
+                self.store_list(items, v, true).map(|_| ())
             }
             Expr::Prop {
                 obj,
@@ -2270,76 +2206,195 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// `[$a, &$b] = $src` / `list($a, &$b) = $src` — a destructure
-    /// carrying `&` elements. Lvalue sources (`refable`) bind the
-    /// source's real element cells — a missing index auto-creates
-    /// `&NULL` like foreach (probe5o); temps and call results take
-    /// zend's 'Attempting to set reference to non referenceable value'
-    /// notice per `&` and assign by value (probe5h/5p). Non-array
-    /// sources run zend's matrix: objects (and Closures) error on ANY
-    // element, scalars/strings warn on plain elements and error on
-    /// `&`, null destructures silently (probe5q/5r).
-    fn store_list_byref(
+    /// Any `&` element in a destructure — nested lists count
+    /// (`list(list(&$x))` and `[[$x, &$y]]` bind references too).
+    pub(in crate::interp) fn list_has_ref(
+        items: &[Option<(Option<Expr>, Expr)>],
+    ) -> bool {
+        items.iter().flatten().any(|(_, t)| match t {
+            Expr::ByRef(_) => true,
+            Expr::List(sub) => Self::list_has_ref(sub),
+            _ => false,
+        })
+    }
+
+    /// The `Undefined array key` warning for a missing element —
+    /// zend quotes string keys (`"k"`), ints print bare.
+    fn list_missing_key(&mut self, key: &ArrKey) -> Result<(), PhpError> {
+        match key {
+            ArrKey::Str(s) => self.warn(&format!("Undefined array key \"{}\"", s)),
+            ArrKey::Int(i) => self.warn(&format!("Undefined array key {}", i)),
+            ArrKey::Tomb => Ok(()),
+        }
+    }
+
+    /// `[$a, 'k' => $b, &$c] = $src` / `list(..)` destructuring.
+    /// Keyed elements evaluate their key expr to an ArrKey at write
+    /// time. `&` elements bind the source's real cells — a missing
+    /// key auto-creates `&NULL` like foreach (probe5o) — when the
+    /// source is referenceable (`refable`); temps and call results
+    /// take zend's 'Attempting to set reference to non referenceable
+    /// value' notice per `&` and assign by value (probe5h/5p). A
+    /// nested list carrying `&` fetches its intermediate slot by
+    /// write-reference: missing/NULL auto-vivifies silently and inner
+    /// plain reads stay silent on the fresh array, while
+    /// scalars/objects hit zend's 'Cannot use T as array' Errors
+    /// (kd_nested*/kd_scalar_inter probes). Non-array sources run
+    /// zend's matrix: objects (and Closures) error on ANY element,
+    /// scalars/strings warn on plain elements and error on `&`, null
+    /// destructures silently (probe5q/5r).
+    fn store_list(
         &mut self,
-        items: &[Option<Expr>],
+        items: &[Option<(Option<Expr>, Expr)>],
         v: Value,
         refable: bool,
     ) -> Result<Value, PhpError> {
-        match &v {
-            Value::Array(a) => {
-                for (i, t) in items.iter().enumerate() {
-                    let Some(t) = t else { continue };
-                    let k = ArrKey::Int(i as i64);
-                    match t {
-                        Expr::ByRef(inner) if refable => {
-                            let c = {
-                                let mut arr = a.borrow_mut();
-                                match arr.get_cell(&k) {
-                                    Some(c) => c,
-                                    None => {
-                                        let nc = cell(Value::Null);
-                                        arr.bind_cell(k.clone(), nc.clone());
-                                        nc
+        self.store_list_q(items, v, refable, false)
+    }
+
+    /// `quiet` suppresses 'Undefined array key' — set when the source
+    /// array was just auto-vivified for a nested `&` list (fresh
+    /// arrays are empty; zend stays silent there).
+    fn store_list_q(
+        &mut self,
+        items: &[Option<(Option<Expr>, Expr)>],
+        v: Value,
+        refable: bool,
+        quiet: bool,
+    ) -> Result<Value, PhpError> {
+        for (i, slot) in items.iter().enumerate() {
+            let Some((ke, t)) = slot else { continue };
+            // Keyed elements evaluate their key expr; positional
+            // elements index by slot.
+            let (key, keyv) = match ke {
+                Some(ke) => {
+                    let kv = self.eval(ke)?;
+                    (to_key(&kv), kv)
+                }
+                None => (ArrKey::Int(i as i64), Value::Int(i as i64)),
+            };
+            match &v {
+                Value::Array(a) => match t {
+                    Expr::ByRef(inner) if refable => {
+                        let c = {
+                            let mut arr = a.borrow_mut();
+                            match arr.get_cell(&key) {
+                                Some(c) => c,
+                                None => {
+                                    let nc = cell(Value::Null);
+                                    arr.bind_cell(key.clone(), nc.clone());
+                                    nc
+                                }
+                            }
+                        };
+                        self.bind_cell(inner, c)?;
+                    }
+                    Expr::ByRef(inner) => {
+                        self.notice("Attempting to set reference to non referenceable value")?;
+                        let vi = match a.borrow().get(&key) {
+                            Some(vi) => vi,
+                            None => {
+                                if !quiet {
+                                    self.list_missing_key(&key)?;
+                                }
+                                Value::Null
+                            }
+                        };
+                        self.store(inner, vi)?;
+                    }
+                    Expr::List(sub) if Self::list_has_ref(sub) => {
+                        // Intermediate fetch by write-reference:
+                        // missing/NULL auto-vivifies to `[]` silently
+                        // and inner plain reads stay silent on the
+                        // fresh array.
+                        enum Inter {
+                            Fresh(Rc<RefCell<PhpArray>>),
+                            Existing(Rc<RefCell<PhpArray>>),
+                            ScalarErr,
+                            StrOffsetErr,
+                            ObjectErr(String),
+                        }
+                        let inter = {
+                            let mut arr = a.borrow_mut();
+                            match arr.get_cell(&key) {
+                                Some(c) => {
+                                    // The clone drops the cell borrow
+                                    // before the Null arm re-borrows.
+                                    let cv = c.borrow().clone();
+                                    match cv {
+                                        Value::Array(rc) => Inter::Existing(rc),
+                                        Value::Null => {
+                                            let rc = Rc::new(RefCell::new(PhpArray::new()));
+                                            *c.borrow_mut() = Value::Array(rc.clone());
+                                            Inter::Fresh(rc)
+                                        }
+                                        Value::Str(_) => Inter::StrOffsetErr,
+                                        Value::Object(o) => {
+                                            Inter::ObjectErr(o.borrow().class.name().to_string())
+                                        }
+                                        Value::Callable(_) => {
+                                            Inter::ObjectErr("Closure".to_string())
+                                        }
+                                        _ => Inter::ScalarErr,
                                     }
                                 }
-                            };
-                            self.bind_cell(inner, c)?;
-                        }
-                        Expr::ByRef(inner) => {
-                            self.notice("Attempting to set reference to non referenceable value")?;
-                            let vi = match a.borrow().get(&k) {
-                                Some(vi) => vi,
                                 None => {
-                                    self.warn(&format!("Undefined array key {}", i))?;
-                                    Value::Null
+                                    let rc = Rc::new(RefCell::new(PhpArray::new()));
+                                    arr.set_cell(key.clone(), cell(Value::Array(rc.clone())));
+                                    Inter::Fresh(rc)
                                 }
-                            };
-                            self.store(inner, vi)?;
-                        }
-                        _ => {
-                            let vi = match a.borrow().get(&k) {
-                                Some(vi) => vi,
-                                None => {
-                                    self.warn(&format!("Undefined array key {}", i))?;
-                                    Value::Null
-                                }
-                            };
-                            self.store(t, vi)?;
+                            }
+                        };
+                        match inter {
+                            Inter::Fresh(rc) => {
+                                self.store_list_q(sub, Value::Array(rc), refable, true)?;
+                            }
+                            Inter::Existing(rc) => {
+                                self.store_list_q(sub, Value::Array(rc), refable, quiet)?;
+                            }
+                            Inter::ScalarErr => {
+                                return self.fail(PhpError::uncaught(
+                                    "Error",
+                                    "Cannot use a scalar value as an array",
+                                    self.cur_line,
+                                ));
+                            }
+                            Inter::StrOffsetErr => {
+                                return self.fail(PhpError::uncaught(
+                                    "Error",
+                                    "Cannot create references to/from string offsets",
+                                    self.cur_line,
+                                ));
+                            }
+                            Inter::ObjectErr(cn) => {
+                                return self.fail(PhpError::uncaught(
+                                    "Error",
+                                    format!("Cannot use object of type {} as array", cn),
+                                    self.cur_line,
+                                ));
+                            }
                         }
                     }
-                }
-            }
-            Value::Null => {
-                for t in items.iter().flatten() {
-                    match t {
-                        Expr::ByRef(inner) => self.bind_cell(inner, cell(Value::Null))?,
-                        _ => self.store(t, Value::Null)?,
+                    _ => {
+                        let vi = match a.borrow().get(&key) {
+                            Some(vi) => vi,
+                            None => {
+                                if !quiet {
+                                    self.list_missing_key(&key)?;
+                                }
+                                Value::Null
+                            }
+                        };
+                        self.store(t, vi)?;
                     }
-                }
-            }
-            other => {
-                for (i, t) in items.iter().enumerate() {
-                    let Some(t) = t else { continue };
+                },
+                // `[$a] = null` is silent (probe5s) — `&` still binds a
+                // fresh NULL cell.
+                Value::Null => match t {
+                    Expr::ByRef(inner) => self.bind_cell(inner, cell(Value::Null))?,
+                    _ => self.store(t, Value::Null)?,
+                },
+                other => {
                     let (inner, by_ref) = match t {
                         Expr::ByRef(inner) => (inner.as_ref(), true),
                         _ => (t, false),
@@ -2353,7 +2408,7 @@ impl<'a> Interp<'a> {
                                 .method_invoke(
                                     o.clone(),
                                     "offsetGet",
-                                    CallArgs::positional(vec![cell(Value::Int(i as i64))]),
+                                    CallArgs::positional(vec![cell(keyv)]),
                                 )
                                 .unwrap_or(Value::Null);
                             if by_ref {

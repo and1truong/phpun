@@ -606,7 +606,7 @@ impl<'a> Parser<'a> {
         use crate::ast::Expr::*;
         if let List(items) = e {
             for it in items.iter().flatten() {
-                self.list_writable(it)?;
+                self.list_writable(&it.1)?;
             }
             return Ok(());
         }
@@ -712,7 +712,10 @@ impl<'a> Parser<'a> {
     /// call/method results die with the return-value fatals, and
     /// everything else (nullsafe chains included) is
     /// `Assignments can only happen to writable values` (p13 l*).
-    fn list_writable(&self, e: &Expr) -> Result<(), PhpError> {
+    pub(in crate::parser) fn list_writable(
+        &self,
+        e: &Expr,
+    ) -> Result<(), PhpError> {
         use crate::ast::Expr::*;
         let writable = || {
             Err(PhpError::compile_fatal(
@@ -725,7 +728,7 @@ impl<'a> Parser<'a> {
             Paren(inner) | ByRef(inner) => self.list_writable(inner),
             List(items) => {
                 for it in items.iter().flatten() {
-                    self.list_writable(it)?;
+                    self.list_writable(&it.1)?;
                 }
                 Ok(())
             }
@@ -765,12 +768,14 @@ impl<'a> Parser<'a> {
                 // array literals (and `list()` calls) convert to List
                 // too, so runtime store() can recurse (lp4).
                 let mut out = Vec::with_capacity(items.len());
-                for (_, v) in items {
-                    out.push(match v {
-                        Expr::Null => None,
-                        other => Some(self.list_target(other)?),
+                for (k, v) in items {
+                    out.push(match (k, v) {
+                        // `[,$a]`/`[$a, ,$c]` holes parse as `(None, Null)`.
+                        (None, Expr::Null) => None,
+                        (k, other) => Some((k, self.list_target(other)?)),
                     });
                 }
+                self.list_mix_check(&out)?;
                 Ok(Expr::List(out))
             }
             Expr::Call { name, args } => match *name {
@@ -779,9 +784,16 @@ impl<'a> Parser<'a> {
                     for a in args {
                         out.push(match a {
                             Expr::Null => None,
-                            other => Some(self.list_target(other)?),
+                            // `list('k' => $v)` — args_flags encodes the
+                            // keyed pair as a transient `=>` binary.
+                            Expr::Binary { op: "=>", l, r } => Some((
+                                Some(*l),
+                                self.list_target(*r)?,
+                            )),
+                            other => Some((None, self.list_target(other)?)),
                         });
                     }
+                    self.list_mix_check(&out)?;
                     Ok(Expr::List(out))
                 }
                 other => Ok(Expr::Call {
@@ -1177,6 +1189,40 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
+    /// Zend rejects `['k' => $a, $b]`/`[$a, 'k' => $b]` — keyed and
+    /// unkeyed destructuring elements can't mix in one list.
+    fn list_mix_check(
+        &self,
+        items: &[Option<(Option<Expr>, Expr)>],
+    ) -> Result<(), PhpError> {
+        let mut keyed = false;
+        let mut unkeyed = false;
+        for it in items.iter().flatten() {
+            if it.0.is_some() {
+                keyed = true;
+            } else {
+                unkeyed = true;
+            }
+        }
+        if keyed && unkeyed {
+            return Err(PhpError::compile_fatal(
+                "Cannot mix keyed and unkeyed array entries in assignments",
+                self.line(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Any `&` element in the list — nested lists count too
+    /// (`list(list(&$x))` is a referenceable-value target).
+    fn list_has_ref(items: &[Option<(Option<Expr>, Expr)>]) -> bool {
+        items.iter().flatten().any(|(_, t)| match t {
+            Expr::ByRef(_) => true,
+            Expr::List(sub) => Self::list_has_ref(sub),
+            _ => false,
+        })
+    }
+
     /// `[$a, &$b] = [..]` — a `&` element against a literal array RHS
     /// is a zend compile fatal: temporaries can't be reference sources
     /// (probe5j). `=` reaches the parser at both the statement and the
@@ -1188,8 +1234,7 @@ impl<'a> Parser<'a> {
         let Expr::List(items) = target else {
             return Ok(());
         };
-        let has_ref = items.iter().flatten().any(|t| matches!(t, Expr::ByRef(_)));
-        if !has_ref {
+        if !Self::list_has_ref(items) {
             return Ok(());
         }
         let mut lit = rhs;
@@ -1980,7 +2025,25 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     args.push(Expr::ByRef(Box::new(self.ref_variable(false)?)));
                 } else {
-                    args.push(self.expr()?);
+                    let e = self.expr()?;
+                    // `list('k' => $v)` — keyed elements carry the key
+                    // expr on a transient `=>` binary; list_target
+                    // converts it to a keyed List element.
+                    if allow_ref && self.eat_op("=>") {
+                        let t = if self.at_op("&") {
+                            self.pos += 1;
+                            Expr::ByRef(Box::new(self.ref_variable(false)?))
+                        } else {
+                            self.expr()?
+                        };
+                        args.push(Expr::Binary {
+                            op: "=>",
+                            l: Box::new(e),
+                            r: Box::new(t),
+                        });
+                    } else {
+                        args.push(e);
+                    }
                 }
             }
             if !self.eat_op(",") {
@@ -2236,15 +2299,31 @@ impl<'a> Parser<'a> {
                         // element (probe5b): binds the source cell.
                         if self.at_op("&") {
                             self.pos += 1;
-                            items.push(Some(Expr::ByRef(Box::new(self.ref_variable(false)?))));
+                            items.push(Some((
+                                None,
+                                Expr::ByRef(Box::new(self.ref_variable(false)?)),
+                            )));
                         } else {
-                            items.push(Some(self.expr()?));
+                            let e = self.expr()?;
+                            if self.eat_op("=>") {
+                                // `list('k' => $v)` — a keyed element.
+                                let t = if self.at_op("&") {
+                                    self.pos += 1;
+                                    Expr::ByRef(Box::new(self.ref_variable(false)?))
+                                } else {
+                                    self.expr()?
+                                };
+                                items.push(Some((Some(e), t)));
+                            } else {
+                                items.push(Some((None, e)));
+                            }
                         }
                         if !self.eat_op(",") {
                             break;
                         }
                     }
                     self.expect_op(")")?;
+                    self.list_mix_check(&items)?;
                     Ok(Expr::List(items))
                 } else if self.ident_is("include")
                     || self.ident_is("include_once")

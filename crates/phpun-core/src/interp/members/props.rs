@@ -387,10 +387,10 @@ impl<'a> Interp<'a> {
                 k.as_ref().is_some_and(|k| Self::expr_uses_this_prop(k, pn))
                     || Self::expr_uses_this_prop(v, pn)
             }),
-            Expr::List(items) => items
-                .iter()
-                .flatten()
-                .any(|e| Self::expr_uses_this_prop(e, pn)),
+            Expr::List(items) => items.iter().flatten().any(|(k, e)| {
+                k.as_ref().is_some_and(|k| Self::expr_uses_this_prop(k, pn))
+                    || Self::expr_uses_this_prop(e, pn)
+            }),
             Expr::Match { subject, arms } => {
                 Self::expr_uses_this_prop(subject, pn)
                     || arms.iter().any(|a| {

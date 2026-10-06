@@ -138,7 +138,10 @@ impl<'a> Interp<'a> {
                     || matches!(name, PropName::Expr(e) if Self::expr_contains_yield(e))
             }
             Expr::Isset(v) => v.iter().any(Self::expr_contains_yield),
-            Expr::List(v) => v.iter().flatten().any(Self::expr_contains_yield),
+            Expr::List(v) => v.iter().flatten().any(|(k, e)| {
+                k.as_ref().is_some_and(Self::expr_contains_yield)
+                    || Self::expr_contains_yield(e)
+            }),
             Expr::Exit(Some(e)) => Self::expr_contains_yield(e),
             Expr::ArrayLit(items) => items.iter().any(|(k, v)| {
                 k.as_ref().is_some_and(Self::expr_contains_yield) || Self::expr_contains_yield(v)

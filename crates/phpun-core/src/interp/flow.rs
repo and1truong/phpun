@@ -465,7 +465,10 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
             Expr::List(v) => {
-                for e in v.iter().flatten() {
+                for (k, e) in v.iter().flatten() {
+                    if let Some(k) = k {
+                        Self::flow_expr(k, sc)?;
+                    }
                     Self::flow_expr(e, sc)?;
                 }
                 Ok(())
@@ -557,7 +560,10 @@ impl<'a> Interp<'a> {
             ForeachTarget::Lvalue(e) => Self::flow_expr(e, sc),
             ForeachTarget::Var(_) | ForeachTarget::ByRef(_) => Ok(()),
             ForeachTarget::List(ts) => {
-                for t in ts.iter().flatten() {
+                for (k, t) in ts.iter().flatten() {
+                    if let Some(k) = k {
+                        Self::flow_expr(k, sc)?;
+                    }
                     Self::flow_foreach_target(t, sc)?;
                 }
                 Ok(())

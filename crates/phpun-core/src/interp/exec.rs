@@ -1477,28 +1477,59 @@ impl<'a> Interp<'a> {
     fn foreach_target_by_ref(t: &ForeachTarget) -> bool {
         match t {
             ForeachTarget::ByRef(_) => true,
-            ForeachTarget::List(items) => items.iter().flatten().any(Self::foreach_target_by_ref),
+            ForeachTarget::List(items) => items
+                .iter()
+                .flatten()
+                .any(|(_, t)| Self::foreach_target_by_ref(t)),
             _ => false,
         }
     }
 
-    /// Positional destructuring of a foreach row. `&` elements bind the
-    /// row's real element cell — a missing key auto-creates a null
-    /// reference silently — while plain elements read the value and warn
-    /// `Undefined array key N` on a miss (zend list-in-foreach semantics).
-    /// Non-array rows follow zend's matrix: objects (and scalars/strings
-    /// under a `&` element) raise catchable Errors, a plain list on a
-    /// scalar warns `Cannot use T as array`, and null is silent — a `&`
-    /// element auto-vivifies the null row to an array first.
+    /// `Undefined array key` warn for a missing row element —
+    /// zend quotes string keys.
+    fn foreach_missing_key(&mut self, key: &ArrKey) -> Result<(), PhpError> {
+        match key {
+            ArrKey::Str(s) => self.warn(&format!("Undefined array key \"{}\"", s)),
+            ArrKey::Int(i) => self.warn(&format!("Undefined array key {}", i)),
+            ArrKey::Tomb => Ok(()),
+        }
+    }
+
+    /// Positional/keyed destructuring of a foreach row. `&` elements
+    /// bind the row's real element cell — a missing key auto-creates a
+    /// null reference silently — while plain elements read the value
+    /// and warn `Undefined array key N` on a miss (zend list-in-foreach
+    /// semantics). Non-array rows follow zend's matrix: objects (and
+    /// scalars/strings under a `&` element) raise catchable Errors, a
+    /// plain list on a scalar warns `Cannot use T as array`, and null
+    /// is silent — a `&` element auto-vivifies the null row to an
+    /// array first.
     fn foreach_list(
         &mut self,
-        items: &[Option<ForeachTarget>],
+        items: &[Option<(Option<Expr>, ForeachTarget)>],
         c: &Cell,
         line: usize,
     ) -> Result<(), PhpError> {
+        self.foreach_list_q(items, c, line, false)
+    }
+
+    /// `quiet` suppresses 'Undefined array key' — set for a nested
+    /// list's freshly auto-vivified intermediate (`[&$x]` on a
+    /// missing slot creates `[]` and inner plain reads stay silent,
+    /// matching zend's write-reference fetch).
+    fn foreach_list_q(
+        &mut self,
+        items: &[Option<(Option<Expr>, ForeachTarget)>],
+        c: &Cell,
+        line: usize,
+        quiet: bool,
+    ) -> Result<(), PhpError> {
         // Zend attributes destructure diagnostics to the foreach stmt.
         self.cur_line = line;
-        let needs_ref = items.iter().flatten().any(Self::foreach_target_by_ref);
+        let needs_ref = items
+            .iter()
+            .flatten()
+            .any(|(_, t)| Self::foreach_target_by_ref(t));
         enum Row {
             Array(Rc<RefCell<PhpArray>>),
             Skip,
@@ -1560,13 +1591,17 @@ impl<'a> Interp<'a> {
                 // Destructures via offsetGet; a `&` element binds the
                 // returned temp after zend's 'Indirect modification of
                 // overloaded element' notice.
-                for (i, t) in items.iter().enumerate() {
-                    let Some(t) = t else { continue };
+                for (i, elem) in items.iter().enumerate() {
+                    let Some((ke, t)) = elem else { continue };
+                    let keyv = match ke {
+                        Some(ke) => self.eval(ke)?,
+                        None => Value::Int(i as i64),
+                    };
                     let iv = self
                         .method_invoke(
                             o.clone(),
                             "offsetGet",
-                            CallArgs::positional(vec![cell(Value::Int(i as i64))]),
+                            CallArgs::positional(vec![cell(keyv)]),
                         )
                         .unwrap_or(Value::Null);
                     match t {
@@ -1588,14 +1623,19 @@ impl<'a> Interp<'a> {
                 }
             }
             Row::Array(a) => {
-                for (i, t) in items.iter().enumerate() {
-                    let Some(t) = t else { continue };
-                    let key = ArrKey::Int(i as i64);
+                for (i, elem) in items.iter().enumerate() {
+                    let Some((ke, t)) = elem else { continue };
+                    let key = match ke {
+                        Some(ke) => to_key(&self.eval(ke)?),
+                        None => ArrKey::Int(i as i64),
+                    };
                     match t {
                         ForeachTarget::Var(n) => match a.borrow().get(&key) {
                             Some(iv) => self.var_set(n, iv),
                             None => {
-                                self.warn(&format!("Undefined array key {}", i))?;
+                                if !quiet {
+                                    self.foreach_missing_key(&key)?;
+                                }
                                 self.var_set(n, Value::Null);
                             }
                         },
@@ -1604,7 +1644,9 @@ impl<'a> Interp<'a> {
                                 let _ = self.store(e, iv);
                             }
                             None => {
-                                self.warn(&format!("Undefined array key {}", i))?;
+                                if !quiet {
+                                    self.foreach_missing_key(&key)?;
+                                }
                                 let _ = self.store(e, Value::Null);
                             }
                         },
@@ -1622,11 +1664,35 @@ impl<'a> Interp<'a> {
                             self.bind_cell(e, ec)?;
                         }
                         ForeachTarget::List(sub) => {
-                            let ec = a
-                                .borrow()
-                                .get_cell(&key)
-                                .unwrap_or_else(|| cell(Value::Null));
-                            self.foreach_list(sub, &ec, line)?;
+                            // A nested list carrying `&` binds the
+                            // row's real cell: a missing key
+                            // auto-creates a null cell (auto-vivified
+                            // to [] inside), and the fresh array's
+                            // inner reads stay silent — zend's
+                            // write-reference fetch (kd_nested_ref).
+                            let sub_ref = sub
+                                .iter()
+                                .flatten()
+                                .any(|(_, t)| Self::foreach_target_by_ref(t));
+                            let ec = {
+                                let mut arr = a.borrow_mut();
+                                match arr.get_cell(&key) {
+                                    Some(c) => c,
+                                    None if sub_ref => {
+                                        let nc = cell(Value::Null);
+                                        arr.set_cell(key.clone(), nc.clone());
+                                        nc
+                                    }
+                                    None => {
+                                        if !quiet {
+                                            self.foreach_missing_key(&key)?;
+                                        }
+                                        cell(Value::Null)
+                                    }
+                                }
+                            };
+                            let fresh = sub_ref && matches!(&*ec.borrow(), Value::Null);
+                            self.foreach_list_q(sub, &ec, line, fresh)?;
                         }
                     }
                 }

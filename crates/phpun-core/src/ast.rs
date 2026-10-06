@@ -286,7 +286,9 @@ pub enum ForeachTarget {
     ByRef(Box<Expr>),
     /// Any other assignable lvalue (`$b[0]`, `$o->p`, ...).
     Lvalue(Box<Expr>),
-    List(Vec<Option<ForeachTarget>>),
+    /// `as [$a, 'k' => $b]` destructuring — `(key expr, target)` per
+    /// element; zend forbids mixing keyed and unkeyed entries.
+    List(Vec<Option<(Option<Expr>, ForeachTarget)>>),
 }
 
 /// A parsed `#[Name(args)]` attribute group entry — args stay as Exprs
@@ -412,7 +414,10 @@ pub enum Expr {
     YieldFrom(Box<Expr>),
     Exit(Option<Box<Expr>>),
     /// `list($a, $b)` / `[$a, $b]` — only valid as an assignment target.
-    List(Vec<Option<Expr>>),
+    /// Elements are `(key, target)`; `key` is the evaluated key expr of
+    /// a keyed element (`'k' => $v`) — zend forbids mixing keyed and
+    /// unkeyed entries in one list.
+    List(Vec<Option<(Option<Expr>, Expr)>>),
     /// `include/require/eval` — argument is the filename/code expression.
     Include {
         kind: IncludeKind,

@@ -337,37 +337,12 @@ impl<'a> Parser<'a> {
         }
         if self.at_op("[") {
             self.pos += 1;
-            let mut items = Vec::new();
-            while !self.at_op("]") {
-                if self.eat_op(",") {
-                    items.push(None);
-                    continue;
-                }
-                items.push(Some(self.foreach_target_in(true)?));
-                if !self.eat_op(",") {
-                    break;
-                }
-            }
-            self.expect_op("]")?;
-            return Ok(ForeachTarget::List(items));
+            return Ok(ForeachTarget::List(self.foreach_list_items("]")?));
         }
         if self.ident_is("list") && matches!(self.peek2(), Some(Token::Op("("))) {
             self.pos += 1;
             self.expect_op("(")?;
-            let mut items = Vec::new();
-            while !self.at_op(")") {
-                if self.at_op(",") {
-                    items.push(None);
-                    self.pos += 1;
-                    continue;
-                }
-                items.push(Some(self.foreach_target_in(true)?));
-                if !self.eat_op(",") {
-                    break;
-                }
-            }
-            self.expect_op(")")?;
-            return Ok(ForeachTarget::List(items));
+            return Ok(ForeachTarget::List(self.foreach_list_items(")")?));
         }
         match self.next() {
             Some(Token::Variable(n)) => {
@@ -439,6 +414,100 @@ impl<'a> Parser<'a> {
                 ),
                 self.line(),
             )),
+        }
+    }
+
+    /// `[..]`/`list(..)` destructuring inside a foreach target —
+    /// positional elements, holes, and `expr => target` keyed pairs
+    /// (zend-legal `as ['a' => $a]` / `as list('a' => $a)`); keyed and
+    /// unkeyed entries can't mix.
+    fn foreach_list_items(
+        &mut self,
+        close: &str,
+    ) -> Result<Vec<Option<(Option<Expr>, ForeachTarget)>>, PhpError> {
+        let mut items = Vec::new();
+        let (mut keyed, mut unkeyed) = (false, false);
+        while !self.at_op(close) {
+            if self.eat_op(",") {
+                items.push(None);
+                continue;
+            }
+            if self.at_op("&") {
+                unkeyed = true;
+                items.push(Some((None, self.foreach_target_in(true)?)));
+            } else {
+                let e = self.expr()?;
+                if self.eat_op("=>") {
+                    keyed = true;
+                    items.push(Some((Some(e), self.foreach_target_in(true)?)));
+                } else {
+                    unkeyed = true;
+                    items.push(Some((None, self.expr_to_foreach_target(e)?)));
+                }
+            }
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op(close)?;
+        if keyed && unkeyed {
+            return Err(PhpError::compile_fatal(
+                "Cannot mix keyed and unkeyed array entries in assignments",
+                self.line(),
+            ));
+        }
+        Ok(items)
+    }
+
+    /// A foreach destructuring element parsed as an expression —
+    /// variables stay `Var`, nested array literals / `list()` calls
+    /// recurse as lists, `&` elements stay ByRef, other writable
+    /// chains are Lvalues; non-writable exprs die in list_writable.
+    fn expr_to_foreach_target(&mut self, e: Expr) -> Result<ForeachTarget, PhpError> {
+        match e {
+            Expr::Var(n) => Ok(ForeachTarget::Var(n)),
+            Expr::ByRef(inner) => Ok(ForeachTarget::ByRef(inner)),
+            Expr::ArrayLit(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                let (mut keyed, mut unkeyed) = (false, false);
+                for (k, v) in items {
+                    match (k, v) {
+                        (None, Expr::Null) => {
+                            unkeyed = true;
+                            out.push(None);
+                        }
+                        (k, other) => {
+                            if k.is_some() {
+                                keyed = true;
+                            } else {
+                                unkeyed = true;
+                            }
+                            out.push(Some((k, self.expr_to_foreach_target(other)?)));
+                        }
+                    }
+                }
+                if keyed && unkeyed {
+                    return Err(PhpError::compile_fatal(
+                        "Cannot mix keyed and unkeyed array entries in assignments",
+                        self.line(),
+                    ));
+                }
+                Ok(ForeachTarget::List(out))
+            }
+            Expr::List(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(match it {
+                        None => None,
+                        Some((k, e)) => Some((k, self.expr_to_foreach_target(e)?)),
+                    });
+                }
+                Ok(ForeachTarget::List(out))
+            }
+            _ => {
+                self.list_writable(&e)?;
+                Ok(ForeachTarget::Lvalue(Box::new(e)))
+            }
         }
     }
 
