@@ -424,8 +424,10 @@ pub(crate) fn dispatch(
         }
         "fwrite" | "fputs" => {
             stream_open_check(args, 0, name, 1, "stream")?;
-            let data = arg(args, 1).to_php_string();
-            match write_resource(it, args.first(), data.as_bytes())? {
+            // Byte-faithful: PHP strings are byte arrays — binary data
+            // must survive the write unchanged.
+            let data = arg_bs(it, args, 1);
+            match write_resource(it, args.first(), &data)? {
                 StreamWrite::Written => Value::Int(data.len() as i64),
                 StreamWrite::Partial(n) => Value::Int(n as i64),
                 StreamWrite::Ebadf(errno, msg) => {
@@ -439,7 +441,7 @@ pub(crate) fn dispatch(
             stream_open_check(args, 0, name, 1, "stream")?;
             let n = arg(args, 1).to_int().max(0) as usize;
             match read_resource(args.first(), n)? {
-                StreamRead::Data(b) => Value::str(String::from_utf8_lossy(&b).into_owned()),
+                StreamRead::Data(b) => Value::bytes(b),
                 StreamRead::Ebadf(errno, msg) => {
                     read_ebadf_notice(it, name, errno, &msg)?;
                     Value::Bool(false)
@@ -467,7 +469,7 @@ pub(crate) fn dispatch(
                     if b.is_empty() {
                         Value::Bool(false)
                     } else {
-                        Value::str(String::from_utf8_lossy(&b).into_owned())
+                        Value::bytes(b)
                     }
                 }
                 StreamRead::Ebadf(errno, msg) => {
@@ -480,7 +482,7 @@ pub(crate) fn dispatch(
             stream_open_check(args, 0, name, 1, "stream")?;
             match read_resource(args.first(), 1)? {
                 StreamRead::Data(b) if b.is_empty() => Value::Bool(false),
-                StreamRead::Data(b) => Value::str(String::from_utf8_lossy(&b).into_owned()),
+                StreamRead::Data(b) => Value::bytes(b),
                 StreamRead::Ebadf(errno, msg) => {
                     read_ebadf_notice(it, name, errno, &msg)?;
                     Value::Bool(false)
@@ -647,8 +649,7 @@ pub(crate) fn dispatch(
                     }
                 }
             }
-            let s = String::from_utf8_lossy(&out);
-            it.emit(&s);
+            it.emit_bytes(&out);
             // zend returns -1 when the passthrough read failed.
             Value::Int(if failed { -1 } else { out.len() as i64 })
         }
@@ -843,7 +844,7 @@ pub(crate) fn dispatch(
                     }
                 }
             }
-            Value::str(String::from_utf8_lossy(&out).into_owned())
+            Value::bytes(out)
         }
         "stream_copy_to_stream" => {
             stream_open_check(args, 0, name, 1, "from")?;
