@@ -331,8 +331,8 @@ impl<'a> Interp<'a> {
     /// ints "accept only positive integers", n>depth is "Cannot … N
     /// levels", and a plain stray break/continue outside any context
     /// is "not in the 'loop' or 'switch' context". A continue whose
-    /// target lands on a switch warns (the "continue 2" hint only when
-    /// a loop encloses the switch).
+    /// target lands on a switch warns (the "continue N" hint when any
+    /// breakable context encloses the switch).
     fn flow_operand(
         op: Option<&Expr>,
         line: usize,
@@ -342,32 +342,38 @@ impl<'a> Interp<'a> {
         let kw = if is_break { "break" } else { "continue" };
         let n = match op {
             None => 1usize,
-            Some(Expr::Int(i)) => {
-                if *i <= 0 {
+            Some(e) => match Self::flow_op_lit(e) {
+                Some(Some(i)) => {
+                    if i <= 0 {
+                        return Err(PhpError::compile_fatal(
+                            format!("'{}' operator accepts only positive integers", kw),
+                            line,
+                        ));
+                    }
+                    i as usize
+                }
+                // Other literals — including constant strings and
+                // floats — still get the "positive integers"
+                // diagnostic (`break "2"`, `break 1.5`).
+                Some(None) => {
                     return Err(PhpError::compile_fatal(
                         format!("'{}' operator accepts only positive integers", kw),
                         line,
                     ));
                 }
-                *i as usize
-            }
-            // Other literals are still "positive integers" diagnostics;
-            // expressions are the removed-operand diagnostic.
-            Some(Expr::Float(_)) | Some(Expr::Str(_)) | Some(Expr::Bool(_)) => {
-                return Err(PhpError::compile_fatal(
-                    format!("'{}' operator accepts only positive integers", kw),
-                    line,
-                ));
-            }
-            Some(_) => {
-                return Err(PhpError::compile_fatal(
-                    format!(
-                        "'{}' operator with non-integer operand is no longer supported",
-                        kw
-                    ),
-                    line,
-                ));
-            }
+                // Non-literals — including `true`/`false` — get the
+                // removed-operand diagnostic (`break "$x"`,
+                // `break true`).
+                None => {
+                    return Err(PhpError::compile_fatal(
+                        format!(
+                            "'{}' operator with non-integer operand is no longer supported",
+                            kw
+                        ),
+                        line,
+                    ));
+                }
+            },
         };
         let len = sc.ctxs.len();
         if n > len {
@@ -395,18 +401,47 @@ impl<'a> Interp<'a> {
         }
         if !is_break {
             if let Ctx::Switch(_) = sc.ctxs[len - n] {
-                // The operand lands on a switch — equivalent to break,
-                // with Zend's continue-N hint when a loop encloses it.
-                let hint = sc.ctxs[..len - n].iter().any(|c| matches!(c, Ctx::Loop(_)));
-                let mut msg =
-                    "\"continue\" targeting switch is equivalent to \"break\"".to_string();
-                if hint {
+                // The operand lands on a switch — equivalent to break.
+                // Zend prints the operand digits for n>=2 and offers
+                // the continue-N hint whenever ANY breakable context
+                // encloses the switch (another switch qualifies).
+                let mut msg = if n == 1 {
+                    "\"continue\" targeting switch is equivalent to \"break\"".to_string()
+                } else {
+                    format!(
+                        "\"continue {}\" targeting switch is equivalent to \"break {}\"",
+                        n, n
+                    )
+                };
+                if len - n > 0 {
                     msg.push_str(&format!(". Did you mean to use \"continue {}\"?", n + 1));
                 }
                 sc.warnings.push(("Warning", msg, line));
             }
         }
         Ok(())
+    }
+
+    /// Literal-ness of a break/continue operand: an int resolves
+    /// (`Some(Some(n))`), other scalars and constant strings are the
+    /// positive-integers diagnostic (`Some(None)`), and anything else —
+    /// `true`/`false`, interpolated strings with variables, expressions —
+    /// is the removed-operand diagnostic (`None`). Parentheses and
+    /// pure-literal interpolations count as their contents.
+    fn flow_op_lit(e: &Expr) -> Option<Option<i64>> {
+        match e {
+            Expr::Int(i) => Some(Some(*i)),
+            Expr::Float(_) | Expr::Str(_) => Some(None),
+            Expr::Interp(ps)
+                if ps
+                    .iter()
+                    .all(|p| matches!(p, crate::lexer::StringPart::Lit(_))) =>
+            {
+                Some(None)
+            }
+            Expr::Paren(e) => Self::flow_op_lit(e),
+            _ => None,
+        }
     }
 
     /// Nested function bodies hide inside expressions (closures,
