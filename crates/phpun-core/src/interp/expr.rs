@@ -507,7 +507,7 @@ impl<'a> Interp<'a> {
                         // `static` statement first executes
                         // (closure_const_expr/bug79778).
                         let Some(e) = d else { continue };
-                        if !literal_static_init(&e) {
+                        if !literal_static_init(&e, &self.engine_consts) {
                             continue;
                         }
                         // __LINE__ resolves to the `static` statement's
@@ -4608,10 +4608,11 @@ fn closure_static_vars(stmts: &[Stmt], out: &mut Vec<(String, Option<Expr>, usiz
 }
 
 /// Compile-time bindable `static` initializer: literals and ops on
-/// literals only. Zend resolves consts/`new`/calls when the `static`
-/// statement runs, not at closure creation (probe_sv3), so those
-/// stay NULL in the seeded table.
-fn literal_static_init(e: &Expr) -> bool {
+/// literals only. Zend resolves user consts/`new`/calls when the
+/// `static` statement runs, not at closure creation (probe_sv3), so
+/// those stay NULL in the seeded table — except engine consts
+/// (PHP_VERSION, ...), which Zend binds at creation (probe_sv_engine).
+fn literal_static_init(e: &Expr, engine: &std::collections::HashSet<String>) -> bool {
     match e {
         Expr::Null
         | Expr::Bool(_)
@@ -4619,21 +4620,29 @@ fn literal_static_init(e: &Expr) -> bool {
         | Expr::Float(_)
         | Expr::Str(_)
         | Expr::MagicConst(_) => true,
+        Expr::Const(n) => engine.contains(n.trim_start_matches('\\')),
         Expr::ArrayLit(items) => items.iter().all(|(k, v)| {
-            k.as_ref().map(literal_static_init).unwrap_or(true) && literal_static_init(v)
+            k.as_ref()
+                .map(|k| literal_static_init(k, engine))
+                .unwrap_or(true)
+                && literal_static_init(v, engine)
         }),
         Expr::Interp(parts) => parts
             .iter()
             .all(|p| matches!(p, crate::lexer::StringPart::Lit(_))),
         Expr::Paren(inner) | Expr::ByRef(inner) | Expr::Unary { e: inner, .. } => {
-            literal_static_init(inner)
+            literal_static_init(inner, engine)
         }
-        Expr::Cast { e: inner, .. } => literal_static_init(inner),
-        Expr::Binary { l, r, .. } => literal_static_init(l) && literal_static_init(r),
+        Expr::Cast { e: inner, .. } => literal_static_init(inner, engine),
+        Expr::Binary { l, r, .. } => {
+            literal_static_init(l, engine) && literal_static_init(r, engine)
+        }
         Expr::Ternary { c, t, f, .. } => {
-            literal_static_init(c)
-                && t.as_ref().map(|t| literal_static_init(t)).unwrap_or(true)
-                && literal_static_init(f)
+            literal_static_init(c, engine)
+                && t.as_ref()
+                    .map(|t| literal_static_init(t, engine))
+                    .unwrap_or(true)
+                && literal_static_init(f, engine)
         }
         _ => false,
     }

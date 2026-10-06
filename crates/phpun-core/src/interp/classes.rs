@@ -3186,7 +3186,13 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn next_callable_id(&mut self, c: &Rc<PhpCallable>) -> u64 {
-        self.push_handle(ObjHandle::Callable(Rc::downgrade(c)))
+        // Only closures own per-instance statics tables — the decl name
+        // lets push_handle GC a dead closure's table on slot reuse.
+        let name = match &c.kind {
+            CallableKind::Closure(d) => Some(d.name.clone()),
+            _ => None,
+        };
+        self.push_handle(ObjHandle::Callable(Rc::downgrade(c), name))
     }
 
     fn push_handle(&mut self, w: ObjHandle) -> u64 {
@@ -3197,6 +3203,12 @@ impl<'a> Interp<'a> {
         let n = self.obj_handles.len();
         for i in (0..n).rev() {
             if !self.obj_handles[i].alive() {
+                if let ObjHandle::Callable(_, Some(name)) = &self.obj_handles[i] {
+                    // The dead closure's per-instance statics table dies
+                    // with it — the recycled id must not leak stale
+                    // entries to an unrelated decl of the same name.
+                    self.statics.remove(&format!("{}\u{0}c{}", name, i + 1));
+                }
                 self.obj_handles[i] = w;
                 return (i + 1) as u64;
             }

@@ -51,14 +51,16 @@ pub enum Flow {
 /// closures draw ids from the same vector, like Zend's EG(objects_store).
 enum ObjHandle {
     Obj(std::rc::Weak<RefCell<PhpObject>>),
-    Callable(std::rc::Weak<PhpCallable>),
+    /// Weak callable + its statics-table key prefix (the decl name in
+    /// `{name}\0c{id}`) — lets a dead slot's entry be GC'd on reuse.
+    Callable(std::rc::Weak<PhpCallable>, Option<String>),
 }
 
 impl ObjHandle {
     fn alive(&self) -> bool {
         match self {
             Self::Obj(w) => w.upgrade().is_some(),
-            Self::Callable(w) => w.upgrade().is_some(),
+            Self::Callable(w, _) => w.upgrade().is_some(),
         }
     }
 }
@@ -395,6 +397,10 @@ pub struct Interp<'a> {
     /// evaluated — stack-based closure names apply only while it still
     /// matches (a nested class initializer bumps it out from under us).
     param_bind_ctx: Option<u32>,
+    /// Engine-provided constants (PHP_VERSION, PHP_EOL, ...) — always
+    /// resolvable, so closure `static` defaults naming them bind at
+    /// creation like Zend (probe_sv_engine). User consts stay lazy.
+    engine_consts: std::collections::HashSet<String>,
     /// spl_autoload_register() callbacks, in registration order.
     pub autoload_fns: Vec<Value>,
     /// File currently executing — include resolution uses its directory
@@ -761,6 +767,7 @@ impl<'a> Interp<'a> {
         constants.insert("LC_MONETARY".into(), Value::Int(4));
         constants.insert("LC_MESSAGES".into(), Value::Int(5));
         constants.insert("LC_ALL".into(), Value::Int(6));
+        let engine_consts: std::collections::HashSet<String> = constants.keys().cloned().collect();
         let mut it = Self {
             file,
             globals: Frame::new(String::new()),
@@ -839,6 +846,7 @@ impl<'a> Interp<'a> {
             class_const_ctx: 0,
             const_self: None,
             param_bind_ctx: None,
+            engine_consts,
             autoload_fns: Vec::new(),
             obj_handles: Vec::new(),
             fcc_fn_cache: HashMap::new(),
@@ -1254,7 +1262,9 @@ impl<'a> Interp<'a> {
                 }
                 Ok(())
             }
-            Expr::MethodCall { obj, name, args, .. } => {
+            Expr::MethodCall {
+                obj, name, args, ..
+            } => {
                 Self::gate_expr(obj, m)?;
                 if let PropName::Expr(e) = name {
                     Self::gate_expr(e, m)?;
