@@ -371,6 +371,16 @@ pub struct Interp<'a> {
     gen_sink: Option<Rc<RefCell<Vec<crate::value::GenItem>>>>,
     /// send() queue feeding `yield`-expr results in the running body.
     gen_sends: std::collections::VecDeque<Value>,
+    /// throw() queue for the running body — (yield index, throwable)
+    /// entries the `yield` expression raises as its result when the
+    /// replay reaches them, so the body's own try/catch/finally does
+    /// the unwind.
+    gen_throws: std::collections::VecDeque<(usize, Value)>,
+    /// Yield indices a queued throw actually fired at during the
+    /// current gen run — `Generator->throw()` checks this to tell a
+    /// delivered injection from one that couldn't land (exhausted
+    /// gen, suspension point inside a `yield from` splice).
+    gen_throws_fired: Vec<usize>,
     /// Auto-key counter for keyless `yield $v` — counts keyless yields
     /// only (explicit keys and `yield from` items don't advance it).
     gen_auto: i64,
@@ -644,6 +654,19 @@ pub struct ObLevel {
     /// cursor passes them (or in full inside the body itself, where
     /// they already ran).
     pub gen_pending: Vec<(usize, Vec<u8>)>,
+    /// Deferred bytes drained into `buf` so far — the tail of a
+    /// body-pop value (buf[..len-drained] is pre-pop writes, the rest
+    /// is the resume segment it captured).
+    pub gen_drained: usize,
+    /// A body-popped window mirror: the pop value's head and tail —
+    /// consumer writes captured in [gen_open, gen_close) splice
+    /// between them when the journaled pop echo is rewritten at
+    /// window close.
+    pub pop_head: Option<Vec<u8>>,
+    pub pop_tail: Option<Vec<u8>>,
+    /// The owning generator's state — stale-drop rewrites its
+    /// deferred journal entries still holding the stale pop value.
+    pub gen_state: Option<std::rc::Weak<RefCell<crate::value::GenState>>>,
 }
 
 /// Result of a top-level program run.
@@ -964,6 +987,8 @@ impl<'a> Interp<'a> {
             gen_sink: None,
             pending_gen_captures: Vec::new(),
             gen_sends: std::collections::VecDeque::new(),
+            gen_throws: std::collections::VecDeque::new(),
+            gen_throws_fired: Vec::new(),
             gen_auto: 0,
             gen_run_state: None,
             iter_calls: 0,
@@ -1787,6 +1812,22 @@ impl<'a> Interp<'a> {
                     break;
                 }
             }
+            // Prop cells free with the object — a suspended
+            // generator held only by them force-closes at this same
+            // teardown slot (Zend frees the prop table alongside the
+            // dtor, interleaved with the CV pass).
+            if let Some(e) = self.gen_prop_sweep(&o) {
+                shutdown_code = Some(match self.err_flow(e) {
+                    Flow::Exit(c) => c,
+                    Flow::Throw(v) => {
+                        self.uncaught(&v);
+                        255
+                    }
+                    _ => 255,
+                });
+                dtor_stop = true;
+                break;
+            }
         }
         self.globals.vars.clear();
         // Objects a dtor spawns may land in already-visited recycled
@@ -1829,6 +1870,20 @@ impl<'a> Interp<'a> {
                             });
                             break 'sweep;
                         }
+                    }
+                    // Same prop-free rule as the CV pass — a
+                    // prop-held generator force-closes at this
+                    // object's slot in the store pass.
+                    if let Some(e) = self.gen_prop_sweep(&o) {
+                        shutdown_code = Some(match self.err_flow(e) {
+                            Flow::Exit(c) => c,
+                            Flow::Throw(v) => {
+                                self.uncaught(&v);
+                                255
+                            }
+                            _ => 255,
+                        });
+                        break 'sweep;
                     }
                 }
                 if !progressed {
@@ -2559,8 +2614,14 @@ impl<'a> Interp<'a> {
                 // tag so it merges with consumer writes in cursor
                 // order instead of echoing raw at replay.
                 if let Some(l) = self.ob_stack.last_mut() {
+                    // A popped window's mirror must not take the
+                    // re-run's writes — those belong to the body's
+                    // own deferred journal (the pop already closed
+                    // the real buffer).
                     let owns = match (&l.gen_q, &self.gen_run_state) {
-                        (Some(q), Some(s)) => std::rc::Rc::ptr_eq(q, &s.borrow().fin_q),
+                        (Some(q), Some(s)) => {
+                            std::rc::Rc::ptr_eq(q, &s.borrow().fin_q) && l.gen_close.is_none()
+                        }
                         _ => false,
                     };
                     if owns {
@@ -2594,7 +2655,8 @@ impl<'a> Interp<'a> {
     /// below anything the consumer pushed while suspended.
     fn ob_promote(&mut self) {
         // A promoted capture window closes once the cursor passes
-        // the body's pop point — drop it.
+        // the body's pop point — its consumer writes splice into
+        // the journaled pop value before it drops.
         let mut i = 0;
         while i < self.ob_stack.len() {
             let stale = self.ob_stack[i].gen_close.is_some_and(|c| {
@@ -2604,16 +2666,30 @@ impl<'a> Interp<'a> {
                     .is_some_and(|q| q.borrow().pos >= c)
             });
             if stale {
-                self.ob_stack.remove(i);
+                let l = self.ob_stack.remove(i);
+                self.ob_mirror_close(&l);
             } else {
                 i += 1;
             }
         }
-        // Dead mirrors (cursor at/past the body's pop) stay dead.
-        self.suspended_obs.retain(|l| {
-            l.gen_close
-                .is_none_or(|c| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos < c))
-        });
+        // Dead mirrors (cursor at/past the body's pop) stay dead —
+        // same splice for one demoted back to suspended_obs by a
+        // body re-run before it could re-materialize.
+        let mut i = 0;
+        while i < self.suspended_obs.len() {
+            let dead = self.suspended_obs[i].gen_close.is_some_and(|c| {
+                self.suspended_obs[i]
+                    .gen_q
+                    .as_ref()
+                    .is_some_and(|q| q.borrow().pos >= c)
+            });
+            if dead {
+                let l = self.suspended_obs.remove(i);
+                self.ob_mirror_close(&l);
+            } else {
+                i += 1;
+            }
+        }
         let mut i = 0;
         while i < self.suspended_obs.len() {
             let l = &self.suspended_obs[i];
@@ -2653,6 +2729,64 @@ impl<'a> Interp<'a> {
         self.suspended_obs.extend(moved);
     }
 
+    /// A gen window mirror that just closed: the consumer writes it
+    /// captured splice into the pop value Zend's shared buffer held
+    /// — rewrite the gen's deferred journal entries still carrying
+    /// the stale value (head+tail) to the corrected
+    /// (head+captures+tail).
+    fn ob_mirror_close(&mut self, l: &ObLevel) {
+        let Some(head) = &l.pop_head else {
+            return;
+        };
+        if l.buf.is_empty() {
+            return;
+        }
+        let tail = l.pop_tail.clone().unwrap_or_default();
+        let mut old_v = head.clone();
+        old_v.extend_from_slice(&tail);
+        let mut new_v = head.clone();
+        new_v.extend_from_slice(&l.buf);
+        new_v.extend_from_slice(&tail);
+        // The pop ran inside the resume that produced item close-1 —
+        // only deferred entries from that segment on can carry the
+        // pop value.
+        let min_tag = l.gen_close.unwrap_or(0).saturating_sub(1);
+        if let Some(gs) = &l.gen_state {
+            if let Some(st) = gs.upgrade() {
+                for (t, b, ..) in &mut st.borrow_mut().pending_out {
+                    if *t >= min_tag {
+                        Self::bytes_replace(b, &old_v, &new_v);
+                    }
+                }
+            }
+        }
+        if let Some(q) = &l.gen_q {
+            for (t, b, _) in &mut q.borrow_mut().bytes {
+                if *t >= min_tag {
+                    Self::bytes_replace(b, &old_v, &new_v);
+                }
+            }
+        }
+    }
+
+    /// Replace every occurrence of `old` in `b` with `new`.
+    fn bytes_replace(b: &mut Vec<u8>, old: &[u8], new: &[u8]) {
+        if old.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i + old.len() <= b.len() {
+            match b[i..].windows(old.len()).position(|w| w == old) {
+                Some(p) => {
+                    let at = i + p;
+                    b.splice(at..at + old.len(), new.iter().copied());
+                    i = at + new.len();
+                }
+                None => break,
+            }
+        }
+    }
+
     /// Merge a gen-opened buffer's journaled deferred bytes into its
     /// buf: an entry tagged `t` ran inside the resume that produced
     /// item `t`, so it lands in the buffer once the cursor passes
@@ -2677,6 +2811,7 @@ impl<'a> Interp<'a> {
             .take_while(|(t, _)| all || fin || *t < pos)
             .count();
         for (_, b) in level.gen_pending.drain(..take) {
+            level.gen_drained += b.len();
             level.buf.extend_from_slice(&b);
         }
     }
@@ -2809,11 +2944,59 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// An object freed at this teardown slot drops its prop cells
+    /// with it — a suspended generator whose only owners are those
+    /// cells force-closes right here (Zend frees the property table
+    /// alongside the object, interleaved with the destruct pass,
+    /// not at the unit-end gen sweep). Returns the first terminal
+    /// raise, like `gen_fin_replay` callers expect.
+    fn gen_prop_sweep(&mut self, o: &Rc<RefCell<PhpObject>>) -> Option<PhpError> {
+        // Tally the prop cells referencing each generator object —
+        // the gen dies with this object iff every strong ref lives
+        // in its prop table (plus the clone we hold for the check).
+        let mut gens: Vec<(Rc<RefCell<PhpObject>>, usize)> = Vec::new();
+        {
+            let b = o.borrow();
+            for name in &b.prop_order {
+                let Some(c) = b.props.get(name) else {
+                    continue;
+                };
+                if let Value::Object(go) = &*c.borrow() {
+                    if !matches!(
+                        &go.borrow().internal,
+                        Some(crate::value::ObjectInternal::Generator(_))
+                    ) {
+                        continue;
+                    }
+                    if let Some((_, n)) = gens.iter_mut().find(|(g, _)| Rc::ptr_eq(g, go)) {
+                        *n += 1;
+                    } else {
+                        gens.push((go.clone(), 1));
+                    }
+                }
+            }
+        }
+        let mut terminal = None;
+        for (go, n) in gens {
+            if Rc::strong_count(&go) != n + 1 {
+                continue;
+            }
+            let q = match &go.borrow().internal {
+                Some(crate::value::ObjectInternal::Generator(st)) => st.borrow().fin_q.clone(),
+                _ => continue,
+            };
+            if terminal.is_none() {
+                terminal = self.gen_fin_replay(&q, true);
+            }
+        }
+        terminal
+    }
+
     /// Drain one gen's destruction journal: emit the suspended
     /// delegation chain's queued finally output (innermost level
     /// first) and return the level's own terminal raise — the
-    /// `yield`-inside-`finally` fatal, the parked throw() throwable,
-    /// or the body's `finally`-region death.
+    /// `yield`-inside-`finally` fatal or the body's `finally`-region
+    /// death.
     pub(in crate::interp) fn gen_fin_replay(
         &mut self,
         q: &crate::value::FinQueue,
@@ -2838,6 +3021,14 @@ impl<'a> Interp<'a> {
                 return Some(e);
             }
         }
+        // Suspended AT a yield inside `finally` (iteration reached it
+        // normally, or a throw()-driven unwind parked there): Zend
+        // abandons the gen silently — the yield already suspended,
+        // so the finally's tail bytes and any terminal raise never
+        // run.
+        if fin.yields.iter().any(|(i, _)| *i == pos) {
+            return None;
+        }
         self.gen_fin_own_bytes(fin, pos);
         self.gen_fin_terminal(fin, pos, at_unit_end)
     }
@@ -2854,10 +3045,21 @@ impl<'a> Interp<'a> {
 
     /// This level's output bytes whose tags the consumer hasn't
     /// passed (already-shown tags were flushed through `pending_out`
-    /// during normal iteration).
+    /// during normal iteration). A `yield`-inside-`finally` past the
+    /// suspension point ends the unwind — bytes it or anything after
+    /// it emitted never replay.
     fn gen_fin_own_bytes(&mut self, fin: &crate::value::GenFinData, pos: usize) {
+        let cap = fin
+            .yields
+            .iter()
+            .filter(|(i, _)| *i > pos)
+            .map(|(i, _)| *i)
+            .min();
         for (t, b, is_err) in &fin.bytes {
             if *t < pos {
+                continue;
+            }
+            if cap.is_some_and(|y| *t >= y) {
                 continue;
             }
             if *is_err {
@@ -2870,9 +3072,8 @@ impl<'a> Interp<'a> {
 
     /// The destruction-time raise for a force-closed or shutdown gen,
     /// in unwind order: a `yield` past the suspension point inside a
-    /// `finally` region fatals; a `$gen->throw()` parked at a
-    /// finally-yield re-raises the injected throwable verbatim; the
-    /// body's own error replays when it died inside `finally`.
+    /// `finally` region fatals; the body's own error replays when it
+    /// died inside `finally`.
     fn gen_fin_terminal(
         &mut self,
         fin: &crate::value::GenFinData,
@@ -2903,9 +3104,6 @@ impl<'a> Interp<'a> {
             let frames = self.gen_gc_frames(&fin.fn_name, at_unit_end);
             self.rewrite_throwable_trace(&frames);
             return Some(e);
-        }
-        if let Some((v, _)) = fin.injected.clone() {
-            return Some(self.throw(v));
         }
         if let Some((mut e, throwable)) = fin.fin_err.clone() {
             let frames = self.gen_gc_frames(&fin.fn_name, at_unit_end);

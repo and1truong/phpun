@@ -191,6 +191,7 @@ impl<'a> Interp<'a> {
             by_ref,
             auto_key: 0,
             sends: Vec::new(),
+            throws: Vec::new(),
             pending_out: Vec::new(),
             fin_q,
             deferred_err: None,
@@ -260,9 +261,14 @@ impl<'a> Interp<'a> {
                 GenSetup::Invoke { args, .. } => args.clone(),
             }
         };
+        let throws = {
+            let st = state.borrow();
+            st.throws.clone()
+        };
         let items = Rc::new(RefCell::new(Vec::new()));
         let saved_sink = self.gen_sink.replace(items.clone());
         let saved_sends = std::mem::replace(&mut self.gen_sends, sends.into_iter().collect());
+        let saved_throws = std::mem::replace(&mut self.gen_throws, throws.into_iter().collect());
         let saved_auto = std::mem::replace(&mut self.gen_auto, 0);
         let saved_run = self.gen_run_state.replace(state.clone());
         let saved_fin_q = self.gen_fin_q.replace(state.borrow().fin_q.clone());
@@ -304,6 +310,7 @@ impl<'a> Interp<'a> {
         self.ob_suspend(&state.borrow().fin_q);
         self.gen_sink = saved_sink;
         self.gen_sends = saved_sends;
+        self.gen_throws = saved_throws;
         self.gen_auto = saved_auto;
         self.gen_run_state = saved_run;
         self.gen_fin_q = saved_fin_q;
@@ -689,42 +696,6 @@ impl<'a> Interp<'a> {
         method: &str,
         args: &[crate::value::Cell],
     ) -> Result<(), PhpError> {
-        // A `$gen->throw()` parked at a yield inside `finally`: the
-        // unwind continues at each resume — suspending again on the
-        // next finally-yield, surfacing the throwable verbatim once
-        // the consumer passes the parked point.
-        {
-            let st = state.borrow();
-            let fq = st.fin_q.clone();
-            let mut fq = fq.borrow_mut();
-            if let Some((v, i)) = fq.injected.take() {
-                let parked = fq.at_fin_yield(st.pos);
-                if parked {
-                    fq.injected = Some((v, st.pos));
-                } else if st.pos > i {
-                    drop(fq);
-                    drop(st);
-                    // The injected throwable surfaced — the unwind it
-                    // was mid-way through is complete, so the gen is
-                    // closed (its post-finally items never run).
-                    {
-                        let mut st = state.borrow_mut();
-                        st.finished = true;
-                        st.closed = true;
-                        st.items.clear();
-                        st.pending_out.clear();
-                        st.fin_q.borrow_mut().finished = true;
-                    }
-                    // The injected death is the gen's own — the body's
-                    // pending error never ran past that yield.
-                    state.borrow_mut().deferred_err = None;
-                    state.borrow().fin_q.borrow_mut().fin_err = None;
-                    return Err(self.throw(v));
-                } else {
-                    fq.injected = Some((v, i));
-                }
-            }
-        }
         let dead = {
             let st = state.borrow();
             st.pos >= st.items.len() && st.deferred_err.is_some()
@@ -876,6 +847,18 @@ impl<'a> Interp<'a> {
         args: &[crate::value::Cell],
         msg: &str,
     ) -> PhpError {
+        self.gen_method_throw_kind("Exception", method, args, msg)
+    }
+
+    /// `gen_method_throw` for a different throwable class (TypeError
+    /// for bad `Generator->throw()` args).
+    fn gen_method_throw_kind(
+        &mut self,
+        class: &str,
+        method: &str,
+        args: &[crate::value::Cell],
+        msg: &str,
+    ) -> PhpError {
         let userland = self.iter_calls == 0 && self.gen_internal_resume == 0;
         if userland {
             self.call_trace.push(TraceFrame {
@@ -889,7 +872,7 @@ impl<'a> Interp<'a> {
                 internal: false,
             });
         }
-        let v = self.exception("Exception", msg);
+        let v = self.exception(class, msg);
         if userland {
             self.call_trace.pop();
         }
@@ -935,9 +918,21 @@ impl<'a> Interp<'a> {
                     if dead {
                         if pos == 0 {
                             // Dead while still at the first item:
-                            // rewind is a silent no-op — the buffered
-                            // items serve, the death surfaces at the
-                            // resume past them.
+                            // rewind is a silent no-op while the
+                            // death is still deferred — the buffered
+                            // items serve, it surfaces at the resume
+                            // past them. Once it surfaced, Zend marks
+                            // the gen closed: an engine consume
+                            // reports 'closed' on every retry while
+                            // an explicit ->rewind() stays silent.
+                            let surfaced = state.borrow().deferred_err.is_none();
+                            if surfaced && engine {
+                                return Err(self.gen_method_throw(
+                                    "rewind",
+                                    &args.cells,
+                                    "Cannot traverse an already closed generator",
+                                ));
+                            }
                             return Ok(Some(Value::Null));
                         }
                         if engine && pos >= len {
@@ -1034,7 +1029,17 @@ impl<'a> Interp<'a> {
                         st.items.clear();
                         st.set_pos(0);
                         st.pending_out.clear();
-                        st.fin_q.borrow_mut().bytes.clear();
+                        // The deferred-output journal replays from
+                        // scratch with the body — stale fin bytes /
+                        // yield markers from the pre-resume stream
+                        // would double-emit or mis-flag yields.
+                        {
+                            let mut fin = st.fin_q.borrow_mut();
+                            fin.bytes.clear();
+                            fin.yields.clear();
+                            fin.delegates.clear();
+                            fin.fin_err = None;
+                        }
                         st.deferred_err = None;
                         st.dead = false;
                     }
@@ -1069,24 +1074,73 @@ impl<'a> Interp<'a> {
             }
             "throw" => {
                 let e = args.cells.first().map(|c| c.borrow().clone()).unwrap_or(Value::Null);
+                // zpp: $exception must be a Throwable.
+                let ok = matches!(&e, Value::Object(o) if self.obj_is_a(o, "throwable"));
+                if !ok {
+                    return Err(self.gen_method_throw_kind(
+                        "TypeError",
+                        "throw",
+                        &args.cells,
+                        &format!(
+                            "Generator::throw(): Argument #1 ($exception) must be of type Throwable, {} given",
+                            self.zval_type_name(&e)
+                        ),
+                    ));
+                }
                 // throw() into an unstarted gen resumes it to the
                 // first yield first — its body (and queued finally
                 // output) exists before the kill.
                 self.gen_start(&state)?;
-                let (at_fin, next_fin) = {
-                    let st = state.borrow();
-                    let fq = st.fin_q.borrow();
-                    (fq.at_fin_yield(st.pos), fq.next_fin_yield(st.pos))
+                if state.borrow().closed {
+                    // No suspended frame to receive the throwable —
+                    // Zend bounces it out of this call verbatim.
+                    return Err(self.throw(e));
+                }
+                // Re-run the body with the throwable queued at the
+                // suspended yield: that yield expression raises it,
+                // so the body's own try/catch/finally performs the
+                // real unwind — a matching catch binds the exception
+                // object itself, `return` ending a finally swallows
+                // it, a yield inside `finally` suspends the unwind.
+                let prev = {
+                    let mut st = state.borrow_mut();
+                    let prev = st.pos;
+                    st.throws.push((prev, e.clone()));
+                    st.started = false;
+                    st.finished = false;
+                    st.items.clear();
+                    st.set_pos(0);
+                    st.pending_out.clear();
+                    {
+                        let mut fin = st.fin_q.borrow_mut();
+                        fin.bytes.clear();
+                        fin.yields.clear();
+                        fin.delegates.clear();
+                        fin.fin_err = None;
+                    }
+                    st.deferred_err = None;
+                    st.dead = false;
+                    prev
                 };
-                if at_fin {
-                    // Suspended AT a yield inside `finally`: the
-                    // injected throwable lands on the suspended yield
-                    // expression itself — the rest of the finally
-                    // never runs and the throwable surfaces at this
-                    // throw() call.
+                self.gen_throws_fired.clear();
+                // The re-run replays the prefix the consumer already
+                // echoed — suppress its bytes like a send() re-run.
+                self.gen_replay_horizon = Some(prev);
+                let r = self.gen_start(&state);
+                self.gen_replay_horizon = None;
+                r?;
+                if !self.gen_throws_fired.contains(&prev) {
+                    // The injection couldn't land — the suspension
+                    // point isn't a body-level yield (a `yield from`
+                    // splice item) or the stream was exhausted: Zend
+                    // force-closes — run the suspended chain's
+                    // finally output, then bounce the throwable out
+                    // of this call.
                     let fq = state.borrow().fin_q.clone();
-                    std::mem::take(&mut *fq.borrow_mut());
+                    let fin = std::mem::take(&mut *fq.borrow_mut());
+                    let pos = fin.pos;
                     fq.borrow_mut().finished = true;
+                    self.gen_fin_bytes(&fin, pos);
                     let mut st = state.borrow_mut();
                     st.finished = true;
                     st.closed = true;
@@ -1095,48 +1149,27 @@ impl<'a> Interp<'a> {
                     st.deferred_err = None;
                     return Err(self.throw(e));
                 }
-                if let Some(idx) = next_fin {
-                    // A `finally` yield ahead of the suspension
-                    // point: the unwind echoes the queued output up
-                    // to that journal point, delivers its item from
-                    // throw() and parks the throwable — it
-                    // re-surfaces at the consumer's next resume
-                    // (gen_raise_deferred).
-                    self.gen_flush_out(&state, idx);
-                    let v = {
-                        let mut st = state.borrow_mut();
-                        st.set_pos(idx);
-                        st.items
-                            .get(idx)
-                            .map(|(_, v)| v.borrow().clone())
-                            .unwrap_or(Value::Null)
-                    };
-                    state.borrow().fin_q.borrow_mut().injected = Some((e, idx));
-                    return Ok(Some(v));
-                }
                 {
-                    // Closing a suspended generator runs the finally
-                    // chains of the try-regions enclosing its
-                    // suspension point BEFORE the throwable
-                    // propagates — replay the suspended delegation
-                    // chain's queued bytes (innermost first).
-                    let fq = state.borrow().fin_q.clone();
-                    let fin = std::mem::take(&mut *fq.borrow_mut());
-                    let pos = fin.pos;
-                    fq.borrow_mut().finished = true;
-                    self.gen_fin_bytes(&fin, pos);
-                    // Zend's closed generator: the kill discards the
-                    // buffered item stream — subsequent reads report
-                    // exhausted (valid() false, current()/key() null),
-                    // send()/next() stay silent.
                     let mut st = state.borrow_mut();
-                    st.finished = true;
-                    st.closed = true;
-                    st.items.clear();
-                    st.pending_out.clear();
-                    st.deferred_err = None;
+                    st.set_pos(prev + 1);
+                    // An injected throwable that propagated uncaught
+                    // killed the body — Zend leaves the gen closed,
+                    // not dead-resumable (explicit ->rewind() reports
+                    // 'already run').
+                    if st.dead {
+                        st.closed = true;
+                    }
                 }
-                Err(self.throw(e))
+                self.gen_flush_out(&state, prev + 1);
+                self.gen_raise_deferred(&state, "throw", &args.cells)?;
+                Ok(Some(
+                    state
+                        .borrow()
+                        .items
+                        .get(prev + 1)
+                        .map(|(_, v)| v.borrow().clone())
+                        .unwrap_or(Value::Null),
+                ))
             }
             "getreturn" => {
                 // getReturn() starts the body first (zend_generator
@@ -1145,7 +1178,12 @@ impl<'a> Interp<'a> {
                 // throws 'hasn't returned' once the run proves it
                 // unfinished.
                 self.gen_start(&state)?;
-                self.gen_flush_out(&state, usize::MAX);
+                // Deferred output belongs to the resumes that cross
+                // each tag — getReturn doesn't advance the cursor,
+                // so only bytes already due drain here (Zend emits
+                // nothing extra for a still-suspended gen).
+                let pos = state.borrow().pos;
+                self.gen_flush_out(&state, pos);
                 self.gen_raise_deferred(&state, "getReturn", &args.cells)?;
                 let st = state.borrow();
                 if st.pos < st.items.len() || st.closed || st.dead {

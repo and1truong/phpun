@@ -196,15 +196,24 @@ impl<'a> Interp<'a> {
                 match &self.gen_sink {
                     Some(sink) => {
                         sink.borrow_mut().push((k, vc));
+                        let idx = sink.borrow().len() - 1;
                         // A yield inside a `finally` region marks the
                         // force-close fatal — destruction replay
                         // raises 'Cannot yield from finally in a
                         // force-closed generator' here.
                         if self.gen_fin_depth > 0 {
                             if let Some(q) = &self.gen_fin_q {
-                                let idx = sink.borrow().len() - 1;
                                 q.borrow_mut().yields.push((idx, self.cur_line));
                             }
+                        }
+                        // A `Generator->throw()` queued for this yield
+                        // raises the throwable as the expression's
+                        // result — the body's own try/catch/finally
+                        // performs the unwind.
+                        if self.gen_throws.front().is_some_and(|(i, _)| *i == idx) {
+                            let (_, v) = self.gen_throws.pop_front().unwrap();
+                            self.gen_throws_fired.push(idx);
+                            return Err(self.throw(v));
                         }
                         Ok(self.gen_sends.pop_front().unwrap_or(Value::Null))
                     }

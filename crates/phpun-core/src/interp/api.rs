@@ -179,25 +179,69 @@ impl<'a> Interp<'a> {
             gen_open,
             gen_close: None,
             gen_pending: Vec::new(),
+            gen_drained: 0,
+            pop_head: None,
+            pop_tail: None,
+            gen_state: None,
         });
     }
 
     /// Pop the top buffer — a gen-opened one popped by the body
     /// keeps a suspended capture window until the consumer's cursor
     /// passes its close tag (Zend's global buffer still exists
-    /// between the body's yield and its pop).
+    /// between the body's yield and its pop). A body re-run that
+    /// replays the pop folds the live mirror's consumer captures
+    /// into the returned value instead of registering a second
+    /// window.
     fn ob_pop(&mut self) -> Option<ObLevel> {
-        let l = self.ob_stack.pop()?;
+        let mut l = self.ob_stack.pop()?;
         if l.gen_open.is_some() && self.gen_run_state.is_some() && l.gen_close.is_none() {
-            self.suspended_obs.push(ObLevel {
-                buf: Vec::new(),
-                handler: None,
-                started: true,
-                gen_q: l.gen_q.clone(),
-                gen_open: l.gen_open,
-                gen_close: self.gen_sink.as_ref().map(|s| s.borrow().len()),
-                gen_pending: Vec::new(),
-            });
+            let close = self.gen_sink.as_ref().map(|s| s.borrow().len());
+            let existing = match (&l.gen_q, close) {
+                (Some(q), Some(c)) => self
+                    .ob_stack
+                    .iter()
+                    .chain(self.suspended_obs.iter())
+                    .find(|m| {
+                        m.gen_q
+                            .as_ref()
+                            .is_some_and(|mq| std::rc::Rc::ptr_eq(mq, q))
+                            && m.gen_close == Some(c)
+                    })
+                    .map(|m| (m.pop_head.clone(), m.buf.clone())),
+                _ => None,
+            };
+            if let Some((head, caps)) = existing {
+                // Replayed pop: the mirror already captured the
+                // consumer writes the shared Zend buffer also held
+                // — the returned value is head+captures+this pop.
+                let mut nv = head.unwrap_or_default();
+                nv.extend_from_slice(&caps);
+                nv.extend_from_slice(&l.buf);
+                l.buf = nv;
+            } else {
+                // Register the window mirror: keep the pop value's
+                // head/tail split so consumer captures splice
+                // between them at window close.
+                let drained = l.gen_drained.min(l.buf.len());
+                let split = l.buf.len() - drained;
+                let head = l.buf[..split].to_vec();
+                let tail = l.buf[split..].to_vec();
+                let gen_state = self.gen_run_state.as_ref().map(std::rc::Rc::downgrade);
+                self.suspended_obs.push(ObLevel {
+                    buf: Vec::new(),
+                    handler: None,
+                    started: true,
+                    gen_q: l.gen_q.clone(),
+                    gen_open: l.gen_open,
+                    gen_close: close,
+                    gen_pending: Vec::new(),
+                    gen_drained: 0,
+                    pop_head: Some(head),
+                    pop_tail: Some(tail),
+                    gen_state,
+                });
+            }
         }
         Some(l)
     }

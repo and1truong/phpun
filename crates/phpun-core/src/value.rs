@@ -1707,10 +1707,6 @@ pub struct GenFinData {
     /// region — (err, throwable), mirrors `GenState::deferred_err`'s
     /// finally component so a dead weak still surfaces it.
     pub fin_err: Option<(crate::error::PhpError, Option<Value>)>,
-    /// `$gen->throw()` parked at a yield inside `finally`:
-    /// (throwable, item idx parked at) — re-raised verbatim once
-    /// the consumer resumes past it.
-    pub injected: Option<(Value, usize)>,
     /// Mirrored `GenState::pos` — the object is gone when a dead
     /// weak's entry replays.
     pub pos: usize,
@@ -1764,9 +1760,6 @@ impl GenFinData {
             *t += base;
         }
         for (i, _) in &mut self.yields {
-            *i += base;
-        }
-        if let Some((_, i)) = &mut self.injected {
             *i += base;
         }
         for d in &mut self.delegates {
@@ -1851,6 +1844,13 @@ pub struct GenState {
     /// Every send() value ever passed, in call order — the k-th send
     /// feeds the k-th yield expression when the body (re)runs.
     pub sends: Vec<Value>,
+    /// Every `Generator->throw()` injection, as (yield index,
+    /// throwable) — the body re-runs on each resume, so the queued
+    /// throwable is raised as the result of that yield expression and
+    /// the body's own try/catch/finally performs the real unwind
+    /// (catch delivery, `return`-in-finally swallow, suspend at a
+    /// yield inside `finally`).
+    pub throws: Vec<(usize, Value)>,
     /// Output produced after a yield suspends mid-expression — Zend
     /// defers it to resume; buffered per yield index and emitted when
     /// the consumer advances `pos` past it (closure_call_leak). The
