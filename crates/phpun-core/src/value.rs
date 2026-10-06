@@ -1809,6 +1809,12 @@ pub enum PhpResource {
         /// fwrite honors the fopen mode ('r' → false); fprintf does not
         /// (zend php_stream_printf bypasses the check).
         write: bool,
+        /// The php:// URI the stream was opened with ("php://memory",
+        /// "php://temp", "php://temp/maxmemory:N") — reported verbatim
+        /// in stream_get_meta_data()'s 'uri' key.
+        uri: String,
+        /// zend's normalized open mode for meta ('rb', 'w+b', 'a+b').
+        mode: String,
     },
     /// A resource closed via fclose()/fclose-aliased wrappers — Zend
     /// keeps the zval `resource (closed)` (gettype "resource (closed)",
@@ -1825,6 +1831,9 @@ pub enum PhpResource {
         /// ["socket"] descriptor pair — bidirectional, different
         /// stream_type in stream_get_meta_data().
         socket: bool,
+        /// ["pty"] descriptor — the parent's end is the pty master,
+        /// opened 'r+' in zend's meta.
+        pty: bool,
         /// stream_set_blocking($s, false) — reads return "" instead
         /// of waiting (fcntl O_NONBLOCK on the fd).
         nonblock: bool,

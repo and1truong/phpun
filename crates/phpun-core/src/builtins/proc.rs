@@ -309,6 +309,8 @@ struct Desc {
     parent: RawFd,
     pipe_rw: Option<bool>,
     socket: bool,
+    /// ["pty"] descriptor — the parent's end is the pty master (r+).
+    pty: bool,
 }
 
 fn dup_fd(from: RawFd) -> Option<RawFd> {
@@ -691,6 +693,7 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
                         file: f,
                         write: wr,
                         socket: d.socket,
+                        pty: d.pty,
                         nonblock: false,
                         pos: 0,
                         eof: false,
@@ -769,6 +772,7 @@ fn spec_array(
                 parent: cloexec(parent),
                 pipe_rw: Some(rw),
                 socket: false,
+                pty: false,
             })
         }
         b"socket" => {
@@ -790,6 +794,7 @@ fn spec_array(
                 parent: cloexec(s[0]),
                 pipe_rw: Some(true),
                 socket: true,
+                pty: false,
             })
         }
         b"file" => {
@@ -817,6 +822,7 @@ fn spec_array(
                     parent: -1,
                     pipe_rw: None,
                     socket: false,
+                    pty: false,
                 }),
                 Err(e) => {
                     it.warn_pub(&format!(
@@ -859,6 +865,7 @@ fn spec_array(
                         parent: -1,
                         pipe_rw: None,
                         socket: false,
+                        pty: false,
                     }),
                     None => {
                         spec_err(
@@ -890,6 +897,7 @@ fn spec_array(
                     parent: -1,
                     pipe_rw: None,
                     socket: false,
+                    pty: false,
                 }),
                 Err(e) => {
                     spec_err(it, &format!("Failed to open /dev/null: {}", io_err_str(&e)))?;
@@ -931,6 +939,7 @@ fn spec_array(
                     parent: pd,
                     pipe_rw: Some(true),
                     socket: false,
+                    pty: true,
                 }),
                 (cd, pd) => {
                     for f in [cd, pd].into_iter().flatten() {

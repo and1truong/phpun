@@ -356,12 +356,29 @@ pub(crate) fn dispatch(
                 // internally; fwrite still honors the fopen mode.
                 let id = it.next_res_id();
                 let w = mem_writeable(&mode);
+                // zend reports the URI verbatim and a normalized mode:
+                // '+' → w+b (a → a+b), else w → w+b, a → a+b, rest → rb.
+                let meta_mode = if mode.contains('+') {
+                    if mode.contains('a') {
+                        "a+b"
+                    } else {
+                        "w+b"
+                    }
+                } else {
+                    match mode.chars().next() {
+                        Some('w') => "w+b",
+                        Some('a') => "a+b",
+                        _ => "rb",
+                    }
+                };
                 Value::Resource(Rc::new(RefCell::new(PhpResource::Mem {
                     id,
                     buf: Vec::new(),
                     pos: 0,
                     eof: false,
                     write: w,
+                    uri: path.clone(),
+                    mode: meta_mode.to_string(),
                 })))
             } else if let Some(which) = match path.as_str() {
                 "php://stdin" => Some(0u8),
@@ -970,6 +987,7 @@ pub(crate) fn dispatch(
                         PhpResource::Pipe {
                             write,
                             socket,
+                            pty,
                             eof,
                             nonblock,
                             ..
@@ -982,7 +1000,7 @@ pub(crate) fn dispatch(
                             ));
                             base.push((
                                 "mode",
-                                Value::str(if *socket {
+                                Value::str(if *socket || *pty {
                                     "r+"
                                 } else if *write {
                                     "w"
@@ -1034,13 +1052,30 @@ pub(crate) fn dispatch(
                             ));
                             mk(base)
                         }
-                        PhpResource::Mem { eof, .. } => {
-                            base.push(("eof", Value::Bool(*eof)));
+                        PhpResource::Mem {
+                            eof, uri, mode, ..
+                        } => {
+                            // zend quirk: php://memory reports the full
+                            // 9-key meta, but temp streams (TEMP) omit
+                            // timed_out/blocked/eof entirely.
+                            if uri == "php://memory" {
+                                base.push(("eof", Value::Bool(*eof)));
+                            } else {
+                                base.clear();
+                            }
                             base.push(("wrapper_type", Value::str("PHP")));
-                            base.push(("stream_type", Value::str("TEMP")));
-                            base.push(("mode", Value::str("w+b")));
+                            base.push((
+                                "stream_type",
+                                Value::str(if uri == "php://memory" {
+                                    "MEMORY"
+                                } else {
+                                    "TEMP"
+                                }),
+                            ));
+                            base.push(("mode", Value::str(mode.clone())));
                             base.push(("unread_bytes", Value::Int(0)));
                             base.push(("seekable", Value::Bool(true)));
+                            base.push(("uri", Value::str(uri.clone())));
                             mk(base)
                         }
                         PhpResource::Input { body, pos, .. } => {
