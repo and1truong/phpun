@@ -4361,7 +4361,12 @@ impl<'a> Interp<'a> {
             CastKind::Float => Value::Float(v.to_float()),
             CastKind::Bool => Value::Bool(v.is_truthy()),
             CastKind::Unset => Value::Null,
-            CastKind::String => Value::str(self.conv_str(&v)?),
+            CastKind::String => match &v {
+                // Identity on strings — conv_str's UTF-8 decode would
+                // mangle non-UTF-8 bytes.
+                Value::Str(_) => v,
+                _ => Value::str(self.conv_str(&v)?),
+            },
             CastKind::Array => match v {
                 Value::Array(_) => v,
                 Value::Null => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),

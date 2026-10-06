@@ -875,7 +875,11 @@ impl<'a> Interp<'a> {
             mem_exceeded: false,
             deadline: None,
             deadline_secs: 0,
-            ini: HashMap::from([("error_reporting".to_string(), "30719".to_string())]),
+            ini: HashMap::from([
+                ("error_reporting".to_string(), "30719".to_string()),
+                // Zend's compiled-in default (hardcoded in main/php.ini).
+                ("memory_limit".to_string(), "128M".to_string()),
+            ]),
         };
         // Auto-globals. PHP's $_SERVER carries env + script metadata;
         // the request arrays start empty (bug24908 counts on non-empty

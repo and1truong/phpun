@@ -62,7 +62,13 @@ pub(crate) fn dispatch(
                     return Ok(Some(Value::str(o.borrow().class.name().to_string())))
                 }
                 Value::Callable(_) => "Closure",
-                Value::Resource(_) => "resource",
+                Value::Resource(r) => {
+                    if matches!(&*r.borrow(), PhpResource::Closed { .. }) {
+                        "resource (closed)"
+                    } else {
+                        "resource"
+                    }
+                }
             }
             .to_string(),
         ),
@@ -129,7 +135,12 @@ pub(crate) fn dispatch(
                 .any(|i| i.eq_ignore_ascii_case("countable")),
             _ => false,
         }),
-        "is_resource" => Value::Bool(matches!(arg(args, 0), Value::Resource(_))),
+        // is_resource() is false on closed handles (zend_list_close
+        // leaves a `resource (closed)` zval, not a live resource).
+        "is_resource" => Value::Bool(match arg(args, 0) {
+            Value::Resource(r) => !matches!(&*r.borrow(), PhpResource::Closed { .. }),
+            _ => false,
+        }),
         "is_nan" => Value::Bool(matches!(arg(args, 0), Value::Float(f) if f.is_nan())),
         "is_finite" => Value::Bool(matches!(arg(args, 0), Value::Float(f) if f.is_finite())),
         "is_infinite" => Value::Bool(matches!(arg(args, 0), Value::Float(f) if f.is_infinite())),
@@ -424,11 +435,15 @@ fn var_dump(it: &mut Interp, v: &Value, indent: usize, zval: bool, is_ref: bool)
             it.emit(&format!("{}}}\n", pad));
             it.dump_stack.remove(&cptr);
         }
-        Value::Resource(r) => it.emit(&format!(
-            "{}resource({}) of type (stream)\n",
-            pad,
-            r.borrow().id()
-        )),
+        Value::Resource(r) => {
+            let rb = r.borrow();
+            it.emit(&format!(
+                "{}resource({}) of type ({})\n",
+                pad,
+                rb.id(),
+                rb.type_name()
+            ));
+        }
     }
 }
 
