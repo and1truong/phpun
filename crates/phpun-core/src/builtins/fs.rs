@@ -341,10 +341,13 @@ pub(crate) fn dispatch(
                     eof: false,
                     pos_broken: false,
                     uri: path.clone(),
+                    mode: "rb".into(),
+                    spilled_fd: None,
                 })))
             } else if let Some(body) = parse_data_uri(&path) {
-                // `data:[mediatype][;base64],payload` — a memory stream
-                // (scalar_* tests fopen a data: URL for test values).
+                // `data:[mediatype][;base64],payload` — zend's RFC2397
+                // wrapper: a temp-backed read-only stream (scalar_*
+                // tests fopen a data: URL for test values).
                 let id = it.next_res_id();
                 Value::Resource(Rc::new(RefCell::new(PhpResource::Input {
                     id,
@@ -353,6 +356,8 @@ pub(crate) fn dispatch(
                     eof: false,
                     pos_broken: false,
                     uri: path.clone(),
+                    mode: mode.clone(),
+                    spilled_fd: None,
                 })))
             } else if path == "php://memory"
                 || path == "php://temp"
@@ -386,6 +391,7 @@ pub(crate) fn dispatch(
                     write: w,
                     uri: path.clone(),
                     mode: meta_mode.to_string(),
+                    spilled_fd: None,
                 })))
             } else if let Some(which) = match path.as_str() {
                 "php://stdin" => Some(0u8),
@@ -2440,94 +2446,43 @@ fn stat_array(m: &std::fs::Metadata) -> PhpArray {
 /// stream_array_from_fd_set rewrite. Each bad element chains a
 /// TypeError via Exception::$previous on EVERY pass (oracle: 2 bad
 /// elements in the read array → depth 6); a real stream with no
-/// descriptor warns its stream-type name on the build and rewrite
-/// passes only. With no usable stream left, the ValueError is thrown
-/// ON TOP of the chain and no rewrite happens; otherwise select still
-/// runs and the by-ref arrays are rewritten before the chain surfaces
-/// at return.
+/// descriptor warns its ops label on the build and emulate passes
+/// only (the rewrite pass skips uncastable entries silently). With no
+/// usable stream left, the ValueError is thrown ON TOP of the chain
+/// and no rewrite happens; otherwise select still runs and the
+/// by-ref arrays are rewritten before the chain surfaces at return.
 fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<Value>, PhpError> {
     use std::os::fd::AsRawFd;
     let param_names = ["read", "write", "except"];
-    let mut sets: [Vec<(ArrKey, Value, i32)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    let mut chain: Vec<Value> = Vec::new();
+    // zend signature: stream_select(?array &$read, ?array &$write,
+    // ?array &$except, ?int $seconds, ?int $microseconds = null) — the
+    // 4th arg is REQUIRED and all five ZPP type-checks run before the
+    // body: a bad $seconds TypeError surfaces BEFORE any element fetch
+    // (chains, "Cannot represent" warnings, the empty-sets ValueError).
+    if args.len() < 4 {
+        return err(
+            "ArgumentCountError",
+            format!(
+                "{}() expects at least 4 arguments, {} given",
+                fname,
+                args.len()
+            ),
+        );
+    }
+    if args.len() > 5 {
+        return err(
+            "ArgumentCountError",
+            format!(
+                "{}() expects at most 5 arguments, {} given",
+                fname,
+                args.len()
+            ),
+        );
+    }
     for (ai, arg_c) in args.iter().take(3).enumerate() {
         let v = arg_c.borrow().clone();
         match v {
-            Value::Array(a) => {
-                for (k, c) in a.borrow().iter() {
-                    let item = c.borrow().clone();
-                    let Value::Resource(ref r) = item else {
-                        select_chain(
-                            it,
-                            &mut chain,
-                            "TypeError",
-                            format!(
-                                "{}(): supplied argument is not a valid stream resource",
-                                fname
-                            ),
-                        );
-                        continue;
-                    };
-                    let fd = {
-                        let rb = r.borrow();
-                        match &*rb {
-                            PhpResource::File { file, .. } | PhpResource::Pipe { file, .. } => {
-                                file.as_raw_fd()
-                            }
-                            PhpResource::Stdio { which, .. } if *which <= 2 => *which as i32,
-                            // php://temp is fd-claimable: zend's cast
-                            // spills the buffer into a tmpfile() and
-                            // seeks it to the stream position.
-                            PhpResource::Mem { uri, buf, pos, .. } if uri == "php://temp" => {
-                                match temp_spill_fd(buf, *pos) {
-                                    Some(fd) => fd,
-                                    None => {
-                                        it.warn_pub(&format!(
-                                            "{}(): Cannot represent a stream of type TEMP as a select()able descriptor",
-                                            fname
-                                        ))?;
-                                        continue;
-                                    }
-                                }
-                            }
-                            // Resources that aren't streams (closed,
-                            // process, ...) → zend's stream le fetch
-                            // fails → TypeError.
-                            PhpResource::Closed { .. }
-                            | PhpResource::Proc { .. }
-                            | PhpResource::Other { .. } => {
-                                drop(rb);
-                                select_chain(
-                                    it,
-                                    &mut chain,
-                                    "TypeError",
-                                    format!(
-                                        "{}(): supplied resource is not a valid stream resource",
-                                        fname
-                                    ),
-                                );
-                                continue;
-                            }
-                            // Real streams without a select()able fd warn.
-                            other => {
-                                let ty = match other {
-                                    PhpResource::Mem { .. } => "MEMORY",
-                                    PhpResource::Input { .. } => "Input",
-                                    PhpResource::Stdio { .. } => "Output",
-                                    o => o.type_name(),
-                                };
-                                it.warn_pub(&format!(
-                                    "{}(): Cannot represent a stream of type {} as a select()able descriptor",
-                                    fname, ty
-                                ))?;
-                                continue;
-                            }
-                        }
-                    };
-                    sets[ai].push((k.clone(), item, fd));
-                }
-            }
-            Value::Null => {}
+            Value::Array(_) | Value::Null => {}
             _ => {
                 return err(
                     "TypeError",
@@ -2539,6 +2494,97 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
                         select_arg_word(&v)
                     ),
                 )
+            }
+        }
+    }
+    let sec_null = matches!(*args[3].borrow(), Value::Null);
+    let usec_null = args
+        .get(4)
+        .map(|c| matches!(*c.borrow(), Value::Null))
+        .unwrap_or(true);
+    let sec = if sec_null {
+        0
+    } else {
+        zpp_long(it, args, 3, fname, 4, "$seconds", "?int")?
+    };
+    let usec = if usec_null {
+        0
+    } else {
+        zpp_long(it, args, 4, fname, 5, "$microseconds", "?int")?
+    };
+    // zend stream_select: per-element validation runs THREE fetch passes
+    // per array — the fd_set build, stream_array_emulate_read_fd_set
+    // (read array only, keeps buffered streams readable), and the
+    // stream_array_from_fd_set rewrite. Each bad element chains a
+    // TypeError via Exception::$previous on EVERY pass (oracle: 2 bad
+    // elements in the read array → depth 6); an uncastable stream warns
+    // its ops label on the build and emulate passes only. With no
+    // usable stream left, the ValueError is thrown ON TOP of the chain
+    // and no rewrite happens; otherwise select still runs and the
+    // by-ref arrays are rewritten before the chain surfaces at return.
+    let mut sets: [Vec<(ArrKey, Value, i32)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut chain: Vec<Value> = Vec::new();
+    for (ai, arg_c) in args.iter().take(3).enumerate() {
+        let Value::Array(a) = &*arg_c.borrow() else {
+            continue;
+        };
+        for (k, c) in a.borrow().iter() {
+            let item = c.borrow().clone();
+            let Value::Resource(ref r) = item else {
+                select_chain(
+                    it,
+                    &mut chain,
+                    "TypeError",
+                    format!(
+                        "{}(): supplied argument is not a valid stream resource",
+                        fname
+                    ),
+                );
+                continue;
+            };
+            let fd = {
+                let mut rb = r.borrow_mut();
+                match &mut *rb {
+                    PhpResource::File { file, .. } | PhpResource::Pipe { file, .. } => {
+                        Some(file.as_raw_fd())
+                    }
+                    PhpResource::Stdio { which, .. } if *which <= 2 => Some(*which as i32),
+                    // Resources that aren't streams (closed, process,
+                    // ...) → zend's stream le fetch fails → TypeError.
+                    PhpResource::Closed { .. }
+                    | PhpResource::Proc { .. }
+                    | PhpResource::Other { .. } => {
+                        drop(rb);
+                        select_chain(
+                            it,
+                            &mut chain,
+                            "TypeError",
+                            format!(
+                                "{}(): supplied resource is not a valid stream resource",
+                                fname
+                            ),
+                        );
+                        continue;
+                    }
+                    // php://temp* and data: are fd-claimable — zend's
+                    // cast spills the buffer into a tmpfile() the
+                    // stream then keeps; a failed spill (or any other
+                    // fd-less stream) warns its stream-type label.
+                    other => match spill_fd_for_stream(other) {
+                        Some(fd) => Some(fd),
+                        None => {
+                            let ty = stream_ops_label(other);
+                            it.warn_pub(&format!(
+                                "{}(): Cannot represent a stream of type {} as a select()able descriptor",
+                                fname, ty
+                            ))?;
+                            continue;
+                        }
+                    },
+                }
+            };
+            if let Some(fd) = fd {
+                sets[ai].push((k.clone(), item, fd));
             }
         }
     }
@@ -2554,28 +2600,10 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
             "No stream arrays were passed",
         ));
     }
-    // $seconds/$microseconds are ?long zpp params; negatives are
-    // ValueErrors thrown AFTER the empty-sets check. A non-null usec
-    // with null sec must be 0. Zend folds usec into tv (sec + usec/1e6,
-    // usec%1e6) — no upper bound.
-    let sec_null = args
-        .get(3)
-        .map(|c| matches!(*c.borrow(), Value::Null))
-        .unwrap_or(true);
-    let usec_null = args
-        .get(4)
-        .map(|c| matches!(*c.borrow(), Value::Null))
-        .unwrap_or(true);
-    let sec = if sec_null {
-        0
-    } else {
-        zpp_long_arg(it, args, 3, fname, 4, "$seconds")?
-    };
-    let usec = if usec_null {
-        0
-    } else {
-        zpp_long_arg(it, args, 4, fname, 5, "$microseconds")?
-    };
+    // $seconds/$microseconds semantic checks — after the empty-sets
+    // check, before select. A non-null usec with null sec must be 0.
+    // Zend folds usec into tv (sec + usec/1e6, usec%1e6) — no upper
+    // bound.
     if sec_null && !usec_null && usec != 0 {
         return err(
             "ValueError",
@@ -2607,27 +2635,38 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
     }
     // zend's stream_array_emulate_read_fd_set re-fetches every
     // read-array element (keeps streams with buffered reads
-    // select-readable): bad elements chain ANOTHER TypeError — real
-    // streams fetch fine and add nothing.
+    // select-readable): bad elements chain ANOTHER TypeError and
+    // uncastable streams warn AGAIN — real streams fetch fine and
+    // add nothing.
     if let Some(c0) = args.first() {
         if let Value::Array(a) = &*c0.borrow() {
             for (_, c) in a.borrow().iter() {
                 let item = c.borrow().clone();
                 match item {
-                    Value::Resource(r) => match &*r.borrow() {
-                        PhpResource::Closed { .. }
-                        | PhpResource::Proc { .. }
-                        | PhpResource::Other { .. } => select_chain(
-                            it,
-                            &mut chain,
-                            "TypeError",
-                            format!(
-                                "{}(): supplied resource is not a valid stream resource",
-                                fname
+                    Value::Resource(r) => {
+                        let rb = r.borrow();
+                        match &*rb {
+                            PhpResource::Closed { .. }
+                            | PhpResource::Proc { .. }
+                            | PhpResource::Other { .. } => select_chain(
+                                it,
+                                &mut chain,
+                                "TypeError",
+                                format!(
+                                    "{}(): supplied resource is not a valid stream resource",
+                                    fname
+                                ),
                             ),
-                        ),
-                        _ => {}
-                    },
+                            other if existing_fd(other).is_none() => {
+                                let ty = stream_ops_label(other);
+                                it.warn_pub(&format!(
+                                    "{}(): Cannot represent a stream of type {} as a select()able descriptor",
+                                    fname, ty
+                                ))?;
+                            }
+                            _ => {}
+                        }
+                    }
                     _ => select_chain(
                         it,
                         &mut chain,
@@ -2649,14 +2688,31 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
     let mut max_fd = 0i32;
     for (i, s) in sets.iter().enumerate() {
         for (_, _, fd) in s {
-            unsafe {
-                libc::FD_SET(*fd, &mut fds[i]);
+            // PHP_SAFE_FD_SET: an fd at/over FD_SETSIZE must never be
+            // FD_SET — the fd_set arrays are FD_SETSIZE bits wide, so a
+            // wider descriptor would write out of bounds. max_fd still
+            // tracks it: zend reports the real high-water mark in the
+            // fd_setsize diagnostic below.
+            if *fd < libc::FD_SETSIZE as i32 {
+                unsafe {
+                    libc::FD_SET(*fd, &mut fds[i]);
+                }
             }
             max_fd = max_fd.max(*fd);
         }
     }
-    // PHP_SAFE_MAX_FD: an fd at/over FD_SETSIZE silently returns false.
-    if max_fd + 1 > libc::FD_SETSIZE as i32 {
+    // zend's php_select refuses descriptors at/over FD_SETSIZE — the
+    // call warns and returns false before select(), arrays untouched.
+    if max_fd >= libc::FD_SETSIZE as i32 {
+        let fs = libc::FD_SETSIZE as i64;
+        let recommended = ((max_fd as i64 + 1) + fs - 1) / fs * fs;
+        it.warn_pub(&format!(
+            "{}(): You MUST recompile PHP with a larger value of FD_SETSIZE.\nIt is set to {}, but you have descriptors numbered at least as high as {}.\n --enable-fd-setsize={} is recommended, but you may want to set it\nto equal the maximum number of open files supported by your system,\nin order to avoid seeing this error again at a later date.",
+            fname,
+            libc::FD_SETSIZE,
+            max_fd,
+            recommended
+        ))?;
         return Ok(Some(Value::Bool(false)));
     }
     let mut tv = libc::timeval {
@@ -2687,8 +2743,8 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
     }
     // Rewrite each input array to the ready entries only — zend's
     // from_fd_set pass re-fetches every element: bad elements chain a
-    // third TypeError and uncastable streams warn AGAIN (the build
-    // pass already warned once).
+    // third TypeError; streams without a descriptor are skipped
+    // SILENTLY here (they already warned on the build/emulate passes).
     for (i, s) in sets.iter().enumerate() {
         let mut ready = PhpArray::new();
         if let Some(c) = args.get(i) {
@@ -2696,40 +2752,20 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
                 for (_, item_c) in a.borrow().iter() {
                     let item = item_c.borrow().clone();
                     match item {
-                        Value::Resource(r) => {
-                            let rb = r.borrow();
-                            match &*rb {
-                                PhpResource::Closed { .. }
-                                | PhpResource::Proc { .. }
-                                | PhpResource::Other { .. } => select_chain(
-                                    it,
-                                    &mut chain,
-                                    "TypeError",
-                                    format!(
-                                        "{}(): supplied resource is not a valid stream resource",
-                                        fname
-                                    ),
+                        Value::Resource(r) => match &*r.borrow() {
+                            PhpResource::Closed { .. }
+                            | PhpResource::Proc { .. }
+                            | PhpResource::Other { .. } => select_chain(
+                                it,
+                                &mut chain,
+                                "TypeError",
+                                format!(
+                                    "{}(): supplied resource is not a valid stream resource",
+                                    fname
                                 ),
-                                _ => {
-                                    let ty = match &*rb {
-                                        PhpResource::Mem { uri, .. } => {
-                                            (uri == "php://memory").then_some("MEMORY")
-                                        }
-                                        PhpResource::Input { .. } => Some("Input"),
-                                        PhpResource::Stdio { which, .. } if *which > 2 => {
-                                            Some("Output")
-                                        }
-                                        _ => None,
-                                    };
-                                    if let Some(ty) = ty {
-                                        it.warn_pub(&format!(
-                                            "{}(): Cannot represent a stream of type {} as a select()able descriptor",
-                                            fname, ty
-                                        ))?;
-                                    }
-                                }
-                            }
-                        }
+                            ),
+                            _ => {}
+                        },
                         _ => select_chain(
                             it,
                             &mut chain,
@@ -2817,6 +2853,90 @@ pub(in crate::builtins) fn temp_spill_fd(buf: &[u8], pos: u64) -> Option<std::os
         } else {
             Some(d)
         }
+    }
+}
+
+/// Whether `uri` is a `data:` stream (zend's RFC2397 wrapper).
+fn is_data_uri(uri: &str) -> bool {
+    uri.starts_with("data:")
+}
+
+/// zend's `stream->ops->label` — the stream-type name in the
+/// "Cannot represent a stream of type X ..." warnings and
+/// posix_isatty's "Could not use stream of type 'X'": TEMP covers
+/// php://temp* (incl. maxmemory), RFC2397 covers data:.
+pub(in crate::builtins) fn stream_ops_label(res: &PhpResource) -> &'static str {
+    match res {
+        PhpResource::Mem { uri, .. } => {
+            if uri == "php://memory" {
+                "MEMORY"
+            } else {
+                "TEMP"
+            }
+        }
+        PhpResource::Input { uri, .. } => {
+            if is_data_uri(uri) {
+                "RFC2397"
+            } else {
+                "Input"
+            }
+        }
+        PhpResource::Stdio { which, .. } if *which > 2 => "Output",
+        PhpResource::File { .. }
+        | PhpResource::Pipe { .. }
+        | PhpResource::Stdio { .. } => "STDIO",
+        other => other.type_name(),
+    }
+}
+
+/// zend's PHP_STREAM_AS_FD_FOR_SELECT cast on a buffer-backed stream:
+/// the buffer is spilled into a tmpfile() positioned at the stream's
+/// offset and the stream KEEPS the fd — later casts reuse it and
+/// flock(2)/fstat(2) see it. php://temp* and data: are castable;
+/// php://memory and php://input are not.
+pub(in crate::builtins) fn spill_fd_for_stream(
+    res: &mut PhpResource,
+) -> Option<std::os::unix::io::RawFd> {
+    match res {
+        PhpResource::Mem {
+            uri,
+            buf,
+            pos,
+            spilled_fd,
+            ..
+        } if uri.starts_with("php://temp") => {
+            if spilled_fd.is_none() {
+                *spilled_fd = temp_spill_fd(buf, *pos);
+            }
+            *spilled_fd
+        }
+        PhpResource::Input {
+            uri,
+            body,
+            pos,
+            spilled_fd,
+            ..
+        } if is_data_uri(uri) => {
+            if spilled_fd.is_none() {
+                *spilled_fd = temp_spill_fd(body, *pos);
+            }
+            *spilled_fd
+        }
+        _ => None,
+    }
+}
+
+/// The stream's descriptor when it already has one — no spilling.
+/// Shared by stream_isatty/posix_isatty/flock.
+fn existing_fd(res: &PhpResource) -> Option<std::os::unix::io::RawFd> {
+    use std::os::fd::AsRawFd;
+    match res {
+        PhpResource::File { file, .. } | PhpResource::Pipe { file, .. } => Some(file.as_raw_fd()),
+        PhpResource::Stdio { which, .. } if *which <= 2 => Some(*which as i32),
+        PhpResource::Mem { spilled_fd, .. } | PhpResource::Input { spilled_fd, .. } => {
+            *spilled_fd
+        }
+        _ => None,
     }
 }
 

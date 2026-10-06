@@ -1807,6 +1807,13 @@ pub enum PhpResource {
         /// The URI the stream was opened with ("php://input", "data:...")
         /// — reported verbatim in stream_get_meta_data()'s 'uri' key.
         uri: String,
+        /// The fopen() mode, verbatim — stream_get_meta_data() 'mode'.
+        mode: String,
+        /// fd claimed by a PHP_STREAM_AS_FD_FOR_SELECT cast (zend's
+        /// php_stream_temp_cast spills an RFC2397 buffer into a
+        /// tmpfile() the stream then KEEPS — later casts reuse it and
+        /// flock(2)/fstat(2) see it).
+        spilled_fd: Option<std::os::unix::io::RawFd>,
     },
     /// php://memory / php://temp — an in-memory byte buffer that is
     /// always read/write, seekable (Composer's BufferIO).
@@ -1828,6 +1835,11 @@ pub enum PhpResource {
         uri: String,
         /// zend's normalized open mode for meta ('rb', 'w+b', 'a+b').
         mode: String,
+        /// fd claimed by a PHP_STREAM_AS_FD_FOR_SELECT cast — zend's
+        /// php_stream_temp_cast spills a TEMP buffer into a tmpfile()
+        /// the stream then KEEPS (later casts reuse it and
+        /// flock(2)/fstat(2) see it). php://memory is not castable.
+        spilled_fd: Option<std::os::unix::io::RawFd>,
     },
     /// A resource closed via fclose()/fclose-aliased wrappers — Zend
     /// keeps the zval `resource (closed)` (gettype "resource (closed)",
@@ -1921,6 +1933,17 @@ impl Drop for PhpResource {
                     let mut st = 0;
                     libc::waitpid(*pid, &mut st, libc::WNOHANG);
                 }
+            }
+        }
+        let fd = match self {
+            PhpResource::Mem { spilled_fd, .. } | PhpResource::Input { spilled_fd, .. } => {
+                spilled_fd.take()
+            }
+            _ => None,
+        };
+        if let Some(fd) = fd {
+            unsafe {
+                libc::close(fd);
             }
         }
     }

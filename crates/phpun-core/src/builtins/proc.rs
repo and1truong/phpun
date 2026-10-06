@@ -331,7 +331,7 @@ fn spec_err(it: &mut Interp, msg: &str) -> Result<(), PhpError> {
 
 fn resource_child_fd(
     it: &mut Interp,
-    r: &PhpResource,
+    r: &mut PhpResource,
     index: i64,
 ) -> Result<Option<RawFd>, PhpError> {
     let fd = match r {
@@ -353,33 +353,24 @@ fn resource_child_fd(
                 "proc_open(): supplied resource is not a valid stream resource",
             )
         }
-        // php://temp is claimable — php_stream_temp_cast spills the
-        // buffer to a tmpfile() positioned at the stream offset.
-        PhpResource::Mem { uri, buf, pos, .. } if uri == "php://temp" => {
-            match crate::builtins::fs::temp_spill_fd(buf, *pos) {
-                Some(fd) => return Ok(Some(fd)),
+        // php://temp* and data: (RFC2397) are claimable — the cast
+        // spills the buffer to a tmpfile() the stream then KEEPS; the
+        // child gets a dup so closing its end can't kill the stream's
+        // descriptor. MEMORY and php://input are not castable.
+        PhpResource::Mem { .. } | PhpResource::Input { .. } => {
+            match crate::builtins::fs::spill_fd_for_stream(r) {
+                Some(fd) => fd,
                 None => {
                     spec_err(
                         it,
-                        "Cannot represent a stream of type TEMP as a File Descriptor",
+                        &format!(
+                            "Cannot represent a stream of type {} as a File Descriptor",
+                            crate::builtins::fs::stream_ops_label(r)
+                        ),
                     )?;
                     return Ok(None);
                 }
             }
-        }
-        PhpResource::Mem { .. } => {
-            spec_err(
-                it,
-                "Cannot represent a stream of type MEMORY as a File Descriptor",
-            )?;
-            return Ok(None);
-        }
-        PhpResource::Input { .. } => {
-            spec_err(
-                it,
-                "Cannot represent a stream of type Input as a File Descriptor",
-            )?;
-            return Ok(None);
         }
         PhpResource::Other { kind, .. } => {
             spec_err(
@@ -542,8 +533,8 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
         };
         let res = match v {
             Value::Resource(r) => {
-                let rb = r.borrow();
-                match resource_child_fd(it, &rb, index as i64) {
+                let mut rb = r.borrow_mut();
+                match resource_child_fd(it, &mut rb, index as i64) {
                     Ok(f) => f.map(|fd| Desc {
                         index,
                         child: fd,
@@ -832,13 +823,12 @@ fn spec_array(
             let mode = get_bytes(it, 2, "mode parameter for 'file'")?;
             let path_s = String::from_utf8_lossy(&path).into_owned();
             let mode_s = String::from_utf8_lossy(&mode).into_owned();
+            // zend validates only the FIRST mode char (r/w/a/x/c);
+            // everything after it — flags like 'b'/'e', the PHP 8.4+
+            // 'n' non-blocking flag, even junk like 'rq' — passes
+            // through to fopen and is ignored.
             let first = mode_s.chars().next().unwrap_or('\0');
-            if !matches!(first, 'r' | 'w' | 'a' | 'x' | 'c')
-                || mode_s
-                    .chars()
-                    .skip(1)
-                    .any(|c| !matches!(c, '+' | 'b' | 't' | 'e'))
-            {
+            if !matches!(first, 'r' | 'w' | 'a' | 'x' | 'c') {
                 it.warn_pub(&format!(
                     "proc_open({}): Failed to open stream: `{}' is not a valid mode for fopen",
                     path_s, mode_s
