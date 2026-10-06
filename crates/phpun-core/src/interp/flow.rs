@@ -54,6 +54,10 @@ struct ScanScope {
     /// emits them while compiling, so an entry already collected
     /// still prints when a later stmt's compile check fails.
     warnings: Vec<(&'static str, String, usize)>,
+    /// Lexically enclosing scope's display name for `{closure:...}`
+    /// naming (`f()`, `C::m()`, or a wrapped `{closure:...}`); empty
+    /// at top level, where the unit file names the scope.
+    enclosing: String,
 }
 
 struct GotoSite {
@@ -85,6 +89,77 @@ impl<'a> Interp<'a> {
         r
     }
 
+    /// Compile-time signature deprecations Zend emits while compiling a
+    /// function's params: `T $x = null` implicit-nullable, and each
+    /// optional param left of the last required one (named after that
+    /// required param). Deduped per decl site — exec-time
+    /// decl_type_checks re-runs the same checks for live decls.
+    pub(in crate::interp) fn sig_deprecations(
+        &mut self,
+        fname: &str,
+        d: &FunctionDecl,
+    ) -> Result<(), PhpError> {
+        let dep_file = if d.file.is_empty() {
+            self.cur_file.clone()
+        } else {
+            d.file.clone()
+        };
+        // The last param carrying no default — required params for the
+        // optional-before-required check exclude variadics.
+        let mut last_req = None;
+        for (i, p) in d.params.iter().enumerate() {
+            if p.default.is_none() && !p.variadic {
+                last_req = Some(i);
+            }
+        }
+        let implicit_nullable = |p: &crate::ast::Param| -> bool {
+            let Some(ty) = &p.ty else { return false };
+            let null_default = match &p.default {
+                Some(Expr::Null) => true,
+                Some(Expr::Const(c)) => c.eq_ignore_ascii_case("null"),
+                _ => false,
+            };
+            null_default
+                && !ty
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case("null") || m.eq_ignore_ascii_case("mixed"))
+        };
+        for (i, p) in d.params.iter().enumerate() {
+            if implicit_nullable(p)
+                && self
+                    .dep_seen
+                    .insert(format!("{}\0{}\0{}", dep_file, d.line, p.name))
+            {
+                self.cur_line = d.line;
+                self.deprecated(&format!(
+                    "{}(): Implicitly marking parameter ${} as nullable is deprecated, the explicit nullable type must be used instead",
+                    fname, p.name
+                ))?;
+            }
+            // The deprecation reports at the last required param's
+            // compile point — before a later param's default-value
+            // fatal can preempt it (it names that required param).
+            if Some(i) == last_req {
+                for q in &d.params[..i] {
+                    if q.default.is_some()
+                        && !implicit_nullable(q)
+                        && self.dep_seen.insert(format!(
+                            "{}\0{}\0{}\0opt",
+                            dep_file, d.line, q.name
+                        ))
+                    {
+                        self.cur_line = d.line;
+                        self.deprecated(&format!(
+                            "{}(): Optional parameter ${} declared before required parameter ${} is implicitly treated as a required parameter",
+                            fname, q.name, p.name
+                        ))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Top level of a unit (or a `namespace {}` body): unconditional
     /// `function` decls early-bind AT THEIR POSITION in Zend's compile
     /// (the function-table insert runs per statement, not after the
@@ -106,21 +181,21 @@ impl<'a> Interp<'a> {
                         if let Stmt::Block(b) = inner {
                             self.flow_unit(b, sc)?;
                         } else {
-                            Self::flow_scan(std::slice::from_ref(inner), sc)?;
+                            self.flow_scan(std::slice::from_ref(inner), sc)?;
                         }
                     }
                     continue;
                 }
             }
-            Self::flow_scan(std::slice::from_ref(s), sc)?;
+            self.flow_scan(std::slice::from_ref(s), sc)?;
         }
         Ok(())
     }
 
     /// Scan one label/goto scope: the unit's top level or one function
     /// body (labels and `static` declarations bind per function).
-    fn flow_scope(stmts: &[Stmt], sc: &mut ScanScope) -> Result<(), PhpError> {
-        Self::flow_scan(stmts, sc)?;
+    fn flow_scope(&mut self, stmts: &[Stmt], sc: &mut ScanScope) -> Result<(), PhpError> {
+        self.flow_scan(stmts, sc)?;
         Self::flow_resolve_gotos(sc)
     }
 
@@ -174,21 +249,34 @@ impl<'a> Interp<'a> {
     /// A fresh scope for one function body — its own labels, statics
     /// and a reset loop depth — resolved before returning.
     fn flow_fn(
+        &mut self,
         d: &FunctionDecl,
+        fname: &str,
         warns_out: &mut Vec<(&'static str, String, usize)>,
     ) -> Result<(), PhpError> {
-        let mut sc = ScanScope::default();
-        let r = Self::flow_scope(&d.body, &mut sc);
+        // Signature deprecations fire when the op_array compiles —
+        // dead/conditional decls and unexecuted closures report too.
+        self.sig_deprecations(fname, d)?;
+        let mut sc = ScanScope {
+            enclosing: if fname.starts_with('{') {
+                fname.to_string()
+            } else {
+                format!("{}()", fname)
+            },
+            ..Default::default()
+        };
+        let r = self.flow_scope(&d.body, &mut sc);
         warns_out.append(&mut sc.warnings);
         r
     }
 
     fn flow_class(
+        &mut self,
         d: &ClassDecl,
         warns_out: &mut Vec<(&'static str, String, usize)>,
     ) -> Result<(), PhpError> {
         for m in &d.methods {
-            Self::flow_fn(&m.decl, warns_out)?;
+            self.flow_fn(&m.decl, &format!("{}::{}", d.name, m.decl.name), warns_out)?;
         }
         // Property hooks carry a body too (scoped like methods).
         for p in &d.props {
@@ -196,7 +284,7 @@ impl<'a> Interp<'a> {
                 for h in hooks {
                     if let Some(body) = &h.body {
                         let mut sc = ScanScope::default();
-                        let r = Self::flow_scope(body, &mut sc);
+                        let r = self.flow_scope(body, &mut sc);
                         warns_out.append(&mut sc.warnings);
                         r?;
                     }
@@ -206,7 +294,7 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    fn flow_scan(stmts: &[Stmt], sc: &mut ScanScope) -> Result<(), PhpError> {
+    fn flow_scan(&mut self, stmts: &[Stmt], sc: &mut ScanScope) -> Result<(), PhpError> {
         for s in stmts {
             match s {
                 Stmt::Line(l) => sc.line = *l,
@@ -217,10 +305,10 @@ impl<'a> Interp<'a> {
                     sc.warnings.push((*level, msg.clone(), *line));
                 }
                 Stmt::Function(d) => {
-                    Self::flow_fn(d, &mut sc.warnings)?;
+                    self.flow_fn(d, &d.name, &mut sc.warnings)?;
                 }
                 Stmt::Class(d) => {
-                    Self::flow_class(d, &mut sc.warnings)?;
+                    self.flow_class(d, &mut sc.warnings)?;
                 }
                 Stmt::Break(op) => Self::flow_operand(op.as_ref(), sc.line, true, sc)?,
                 Stmt::Continue(op) => Self::flow_operand(op.as_ref(), sc.line, false, sc)?,
@@ -252,16 +340,16 @@ impl<'a> Interp<'a> {
                     }
                 }
                 Stmt::While { cond, body } => {
-                    Self::flow_expr(cond, sc)?;
+                    self.flow_expr(cond, sc)?;
                     sc.ctxs.push(Ctx::Loop(std::ptr::from_ref(s) as usize));
-                    Self::flow_scan(body, sc)?;
+                    self.flow_scan(body, sc)?;
                     sc.ctxs.pop();
                 }
                 Stmt::DoWhile { body, cond } => {
                     sc.ctxs.push(Ctx::Loop(std::ptr::from_ref(s) as usize));
-                    Self::flow_scan(body, sc)?;
+                    self.flow_scan(body, sc)?;
                     sc.ctxs.pop();
-                    Self::flow_expr(cond, sc)?;
+                    self.flow_expr(cond, sc)?;
                 }
                 Stmt::For {
                     init,
@@ -270,27 +358,27 @@ impl<'a> Interp<'a> {
                     body,
                 } => {
                     for e in init.iter().chain(cond.iter()).chain(inc.iter()) {
-                        Self::flow_expr(e, sc)?;
+                        self.flow_expr(e, sc)?;
                     }
                     sc.ctxs.push(Ctx::Loop(std::ptr::from_ref(s) as usize));
-                    Self::flow_scan(body, sc)?;
+                    self.flow_scan(body, sc)?;
                     sc.ctxs.pop();
                 }
                 Stmt::Foreach { arr, val, body, .. } => {
-                    Self::flow_expr(arr, sc)?;
-                    Self::flow_foreach_target(val, sc)?;
+                    self.flow_expr(arr, sc)?;
+                    self.flow_foreach_target(val, sc)?;
                     sc.ctxs.push(Ctx::Loop(std::ptr::from_ref(s) as usize));
-                    Self::flow_scan(body, sc)?;
+                    self.flow_scan(body, sc)?;
                     sc.ctxs.pop();
                 }
                 Stmt::Switch { cond, cases } => {
-                    Self::flow_expr(cond, sc)?;
+                    self.flow_expr(cond, sc)?;
                     sc.ctxs.push(Ctx::Switch(std::ptr::from_ref(s) as usize));
                     for (c, b) in cases {
                         if let Some(c) = c {
-                            Self::flow_expr(c, sc)?;
+                            self.flow_expr(c, sc)?;
                         }
-                        Self::flow_scan(b, sc)?;
+                        self.flow_scan(b, sc)?;
                     }
                     sc.ctxs.pop();
                 }
@@ -305,9 +393,9 @@ impl<'a> Interp<'a> {
                         // outer trys are checked before inner ones.
                         sc.fin_order.push(std::ptr::from_ref(s) as usize);
                     }
-                    Self::flow_scan(body, sc)?;
+                    self.flow_scan(body, sc)?;
                     for c in catches {
-                        Self::flow_scan(&c.body, sc)?;
+                        self.flow_scan(&c.body, sc)?;
                     }
                     if let Some(f) = finally {
                         // A finally region is closed to gotos in either
@@ -316,33 +404,33 @@ impl<'a> Interp<'a> {
                         // …and to break/continue operands resolving to a
                         // context outside it — the ctx depth marks that line.
                         let saved_depth = sc.fin_depth.replace(sc.ctxs.len());
-                        Self::flow_scan(f, sc)?;
+                        self.flow_scan(f, sc)?;
                         sc.fins.pop();
                         sc.fin_depth = saved_depth;
                     }
                 }
-                Stmt::Block(b) => Self::flow_scan(b, sc)?,
+                Stmt::Block(b) => self.flow_scan(b, sc)?,
                 Stmt::If { cond, then, else_ } => {
-                    Self::flow_expr(cond, sc)?;
-                    Self::flow_scan(then, sc)?;
-                    Self::flow_scan(else_, sc)?;
+                    self.flow_expr(cond, sc)?;
+                    self.flow_scan(then, sc)?;
+                    self.flow_scan(else_, sc)?;
                 }
                 Stmt::Echo(es) => {
                     for e in es {
-                        Self::flow_expr(e, sc)?;
+                        self.flow_expr(e, sc)?;
                     }
                 }
-                Stmt::Expr(e) => Self::flow_expr(e, sc)?,
-                Stmt::Return(Some(e)) => Self::flow_expr(e, sc)?,
+                Stmt::Expr(e) => self.flow_expr(e, sc)?,
+                Stmt::Return(Some(e)) => self.flow_expr(e, sc)?,
                 Stmt::Global(v) | Stmt::Unset(v) => {
                     for e in v {
-                        Self::flow_expr(e, sc)?;
+                        self.flow_expr(e, sc)?;
                     }
                 }
-                Stmt::Declare { value, .. } => Self::flow_expr(value, sc)?,
+                Stmt::Declare { value, .. } => self.flow_expr(value, sc)?,
                 Stmt::ConstDecl(v) => {
                     for (_, e) in v {
-                        Self::flow_expr(e, sc)?;
+                        self.flow_expr(e, sc)?;
                     }
                 }
                 _ => {}
@@ -475,17 +563,31 @@ impl<'a> Interp<'a> {
 
     /// Nested function bodies hide inside expressions (closures,
     /// anonymous classes) — each is its own label/static scope.
-    fn flow_expr(e: &Expr, sc: &mut ScanScope) -> Result<(), PhpError> {
+    fn flow_expr(&mut self, e: &Expr, sc: &mut ScanScope) -> Result<(), PhpError> {
         match e {
-            Expr::Closure(c) => Self::flow_fn(&c.decl, &mut sc.warnings),
-            Expr::AnonClass(d) => Self::flow_class(d, &mut sc.warnings),
+            Expr::Closure(c) => {
+                // `{closure:SCOPE:LINE}` — SCOPE is the enclosing
+                // function/method name, a wrapped `{closure:...}` when
+                // nested, or the unit file at top level.
+                let enc = if sc.enclosing.is_empty() {
+                    self.cur_file.clone()
+                } else {
+                    sc.enclosing.clone()
+                };
+                self.flow_fn(
+                    &c.decl,
+                    &format!("{{closure:{}:{}}}", enc, c.decl.line),
+                    &mut sc.warnings,
+                )
+            }
+            Expr::AnonClass(d) => self.flow_class(d, &mut sc.warnings),
             Expr::Assign { target, value, .. } => {
-                Self::flow_expr(target, sc)?;
-                Self::flow_expr(value, sc)
+                self.flow_expr(target, sc)?;
+                self.flow_expr(value, sc)
             }
             Expr::Binary { l, r, .. } => {
-                Self::flow_expr(l, sc)?;
-                Self::flow_expr(r, sc)
+                self.flow_expr(l, sc)?;
+                self.flow_expr(r, sc)
             }
             Expr::Unary { e, .. }
             | Expr::Clone(e)
@@ -503,126 +605,126 @@ impl<'a> Interp<'a> {
             | Expr::Cast { e, .. }
             | Expr::Throw(e)
             | Expr::YieldFrom(e)
-            | Expr::Include { e, .. } => Self::flow_expr(e, sc),
+            | Expr::Include { e, .. } => self.flow_expr(e, sc),
             Expr::Exit(e) => match e {
-                Some(e) => Self::flow_expr(e, sc),
+                Some(e) => self.flow_expr(e, sc),
                 None => Ok(()),
             },
             Expr::Yield { key, val } => {
                 if let Some(k) = key {
-                    Self::flow_expr(k, sc)?;
+                    self.flow_expr(k, sc)?;
                 }
                 if let Some(v) = val {
-                    Self::flow_expr(v, sc)?;
+                    self.flow_expr(v, sc)?;
                 }
                 Ok(())
             }
             Expr::Ternary { c, t, f } => {
-                Self::flow_expr(c, sc)?;
+                self.flow_expr(c, sc)?;
                 if let Some(t) = t {
-                    Self::flow_expr(t, sc)?;
+                    self.flow_expr(t, sc)?;
                 }
-                Self::flow_expr(f, sc)
+                self.flow_expr(f, sc)
             }
             Expr::Instanceof { obj, class } => {
-                Self::flow_expr(obj, sc)?;
-                Self::flow_expr(class, sc)
+                self.flow_expr(obj, sc)?;
+                self.flow_expr(class, sc)
             }
             Expr::Call { name, args } => {
-                Self::flow_expr(name, sc)?;
+                self.flow_expr(name, sc)?;
                 for a in args {
-                    Self::flow_expr(a, sc)?;
+                    self.flow_expr(a, sc)?;
                 }
                 Ok(())
             }
             Expr::Index { e, i } => {
-                Self::flow_expr(e, sc)?;
+                self.flow_expr(e, sc)?;
                 if let Some(i) = i {
-                    Self::flow_expr(i, sc)?;
+                    self.flow_expr(i, sc)?;
                 }
                 Ok(())
             }
             Expr::Isset(v) => {
                 for e in v {
-                    Self::flow_expr(e, sc)?;
+                    self.flow_expr(e, sc)?;
                 }
                 Ok(())
             }
             Expr::List(v) => {
                 for e in v.iter().flatten() {
-                    Self::flow_expr(e, sc)?;
+                    self.flow_expr(e, sc)?;
                 }
                 Ok(())
             }
             Expr::ArrayLit(v) => {
                 for (k, e) in v {
                     if let Some(k) = k {
-                        Self::flow_expr(k, sc)?;
+                        self.flow_expr(k, sc)?;
                     }
-                    Self::flow_expr(e, sc)?;
+                    self.flow_expr(e, sc)?;
                 }
                 Ok(())
             }
 
             Expr::Match { subject, arms } => {
-                Self::flow_expr(subject, sc)?;
+                self.flow_expr(subject, sc)?;
                 for a in arms {
                     for c in &a.conds {
-                        Self::flow_expr(c, sc)?;
+                        self.flow_expr(c, sc)?;
                     }
-                    Self::flow_expr(&a.result, sc)?;
+                    self.flow_expr(&a.result, sc)?;
                 }
                 Ok(())
             }
             Expr::New { class, args } => {
-                Self::flow_expr(class, sc)?;
+                self.flow_expr(class, sc)?;
                 for a in args {
-                    Self::flow_expr(a, sc)?;
+                    self.flow_expr(a, sc)?;
                 }
                 Ok(())
             }
             Expr::Prop { obj, name, .. } => {
-                Self::flow_expr(obj, sc)?;
+                self.flow_expr(obj, sc)?;
                 if let PropName::Expr(e) = name {
-                    Self::flow_expr(e, sc)?;
+                    self.flow_expr(e, sc)?;
                 }
                 Ok(())
             }
             Expr::MethodCall {
                 obj, name, args, ..
             } => {
-                Self::flow_expr(obj, sc)?;
+                self.flow_expr(obj, sc)?;
                 if let PropName::Expr(e) = name {
-                    Self::flow_expr(e, sc)?;
+                    self.flow_expr(e, sc)?;
                 }
                 for a in args {
-                    Self::flow_expr(a, sc)?;
+                    self.flow_expr(a, sc)?;
                 }
                 Ok(())
             }
             Expr::StaticProp { class, name } => {
-                Self::flow_expr(class, sc)?;
+                self.flow_expr(class, sc)?;
                 if let PropName::Expr(e) = name {
-                    Self::flow_expr(e, sc)?;
+                    self.flow_expr(e, sc)?;
                 }
                 Ok(())
             }
             Expr::StaticCall { class, args, .. } => {
-                Self::flow_expr(class, sc)?;
+                self.flow_expr(class, sc)?;
                 for a in args {
-                    Self::flow_expr(a, sc)?;
+                    self.flow_expr(a, sc)?;
                 }
                 Ok(())
             }
             Expr::StaticCallDyn { class, name, args } => {
-                Self::flow_expr(class, sc)?;
-                Self::flow_expr(name, sc)?;
+                self.flow_expr(class, sc)?;
+                self.flow_expr(name, sc)?;
                 for a in args {
-                    Self::flow_expr(a, sc)?;
+                    self.flow_expr(a, sc)?;
                 }
                 Ok(())
             }
-            Expr::ClassConst { class, .. } => Self::flow_expr(class, sc),
+            Expr::ClassConst { class, .. } => self.flow_expr(class, sc),
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -636,13 +738,13 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn flow_foreach_target(t: &ForeachTarget, sc: &mut ScanScope) -> Result<(), PhpError> {
+    fn flow_foreach_target(&mut self, t: &ForeachTarget, sc: &mut ScanScope) -> Result<(), PhpError> {
         match t {
-            ForeachTarget::Lvalue(e) => Self::flow_expr(e, sc),
+            ForeachTarget::Lvalue(e) => self.flow_expr(e, sc),
             ForeachTarget::Var(_) | ForeachTarget::ByRef(_) => Ok(()),
             ForeachTarget::List(ts) => {
                 for t in ts.iter().flatten() {
-                    Self::flow_foreach_target(t, sc)?;
+                    self.flow_foreach_target(t, sc)?;
                 }
                 Ok(())
             }

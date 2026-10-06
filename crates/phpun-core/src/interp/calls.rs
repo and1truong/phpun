@@ -2128,32 +2128,14 @@ impl<'a> Interp<'a> {
             "void", "never", "false", "true", "self", "parent", "static", "null",
         ];
         let saved = self.cur_line;
+        // Signature deprecations (implicit-nullable, optional-before-
+        // required) must precede the param checks' default-value
+        // fatals — Zend emits them while compiling the params.
+        self.sig_deprecations(fname, decl)?;
         for p in &decl.params {
             let Some(ty) = &p.ty else { continue };
             self.cur_line = decl.line;
-            // `mixed` already spans null (and `?mixed` is a parse error),
-            // so `mixed $x = null` is never the implicit-nullable case.
-            let nullable = ty
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case("null") || m.eq_ignore_ascii_case("mixed"));
-            let null_default = match &p.default {
-                Some(Expr::Null) => true,
-                Some(Expr::Const(c)) => c.eq_ignore_ascii_case("null"),
-                _ => false,
-            };
             match &p.default {
-                _ if null_default => {
-                    if !nullable
-                        && self
-                            .dep_seen
-                            .insert(format!("{}\0{}\0{}", decl.file, decl.line, p.name))
-                    {
-                        self.deprecated(&format!(
-                            "{}(): Implicitly marking parameter ${} as nullable is deprecated, the explicit nullable type must be used instead",
-                            fname, p.name
-                        ))?;
-                    }
-                }
                 Some(Expr::Int(_))
                 | Some(Expr::Float(_))
                 | Some(Expr::Str(_))
