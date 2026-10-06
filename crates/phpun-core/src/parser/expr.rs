@@ -1025,6 +1025,11 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn postfix(&mut self) -> Result<Expr, PhpError> {
+        // First token of the whole postfix chain — a dynamic
+        // `callable_expr(...)` call sites at its callee's line (zend
+        // DO_FCALL's lineno is the call node's = the callee node's
+        // lineno), which a `(` on a later line must not move.
+        let callee_line = self.line();
         let mut e = self.primary()?;
         loop {
             if self.eat_op("++") {
@@ -1067,14 +1072,14 @@ impl<'a> Parser<'a> {
                 self.expect_op("]")?;
                 e = Expr::Index { e: Box::new(e), i };
             } else if self.at_op("(") {
-                // `callable_expr(...)` — Zend sites the frame at the `(`.
-                let site = self.line();
+                // `callable_expr(...)` — Zend sites the frame at the
+                // callee's first-token line, not the `(`.
                 self.pos += 1;
                 let args = self.args()?;
                 e = Self::fcc_wrap(Expr::Call {
                     name: Box::new(e),
                     args,
-                    site,
+                    site: callee_line,
                 })?;
             } else if self.at_op("->") || self.at_op("?->") {
                 let nullsafe = self.at_op("?->");

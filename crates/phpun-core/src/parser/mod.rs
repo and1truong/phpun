@@ -3,7 +3,7 @@ mod expr;
 
 use crate::ast::*;
 use crate::error::PhpError;
-use crate::lexer::{lex, lex_with, Lexed, Token};
+use crate::lexer::{lex, lex_with, Lexed, StringPart, Token};
 use std::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -273,10 +273,24 @@ pub fn parse_expr_src(src: &str, base: usize) -> Result<(Expr, SrcDiags), PhpErr
         .into_iter()
         .filter_map(|mut t| {
             t.line += base - 1;
-            match t.token {
+            match &mut t.token {
                 Token::Diag(level, msg) => {
-                    diags.push((level, msg, t.line));
+                    diags.push((*level, std::mem::take(msg), t.line));
                     None
+                }
+                // Part bases inside an embedded string are
+                // snippet-relative as well — rebase them with the
+                // token (a part's own parts rebase when IT parses).
+                Token::InterpString(parts) => {
+                    for p in parts.iter_mut() {
+                        match p {
+                            StringPart::Lit(_) => {}
+                            StringPart::Var(_, b)
+                            | StringPart::Expr(_, b)
+                            | StringPart::DollarBraceExpr(_, b) => *b += base - 1,
+                        }
+                    }
+                    Some(t)
                 }
                 _ => Some(t),
             }
@@ -303,7 +317,9 @@ pub fn parse_expr_src(src: &str, base: usize) -> Result<(Expr, SrcDiags), PhpErr
         strict_slot: false,
         in_closure: false,
     };
-    let e = p.expr().map_err(rebase)?;
+    // No rebase here: token lines are already absolute, so the
+    // parser's own error lines report file lines.
+    let e = p.expr()?;
     Ok((e, diags))
 }
 

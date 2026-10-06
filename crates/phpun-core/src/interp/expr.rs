@@ -7,6 +7,36 @@ use super::*;
 impl<'a> Interp<'a> {
     // ----- expressions -----
 
+    /// The line a `{$expr}`/`${expr}` part's trailing read or
+    /// conversion reports when the re-parsed inner `e` ends in a
+    /// call: the deepest last-arg marker line (zend's post-arg-eval
+    /// lineno) — a call's dispatch leaves `cur_line` at the call's
+    /// own site instead. `None` when `e` isn't call-shaped or has no
+    /// args (cur_line already holds the right line).
+    fn inner_end_line(e: &Expr) -> Option<usize> {
+        let args = match e {
+            Expr::Call { args, .. }
+            | Expr::MethodCall { args, .. }
+            | Expr::StaticCall { args, .. }
+            | Expr::StaticCallDyn { args, .. }
+            | Expr::New { args, .. } => args,
+            _ => return None,
+        };
+        let last = args.last()?;
+        if let Some(l) = Self::inner_end_line(Self::unmark_arg(last)) {
+            return Some(l);
+        }
+        match last {
+            Expr::Binary {
+                op: "argline", l, ..
+            } => match l.as_ref() {
+                Expr::Int(n) => Some(*n as usize),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Runs a call-producing expression with send_line scoped to that
     /// call's own dispatch: the site covers frames pushed while binding
     /// and invoking, then the previous send_line resumes — a callee's
@@ -53,6 +83,15 @@ impl<'a> Interp<'a> {
                             let (expr, _) = parser::parse_expr_src(src, *base)
                                 .map_err(|e| PhpError::parse(e.message, e.line))?;
                             let v = self.eval(&expr)?;
+                            // The part's trailing conversion sites at
+                            // the inner expr's last evaluated line —
+                            // a call-shaped inner leaves cur_line at
+                            // the call site, so re-site; the stale
+                            // part-base send_line goes with it.
+                            if let Some(l) = Self::inner_end_line(&expr) {
+                                self.cur_line = l;
+                            }
+                            self.send_line = Some(self.cur_line);
                             s.extend_from_slice(&self.conv_bytes(&v)?);
                         }
                         StringPart::DollarBraceExpr(src, base) => {
@@ -65,6 +104,13 @@ impl<'a> Interp<'a> {
                             let (expr, _) = parser::parse_expr_src(src, *base)
                                 .map_err(|e| PhpError::parse(e.message, e.line))?;
                             let nv = self.eval(&expr)?;
+                            // The name-conversion + variable read site
+                            // at the inner expr's last evaluated line
+                            // (same re-site as StringPart::Expr above).
+                            if let Some(l) = Self::inner_end_line(&expr) {
+                                self.cur_line = l;
+                            }
+                            self.send_line = Some(self.cur_line);
                             let name = self.conv_str(&nv)?;
                             let v = self.var_get(&name)?;
                             s.extend_from_slice(&self.conv_bytes(&v)?);

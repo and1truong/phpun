@@ -825,14 +825,15 @@ fn interp_scan(
                 }
                 flush!();
                 // Compile-time diags inside `{$expr}` (e.g. octal
-                // overflow) scan at lex time like Zend.
+                // overflow) scan at lex time like Zend — each sites
+                // at its own inner-source line, not the marker's.
                 let inner = &src[pos + n + 1..pos + k];
                 if let Ok(toks) = lex(&format!("<?php {}", inner)) {
                     for t in toks {
                         if let Token::Diag(level, msg) = t.token {
                             diags.push(Lexed {
                                 token: Token::Diag(level, msg),
-                                line: line + s_matches(&src[pos..pos + n]),
+                                line: line + s_matches(&src[pos..pos + n]) + t.line - 1,
                                 ws_adj: 0,
                                 start: usize::MAX,
                                 end: usize::MAX,
@@ -879,7 +880,7 @@ fn interp_scan(
                             if let Token::Diag(level, msg) = t.token {
                                 diags.push(Lexed {
                                     token: Token::Diag(level, msg),
-                                    line: line + s_matches(&src[pos..pos + n]),
+                                    line: line + s_matches(&src[pos..pos + n]) + t.line - 1,
                                     ws_adj: 0,
                                     start: usize::MAX,
                                     end: usize::MAX,
@@ -930,11 +931,12 @@ fn interp_scan(
                         } else if src[rest..].starts_with('[') {
                             // Quoted keys are illegal in simple
                             // interpolation — `$arr['x']` is E_PARSE
-                            // (bug21820).
+                            // (bug21820). Zend sites it at the `$`,
+                            // not the string's opening quote.
                             if matches!(b.get(rest + 1), Some(b'\'') | Some(b'"')) {
                                 return Err(PhpError::parse(
                                     "syntax error, unexpected string content \"\", expecting \"-\" or identifier or variable or number",
-                                    line,
+                                    line + s_matches(&src[pos..pos + n]),
                                 ));
                             }
                             // One-dimensional index (unquoted ident/number/quoted).
