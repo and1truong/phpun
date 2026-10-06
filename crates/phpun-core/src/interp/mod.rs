@@ -1541,6 +1541,11 @@ impl<'a> Interp<'a> {
             }
         }
         cv_objs.sort_by_key(|(id, _)| *id);
+        // A __destruct that errors unwinds like a shutdown-function
+        // error: exit(N) supplies the exit code, a throw prints its
+        // uncaught block — and Zend stops the whole sweep after any
+        // shutdown-time error, so later destructors do not run.
+        let mut dtor_stop = false;
         for (_, o) in cv_objs.into_iter().rev() {
             // strong_count 2 = the var's cell + our clone.
             if Rc::strong_count(&o) != 2 {
@@ -1551,41 +1556,67 @@ impl<'a> Interp<'a> {
                 .is_some()
                 && self.mark_destructed(&o)
             {
-                let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                if let Err(e) = self.method_invoke(o.clone(), "__destruct", CallArgs::empty())
+                {
+                    shutdown_code = Some(match self.err_flow(e) {
+                        Flow::Exit(c) => c,
+                        Flow::Throw(v) => {
+                            self.uncaught(&v);
+                            255
+                        }
+                        _ => 255,
+                    });
+                    dtor_stop = true;
+                    break;
+                }
             }
         }
         self.globals.vars.clear();
         // Objects a dtor spawns may land in already-visited recycled
         // handle slots — rescan until a full pass runs nothing new
         // (bug51822/bug74053).
-        loop {
-            let mut progressed = false;
-            let mut i = 0;
-            while i < self.obj_handles.len() {
-                let w = match &self.obj_handles[i] {
-                    ObjHandle::Obj(w) => w.clone(),
-                    _ => {
-                        i += 1;
+        if !dtor_stop {
+            'sweep: loop {
+                let mut progressed = false;
+                let mut i = 0;
+                while i < self.obj_handles.len() {
+                    let w = match &self.obj_handles[i] {
+                        ObjHandle::Obj(w) => w.clone(),
+                        _ => {
+                            i += 1;
+                            continue;
+                        }
+                    };
+                    i += 1;
+                    let Some(o) = w.upgrade() else { continue };
+                    let key = Rc::as_ptr(&o) as usize;
+                    if self.destructed.contains_key(&key) {
                         continue;
                     }
-                };
-                i += 1;
-                let Some(o) = w.upgrade() else { continue };
-                let key = Rc::as_ptr(&o) as usize;
-                if self.destructed.contains_key(&key) {
-                    continue;
+                    if self
+                        .find_method_in(&o.borrow().class, "__destruct")
+                        .is_some()
+                    {
+                        self.mark_destructed(&o);
+                        progressed = true;
+                        if let Err(e) =
+                            self.method_invoke(o.clone(), "__destruct", CallArgs::empty())
+                        {
+                            shutdown_code = Some(match self.err_flow(e) {
+                                Flow::Exit(c) => c,
+                                Flow::Throw(v) => {
+                                    self.uncaught(&v);
+                                    255
+                                }
+                                _ => 255,
+                            });
+                            break 'sweep;
+                        }
+                    }
                 }
-                if self
-                    .find_method_in(&o.borrow().class, "__destruct")
-                    .is_some()
-                {
-                    self.mark_destructed(&o);
-                    progressed = true;
-                    let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                if !progressed {
+                    break;
                 }
-            }
-            if !progressed {
-                break;
             }
         }
         if !self.mem_exceeded {
