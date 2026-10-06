@@ -861,11 +861,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         // (stream,data,length) → 3/2).
         "fwrite" | "fputs" => bp!(("stream", Req), ("data", Req), ("length", Null)),
         "fread" => bp!(("stream", Req), ("length", Req)),
-        "fseek" => bp!(
-            ("stream", Req),
-            ("offset", Req),
-            ("whence", Int(0))
-        ),
+        "fseek" => bp!(("stream", Req), ("offset", Req), ("whence", Int(0))),
         "ftell" | "fclose" | "feof" | "fgetc" | "fpassthru" | "rewind" | "fflush" | "pclose"
         | "fstat" => bp!(("stream", Req)),
         "fgets" => bp!(("stream", Req), ("length", Null)),
@@ -885,11 +881,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
             ("eol", Str("\n"))
         ),
         "fscanf" => bp!(("stream", Req), ("format", Req), ("vars", Var)),
-        "flock" => bp!(
-            ("stream", Req),
-            ("operation", Req),
-            ("would_block", Null)
-        ),
+        "flock" => bp!(("stream", Req), ("operation", Req), ("would_block", Null)),
         "fopen" => bp!(
             ("filename", Req),
             ("mode", Req),
@@ -932,11 +924,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
             ("sorting_order", Int(0)),
             ("context", Null)
         ),
-        "file" => bp!(
-            ("filename", Req),
-            ("flags", Int(0)),
-            ("context", Null)
-        ),
+        "file" => bp!(("filename", Req), ("flags", Int(0)), ("context", Null)),
         "readfile" => bp!(
             ("filename", Req),
             ("use_include_path", Bool(false)),
@@ -952,26 +940,15 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
             ("process_sections", Bool(false)),
             ("scanner_mode", Int(0))
         ),
-        "fnmatch" => bp!(
-            ("pattern", Req),
-            ("filename", Req),
-            ("flags", Int(0))
-        ),
+        "fnmatch" => bp!(("pattern", Req), ("filename", Req), ("flags", Int(0))),
         "disk_free_space" | "disk_total_space" | "diskfreespace" => {
             bp!(("directory", Req))
         }
         "tempnam" => bp!(("directory", Req), ("prefix", Req)),
         "chdir" => bp!(("directory", Req)),
-        "clearstatcache" => bp!(
-            ("clear_realpath_cache", Bool(false)),
-            ("filename", Str(""))
-        ),
+        "clearstatcache" => bp!(("clear_realpath_cache", Bool(false)), ("filename", Str(""))),
         "move_uploaded_file" => bp!(("from", Req), ("to", Req)),
-        "stream_get_contents" => bp!(
-            ("stream", Req),
-            ("length", Null),
-            ("offset", Int(-1))
-        ),
+        "stream_get_contents" => bp!(("stream", Req), ("length", Null), ("offset", Int(-1))),
         "stream_get_meta_data" => bp!(("stream", Req)),
         "stream_copy_to_stream" => bp!(
             ("from", Req),

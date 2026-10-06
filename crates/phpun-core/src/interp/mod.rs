@@ -2845,10 +2845,7 @@ impl<'a> Interp<'a> {
                     .collect();
                 return Some((names, variadic));
             }
-            interp
-                .functions
-                .get(&lower)
-                .map(|d| decl_sig(d))
+            interp.functions.get(&lower).map(|d| decl_sig(d))
         };
         let sig: Option<(Vec<String>, bool)> = match cb {
             Value::Str(s) => name_sig(self, &crate::value::lossy(s)),
@@ -2889,13 +2886,18 @@ impl<'a> Interp<'a> {
                 })?;
                 drop(arr);
                 let key = self.resolve_class(&cn).unwrap_or(cn);
-                self.classes.get(&key.to_lowercase()).cloned().and_then(|cls| {
-                    self.find_method_in(&cls, &mn).map(|(m, _)| decl_sig(&m.decl))
-                })
+                self.classes
+                    .get(&key.to_lowercase())
+                    .cloned()
+                    .and_then(|cls| {
+                        self.find_method_in(&cls, &mn)
+                            .map(|(m, _)| decl_sig(&m.decl))
+                    })
             }
             Value::Object(o) => {
                 let cls = o.borrow().class.clone();
-                self.find_method_in(&cls, "__invoke").map(|(m, _)| decl_sig(&m.decl))
+                self.find_method_in(&cls, "__invoke")
+                    .map(|(m, _)| decl_sig(&m.decl))
             }
             _ => None,
         };

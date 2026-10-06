@@ -580,7 +580,10 @@ impl<'a> Interp<'a> {
             decl.as_deref()
                 .map(|d| d.params.as_slice())
                 .unwrap_or(&builtin_params),
-            &format!("{}()", fname.trim_start_matches('\u{1}').trim_start_matches('\\')),
+            &format!(
+                "{}()",
+                fname.trim_start_matches('\u{1}').trim_start_matches('\\')
+            ),
             decl.is_none(),
         )?;
         if !ns_resolved {
@@ -4462,9 +4465,7 @@ fn const_str_fold(e: &Expr) -> Option<Vec<u8>> {
             }
             Some(v)
         }
-        Expr::Binary {
-            op: ".", l, r, ..
-        } => {
+        Expr::Binary { op: ".", l, r, .. } => {
             let mut v = const_str_fold(l)?;
             v.extend(const_str_fold(r)?);
             Some(v)
