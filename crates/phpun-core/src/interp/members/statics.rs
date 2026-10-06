@@ -33,6 +33,61 @@ impl<'a> Interp<'a> {
         None
     }
 
+    /// Zend's visibility check for `Cls::$p` static access: a private
+    /// prop declared in an ancestor still resolves (for the error) even
+    /// though the subclass can't see it, and the message names the
+    /// ACCESSED class — 'Cannot access private property D::$s' for a
+    /// `private static $s` living in C.
+    fn static_prop_vis(&mut self, cls: &Rc<PhpClass>, name: &str) -> Result<(), PhpError> {
+        let mut cur = Some(cls.clone());
+        let mut found: Option<(crate::ast::PropDecl, Rc<PhpClass>)> = None;
+        while let Some(c) = cur {
+            if let Some(pd) = c.decl.props.iter().find(|p| p.name == name && p.is_static) {
+                found = Some((pd.clone(), c.clone()));
+                break;
+            }
+            cur = c
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        let Some((pd, dcls)) = found else {
+            return Ok(());
+        };
+        let scope = self.stack.last().and_then(|f| {
+            f.decl_class
+                .as_ref()
+                .or(f.scope_class.as_ref())
+                .map(|s| s.decl.name.clone())
+        });
+        let ok = match pd.visibility {
+            crate::ast::Visibility::Public => true,
+            crate::ast::Visibility::Private => scope.as_deref() == Some(dcls.name()),
+            crate::ast::Visibility::Protected => match &scope {
+                Some(s) => self.is_a_str(s, dcls.name()) || self.is_a_str(dcls.name(), s),
+                None => false,
+            },
+        };
+        if ok {
+            return Ok(());
+        }
+        self.fail(PhpError::uncaught(
+            "Error",
+            format!(
+                "Cannot access {} property {}::${}",
+                match pd.visibility {
+                    crate::ast::Visibility::Private => "private",
+                    crate::ast::Visibility::Protected => "protected",
+                    crate::ast::Visibility::Public => "public",
+                },
+                cls.name(),
+                name
+            ),
+            0,
+        ))
+    }
+
     pub(in crate::interp) fn static_prop_read(
         &mut self,
         class: &Expr,
@@ -47,6 +102,7 @@ impl<'a> Interp<'a> {
             ))?;
         }
         self.statics_init(&cls)?;
+        self.static_prop_vis(&cls, &name)?;
         let v = cls.statics.borrow().get(&name).map(|c| c.borrow().clone());
         match v {
             Some(v) => Ok(v),
@@ -99,6 +155,7 @@ impl<'a> Interp<'a> {
             ))?;
         }
         self.statics_init(&cls)?;
+        self.static_prop_vis(&cls, name)?;
         let found = cls.statics.borrow().get(name).cloned();
         match found {
             Some(c) => {

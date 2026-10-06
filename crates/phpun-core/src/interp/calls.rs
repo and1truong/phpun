@@ -269,12 +269,24 @@ impl<'a> Interp<'a> {
             };
             if by_ref {
                 match expr {
-                    Expr::Var(_) | Expr::Index { .. } | Expr::Prop { .. } | Expr::VarVar(_)
+                    Expr::Var(_)
+                    | Expr::Index { .. }
+                    | Expr::Prop { .. }
+                    | Expr::VarVar(_)
+                    | Expr::StaticProp { .. }
                         // zend's SEND_REF check rejects the $GLOBALS
                         // table itself (its elements are fine).
                         if !matches!(expr, Expr::Var(n) if n == "GLOBALS") =>
                     {
-                        match self.eval_cell(expr) {
+                        // zend evaluates a by-ref arg dim as BP_VAR_RW
+                        // — string offsets fail with the catchable
+                        // 'Cannot create references to/from string
+                        // offsets' (and the str-key TypeError), not the
+                        // generic scalar-as-array fatal.
+                        let was = std::mem::replace(&mut self.dim_by_ref, true);
+                        let rc = self.eval_cell(expr);
+                        self.dim_by_ref = was;
+                        match rc {
                             Ok(c) => {
                                 if let Some(n) = name {
                                     out.named.push((n, c, true, false));
@@ -284,12 +296,11 @@ impl<'a> Interp<'a> {
                                     pos += 1;
                                 }
                             }
-                            Err(_) => {
-                                return self.fail(PhpError::fatal(
-                                    "Only variables should be passed by reference",
-                                    0,
-                                ))
-                            }
+                            // Cell-access errors (readonly/private
+                            // prop, string offsets, undeclared static)
+                            // are real catchable throwables — propagate
+                            // them, not the bogus by-ref compile fatal.
+                            Err(e) => return Err(e),
                         }
                     }
                     Expr::Assign {
