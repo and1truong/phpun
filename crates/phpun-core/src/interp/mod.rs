@@ -2480,13 +2480,39 @@ impl<'a> Interp<'a> {
     }
 
     /// Builtin call — errors become catchable throwables via `fail`.
-    fn call_builtin(&mut self, name: &str, args: &CallArgs) -> Result<Option<Value>, PhpError> {
+    /// `visible` marks frames Zend keeps in exception traces — every
+    /// real call, literal or dynamic; false only for literal calls
+    /// compile-specialized into dedicated opcodes (sprintf rope).
+    fn call_builtin(
+        &mut self,
+        name: &str,
+        args: &CallArgs,
+        visible: bool,
+    ) -> Result<Option<Value>, PhpError> {
+        // A builtin frame pushed while dispatched from inside another
+        // builtin's own machinery (internal_cb: sort/ob/array-callbacks)
+        // reports `[internal function]` — Zend emits no file/line for a
+        // frame whose caller is internal. call_user_func* trampolines
+        // are transparent to the walk (trace_frame_hidden).
+        let from_builtin = self.internal_cb > 0
+            && self
+                .call_trace
+                .iter()
+                .rev()
+                .find(|f| !crate::value::trace_frame_hidden(f))
+                .map(|f| f.internal)
+                .unwrap_or(false);
+        let (site_file, site_line) = if from_builtin {
+            ("[internal function]".to_string(), 0)
+        } else {
+            (self.diag_file(), self.cur_line as u32)
+        };
         self.call_trace.push(TraceFrame {
             function: name.to_string(),
             class: None,
             ty: String::new(),
-            file: self.diag_file(),
-            line: self.cur_line as u32,
+            file: site_file,
+            line: site_line,
             args: args.to_vec(),
             named_args: args
                 .named
@@ -2494,6 +2520,7 @@ impl<'a> Interp<'a> {
                 .map(|(n, c, ..)| (n.clone(), c.clone()))
                 .collect(),
             internal: true,
+            visible,
         });
         if name == "assert" {
             // AssertionError message = `assert(<args>)` as written.

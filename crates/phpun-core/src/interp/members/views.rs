@@ -1376,6 +1376,50 @@ impl<'a> Interp<'a> {
                 let cn = self.conv_str(&cn)?.to_string();
                 Ok(Some(self.new_instance(&cn, ca)?))
             }
+            // Arity introspection (ReflectionFunctionAbstract). Zend
+            // counts every declared slot — variadic included; required
+            // covers the non-optional, non-variadic prefix (fprintf
+            // arginfo stream/format/values → 2 of 3).
+            "getnumberofparameters" | "getnumberofrequiredparameters" => {
+                let stored = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                let arity = match &stored {
+                    Value::Callable(c) => match &c.kind {
+                        CallableKind::Closure(d) => Some(reflect_decl_arity(d)),
+                        CallableKind::Named(n) => self.name_arity(n),
+                        CallableKind::Method {
+                            obj: mo,
+                            class,
+                            name,
+                        } => {
+                            let cls = class
+                                .clone()
+                                .or_else(|| mo.as_ref().map(|o| o.borrow().class.clone()));
+                            cls.and_then(|ce| {
+                                self.find_method_in(&ce, name)
+                                    .map(|(m, _)| reflect_decl_arity(&m.decl))
+                            })
+                        }
+                    },
+                    _ => {
+                        let n = self.conv_str(&stored)?.to_string();
+                        self.name_arity(&n)
+                    }
+                };
+                let pick = if lname == "getnumberofparameters" {
+                    arity.map(|(t, _)| t)
+                } else {
+                    arity.map(|(_, r)| r)
+                };
+                Ok(Some(match pick {
+                    Some(n) => Value::Int(n),
+                    None => Value::Null,
+                }))
+            }
             "getname" => {
                 if let Some(ObjectInternal::ReflectionAttribute { name, .. }) =
                     &obj.borrow().internal
@@ -2381,4 +2425,39 @@ impl<'a> Interp<'a> {
         }
         out
     }
+}
+
+impl Interp<'_> {
+    /// Arity of a named function — builtin arginfo first (zend's
+    /// required/total split: variadic counts as a param but not as
+    /// required), then userland decls.
+    fn name_arity(&mut self, name: &str) -> Option<(i64, i64)> {
+        let n = name.trim_start_matches('\\').to_lowercase();
+        if let Some(params) = crate::builtins::builtin_params(&n) {
+            let total = params.len() as i64;
+            let required = params
+                .iter()
+                .filter(|(_, d)| matches!(d, crate::builtins::BDef::Req))
+                .count() as i64;
+            return Some((total, required));
+        }
+        if let Some(sig) = crate::builtins::builtin_sig(&n) {
+            let total = sig.len() as i64;
+            let required = sig.iter().filter(|(_, req)| *req).count() as i64;
+            return Some((total, required));
+        }
+        self.functions.get(&n).map(|d| reflect_decl_arity(d))
+    }
+}
+
+/// Total and required param counts for a function/method decl — a
+/// variadic tail is a declared slot but not required.
+fn reflect_decl_arity(d: &crate::ast::FunctionDecl) -> (i64, i64) {
+    (
+        d.params.len() as i64,
+        d.params
+            .iter()
+            .filter(|p| p.default.is_none() && !p.variadic)
+            .count() as i64,
+    )
 }

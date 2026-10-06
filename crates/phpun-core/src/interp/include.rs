@@ -41,6 +41,7 @@ impl<'a> Interp<'a> {
             args: vec![cell(pathv.clone())],
             named_args: Vec::new(),
             internal: true,
+            visible: true,
         });
         let inc_pop = |it: &mut Interp| {
             it.call_trace.pop();

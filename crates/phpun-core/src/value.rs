@@ -1578,6 +1578,12 @@ pub struct TraceFrame {
     /// Callee is an internal/builtin function — marks builtin frames so
     /// callers can attribute userland callbacks (`[internal function]`).
     pub internal: bool,
+    /// Zend emits this frame in exception/backtraces — every real call
+    /// produces one, literal or dynamic. False only for a literal call
+    /// Zend compile-specializes into dedicated opcodes (a const-format
+    /// `sprintf` becomes rope-concat — no call exists, conversion
+    /// errors trace `{main}` only).
+    pub visible: bool,
 }
 
 /// Shared storage slot for spl array-objects — zend's `intern->array`

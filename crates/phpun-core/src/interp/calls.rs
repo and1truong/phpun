@@ -617,7 +617,18 @@ impl<'a> Interp<'a> {
                 };
                 return Ok(if pick_lhs { lhs } else { rhs });
             }
-            if let Some(v) = self.call_builtin(&lname, &argvals)? {
+            // Zend keeps the callee frame in traces for every real
+            // internal call — literal or dynamic (`substr`/`fprintf`
+            // show #0 in conversion errors). The exception: literal
+            // calls Zend compile-specializes into dedicated opcodes
+            // emit no call at all, e.g. `sprintf(<const "%s"/"%d"/"%%"
+            // fmt>, <exact arg count>)` → rope-concat
+            // (sprintf_rope_optimization_002). Dynamic dispatches —
+            // `$fn()`, `f(...$a)`, callables — are always real calls.
+            let literal = fname.starts_with('\u{1}') || fname.starts_with('\\');
+            let visible = args.iter().any(|a| matches!(a, Expr::Unpack(_)))
+                || !(literal && zend_literal_no_frame(&lname, args));
+            if let Some(v) = self.call_builtin(&lname, &argvals, visible)? {
                 return Ok(v);
             }
         }
@@ -707,7 +718,7 @@ impl<'a> Interp<'a> {
                     }
                     CallableKind::Named(n) => {
                         let n = n.trim_start_matches('\\');
-                        if let Some(v) = self.call_builtin(&n.to_lowercase(), &args)? {
+                        if let Some(v) = self.call_builtin(&n.to_lowercase(), &args, true)? {
                             return Ok(v);
                         }
                         let decl = match self.functions.get(&n.to_lowercase()) {
@@ -769,7 +780,7 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                if let Some(v) = self.call_builtin(&name.to_lowercase(), &args)? {
+                if let Some(v) = self.call_builtin(&name.to_lowercase(), &args, true)? {
                     return Ok(v);
                 }
                 let decl = match self.functions.get(&name.to_lowercase()) {
@@ -1948,11 +1959,20 @@ impl<'a> Interp<'a> {
         // (internal_cb: ob handlers, sort callbacks) has call site
         // `[internal function]`; engine callbacks like the error handler
         // invoked mid-eval instead report the builtin's own call site
-        // (bug32828 vs bug28213). At shutdown the trace is empty — the
-        // engine itself is the caller, which is also `[internal
-        // function]` (registered shutdown fns, the dtor sweep).
-        let from_builtin =
-            self.internal_cb > 0 && self.call_trace.last().map(|f| f.internal).unwrap_or(true);
+        // (bug32828 vs bug28213). The zend-equivalent "prev frame"
+        // skips call_user_func* trampolines and frameless compile-
+        // specialized calls (rope sprintf) — they leave no execute_data.
+        // At shutdown the trace is empty — the engine itself is the
+        // caller, which is also `[internal function]` (registered
+        // shutdown fns, the dtor sweep).
+        let from_builtin = self.internal_cb > 0
+            && self
+                .call_trace
+                .iter()
+                .rev()
+                .find(|f| f.visible && !crate::value::trace_frame_hidden(f))
+                .map(|f| f.internal)
+                .unwrap_or(true);
         let (site_file, site_line) = if from_builtin {
             ("[internal function]".to_string(), 0)
         } else {
@@ -2055,6 +2075,7 @@ impl<'a> Interp<'a> {
                 args: targs.clone(),
                 named_args: targs_named.clone(),
                 internal: false,
+                visible: true,
             })
             .unwrap_or_else(|| TraceFrame {
                 function: decl.name.clone(),
@@ -2065,6 +2086,7 @@ impl<'a> Interp<'a> {
                 args: targs,
                 named_args: targs_named,
                 internal: false,
+                visible: true,
             });
         self.call_trace.push(fr);
         self.last_call_by_ref = decl.by_ref;
@@ -4366,6 +4388,56 @@ fn builtin_byref(name: &str) -> Option<&'static [bool]> {
         "preg_grep" => &[false],
         _ => return None,
     })
+}
+
+/// A literal `sprintf(...)` Zend compiles to rope-concat opcodes
+/// instead of a call (zend_compile_func_sprintf): the format is a
+/// constant string under 256 bytes, placeholders are only `%s`/`%d`
+/// (`%%` emits a literal `%`), and placeholder count == value count.
+/// No call exists at runtime, so the frame contributes nothing to
+/// traces. Everything else — other literal builtins, non-const or
+/// non-rope formats, dynamic dispatches — is a real call.
+fn zend_literal_no_frame(name: &str, args: &[Expr]) -> bool {
+    if name != "sprintf" {
+        return false;
+    }
+    // Compile-time-constant format — a quoted literal is `Expr::Str`
+    // or an all-literal `Expr::Interp`.
+    let fmt: Vec<u8> = match args.first() {
+        Some(Expr::Str(s)) => s.as_bytes().to_vec(),
+        Some(Expr::Interp(parts)) => {
+            let mut v = Vec::new();
+            for p in parts {
+                match p {
+                    crate::lexer::StringPart::Lit(t) => v.extend_from_slice(t),
+                    _ => return false,
+                }
+            }
+            v
+        }
+        _ => return false,
+    };
+    let fmt = fmt.as_slice();
+    if fmt.len() >= 256 {
+        return false;
+    }
+    let mut n = 0usize;
+    let mut i = 0;
+    while i < fmt.len() {
+        if fmt[i] == b'%' {
+            i += 1;
+            if i >= fmt.len() {
+                return false;
+            }
+            match fmt[i] {
+                b's' | b'd' => n += 1,
+                b'%' => {}
+                _ => return false,
+            }
+        }
+        i += 1;
+    }
+    n == args.len() - 1
 }
 
 /// Zend's normalized union display for redundancy errors: iterable
