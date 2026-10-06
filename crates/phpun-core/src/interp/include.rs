@@ -199,9 +199,13 @@ impl<'a> Interp<'a> {
                         });
                     }
                     // Non-parse fatals raised while compiling the included
-                    // file still attribute to the included file.
+                    // file still attribute to the included file — with the
+                    // compile-context backtrace (the live stack minus this
+                    // include's own pseudo-frame) like the post-parse gates.
                     _ => {
                         self.last_err_file = fname.clone();
+                        let mut e = e;
+                        e.trace = Some(self.compile_err_frames());
                         self.print_fatal(&e);
                     }
                 }

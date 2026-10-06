@@ -465,8 +465,10 @@ impl<'a> Interp<'a> {
             .iter()
             .rev()
             .filter(|f| !crate::value::trace_frame_hidden(f))
-            .enumerate()
-            .map(|(i, f)| crate::value::trace_frame_str_at(f, i))
+            // The slice's frames are all DEEPER than the dropped
+            // innermost include — every include frame here keeps its
+            // path argument.
+            .map(|f| crate::value::trace_frame_str_at(f, false))
             .collect()
     }
 
@@ -479,13 +481,18 @@ impl<'a> Interp<'a> {
     /// level, the real frames inside a function call.
     pub(in crate::interp) fn decl_fatal_ctx(&mut self, mut e: PhpError) -> PhpError {
         if matches!(e.kind, ErrorKind::Fatal) {
+            let frames: Vec<&crate::value::TraceFrame> = self
+                .call_trace
+                .iter()
+                .rev()
+                .filter(|f| !crate::value::trace_frame_hidden(f))
+                .collect();
+            let bare = frames.iter().position(|f| crate::value::include_frame(f));
             e.trace = Some(
-                self.call_trace
+                frames
                     .iter()
-                    .rev()
-                    .filter(|f| !crate::value::trace_frame_hidden(f))
                     .enumerate()
-                    .map(|(i, f)| crate::value::trace_frame_str_at(f, i))
+                    .map(|(i, f)| crate::value::trace_frame_str_at(f, Some(i) == bare))
                     .collect(),
             );
         }

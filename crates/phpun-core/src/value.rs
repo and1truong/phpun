@@ -270,11 +270,16 @@ pub fn format_trace(frames: &[TraceFrame]) -> String {
 pub fn format_backtrace_frames(frames: &[TraceFrame]) -> String {
     let mut t = String::new();
     let mut i = 0;
-    for fr in frames.iter() {
+    let bare_incl = frames.iter().position(include_frame);
+    for (pos, fr) in frames.iter().enumerate() {
         if trace_frame_hidden(fr) {
             continue;
         }
-        t.push_str(&format!("#{} {}\n", i, trace_frame_str_at(fr, i)));
+        t.push_str(&format!(
+            "#{} {}\n",
+            i,
+            trace_frame_str_at(fr, Some(pos) == bare_incl)
+        ));
         i += 1;
     }
     t
@@ -365,13 +370,13 @@ fn trace_frame_str_noargs(fr: &TraceFrame) -> String {
     trace_frame_str(&f)
 }
 
-/// Frame body for the `idx`-th frame of an innermost-first live
-/// backtrace. The innermost include/require pseudo-frame renders bare
-/// (`require()` — the include op_array's own executing context carries
-/// no call args in Zend); deeper include frames keep their path
-/// argument (`require('/tmp/x/inc....')`).
-pub fn trace_frame_str_at(fr: &TraceFrame, idx: usize) -> String {
-    if idx == 0 && include_frame(fr) {
+/// Frame body for an innermost-first live backtrace. The innermost
+/// include/require pseudo-frame renders bare (`require()` — the
+/// include op_array's own executing context carries no call args in
+/// Zend) at WHATEVER depth it sits (bug28213); deeper include frames
+/// keep their path argument (`require('/tmp/x/inc....')`).
+pub fn trace_frame_str_at(fr: &TraceFrame, bare_incl: bool) -> String {
+    if bare_incl && include_frame(fr) {
         trace_frame_str_noargs(fr)
     } else {
         trace_frame_str(fr)
