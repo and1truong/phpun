@@ -108,6 +108,17 @@ impl<'a> Interp<'a> {
             Some(v) => Ok(v),
             None => {
                 if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &name) {
+                    // The shared slot lives on the DECLARING class —
+                    // materialized after this class's init it isn't in
+                    // its own table yet.
+                    if !Rc::ptr_eq(&dcls, &cls) {
+                        self.statics_init(&dcls)?;
+                        if let Some(v) =
+                            dcls.statics.borrow().get(&name).map(|c| c.borrow().clone())
+                        {
+                            return Ok(v);
+                        }
+                    }
                     if pd.ty.is_some() {
                         return self.fail(PhpError::uncaught(
                             "Error",
@@ -181,10 +192,69 @@ impl<'a> Interp<'a> {
             }
             None => {
                 // Write/cell path materializes a declared static; an
-                // undeclared one is an Error.
+                // undeclared one is an Error. The slot lives on the
+                // DECLARING class's table — zend shares one storage
+                // slot with every subclass that doesn't redeclare.
                 if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
+                    if !Rc::ptr_eq(&dcls, &cls) {
+                        self.statics_init(&dcls)?;
+                        if let Some(c) = dcls.statics.borrow().get(name).cloned() {
+                            if let Some(tys) = &pd.ty {
+                                let p = Rc::as_ptr(&c) as usize;
+                                self.typed_slots.insert(
+                                    p,
+                                    (
+                                        c.clone(),
+                                        tys.clone(),
+                                        dcls.name().to_string(),
+                                        name.to_string(),
+                                    ),
+                                );
+                                self.slot_anchor.insert(
+                                    p,
+                                    SlotAnchor::Statics(dcls.name().to_string(), name.to_string()),
+                                );
+                            }
+                            return Ok(c);
+                        }
+                    }
+                    if pd.ty.is_some() && pd.default.is_none() {
+                        let nullable = pd
+                            .ty
+                            .as_ref()
+                            .map(|t| t.iter().any(|m| m.eq_ignore_ascii_case("null")))
+                            .unwrap_or(false);
+                        if !nullable && (self.dim_by_ref || self.foreach_by_ref) {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Cannot access uninitialized non-nullable property {}::${} by reference",
+                                    dcls.name(),
+                                    name
+                                ),
+                                0,
+                            ));
+                        }
+                        if nullable && self.foreach_by_ref {
+                            // `foreach (C::$p as &$v)` on an
+                            // uninitialized nullable slot names the
+                            // 'undeclared' Error — the `=&` bind alone
+                            // materializes NULL instead.
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Access to undeclared static property {}::${}",
+                                    cls.name(),
+                                    name
+                                ),
+                                0,
+                            ));
+                        }
+                    }
                     let c = cell(Value::Null);
-                    cls.statics.borrow_mut().insert(name.to_string(), c.clone());
+                    dcls.statics
+                        .borrow_mut()
+                        .insert(name.to_string(), c.clone());
                     if let Some(tys) = &pd.ty {
                         self.last_fresh_cell = Some(Rc::as_ptr(&c) as usize);
                         let p = Rc::as_ptr(&c) as usize;
@@ -223,9 +293,9 @@ impl<'a> Interp<'a> {
             return Ok(());
         }
         *cls.statics_init.borrow_mut() = true;
-        // Inherited statics: PHP snapshots the parent's static-prop
-        // values into the child's table at link time, so `static::$p`
-        // on the child resolves parent defaults.
+        // Inherited statics: a non-redeclared prop is ONE shared slot
+        // — zend links the child to the parent's storage cell, so
+        // `D::$a` and `C::$a` write through the same reference.
         if let Some(pname) = &cls.decl.parent {
             if let Some(p) = self.classes.get(&pname.to_lowercase()).cloned() {
                 self.statics_init(&p)?;
@@ -233,7 +303,7 @@ impl<'a> Interp<'a> {
                     cls.statics
                         .borrow_mut()
                         .entry(k.clone())
-                        .or_insert_with(|| cell(v.borrow().clone()));
+                        .or_insert_with(|| v.clone());
                 }
             }
         }

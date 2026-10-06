@@ -867,7 +867,12 @@ impl<'a> Interp<'a> {
                 Expr::Prop { .. } | Expr::StaticProp { .. } | Expr::Index { .. } | Expr::VarVar(_)
             );
         let src = if cell_src {
-            match self.eval_cell(arr) {
+            // A `&` source is a by-ref bind — uninitialized typed props
+            // report the 'by reference'/'undeclared' catchable.
+            let was = std::mem::replace(&mut self.foreach_by_ref, true);
+            let c = self.eval_cell(arr);
+            self.foreach_by_ref = was;
+            match c {
                 Ok(c) => c.borrow().clone(),
                 Err(e) => return self.err_flow(e),
             }

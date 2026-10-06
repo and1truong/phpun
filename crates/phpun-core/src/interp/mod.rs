@@ -329,6 +329,10 @@ pub struct Interp<'a> {
     /// zend's read_dimension(BP_VAR_RW) silently creates missing
     /// buckets instead of warning.
     dim_by_ref: bool,
+    /// `foreach ($x as &$v)` source fetch — zend treats it as a
+    /// write-reference bind (uninit non-nullable typed props error
+    /// 'by reference'; uninit *nullable* statics report 'undeclared').
+    foreach_by_ref: bool,
     /// Autoload/lookup error swallowed by the last `is_callable_value`
     /// probe — re-raised when a `callable` param type rejects the arg.
     callable_probe_err: Option<(Value, PhpError)>,
@@ -826,6 +830,7 @@ impl<'a> Interp<'a> {
             globals_arr: None,
             globals_synced: std::collections::HashSet::new(),
             dim_by_ref: false,
+            foreach_by_ref: false,
             callable_probe_err: None,
             stack: Vec::new(),
             functions: HashMap::new(),

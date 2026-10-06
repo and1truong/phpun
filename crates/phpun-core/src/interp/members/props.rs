@@ -1629,7 +1629,7 @@ impl<'a> Interp<'a> {
                                 .as_ref()
                                 .map(|t| t.iter().any(|m| m.eq_ignore_ascii_case("null")))
                                 .unwrap_or(false);
-                            if !nullable {
+                            if !nullable && (self.dim_by_ref || self.foreach_by_ref) {
                                 // `=&` on an uninit typed prop routes to
                                 // `&__get` when it exists — the bound
                                 // ref sees __get's cell (073).

@@ -979,7 +979,17 @@ impl<'a> Interp<'a> {
                     Err(_) => return Ok(None),
                 };
                 self.statics_init(&cls)?;
-                let v = cls.statics.borrow().get(&pn).map(|c| c.borrow().clone());
+                let mut v = cls.statics.borrow().get(&pn).map(|c| c.borrow().clone());
+                if v.is_none() {
+                    // Shared slot materialized on the DECLARING class
+                    // after this class's init (shared statics).
+                    if let Some((_, dcls)) = self.find_static_prop_decl(&cls, &pn) {
+                        if !Rc::ptr_eq(&dcls, &cls) {
+                            self.statics_init(&dcls)?;
+                            v = dcls.statics.borrow().get(&pn).map(|c| c.borrow().clone());
+                        }
+                    }
+                }
                 let ok = match self.find_static_prop_decl(&cls, &pn) {
                     Some((pd, dcls)) => match pd.visibility {
                         crate::ast::Visibility::Public => true,
@@ -1436,8 +1446,14 @@ impl<'a> Interp<'a> {
                                 let c = self.prop_read_value(ov.clone(), &pn, false);
                                 if $quiet {
                                     self.silence -= 1;
+                                    c.unwrap_or(Value::Null)
+                                } else {
+                                    // Compound reads propagate real
+                                    // Errors — an uninit typed prop's
+                                    // 'must not be accessed' beats the
+                                    // operand TypeError (oracle).
+                                    c?
                                 }
-                                c.unwrap_or(Value::Null)
                             }
                             Late::PropStr { ov, pn } if matches!(ov, Value::Object(_)) => {
                                 if $quiet {
@@ -1446,8 +1462,23 @@ impl<'a> Interp<'a> {
                                 let c = self.prop_read_value(ov.clone(), pn, false);
                                 if $quiet {
                                     self.silence -= 1;
+                                    c.unwrap_or(Value::Null)
+                                } else {
+                                    c?
                                 }
-                                c.unwrap_or(Value::Null)
+                            }
+                            // A compound-read on a static prop runs
+                            // the real read path — uninitialized typed
+                            // statics surface 'must not be accessed
+                            // before initialization' (`??=` keeps the
+                            // silent isset-style read).
+                            Late::Static { class, pn } => {
+                                let c = self.static_prop_read(class, &PropName::Name(pn.clone()));
+                                if $quiet {
+                                    c.unwrap_or(Value::Null)
+                                } else {
+                                    c?
+                                }
                             }
                             _ => {
                                 // `$i->p += v` on a non-object base: the
@@ -2074,7 +2105,17 @@ impl<'a> Interp<'a> {
                         merged = Some(self.bind_typed_check(&pd, &dcls, &src)?);
                     }
                 }
-                cls.statics.borrow_mut().insert(pn.clone(), src.clone());
+                // The bound cell lands on the DECLARING class's slot —
+                // inherited statics are one shared storage (D::$a =&
+                // aliases C::$a).
+                match self.find_static_prop_decl(&cls, &pn) {
+                    Some((_, dcls)) => {
+                        dcls.statics.borrow_mut().insert(pn.clone(), src.clone());
+                    }
+                    None => {
+                        cls.statics.borrow_mut().insert(pn.clone(), src.clone());
+                    }
+                }
                 if let (Some(m), Some((pd, dcls))) = (merged, self.find_static_prop_decl(&cls, &pn))
                 {
                     let sptr = Rc::as_ptr(&src) as usize;
@@ -4787,7 +4828,10 @@ impl<'a> Interp<'a> {
                 self.var_get(&name).unwrap_or(Value::Null)
             }
             Expr::StaticProp { class, name } => {
-                self.static_prop_read(class, name).unwrap_or(Value::Null)
+                // Static-prop reads are real catchable Errors — an
+                // uninitialized typed static reports 'must not be
+                // accessed', not a silent NULL.
+                self.static_prop_read(class, name)?
             }
             _ => {
                 return self.fail(PhpError::fatal(
