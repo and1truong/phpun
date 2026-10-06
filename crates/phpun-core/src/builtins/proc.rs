@@ -45,6 +45,36 @@ fn trunc_nul(b: &[u8]) -> &[u8] {
     }
 }
 
+/// execvp-style argv[0] resolution in the CALLER's PATH — zend
+/// resolves the program in the parent before the child's $env is
+/// installed, so an $env without PATH (or empty) can't break the
+/// lookup. Falls back to the literal name when nothing resolves.
+fn resolve_argv0(prog: &[u8]) -> Vec<u8> {
+    if prog.contains(&b'/') {
+        return prog.to_vec();
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return prog.to_vec();
+    };
+    use std::os::unix::fs::PermissionsExt;
+    for dir in std::env::split_paths(&path) {
+        // Empty PATH entries mean the current directory (execvp).
+        let cand = if dir.as_os_str().is_empty() {
+            std::path::Path::new(".").join(to_os(prog))
+        } else {
+            dir.join(to_os(prog))
+        };
+        let ok = cand
+            .metadata()
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+        if ok {
+            return cand.into_os_string().as_bytes().to_vec();
+        }
+    }
+    prog.to_vec()
+}
+
 fn io_err_str(e: &std::io::Error) -> String {
     match e.raw_os_error() {
         Some(n) => unsafe {
@@ -478,7 +508,7 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
 
     let mut cmd = match &argv {
         Some(av) => {
-            let mut c = Command::new(to_os(trunc_nul(&av[0])));
+            let mut c = Command::new(to_os(&resolve_argv0(&av[0])));
             for a in &av[1..] {
                 c.arg(to_os(trunc_nul(a)));
             }
