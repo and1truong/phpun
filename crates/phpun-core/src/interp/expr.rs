@@ -531,6 +531,10 @@ impl<'a> Interp<'a> {
             }
             Expr::New { class, args } => {
                 let name = self.class_name_of(class)?;
+                // `new self`/`static`/`parent` outside class scope is the
+                // no-scope Error; `parent` inside a parentless class is
+                // the compile fatal (p10new vs oracle).
+                self.scope_kw_err(&name)?;
                 let params = self
                     .classes
                     .get(&name.to_lowercase())
@@ -1188,16 +1192,8 @@ impl<'a> Interp<'a> {
     }
 
     fn const_read(&mut self, name: &str) -> Result<Value, PhpError> {
-        match name {
-            "self" | "static" | "parent" => {
-                // Resolved as class names only in :: context; bare self is an error.
-                return self.fail(PhpError::fatal(
-                    format!("Cannot access \"{}\" when no class scope is active", name),
-                    0,
-                ));
-            }
-            _ => {}
-        }
+        // Bare `self`/`static`/`parent` outside `::` are just undefined
+        // constants ('Undefined constant "self"' — p15/v vs oracle).
         let key = name.trim_start_matches('\\');
         // Error names the ns-qualified candidate for an unqualified
         // const inside a namespace (namespaces/ns_041).

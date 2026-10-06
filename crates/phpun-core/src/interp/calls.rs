@@ -2942,7 +2942,7 @@ impl<'a> Interp<'a> {
         match lw.as_str() {
             "self" => match scope {
                 None => Err(SiteErr::Msg(
-                    "cannot access \"self\" when no class scope is active".to_string(),
+                    "Cannot access \"self\" when no class scope is active".to_string(),
                 )),
                 Some(s) => {
                     if emit_dep {
@@ -2957,7 +2957,7 @@ impl<'a> Interp<'a> {
             },
             "parent" => match scope {
                 None => Err(SiteErr::Msg(
-                    "cannot access \"parent\" when no class scope is active".to_string(),
+                    "Cannot access \"parent\" when no class scope is active".to_string(),
                 )),
                 Some(s) => match s
                     .decl
@@ -2965,10 +2965,13 @@ impl<'a> Interp<'a> {
                     .as_deref()
                     .and_then(|p| self.classes.get(&p.to_lowercase()).cloned())
                 {
-                    None => Err(SiteErr::Msg(
-                        "cannot access \"parent\" when current class scope has no parent"
-                            .to_string(),
-                    )),
+                    // A class without parent — zend's uncatchable
+                    // 'Cannot use "parent" when current class scope
+                    // has no parent' (p15/y), not a thrown Error.
+                    None => Err(SiteErr::Thrown(PhpError::compile_fatal(
+                        "Cannot use \"parent\" when current class scope has no parent",
+                        self.cur_line,
+                    ))),
                     Some(p) => {
                         if emit_dep {
                             let _ = self.deprecated("Use of \"parent\" in callables is deprecated");
@@ -2989,7 +2992,7 @@ impl<'a> Interp<'a> {
                     .or(scope);
                 match called {
                     None => Err(SiteErr::Msg(
-                        "cannot access \"static\" when no class scope is active".to_string(),
+                        "Cannot access \"static\" when no class scope is active".to_string(),
                     )),
                     Some(s) => {
                         if emit_dep {

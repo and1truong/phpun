@@ -584,8 +584,49 @@ impl<'a> Interp<'a> {
         out
     }
 
+    /// `self`/`static`/`parent` left as the literal keyword after scope
+    /// resolution — member-style access (`X::$p`, `new X`, `X::K`,
+    /// extends/catch) on an unresolved scope keyword throws the
+    /// catchable `Cannot access "X" when no class scope is active`;
+    /// `parent` inside a class without one is the compile fatal
+    /// 'Cannot use "parent" when current class scope has no parent'
+    /// (p15/probe10new vs oracle).
+    pub(in crate::interp) fn scope_kw_err(&mut self, name: &str) -> Result<(), PhpError> {
+        let lw = name.to_lowercase();
+        if !matches!(lw.as_str(), "self" | "static" | "parent") {
+            return Ok(());
+        }
+        let resolved = self.resolve_class_name(name);
+        if !resolved.eq_ignore_ascii_case(&lw) {
+            return Ok(());
+        }
+        if lw == "parent" && self.has_class_scope() {
+            return Err(PhpError::compile_fatal(
+                "Cannot use \"parent\" when current class scope has no parent",
+                self.cur_line,
+            ));
+        }
+        self.fail(PhpError::uncaught(
+            "Error",
+            format!("Cannot access \"{}\" when no class scope is active", lw),
+            0,
+        ))
+    }
+
+    /// Whether any class scope is live — an executing method frame or a
+    /// const-expression bound to a class.
+    fn has_class_scope(&self) -> bool {
+        (self.in_const_expr > 0 && self.const_self.is_some())
+            || self
+                .stack
+                .last()
+                .map(|f| f.scope_class.is_some())
+                .unwrap_or(false)
+    }
+
     pub(in crate::interp) fn class_of(&mut self, e: &Expr) -> Result<Rc<PhpClass>, PhpError> {
         let name = self.class_name_of(e)?;
+        self.scope_kw_err(&name)?;
         if !self.classes.contains_key(&name.to_lowercase()) {
             self.run_autoload(&name)?;
         }
@@ -605,6 +646,29 @@ impl<'a> Interp<'a> {
         name: &str,
     ) -> Result<Value, PhpError> {
         let cname = self.class_name_of(class)?;
+        if name == "class" {
+            // `X::class` on an unresolved scope keyword carries its own
+            // messages: 'Cannot use "X" in the global scope'; in a class
+            // without parent, `parent::class` is the no-parent compile
+            // fatal (p15/t).
+            match cname.to_lowercase().as_str() {
+                "parent" if self.has_class_scope() => {
+                    return Err(PhpError::compile_fatal(
+                        "Cannot use \"parent\" when current class scope has no parent",
+                        self.cur_line,
+                    ));
+                }
+                "self" | "static" | "parent" => {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Cannot use \"{}\" in the global scope", cname.to_lowercase()),
+                        0,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        self.scope_kw_err(&cname)?;
         self.class_const_named(&cname, name)
     }
 

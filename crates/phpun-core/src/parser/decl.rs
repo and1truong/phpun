@@ -321,6 +321,15 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn foreach_target(&mut self) -> Result<ForeachTarget, PhpError> {
+        self.foreach_target_in(false)
+    }
+
+    /// `in_list` marks destructuring elements (`as [$a, $b]` /
+    /// `as list($a, $b)`) — a `?->` chain there reports
+    /// 'Assignments can only happen to writable values' while the
+    /// direct target reports 'Can't use nullsafe operator in write
+    /// context' (p13 l6 vs fp2).
+    fn foreach_target_in(&mut self, in_list: bool) -> Result<ForeachTarget, PhpError> {
         if self.eat_op("&") {
             // `&$v`, `&$o->p`, `&$a[i]` — a write-context `new_variable`
             // chain (call roots and `?->` are compile fatals).
@@ -334,7 +343,7 @@ impl<'a> Parser<'a> {
                     items.push(None);
                     continue;
                 }
-                items.push(Some(self.foreach_target()?));
+                items.push(Some(self.foreach_target_in(true)?));
                 if !self.eat_op(",") {
                     break;
                 }
@@ -352,7 +361,7 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     continue;
                 }
-                items.push(Some(self.foreach_target()?));
+                items.push(Some(self.foreach_target_in(true)?));
                 if !self.eat_op(",") {
                     break;
                 }
@@ -362,17 +371,57 @@ impl<'a> Parser<'a> {
         }
         match self.next() {
             Some(Token::Variable(n)) => {
-                // Lvalue targets: `$b[0]`, `$o->p`, ...
+                // Lvalue targets: `$b[0]`, `$o->p`, `$o?->p` — dim and
+                // prop links like zend's `variable` write context
+                // (`foreach($a as $o->p)` is legal; `?->` is the
+                // write-context compile fatal).
                 let mut e = Expr::Var(n);
-                while self.at_op("[") {
-                    self.pos += 1;
-                    let i = if self.at_op("]") {
-                        None
+                loop {
+                    if self.at_op("[") {
+                        self.pos += 1;
+                        let i = if self.at_op("]") {
+                            None
+                        } else {
+                            Some(Box::new(self.expr()?))
+                        };
+                        self.expect_op("]")?;
+                        e = Expr::Index { e: Box::new(e), i };
+                    } else if self.at_op("->") || self.at_op("?->") {
+                        let nullsafe = self.at_op("?->");
+                        self.pos += 1;
+                        let name = match self.next() {
+                            Some(Token::Ident(m)) => PropName::Name(m),
+                            Some(Token::Op("{")) => {
+                                let inner = self.expr()?;
+                                self.expect_op("}")?;
+                                PropName::Expr(Box::new(inner))
+                            }
+                            Some(Token::Variable(v)) => PropName::Name(v),
+                            t => {
+                                return Err(PhpError::parse(
+                                    format!("syntax error, unexpected {}", desc_t(t.as_ref())),
+                                    self.line(),
+                                ));
+                            }
+                        };
+                        e = Expr::Prop {
+                            obj: Box::new(e),
+                            name,
+                            nullsafe,
+                        };
                     } else {
-                        Some(Box::new(self.expr()?))
-                    };
-                    self.expect_op("]")?;
-                    e = Expr::Index { e: Box::new(e), i };
+                        break;
+                    }
+                }
+                if Self::has_nullsafe(&e) {
+                    return Err(PhpError::compile_fatal(
+                        if in_list {
+                            "Assignments can only happen to writable values"
+                        } else {
+                            "Can't use nullsafe operator in write context"
+                        },
+                        self.line(),
+                    ));
                 }
                 if let Expr::Var(_) = e {
                     Ok(ForeachTarget::Var(match e {
