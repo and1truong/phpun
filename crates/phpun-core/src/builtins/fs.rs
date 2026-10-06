@@ -917,8 +917,7 @@ pub(crate) fn dispatch(
                     let wb = if ok {
                         0
                     } else {
-                        (unsafe { *libc::__errno_location() } == libc::EWOULDBLOCK)
-                            as i64
+                        (unsafe { *libc::__errno_location() } == libc::EWOULDBLOCK) as i64
                     };
                     (ok, wb)
                 }
@@ -1215,10 +1214,7 @@ pub(crate) fn dispatch(
                                 break;
                             }
                             StreamWrite::NotWritable => {
-                                it.notice_pub(&format!(
-                                    "{}(): Stream is not writable",
-                                    name
-                                ))?;
+                                it.notice_pub(&format!("{}(): Stream is not writable", name))?;
                                 ok = false;
                                 break;
                             }
@@ -1272,9 +1268,7 @@ pub(crate) fn dispatch(
                 };
                 match (as_int, &v) {
                     (Some(i), _) => {
-                        return Ok(Some(Value::Bool(
-                            unsafe { libc::isatty(i as i32) } == 1,
-                        )))
+                        return Ok(Some(Value::Bool(unsafe { libc::isatty(i as i32) } == 1)))
                     }
                     (_, Value::Resource(_)) => {}
                     (_, other) => {
@@ -1517,9 +1511,7 @@ pub(crate) fn dispatch(
                             base.push(("uri", Value::str(uri.clone())));
                             mk(base)
                         }
-                        PhpResource::Input {
-                            eof, uri, mode, ..
-                        } if is_data_uri(uri) => {
+                        PhpResource::Input { eof, uri, mode, .. } if is_data_uri(uri) => {
                             // zend's RFC2397 meta: like TEMP there is
                             // no timed_out/blocked/eof, but the header
                             // mediatype/base64 keys lead the array and
@@ -1575,8 +1567,12 @@ pub(crate) fn dispatch(
                             }
                             crate::value::PhpResource::Stdio { which, .. } => match which {
                                 0 => std::fs::metadata("/dev/stdin").ok().map(|m| stat_array(&m)),
-                                1 => std::fs::metadata("/dev/stdout").ok().map(|m| stat_array(&m)),
-                                2 => std::fs::metadata("/dev/stderr").ok().map(|m| stat_array(&m)),
+                                1 => std::fs::metadata("/dev/stdout")
+                                    .ok()
+                                    .map(|m| stat_array(&m)),
+                                2 => std::fs::metadata("/dev/stderr")
+                                    .ok()
+                                    .map(|m| stat_array(&m)),
                                 // php://output has no fd — fstat fails.
                                 _ => None,
                             },
@@ -1587,12 +1583,10 @@ pub(crate) fn dispatch(
                             crate::value::PhpResource::Mem {
                                 buf, spilled_fd, ..
                             } => Some(match spilled_fd {
-                                Some(fd) => std::fs::metadata(
-                                    format!("/proc/self/fd/{}", fd),
-                                )
-                                .ok()
-                                .map(|m| stat_array(&m))
-                                .unwrap_or_else(|| buf_stat_array(buf.len())),
+                                Some(fd) => std::fs::metadata(format!("/proc/self/fd/{}", fd))
+                                    .ok()
+                                    .map(|m| stat_array(&m))
+                                    .unwrap_or_else(|| buf_stat_array(buf.len())),
                                 None => buf_stat_array(buf.len()),
                             }),
                             crate::value::PhpResource::Input {
@@ -1601,12 +1595,10 @@ pub(crate) fn dispatch(
                                 spilled_fd,
                                 ..
                             } if is_data_uri(uri) => Some(match spilled_fd {
-                                Some(fd) => std::fs::metadata(
-                                    format!("/proc/self/fd/{}", fd),
-                                )
-                                .ok()
-                                .map(|m| stat_array(&m))
-                                .unwrap_or_else(|| buf_stat_array(body.len())),
+                                Some(fd) => std::fs::metadata(format!("/proc/self/fd/{}", fd))
+                                    .ok()
+                                    .map(|m| stat_array(&m))
+                                    .unwrap_or_else(|| buf_stat_array(body.len())),
                                 None => buf_stat_array(body.len()),
                             }),
                             // php://input is not stat-able in zend.
@@ -2036,9 +2028,7 @@ pub(in crate::builtins) fn write_resource(
                 }
                 // RFC2397 streams notice like a plain fd failing the
                 // writable check; php://input drops silently.
-                PhpResource::Input { uri, .. } if is_data_uri(uri) => {
-                    Ok(StreamWrite::NotWritable)
-                }
+                PhpResource::Input { uri, .. } if is_data_uri(uri) => Ok(StreamWrite::NotWritable),
                 PhpResource::Input { .. } => Ok(StreamWrite::Discarded),
                 _ => Err(PhpError::fatal("bad resource", 0)),
             }
@@ -2736,21 +2726,7 @@ fn stat_from_vals(vals: [i64; 13]) -> PhpArray {
 /// mode=0100666, nlink=1, uid=gid=0, rdev=-1, size=buffer length,
 /// atime=mtime=ctime=0, blksize=blocks=-1.
 fn buf_stat_array(len: usize) -> PhpArray {
-    stat_from_vals([
-        12,
-        0,
-        33206,
-        1,
-        0,
-        0,
-        -1,
-        len as i64,
-        0,
-        0,
-        0,
-        -1,
-        -1,
-    ])
+    stat_from_vals([12, 0, 33206, 1, 0, 0, -1, len as i64, 0, 0, 0, -1, -1])
 }
 
 /// stream_select(&$read, &$write, &$except, ?$seconds, ?$usec): libc
@@ -3199,9 +3175,7 @@ pub(in crate::builtins) fn stream_ops_label(res: &PhpResource) -> &'static str {
             }
         }
         PhpResource::Stdio { which, .. } if *which > 2 => "Output",
-        PhpResource::File { .. }
-        | PhpResource::Pipe { .. }
-        | PhpResource::Stdio { .. } => "STDIO",
+        PhpResource::File { .. } | PhpResource::Pipe { .. } | PhpResource::Stdio { .. } => "STDIO",
         other => other.type_name(),
     }
 }
@@ -3250,9 +3224,7 @@ fn existing_fd(res: &PhpResource) -> Option<std::os::unix::io::RawFd> {
     match res {
         PhpResource::File { file, .. } | PhpResource::Pipe { file, .. } => Some(file.as_raw_fd()),
         PhpResource::Stdio { which, .. } if *which <= 2 => Some(*which as i32),
-        PhpResource::Mem { spilled_fd, .. } | PhpResource::Input { spilled_fd, .. } => {
-            *spilled_fd
-        }
+        PhpResource::Mem { spilled_fd, .. } | PhpResource::Input { spilled_fd, .. } => *spilled_fd,
         _ => None,
     }
 }
