@@ -63,6 +63,39 @@ pub(crate) fn dispatch(
                         && (-9223372036854775808.0..9223372036854775808.0).contains(&f)
                 }
             };
+            // The result buffer is ~dec bytes (MAX_LENGTH_OF_LONG(32)
+            // + decimals + dec_point on the int path) — charge it
+            // against memory_limit before allocating so dec=INT_MAX
+            // fatals instead of OOMing (zend emalloc-check parity).
+            let want = 32i128 + dec.max(0) as i128 + dp.len() as i128;
+            let limit = it.ini_bytes("memory_limit");
+            if limit > 0 && (it.mem_used as i128) + want > limit as i128 {
+                it.mem_used = limit.max(0) as u64 + 1;
+                it.mem_exceeded = true;
+                let mut e = PhpError::fatal(
+                    format!(
+                        "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
+                        limit, want
+                    ),
+                    it.cur_line,
+                );
+                e.trace = Some(it.fatal_frames());
+                return Err(e);
+            }
+            if want > isize::MAX as i128 {
+                // Unlimited memory_limit: zend's emalloc fails inside
+                // malloc here (Rust would panic on capacity overflow).
+                it.mem_exceeded = true;
+                let mut e = PhpError::fatal(
+                    format!(
+                        "Out of memory (allocated {} bytes) (tried to allocate {} bytes)",
+                        it.mem_used, want
+                    ),
+                    it.cur_line,
+                );
+                e.trace = Some(it.fatal_frames());
+                return Err(e);
+            }
             Value::bytes(if is_long {
                 let n = match num {
                     Num::Int(i) => i,
