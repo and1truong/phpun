@@ -335,7 +335,20 @@ fn resource_child_fd(
     index: i64,
 ) -> Result<Option<RawFd>, PhpError> {
     let fd = match r {
-        PhpResource::File { file, .. } | PhpResource::Pipe { file, .. } => file.as_raw_fd(),
+        PhpResource::File { file, .. } => file.as_raw_fd(),
+        PhpResource::Pipe { file, rbuf, .. } => {
+            // zend's AS_FD cast skips the buffer sync on NO_SEEK
+            // streams: the pending read-buffer bytes stay put and the
+            // fd handed out simply misses them — the "data lost"
+            // warning reports that once per cast.
+            if !rbuf.is_empty() {
+                it.warn_pub(&format!(
+                    "proc_open(): {} bytes of buffered data lost during stream conversion!",
+                    rbuf.len()
+                ))?;
+            }
+            file.as_raw_fd()
+        }
         PhpResource::Stdio { which, .. } => {
             if *which > 2 {
                 // php://output has no descriptor to hand the child.
@@ -359,7 +372,14 @@ fn resource_child_fd(
         // descriptor. MEMORY and php://input are not castable.
         PhpResource::Mem { .. } | PhpResource::Input { .. } => {
             match crate::builtins::fs::spill_fd_for_stream(r) {
-                Some(fd) => fd,
+                Some(fd) => {
+                    // zend's non-FOR_SELECT cast syncs first: flush +
+                    // seek the fd to the stream's logical position +
+                    // drop the pending read buffer — the child gets the
+                    // descriptor where the stream claims to be.
+                    crate::builtins::fs::resync_spilled_fd(r, fd);
+                    fd
+                }
                 None => {
                     spec_err(
                         it,

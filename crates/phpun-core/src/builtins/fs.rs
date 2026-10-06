@@ -204,28 +204,34 @@ pub(crate) fn dispatch(
             Value::str(name)
         }
         "tmpfile" => {
-            let name = std::env::temp_dir().join(format!("phpun-{}", std::process::id()));
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&name)
-            {
-                Ok(f) => {
-                    let id = it.next_res_id();
-                    Value::Resource(Rc::new(RefCell::new(PhpResource::File {
-                        id,
-                        file: f,
-                        read: true,
-                        write: true,
-                        pos: 0,
-                        eof: false,
-                        path: name.display().to_string(),
-                        mode: "w+b".into(),
-                    })))
-                }
-                Err(_) => Value::Bool(false),
+            // zend's php_stream_fopen_tmpfile → php_open_temporary_fd
+            // (mkstemp "<tmpdir>/phpXXXXXX"): a real, unique, LINKED
+            // file — mode r+b — that the stream removes on close
+            // (PhpResource::Drop honors unlink_on_close).
+            let mut tmpl = std::env::temp_dir()
+                .join("phpXXXXXX\0")
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes();
+            let fd = unsafe { libc::mkstemp(tmpl.as_mut_ptr() as *mut libc::c_char) };
+            if fd < 0 {
+                Value::Bool(false)
+            } else {
+                use std::os::unix::io::FromRawFd;
+                let f = unsafe { std::fs::File::from_raw_fd(fd) };
+                let id = it.next_res_id();
+                let name = String::from_utf8_lossy(&tmpl[..tmpl.len() - 1]).into_owned();
+                Value::Resource(Rc::new(RefCell::new(PhpResource::File {
+                    id,
+                    file: f,
+                    read: true,
+                    write: true,
+                    pos: 0,
+                    eof: false,
+                    unlink_on_close: true,
+                    path: name,
+                    mode: "r+b".into(),
+                })))
             }
         }
         "sys_get_temp_dir" => Value::str(std::env::temp_dir().display().to_string()),
@@ -439,6 +445,7 @@ pub(crate) fn dispatch(
                                 write: spec.write,
                                 pos: 0,
                                 eof: false,
+                                unlink_on_close: false,
                                 path: path.clone(),
                                 mode: mode.clone(),
                             })))
@@ -2155,6 +2162,7 @@ pub(in crate::builtins) fn write_resource(
                     eof,
                     write,
                     spilled_fd,
+                    srbuf,
                     ..
                 } => {
                     // Once temp_cast spills the buffer the stream io
@@ -2162,6 +2170,11 @@ pub(in crate::builtins) fn write_resource(
                     // 'r'-mode php://temp (the write flag only gates
                     // the in-buffer op).
                     if let Some(fd) = *spilled_fd {
+                        // zend's buffered write discards the read buffer
+                        // and reseeks the fd to the logical position
+                        // first (streams.c:1194) — the kernel offset may
+                        // sit ahead of *pos by the buffered read-ahead.
+                        fd_resync(fd, *pos, srbuf);
                         return Ok(fd_stream_write(fd, pos, eof, data));
                     }
                     // TEMP_STREAM_READONLY → php_stream_memory_write
@@ -3372,7 +3385,20 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
                     // stream then keeps; a failed spill (or any other
                     // fd-less stream) warns its stream-type label.
                     other => match spill_fd_for_stream(other) {
-                        Some(fd) => Some(fd),
+                        Some(fd) => {
+                            // temp_cast delegates to the inner stream's
+                            // cast and drops the INTERNAL flag at that
+                            // boundary — a spilled stream with buffered
+                            // bytes warns "data lost" on EVERY cast,
+                            // even inside select (zend cast.c:325).
+                            let n = spilled_buffered(other);
+                            if n > 0 {
+                                it.warn_pub(&format!(
+                                    "{fname}(): {n} bytes of buffered data lost during stream conversion!"
+                                ))?;
+                            }
+                            Some(fd)
+                        }
                         None => {
                             let ty = stream_ops_label(other);
                             it.warn_pub(&format!(
@@ -3581,6 +3607,16 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
             }
         }
         for (k, v, fd) in s {
+            // from_fd_set re-casts every element — a spilled stream's
+            // inner delegation warns "data lost" a second time here.
+            if let Value::Resource(rv) = v {
+                let n = spilled_buffered(&rv.borrow());
+                if n > 0 {
+                    it.warn_pub(&format!(
+                        "{fname}(): {n} bytes of buffered data lost during stream conversion!"
+                    ))?;
+                }
+            }
             if unsafe { libc::FD_ISSET(*fd, &fds[i]) } {
                 ready.set(k.clone(), v.clone());
             }
@@ -3688,6 +3724,54 @@ pub(in crate::builtins) fn stream_ops_label(res: &PhpResource) -> &'static str {
         PhpResource::Stdio { which, .. } if *which > 2 => "Output",
         PhpResource::File { .. } | PhpResource::Pipe { .. } | PhpResource::Stdio { .. } => "STDIO",
         other => other.type_name(),
+    }
+}
+
+/// zend's non-FOR_SELECT buffer sync (cast.c: php_stream_flush +
+/// ops->seek(position) + readpos=writepos=0, and the same
+/// discard+reseek a buffered write does first, streams.c:1194):
+/// the fd's kernel offset is lseek(2)'d back to the stream's logical
+/// position and pending read-buffer bytes are dropped. FOR_SELECT
+/// casts must NOT do this — they keep the read buffer.
+pub(in crate::builtins) fn fd_resync(
+    fd: std::os::unix::io::RawFd,
+    pos: u64,
+    srbuf: &mut std::collections::VecDeque<u8>,
+) {
+    if srbuf.is_empty() {
+        return;
+    }
+    unsafe {
+        libc::lseek(fd, pos as libc::off_t, libc::SEEK_SET);
+    }
+    srbuf.clear();
+}
+
+/// The resync above, resolved against a spilled Mem/Input stream.
+pub(in crate::builtins) fn resync_spilled_fd(res: &mut PhpResource, fd: std::os::unix::io::RawFd) {
+    match res {
+        PhpResource::Mem { pos, srbuf, .. } | PhpResource::Input { pos, srbuf, .. } => {
+            fd_resync(fd, *pos, srbuf)
+        }
+        _ => {}
+    }
+}
+
+/// Bytes pending in a spilled stream's read buffer — what zend's
+/// "N bytes of buffered data lost during stream conversion!" counts.
+pub(in crate::builtins) fn spilled_buffered(res: &PhpResource) -> usize {
+    match res {
+        PhpResource::Mem {
+            spilled_fd: Some(_),
+            srbuf,
+            ..
+        }
+        | PhpResource::Input {
+            spilled_fd: Some(_),
+            srbuf,
+            ..
+        } => srbuf.len(),
+        _ => 0,
     }
 }
 

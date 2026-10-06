@@ -1787,6 +1787,9 @@ pub enum PhpResource {
         /// Byte position used for reads (we do our own buffering for fgets).
         pos: u64,
         eof: bool,
+        /// tmpfile() only — zend removes the temp file when the stream
+        /// closes (Drop unlinks `path`).
+        unlink_on_close: bool,
         /// Path and mode as given to fopen() — stream_get_meta_data().
         path: String,
         mode: String,
@@ -1952,6 +1955,15 @@ impl Drop for PhpResource {
                     libc::waitpid(*pid, &mut st, libc::WNOHANG);
                 }
             }
+        }
+        // tmpfile(): zend removes the temp file on stream close.
+        if let PhpResource::File {
+            unlink_on_close: true,
+            path,
+            ..
+        } = self
+        {
+            let _ = std::fs::remove_file(&*path);
         }
         let fd = match self {
             PhpResource::Mem { spilled_fd, .. } | PhpResource::Input { spilled_fd, .. } => {
