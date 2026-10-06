@@ -250,6 +250,7 @@ impl<'a> Interp<'a> {
             {
                 if let Expr::Int(n) = l.as_ref() {
                     self.cur_line = *n as usize;
+                    self.send_line = Some(*n as usize);
                 }
             }
             let a = Self::unmark_arg(a);
@@ -462,6 +463,7 @@ impl<'a> Interp<'a> {
         // frame's site (nested calls inside the args set their own),
         // and post-eval call diagnostics (arity, dispatch failures)
         // site at the call itself, zend's DO_FCALL line.
+        out.end_line = self.cur_line;
         self.cur_line = site.unwrap_or(saved_line);
         if let Some(s) = site {
             self.send_line = Some(s);
@@ -511,8 +513,10 @@ impl<'a> Interp<'a> {
                     } else if self.obj_is_a(&cur, "Iterator") {
                         break cur;
                     } else {
+                        // TypeError in Zend — an object argument is a
+                        // type violation, not an engine error.
                         return self.fail(PhpError::uncaught(
-                            "Error",
+                            "TypeError",
                             format!(
                                 "Only arrays and Traversables can be unpacked, {} given",
                                 cur.borrow().class.name()
@@ -547,7 +551,7 @@ impl<'a> Interp<'a> {
                 Ok(out)
             }
             _ => self.fail(PhpError::uncaught(
-                "Error",
+                "TypeError",
                 format!(
                     "Only arrays and Traversables can be unpacked, {} given",
                     self.zval_type_name(v)
@@ -1860,6 +1864,9 @@ impl<'a> Interp<'a> {
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null => {
                 Err(PhpError::fatal("Illegal function name", self.cur_line))
             }
+            Expr::Binary {
+                op: "argline", r, ..
+            } => self.const_scalar_callee(r, msg),
             _ => Err(PhpError::fatal(msg, self.cur_line)),
         }
     }
@@ -2065,6 +2072,10 @@ impl<'a> Interp<'a> {
         // Callee `Stmt::Line` markers must not leak into the caller:
         // diagnostics after the call report the call-site line.
         let saved_line = self.cur_line;
+        // The callee's argline markers overwrite `send_line`; after
+        // the call returns the enclosing op's own line is the pending
+        // site again — engine checks running post-call (getIterator
+        // validation, conversion warnings) site at the caller's line.
         // A callback invoked from inside a builtin's own machinery
         // (internal_cb: ob handlers, sort callbacks) has call site
         // `[internal function]`; engine callbacks like the error handler
@@ -2216,6 +2227,7 @@ impl<'a> Interp<'a> {
         self.last_call_by_ref = decl.by_ref;
         self.call_trace.pop();
         self.cur_line = saved_line;
+        self.send_line = Some(saved_line);
         // Zend decrefs the frame's CVs at unwind — a local object
         // whose last strong refs are that frame's cells runs its
         // __destruct now (bug52361). A dtor error on a clean return
@@ -4575,6 +4587,9 @@ fn zend_literal_no_frame(name: &str, args: &[Expr]) -> bool {
 /// runtime).
 fn const_str_fold(e: &Expr) -> Option<Vec<u8>> {
     match e {
+        Expr::Binary {
+            op: "argline", r, ..
+        } => const_str_fold(r),
         Expr::Str(s) => Some(s.as_bytes().to_vec()),
         Expr::Interp(parts) => {
             let mut v = Vec::new();

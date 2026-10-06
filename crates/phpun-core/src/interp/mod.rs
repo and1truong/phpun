@@ -87,6 +87,11 @@ pub struct CallArgs {
     /// references, so zend warns "must be passed by reference, value
     /// given" (closure_invoke_ref_warning).
     pub nonref_cells: Vec<usize>,
+    /// Diagnostic line of the last-evaluated argument — the deepest
+    /// line marker reached while building this list. Zend sites the
+    /// diagnostics of a compile-specialized literal call (sprintf rope)
+    /// at the line of its final operand, not the call's first token.
+    pub end_line: usize,
 }
 
 impl CallArgs {
@@ -96,6 +101,7 @@ impl CallArgs {
             named: Vec::new(),
             trav_cells: Vec::new(),
             nonref_cells: Vec::new(),
+            end_line: 0,
         }
     }
     pub fn empty() -> Self {
@@ -2596,6 +2602,7 @@ impl<'a> Interp<'a> {
                 return r;
             }
             let ca = CallArgs {
+                end_line: args.end_line,
                 cells: args.cells[1.min(args.cells.len())..].to_vec(),
                 named: args
                     .named
@@ -2755,12 +2762,26 @@ impl<'a> Interp<'a> {
             // Internal fns with a known signature get Zend's named-arg
             // resolution AND positional arity checks.
             Some(params) => {
-                self.internal_cb += 1;
+                let (save_l, save_s) = (self.cur_line, self.send_line);
+                if visible {
+                    self.internal_cb += 1;
+                } else {
+                    // A compile-specialized literal call (sprintf rope)
+                    // has no DO_FCALL of its own in Zend — the builtin
+                    // runs as inline ops of the caller, so conversions
+                    // and the callbacks they reach (__toString, thrown
+                    // errors) site at the last argument's line, never
+                    // `[internal function]`.
+                    self.cur_line = args.end_line;
+                    self.send_line = Some(args.end_line);
+                }
                 let r = match self.resolve_named_builtin(name, params, args) {
                     Ok(cells) => builtins::call(self, name, &cells),
                     Err(e) => Err(e),
                 };
-                self.internal_cb -= 1;
+                if visible {
+                    self.internal_cb -= 1;
+                }
                 // fail() captures call_trace — pop AFTER it so the
                 // builtin's own frame shows in the backtrace
                 // (`array_multisort(: 1)` in call_user_func_array_variadic).
@@ -2779,7 +2800,12 @@ impl<'a> Interp<'a> {
                     }
                 };
                 self.call_trace.pop();
-                self.emit_cmp_notices()?;
+                let n = self.emit_cmp_notices();
+                if !visible {
+                    self.cur_line = save_l;
+                    self.send_line = save_s;
+                }
+                n?;
                 r
             }
             // Internal fns without a signature accept no named args;
@@ -2796,15 +2822,28 @@ impl<'a> Interp<'a> {
                 r
             }
             None => {
-                self.internal_cb += 1;
+                let (save_l, save_s) = (self.cur_line, self.send_line);
+                if visible {
+                    self.internal_cb += 1;
+                } else {
+                    self.cur_line = args.end_line;
+                    self.send_line = Some(args.end_line);
+                }
                 let r = builtins::call(self, name, args);
-                self.internal_cb -= 1;
+                if visible {
+                    self.internal_cb -= 1;
+                }
                 let r = match r {
                     Ok(r) => Ok(r),
                     Err(e) => self.fail(e),
                 };
                 self.call_trace.pop();
-                self.emit_cmp_notices()?;
+                let n = self.emit_cmp_notices();
+                if !visible {
+                    self.cur_line = save_l;
+                    self.send_line = save_s;
+                }
+                n?;
                 r
             }
         }
