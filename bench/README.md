@@ -11,6 +11,23 @@ PHP=/path/to/php PHPUN=./target/release/phpun bench/run.sh [--save bench/RESULTS
 
 Defaults: `PHP=php`, `PHPUN=./target/release/phpun`, `TIMEOUT=300` (per run, seconds).
 
+### HTTP (concurrent server load)
+
+```sh
+PHP=/path/to/php PHPUN=./target/release/phpun REQ=400 CONC=8 WORKERS=8 \
+    bench/run-http.sh [--save bench/RESULTS.md]
+```
+
+Compares four server configs on `bench/http/app*.php` (same response body;
+the driver asserts a `bench-ok` marker): `php -S` single process,
+`php -S` with `PHP_CLI_SERVER_WORKERS`, `phpun serve` classic (fresh
+interp per request), and `phpun serve --workers N` (warm interpreter
+reused per request — the script returns a `fn(array $req)` handler,
+see `http/app-worker.php`). Load driver is `http/http-load.py` (python3
+stdlib threads; one connection per request, matching how these dev
+servers respond). `bench/http/` is intentionally outside `run.sh`'s
+`bench/[0-9]*.php` glob.
+
 ## How it works
 
 - Each `bench/*.php` script does a fixed workload and prints one deterministic
