@@ -16,6 +16,15 @@ impl<'a> Interp<'a> {
         errno: i64,
         msg: &str,
     ) -> Result<(), PhpError> {
+        // \u{1} in a compile-time diagnostic is the source file — the
+        // parser doesn't know it (`{closure:\u{1}:L}`).
+        let owned;
+        let msg = if msg.contains('\u{1}') {
+            owned = msg.replace('\u{1}', &self.diag_file());
+            owned.as_str()
+        } else {
+            msg
+        };
         if self.error_handler.is_some() && !self.in_handler {
             let h = self.error_handler.clone().unwrap();
             let args: Vec<Cell> = vec![

@@ -1423,11 +1423,14 @@ impl<'a> Interp<'a> {
             ));
         }
         let req = |ms: &MethodDecl| {
+            // Optional-before-required counts as required (zend's
+            // "implicitly required"), matching call-site arity.
             ms.decl
                 .params
                 .iter()
-                .filter(|p| p.default.is_none() && !p.variadic)
-                .count()
+                .rposition(|p| p.default.is_none() && !p.variadic)
+                .map(|i| i + 1)
+                .unwrap_or(0)
         };
         let (ir, ar) = (req(impl_m), req(abs_m));
         let count_ok = ir <= ar

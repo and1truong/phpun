@@ -4019,6 +4019,16 @@ impl<'a> Interp<'a> {
                 self.compare_op(op, l, r, &lv, &rv)
             }
             "named" => self.eval(r), // named-arg marker: value passthrough
+            // Call-site line marker on the last argument: the frame's
+            // site is the arg's own line (zend's SEND op line). Set
+            // AFTER evaluating so nested calls inside it can't clobber.
+            "argline" => {
+                let v = self.eval(r)?;
+                if let Expr::Int(n) = l {
+                    self.send_line = Some(*n as usize);
+                }
+                Ok(v)
+            }
             _ => {
                 let (lv, rv) = self.binary_operands(l, r)?;
                 self.arith(op, lv, rv)

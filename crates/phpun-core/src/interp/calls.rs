@@ -163,6 +163,17 @@ impl<'a> Interp<'a> {
         self.call_named(&fname, args)
     }
 
+    /// Sees through the parser's `argline` call-site marker (last arg)
+    /// to the arg expression itself.
+    pub(in crate::interp) fn unmark_arg(e: &Expr) -> &Expr {
+        match e {
+            Expr::Binary {
+                op: "argline", r, ..
+            } => r,
+            _ => e,
+        }
+    }
+
     /// Evaluate args into cells (by-ref params alias caller storage).
     /// `named` params collected as (name, cell) too.
     pub(in crate::interp) fn arg_cells(
@@ -178,6 +189,18 @@ impl<'a> Interp<'a> {
         let mut pos = 0usize;
         let mut seen_named = false;
         for a in args {
+            // The parser marks the LAST arg with its line — Zend
+            // attributes a frame's call-site to the last evaluated
+            // argument (multi-line calls).
+            if let Expr::Binary {
+                op: "argline", l, ..
+            } = a
+            {
+                if let Expr::Int(n) = l.as_ref() {
+                    self.send_line = Some(*n as usize);
+                }
+            }
+            let a = Self::unmark_arg(a);
             let (name, expr): (Option<String>, &Expr) = match a {
                 Expr::Binary {
                     op: "named", l, r, ..
@@ -601,7 +624,9 @@ impl<'a> Interp<'a> {
                 && matches!(lname.as_str(), "min" | "max")
                 && argvals.cells.len() == 2
                 && argvals.named.is_empty()
-                && !args.iter().any(|a| matches!(a, Expr::Unpack(_)))
+                && !args
+                    .iter()
+                    .any(|a| matches!(Self::unmark_arg(a), Expr::Unpack(_)))
                 && (fname.starts_with('\\') || (unqualified && self.caller_ns().is_empty()))
             {
                 let lhs = argvals.cells[0].borrow().clone();
@@ -639,7 +664,9 @@ impl<'a> Interp<'a> {
             // Zend can't specialize them — the frame is real.
             let literal = fname.starts_with('\\')
                 || (fname.starts_with('\u{1}') && self.caller_ns().is_empty());
-            let visible = args.iter().any(|a| matches!(a, Expr::Unpack(_)))
+            let visible = args
+                .iter()
+                .any(|a| matches!(Self::unmark_arg(a), Expr::Unpack(_)))
                 || !(literal && zend_literal_no_frame(&lname, args));
             if let Some(v) = self.call_builtin(&lname, &argvals, visible)? {
                 return Ok(v);
@@ -1983,7 +2010,7 @@ impl<'a> Interp<'a> {
                 .call_trace
                 .iter()
                 .rev()
-                .find(|f| f.visible && !crate::value::trace_frame_hidden(f))
+                .find(|f| !crate::value::trace_frame_hidden(f))
                 .map(|f| f.internal)
                 .unwrap_or(true);
         let (site_file, site_line) = if from_builtin {
@@ -2000,7 +2027,12 @@ impl<'a> Interp<'a> {
                 .map(|f| f.file.clone())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| self.cur_file.clone());
-            (sf, saved_line as u32)
+            (
+                sf,
+                self.send_line
+                    .map(|l| l as u32)
+                    .unwrap_or(saved_line as u32),
+            )
         };
         // Trace args are the send list normalized through the last
         // bound slot (unbound params render null; named args appear in
@@ -2020,6 +2052,16 @@ impl<'a> Interp<'a> {
                     last = i as i64;
                 }
             }
+            // Zend binds skipped interior slots to the param default —
+            // `f(a:5, c:7)` traces `f(5, 1, 7)` — except params the
+            // optional-before-required rule makes required, which stay
+            // NULL.
+            let req_arity = decl
+                .params
+                .iter()
+                .rposition(|p| p.default.is_none() && !p.variadic)
+                .map(|i| i + 1)
+                .unwrap_or(0);
             let mut t: Vec<Cell> = Vec::new();
             for (i, p) in decl.params.iter().enumerate() {
                 if p.variadic || i as i64 > last {
@@ -2035,7 +2077,17 @@ impl<'a> Interp<'a> {
                             .find(|(n, ..)| *n == p.name)
                             .map(|(_, c, ..)| c.clone())
                     })
-                    .unwrap_or_else(|| cell(Value::Null));
+                    .unwrap_or_else(|| {
+                        if i < req_arity {
+                            cell(Value::Null)
+                        } else {
+                            p.default
+                                .as_ref()
+                                .and_then(|d| self.eval_decl_const(d, &decl.file).ok())
+                                .map(cell)
+                                .unwrap_or_else(|| cell(Value::Null))
+                        }
+                    });
                 t.push(c);
             }
             if decl.params.iter().any(|p| p.variadic) {
@@ -3544,11 +3596,15 @@ impl<'a> Interp<'a> {
         args: CallArgs,
         _unused: Vec<Cell>,
     ) -> Result<Value, PhpError> {
+        // Required count runs to the last non-default param: an
+        // optional declared before a required is itself required
+        // (`opt($a = 1, $b)` needs 2 args — zend's "implicitly required").
         let required = decl
             .params
             .iter()
-            .filter(|p| p.default.is_none() && !p.variadic)
-            .count();
+            .rposition(|p| p.default.is_none() && !p.variadic)
+            .map(|i| i + 1)
+            .unwrap_or(0);
         // With named args, missing-required is reported per-param during
         // binding ("Argument #N ($x) not passed"); the count check below
         // is the positional-only form.
@@ -3883,7 +3939,11 @@ impl<'a> Interp<'a> {
                     } else {
                         binds.push((p.name.clone(), cell(v.borrow().clone())));
                     }
-                } else if let Some(d) = &p.default {
+                } else if let Some(d) = if i < required {
+                    None
+                } else {
+                    p.default.as_ref()
+                } {
                     // Default exprs are evaluated at call time; an error
                     // (e.g. an undefined constant) propagates as the
                     // call's failure (namespaces/ns_077) and attributes
@@ -4279,11 +4339,15 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        // Required count runs to the last non-default param: an
+        // optional declared before a required is itself required
+        // (`opt($a = 1, $b)` needs 2 args — zend's "implicitly required").
         let required = decl
             .params
             .iter()
-            .filter(|p| p.default.is_none() && !p.variadic)
-            .count();
+            .rposition(|p| p.default.is_none() && !p.variadic)
+            .map(|i| i + 1)
+            .unwrap_or(0);
         if args.named.is_empty() && args.len() < required {
             return self.fail(PhpError::uncaught(
                 "ArgumentCountError",
@@ -4410,10 +4474,10 @@ fn zend_literal_no_frame(name: &str, args: &[Expr]) -> bool {
     }
     // Named args make it a dynamic arg-bind (sprintf's '*' variadic
     // rejects them anyway) — Zend emits a real call, not a rope.
-    if args
-        .iter()
-        .any(|a| matches!(a, Expr::Binary { op: "named", .. }))
-    {
+    if args.iter().any(|a| {
+        matches!(a, Expr::Binary { op: "named", .. })
+            || matches!(Interp::unmark_arg(a), Expr::Binary { op: "named", .. })
+    }) {
         return false;
     }
     // Compile-time-constant format — a quoted literal is `Expr::Str`,

@@ -358,6 +358,12 @@ pub struct Interp<'a> {
     in_handler: bool,
     /// Current line estimate for error messages (best-effort).
     pub cur_line: usize,
+    /// Line of the most recently evaluated call argument — Zend
+    /// attributes a pushed frame's call site to the line of its last
+    /// SEND op, not the call's first token (`f(\n g()\n)` sites at
+    /// the arg line). Set by the parser's `argline` arg wrapper and
+    /// cleared at each `Stmt::Line`.
+    pub(in crate::interp) send_line: Option<usize>,
     /// Active generator body's yield collector — `Expr::Yield` pushes
     /// (key, value) here while a generator function's body runs.
     gen_sink: Option<Rc<RefCell<Vec<crate::value::GenItem>>>>,
@@ -863,6 +869,7 @@ impl<'a> Interp<'a> {
             exception_handler: None,
             in_handler: false,
             cur_line: 1,
+            send_line: None,
             gen_sink: None,
             pending_gen_captures: Vec::new(),
             gen_sends: std::collections::VecDeque::new(),
@@ -2505,7 +2512,12 @@ impl<'a> Interp<'a> {
         let (site_file, site_line) = if from_builtin {
             ("[internal function]".to_string(), 0)
         } else {
-            (self.diag_file(), self.cur_line as u32)
+            (
+                self.diag_file(),
+                self.send_line
+                    .map(|l| l as u32)
+                    .unwrap_or(self.cur_line as u32),
+            )
         };
         // Trace frame args mirror Zend's bound param array: named args
         // that resolve to a declared fixed param merge into that
@@ -3027,9 +3039,12 @@ impl<'a> Interp<'a> {
             .iter()
             .take_while(|(_, d)| !matches!(d, BDef::Var))
             .count();
+        // `required` counts OptReq params too: arginfo declares them
+        // required (reflection/named-arg checks) even though ZPP accepts
+        // the call without them (rand/mt_rand).
         let required = params[..n_fixed]
             .iter()
-            .filter(|(_, d)| matches!(d, BDef::Req))
+            .filter(|(_, d)| matches!(d, BDef::Req | BDef::OptReq))
             .count();
         // Positional arity errors use Zend's internal-function wording:
         // "expects exactly" when all fixed params are required, else
@@ -3148,7 +3163,7 @@ impl<'a> Interp<'a> {
                     }
                     return Err(arity_err(given, false));
                 }
-                None if matches!(params[i].1, BDef::Unk) && i < last_bound => {
+                None if matches!(params[i].1, BDef::Unk | BDef::OptReq) && i < last_bound => {
                     return Err(PhpError::uncaught(
                         "ArgumentCountError",
                         format!(
@@ -3159,6 +3174,15 @@ impl<'a> Interp<'a> {
                         ),
                         0,
                     ));
+                }
+                // OptReq params accept nothing-or-all: a tail gap when
+                // args were given is the arginfo arity error
+                // (`rand(1)`/`rand(min: 1)` => "expects exactly 2, 1
+                // given"); `rand()` binds no slot at all.
+                None if matches!(params[i].1, BDef::OptReq)
+                    && (args.cells.len() + args.named.len()) > 0 =>
+                {
+                    return Err(arity_err(given, false));
                 }
                 None if i < last_bound => out.push(cell(params[i].1.val())),
                 None => break,
