@@ -1550,6 +1550,56 @@ impl<'a> Interp<'a> {
         } else {
             Value::Null
         };
+        // A compound op gates on the target container BEFORE the
+        // operator evaluates — `$s[k] += v` throws the string-offset
+        // gate (or the offset TypeError) rather than an operand error
+        // on the fetched Null, and scalars/plain objects name their
+        // 'Cannot use ... as array' Error ahead of the arith (p12h/p12k).
+        if needs_read && op != "??=" {
+            match &late {
+                Late::Index { base, key, append } => {
+                    // `[]` keeps its own gate: '[] operator not
+                    // supported for strings' outranks the assign-op
+                    // offset check (probe8).
+                    if *append && matches!(&*base.borrow(), Value::Str(_)) {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            "[] operator not supported for strings",
+                            self.cur_line,
+                        ));
+                    }
+                    self.compound_dim_gate(base, key)?
+                }
+                Late::Keyed { base, keys } => {
+                    let mut c = base.clone();
+                    for k in keys {
+                        if k.is_none() && matches!(&*c.borrow(), Value::Str(_)) {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                "[] operator not supported for strings",
+                                self.cur_line,
+                            ));
+                        }
+                        self.compound_dim_gate(&c, k)?;
+                        let nxt = {
+                            let b = c.borrow();
+                            match &*b {
+                                Value::Array(rc) => k
+                                    .as_ref()
+                                    .map(|kc| to_key(&kc.borrow()))
+                                    .and_then(|ak| rc.borrow().get_cell(&ak)),
+                                _ => None,
+                            }
+                        };
+                        match nxt {
+                            Some(nc) => c = nc,
+                            None => break,
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         let newv = match op {
             "=" => rhs,
             "+=" => self.arith("+", cur, rhs)?,
@@ -1850,14 +1900,36 @@ impl<'a> Interp<'a> {
                                 None => {
                                     ("Error", "[] operator not supported for strings".to_string())
                                 }
-                                Some(k) if matches!(to_key(k), ArrKey::Str(_)) => (
-                                    "TypeError",
-                                    "Cannot access offset of type string on string".to_string(),
-                                ),
-                                _ => (
-                                    "Error",
-                                    "Cannot create references to/from string offsets".to_string(),
-                                ),
+                                Some(k) => match k {
+                                    Value::Str(ks) => match Self::str_off_key(ks) {
+                                        StrOffKey::Bad => (
+                                            "TypeError",
+                                            "Cannot access offset of type string on string"
+                                                .to_string(),
+                                        ),
+                                        StrOffKey::Junk(_) => {
+                                            self.warn(&format!(
+                                                "Illegal string offset \"{}\"",
+                                                crate::value::lossy(ks)
+                                            ))?;
+                                            (
+                                                "Error",
+                                                "Cannot create references to/from string offsets"
+                                                    .to_string(),
+                                            )
+                                        }
+                                        StrOffKey::Int(_) => (
+                                            "Error",
+                                            "Cannot create references to/from string offsets"
+                                                .to_string(),
+                                        ),
+                                    },
+                                    _ => (
+                                        "Error",
+                                        "Cannot create references to/from string offsets"
+                                            .to_string(),
+                                    ),
+                                },
                             },
                             Value::Callable(_) => (
                                 "Error",
@@ -2776,15 +2848,29 @@ impl<'a> Interp<'a> {
                                 self.cur_line,
                             ));
                         }
-                        // A non-numeric string key on a string is a
-                        // TypeError, not a byte write (probe4d).
+                        // String-offset writes split like reads: a key
+                        // whose leading int resolves (`'0idx'`) warns
+                        // 'Illegal string offset' and writes at that
+                        // index; keys with no leading int are the
+                        // TypeError (probe4d, bug19943).
                         if let Some(kc) = k.as_ref() {
-                            if matches!(to_key(&kc.borrow()), ArrKey::Str(_)) {
-                                return self.fail(PhpError::uncaught(
-                                    "TypeError",
-                                    "Cannot access offset of type string on string",
-                                    self.cur_line,
-                                ));
+                            if let Value::Str(ks) = &*kc.borrow() {
+                                match Self::str_off_key(ks) {
+                                    StrOffKey::Bad => {
+                                        return self.fail(PhpError::uncaught(
+                                            "TypeError",
+                                            "Cannot access offset of type string on string",
+                                            self.cur_line,
+                                        ));
+                                    }
+                                    StrOffKey::Junk(_) => {
+                                        self.warn(&format!(
+                                            "Illegal string offset \"{}\"",
+                                            crate::value::lossy(ks)
+                                        ))?;
+                                    }
+                                    StrOffKey::Int(_) => {}
+                                }
                             }
                         }
                         // String offset write (final level only).
@@ -2883,13 +2969,13 @@ impl<'a> Interp<'a> {
             return self.fail(PhpError::uncaught("Error", msg, self.cur_line));
         }
         if matches!(&*c.borrow(), Value::Str(_)) {
-            // Non-numeric string keys (and the always-illegal kinds)
-            // name the offset TypeError; numeric strings coerce to int
-            // offsets and hit the op gate like ints (`$s['x']` vs
-            // `$s['5']`).
+            // Non-numeric keys (and the always-illegal kinds) name the
+            // offset TypeError; keys that resolve to an index — ints,
+            // numeric strings, leading-junk like `'0idx'` (the read
+            // already warned) — hit the op gate like ints (bug19943).
             let kt = k.as_ref().and_then(|kv| match &*kv.borrow() {
-                Value::Str(_) => match to_key(&kv.borrow()) {
-                    ArrKey::Str(_) => Some("string".to_string()),
+                Value::Str(ks) => match Self::str_off_key(ks) {
+                    StrOffKey::Bad => Some("string".to_string()),
                     _ => None,
                 },
                 v => Self::illegal_offset_ty(v),
@@ -2937,11 +3023,12 @@ impl<'a> Interp<'a> {
         keys: &[Option<Cell>],
         quiet: bool,
     ) -> Result<Value, PhpError> {
-        for k in keys {
+        for (n, k) in keys.iter().enumerate() {
             enum Step {
                 Cell(Cell),
                 Missing,
                 Stop,
+                Done(Value),
             }
             // The fetch-for-write auto-vivifies a null container BEFORE
             // the key is read — an aliased key (`$v[$v]`) then reports
@@ -2990,6 +3077,40 @@ impl<'a> Interp<'a> {
                                     .map(|kc| to_key(&kc.borrow()))
                                     .filter(|k| !matches!(k, ArrKey::Tomb)),
                             )
+                        }
+                    }
+                    Value::Str(s) => {
+                        // String offsets fetch during compound writes
+                        // too: leading-junk keys warn 'Illegal string
+                        // offset' and read the resolved index — the op
+                        // gate then throws, or `??=`'s isset check sees
+                        // the byte and skips the write (bug19943, p12j).
+                        let s = s.clone();
+                        let kv = k.as_ref().map(|kc| kc.borrow().clone());
+                        let (idx, junk) = match &kv {
+                            Some(Value::Str(ks)) => match Self::str_off_key(ks) {
+                                StrOffKey::Int(i) => (Some(i), None),
+                                StrOffKey::Junk(i) => (Some(i), Some(crate::value::lossy(ks))),
+                                StrOffKey::Bad => (None, None),
+                            },
+                            Some(Value::Int(i)) => (Some(*i), None),
+                            _ => (None, None),
+                        };
+                        if let Some(jn) = junk {
+                            self.warn(&format!("Illegal string offset \"{}\"", jn))?;
+                        }
+                        match (n + 1 == keys.len(), idx) {
+                            (true, Some(i)) => {
+                                let bytes: &[u8] = &s[..];
+                                let i = if i < 0 { i + bytes.len() as i64 } else { i };
+                                let v = if i >= 0 && (i as usize) < bytes.len() {
+                                    Value::bytes(bytes[i as usize..i as usize + 1].to_vec())
+                                } else {
+                                    Value::Null
+                                };
+                                (Step::Done(v), None)
+                            }
+                            _ => (Step::Stop, None),
                         }
                     }
                     Value::Object(o) if self.obj_is_a(o, "ArrayAccess") => {
@@ -3045,6 +3166,7 @@ impl<'a> Interp<'a> {
                     c = cell(Value::Null);
                 }
                 Step::Stop => return Ok(Value::Null),
+                Step::Done(v) => return Ok(v),
             }
         }
         Ok(c.borrow().clone())
@@ -3094,6 +3216,25 @@ impl<'a> Interp<'a> {
             Value::Object(o) => Some(o.borrow().class.name().to_string()),
             Value::Callable(_) => Some("Closure".to_string()),
             _ => None,
+        }
+    }
+
+    /// A string-offset key classifies like zend's offset reads: a full
+    /// int indexes cleanly, leading-numeric junk (`'0idx'`) warns
+    /// 'Illegal string offset' and still indexes, and anything else is
+    /// the illegal-offset TypeError (bug19943).
+    fn str_off_key(b: &[u8]) -> StrOffKey {
+        let mut i = usize::from(b.first() == Some(&b'-'));
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == b.len() && i > start {
+            StrOffKey::Int(crate::value::lossy(b).parse().unwrap_or(0))
+        } else if i > start && matches!(numeric(b), Numeric::Leading(_, _)) {
+            StrOffKey::Junk(crate::value::lossy(&b[..i]).parse().unwrap_or(0))
+        } else {
+            StrOffKey::Bad
         }
     }
 
@@ -3400,14 +3541,33 @@ impl<'a> Interp<'a> {
                 Value::Str(_) if self.dim_by_ref => {
                     let (class, msg) = match &key {
                         None => ("Error", "[] operator not supported for strings".to_string()),
-                        Some(k) if matches!(to_key(k), ArrKey::Str(_)) => (
-                            "TypeError",
-                            "Cannot access offset of type string on string".to_string(),
-                        ),
-                        _ => (
-                            "Error",
-                            "Cannot create references to/from string offsets".to_string(),
-                        ),
+                        Some(k) => match k {
+                            Value::Str(ks) => match Self::str_off_key(ks) {
+                                StrOffKey::Bad => (
+                                    "TypeError",
+                                    "Cannot access offset of type string on string".to_string(),
+                                ),
+                                StrOffKey::Junk(_) => {
+                                    self.warn(&format!(
+                                        "Illegal string offset \"{}\"",
+                                        crate::value::lossy(ks)
+                                    ))?;
+                                    (
+                                        "Error",
+                                        "Cannot create references to/from string offsets"
+                                            .to_string(),
+                                    )
+                                }
+                                StrOffKey::Int(_) => (
+                                    "Error",
+                                    "Cannot create references to/from string offsets".to_string(),
+                                ),
+                            },
+                            _ => (
+                                "Error",
+                                "Cannot create references to/from string offsets".to_string(),
+                            ),
+                        },
                     };
                     self.fail(PhpError::uncaught(class, msg, self.cur_line))
                 }
@@ -5213,6 +5373,15 @@ impl<'a> Interp<'a> {
             },
         })
     }
+}
+
+/// String-offset key classes (zend `zend_check_string_offset`): a clean
+/// int, a leading-int-with-junk that warns and still indexes, or an
+/// illegal key.
+enum StrOffKey {
+    Int(i64),
+    Junk(i64),
+    Bad,
 }
 
 enum Num {
