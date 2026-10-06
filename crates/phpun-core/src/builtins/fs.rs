@@ -507,7 +507,16 @@ pub(crate) fn dispatch(
             if let Some(c) = args.first() {
                 if let Value::Resource(r) = &*c.borrow() {
                     match &mut *r.borrow_mut() {
-                        PhpResource::File { pos, eof, .. } | PhpResource::Mem { pos, eof, .. } => {
+                        PhpResource::File { file, pos, eof, .. } => {
+                            use std::io::Seek;
+                            *pos = arg(args, 1).to_int().max(0) as u64;
+                            *eof = false;
+                            // Keep the real fd offset in step so the fd
+                            // can be handed to a child (proc_open
+                            // descriptorspec) at the tracked position.
+                            let _ = file.seek(std::io::SeekFrom::Start(*pos));
+                        }
+                        PhpResource::Mem { pos, eof, .. } => {
                             *pos = arg(args, 1).to_int().max(0) as u64;
                             *eof = false;
                         }
@@ -542,7 +551,13 @@ pub(crate) fn dispatch(
             if let Some(c) = args.first() {
                 if let Value::Resource(r) = &*c.borrow() {
                     match &mut *r.borrow_mut() {
-                        PhpResource::File { pos, eof, .. } | PhpResource::Mem { pos, eof, .. } => {
+                        PhpResource::File { file, pos, eof, .. } => {
+                            use std::io::Seek;
+                            *pos = 0;
+                            *eof = false;
+                            let _ = file.seek(std::io::SeekFrom::Start(0));
+                        }
+                        PhpResource::Mem { pos, eof, .. } => {
                             *pos = 0;
                             *eof = false;
                         }
