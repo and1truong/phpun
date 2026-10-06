@@ -1702,8 +1702,15 @@ pub struct GenState {
     pub sends: Vec<Value>,
     /// Output produced after a yield suspends mid-expression — Zend
     /// defers it to resume; buffered per yield index and emitted when
-    /// the consumer advances `pos` past it (closure_call_leak).
-    pub pending_out: Vec<(usize, Vec<u8>)>,
+    /// the consumer advances `pos` past it (closure_call_leak). The
+    /// bool marks stderr-diag bytes so `PHP Fatal error:`/`PHP Warning:`
+    /// lines defer in the same emission order as stdout's.
+    pub pending_out: Vec<(usize, Vec<u8>, bool)>,
+    /// The body's terminal error, held until the consumer's next
+    /// resume past the last collected item — Zend's lazy body dies
+    /// inside `Generator->next()`/friends, after the bytes the
+    /// consumer already echoed between yields.
+    pub deferred_err: Option<crate::error::PhpError>,
 }
 
 pub enum GenSetup {

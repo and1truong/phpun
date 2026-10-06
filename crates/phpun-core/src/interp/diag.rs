@@ -96,6 +96,22 @@ impl<'a> Interp<'a> {
     /// Route a diagnostic to stderr — streamed in live_io mode so it
     /// interleaves with stdout like real PHP, captured otherwise.
     pub fn diag_stderr(&mut self, s: &str) {
+        // Inside a generator run, stderr diag bytes defer with
+        // stdout's — Zend emits both at the resume that produced
+        // them, so they must not overtake consumer output.
+        if let Some(run) = &self.gen_run_state {
+            let done = self
+                .gen_sink
+                .as_ref()
+                .map(|s| s.borrow().len())
+                .unwrap_or(0);
+            if done > 0 {
+                run.borrow_mut()
+                    .pending_out
+                    .push((done - 1, s.as_bytes().to_vec(), true));
+                return;
+            }
+        }
         if self.live_io {
             eprint!("{}", s);
         } else {

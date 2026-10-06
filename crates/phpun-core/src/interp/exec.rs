@@ -1295,6 +1295,16 @@ impl<'a> Interp<'a> {
         f
     }
 
+    /// An iterator-method call driven by foreach itself — marked so
+    /// diagnostics raised inside attribute the gen body's original
+    /// call frame, not a userland `Generator->next()` resume stack.
+    fn iter_call(&mut self, it: &Rc<RefCell<PhpObject>>, name: &str) -> Result<Value, PhpError> {
+        self.iter_calls += 1;
+        let r = self.method_invoke(it.clone(), name, CallArgs::empty());
+        self.iter_calls -= 1;
+        r
+    }
+
     fn exec_foreach_iter_loop(
         &mut self,
         it: Rc<RefCell<PhpObject>>,
@@ -1302,25 +1312,27 @@ impl<'a> Interp<'a> {
         val: &ForeachTarget,
         body: &[Stmt],
     ) -> Flow {
-        if let Err(e) = self.method_invoke(it.clone(), "rewind", CallArgs::empty()) {
+        if let Err(e) = self.iter_call(&it, "rewind") {
             return self.err_flow(e);
         }
         loop {
-            let ok = self
-                .method_invoke(it.clone(), "valid", CallArgs::empty())
-                .map(|v| v.is_truthy())
-                .unwrap_or(false);
+            let ok = match self.iter_call(&it, "valid") {
+                Ok(v) => v.is_truthy(),
+                Err(e) => return self.err_flow(e),
+            };
             if !ok {
                 break;
             }
             // PHP calls current() before key() on each iteration.
-            let v = self
-                .method_invoke(it.clone(), "current", CallArgs::empty())
-                .unwrap_or(Value::Null);
+            let v = match self.iter_call(&it, "current") {
+                Ok(v) => v,
+                Err(e) => return self.err_flow(e),
+            };
             if let Some(ForeachKey::Var(kn)) = key {
-                let k = self
-                    .method_invoke(it.clone(), "key", CallArgs::empty())
-                    .unwrap_or(Value::Null);
+                let k = match self.iter_call(&it, "key") {
+                    Ok(k) => k,
+                    Err(e) => return self.err_flow(e),
+                };
                 self.var_set(kn, k);
             }
             match val {
@@ -1370,7 +1382,7 @@ impl<'a> Interp<'a> {
                 Flow::Normal => {}
                 f => return f,
             }
-            if let Err(e) = self.method_invoke(it.clone(), "next", CallArgs::empty()) {
+            if let Err(e) = self.iter_call(&it, "next") {
                 return self.err_flow(e);
             }
         }

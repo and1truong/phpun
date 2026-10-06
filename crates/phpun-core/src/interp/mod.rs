@@ -374,6 +374,12 @@ pub struct Interp<'a> {
     /// and buffered on the GenState until the consumer resumes past
     /// it (closure_call_leak_with_exception).
     gen_run_state: Option<Rc<RefCell<crate::value::GenState>>>,
+    /// Nonzero while a method call is driven by foreach's internal
+    /// iteration — a deferred gen-body death raised under it keeps
+    /// the body's original call-frame trace (`FILE(n): g()`), while a
+    /// userland `Generator->next()`-style resume renders the engine's
+    /// internal resume stack instead.
+    iter_calls: u32,
     /// Declaring class of the method about to be invoked (set by
     /// invoke_method, consumed by invoke_fn to fill Frame::decl_class).
     pending_decl_class: Option<Rc<PhpClass>>,
@@ -871,6 +877,7 @@ impl<'a> Interp<'a> {
             gen_sends: std::collections::VecDeque::new(),
             gen_auto: 0,
             gen_run_state: None,
+            iter_calls: 0,
             pending_decl_class: None,
             pending_called_class: None,
             pending_hook_prop: None,
@@ -1434,7 +1441,8 @@ impl<'a> Interp<'a> {
                         *m = Rc::new(mm);
                     }
                     if self.register_class(Rc::new(d)).is_ok() {
-                        self.early_bound_classes.insert(key, (self.cur_unit_id, site));
+                        self.early_bound_classes
+                            .insert(key, (self.cur_unit_id, site));
                     }
                 }
                 _ => {}
@@ -2358,7 +2366,9 @@ impl<'a> Interp<'a> {
                 .map(|s| s.borrow().len())
                 .unwrap_or(0);
             if done > 0 {
-                run.borrow_mut().pending_out.push((done - 1, b.to_vec()));
+                run.borrow_mut()
+                    .pending_out
+                    .push((done - 1, b.to_vec(), false));
                 return;
             }
         }
@@ -2383,14 +2393,18 @@ impl<'a> Interp<'a> {
             let split = st
                 .pending_out
                 .iter()
-                .position(|(t, _)| *t >= pos)
+                .position(|(t, ..)| *t >= pos)
                 .unwrap_or(st.pending_out.len());
             let mut rest = st.pending_out.split_off(split);
             std::mem::swap(&mut st.pending_out, &mut rest);
             rest
         };
-        for (_, b) in ready {
-            self.emit_bytes(&b);
+        for (_, b, is_err) in ready {
+            if is_err {
+                self.diag_stderr(&String::from_utf8_lossy(&b));
+            } else {
+                self.emit_bytes(&b);
+            }
         }
     }
 
