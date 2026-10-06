@@ -1411,13 +1411,17 @@ impl<'a> Interp<'a> {
         }
         if let Err(e) = Self::const_closure_gate(stmts).and_then(|_| self.hoist_funcs(stmts)) {
             let flow = self.err_flow(e);
-            let result = self.finish(flow);
-            self.run_shutdown();
+            let mut result = self.finish(flow);
+            if let Some(c) = self.run_shutdown() {
+                result.exit_code = c;
+            }
             return result;
         }
         let flow = self.exec_block(stmts);
-        let result = self.finish(flow);
-        self.run_shutdown();
+        let mut result = self.finish(flow);
+        if let Some(c) = self.run_shutdown() {
+            result.exit_code = c;
+        }
         result
     }
 
@@ -1466,6 +1470,7 @@ impl<'a> Interp<'a> {
                     "'break' not in the 'loop' or 'switch' context",
                     self.cur_line,
                 );
+                self.last_err_file = self.diag_file();
                 self.print_fatal(&e);
                 RunResult {
                     exit_code: 255,
@@ -1477,6 +1482,7 @@ impl<'a> Interp<'a> {
                     "'continue' not in the 'loop' or 'switch' context",
                     self.cur_line,
                 );
+                self.last_err_file = self.diag_file();
                 self.print_fatal(&e);
                 RunResult {
                     exit_code: 255,
@@ -1488,6 +1494,7 @@ impl<'a> Interp<'a> {
                     format!("'goto' to undefined label '{}'", l),
                     self.cur_line,
                 );
+                self.last_err_file = self.diag_file();
                 self.print_fatal(&e);
                 RunResult {
                     exit_code: 255,
@@ -1497,10 +1504,27 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn run_shutdown(&mut self) {
+    /// Run registered shutdown functions then the deferred __destruct
+    /// sweep. A shutdown function that exits or dies stops the rest,
+    /// but destructors still run (Zend); the produced exit code —
+    /// `exit(N)`'s N or 255 for a fatal — is returned so the caller can
+    /// override the script's exit code (a shutdown `exit` rewrites even
+    /// a main-path fatal's code).
+    fn run_shutdown(&mut self) -> Option<i32> {
         let fns = std::mem::take(&mut self.shutdown_fns);
+        let mut shutdown_code = None;
         for (f, args) in fns {
-            let _ = self.call_value(&f, CallArgs::positional(args));
+            if let Err(e) = self.call_value(&f, CallArgs::positional(args)) {
+                shutdown_code = Some(match self.err_flow(e) {
+                    Flow::Exit(c) => c,
+                    Flow::Throw(v) => {
+                        self.uncaught(&v);
+                        255
+                    }
+                    _ => 255,
+                });
+                break;
+            }
         }
         // Zend calls __destruct on live objects after shutdown functions
         // and before output buffers flush — destructors still see their
@@ -1567,6 +1591,7 @@ impl<'a> Interp<'a> {
         if !self.mem_exceeded {
             self.flush_ob_all();
         }
+        shutdown_code
     }
 
     /// Free the expression statement's temporaries: an object with no
@@ -1819,8 +1844,10 @@ impl<'a> Interp<'a> {
                     Self::const_closure_gate(&stmts).and_then(|_| self.hoist_funcs(&stmts))
                 {
                     let flow = self.err_flow(e);
-                    let res = self.finish(flow);
-                    self.run_shutdown();
+                    let mut res = self.finish(flow);
+                    if let Some(c) = self.run_shutdown() {
+                        res.exit_code = c;
+                    }
                     return (res, None);
                 }
                 let flow = self.exec_block(&stmts);
@@ -1828,8 +1855,10 @@ impl<'a> Interp<'a> {
                     Flow::Return(v) => Some(v.clone()),
                     _ => None,
                 };
-                let res = self.finish(flow);
-                self.run_shutdown();
+                let mut res = self.finish(flow);
+                if let Some(c) = self.run_shutdown() {
+                    res.exit_code = c;
+                }
                 (res, rv)
             }
             Err(e) => {
@@ -1881,7 +1910,7 @@ impl<'a> Interp<'a> {
     /// Worker-mode request end: registered shutdown functions and
     /// destructors for request-created objects.
     pub fn end_request(&mut self) {
-        self.run_shutdown();
+        let _ = self.run_shutdown();
     }
 
     fn cur(&mut self) -> &mut Frame {

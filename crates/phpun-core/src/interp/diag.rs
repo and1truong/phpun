@@ -192,6 +192,18 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn print_fatal(&mut self, e: &PhpError) {
+        // A fatal raised while a generator body runs must not be
+        // swallowed by the yield output-deferral — flush pending bytes
+        // and print with the deferral lifted.
+        let run = self.gen_run_state.take();
+        if let Some(run) = &run {
+            self.gen_flush_out(run, usize::MAX);
+        }
+        self.print_fatal_inner(e);
+        self.gen_run_state = run;
+    }
+
+    fn print_fatal_inner(&mut self, e: &PhpError) {
         match e.kind {
             ErrorKind::Uncaught { ref class } => {
                 // Zend's display path checks PG(error_reporting) &
