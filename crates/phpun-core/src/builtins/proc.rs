@@ -2,6 +2,7 @@
 //! (std::process + raw fd plumbing matching zend's proc_open.c), the
 //! `/bin/sh -c` exec family, and shell-quoting helpers. Unix only.
 
+use super::string::zpp_long_arg;
 use super::*;
 
 use std::ffi::OsStr;
@@ -204,7 +205,7 @@ fn proc_get_status(_it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
     Ok(Value::Array(Rc::new(RefCell::new(a))))
 }
 
-fn proc_terminate(_it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
+fn proc_terminate(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
     let r = proc_handle(args, "proc_terminate")?;
     let rb = r.borrow();
     let PhpResource::Proc { pid, closed, .. } = &*rb else {
@@ -220,7 +221,7 @@ fn proc_terminate(_it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
         );
     }
     let sig = match args.get(1) {
-        Some(_) => arg(args, 1).to_int() as i32,
+        Some(_) => zpp_long_arg(it, args, 1, "proc_terminate", 2, "$signal")? as i32,
         None => libc::SIGTERM,
     };
     Ok(Value::Bool(unsafe { libc::kill(*pid, sig) } == 0))
