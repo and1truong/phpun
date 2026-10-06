@@ -1377,21 +1377,59 @@ pub(crate) fn dispatch(
             let v = arg(args, 0);
             if name == "posix_isatty" {
                 // posix_isatty takes `resource|int $file_descriptor` —
-                // a raw fd answers isatty directly; scalars coerce to
-                // int; everything else warns (not throws) and fails.
-                let as_int = match &v {
+                // a raw fd answers isatty directly. zend's union zpp
+                // coerces scalars to int: bool/int silently, an
+                // in-range float or well-formed float-string with a
+                // "loses precision" deprecation, null deprecated to 0.
+                // Incompatible (or out-of-i64-range) values fall to the
+                // "int|resource, T given" warning; a coerced int outside
+                // 0..=2147483647 warns "must be between" and fails.
+                let long_ok = |f: f64| {
+                    f.is_finite() && f >= i64::MIN as f64 && f < -(i64::MIN as f64)
+                };
+                let as_int: Option<i64> = match &v {
                     Value::Int(i) => Some(*i),
                     Value::Bool(b) => Some(*b as i64),
-                    Value::Float(f) => Some(*f as i64),
+                    Value::Float(f) if long_ok(*f) => {
+                        if f.fract() != 0.0 {
+                            it.deprecated_pub(&format!(
+                                "Implicit conversion from float {} to int loses precision",
+                                crate::value::format_float_repr(*f)
+                            ))?;
+                        }
+                        Some(*f as i64)
+                    }
                     Value::Str(s) => match crate::value::numeric(s) {
                         crate::value::Numeric::Int(i) => Some(i),
-                        crate::value::Numeric::Float(f) => Some(f as i64),
+                        crate::value::Numeric::Float(f) if long_ok(f) => {
+                            if f.fract() != 0.0 {
+                                it.deprecated_pub(&format!(
+                                    "Implicit conversion from float-string \"{}\" to int loses precision",
+                                    String::from_utf8_lossy(s)
+                                ))?;
+                            }
+                            Some(f as i64)
+                        }
                         _ => None,
                     },
+                    Value::Null => {
+                        it.deprecated_pub(&format!(
+                            "{}(): Passing null to parameter #1 ($file_descriptor) of type int is deprecated",
+                            name
+                        ))?;
+                        Some(0)
+                    }
                     _ => None,
                 };
                 match (as_int, &v) {
                     (Some(i), _) => {
+                        if !(0..=2147483647).contains(&i) {
+                            it.warn_pub(&format!(
+                                "{}(): Argument #1 ($file_descriptor) must be between 0 and 2147483647",
+                                name
+                            ))?;
+                            return Ok(Some(Value::Bool(false)));
+                        }
                         return Ok(Some(Value::Bool(unsafe { libc::isatty(i as i32) } == 1)))
                     }
                     (_, Value::Resource(_)) => {}
