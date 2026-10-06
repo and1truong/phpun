@@ -463,6 +463,9 @@ pub struct Interp<'a> {
     /// — a dead entry at a recycled address is simply unmarked
     /// (bug74053).
     destructed: HashMap<usize, std::rc::Weak<RefCell<PhpObject>>>,
+    /// Next `destructed` size that triggers a stale-weak prune —
+    /// doubling growth like `ref_cells_prune`.
+    destructed_prune: usize,
     /// `new` temporaries of the running expression statement — swept
     /// at statement end so unowned objects destruct promptly
     /// (bug29368_2/_3).
@@ -987,6 +990,7 @@ impl<'a> Interp<'a> {
             obj_handles: Vec::new(),
             fcc_fn_cache: HashMap::new(),
             destructed: HashMap::new(),
+            destructed_prune: 1024,
             expr_temps: Vec::new(),
             last_popped_frame: None,
             dump_stack: std::collections::HashSet::new(),
@@ -2170,6 +2174,10 @@ impl<'a> Interp<'a> {
             return false;
         }
         self.destructed.insert(key, Rc::downgrade(o));
+        if self.destructed.len() > self.destructed_prune {
+            self.destructed.retain(|_, w| w.strong_count() > 0);
+            self.destructed_prune = (self.destructed.len() * 2).max(1024);
+        }
         true
     }
 
