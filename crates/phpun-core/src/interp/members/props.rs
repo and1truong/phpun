@@ -1521,19 +1521,7 @@ impl<'a> Interp<'a> {
         // `$i->p->sub` dies with 'Attempt to modify property "p" on
         // int' instead of the read warning (probe4j). A paren just
         // wraps a link.
-        let ov = match obj {
-            Expr::Prop { .. } | Expr::Index { .. } | Expr::StaticProp { .. } | Expr::VarVar(_) => {
-                self.eval_cell(obj)?.borrow().clone()
-            }
-            Expr::Paren(inner) => match &**inner {
-                Expr::Prop { .. }
-                | Expr::Index { .. }
-                | Expr::StaticProp { .. }
-                | Expr::VarVar(_) => self.eval_cell(inner)?.borrow().clone(),
-                _ => self.eval(inner)?,
-            },
-            _ => self.eval(obj)?,
-        };
+        let ov = self.eval_lvalue_obj(obj)?;
         self.last_prop_ov = Some(ov.clone());
         match ov {
             Value::Object(o) => {
@@ -1593,10 +1581,46 @@ impl<'a> Interp<'a> {
                 // is *inaccessible*: cell ops route to __get like a
                 // missing prop, and the write dies in the temp
                 // (bug37667 — appends to a protected prop).
+                let visible = self.prop_visible(&o.borrow().class.clone(), &pn);
                 let key = match key {
-                    Some(k) if self.prop_visible(&o.borrow().class.clone(), &pn) => Some(k),
+                    Some(k) if visible => Some(k),
                     _ => None,
                 };
+                // zend's write-fetch on a readonly prop is only legal
+                // when the slot already holds an object — the write
+                // then targets the object, never the slot. The engine
+                // hands out the object handle, so `&`-binds get a
+                // detached temp whose writes can't reach the slot.
+                // Any other content — missing, scalar, array — dies
+                // with the indirect-modify Error, ahead of the
+                // uninit-typed 'by reference' gate (R3 finding 3).
+                // Invisible props keep falling to __get/hidden-error.
+                if visible {
+                    if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
+                        if pd.readonly {
+                            let dk = if pd.visibility == crate::ast::Visibility::Private {
+                                format!("\0{}\0{}", dcls.name(), pd.name)
+                            } else {
+                                pd.name.clone()
+                            };
+                            let held = o.borrow().props.get(&dk).cloned();
+                            return match held {
+                                Some(c) if matches!(&*c.borrow(), Value::Object(_)) => {
+                                    Ok(cell(c.borrow().clone()))
+                                }
+                                _ => self.fail(PhpError::uncaught(
+                                    "Error",
+                                    format!(
+                                        "Cannot indirectly modify readonly property {}::${}",
+                                        dcls.name(),
+                                        pd.name
+                                    ),
+                                    0,
+                                )),
+                            };
+                        }
+                    }
+                }
                 if key.is_none() {
                     if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
                         if tpd.ty.is_some() && tpd.default.is_none() {
@@ -1754,20 +1778,6 @@ impl<'a> Interp<'a> {
                 let slot = ob.props.get(&key).unwrap().clone();
                 drop(ob);
                 if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
-                    // Every write-context surface (`[]`, `+=`, `++`,
-                    // `&`, `unset`, foreach-&) dies the same way on a
-                    // readonly declared prop (finding 8).
-                    if pd.readonly {
-                        return self.fail(PhpError::uncaught(
-                            "Error",
-                            format!(
-                                "Cannot indirectly modify readonly property {}::${}",
-                                dcls.name(),
-                                pd.name
-                            ),
-                            0,
-                        ));
-                    }
                     if let Some(tys) = &pd.ty {
                         let p = Rc::as_ptr(&slot) as usize;
                         self.typed_slots.insert(
@@ -1829,7 +1839,7 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn unset_prop(&mut self, e: &Expr) -> Result<(), PhpError> {
         if let Expr::Prop { obj, name, .. } = e {
             let pn = self.prop_name(name)?;
-            let ov = self.eval(obj)?;
+            let ov = self.eval_lvalue_obj(obj)?;
             if let Value::Object(o) = ov {
                 if !self.in_own_hook(&o, &pn) {
                     if let Some((pd, hs)) = self.hooked_prop(&o, &pn) {
@@ -1848,12 +1858,85 @@ impl<'a> Interp<'a> {
                 let cls = o.borrow().class.clone();
                 // A declared prop the scope can't see is zend's access
                 // Error — `__unset` intercepts it like any overload
-                // first (finding 11: unset($a->protected)).
-                let hidden = if self.prop_visible(&cls, &pn) {
-                    None
-                } else {
-                    self.hidden_decl_error(&o, &pn)
-                };
+                // first (finding 11: unset($a->protected)). Computed
+                // unconditionally: prop_visible() skips private decls,
+                // which would make an invisible private prop unset()
+                // silently no-op instead of 'Cannot access private
+                // property' (R3 finding 2).
+                let hidden = self.hidden_decl_error(&o, &pn);
+                // zend's unset on a declared prop runs its write-scope
+                // gates BEFORE the slot is touched (R3 finding 1): an
+                // initialized readonly prop can never be unset; an
+                // uninitialized one — or any asymmetric-visibility
+                // prop — needs the set-visibility scope
+                // (`public readonly` is implicitly protected(set)).
+                if hidden.is_none() {
+                    if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
+                        let dk = if pd.visibility == crate::ast::Visibility::Private {
+                            format!("\0{}\0{}", dcls.name(), pd.name)
+                        } else {
+                            pd.name.clone()
+                        };
+                        if pd.readonly && o.borrow().props.contains_key(&dk) {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Cannot unset readonly property {}::${}",
+                                    dcls.name(),
+                                    pd.name
+                                ),
+                                0,
+                            ));
+                        }
+                        let eff = pd.set_vis.unwrap_or(if pd.readonly {
+                            crate::ast::Visibility::Protected
+                        } else {
+                            pd.visibility
+                        });
+                        if eff != crate::ast::Visibility::Public {
+                            let scope = self.caller_scope_name();
+                            let dn = dcls.name().to_string();
+                            let ok = match eff {
+                                crate::ast::Visibility::Private => {
+                                    scope.as_deref() == Some(dn.as_str())
+                                }
+                                crate::ast::Visibility::Protected => scope
+                                    .as_deref()
+                                    .map(|s| self.is_a_str(s, &dn) || self.is_a_str(&dn, s))
+                                    .unwrap_or(false),
+                                crate::ast::Visibility::Public => true,
+                            };
+                            if !ok {
+                                let word = if eff == crate::ast::Visibility::Private {
+                                    "private(set)"
+                                } else {
+                                    "protected(set)"
+                                };
+                                // zend's wording tucks 'readonly' into
+                                // the protected(set) form only — the
+                                // private(set) message drops it.
+                                let rw = if pd.readonly
+                                    && eff == crate::ast::Visibility::Protected
+                                {
+                                    " readonly"
+                                } else {
+                                    ""
+                                };
+                                let from = scope
+                                    .map(|s| format!("scope {}", s))
+                                    .unwrap_or_else(|| "global scope".to_string());
+                                return self.fail(PhpError::uncaught(
+                                    "Error",
+                                    format!(
+                                        "Cannot unset {}{} property {}::${} from {}",
+                                        word, rw, dn, pd.name, from
+                                    ),
+                                    0,
+                                ));
+                            }
+                        }
+                    }
+                }
                 if let Some(k) = self.obj_prop_key(&o, &pn).filter(|_| hidden.is_none()) {
                     let mut ob = o.borrow_mut();
                     let prune = if let Some(c) = ob.props.remove(&k) {

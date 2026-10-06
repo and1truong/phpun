@@ -1400,7 +1400,10 @@ impl<'a> Interp<'a> {
         self.fresh_dyn_props.clear();
         let target_cell = match target {
             Expr::Prop { obj, name, .. } => {
-                match self.eval(obj) {
+                // zend fetches the object operand in write context —
+                // an intermediate readonly prop holding a non-object
+                // dies here, naming THAT prop (R3 finding 3).
+                match self.eval_lvalue_obj(obj) {
                     Ok(ov) => {
                         // A {dynamic} name expr resolves now (side effects +
                         // the var-var temp is read early, matching Zend);
@@ -1416,7 +1419,7 @@ impl<'a> Interp<'a> {
                         }
                         None
                     }
-                    Err(_) => None,
+                    Err(e) => return Err(e),
                 }
             }
             Expr::Index { e, i } if has_prop(e) => {
@@ -1800,6 +1803,28 @@ impl<'a> Interp<'a> {
         Ok(newv)
     }
 
+    /// Evaluate the object operand of a Prop write target — zend
+    /// fetches it in write context, so an intermediate readonly prop
+    /// holding a non-object dies with 'Cannot indirectly modify
+    /// readonly property' naming the INTERMEDIATE prop (R3 finding 3:
+    /// `$c->a['x']->p = 5` gates on `a`). Non-chain forms read normally.
+    pub(in crate::interp) fn eval_lvalue_obj(&mut self, obj: &Expr) -> Result<Value, PhpError> {
+        match obj {
+            Expr::Prop { .. }
+            | Expr::Index { .. }
+            | Expr::StaticProp { .. }
+            | Expr::VarVar(_) => Ok(self.eval_cell(obj)?.borrow().clone()),
+            Expr::Paren(inner) => match &**inner {
+                Expr::Prop { .. }
+                | Expr::Index { .. }
+                | Expr::StaticProp { .. }
+                | Expr::VarVar(_) => Ok(self.eval_cell(inner)?.borrow().clone()),
+                _ => self.eval(obj),
+            },
+            _ => self.eval(obj),
+        }
+    }
+
     /// Evaluate to a cell (for by-ref semantics): vars and array elements
     /// and object props alias their storage.
     pub(in crate::interp) fn eval_cell(&mut self, e: &Expr) -> Result<Cell, PhpError> {
@@ -2010,7 +2035,7 @@ impl<'a> Interp<'a> {
                 // `=&` on a hooked prop without `&get` — the engine
                 // reports the overloaded-object error, not the
                 // indirect-modification one (get_by_ref_auto).
-                if let Ok(Value::Object(o)) = self.eval(obj) {
+                if let Ok(Value::Object(o)) = self.eval_lvalue_obj(obj) {
                     if let Ok(pn) = self.prop_name(name) {
                         if let Some((_pd, hs)) = self.hooked_prop(&o, &pn) {
                             let has_ref_get = hs
@@ -2027,7 +2052,7 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                let ov = self.eval(obj)?;
+                let ov = self.eval_lvalue_obj(obj)?;
                 if let Value::Object(o) = &ov {
                     if let Ok(pn) = self.prop_name(name) {
                         // `=&` into an overloaded prop (missing slot +
@@ -2239,7 +2264,7 @@ impl<'a> Interp<'a> {
                 nullsafe: _,
             } => {
                 let pn = self.prop_name(name)?;
-                let ov = self.eval(obj)?;
+                let ov = self.eval_lvalue_obj(obj)?;
                 self.store_prop(ov, &pn, v).map(|_| ())
             }
             _ => self.fail(PhpError::fatal("Cannot assign to this expression", 0)),
@@ -4589,6 +4614,7 @@ impl<'a> Interp<'a> {
 
     fn incdec(&mut self, target: &Expr, delta: i64, post: bool) -> Result<Value, PhpError> {
         // PHP warns on undefined vars/props/keys during ++/-- (bug25547).
+        let mut ro_target: Option<(Rc<RefCell<PhpObject>>, String)> = None;
         let old = match target {
             Expr::Var(name) => self.var_get(name).unwrap_or(Value::Null),
             Expr::Index { e, i } => {
@@ -4625,7 +4651,7 @@ impl<'a> Interp<'a> {
             Expr::Prop { obj, name, .. } => {
                 // `++`/`--` on a prop of a non-object dies with the
                 // incdec verb before the loose-read warn (probe4i).
-                let ov = self.eval(obj)?;
+                let ov = self.eval_lvalue_obj(obj)?;
                 if !matches!(ov, Value::Object(_)) {
                     let pn = self.prop_name(name)?;
                     return self.fail(PhpError::uncaught(
@@ -4644,6 +4670,7 @@ impl<'a> Interp<'a> {
                 // (probe_r2). Magic __get props keep loose-read.
                 if let Value::Object(o) = &ov {
                     let pn = self.prop_name(name)?;
+                    ro_target = Some((o.clone(), pn.clone()));
                     let cls = o.borrow().class.clone();
                     if self.decl_prop(o, &pn).is_none()
                         && !o.borrow().props.contains_key(&pn)
@@ -4694,6 +4721,34 @@ impl<'a> Interp<'a> {
                 ))
             }
         };
+        // `++`/`--` on a declared readonly prop is a direct slot write:
+        // zend's 'Cannot modify readonly property' precedes the
+        // increment verb — `$c->o++` on an object-held readonly prop
+        // must not reach 'Cannot increment Inner' (R3 finding 12).
+        // Runs post-read so an uninitialized typed prop still reports
+        // 'must not be accessed before initialization' first.
+        if let Some((o, pn)) = &ro_target {
+            if let Some((pd, dcls)) = self.decl_prop(o, pn) {
+                if pd.readonly {
+                    let dk = if pd.visibility == crate::ast::Visibility::Private {
+                        format!("\0{}\0{}", dcls.name(), pd.name)
+                    } else {
+                        pd.name.clone()
+                    };
+                    if o.borrow().props.contains_key(&dk) {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Cannot modify readonly property {}::${}",
+                                dcls.name(),
+                                pd.name
+                            ),
+                            0,
+                        ));
+                    }
+                }
+            }
+        }
         // Typed `int` prop can't overflow to float — a dedicated Error
         // instead of the generic assign TypeError (typed_properties_019).
         // The target's storage cell carries the owning prop's type —
