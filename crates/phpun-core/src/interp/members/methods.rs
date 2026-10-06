@@ -2469,45 +2469,72 @@ impl<'a> Interp<'a> {
                 _ => Some(Value::Null),
             },
             "__tostring" => {
-                let msg = ob
-                    .props
-                    .get("message")
-                    .map(|c| c.borrow().to_php_string())
-                    .unwrap_or_default();
-                let (file, line, trace, full) = match &ob.internal {
-                    Some(ObjectInternal::Exception {
-                        file,
-                        line,
-                        trace,
-                        frames,
-                        full_msg,
-                        ..
-                    }) => {
-                        let t = if !trace.is_empty() {
-                            trace.clone()
-                        } else if !frames.is_empty() {
-                            format_trace(frames)
-                        } else {
-                            "#0 {main}".into()
-                        };
-                        (file.clone(), *line, t, full_msg.clone())
+                // zend renders the whole previous-chain innermost
+                // first — each later member is a 'Next {cls}:' block
+                // (same layout as the uncaught display).
+                let mut chain: Vec<Rc<RefCell<PhpObject>>> = vec![obj.clone()];
+                for _ in 0..16 {
+                    let nxt = {
+                        let top = chain.last().unwrap().borrow();
+                        match &top.internal {
+                            Some(ObjectInternal::Exception {
+                                previous: Some(Value::Object(p)),
+                                ..
+                            }) => p.clone(),
+                            _ => break,
+                        }
+                    };
+                    chain.push(nxt);
+                }
+                let mut out = String::new();
+                for (i, m) in chain.iter().rev().enumerate() {
+                    let mo = m.borrow();
+                    let msg = mo
+                        .props
+                        .get("message")
+                        .map(|c| c.borrow().to_php_string())
+                        .unwrap_or_default();
+                    let (file, line, trace, full) = match &mo.internal {
+                        Some(ObjectInternal::Exception {
+                            file,
+                            line,
+                            trace,
+                            frames,
+                            full_msg,
+                            ..
+                        }) => {
+                            let t = if !trace.is_empty() {
+                                trace.clone()
+                            } else if !frames.is_empty() {
+                                format_trace(frames)
+                            } else {
+                                "#0 {main}".into()
+                            };
+                            (file.clone(), *line, t, full_msg.clone())
+                        }
+                        _ => (
+                            self.diag_file(),
+                            self.cur_line as u32,
+                            "#0 {main}".into(),
+                            String::new(),
+                        ),
+                    };
+                    let msg = if full.is_empty() { msg } else { full };
+                    let head = if i == 0 {
+                        mo.class.name().to_string()
+                    } else {
+                        format!("Next {}", mo.class.name())
+                    };
+                    if i > 0 {
+                        out.push_str("\n\n");
                     }
-                    _ => (
-                        self.diag_file(),
-                        self.cur_line as u32,
-                        "#0 {main}".into(),
-                        String::new(),
-                    ),
-                };
-                let msg = if full.is_empty() { msg } else { full };
-                Some(Value::str(format!(
-                    "{}: {} in {}:{}\nStack trace:\n{}",
-                    ob.class.name(),
-                    msg,
-                    file,
-                    line,
-                    trace
-                )))
+                    out.push_str(&format!(
+                        "{}: {} in {}:{}\nStack trace:\n{}",
+                        head, msg, file, line, trace
+                    ));
+                }
+                drop(ob);
+                Some(Value::str(out))
             }
             // __construct is dispatched to throwable_ctor() ahead of
             // this table — it needs arginfo errors (TypeError/
@@ -2522,16 +2549,45 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// zend materializes its engine state into the dump-visible prop
+    /// table — file/line carry the create site; string/trace/previous
+    /// are private slots on the root class.
+    pub(in crate::interp) fn exception_prop_defaults(&mut self, o: &Rc<RefCell<PhpObject>>) {
+        let scope = {
+            let cn = o.borrow().class.name().to_string();
+            if self.is_a_str(&cn, "error") {
+                "Error"
+            } else {
+                "Exception"
+            }
+        };
+        let trace_v = self
+            .throwable_method(o, "getTrace", &[])
+            .unwrap_or(Value::Null);
+        let (file, line) = {
+            let ob = o.borrow();
+            match &ob.internal {
+                Some(ObjectInternal::Exception { file, line, .. }) => (file.clone(), *line),
+                _ => return,
+            }
+        };
+        let mut ob = o.borrow_mut();
+        let put = |ob: &mut PhpObject, k: String, v: Value| {
+            if !ob.prop_order.contains(&k) {
+                ob.prop_order.push(k.clone());
+            }
+            ob.props.insert(k, cell(v));
+        };
+        put(&mut ob, "file".to_string(), Value::str(file));
+        put(&mut ob, "line".to_string(), Value::Int(line as i64));
+        put(&mut ob, format!("\0{}\0string", scope), Value::str(""));
+        put(&mut ob, format!("\0{}\0trace", scope), trace_v);
+        // 'previous' slot exists with a Null cell from decl defaults.
+    }
+
     /// `Ctor::__construct(): Argument #N` TypeError for throwable
     /// arginfo checks — names the DECLARING class.
-    fn arg_tyerr(
-        &self,
-        dname: &str,
-        n: usize,
-        pname: &str,
-        ty: &str,
-        v: &Value,
-    ) -> PhpError {
+    fn arg_tyerr(&self, dname: &str, n: usize, pname: &str, ty: &str, v: &Value) -> PhpError {
         PhpError::uncaught(
             "TypeError",
             format!(
@@ -2572,10 +2628,15 @@ impl<'a> Interp<'a> {
         obj: &Rc<RefCell<PhpObject>>,
         args: &crate::interp::CallArgs,
     ) -> Result<Option<Value>, PhpError> {
-        let is_ee = self.obj_is_a(obj, "errorexception");
+        // Class-table checks only — callers may hold an object borrow.
+        let cname = {
+            let ob = obj.borrow();
+            ob.class.name().to_string()
+        };
+        let is_ee = self.is_a_str(&cname, "errorexception");
         let dname = if is_ee {
             "ErrorException"
-        } else if self.obj_is_a(obj, "error") {
+        } else if self.is_a_str(&cname, "error") {
             "Error"
         } else {
             "Exception"
@@ -2607,8 +2668,7 @@ impl<'a> Interp<'a> {
                 0,
             ));
         }
-        let mut slots: Vec<Option<Cell>> =
-            args.cells.iter().cloned().map(Some).collect();
+        let mut slots: Vec<Option<Cell>> = args.cells.iter().cloned().map(Some).collect();
         slots.resize(params.len(), None);
         for (n, c, _, _) in &args.named {
             match params.iter().position(|(p, _)| p == n) {
@@ -2616,10 +2676,7 @@ impl<'a> Interp<'a> {
                     if slots[i].is_some() {
                         return self.fail(PhpError::uncaught(
                             "Error",
-                            format!(
-                                "Named parameter ${} overwrites previous argument",
-                                n
-                            ),
+                            format!("Named parameter ${} overwrites previous argument", n),
                             0,
                         ));
                     }
@@ -2664,7 +2721,10 @@ impl<'a> Interp<'a> {
                         return self.fail(self.arg_tyerr(dname, n, pname, "string", &v));
                     }
                     Value::Object(o) => {
-                        if self.find_method_in(&o.borrow().class.clone(), "__tostring").is_some() {
+                        if self
+                            .find_method_in(&o.borrow().class.clone(), "__tostring")
+                            .is_some()
+                        {
                             Value::str(self.conv_str(&v)?)
                         } else {
                             return self.fail(self.arg_tyerr(dname, n, pname, "string", &v));
@@ -2715,7 +2775,10 @@ impl<'a> Interp<'a> {
                         return self.fail(self.arg_tyerr(dname, n, pname, "?string", &v));
                     }
                     Value::Object(o) => {
-                        if self.find_method_in(&o.borrow().class.clone(), "__tostring").is_some() {
+                        if self
+                            .find_method_in(&o.borrow().class.clone(), "__tostring")
+                            .is_some()
+                        {
                             Value::str(self.conv_str(&v)?)
                         } else {
                             return self.fail(self.arg_tyerr(dname, n, pname, "?string", &v));
@@ -2725,9 +2788,7 @@ impl<'a> Interp<'a> {
                 },
                 "?Throwable" => match &v {
                     Value::Null => Value::Null,
-                    Value::Object(o)
-                        if self.is_throwable_name(&o.borrow().class.decl.name) =>
-                    {
+                    Value::Object(o) if self.is_throwable_name(&o.borrow().class.decl.name) => {
                         v.clone()
                     }
                     _ => return self.fail(self.arg_tyerr(dname, n, pname, "?Throwable", &v)),
@@ -2768,11 +2829,9 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        if let Some(lv) = line_v {
-            if let Value::Int(l) = lv {
-                if let Some(ObjectInternal::Exception { line, .. }) = &mut ob.internal {
-                    *line = l as u32;
-                }
+        if let Some(Value::Int(l)) = line_v {
+            if let Some(ObjectInternal::Exception { line, .. }) = &mut ob.internal {
+                *line = l as u32;
             }
         }
         if let prev @ Value::Object(_) = bound[prev_i].clone() {
@@ -2780,6 +2839,23 @@ impl<'a> Interp<'a> {
                 *previous = Some(prev);
             }
         }
+        // Dump-visible props mirror the engine state — file/line pick
+        // up the ErrorException filename/line overrides; previous is
+        // a private slot on the root class.
+        let (fprop, lprop) = match &ob.internal {
+            Some(ObjectInternal::Exception { file, line, .. }) => (file.clone(), *line as i64),
+            _ => (String::new(), 0),
+        };
+        ob.props.insert("file".into(), cell(Value::str(fprop)));
+        ob.props.insert("line".into(), cell(Value::Int(lprop)));
+        let prev_v = bound[prev_i].clone();
+        let pscope = if self.is_a_str(&cname, "error") {
+            "Error"
+        } else {
+            "Exception"
+        };
+        ob.props
+            .insert(format!("\0{}\0previous", pscope), cell(prev_v));
         Ok(Some(Value::Null))
     }
 

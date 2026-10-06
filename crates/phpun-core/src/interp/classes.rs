@@ -2210,13 +2210,15 @@ impl<'a> Interp<'a> {
             }
             // `readonly $p = v` — 'cannot have default value' outranks
             // the static-readonly and hook rules below (m11b/m11j).
+            // zend attributes it to the prop's decl line, not the
+            // class's.
             if p.readonly && p.default.is_some() {
                 return Err(PhpError::fatal(
                     format!(
                         "Readonly property {}::${} cannot have default value",
                         d.name, p.name
                     ),
-                    self.cur_line,
+                    p.line.max(1),
                 ));
             }
             // `static readonly` — zend's own decl fatal; it outranks
@@ -3574,14 +3576,22 @@ impl<'a> Interp<'a> {
         } else {
             None
         };
-        Ok(Value::Object(self.alloc_obj(PhpObject {
+        let v = Value::Object(self.alloc_obj(PhpObject {
             class: cls,
             props,
             prop_order,
             id: 0,
             internal,
             unset_props: std::collections::HashSet::new(),
-        })))
+        }));
+        // zend's throwable dump view needs engine state materialized
+        // into props (file/line/string/trace) before any ctor runs.
+        if let Value::Object(o) = &v {
+            if matches!(o.borrow().internal, Some(ObjectInternal::Exception { .. })) {
+                self.exception_prop_defaults(o);
+            }
+        }
+        Ok(v)
     }
 
     pub(in crate::interp) fn is_throwable_name(&mut self, name: &str) -> bool {

@@ -692,13 +692,6 @@ pub(crate) fn dispatch(
             it.ini.insert("include_path".into(), v);
             Value::str(prev)
         }
-        "restore_include_path" => {
-            it.ini.insert(
-                "include_path".into(),
-                ".:/home/linuxbrew/.linuxbrew/Cellar/php/8.5.11/share/php/pear".into(),
-            );
-            Value::Null
-        }
         "token_get_all" | "token_name" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
         "highlight_string" => {
             let src = arg(args, 0).to_php_string();

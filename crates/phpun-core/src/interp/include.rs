@@ -367,6 +367,11 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn eval_code(&mut self, code: &str) -> Result<Value, PhpError> {
+        // eval('') returns false in zend (empty string only — a
+        // whitespace/comment-only string still compiles to NULL).
+        if code.is_empty() {
+            return Ok(Value::Bool(false));
+        }
         // eval'd code has no <?php tag; strip a leading one defensively.
         let src = code.strip_prefix("<?php").unwrap_or(code).to_string();
         match parser::parse_pure(&src, self.ini_on("short_open_tag")) {

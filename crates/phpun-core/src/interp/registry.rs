@@ -1401,6 +1401,8 @@ impl<'a> Interp<'a> {
                     mk_method("getType", vec![]),
                     mk_method("getName", vec![]),
                     mk_method("getClass", vec![]),
+                    mk_method("getDefaultValue", vec![]),
+                    mk_method("isDefaultValueAvailable", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -1957,14 +1959,41 @@ impl<'a> Interp<'a> {
         ] {
             reg(d, false);
         }
-        reg(
-            throwable_class("Exception", None, &["message", "code", "file", "line"]),
-            false,
-        );
-        reg(
-            throwable_class("Error", None, &["message", "code", "file", "line"]),
-            false,
-        );
+        // zend's private string/trace/previous live on the root
+        // classes only — subclasses inherit the declaring-class label
+        // (`"string":"Exception":private` even on RuntimeException).
+        // Declaration order matches zend's default-properties table
+        // (it's the var_dump key order).
+        for root in ["Exception", "Error"] {
+            let mut d = throwable_class(root, None, &[]);
+            d.props = [
+                ("message", Visibility::Protected),
+                ("string", Visibility::Private),
+                ("code", Visibility::Protected),
+                ("file", Visibility::Protected),
+                ("line", Visibility::Protected),
+                ("trace", Visibility::Private),
+                ("previous", Visibility::Private),
+            ]
+            .iter()
+            .map(|(p, vis)| PropDecl {
+                name: p.to_string(),
+                default: None,
+                is_static: false,
+                visibility: *vis,
+                readonly: false,
+                ty: None,
+                is_abstract: false,
+                is_final: false,
+                set_vis: None,
+                decl_in: None,
+                hooks: None,
+                attrs: vec![],
+                line: 0,
+            })
+            .collect();
+            reg(d, false);
+        }
         // Closure — name must resolve for `\Closure::bind()` /
         // `\Closure::fromCallable()` (composer's ClassLoader uses bind to
         // scope-isolate `include`). Methods dispatch natively in
