@@ -24,6 +24,8 @@ impl<'a> Interp<'a> {
     /// START=1, CLEAN=2, FLUSH=4, FINAL=8). Returns the handler's output
     /// — or the raw buffer when there is no handler.
     fn ob_invoke(&mut self, mode: i64) -> Result<Option<Vec<u8>>, PhpError> {
+        // Cursor-past journaled gen captures join the buffer first.
+        self.ob_drain_pending();
         let (handler, buf, already) = match self.ob_stack.last_mut() {
             Some(l) => {
                 let buf = std::mem::take(&mut l.buf);
@@ -132,22 +134,71 @@ impl<'a> Interp<'a> {
     }
     // public helpers for builtins
     pub fn ob_push(&mut self, handler: Option<Value>) {
+        // A buffer opened inside a generator body is a real global
+        // buffer in Zend — it survives the body's suspends and
+        // captures consumer writes too. Tag the level with the
+        // cursor position its ob_start ran at: it stays on the stack
+        // during the body run, detaches at suspend, and
+        // rematerializes once the consumer's cursor reaches it
+        // (ob_suspend/ob_promote).
+        let (gen_q, gen_open) = match &self.gen_run_state {
+            Some(s) => {
+                let done = self
+                    .gen_sink
+                    .as_ref()
+                    .map(|k| k.borrow().len())
+                    .unwrap_or(0);
+                // send()'s prefix re-run replays pushes that
+                // already exist — never materialize the dup.
+                let open = if self.gen_replay_horizon.is_some_and(|k| done <= k) {
+                    usize::MAX
+                } else {
+                    done
+                };
+                (Some(s.borrow().fin_q.clone()), Some(open))
+            }
+            None => (None, None),
+        };
         self.ob_stack.push(ObLevel {
             buf: Vec::new(),
             handler,
             started: false,
+            gen_q,
+            gen_open,
+            gen_close: None,
+            gen_pending: Vec::new(),
         });
+    }
+
+    /// Pop the top buffer — a gen-opened one popped by the body
+    /// keeps a suspended capture window until the consumer's cursor
+    /// passes its close tag (Zend's global buffer still exists
+    /// between the body's yield and its pop).
+    fn ob_pop(&mut self) -> Option<ObLevel> {
+        let l = self.ob_stack.pop()?;
+        if l.gen_open.is_some() && self.gen_run_state.is_some() && l.gen_close.is_none() {
+            self.suspended_obs.push(ObLevel {
+                buf: Vec::new(),
+                handler: None,
+                started: true,
+                gen_q: l.gen_q.clone(),
+                gen_open: l.gen_open,
+                gen_close: self.gen_sink.as_ref().map(|s| s.borrow().len()),
+                gen_pending: Vec::new(),
+            });
+        }
+        Some(l)
     }
     /// ob_end_clean: handler(mode=CLEAN|FINAL) result discarded, pop.
     pub fn ob_end_clean(&mut self) -> Result<(), PhpError> {
         self.ob_invoke(10)?;
-        self.ob_stack.pop();
+        self.ob_pop();
         Ok(())
     }
     /// ob_end_flush: handler(mode=FINAL) result emitted to parent, pop.
     pub fn ob_end_flush(&mut self) -> Result<(), PhpError> {
         let r = self.ob_invoke(8)?;
-        self.ob_stack.pop();
+        self.ob_pop();
         if let Some(s) = r {
             self.emit_bytes(&s);
         }
@@ -173,26 +224,30 @@ impl<'a> Interp<'a> {
     }
     /// ob_get_clean: raw buffer, NO handler invocation, pop.
     pub fn ob_get_clean(&mut self) -> Value {
-        self.ob_stack
-            .pop()
+        self.ob_drain_pending();
+        self.ob_pop()
             .map(|l| Value::bytes(l.buf))
             .unwrap_or(Value::Bool(false))
     }
     /// ob_get_flush: handler(mode=FINAL) result emitted, RAW buffer
     /// returned, level popped.
     pub fn ob_get_flush(&mut self) -> Result<Value, PhpError> {
+        self.ob_drain_pending();
         let raw = self.ob_stack.last().map(|l| l.buf.clone());
         let r = self.ob_invoke(8)?;
-        self.ob_stack.pop();
+        self.ob_pop();
         if let Some(s) = r {
             self.emit_bytes(&s);
         }
         Ok(raw.map(Value::bytes).unwrap_or(Value::Bool(false)))
     }
-    pub fn ob_top(&self) -> Option<&Vec<u8>> {
+    pub fn ob_top(&mut self) -> Option<&Vec<u8>> {
+        self.ob_promote();
+        self.ob_drain_pending();
         self.ob_stack.last().map(|l| &l.buf)
     }
-    pub fn ob_len(&self) -> usize {
+    pub fn ob_len(&mut self) -> usize {
+        self.ob_promote();
         self.ob_stack.len()
     }
     pub fn register_shutdown(&mut self, f: Value, args: Vec<Cell>) {

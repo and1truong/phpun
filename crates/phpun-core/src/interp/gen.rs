@@ -297,6 +297,11 @@ impl<'a> Interp<'a> {
             called_class,
             closure_rc,
         );
+        // Output buffers the body opened past a yield leave the real
+        // stack while it is suspended — Zend's buffers are global, so
+        // they rematerialize as the consumer's cursor passes each
+        // open tag.
+        self.ob_suspend(&state.borrow().fin_q);
         self.gen_sink = saved_sink;
         self.gen_sends = saved_sends;
         self.gen_auto = saved_auto;

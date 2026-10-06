@@ -296,6 +296,11 @@ pub struct Interp<'a> {
     pub uploads: Vec<std::path::PathBuf>,
     /// Output buffer stack for ob_*().
     ob_stack: Vec<ObLevel>,
+    /// Buffers opened inside a generator body past a yield — they
+    /// leave the real stack while the body is suspended and
+    /// rematerialize when the consumer's cursor passes each open tag
+    /// (Zend's buffers are global across suspends).
+    suspended_obs: Vec<ObLevel>,
     /// While >0, warnings are suppressed (implements `??`, `isset`,
     /// `empty`, `@`).
     silence: u32,
@@ -615,6 +620,27 @@ pub struct ObLevel {
     /// Set after the handler's first invocation — PHP's
     /// PHP_OUTPUT_HANDLER_START bit is only passed once (bug24951).
     pub started: bool,
+    /// When the buffer was opened inside a generator body past its
+    /// first yield: the owning gen's fin queue, whose mirrored `pos`
+    /// tracks how far the consumer advanced — Zend buffers live on
+    /// the global stack and survive the suspend, so deferred bytes
+    /// merge into `buf` in cursor order rather than echoing raw at
+    /// replay.
+    pub gen_q: Option<crate::value::FinQueue>,
+    /// The consumer cursor position at which the body's `ob_start`
+    /// ran — the buffer exists consumer-side only once `pos` reaches
+    /// it; before that it lives in `suspended_obs`.
+    pub gen_open: Option<usize>,
+    /// When the body's ob-pop op ran (ob_get_clean & friends), in
+    /// consumer cursor space — the buffer keeps capturing consumer
+    /// writes while `pos` sits inside [gen_open, gen_close), like
+    /// Zend's still-live global buffer.
+    pub gen_close: Option<usize>,
+    /// Deferred gen bytes captured while this buffer is open, tagged
+    /// by the yield index they follow — merged into `buf` when the
+    /// cursor passes them (or in full inside the body itself, where
+    /// they already ran).
+    pub gen_pending: Vec<(usize, Vec<u8>)>,
 }
 
 /// Result of a top-level program run.
@@ -912,6 +938,7 @@ impl<'a> Interp<'a> {
             php_input: std::rc::Rc::new(Vec::new()),
             uploads: Vec::new(),
             ob_stack: Vec::new(),
+            suspended_obs: Vec::new(),
             silence: 0,
             statics: HashMap::new(),
             static_decls: HashMap::new(),
@@ -2126,6 +2153,7 @@ impl<'a> Interp<'a> {
         self.resp_code = 200;
         self.uploads.clear();
         self.ob_stack.clear();
+        self.suspended_obs.clear();
         self.silence = 0;
         self.pending_exception = None;
         self.call_trace.clear();
@@ -2509,12 +2537,31 @@ impl<'a> Interp<'a> {
                 return;
             }
             if done > 0 {
+                // An ob opened inside this gen captures the deferred
+                // output like Zend's global buffer — journaled per
+                // tag so it merges with consumer writes in cursor
+                // order instead of echoing raw at replay.
+                if let Some(l) = self.ob_stack.last_mut() {
+                    let owns = match (&l.gen_q, &self.gen_run_state) {
+                        (Some(q), Some(s)) => {
+                            std::rc::Rc::ptr_eq(q, &s.borrow().fin_q)
+                        }
+                        _ => false,
+                    };
+                    if owns {
+                        l.gen_pending.push((done - 1, b.to_vec()));
+                        return;
+                    }
+                }
                 let is_fin = self.gen_fin_depth > 0;
                 self.gen_buf_out(done - 1, b, false, is_fin);
                 return;
             }
         }
+        self.ob_promote();
         if let Some(buf) = self.ob_stack.last_mut() {
+            // Cursor-past journaled captures precede this write.
+            Self::ob_drain_level(buf, false);
             buf.buf.extend_from_slice(b);
         } else if self.live_io {
             use std::io::Write;
@@ -2526,10 +2573,119 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Move the suspended gen-owned buffers whose open tag the
+    /// consumer's cursor passed back onto the real stack — Zend's
+    /// buffers are global, so they materialize at resume time,
+    /// below anything the consumer pushed while suspended.
+    fn ob_promote(&mut self) {
+        // A promoted capture window closes once the cursor passes
+        // the body's pop point — drop it.
+        let mut i = 0;
+        while i < self.ob_stack.len() {
+            let stale = self.ob_stack[i].gen_close.is_some_and(|c| {
+                self.ob_stack[i]
+                    .gen_q
+                    .as_ref()
+                    .is_some_and(|q| q.borrow().pos >= c)
+            });
+            if stale {
+                self.ob_stack.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        let mut i = 0;
+        while i < self.suspended_obs.len() {
+            let l = &self.suspended_obs[i];
+            let ready = l.gen_open.is_some_and(|t| {
+                l.gen_q
+                    .as_ref()
+                    .is_some_and(|q| q.borrow().pos >= t)
+            }) && l.gen_close.is_none_or(|c| {
+                l.gen_q
+                    .as_ref()
+                    .is_some_and(|q| q.borrow().pos < c)
+            });
+            if ready {
+                let l = self.suspended_obs.remove(i);
+                self.ob_stack.push(l);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// The body's own buffers leave the real stack when it suspends
+    /// (they were opened inside the eager run but exist consumer-side
+    /// only once its yield index passes) — park them keyed by open
+    /// tag until `ob_promote` restores them.
+    fn ob_suspend(&mut self, fq: &crate::value::FinQueue) {
+        let mut moved = Vec::new();
+        let mut i = self.ob_stack.len();
+        while i > 0 {
+            i -= 1;
+            let owned = self.ob_stack[i].gen_open.is_some()
+                && self.ob_stack[i]
+                    .gen_q
+                    .as_ref()
+                    .is_some_and(|q| std::rc::Rc::ptr_eq(q, fq));
+            if owned {
+                moved.push(self.ob_stack.remove(i));
+            }
+        }
+        moved.reverse();
+        self.suspended_obs.extend(moved);
+    }
+
+    /// Merge a gen-opened buffer's journaled deferred bytes into its
+    /// buf: entries tagged below the owning gen's consumer cursor
+    /// have already run in stream order — or all of them when `all`
+    /// (a read inside the body itself, where tags are chronological-
+    /// past anyway).
+    fn ob_drain_level(level: &mut ObLevel, all: bool) {
+        if level.gen_pending.is_empty() {
+            return;
+        }
+        let pos = if all {
+            usize::MAX
+        } else {
+            level
+                .gen_q
+                .as_ref()
+                .map(|q| q.borrow().pos)
+                .unwrap_or(usize::MAX)
+        };
+        let split = level
+            .gen_pending
+            .iter()
+            .position(|(t, _)| *t >= pos)
+            .unwrap_or(level.gen_pending.len());
+        for (_, b) in level.gen_pending.drain(..split) {
+            level.buf.extend_from_slice(&b);
+        }
+    }
+
+    /// Drain the top buffer's journaled gen captures — `all` when the
+    /// read runs inside the owning gen's body (its tags are source-
+    /// ordered already); otherwise by the mirrored consumer cursor.
+    pub(in crate::interp) fn ob_drain_pending(&mut self) {
+        self.ob_promote();
+        if let Some(l) = self.ob_stack.last_mut() {
+            let all = match (&l.gen_q, &self.gen_run_state) {
+                (Some(q), Some(s)) => std::rc::Rc::ptr_eq(q, &s.borrow().fin_q),
+                _ => false,
+            };
+            Self::ob_drain_level(l, all);
+        }
+    }
+
     /// Emit generator-deferred output whose suspending yield the
     /// consumer has now advanced past (`pos > tag`). Pass
     /// `usize::MAX` to flush everything (getReturn runs to the end).
     fn gen_flush_out(&mut self, state: &Rc<RefCell<crate::value::GenState>>, pos: usize) {
+        // Buffers the body opened past a yield materialize once the
+        // cursor passes their open tag.
+        self.ob_promote();
         let ready = {
             let mut st = state.borrow_mut();
             let split = st
