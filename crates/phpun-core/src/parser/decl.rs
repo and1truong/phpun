@@ -597,17 +597,19 @@ impl<'a> Parser<'a> {
         alias: &str,
         fq: &str,
     ) -> Result<(), PhpError> {
-        // Re-importing the same alias to the same target is a no-op
-        // (namespaces/ns_078).
-        if kind == NsKind::Class && self.use_map.get(&alias.to_lowercase()) == Some(&fq.to_string())
-        {
-            return Ok(());
-        }
-        if kind == NsKind::Class && self.declared_types.contains(&alias.to_lowercase()) {
+        // Any alias already claimed in the same import table is a
+        // compile fatal — even re-importing the same target (Zend's
+        // zend_resolve_non_class_name check, use_collision_*).
+        let (hit, tag) = match kind {
+            NsKind::Class => (self.use_map.contains_key(&alias.to_lowercase()), ""),
+            NsKind::Func => (self.use_fn_map.contains_key(&alias.to_lowercase()), "function "),
+            NsKind::Const => (self.use_const_map.contains_key(&alias.to_string()), "const "),
+        };
+        if hit || (kind == NsKind::Class && self.declared_types.contains(&alias.to_lowercase())) {
             return Err(PhpError::compile_fatal(
                 format!(
-                    "Cannot use {} as {} because the name is already in use",
-                    fq, alias
+                    "Cannot use {}{} as {} because the name is already in use",
+                    tag, fq, alias
                 ),
                 self.line(),
             ));
