@@ -738,21 +738,38 @@ impl<'a> Interp<'a> {
         // userland `Generator->{m}()` resume renders the engine
         // stack instead.
         if self.iter_calls > 0 {
-            let fn_name = {
+            let (fn_name, call_args) = {
                 let st = state.borrow();
                 match &st.setup {
-                    GenSetup::Invoke { decl, .. } => decl.name.clone(),
+                    GenSetup::Invoke { decl, args, .. } => {
+                        let a = args
+                            .cells
+                            .iter()
+                            .map(|c| crate::value::trace_arg(&c.borrow()))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        (decl.name.clone(), a)
+                    }
                 }
             };
-            // The resume frame cites the consumer's current site —
-            // the foreach header driving the iteration, not the
-            // `g()` that minted the generator.
-            let mut frames = vec![format!(
-                "{}({}): {}()",
+            // Frames suspended between the throw site and the gen
+            // body (autoloads, nested calls) sit deepest, then the
+            // gen's resume frame — citing the consumer's current
+            // site (the foreach header) with the gen's original
+            // call args — under the consumer's stack.
+            let mut frames: Vec<String> = raise_frames
+                .iter()
+                .rev()
+                .enumerate()
+                .map(|(i, f)| crate::value::trace_frame_str_at(f, i))
+                .collect();
+            frames.push(format!(
+                "{}({}): {}({})",
                 self.diag_file(),
                 self.cur_line,
-                fn_name
-            )];
+                fn_name,
+                call_args
+            ));
             for fr in self.call_trace.iter().rev() {
                 if crate::value::trace_frame_hidden(fr) {
                     continue;
