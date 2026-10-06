@@ -237,29 +237,27 @@ impl<'a> Interp<'a> {
                         let (items, death) = self.yield_from_collect(&v);
                         self.gen_collect_base = saved_cbase;
                         self.iter_calls -= 1;
+                        let inner_len = items.len();
                         sink.borrow_mut().extend(items);
                         // A gen suspended inside `yield from` shares
                         // the OUTER gen's destruction: its destruction
                         // journal (snapshotted at its start, before
                         // the drain pruned it) merges into the
-                        // parent's, retagged into the parent's item
-                        // space — oracle replays inner+outer finally
-                        // together at the outer's unset/shutdown.
-                        if let Some(inner_fin) = self.gen_yield_from_fin.take() {
+                        // parent's — tags retagged into the parent's
+                        // item space and the splice range recorded, so
+                        // the replay fires only while the consumer's
+                        // cursor is inside the delegate's stream (Zend
+                        // force-closes just the actually-suspended
+                        // delegation chain — a delegate never reached
+                        // replays nothing).
+                        if let Some(mut inner_fin) = self.gen_yield_from_fin.take() {
                             if let Some(q) = &self.gen_fin_q {
-                                let mut pq = q.borrow_mut();
-                                for (t, b, e) in inner_fin.bytes {
-                                    pq.bytes.push((base + t, b, e));
-                                }
-                                for (t, l) in inner_fin.yields {
-                                    pq.yields.push((base + t, l));
-                                }
-                                if pq.fin_err.is_none() {
-                                    pq.fin_err = inner_fin.fin_err;
-                                }
-                                if pq.injected.is_none() {
-                                    pq.injected = inner_fin.injected.map(|(v, i)| (v, base + i));
-                                }
+                                inner_fin.retag(base);
+                                q.borrow_mut().delegates.push(crate::value::FinDelegate {
+                                    entry: base,
+                                    span: inner_len,
+                                    fin: inner_fin,
+                                });
                             }
                         }
                         match death {

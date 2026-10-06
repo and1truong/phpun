@@ -1561,13 +1561,12 @@ impl<'a> Interp<'a> {
             return result;
         }
         let flow = self.exec_block(stmts);
-        // Request-end GC: generators still suspended replay their
-        // enclosing finally chains before the result is tallied — a
-        // raise there becomes the unit's own error.
-        let flow = match self.gen_gc_sweep(true) {
-            Err(e) if matches!(flow, Flow::Normal | Flow::Return(_)) => self.err_flow(e),
-            _ => flow,
-        };
+        // Generators still suspended at request end replay their
+        // enclosing finally chains during shutdown — Zend renders a
+        // terminal error first, then tears objects down (shutdown
+        // functions, CV teardown, object store). The sweep inside
+        // run_shutdown raises a destruction-time error as a second
+        // fatal.
         let mut result = self.finish(flow);
         if let Some(c) = self.run_shutdown() {
             result.exit_code = c;
@@ -1705,6 +1704,31 @@ impl<'a> Interp<'a> {
             if Rc::strong_count(&o) != 2 {
                 continue;
             }
+            // A suspended generator torn down here replays its
+            // finally journal at its own slot in the teardown order
+            // — Zend kills the generator handle when the global var
+            // frees it, interleaved with real __destruct calls.
+            let gen_q = match &o.borrow().internal {
+                Some(crate::value::ObjectInternal::Generator(st)) => {
+                    Some(st.borrow().fin_q.clone())
+                }
+                _ => None,
+            };
+            if let Some(q) = gen_q {
+                if let Some(e) = self.gen_fin_replay(&q, true) {
+                    shutdown_code = Some(match self.err_flow(e) {
+                        Flow::Exit(c) => c,
+                        Flow::Throw(v) => {
+                            self.uncaught(&v);
+                            255
+                        }
+                        _ => 255,
+                    });
+                    dtor_stop = true;
+                    break;
+                }
+                continue;
+            }
             if self
                 .find_method_in(&o.borrow().class, "__destruct")
                 .is_some()
@@ -1771,6 +1795,20 @@ impl<'a> Interp<'a> {
                     break;
                 }
             }
+        }
+        // Generators still suspended — not torn down through the CV
+        // pass above (locals, containers, live references) — force
+        // close now: Zend kills every remaining generator handle at
+        // request end, newest first.
+        if let Err(e) = self.gen_gc_sweep(true) {
+            shutdown_code = Some(match self.err_flow(e) {
+                Flow::Exit(c) => c,
+                Flow::Throw(v) => {
+                    self.uncaught(&v);
+                    255
+                }
+                _ => 255,
+            });
         }
         if !self.mem_exceeded {
             self.flush_ob_all();
@@ -2557,31 +2595,89 @@ impl<'a> Interp<'a> {
         if self.live_gens.is_empty() {
             return Ok(());
         }
-        let entries = std::mem::take(&mut self.live_gens);
+        let mut entries = std::mem::take(&mut self.live_gens);
+        // Request teardown destroys newest handles first.
+        if at_unit_end {
+            entries.reverse();
+        }
         let mut terminal = None;
         for (weak, q) in entries {
-            let fin = std::mem::take(&mut *q.borrow_mut());
             let dead = weak.upgrade().is_none();
             if !dead && !at_unit_end {
                 // Still suspended — keep watching it.
-                *q.borrow_mut() = fin;
                 self.live_gens.push((weak, q));
                 continue;
             }
-            for (_, b, is_err) in &fin.bytes {
-                if *is_err {
-                    self.diag_stderr(&String::from_utf8_lossy(b));
-                } else {
-                    self.emit_bytes(b);
-                }
-            }
             if terminal.is_none() {
-                terminal = self.gen_fin_terminal(&fin, at_unit_end);
+                terminal = self.gen_fin_replay(&q, at_unit_end);
+            } else if !dead {
+                // Teardown stopped at the first raise — keep the
+                // rest watched for a later destruction point.
+                self.live_gens.push((weak, q));
             }
         }
         match terminal {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+
+    /// Drain one gen's destruction journal: emit the suspended
+    /// delegation chain's queued finally output (innermost level
+    /// first) and return the level's own terminal raise — the
+    /// `yield`-inside-`finally` fatal, the parked throw() throwable,
+    /// or the body's `finally`-region death.
+    pub(in crate::interp) fn gen_fin_replay(
+        &mut self,
+        q: &crate::value::FinQueue,
+        at_unit_end: bool,
+    ) -> Option<PhpError> {
+        let fin = std::mem::take(&mut *q.borrow_mut());
+        let pos = fin.pos;
+        self.gen_fin_emit(&fin, pos, at_unit_end)
+    }
+
+    /// Emit a journal's queued bytes for the suspended chain the
+    /// consumer is inside, innermost level first, then the level's
+    /// own bytes, then its terminal raise.
+    fn gen_fin_emit(
+        &mut self,
+        fin: &crate::value::GenFinData,
+        pos: usize,
+        at_unit_end: bool,
+    ) -> Option<PhpError> {
+        for d in fin.active_delegates_at(pos) {
+            if let Some(e) = self.gen_fin_emit(&d.fin, pos, at_unit_end) {
+                return Some(e);
+            }
+        }
+        self.gen_fin_own_bytes(fin, pos);
+        self.gen_fin_terminal(fin, pos, at_unit_end)
+    }
+
+    /// Bytes-only replay of the suspended chain (innermost first) —
+    /// the `throw()` close path, whose terminal is the injected
+    /// throwable itself.
+    fn gen_fin_bytes(&mut self, fin: &crate::value::GenFinData, pos: usize) {
+        for d in fin.active_delegates_at(pos) {
+            self.gen_fin_bytes(&d.fin, pos);
+        }
+        self.gen_fin_own_bytes(fin, pos);
+    }
+
+    /// This level's output bytes whose tags the consumer hasn't
+    /// passed (already-shown tags were flushed through `pending_out`
+    /// during normal iteration).
+    fn gen_fin_own_bytes(&mut self, fin: &crate::value::GenFinData, pos: usize) {
+        for (t, b, is_err) in &fin.bytes {
+            if *t < pos {
+                continue;
+            }
+            if *is_err {
+                self.diag_stderr(&String::from_utf8_lossy(b));
+            } else {
+                self.emit_bytes(b);
+            }
         }
     }
 
@@ -2593,9 +2689,10 @@ impl<'a> Interp<'a> {
     fn gen_fin_terminal(
         &mut self,
         fin: &crate::value::GenFinData,
+        pos: usize,
         at_unit_end: bool,
     ) -> Option<PhpError> {
-        if let Some((_, yline)) = fin.yields.iter().find(|(i, _)| *i > fin.pos) {
+        if let Some((_, yline)) = fin.yields.iter().find(|(i, _)| *i > pos) {
             let v = self.exception(
                 "Error",
                 "Cannot yield from finally in a force-closed generator",
