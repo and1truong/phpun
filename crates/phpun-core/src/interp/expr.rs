@@ -72,8 +72,13 @@ impl<'a> Interp<'a> {
             Expr::ArrayLit(items) => {
                 let mut arr = PhpArray::new();
                 for (k, v) in items {
+                    // Elements carry an `argline` marker for their own
+                    // first-token line — look past it for the
+                    // by-ref/spread shapes, but eval the marked expr so
+                    // the marker still sets the line.
+                    let shape = Self::unmark_arg(v);
                     // `&$x` elements bind the source cell, not a copy.
-                    if let Expr::ByRef(e) = v {
+                    if let Expr::ByRef(e) = shape {
                         let c = self.eval_cell(e)?;
                         self.mark_ref(&c);
                         match k {
@@ -101,7 +106,7 @@ impl<'a> Interp<'a> {
                         None => {
                             // `...$it` spread: int keys renumber
                             // positionally, string keys set (PHP 8.1+).
-                            if let Expr::Unpack(e) = v {
+                            if let Expr::Unpack(e) = shape {
                                 let sv = self.eval(e)?;
                                 for (sk, c) in self.unpack_items(&sv)? {
                                     match sk {
@@ -878,6 +883,9 @@ impl<'a> Interp<'a> {
     ///                 directly (bug71359).
     fn isset_val_mode(&mut self, e: &Expr, mode: u8) -> Result<Option<Value>, PhpError> {
         match e {
+            Expr::Binary {
+                op: "argline", r, ..
+            } => self.isset_val_mode(r, mode),
             Expr::Var(n) => Ok(match self.var_cell_opt(n) {
                 Some(c) => match &*c.borrow() {
                     Value::Null => None,
@@ -1285,10 +1293,13 @@ impl<'a> Interp<'a> {
             }
         }
         if op == "=&" {
+            // Shape checks on the source see through the arg's
+            // line marker (`$a =& ($b)` is still a Var source).
+            let value_u = Self::unmark_arg(value);
             // zend refuses the $GLOBALS table itself as a by-ref source
             // (compile error `Cannot acquire reference to $GLOBALS`) —
             // element access $GLOBALS['x'] is fine.
-            if let Expr::Var(n) = value {
+            if let Expr::Var(n) = value_u {
                 if n == "GLOBALS" {
                     // Engine-side fatal — zend prints the
                     // `Stack trace:\n#0 {main}` block too.
@@ -1299,7 +1310,7 @@ impl<'a> Interp<'a> {
                 }
             }
             // By-reference assignment: bind cells.
-            let src = match value {
+            let src = match value_u {
                 Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. } => {
                     let (c, was_ref) = self.eval_call_cell(value)?;
                     if !was_ref {
@@ -1312,7 +1323,7 @@ impl<'a> Interp<'a> {
                     // A `=&` source that is itself a typed-prop slot
                     // carries that prop's declared type into the
                     // conflict check (typed_properties_068/076).
-                    let decl = match value {
+                    let decl = match value_u {
                         Expr::Prop { obj, name, .. } => {
                             let ov = self.eval(obj)?;
                             match (&ov, self.prop_name(name)) {
@@ -1656,6 +1667,19 @@ impl<'a> Interp<'a> {
     /// and object props alias their storage.
     pub(in crate::interp) fn eval_cell(&mut self, e: &Expr) -> Result<Cell, PhpError> {
         match e {
+            // `argline` marker: set the line, then keep binding a real
+            // cell for the inner shape (by-ref args, list targets).
+            Expr::Binary {
+                op: "argline",
+                l,
+                r,
+            } => {
+                if let Expr::Int(n) = l.as_ref() {
+                    self.cur_line = *n as usize;
+                    self.send_line = Some(*n as usize);
+                }
+                self.eval_cell(r)
+            }
             Expr::Var(n) => Ok(self.var_cell(n)),
             Expr::Index { e, i } => self.index_cell(e, i.as_deref()),
             Expr::Prop {
@@ -2857,7 +2881,72 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// The line a sub-expression's `argline` marker records, if any.
+    fn marked_line(e: &Expr) -> Option<usize> {
+        match e {
+            Expr::Binary {
+                op: "argline", l, ..
+            } => match l.as_ref() {
+                Expr::Int(n) => Some(*n as usize),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn index_read(&mut self, e: &Expr, i: Option<&Expr>) -> Result<Value, PhpError> {
+        // zend_compile_dim emits the dim expression's ops BEFORE the
+        // container's for delayed containers — a CV (or varnode: varvar/
+        // prop/static-prop) base binds inside the FETCH_DIM op, so its
+        // warnings follow the dim's and site at the dim's line.
+        // Non-delayable containers (calls, subscript results, literals)
+        // are real ops that emit first — base then dim.
+        let dim_simple = i.map(|i| {
+            let i = Self::unmark_arg(i);
+            matches!(i, Expr::Var(_)) || is_compile_const(i)
+        });
+        let delayed = matches!(
+            e,
+            Expr::Var(_) | Expr::VarVar(_) | Expr::Prop { .. } | Expr::StaticProp { .. }
+        );
+        if delayed && dim_simple != Some(true) {
+            // Complex dim: its ops run first (inner warnings at their
+            // own lines). A CV base binds inside the FETCH_DIM at the
+            // dim's line; varnode bases (varvar/prop/static-prop) emit
+            // their own op after the dim's at the container's own line.
+            let (base_line, base_send) = (self.cur_line, self.send_line);
+            let key = match i {
+                Some(ie) => self.eval(ie)?,
+                None => {
+                    return self.fail(PhpError::fatal("[] used in read context", 0));
+                }
+            };
+            if matches!(e, Expr::Var(_)) {
+                if let Some(l) = i.and_then(Self::marked_line) {
+                    self.cur_line = l;
+                    self.send_line = Some(l);
+                }
+            } else {
+                self.cur_line = base_line;
+                self.send_line = base_send;
+            }
+            let base = self.eval(e)?;
+            // The FETCH's own diagnostics (offset warnings, key checks)
+            // site at the dim's line.
+            if let Some(l) = i.and_then(Self::marked_line) {
+                self.cur_line = l;
+                self.send_line = Some(l);
+            }
+            return self.index_read_base(base, key);
+        }
+        // Simple dim (CV/const binds inside the op): the FETCH_DIM sites
+        // a CV container's warning at the dim's line.
+        if matches!(e, Expr::Var(_)) {
+            if let Some(l) = i.and_then(Self::marked_line) {
+                self.cur_line = l;
+                self.send_line = Some(l);
+            }
+        }
         // Base evaluates before the index expr (left-to-right).
         let base = self.eval(e)?;
         let key = match i {
@@ -4066,11 +4155,15 @@ impl<'a> Interp<'a> {
                 self.compare_op(op, l, r, &lv, &rv)
             }
             "named" => self.eval(r), // named-arg marker: value passthrough
-            // `argline` (call-arg line marker): diagnostics during the
-            // arg's eval attribute to its own line (zend per-op lines).
+            // `argline` (line marker on call args and their inner
+            // sub-expressions): diagnostics during the eval attribute
+            // to the operand's own first-token line (zend per-op
+            // lines); `send_line` tracks it so engine throws and
+            // engine-dispatched callbacks site there too.
             "argline" => {
                 if let Expr::Int(n) = l {
                     self.cur_line = *n as usize;
+                    self.send_line = Some(*n as usize);
                 }
                 self.eval(r)
             }
@@ -4086,12 +4179,15 @@ impl<'a> Interp<'a> {
     /// assigned value. Other left expressions evaluate normally first
     /// (execution_order).
     fn binary_operands(&mut self, l: &Expr, r: &Expr) -> Result<(Value, Value), PhpError> {
-        if let Expr::Var(n) = l {
+        // The operand line markers must not mask the plain-CV shape
+        // (or the deferred read would warn at the var's own line
+        // instead of the op's right-operand line).
+        if let Expr::Var(n) = Self::unmark_arg(l) {
             let c = self.var_cell_opt(n);
             let rv = self.eval(r)?;
             let lv = match c {
                 Some(c) => c.borrow().clone(),
-                None => self.eval(l)?,
+                None => self.eval(Self::unmark_arg(l))?,
             };
             return Ok((lv, rv));
         }
@@ -4119,7 +4215,10 @@ impl<'a> Interp<'a> {
         // `<`/`<=`/`<=>` aren't commutative (source order kept); `>`/`>=`
         // emit as IS_SMALLER(_OR_EQUAL) on the reversed nodes.
         let (a, b) = match op {
-            "==" | "!=" | "===" | "!==" if compare_operand_rank(l) < compare_operand_rank(r) => {
+            "==" | "!=" | "===" | "!=="
+                if compare_operand_rank(Self::unmark_arg(l))
+                    < compare_operand_rank(Self::unmark_arg(r)) =>
+            {
                 (b, a)
             }
             _ => (a, b),

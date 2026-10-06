@@ -401,10 +401,11 @@ impl<'a> Parser<'a> {
                 let mut e = Expr::Var(n);
                 loop {
                     if self.eat_op("[") {
+                        let il = self.line();
                         let i = if self.at_op("]") {
                             None
                         } else {
-                            Some(Box::new(self.expr()?))
+                            Some(Box::new(Self::markline(self.expr()?, il)))
                         };
                         self.expect_op("]")?;
                         e = Expr::Index { e: Box::new(e), i };
@@ -456,6 +457,7 @@ impl<'a> Parser<'a> {
     pub(in crate::parser) fn match_expr(&mut self) -> Result<Expr, PhpError> {
         self.pos += 1; // match
         self.expect_op("(")?;
+        let sl = self.line();
         let subject = self.expr()?;
         self.expect_op(")")?;
         self.expect_op("{")?;
@@ -463,28 +465,34 @@ impl<'a> Parser<'a> {
         while !self.at_op("}") {
             if self.eat_ident("default") {
                 self.expect_op("=>")?;
+                let rl = self.line();
                 let r = self.expr()?;
                 arms.push(MatchArm {
                     conds: Vec::new(),
-                    result: r,
+                    result: Self::markline(r, rl),
                 });
             } else {
-                let mut conds = vec![self.expr()?];
-                while self.eat_op(",") {
-                    if self.at_op("=>") {
+                let mut conds = Vec::new();
+                loop {
+                    let cl = self.line();
+                    conds.push(Self::markline(self.expr()?, cl));
+                    if !self.eat_op(",") || self.at_op("=>") {
                         break;
                     }
-                    conds.push(self.expr()?);
                 }
                 self.expect_op("=>")?;
+                let rl = self.line();
                 let r = self.expr()?;
-                arms.push(MatchArm { conds, result: r });
+                arms.push(MatchArm {
+                    conds,
+                    result: Self::markline(r, rl),
+                });
             }
             self.eat_op(",");
         }
         self.expect_op("}")?;
         Ok(Expr::Match {
-            subject: Box::new(subject),
+            subject: Box::new(Self::markline(subject, sl)),
             arms,
         })
     }
@@ -511,8 +519,9 @@ impl<'a> Parser<'a> {
         // `?? throw`, ternary arms, match arms, arrow-fn bodies.
         if self.ident_is("throw") {
             self.pos += 1;
+            let tl = self.line();
             let e = self.assign()?;
-            return Ok(Expr::Throw(Box::new(e)));
+            return Ok(Expr::Throw(Box::new(Self::markline(e, tl))));
         }
         let e = self.ternary()?;
 
@@ -523,12 +532,13 @@ impl<'a> Parser<'a> {
                 if op == "=" && self.eat_op("&") {
                     op = "=&"; // by-reference assignment
                 }
+                let rl = self.line();
                 let rhs = self.assign()?;
                 let target = self.list_target(e)?;
                 return Ok(Expr::Assign {
                     target: Box::new(target),
                     op,
-                    value: Box::new(rhs),
+                    value: Box::new(Self::markline(rhs, rl)),
                 });
             }
         }
@@ -541,7 +551,7 @@ impl<'a> Parser<'a> {
             Expr::ArrayLit(items) => Ok(Expr::List(
                 items
                     .into_iter()
-                    .map(|(_, v)| match v {
+                    .map(|(_, v)| match Self::unmark_argline(v) {
                         Expr::Null => None,
                         other => Some(other),
                     })
@@ -559,67 +569,89 @@ impl<'a> Parser<'a> {
                     site,
                 }),
             },
-            other => Ok(other),
+            // Lvalue targets can't carry the arg's line marker —
+            // `($x) = 1` must still resolve to a Var target.
+            other => Ok(Self::unmark_argline(other)),
+        }
+    }
+
+    /// Wrap a sub-expression in an `argline` marker: diagnostics
+    /// raised while evaluating it report `line` — the sub-expression's
+    /// own first-token line, Zend's per-operand op attribution.
+    pub(in crate::parser) fn markline(e: Expr, line: usize) -> Expr {
+        Expr::Binary {
+            op: "argline",
+            l: Box::new(Expr::Int(line as i64)),
+            r: Box::new(e),
         }
     }
 
     pub(in crate::parser) fn ternary(&mut self) -> Result<Expr, PhpError> {
+        let cline = self.line();
         let c = self.logical_or()?;
         if self.eat_op("?") {
             if self.at_op(":") {
                 self.pos += 1;
+                let fl = self.line();
                 let f = self.assign()?;
                 return Ok(Expr::Ternary {
                     c: Box::new(c),
                     t: None,
-                    f: Box::new(f),
+                    f: Box::new(Self::markline(f, fl)),
                 });
             }
+            let tl = self.line();
             let t = self.ternary()?;
             self.expect_op(":")?;
+            let fl = self.line();
             let f = self.ternary()?;
             return Ok(Expr::Ternary {
                 c: Box::new(c),
-                t: Some(Box::new(t)),
-                f: Box::new(f),
+                t: Some(Box::new(Self::markline(t, tl))),
+                f: Box::new(Self::markline(f, fl)),
             });
         }
         if self.eat_op("??") {
+            let rline = self.line();
             let r = self.assign()?;
             return Ok(Expr::Binary {
                 op: "??",
-                l: Box::new(c),
-                r: Box::new(r),
+                l: Box::new(Self::markline(c, cline)),
+                r: Box::new(Self::markline(r, rline)),
             });
         }
         Ok(c)
     }
 
     pub(in crate::parser) fn logical_or(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
         let mut e = self.logical_and()?;
         loop {
             if self.eat_op("||") {
+                let rline = self.line();
                 let r = self.logical_and()?;
                 e = Expr::Binary {
                     op: "||",
-                    l: Box::new(e),
-                    r: Box::new(r),
+                    l: Box::new(Self::markline(e, lline)),
+                    r: Box::new(Self::markline(r, rline)),
                 };
             } else if self.ident_is("or") {
                 self.pos += 1;
+                let rline = self.line();
                 let r = self.logical_and()?;
                 e = Expr::Binary {
                     op: "||",
-                    l: Box::new(e),
-                    r: Box::new(r),
+                    l: Box::new(Self::markline(e, lline)),
+                    r: Box::new(Self::markline(r, rline)),
                 };
             } else if self.ident_is("xor") {
                 self.pos += 1;
+                let rline = self.line();
                 let r = self.logical_and()?;
                 e = Expr::Binary {
                     op: "xor",
-                    l: Box::new(e),
-                    r: Box::new(r),
+                    l: Box::new(Self::markline(e, lline)),
+                    r: Box::new(Self::markline(r, rline)),
                 };
             } else {
                 return Ok(e);
@@ -628,22 +660,25 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn logical_and(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
         let mut e = self.equality()?;
         loop {
             if self.eat_op("&&") {
+                let rline = self.line();
                 let r = self.equality()?;
                 e = Expr::Binary {
                     op: "&&",
-                    l: Box::new(e),
-                    r: Box::new(r),
+                    l: Box::new(Self::markline(e, lline)),
+                    r: Box::new(Self::markline(r, rline)),
                 };
             } else if self.ident_is("and") {
                 self.pos += 1;
+                let rline = self.line();
                 let r = self.equality()?;
                 e = Expr::Binary {
                     op: "&&",
-                    l: Box::new(e),
-                    r: Box::new(r),
+                    l: Box::new(Self::markline(e, lline)),
+                    r: Box::new(Self::markline(r, rline)),
                 };
             } else {
                 return Ok(e);
@@ -652,6 +687,7 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn equality(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
         let mut e = self.comparison()?;
         loop {
             let op = match self.peek() {
@@ -664,16 +700,18 @@ impl<'a> Parser<'a> {
                 _ => return Ok(e),
             };
             self.pos += 1;
+            let rline = self.line();
             let r = self.comparison()?;
             e = Expr::Binary {
                 op,
-                l: Box::new(e),
-                r: Box::new(r),
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
             };
         }
     }
 
     pub(in crate::parser) fn comparison(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
         let mut e = self.concat()?;
         loop {
             let op = match self.peek() {
@@ -684,69 +722,79 @@ impl<'a> Parser<'a> {
                 _ => return Ok(e),
             };
             self.pos += 1;
+            let rline = self.line();
             let r = self.concat()?;
             e = Expr::Binary {
                 op,
-                l: Box::new(e),
-                r: Box::new(r),
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
             };
         }
     }
 
     /// `.` binds tighter than `+`/`-` since PHP 8.0.
     pub(in crate::parser) fn concat(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
         let mut e = self.bit_or()?;
         while self.eat_op(".") {
+            let rline = self.line();
             let r = self.bit_or()?;
             e = Expr::Binary {
                 op: ".",
-                l: Box::new(e),
-                r: Box::new(r),
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
             };
         }
         Ok(e)
     }
 
     pub(in crate::parser) fn bit_or(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
         let mut e = self.bit_xor()?;
         while self.eat_op("|") {
+            let rline = self.line();
             let r = self.bit_xor()?;
             e = Expr::Binary {
                 op: "|",
-                l: Box::new(e),
-                r: Box::new(r),
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
             };
         }
         Ok(e)
     }
 
     pub(in crate::parser) fn bit_xor(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
         let mut e = self.bit_and()?;
         while self.eat_op("^") {
+            let rline = self.line();
             let r = self.bit_and()?;
             e = Expr::Binary {
                 op: "^",
-                l: Box::new(e),
-                r: Box::new(r),
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
             };
         }
         Ok(e)
     }
 
     pub(in crate::parser) fn bit_and(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
         let mut e = self.shift()?;
         while self.eat_op("&") {
+            let rline = self.line();
             let r = self.shift()?;
             e = Expr::Binary {
                 op: "&",
-                l: Box::new(e),
-                r: Box::new(r),
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
             };
         }
         Ok(e)
     }
 
     pub(in crate::parser) fn shift(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
         let mut e = self.additive()?;
         loop {
             let op = if self.eat_op("<<") {
@@ -756,16 +804,18 @@ impl<'a> Parser<'a> {
             } else {
                 return Ok(e);
             };
+            let rline = self.line();
             let r = self.additive()?;
             e = Expr::Binary {
                 op,
-                l: Box::new(e),
-                r: Box::new(r),
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
             };
         }
     }
 
     pub(in crate::parser) fn additive(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
         let mut e = self.term()?;
         loop {
             let op = match self.peek() {
@@ -774,16 +824,18 @@ impl<'a> Parser<'a> {
                 _ => return Ok(e),
             };
             self.pos += 1;
+            let rline = self.line();
             let r = self.term()?;
             e = Expr::Binary {
                 op,
-                l: Box::new(e),
-                r: Box::new(r),
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
             };
         }
     }
 
     pub(in crate::parser) fn term(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
         let mut e = self.power()?;
         loop {
             let op = match self.peek() {
@@ -793,24 +845,27 @@ impl<'a> Parser<'a> {
                 _ => return Ok(e),
             };
             self.pos += 1;
+            let rline = self.line();
             let r = self.power()?;
             e = Expr::Binary {
                 op,
-                l: Box::new(e),
-                r: Box::new(r),
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
             };
         }
     }
 
     /// `**` is right-associative and binds tighter than unary minus.
     pub(in crate::parser) fn power(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
         let e = self.unary()?;
         if self.eat_op("**") {
+            let rline = self.line();
             let r = self.power()?;
             return Ok(Expr::Binary {
                 op: "**",
-                l: Box::new(e),
-                r: Box::new(r),
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
             });
         }
         Ok(e)
@@ -818,35 +873,39 @@ impl<'a> Parser<'a> {
 
     pub(in crate::parser) fn unary(&mut self) -> Result<Expr, PhpError> {
         if self.eat_op("!") {
+            let el = self.line();
             let e = self.unary()?;
             return Ok(Expr::Unary {
                 op: "!",
-                e: Box::new(e),
+                e: Box::new(Self::markline(e, el)),
             });
         }
         if self.eat_op("-") {
+            let el = self.line();
             let e = self.unary()?;
             return Ok(Expr::Unary {
                 op: "-",
-                e: Box::new(e),
+                e: Box::new(Self::markline(e, el)),
             });
         }
         if self.eat_op("+") {
+            let el = self.line();
             let e = self.unary()?;
             return Ok(Expr::Unary {
                 op: "+",
-                e: Box::new(e),
+                e: Box::new(Self::markline(e, el)),
             });
         }
         if self.eat_op("~") {
+            let el = self.line();
             let e = self.unary()?;
             return Ok(Expr::Unary {
                 op: "~",
-                e: Box::new(e),
+                e: Box::new(Self::markline(e, el)),
             });
         }
         if self.eat_op("++") {
-            let e = self.unary()?;
+            let e = Self::unmark_argline(self.unary()?);
             if matches!(
                 e,
                 Expr::Call { .. }
@@ -862,7 +921,7 @@ impl<'a> Parser<'a> {
             return Ok(Expr::PreInc(Box::new(e)));
         }
         if self.eat_op("--") {
-            let e = self.unary()?;
+            let e = Self::unmark_argline(self.unary()?);
             if matches!(
                 e,
                 Expr::Call { .. }
@@ -879,16 +938,18 @@ impl<'a> Parser<'a> {
         }
         if self.eat_op("@") {
             // Error suppression — parsed; runtime treats as no-op for now.
+            let el = self.line();
             let e = self.unary()?;
             return Ok(Expr::Unary {
                 op: "@",
-                e: Box::new(e),
+                e: Box::new(Self::markline(e, el)),
             });
         }
         if self.ident_is("clone") {
             self.pos += 1;
+            let el = self.line();
             let e = self.unary()?;
-            return Ok(Expr::Clone(Box::new(e)));
+            return Ok(Expr::Clone(Box::new(Self::markline(e, el))));
         }
         // `(type)` cast: (int) (integer) (float) (real) (double) (string)
         // (binary) (bool) (boolean) (array) (object) (unset)
@@ -910,10 +971,11 @@ impl<'a> Parser<'a> {
                         Some(Token::Op(")"))
                     ) {
                         self.pos += 3; // ( type )
+                        let el = self.line();
                         let e = self.unary()?;
                         return Ok(Expr::Cast {
                             kind,
-                            e: Box::new(e),
+                            e: Box::new(Self::markline(e, el)),
                         });
                     }
                 }
@@ -923,7 +985,7 @@ impl<'a> Parser<'a> {
         // `instanceof` binds between unary and relational ops.
         while self.ident_is("instanceof") {
             self.pos += 1;
-            let mut c = self.unary()?;
+            let mut c = Self::unmark_argline(self.unary()?);
             if let Expr::Const(n) = &c {
                 c = Expr::Const(self.ns_resolve(n, NsKind::Class));
             }
@@ -966,8 +1028,9 @@ impl<'a> Parser<'a> {
         let mut e = self.primary()?;
         loop {
             if self.eat_op("++") {
+                let e_u = Self::unmark_argline(e);
                 if matches!(
-                    e,
+                    e_u,
                     Expr::Call { .. }
                         | Expr::MethodCall { .. }
                         | Expr::StaticCall { .. }
@@ -978,10 +1041,11 @@ impl<'a> Parser<'a> {
                         self.line(),
                     ));
                 }
-                e = Expr::PostInc(Box::new(e));
+                e = Expr::PostInc(Box::new(e_u));
             } else if self.eat_op("--") {
+                let e_u = Self::unmark_argline(e);
                 if matches!(
-                    e,
+                    e_u,
                     Expr::Call { .. }
                         | Expr::MethodCall { .. }
                         | Expr::StaticCall { .. }
@@ -992,12 +1056,13 @@ impl<'a> Parser<'a> {
                         self.line(),
                     ));
                 }
-                e = Expr::PostDec(Box::new(e));
+                e = Expr::PostDec(Box::new(e_u));
             } else if self.eat_op("[") {
+                let il = self.line();
                 let i = if self.at_op("]") {
                     None
                 } else {
-                    Some(Box::new(self.expr()?))
+                    Some(Box::new(Self::markline(self.expr()?, il)))
                 };
                 self.expect_op("]")?;
                 e = Expr::Index { e: Box::new(e), i };
@@ -1362,12 +1427,13 @@ impl<'a> Parser<'a> {
 
     /// Inverse of the `argline` wrapper — for consumers whose arg
     /// lists are not evaluated by the call machinery (attribute args,
-    /// `list()` destructuring targets).
+    /// `list()` destructuring targets, lvalue targets). Recursive:
+    /// nested parens stack markers.
     pub(in crate::parser) fn unmark_argline(e: Expr) -> Expr {
         match e {
             Expr::Binary {
                 op: "argline", r, ..
-            } => *r,
+            } => Self::unmark_argline(*r),
             e => e,
         }
     }
@@ -1377,9 +1443,10 @@ impl<'a> Parser<'a> {
             Some(Token::Ident(n)) => Ok(PropName::Name(n)),
             Some(Token::Variable(n)) => Ok(PropName::Var(n)),
             Some(Token::Op("{")) => {
+                let el = self.line();
                 let e = self.expr()?;
                 self.expect_op("}")?;
-                Ok(PropName::Expr(Box::new(e)))
+                Ok(PropName::Expr(Box::new(Self::markline(e, el))))
             }
             // `$obj->${expr}` / `$obj->$$var` — variable-variable: the prop
             // name is the VALUE of the variable named by the expr
@@ -1387,9 +1454,12 @@ impl<'a> Parser<'a> {
             Some(Token::Op("$")) => {
                 if self.at_op("{") {
                     self.pos += 1;
+                    let el = self.line();
                     let e = self.expr()?;
                     self.expect_op("}")?;
-                    Ok(PropName::Expr(Box::new(Expr::VarVar(Box::new(e)))))
+                    Ok(PropName::Expr(Box::new(Expr::VarVar(Box::new(
+                        Self::markline(e, el),
+                    )))))
                 } else {
                     match self.next() {
                         Some(Token::Variable(n)) => Ok(PropName::Expr(Box::new(Expr::VarVar(
@@ -1439,14 +1509,15 @@ impl<'a> Parser<'a> {
             }
             Some(Token::Op("(")) => {
                 self.pos += 1;
+                let el = self.line();
                 let e = self.expr()?;
                 self.expect_op(")")?;
                 // Mark parenthesized class-prop refs so `(X::$p)::m()`
                 // is not confused with the `X::$p::m()` hook syntax.
                 Ok(if matches!(e, Expr::StaticProp { .. }) {
-                    Expr::Paren(Box::new(e))
+                    Expr::Paren(Box::new(Self::markline(e, el)))
                 } else {
-                    e
+                    Self::markline(e, el)
                 })
             }
             Some(Token::Op("[")) => {
@@ -1507,8 +1578,9 @@ impl<'a> Parser<'a> {
                     // `yield from <it>` splices another iterable's items.
                     if self.ident_is("from") {
                         self.pos += 1;
+                        let el = self.line();
                         let e = self.assign()?;
-                        return Ok(Expr::YieldFrom(Box::new(e)));
+                        return Ok(Expr::YieldFrom(Box::new(Self::markline(e, el))));
                     }
                     // Operand is optional: `yield;` / `(yield)` / `f(yield)`
                     // / `yield ,` in list contexts push a null value.
@@ -1526,31 +1598,35 @@ impl<'a> Parser<'a> {
                             val: None,
                         });
                     }
+                    let kl = self.line();
                     let first = self.assign()?;
                     // `yield k => v`
                     if self.at_op("=>") {
                         self.pos += 1;
+                        let vl = self.line();
                         let v = self.assign()?;
                         return Ok(Expr::Yield {
-                            key: Some(Box::new(first)),
-                            val: Some(Box::new(v)),
+                            key: Some(Box::new(Self::markline(first, kl))),
+                            val: Some(Box::new(Self::markline(v, vl))),
                         });
                     }
                     Ok(Expr::Yield {
                         key: None,
-                        val: Some(Box::new(first)),
+                        val: Some(Box::new(Self::markline(first, kl))),
                     })
                 } else if self.ident_is("print") {
                     self.pos += 1;
+                    let el = self.line();
                     let e = self.expr()?;
-                    Ok(Expr::Print(Box::new(e)))
+                    Ok(Expr::Print(Box::new(Self::markline(e, el))))
                 } else if self.ident_is("exit") || self.ident_is("die") {
                     self.pos += 1;
                     let arg = if self.eat_op("(") {
                         let a = if self.at_op(")") {
                             None
                         } else {
-                            Some(Box::new(self.expr()?))
+                            let al = self.line();
+                            Some(Box::new(Self::markline(self.expr()?, al)))
                         };
                         self.expect_op(")")?;
                         a
@@ -1560,7 +1636,8 @@ impl<'a> Parser<'a> {
                     ) {
                         None
                     } else {
-                        Some(Box::new(self.expr()?))
+                        let al = self.line();
+                        Some(Box::new(Self::markline(self.expr()?, al)))
                     };
                     Ok(Expr::Exit(arg))
                 } else if self.ident_is("array") && matches!(self.peek2(), Some(Token::Op("("))) {
@@ -1633,11 +1710,13 @@ impl<'a> Parser<'a> {
                     // `T_EVAL '(' expr ')'` — its parens are syntax.
                     let e = if kind == IncludeKind::Eval {
                         self.expect_op("(")?;
+                        let el = self.line();
                         let e = self.expr()?;
                         self.expect_op(")")?;
-                        e
+                        Self::markline(e, el)
                     } else {
-                        self.expr()?
+                        let el = self.line();
+                        Self::markline(self.expr()?, el)
                     };
                     Ok(Expr::Include {
                         kind,
@@ -1778,6 +1857,7 @@ impl<'a> Parser<'a> {
                 items.push((None, Expr::Null));
                 continue;
             }
+            let kline = self.line();
             let first = self.array_elem()?;
             if self.eat_op("=>") {
                 if matches!(first, Expr::Unpack(_)) {
@@ -1786,10 +1866,11 @@ impl<'a> Parser<'a> {
                         self.line(),
                     ));
                 }
+                let vline = self.line();
                 let v = self.array_elem()?;
-                items.push((Some(first), v));
+                items.push((Some(Self::markline(first, kline)), Self::markline(v, vline)));
             } else {
-                items.push((None, first));
+                items.push((None, Self::markline(first, kline)));
             }
             if !self.eat_op(",") {
                 break;
@@ -1800,12 +1881,16 @@ impl<'a> Parser<'a> {
     }
 
     /// One array-literal element — may be `&expr` (bound by reference)
-    /// or `...expr` (spread, PHP 7.4+).
+    /// or `...expr` (spread, PHP 7.4+). The inner expr keeps its own
+    /// first-token line so multi-line spreads/by-ref entries site their
+    /// diagnostics on the operand, not the `...`/`&` token.
     pub(in crate::parser) fn array_elem(&mut self) -> Result<Expr, PhpError> {
         if self.eat_op("...") {
-            Ok(Expr::Unpack(Box::new(self.expr()?)))
+            let l = self.line();
+            Ok(Expr::Unpack(Box::new(Self::markline(self.expr()?, l))))
         } else if self.eat_op("&") {
-            Ok(Expr::ByRef(Box::new(self.expr()?)))
+            let l = self.line();
+            Ok(Expr::ByRef(Box::new(Self::markline(self.expr()?, l))))
         } else {
             self.expr()
         }

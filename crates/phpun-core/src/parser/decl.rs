@@ -373,10 +373,11 @@ impl<'a> Parser<'a> {
                 let mut e = Expr::Var(n);
                 while self.at_op("[") {
                     self.pos += 1;
+                    let il = self.line();
                     let i = if self.at_op("]") {
                         None
                     } else {
-                        Some(Box::new(self.expr()?))
+                        Some(Box::new(Self::markline(self.expr()?, il)))
                     };
                     self.expect_op("]")?;
                     e = Expr::Index { e: Box::new(e), i };

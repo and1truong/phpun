@@ -755,8 +755,14 @@ impl<'a> Interp<'a> {
                 // `break (2)` is a parenthesized literal — still valid;
                 // variables/arithmetic are not supported operands.
                 let mut inner = e;
-                while let Expr::Paren(p) = inner {
-                    inner = p;
+                loop {
+                    inner = match inner {
+                        Expr::Paren(p) => p,
+                        Expr::Binary {
+                            op: "argline", r, ..
+                        } => r,
+                        _ => break,
+                    };
                 }
                 match inner {
                     Expr::Int(i) if *i > 0 => *i as u32,

@@ -320,6 +320,20 @@ impl<'a> Interp<'a> {
         sc: &mut ScanScope,
     ) -> Result<(), PhpError> {
         let kw = if is_break { "break" } else { "continue" };
+        // `break (2)`/`break (expr)` — parens and the arg's line
+        // marker wrap the literal; peel both for the operand check.
+        let mut op = op;
+        while let Some(
+            Expr::Paren(inner)
+            | Expr::Binary {
+                op: "argline",
+                r: inner,
+                ..
+            },
+        ) = op
+        {
+            op = Some(inner);
+        }
         let n = match op {
             None => 1usize,
             Some(Expr::Int(i)) => {
