@@ -1714,6 +1714,16 @@ pub struct GenFinData {
     /// Mirrored `GenState::pos` — the object is gone when a dead
     /// weak's entry replays.
     pub pos: usize,
+    /// The body closed or died — its deferred-output journal is
+    /// complete, so every buffered byte it tagged is materialized
+    /// for reads from then on. (Not mirrored from
+    /// `GenState::finished`: eager collection marks that at run end,
+    /// long before the consumer exhausts the items.)
+    pub finished: bool,
+    /// Total items collected by the eager run — the consumer-side
+    /// "exhausted" condition is `pos >= total`, which is when the
+    /// tail bytes (emitted after the last yield) may drain.
+    pub total: usize,
     /// The body's function name and file — destruction-site frames
     /// attribute the raise (`FILE(n): g()` at an unset/overwrite
     /// point, `[internal function]: g()` at request shutdown).
@@ -1740,6 +1750,12 @@ pub struct FinDelegate {
 }
 
 impl GenFinData {
+    /// Whether the consumer has consumed everything the body could
+    /// emit — dead/closed, or the cursor passed the last item.
+    pub fn consumed(&self) -> bool {
+        self.finished || self.pos >= self.total
+    }
+
     /// Shift every item-space index in this journal by `base` —
     /// applied when it merges into a `yield from` parent's item
     /// space.
@@ -1756,6 +1772,17 @@ impl GenFinData {
         for d in &mut self.delegates {
             d.entry += base;
             d.fin.retag(base);
+        }
+    }
+
+    /// Mirror the consumer cursor down the suspended delegation
+    /// chain — a delegate's own journal positions (open/close tags on
+    /// buffers the delegate opened) live in its own item space, offset
+    /// from the parent's by `entry`.
+    pub fn set_pos_tree(&mut self, pos: usize) {
+        self.pos = pos;
+        for d in &mut self.delegates {
+            d.fin.set_pos_tree(pos.saturating_sub(d.entry));
         }
     }
 
@@ -1868,7 +1895,7 @@ impl GenState {
     /// gate on the suspension point.
     pub fn set_pos(&mut self, pos: usize) {
         self.pos = pos;
-        self.fin_q.borrow_mut().pos = pos;
+        self.fin_q.borrow_mut().set_pos_tree(pos);
     }
 }
 

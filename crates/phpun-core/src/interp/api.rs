@@ -10,6 +10,18 @@ impl<'a> Interp<'a> {
     /// Flush all output buffers at script end, innermost first so each
     /// level's handler output lands in its parent's buffer (bug24951).
     pub(in crate::interp) fn flush_ob_all(&mut self) {
+        // Still-open buffers a suspended gen opened are real Zend
+        // stack levels — restore the ones the consumer's cursor
+        // actually reached (in stack order) so the end-of-request
+        // flush covers them; dead capture mirrors (already popped by
+        // the body) and windows whose open tag was never passed are
+        // dropped — Zend never ran those resumes.
+        let sus = std::mem::take(&mut self.suspended_obs);
+        self.ob_stack.extend(sus.into_iter().filter(|l| {
+            l.gen_close.is_none()
+                && l.gen_open
+                    .is_some_and(|o| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos >= o))
+        }));
         while !self.ob_stack.is_empty() {
             let r = self.ob_invoke(8);
             self.ob_stack.pop();
@@ -248,7 +260,9 @@ impl<'a> Interp<'a> {
     }
     pub fn ob_len(&mut self) -> usize {
         self.ob_promote();
-        self.ob_stack.len()
+        // Suspended gen-owned buffers stay on Zend's shared stack
+        // until their window closes — count the live ones too.
+        self.ob_stack.len() + self.ob_suspended_visible()
     }
     pub fn register_shutdown(&mut self, f: Value, args: Vec<Cell>) {
         self.shutdown_fns.push((f, args));

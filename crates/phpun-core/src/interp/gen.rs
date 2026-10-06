@@ -315,6 +315,7 @@ impl<'a> Interp<'a> {
         let collected = std::mem::take(&mut *items.borrow_mut());
         {
             let mut st = state.borrow_mut();
+            st.fin_q.borrow_mut().total = collected.len();
             st.items = collected;
             st.finished = true;
         }
@@ -369,6 +370,7 @@ impl<'a> Interp<'a> {
                 }
                 st.deferred_err = Some((e, throwable, raise_frames, run_fin_err));
                 st.dead = true;
+                st.fin_q.borrow_mut().finished = true;
                 Ok(())
             }
         }
@@ -711,6 +713,7 @@ impl<'a> Interp<'a> {
                         st.closed = true;
                         st.items.clear();
                         st.pending_out.clear();
+                        st.fin_q.borrow_mut().finished = true;
                     }
                     // The injected death is the gen's own — the body's
                     // pending error never ran past that yield.
@@ -1083,6 +1086,7 @@ impl<'a> Interp<'a> {
                     // throw() call.
                     let fq = state.borrow().fin_q.clone();
                     std::mem::take(&mut *fq.borrow_mut());
+                    fq.borrow_mut().finished = true;
                     let mut st = state.borrow_mut();
                     st.finished = true;
                     st.closed = true;
@@ -1119,6 +1123,7 @@ impl<'a> Interp<'a> {
                     let fq = state.borrow().fin_q.clone();
                     let fin = std::mem::take(&mut *fq.borrow_mut());
                     let pos = fin.pos;
+                    fq.borrow_mut().finished = true;
                     self.gen_fin_bytes(&fin, pos);
                     // Zend's closed generator: the kill discards the
                     // buffered item stream — subsequent reads report

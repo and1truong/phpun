@@ -2609,6 +2609,11 @@ impl<'a> Interp<'a> {
                 i += 1;
             }
         }
+        // Dead mirrors (cursor at/past the body's pop) stay dead.
+        self.suspended_obs.retain(|l| {
+            l.gen_close
+                .is_none_or(|c| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos < c))
+        });
         let mut i = 0;
         while i < self.suspended_obs.len() {
             let l = &self.suspended_obs[i];
@@ -2649,29 +2654,29 @@ impl<'a> Interp<'a> {
     }
 
     /// Merge a gen-opened buffer's journaled deferred bytes into its
-    /// buf: entries tagged below the owning gen's consumer cursor
-    /// have already run in stream order — or all of them when `all`
-    /// (a read inside the body itself, where tags are chronological-
-    /// past anyway).
+    /// buf: an entry tagged `t` ran inside the resume that produced
+    /// item `t`, so it lands in the buffer once the cursor passes
+    /// item `t` (`t < pos`) — or all of them for a read inside the
+    /// body itself (`all`), or once the body's gen finished (every
+    /// tag is stream-past).
     fn ob_drain_level(level: &mut ObLevel, all: bool) {
         if level.gen_pending.is_empty() {
             return;
         }
-        let pos = if all {
-            usize::MAX
-        } else {
-            level
-                .gen_q
-                .as_ref()
-                .map(|q| q.borrow().pos)
-                .unwrap_or(usize::MAX)
-        };
-        let split = level
+        let (pos, fin) = level
+            .gen_q
+            .as_ref()
+            .map(|q| {
+                let f = q.borrow();
+                (f.pos, f.consumed())
+            })
+            .unwrap_or((usize::MAX, true));
+        let take = level
             .gen_pending
             .iter()
-            .position(|(t, _)| *t >= pos)
-            .unwrap_or(level.gen_pending.len());
-        for (_, b) in level.gen_pending.drain(..split) {
+            .take_while(|(t, _)| all || fin || *t < pos)
+            .count();
+        for (_, b) in level.gen_pending.drain(..take) {
             level.buf.extend_from_slice(&b);
         }
     }
@@ -2688,6 +2693,21 @@ impl<'a> Interp<'a> {
             };
             Self::ob_drain_level(l, all);
         }
+    }
+
+    /// Stack entries the consumer can see through the suspended-gen
+    /// windows — used by ob_get_level & friends so a detached gen
+    /// buffer still counts like Zend's shared stack.
+    pub(in crate::interp) fn ob_suspended_visible(&self) -> usize {
+        self.suspended_obs
+            .iter()
+            .filter(|l| {
+                l.gen_open
+                    .is_some_and(|t| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos > t))
+                    && l.gen_close
+                        .is_none_or(|c| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos <= c))
+            })
+            .count()
     }
 
     /// Emit generator-deferred output whose suspending yield the
