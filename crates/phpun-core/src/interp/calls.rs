@@ -175,6 +175,42 @@ impl<'a> Interp<'a> {
         self.call_named(&fname, args, site)
     }
 
+    /// The `(file, line)` a pushed call frame or call diagnostic
+    /// attributes its call site to: `"[internal function]", 0` when
+    /// dispatched from inside builtin machinery (internal_cb with an
+    /// internal prev frame — call_user_func* trampolines and frameless
+    /// compile-specialized calls are transparent to the walk), else the
+    /// caller's `file` + the pending `send_line` (falling back to
+    /// `fallback_line` when no send is in flight). `no_frame_internal`
+    /// decides what an empty visible trace means: true = the engine
+    /// itself is the caller (shutdown fns, the dtor sweep); false = a
+    /// plain top-level call.
+    pub(in crate::interp) fn call_site(
+        &self,
+        no_frame_internal: bool,
+        file: String,
+        fallback_line: usize,
+    ) -> (String, u32) {
+        let from_builtin = self.internal_cb > 0
+            && self
+                .call_trace
+                .iter()
+                .rev()
+                .find(|f| !crate::value::trace_frame_hidden(f))
+                .map(|f| f.internal)
+                .unwrap_or(no_frame_internal);
+        if from_builtin {
+            ("[internal function]".to_string(), 0)
+        } else {
+            (
+                file,
+                self.send_line
+                    .map(|l| l as u32)
+                    .unwrap_or(fallback_line as u32),
+            )
+        }
+    }
+
     /// Sees through the parser's `argline` per-arg line marker (every
     /// call arg) to the argument expression itself.
     pub(in crate::interp) fn unmark_arg(e: &Expr) -> &Expr {
@@ -2039,35 +2075,18 @@ impl<'a> Interp<'a> {
         // At shutdown the trace is empty — the engine itself is the
         // caller, which is also `[internal function]` (registered
         // shutdown fns, the dtor sweep).
-        let from_builtin = self.internal_cb > 0
-            && self
-                .call_trace
-                .iter()
-                .rev()
-                .find(|f| !crate::value::trace_frame_hidden(f))
-                .map(|f| f.internal)
-                .unwrap_or(true);
-        let (site_file, site_line) = if from_builtin {
-            ("[internal function]".to_string(), 0)
-        } else {
-            // Call-site file = the frame below the callee (the caller's
-            // executing file); top-level calls report the file currently
-            // being run.
-            let sf = self
-                .stack
-                .iter()
-                .rev()
-                .nth(1)
-                .map(|f| f.file.clone())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| self.cur_file.clone());
-            (
-                sf,
-                self.send_line
-                    .map(|l| l as u32)
-                    .unwrap_or(saved_line as u32),
-            )
-        };
+        // Call-site file = the frame below the callee (the caller's
+        // executing file); top-level calls report the file currently
+        // being run.
+        let sf = self
+            .stack
+            .iter()
+            .rev()
+            .nth(1)
+            .map(|f| f.file.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.cur_file.clone());
+        let (site_file, site_line) = self.call_site(true, sf, saved_line);
         // Trace args are the send list normalized through the last
         // bound slot (unbound params render null; named args appear in
         // declaration order — `test3(NULL, 'B')` in named_params/defaults).

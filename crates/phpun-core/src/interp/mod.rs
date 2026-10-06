@@ -2504,24 +2504,7 @@ impl<'a> Interp<'a> {
         // reports `[internal function]` — Zend emits no file/line for a
         // frame whose caller is internal. call_user_func* trampolines
         // are transparent to the walk (trace_frame_hidden).
-        let from_builtin = self.internal_cb > 0
-            && self
-                .call_trace
-                .iter()
-                .rev()
-                .find(|f| !crate::value::trace_frame_hidden(f))
-                .map(|f| f.internal)
-                .unwrap_or(false);
-        let (site_file, site_line) = if from_builtin {
-            ("[internal function]".to_string(), 0)
-        } else {
-            (
-                self.diag_file(),
-                self.send_line
-                    .map(|l| l as u32)
-                    .unwrap_or(self.cur_line as u32),
-            )
-        };
+        let (site_file, site_line) = self.call_site(false, self.diag_file(), self.cur_line);
         // Trace frame args mirror Zend's bound param array: named args
         // that resolve to a declared fixed param merge into that
         // positional slot (interior unbound slots materialize as NULL);
