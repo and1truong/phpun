@@ -298,7 +298,7 @@ impl<'a> Interp<'a> {
                                 "TypeError",
                                 &format!(
                                     "Closure::bind(): Argument #2 ($newThis) must be of type ?object, {} given",
-                                    v.gettype()
+                                    self.zval_type_name(v)
                                 ),
                             );
                             return Err(self.throw(e));
@@ -314,7 +314,7 @@ impl<'a> Interp<'a> {
                                 "TypeError",
                                 &format!(
                                     "Closure::bind(): Argument #3 ($newScope) must be of type object|string|null, {} given",
-                                    v.gettype()
+                                    self.zval_type_name(v)
                                 ),
                             );
                             return Err(self.throw(e));

@@ -1413,9 +1413,7 @@ impl<'a> Interp<'a> {
     fn foreach_target_by_ref(t: &ForeachTarget) -> bool {
         match t {
             ForeachTarget::ByRef(_) => true,
-            ForeachTarget::List(items) => {
-                items.iter().flatten().any(Self::foreach_target_by_ref)
-            }
+            ForeachTarget::List(items) => items.iter().flatten().any(Self::foreach_target_by_ref),
             _ => false,
         }
     }
@@ -1464,9 +1462,7 @@ impl<'a> Interp<'a> {
                     let n = o.borrow().class.name().to_string();
                     Row::ArrayAccess(o.clone(), n)
                 }
-                Value::Object(o) => {
-                    Row::ObjectErr(o.borrow().class.name().to_string())
-                }
+                Value::Object(o) => Row::ObjectErr(o.borrow().class.name().to_string()),
                 Value::Callable(_) => Row::ObjectErr("Closure".to_string()),
                 _ if needs_ref => Row::ScalarErr,
                 other => Row::Warn(other.type_name().to_string()),

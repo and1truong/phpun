@@ -1271,7 +1271,13 @@ impl<'a> Interp<'a> {
                     c
                 }
                 _ => {
-                    let c = self.eval_cell(value)?;
+                    // `=&` sources fetch under zend's BP_VAR_RW flag —
+                    // dim fetches on non-indexable containers throw the
+                    // reference-specific catchable matrix (probe4).
+                    let was = std::mem::replace(&mut self.dim_by_ref, true);
+                    let c = self.eval_cell(value);
+                    self.dim_by_ref = was;
+                    let c = c?;
                     // A `=&` source that is itself a typed-prop slot
                     // carries that prop's declared type into the
                     // conflict check (typed_properties_068/076).
@@ -1419,23 +1425,19 @@ impl<'a> Interp<'a> {
                     base = e;
                 }
                 dims.reverse();
-                match self.eval_cell(base) {
-                    Ok(c) => {
-                        let mut keys = Vec::with_capacity(dims.len());
-                        for d in dims {
-                            match d {
-                                Some(ie) => match self.dim_key(ie) {
-                                    Ok(k) => keys.push(k),
-                                    Err(_) => keys.push(None),
-                                },
-                                None => keys.push(None),
-                            }
-                        }
-                        late = Late::Keyed { base: c, keys };
-                        None
+                let c = self.eval_cell(base)?;
+                let mut keys = Vec::with_capacity(dims.len());
+                for d in dims {
+                    match d {
+                        Some(ie) => match self.dim_key(ie) {
+                            Ok(k) => keys.push(k),
+                            Err(_) => keys.push(None),
+                        },
+                        None => keys.push(None),
                     }
-                    Err(e) => return Err(e),
                 }
+                late = Late::Keyed { base: c, keys };
+                None
             }
             Expr::StaticProp { class, name } => {
                 // Static prop names evaluate BEFORE the RHS with their own
@@ -1481,14 +1483,26 @@ impl<'a> Interp<'a> {
                                 self.compound_dim_read(base.clone(), &keys, $quiet)?
                             }
                             _ => {
-                                if $quiet {
-                                    self.silence += 1;
+                                // `$i->p += v` on a non-object base: the
+                                // write throws zend's assign Error and
+                                // the read never runs — no 'Attempt to
+                                // read property' warning first (probe4i).
+                                if matches!(
+                                    &late,
+                                    Late::Prop { ov, .. } | Late::PropStr { ov, .. }
+                                        if !matches!(ov, Value::Object(_))
+                                ) {
+                                    Value::Null
+                                } else {
+                                    if $quiet {
+                                        self.silence += 1;
+                                    }
+                                    let c = self.eval(target);
+                                    if $quiet {
+                                        self.silence -= 1;
+                                    }
+                                    c.unwrap_or(Value::Null)
                                 }
-                                let c = self.eval(target);
-                                if $quiet {
-                                    self.silence -= 1;
-                                }
-                                c.unwrap_or(Value::Null)
                             }
                         }
                     }
@@ -1801,8 +1815,57 @@ impl<'a> Interp<'a> {
                     }
                     _ => {
                         drop(b);
-                        return self
-                            .fail(PhpError::fatal("Cannot use scalar value as an array", 0));
+                        // `=&` onto a non-indexable container — zend's
+                        // catchable matrix (probe4a/4e): scalars and
+                        // Closures name the generic errors, objects their
+                        // class, string offsets split append/str-key/
+                        // int-key, ArrayAccess dies with the overloaded
+                        // notice after an offsetGet read.
+                        let (class, msg) = match &*slot.borrow() {
+                            Value::Str(_) => match &key {
+                                None => {
+                                    ("Error", "[] operator not supported for strings".to_string())
+                                }
+                                Some(k) if matches!(to_key(k), ArrKey::Str(_)) => (
+                                    "TypeError",
+                                    "Cannot access offset of type string on string".to_string(),
+                                ),
+                                _ => (
+                                    "Error",
+                                    "Cannot create references to/from string offsets".to_string(),
+                                ),
+                            },
+                            Value::Callable(_) => (
+                                "Error",
+                                "Cannot use object of type Closure as array".to_string(),
+                            ),
+                            Value::Object(o) => {
+                                if self.obj_is_a(o, "ArrayAccess") {
+                                    let _ = self.method_invoke(
+                                        o.clone(),
+                                        "offsetGet",
+                                        CallArgs::positional(vec![cell(
+                                            key.clone().unwrap_or(Value::Null),
+                                        )]),
+                                    );
+                                    let cn = o.borrow().class.name().to_string();
+                                    self.notice(&format!(
+                                        "Indirect modification of overloaded element of {} has no effect",
+                                        cn
+                                    ))?;
+                                    return Ok(());
+                                }
+                                (
+                                    "Error",
+                                    format!(
+                                        "Cannot use object of type {} as array",
+                                        o.borrow().class.name()
+                                    ),
+                                )
+                            }
+                            _ => ("Error", "Cannot use a scalar value as an array".to_string()),
+                        };
+                        return self.fail(PhpError::uncaught(class, msg, self.cur_line));
                     }
                 }
                 Ok(())
@@ -2379,12 +2442,17 @@ impl<'a> Interp<'a> {
                 self.fail(e)
             }
             _ => {
-                self.warn(&format!(
-                    "Attempt to assign property \"{}\" on {}",
-                    pn,
-                    ov.gettype()
-                ))?;
-                Ok(Value::Null)
+                // `=` on a prop whose base isn't an object — zend throws
+                // the assign-verb Error, no auto-viv (probe4h).
+                self.fail(PhpError::uncaught(
+                    "Error",
+                    format!(
+                        "Attempt to assign property \"{}\" on {}",
+                        pn,
+                        self.zval_type_name(&ov)
+                    ),
+                    self.cur_line,
+                ))
             }
         }
     }
@@ -2495,7 +2563,13 @@ impl<'a> Interp<'a> {
                     }
                     c = nc;
                 }
-                Err(_) => {
+                Err(e) => {
+                    // A catchable throwable raised mid-traversal (a
+                    // non-ArrayAccess object, an illegal offset key)
+                    // is already the right zend error — propagate.
+                    if matches!(e.kind, ErrorKind::Throw) {
+                        return Err(e);
+                    }
                     let is_str = matches!(*c.borrow(), Value::Str(_));
                     if is_str {
                         // `$s[] = v` — strings have no append (zend
@@ -2506,6 +2580,17 @@ impl<'a> Interp<'a> {
                                 "[] operator not supported for strings",
                                 self.cur_line,
                             ));
+                        }
+                        // A non-numeric string key on a string is a
+                        // TypeError, not a byte write (probe4d).
+                        if let Some(kc) = k.as_ref() {
+                            if matches!(to_key(&kc.borrow()), ArrKey::Str(_)) {
+                                return self.fail(PhpError::uncaught(
+                                    "TypeError",
+                                    "Cannot access offset of type string on string",
+                                    self.cur_line,
+                                ));
+                            }
                         }
                         // String offset write (final level only).
                         let mut b = c.borrow_mut();
@@ -2555,16 +2640,16 @@ impl<'a> Interp<'a> {
                         }
                         return Ok(v);
                     }
-                    let t = c.borrow().debug_type();
-                    if keys.len() == 1 {
-                        return self.fail(PhpError::uncaught(
-                            "Error",
-                            "Cannot use a scalar value as an array",
-                            self.cur_line,
-                        ));
-                    }
-                    self.warn(&format!("Cannot use {} as array", t))?;
-                    return Ok(v);
+                    // zend throws the same catchable Error at every
+                    // level of the write traversal — `$i[a][b] = v` is
+                    // not a warning (probe4g vs oracle).
+                    let msg = match &*c.borrow() {
+                        Value::Callable(_) => {
+                            "Cannot use object of type Closure as array".to_string()
+                        }
+                        _ => "Cannot use a scalar value as an array".to_string(),
+                    };
+                    return self.fail(PhpError::uncaught("Error", msg, self.cur_line));
                 }
             }
         }
@@ -3111,7 +3196,40 @@ impl<'a> Interp<'a> {
             self.index_cell_object(&c, key)
         } else {
             drop(b);
-            self.fail(PhpError::fatal("Cannot use scalar value as an array", 0))
+            // zend's write-context dim matrix is catchable everywhere
+            // — scalars/Closures name the generic errors; string
+            // offsets stay a marker error for the byte-write path, but
+            // under a by-ref fetch (`=&`, `&offsetGet`) split into
+            // append / str-key / int-key (probe4 vs oracle).
+            match &*c.borrow() {
+                Value::Str(_) if self.dim_by_ref => {
+                    let (class, msg) = match &key {
+                        None => ("Error", "[] operator not supported for strings".to_string()),
+                        Some(k) if matches!(to_key(k), ArrKey::Str(_)) => (
+                            "TypeError",
+                            "Cannot access offset of type string on string".to_string(),
+                        ),
+                        _ => (
+                            "Error",
+                            "Cannot create references to/from string offsets".to_string(),
+                        ),
+                    };
+                    self.fail(PhpError::uncaught(class, msg, self.cur_line))
+                }
+                Value::Str(_) => {
+                    self.fail(PhpError::fatal("Cannot use scalar value as an array", 0))
+                }
+                Value::Callable(_) => self.fail(PhpError::uncaught(
+                    "Error",
+                    "Cannot use object of type Closure as array",
+                    self.cur_line,
+                )),
+                _ => self.fail(PhpError::uncaught(
+                    "Error",
+                    "Cannot use a scalar value as an array",
+                    self.cur_line,
+                )),
+            }
         }
     }
 
@@ -3124,6 +3242,19 @@ impl<'a> Interp<'a> {
         let Value::Object(o) = c.borrow().clone() else {
             unreachable!()
         };
+        // Non-ArrayAccess objects under a dim write/ref — catchable
+        // `Cannot use object of type C as array` (probe4b/4d); zend
+        // never looks for offsetGet on a plain object.
+        if !self.obj_is_a(&o, "ArrayAccess") {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!(
+                    "Cannot use object of type {} as array",
+                    o.borrow().class.name()
+                ),
+                self.cur_line,
+            ));
+        }
         self.last_ret_cell = None;
         // zend evaluates this read as BP_VAR_RW — a missing bucket is
         // created silently inside offsetGet.
@@ -4026,7 +4157,24 @@ impl<'a> Interp<'a> {
             }
             // ++/-- reads through __get first — its exceptions
             // propagate (the __set is never reached, bug38624).
-            Expr::Prop { .. } => self.prop_read_loose(target)?,
+            Expr::Prop { obj, name, .. } => {
+                // `++`/`--` on a prop of a non-object dies with the
+                // incdec verb before the loose-read warn (probe4i).
+                let ov = self.eval(obj)?;
+                if !matches!(ov, Value::Object(_)) {
+                    let pn = self.prop_name(name)?;
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!(
+                            "Attempt to increment/decrement property \"{}\" on {}",
+                            pn,
+                            self.zval_type_name(&ov)
+                        ),
+                        self.cur_line,
+                    ));
+                }
+                self.prop_read_loose(target)?
+            }
             Expr::VarVar(inner) => {
                 let n = self.eval(inner)?;
                 let name = self.conv_str(&n)?;

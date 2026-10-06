@@ -1478,11 +1478,10 @@ impl<'a> Interp<'a> {
             }
             other => {
                 if self.silence == 0 {
-                    self.warn(&format!(
-                        "Attempt to read property \"{}\" on {}",
-                        pn,
-                        other.gettype()
-                    ))?;
+                    // zend names scalar types by their zval name —
+                    // 'on int', never 'on integer' (probe4j).
+                    let t = self.zval_type_name(&other);
+                    self.warn(&format!("Attempt to read property \"{}\" on {}", pn, t))?;
                 }
                 Ok(Value::Null)
             }
@@ -1496,7 +1495,23 @@ impl<'a> Interp<'a> {
         _nullsafe: bool,
     ) -> Result<Cell, PhpError> {
         let pn = self.prop_name(name)?;
-        let ov = self.eval(obj)?;
+        // Write-context chains evaluate every link as a write fetch —
+        // `$i->p->sub` dies with 'Attempt to modify property "p" on
+        // int' instead of the read warning (probe4j). A paren just
+        // wraps a link.
+        let ov = match obj {
+            Expr::Prop { .. } | Expr::Index { .. } | Expr::StaticProp { .. } | Expr::VarVar(_) => {
+                self.eval_cell(obj)?.borrow().clone()
+            }
+            Expr::Paren(inner) => match &**inner {
+                Expr::Prop { .. }
+                | Expr::Index { .. }
+                | Expr::StaticProp { .. }
+                | Expr::VarVar(_) => self.eval_cell(inner)?.borrow().clone(),
+                _ => self.eval(inner)?,
+            },
+            _ => self.eval(obj)?,
+        };
         match ov {
             Value::Object(o) => {
                 // Hooks intercept the cell path entirely — `[]`, `&`,
@@ -1722,9 +1737,16 @@ impl<'a> Interp<'a> {
                 }
                 Ok(slot)
             }
-            _ => self.fail(PhpError::fatal(
-                format!("Attempt to assign property \"{}\" on non-object", pn),
-                0,
+            // Cell fetches (`=&`, `[]`, `++`) on a prop of a non-object
+            // die with zend's modify-verb Error — catchable (probe4f).
+            other => self.fail(PhpError::uncaught(
+                "Error",
+                format!(
+                    "Attempt to modify property \"{}\" on {}",
+                    pn,
+                    self.zval_type_name(&other)
+                ),
+                self.cur_line,
             )),
         }
     }

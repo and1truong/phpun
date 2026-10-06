@@ -1781,7 +1781,7 @@ impl<'a> Interp<'a> {
                             "TypeError",
                             &format!(
                                 "Closure::bindTo(): Argument #1 ($newThis) must be of type ?object, {} given",
-                                v.gettype()
+                                self.zval_type_name(v)
                             ),
                         );
                         return Err(self.throw(e));
@@ -1795,7 +1795,7 @@ impl<'a> Interp<'a> {
                             "TypeError",
                             &format!(
                                 "Closure::bindTo(): Argument #2 ($newScope) must be of type object|string|null, {} given",
-                                v.gettype()
+                                self.zval_type_name(v)
                             ),
                         );
                         return Err(self.throw(e));
@@ -1808,7 +1808,11 @@ impl<'a> Interp<'a> {
             }
             other => self.fail(PhpError::uncaught(
                 "Error",
-                format!("Call to a member function {}() on {}", mn, other.gettype()),
+                format!(
+                    "Call to a member function {}() on {}",
+                    mn,
+                    self.zval_type_name(&other)
+                ),
                 0,
             )),
         }
