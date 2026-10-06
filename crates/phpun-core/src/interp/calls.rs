@@ -4249,6 +4249,7 @@ impl<'a> Interp<'a> {
 
     /// Frame push + body run — the part of invoke_fn the Generator
     /// start path also uses (the yield check must not re-trip here).
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::interp) fn invoke_fn_run(
         &mut self,
         decl: &Rc<FunctionDecl>,
