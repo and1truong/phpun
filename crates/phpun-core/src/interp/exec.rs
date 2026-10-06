@@ -315,6 +315,19 @@ impl<'a> Interp<'a> {
                 Flow::Normal
             }
             Stmt::Class(d) => {
+                // Method-decl diagnostics run even for early-bound
+                // classes (implicit-nullable deprecations, default-
+                // value fatals) — they are decl checks, not
+                // registration side effects.
+                for m in &d.methods {
+                    let fname = format!("{}::{}", d.name, m.decl.name);
+                    if let Err(e) =
+                        self.decl_type_checks(&fname, &m.decl, Some((&d.name, d.parent.clone())))
+                    {
+                        let e = self.decl_fatal_ctx(e);
+                        return self.err_flow(e);
+                    }
+                }
                 let key = d.name.to_lowercase();
                 // The same decl site early-bound at compile time is a
                 // no-op; a DIFFERENT decl claiming an occupied name is
@@ -328,15 +341,6 @@ impl<'a> Interp<'a> {
                         self.cur_line,
                     ));
                     return self.err_flow(e);
-                }
-                for m in &d.methods {
-                    let fname = format!("{}::{}", d.name, m.decl.name);
-                    if let Err(e) =
-                        self.decl_type_checks(&fname, &m.decl, Some((&d.name, d.parent.clone())))
-                    {
-                        let e = self.decl_fatal_ctx(e);
-                        return self.err_flow(e);
-                    }
                 }
                 let mut d = (**d).clone();
                 for m in &mut d.methods {
