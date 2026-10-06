@@ -1204,6 +1204,19 @@ impl<'a> Parser<'a> {
                     }
                     self.expect_op("=")?;
                     let cv = self.expr()?;
+                    // A const name redeclared inside the same class body
+                    // is a compile fatal — the body compiles wherever the
+                    // decl sits (`if (0)`, a dead function), and Zend
+                    // reports the dup on its own line.
+                    if consts
+                        .iter()
+                        .any(|cd: &crate::ast::ConstDecl| cd.name == cname)
+                    {
+                        return Err(PhpError::compile_fatal(
+                            format!("Cannot redefine class constant {}::{}", name, cname),
+                            self.line(),
+                        ));
+                    }
                     consts.push(crate::ast::ConstDecl {
                         name: cname,
                         value: cv,

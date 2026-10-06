@@ -27,18 +27,24 @@ impl<'a> Interp<'a> {
             ));
         }
         // include()/require() appear in backtraces as internal-function
-        // frames — even for a failed open (bug28213).
+        // frames — even for a failed open (bug28213). The frame keeps
+        // Zend's literal callee name for the kind (include_once()/
+        // require_once()) and carries no arg until the path resolves:
+        // an open still in progress renders bare `include()` even with
+        // frames above it (the error-handler trace of a failed open).
         self.call_trace.push(TraceFrame {
             function: match kind {
-                IncludeKind::Include | IncludeKind::IncludeOnce => "include",
-                _ => "require",
+                IncludeKind::Include => "include",
+                IncludeKind::IncludeOnce => "include_once",
+                IncludeKind::Require => "require",
+                _ => "require_once",
             }
             .to_string(),
             class: None,
             ty: String::new(),
             file: self.diag_file(),
             line: self.cur_line as u32,
-            args: vec![cell(pathv.clone())],
+            args: Vec::new(),
             named_args: Vec::new(),
             internal: true,
         });
@@ -92,7 +98,7 @@ impl<'a> Interp<'a> {
                     IncludeKind::Require => "require",
                     _ => "require_once",
                 };
-                let ip = ".:/home/linuxbrew/.linuxbrew/share/pear";
+                let ip = self.ini.get("include_path").cloned().unwrap_or_default();
                 let r = self
                     .warn(&format!(
                         "{}({}): Failed to open stream: No such file or directory",
@@ -136,9 +142,9 @@ impl<'a> Interp<'a> {
         let canon = path.canonicalize().unwrap_or(path);
         // Zend's include/require backtrace entries carry the RESOLVED
         // canonical path as their arg (trace_arg truncates it to 15
-        // chars at render).
+        // chars at render) — set only once the open succeeded.
         if let Some(f) = self.call_trace.last_mut() {
-            f.args[0] = cell(Value::str(canon.display().to_string()));
+            f.args = vec![cell(Value::str(canon.display().to_string()))];
         }
         if matches!(kind, IncludeKind::IncludeOnce | IncludeKind::RequireOnce) {
             if self.included.contains(&canon) {
@@ -371,8 +377,13 @@ impl<'a> Interp<'a> {
                 // Zend compiles eval'd code as its own unit attributed to
                 // the call site — `FILE(N) : eval()'d code` — which
                 // __FILE__, decl files and every diagnostic read via
-                // cur_file (a nested eval composes the context).
-                let eval_ctx = format!("{}({}) : eval()'d code", self.cur_file, self.cur_line);
+                // cur_file (a nested eval composes the context). FILE is
+                // the executing frame's decl file, not the file currently
+                // being included: `eval()` inside a function declared in
+                // the main script attributes to the main file even when
+                // the call runs inside an included unit.
+                let site_file = self.diag_file();
+                let eval_ctx = format!("{}({}) : eval()'d code", site_file, self.cur_line);
                 let saved_file = std::mem::replace(&mut self.cur_file, eval_ctx);
                 // eval'd code is its own compile unit — `break`/`continue`
                 // operands count only ITS enclosing loop/switch contexts.
@@ -393,7 +404,11 @@ impl<'a> Interp<'a> {
                     function: "eval".to_string(),
                     class: None,
                     ty: String::new(),
-                    file: saved_file.clone(),
+                    // The frame's FILE is the call site — the executing
+                    // frame's decl file (diag_file), so eval() inside a
+                    // function still points at the function's own file
+                    // even while an include is in progress.
+                    file: site_file,
                     line: saved_line as u32,
                     args: Vec::new(),
                     named_args: Vec::new(),
@@ -492,7 +507,7 @@ impl<'a> Interp<'a> {
                 // as ParseError.
                 if e.kind != ErrorKind::Parse {
                     self.last_err_file =
-                        format!("{}({}) : eval()'d code", self.cur_file, self.cur_line);
+                        format!("{}({}) : eval()'d code", self.diag_file(), self.cur_line);
                     let mut e = e;
                     if e.trace.as_ref().is_none_or(|t| t.is_empty()) {
                         e.trace = Some(self.compile_err_frames());
@@ -523,7 +538,7 @@ impl<'a> Interp<'a> {
                         // the error's own line inside the eval
                         // string. eval_ctx stays >0 as the marker the
                         // uncaught render keys on.
-                        *file = format!("{}({}) : eval()'d code", self.cur_file, self.cur_line);
+                        *file = format!("{}({}) : eval()'d code", self.diag_file(), self.cur_line);
                         *line = e.line as u32;
                         *thrown = e.line as u32;
                         *eval_ctx = e.line as u32;

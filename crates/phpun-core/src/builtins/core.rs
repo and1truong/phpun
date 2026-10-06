@@ -683,8 +683,21 @@ pub(crate) fn dispatch(
             let s = arg_str(it, args, 0);
             Value::str(format!("'{}'", s.replace('\'', "'\\''")))
         }
-        "get_include_path" | "set_include_path" | "restore_include_path" => {
-            Value::str(".:/home/linuxbrew/.linuxbrew/share/pear")
+        "get_include_path" => Value::str(it.ini.get("include_path").cloned().unwrap_or_default()),
+        "set_include_path" => {
+            // Returns the OLD path; the new one stores into the ini
+            // table like ini_set (zend's set_include_path is ini_set).
+            let prev = it.ini.get("include_path").cloned().unwrap_or_default();
+            let v = arg_str(it, args, 0);
+            it.ini.insert("include_path".into(), v);
+            Value::str(prev)
+        }
+        "restore_include_path" => {
+            it.ini.insert(
+                "include_path".into(),
+                ".:/home/linuxbrew/.linuxbrew/Cellar/php/8.5.11/share/php/pear".into(),
+            );
+            Value::Null
         }
         "token_get_all" | "token_name" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
         "highlight_string" => {

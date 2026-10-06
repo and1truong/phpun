@@ -310,7 +310,17 @@ impl<'a> Interp<'a> {
             .rev()
             .filter(|f| !trace_frame_hidden(f))
             .collect();
-        let bare = frames.iter().position(|f| crate::value::include_frame(f));
+        // Only the innermost frame renders an include bare — deeper
+        // include frames keep their resolved-path argument (an include
+        // that is still opening has no args and renders bare anyway).
+        let bare = if frames
+            .first()
+            .is_some_and(|f| crate::value::include_frame(f))
+        {
+            Some(0)
+        } else {
+            None
+        };
         frames
             .iter()
             .enumerate()

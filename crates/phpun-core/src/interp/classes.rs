@@ -63,8 +63,18 @@ impl<'a> Interp<'a> {
         let res = self.register_class_inner(decl);
         self.declaring.pop();
         match res {
-            // Class-linking errors are compile-class fatals — Zend
-            // attaches the live backtrace even at runtime.
+            // Class-linking errors are compile-class fatals. A
+            // registration from early binding (hoist) reports the
+            // compile context's trace — the innermost include/eval
+            // pseudo-frame dropped — while an exec-phase registration
+            // (conditional decl, a class with interfaces/traits, a
+            // redeclare) keeps the live call chain.
+            Err(e) if self.in_hoist && matches!(e.kind, crate::error::ErrorKind::Fatal) => {
+                Err(PhpError {
+                    trace: Some(self.compile_err_frames()),
+                    ..e
+                })
+            }
             Err(e) => Err(self.decl_fatal_ctx(e)),
             r => r,
         }
@@ -1690,6 +1700,25 @@ impl<'a> Interp<'a> {
                 ),
                 self.cur_line,
             ));
+        }
+        // A class declaring abstract methods itself must be marked
+        // abstract — Zend checks this at the class's own compile with
+        // a different message than the unimplemented-inherited one
+        // ('declares abstract method m()', first own-declared wins).
+        if !d.is_abstract {
+            if let Some(m) = d
+                .methods
+                .iter()
+                .find(|m| m.is_abstract && m.decl.decl_in.is_none())
+            {
+                return Err(PhpError::fatal(
+                    format!(
+                        "Class {} declares abstract method {}() and must therefore be declared abstract",
+                        d.name, m.decl.name
+                    ),
+                    self.cur_line,
+                ));
+            }
         }
         if d.is_abstract {
             return Ok(());

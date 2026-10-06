@@ -472,14 +472,27 @@ impl<'a> Interp<'a> {
             .iter()
             .rposition(|f| crate::value::include_frame(f) || (f.internal && f.function == "eval"))
             .unwrap_or(self.call_trace.len());
-        self.call_trace[..upto]
+        let frames: Vec<&crate::value::TraceFrame> = self.call_trace[..upto]
             .iter()
             .rev()
             .filter(|f| !crate::value::trace_frame_hidden(f))
-            // The slice's frames are all DEEPER than the dropped
-            // innermost include — every include frame here keeps its
-            // path argument.
-            .map(|f| crate::value::trace_frame_str_at(f, false))
+            .collect();
+        // The innermost surviving frame is still the executing unit in
+        // Zend — an include there renders bare `include()` (a compile
+        // error inside `eval` nested in an include shows `#0 f(2):
+        // include()`), deeper includes keep their path argument.
+        let bare = if frames
+            .first()
+            .is_some_and(|f| crate::value::include_frame(f))
+        {
+            Some(0)
+        } else {
+            None
+        };
+        frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| crate::value::trace_frame_str_at(f, Some(i) == bare))
             .collect()
     }
 
@@ -497,11 +510,6 @@ impl<'a> Interp<'a> {
                 .iter()
                 .rev()
                 .filter(|f| !crate::value::trace_frame_hidden(f))
-                // A decl-compile fatal raised while executing the
-                // eval'd unit itself drops that unit's `eval()` pseudo
-                // frame — '#0 {main}' at top level (R3 finding 14).
-                // Real frames above it keep it ('#1 FILE(N): eval()').
-                .skip_while(|f| f.internal && f.function == "eval")
                 .collect();
             // Only the INNERMOST (executing) include renders bare
             // 'include()'; dormant include frames deeper in the chain

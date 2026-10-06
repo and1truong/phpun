@@ -213,6 +213,11 @@ pub struct Interp<'a> {
     /// itself runs does not spawn a nested pass (error9 ordering — the
     /// autoloaded class's own code runs before the recheck resumes).
     in_variance_pass: bool,
+    /// Registration is running inside `hoist_funcs` — Zend's
+    /// early-binding compile phase — so its link errors carry the
+    /// compile-context trace (innermost include/eval frame dropped),
+    /// not the live call chain.
+    in_hoist: bool,
     /// Fatal raised inside an autoload a signature probe triggered —
     /// the probe reports it to the checking context instead of
     /// degrading to "could not check" (cascading variance failures
@@ -831,6 +836,7 @@ impl<'a> Interp<'a> {
             autoloading: std::collections::HashSet::new(),
             variance_obligations: Vec::new(),
             in_variance_pass: false,
+            in_hoist: false,
             sig_fatal: None,
             declaring: Vec::new(),
             tentative: {
@@ -927,6 +933,13 @@ impl<'a> Interp<'a> {
                 ("error_reporting".to_string(), "30719".to_string()),
                 // Zend's compiled-in default (hardcoded in main/php.ini).
                 ("memory_limit".to_string(), "128M".to_string()),
+                // Oracle PHP's compiled-in include_path (brew build) —
+                // `get_include_path` and the Failed-opening diagnostics
+                // print it verbatim.
+                (
+                    "include_path".to_string(),
+                    ".:/home/linuxbrew/.linuxbrew/Cellar/php/8.5.11/share/php/pear".to_string(),
+                ),
             ]),
         };
         // Auto-globals. PHP's $_SERVER carries env + script metadata;
@@ -1419,6 +1432,17 @@ impl<'a> Interp<'a> {
     }
 
     fn hoist_funcs(&mut self, stmts: &[Stmt]) -> Result<(), PhpError> {
+        // Registration inside this pass is Zend's early-binding
+        // compile phase — its link errors carry the compile-context
+        // trace (compile_err_frames), while decls registering at exec
+        // keep the live call chain.
+        let saved_hoist = std::mem::replace(&mut self.in_hoist, true);
+        let r = self.hoist_funcs_pass(stmts);
+        self.in_hoist = saved_hoist;
+        r
+    }
+
+    fn hoist_funcs_pass(&mut self, stmts: &[Stmt]) -> Result<(), PhpError> {
         for s in stmts {
             match s {
                 // `namespace X { stmts }` parses as
@@ -1438,23 +1462,41 @@ impl<'a> Interp<'a> {
                 // class win early binding so the ENUM's exec site is
                 // where the redeclare fatal lands.
                 Stmt::Class(d)
-                    if d.parent.is_none()
-                        && d.implements.is_empty()
+                    if d.implements.is_empty()
                         && d.traits.is_empty()
-                        && d.kind != crate::ast::ClassKind::Enum =>
+                        && d.kind != crate::ast::ClassKind::Enum
+                        && match &d.parent {
+                            // zend_try_early_binding: a class with no
+                            // dependencies always binds; an extends-only
+                            // class binds when its parent is already
+                            // registered (no autoload at compile).
+                            // Classes with interfaces/traits bind at
+                            // exec — their link errors carry the live
+                            // trace ('Class B contains N abstract
+                            // method' for an interface method keeps the
+                            // eval()/include() frame).
+                            None => true,
+                            Some(p) => {
+                                let pl = p.to_lowercase();
+                                self.classes.contains_key(&pl)
+                                    || self.traits.contains_key(&pl)
+                                    || self.interfaces.contains_key(&pl)
+                                    || self
+                                        .linking
+                                        .iter()
+                                        .any(|c| c.name.eq_ignore_ascii_case(&pl))
+                            }
+                        } =>
                 {
                     let key = d.name.to_lowercase();
-                    if let Some((kind, file, line)) = self.existing_class_site(&key) {
-                        // Class-kind redeclares bind at EXEC phase in
-                        // Zend (unlike function redeclares, which die
-                        // inside the unit's compile) — the backtrace
-                        // keeps the live include/eval frames. The
-                        // message names the EXISTING decl's kind.
-                        let e = self.decl_fatal_ctx(PhpError::fatal(
-                            Self::redeclare_class_msg(kind, &d.name, &file, line),
-                            d.line,
-                        ));
-                        return Err(e);
+                    // Class-kind redeclares are EXEC-phase fatals in
+                    // Zend (unlike function redeclares, which die inside
+                    // the unit's compile): an occupied name just leaves
+                    // the decl exec-bound so the dup hits the existing
+                    // 'Cannot redeclare' check in stmt order — an
+                    // earlier exec-bound decl's link error wins first.
+                    if self.existing_class_site(&key).is_some() {
+                        continue;
                     }
                     let site = Rc::as_ptr(d) as usize;
                     let mut d = (**d).clone();
@@ -1463,9 +1505,17 @@ impl<'a> Interp<'a> {
                         mm.decl.file = self.cur_file.clone();
                         *m = Rc::new(mm);
                     }
-                    if self.register_class(Rc::new(d)).is_ok() {
-                        self.early_bound_classes.insert(key, site);
-                    }
+                    // Link errors of an early-bound class are compile
+                    // errors of this unit — propagate (Zend fails the
+                    // whole compile; the decl site still no-ops at
+                    // exec via early_bound_classes). Zend reports the
+                    // class-decl line for them.
+                    let saved_line = self.cur_line;
+                    self.cur_line = d.line;
+                    let r = self.register_class(Rc::new(d));
+                    self.cur_line = saved_line;
+                    r?;
+                    self.early_bound_classes.insert(key, site);
                 }
                 _ => {}
             }
