@@ -270,9 +270,14 @@ impl<'a> Interp<'a> {
                 // here), mirroring the eval()'d-code branch. Zend attaches
                 // the compile-context backtrace — the live stack minus
                 // this include's own pseudo-frame — and prints the block
-                // even when it is just `{main}`.
+                // even when it is just `{main}`. A decl/link error that
+                // already carries the live trace (class-kind 'Cannot
+                // redeclare' binds at exec phase, inside the include
+                // frame) keeps it.
                 self.last_err_file = self.cur_file.clone();
-                e.trace = Some(self.compile_err_frames());
+                if e.trace.as_ref().is_none_or(|t| t.is_empty()) {
+                    e.trace = Some(self.compile_err_frames());
+                }
                 inc_pop(self);
                 inc_frame_popped = true;
                 self.err_flow(e)
@@ -405,9 +410,16 @@ impl<'a> Interp<'a> {
                         // Gate errors are compile fatals of the eval'd
                         // unit — attribute to the eval()'d-code context
                         // and carry the live backtrace (Zend compiles
-                        // eval'd code at the call site).
+                        // eval'd code at the call site). A decl/link
+                        // error that already carries the live trace
+                        // (class-kind 'Cannot redeclare' binds at exec
+                        // phase in Zend, inside the eval() frame) keeps
+                        // it — only compile-phase errors get the
+                        // compile-context frames.
                         self.last_err_file = self.cur_file.clone();
-                        e.trace = Some(self.compile_err_frames());
+                        if e.trace.as_ref().is_none_or(|t| t.is_empty()) {
+                            e.trace = Some(self.compile_err_frames());
+                        }
                         self.err_flow(e)
                     }
                     Ok(()) => self.exec_block(&stmts),
@@ -474,6 +486,27 @@ impl<'a> Interp<'a> {
                 }
             }
             Err(e) => {
+                // E_COMPILE_ERROR-class fatals inside eval'd code are
+                // uncatchable in Zend (`try{eval(...)}catch(ParseError)`
+                // does not see them) — only real syntax errors surface
+                // as ParseError.
+                if e.kind != ErrorKind::Parse {
+                    self.last_err_file =
+                        format!("{}({}) : eval()'d code", self.cur_file, self.cur_line);
+                    let mut e = e;
+                    if e.trace.as_ref().is_none_or(|t| t.is_empty()) {
+                        e.trace = Some(self.compile_err_frames());
+                    }
+                    self.print_fatal(&e);
+                    return Err(PhpError {
+                        trace: None,
+                        thrown_line: None,
+                        display_msg: None,
+                        kind: ErrorKind::Fatal,
+                        message: "\u{1}exit:255".into(),
+                        line: 0,
+                    });
+                }
                 let msg = e.message.clone();
                 let v = self.exception("ParseError", &msg);
                 if let Value::Object(o) = &v {

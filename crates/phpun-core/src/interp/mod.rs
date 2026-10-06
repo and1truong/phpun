@@ -1121,7 +1121,10 @@ impl<'a> Interp<'a> {
                 Self::gate_expr(e, &GateMode::Runtime)
             }
             ForeachTarget::List(ts) => {
-                for t in ts.iter().flatten() {
+                for (k, t) in ts.iter().flatten() {
+                    if let Some(k) = k {
+                        Self::gate_expr(k, &GateMode::Runtime)?;
+                    }
                     Self::gate_foreach_target(t)?;
                 }
                 Ok(())
@@ -1272,7 +1275,10 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
             Expr::List(v) => {
-                for x in v.iter().flatten() {
+                for (k, x) in v.iter().flatten() {
+                    if let Some(k) = k {
+                        Self::gate_expr(k, m)?;
+                    }
                     Self::gate_expr(x, m)?;
                 }
                 Ok(())
@@ -1414,14 +1420,24 @@ impl<'a> Interp<'a> {
                     if d.parent.is_none() && d.implements.is_empty() && d.traits.is_empty() =>
                 {
                     let key = d.name.to_lowercase();
-                    if let Some((kind, file, line)) = self.existing_class_site(&key) {
-                        // A second unconditional decl of an occupied
-                        // name is Zend's compile-time 'Cannot
-                        // redeclare' fatal.
-                        return Err(PhpError::compile_fatal(
+                    if let Some((_, file, line)) = self.existing_class_site(&key) {
+                        // Class-kind redeclares bind at EXEC phase in
+                        // Zend (unlike function redeclares, which die
+                        // inside the unit's compile) — the backtrace
+                        // keeps the live include/eval frames. The
+                        // message names the NEW decl's kind ('class F'
+                        // for `enum F {}; class F {}`).
+                        let kind = match d.kind {
+                            crate::ast::ClassKind::Interface => "interface",
+                            crate::ast::ClassKind::Trait => "trait",
+                            crate::ast::ClassKind::Enum => "enum",
+                            crate::ast::ClassKind::Class => "class",
+                        };
+                        let e = self.decl_fatal_ctx(PhpError::fatal(
                             Self::redeclare_class_msg(kind, &d.name, &file, line),
                             d.line,
                         ));
+                        return Err(e);
                     }
                     let site = Rc::as_ptr(d) as usize;
                     let mut d = (**d).clone();
