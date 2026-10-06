@@ -187,6 +187,7 @@ impl<'a> Interp<'a> {
             auto_key: 0,
             sends: Vec::new(),
             pending_out: Vec::new(),
+            deferred_err: None,
         }));
         let cls = self
             .classes
@@ -280,14 +281,14 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
             Err(e) => {
-                // A fatal unwinding out of the gen body must not
-                // strand output the body emitted after a yield: flush
-                // this run's deferred bytes now that the outer
-                // run-state is restored — they defer into the outer
-                // gen's pending_out (which print_fatal still flushes)
-                // or write out directly at top level.
-                self.gen_flush_out(state, usize::MAX);
-                Err(e)
+                // The body died mid-run: Zend's lazy generator raises
+                // that error at the consumer's NEXT resume call —
+                // after the bytes it already echoed between yields.
+                // Hold it on the state; collected items stay
+                // consumable until the consumer asks for the dead
+                // resume (gen_raise_deferred).
+                state.borrow_mut().deferred_err = Some(e);
+                Ok(())
             }
         }
     }
@@ -594,6 +595,82 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Re-raise the body's terminal error at the consumer's resume
+    /// call — Zend's lazy body dies inside `Generator->{m}()`, after
+    /// the bytes the consumer already echoed between yields, so the
+    /// stored error only fires once `pos` reaches the end of the
+    /// collected items.
+    fn gen_raise_deferred(
+        &mut self,
+        state: &Rc<RefCell<GenState>>,
+        method: &str,
+    ) -> Result<(), PhpError> {
+        let dead = {
+            let st = state.borrow();
+            st.pos >= st.items.len() && st.deferred_err.is_some()
+        };
+        if !dead {
+            return Ok(());
+        }
+        // The body's tail output belongs to this final resume.
+        self.gen_flush_out(state, usize::MAX);
+        let mut e = state.borrow_mut().deferred_err.take().unwrap();
+        // Foreach-internal resume: the body dies under the iteration
+        // machinery, keeping its original call frame; a userland
+        // `Generator->{m}()` resume renders the engine stack instead.
+        if self.iter_calls > 0 {
+            return Err(e);
+        }
+        let frames = self.gen_resume_frames(state, method);
+        if e.kind == crate::error::ErrorKind::Throw {
+            // The uncaught render reads the Throwable's own trace —
+            // swap it for the resume stack.
+            if let Some(Value::Object(o)) = &self.pending_exception {
+                let mut obj = o.borrow_mut();
+                if let Some(crate::value::ObjectInternal::Exception { trace, .. }) =
+                    &mut obj.internal
+                {
+                    let mut t = String::new();
+                    for (i, fr) in frames.iter().enumerate() {
+                        t.push_str(&format!("#{} {}\n", i, fr));
+                    }
+                    t.push_str(&format!("#{} {{main}}", frames.len()));
+                    *trace = t;
+                }
+            }
+        } else {
+            e.trace = Some(frames);
+        }
+        Err(e)
+    }
+
+    /// The resume-stack frames for a deferred body death: the gen fn
+    /// ran as an internal call (`[internal function]: g()`), invoked
+    /// from `Generator->{method}()` at the consumer's call site,
+    /// under whatever frames the consumer itself is in.
+    fn gen_resume_frames(&mut self, state: &Rc<RefCell<GenState>>, method: &str) -> Vec<String> {
+        let fn_name = {
+            let st = state.borrow();
+            match &st.setup {
+                GenSetup::Invoke { decl, .. } => decl.name.clone(),
+            }
+        };
+        let mut frames = vec![format!("[internal function]: {}()", fn_name)];
+        frames.push(format!(
+            "{}({}): Generator->{}()",
+            self.diag_file(),
+            self.cur_line,
+            method
+        ));
+        for fr in self.call_trace.iter().rev() {
+            if crate::value::trace_frame_hidden(fr) {
+                continue;
+            }
+            frames.push(crate::value::trace_frame_str(fr));
+        }
+        frames
+    }
+
     /// Native dispatch for the `Generator` class (Iterator + send/throw/
     /// getReturn). `obj` must carry a Generator internal.
     pub(in crate::interp) fn generator_method(
@@ -626,15 +703,18 @@ impl<'a> Interp<'a> {
                     return Err(self.throw(v));
                 }
                 self.gen_start(&state)?;
+                self.gen_raise_deferred(&state, "rewind")?;
                 Ok(Some(Value::Null))
             }
             "valid" => {
                 self.gen_start(&state)?;
+                self.gen_raise_deferred(&state, "valid")?;
                 let st = state.borrow();
                 Ok(Some(Value::Bool(st.pos < st.items.len())))
             }
             "current" => {
                 self.gen_start(&state)?;
+                self.gen_raise_deferred(&state, "current")?;
                 let st = state.borrow();
                 Ok(Some(
                     st.items
@@ -645,6 +725,7 @@ impl<'a> Interp<'a> {
             }
             "key" => {
                 self.gen_start(&state)?;
+                self.gen_raise_deferred(&state, "key")?;
                 let st = state.borrow();
                 Ok(Some(
                     st.items.get(st.pos).map(|(k, _)| k.clone()).unwrap_or(Value::Null),
@@ -655,6 +736,7 @@ impl<'a> Interp<'a> {
                 state.borrow_mut().pos += 1;
                 let pos = state.borrow().pos;
                 self.gen_flush_out(&state, pos);
+                self.gen_raise_deferred(&state, "next")?;
                 Ok(Some(Value::Null))
             }
             "send" => {
@@ -671,6 +753,7 @@ impl<'a> Interp<'a> {
                         st.items.clear();
                         st.pos = 0;
                         st.pending_out.clear();
+                        st.deferred_err = None;
                     }
                 }
                 self.gen_start(&state)?;
@@ -681,6 +764,7 @@ impl<'a> Interp<'a> {
                 }
                 let pos = state.borrow().pos;
                 self.gen_flush_out(&state, pos);
+                self.gen_raise_deferred(&state, "send")?;
                 let st = state.borrow();
                 Ok(Some(
                     st.items
@@ -699,6 +783,7 @@ impl<'a> Interp<'a> {
                 // everything still deferred past yields belongs to
                 // that final resume.
                 self.gen_flush_out(&state, usize::MAX);
+                self.gen_raise_deferred(&state, "getReturn")?;
                 let st = state.borrow();
                 Ok(Some(st.return_val.clone()))
             }
