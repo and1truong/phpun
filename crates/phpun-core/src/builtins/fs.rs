@@ -884,17 +884,12 @@ pub(crate) fn dispatch(
                     use std::os::fd::AsRawFd;
                     *nonblock = !mode;
                     let fd = file.as_raw_fd();
-                    unsafe {
-                        let fl = libc::fcntl(fd, libc::F_GETFL);
-                        if fl >= 0 {
-                            let fl2 = if mode {
-                                fl & !libc::O_NONBLOCK
-                            } else {
-                                fl | libc::O_NONBLOCK
-                            };
-                            libc::fcntl(fd, libc::F_SETFL, fl2);
-                        }
-                    }
+                    set_fd_nonblock(fd, mode);
+                    Value::Bool(true)
+                }
+                PhpResource::File { file, .. } => {
+                    use std::os::fd::AsRawFd;
+                    set_fd_nonblock(file.as_raw_fd(), mode);
                     Value::Bool(true)
                 }
                 _ => Value::Bool(true),
@@ -926,8 +921,13 @@ pub(crate) fn dispatch(
                     let rb = r.borrow();
                     match &*rb {
                         PhpResource::Pipe {
-                            write, socket, eof, ..
+                            write,
+                            socket,
+                            eof,
+                            nonblock,
+                            ..
                         } => {
+                            base[1] = ("blocked", Value::Bool(!*nonblock));
                             base.push(("eof", Value::Bool(*eof)));
                             base.push((
                                 "stream_type",
@@ -948,8 +948,14 @@ pub(crate) fn dispatch(
                             mk(base)
                         }
                         PhpResource::File {
-                            eof, path, mode, ..
+                            file,
+                            eof,
+                            path,
+                            mode,
+                            ..
                         } => {
+                            use std::os::fd::AsRawFd;
+                            base[1] = ("blocked", Value::Bool(!fd_is_nonblock(file.as_raw_fd())));
                             base.push(("eof", Value::Bool(*eof)));
                             base.push(("wrapper_type", Value::str("plainfile")));
                             base.push(("stream_type", Value::str("STDIO")));
@@ -1162,6 +1168,29 @@ fn fopen_mode(mode: &str) -> Option<FopenSpec> {
 /// php://memory|temp only: 'w', 'a' or '+' anywhere → writeable.
 fn mem_writeable(mode: &str) -> bool {
     mode.bytes().any(|b| matches!(b, b'w' | b'a' | b'+'))
+}
+
+/// fcntl helper for stream_set_blocking: set/clear O_NONBLOCK on a
+/// real fd (zend applies the flag to plain files as well as pipes).
+fn set_fd_nonblock(fd: std::os::fd::RawFd, blocking: bool) {
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        if fl >= 0 {
+            let fl2 = if blocking {
+                fl & !libc::O_NONBLOCK
+            } else {
+                fl | libc::O_NONBLOCK
+            };
+            libc::fcntl(fd, libc::F_SETFL, fl2);
+        }
+    }
+}
+
+fn fd_is_nonblock(fd: std::os::fd::RawFd) -> bool {
+    unsafe {
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        fl >= 0 && fl & libc::O_NONBLOCK != 0
+    }
 }
 
 /// `PHP_Z_PARAM_STREAM` shared by every stream builtin: the argument
