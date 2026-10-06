@@ -271,6 +271,14 @@ impl<'a> Interp<'a> {
                         match self.exec_loop_body(body) {
                             Flow::Break(0) | Flow::Break(1) => return Flow::Normal,
                             Flow::Break(n) => return Flow::Break(n - 1),
+                            // A `continue` aimed at the switch itself acts
+                            // as `break` (Zend warns at compile time, which
+                            // our unit gate mirrors); a deeper `continue N`
+                            // escapes toward the enclosing loop.
+                            Flow::Continue(0) | Flow::Continue(1) => {
+                                return Flow::Normal;
+                            }
+                            Flow::Continue(n) => return Flow::Continue(n - 1),
                             Flow::Normal => {}
                             f => return f,
                         }
