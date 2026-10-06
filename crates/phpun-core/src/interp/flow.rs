@@ -31,6 +31,10 @@ struct ScanScope {
     ctxs: Vec<Ctx>,
     /// Innermost enclosing `finally` node id (gotos must not cross it).
     fin: Option<usize>,
+    /// `ctxs` depth where the innermost enclosing `finally` began — a
+    /// break/continue resolving to a context pushed before it jumps
+    /// out of the finally (Zend zend_check_finally_break).
+    fin_depth: Option<usize>,
     /// label name → (enclosing loop ids outermost→innermost, fin id)
     labels: HashMap<String, (Vec<usize>, Option<usize>)>,
     gotos: Vec<GotoSite>,
@@ -224,8 +228,12 @@ impl<'a> Interp<'a> {
                         // A finally region is closed to gotos in either
                         // direction — the innermost id marks the boundary.
                         let saved = sc.fin.replace(std::ptr::from_ref(s) as usize);
+                        // …and to break/continue operands resolving to a
+                        // context outside it — the ctx depth marks that line.
+                        let saved_depth = sc.fin_depth.replace(sc.ctxs.len());
                         Self::flow_scan(f, sc)?;
                         sc.fin = saved;
+                        sc.fin_depth = saved_depth;
                     }
                 }
                 Stmt::Block(b) => Self::flow_scan(b, sc)?,
@@ -313,6 +321,17 @@ impl<'a> Interp<'a> {
                 format!("Cannot '{}' {} levels", kw, n),
                 line,
             ));
+        }
+        // A resolved target pushed before the innermost enclosing
+        // `finally` means the jump leaves it — Zend compile-fatals any
+        // such break/continue (break on an inner switch is fine).
+        if let Some(d) = sc.fin_depth {
+            if len - n < d {
+                return Err(PhpError::compile_fatal(
+                    "jump out of a finally block is disallowed",
+                    line,
+                ));
+            }
         }
         if !is_break {
             if let Ctx::Switch(_) = sc.ctxs[len - n] {
