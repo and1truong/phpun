@@ -996,7 +996,40 @@ pub(crate) fn dispatch(
                 Value::Int(c)
             }
         }
-        "clone" => arg(args, 0),
+        "clone" => {
+            // PHP 8.5 `clone(object $object, array $withProperties = [])`.
+            if args.is_empty() {
+                return err(
+                    "ArgumentCountError",
+                    "clone() expects at least 1 argument, 0 given",
+                );
+            }
+            if args.len() > 2 {
+                return err(
+                    "ArgumentCountError",
+                    format!("clone() expects at most 2 arguments, {} given", args.len()),
+                );
+            }
+            let with = match args.get(1) {
+                Some(c) => {
+                    let w = c.borrow();
+                    match &*w {
+                        Value::Array(a) => Some(a.clone()),
+                        other => {
+                            return err(
+                                "TypeError",
+                                format!(
+                                    "clone(): Argument #2 ($withProperties) must be of type array, {} given",
+                                    other.debug_type()
+                                ),
+                            )
+                        }
+                    }
+                }
+                None => None,
+            };
+            it.builtin_clone(&arg(args, 0), with.as_ref())?
+        }
         "assert_options_now" => Value::Null,
         "zend_test_func" | "zend_test_array_return" => Value::Null,
         _ => return Ok(None),

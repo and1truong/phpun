@@ -497,6 +497,11 @@ impl<'a> Interp<'a> {
                 .iter()
                 .rev()
                 .filter(|f| !crate::value::trace_frame_hidden(f))
+                // A decl-compile fatal raised while executing the
+                // eval'd unit itself drops that unit's `eval()` pseudo
+                // frame — '#0 {main}' at top level (R3 finding 14).
+                // Real frames above it keep it ('#1 FILE(N): eval()').
+                .skip_while(|f| f.internal && f.function == "eval")
                 .collect();
             // Only the INNERMOST (executing) include renders bare
             // 'include()'; dormant include frames deeper in the chain

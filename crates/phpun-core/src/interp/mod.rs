@@ -478,6 +478,10 @@ pub struct Interp<'a> {
     /// acquiring a `&` on one is "Cannot acquire reference to readonly
     /// property C::$p" (typed_properties_115). Value = (class, prop).
     pub readonly_cells: std::collections::HashMap<usize, (String, String)>,
+    /// Inside `clone($o, [...])` with-property writes: PHP 8.5 lets the
+    /// clone overwrite an already-initialized readonly prop — only the
+    /// set-visibility scope gate still applies (R3 finding 13).
+    pub clone_write: bool,
     /// Ptr of a typed prop slot eval_cell materialized to `null` just
     /// now — a rejected array auto-init must leave the prop
     /// uninitialized again (typed_properties_083).
@@ -863,7 +867,9 @@ impl<'a> Interp<'a> {
             included: HashSet::new(),
             pending_exception: None,
             call_trace: Vec::new(),
-            res_counter: 0,
+            // Zend burns resource ids 1-4 on STDIN/STDOUT/STDERR plus
+            // one internal stream — the first userland resource is #5.
+            res_counter: 4,
             shutdown_fns: Vec::new(),
             error_handler: None,
             error_handler_stack: Vec::new(),
@@ -905,6 +911,7 @@ impl<'a> Interp<'a> {
             ref_cells_prune: 1024,
             magic_guards: std::collections::HashSet::new(),
             readonly_cells: std::collections::HashMap::new(),
+            clone_write: false,
             last_fresh_cell: None,
             builtin_ifaces: std::collections::HashSet::new(),
             dep_seen: std::collections::HashSet::new(),

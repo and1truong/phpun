@@ -1640,7 +1640,10 @@ impl<'a> Interp<'a> {
                 for (i, elem) in items.iter().enumerate() {
                     let Some((ke, t)) = elem else { continue };
                     let key = match ke {
-                        Some(ke) => to_key(&self.eval(ke)?),
+                        Some(ke) => {
+                            let kv = self.eval(ke)?;
+                            self.destructure_key(&kv)?
+                        }
                         None => ArrKey::Int(i as i64),
                     };
                     match t {

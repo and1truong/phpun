@@ -163,6 +163,7 @@ pub(crate) fn builtin_sig(n: &str) -> Option<Vec<(String, bool)>> {
         "substr" => &[("string", true), ("offset", true), ("length", false)],
         "strpos" => &[("haystack", true), ("needle", true), ("offset", false)],
         "assert" => &[("assertion", true), ("description", false)],
+        "clone" => &[("object", true), ("withProperties", false)],
         "count" => &[("value", true), ("mode", false)],
         "implode" => &[("separator", false), ("array", true)],
         "explode" => &[("separator", true), ("string", true), ("limit", false)],
@@ -692,6 +693,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         "intval" | "floatval" | "doubleval" | "strval" | "boolval" => {
             bp!(("value", Req))
         }
+        "clone" => bp!(("object", Req), ("withProperties", Arr)),
         "count" | "sizeof" => bp!(("value", Req), ("mode", Int(0))),
         "array_slice" => bp!(
             ("array", Req),

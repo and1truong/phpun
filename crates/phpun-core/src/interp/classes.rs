@@ -2179,6 +2179,25 @@ impl<'a> Interp<'a> {
                     self.cur_line,
                 ));
             }
+            // `readonly $p = v` — 'cannot have default value' outranks
+            // the static-readonly and hook rules below (m11b/m11j).
+            if p.readonly && p.default.is_some() {
+                return Err(PhpError::fatal(
+                    format!(
+                        "Readonly property {}::${} cannot have default value",
+                        d.name, p.name
+                    ),
+                    self.cur_line,
+                ));
+            }
+            // `static readonly` — zend's own decl fatal; it outranks
+            // the hook rules but loses to 'must have type' above.
+            if p.readonly && p.is_static {
+                return Err(PhpError::fatal(
+                    format!("Static property {}::${} cannot be readonly", d.name, p.name),
+                    self.cur_line,
+                ));
+            }
             let Some(hs) = &p.hooks else { continue };
             // readonly classes forbid hooked props entirely, whether
             // declared or ctor-promoted (gh15419_1, gh15419_2).

@@ -2112,9 +2112,18 @@ impl<'a> Interp<'a> {
         if allows {
             return None;
         }
+        // The message names the DECLARING class for private but the
+        // object's RUNTIME class for protected ('Cannot access
+        // protected property B::$x' on a B() even though A declares
+        // the prop).
+        let en = if pd.visibility == crate::ast::Visibility::Protected {
+            o.borrow().class.name().to_string()
+        } else {
+            dn
+        };
         Some(PhpError::uncaught(
             "Error",
-            format!("Cannot access {} property {}::${}", word, dn, pn),
+            format!("Cannot access {} property {}::${}", word, en, pn),
             0,
         ))
     }

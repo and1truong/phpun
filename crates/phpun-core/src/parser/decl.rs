@@ -1361,16 +1361,10 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                if m_readonly && default.is_some() {
-                    // Only promoted ctor params may default (probe12c).
-                    return Err(PhpError::compile_fatal(
-                        format!(
-                            "Readonly property {}::${} cannot have default value",
-                            name, pname
-                        ),
-                        self.line(),
-                    ));
-                }
+                // 'Readonly property cannot have default value' runs in
+                // the per-prop decl pass (class register), after 'must
+                // have type' and before 'static cannot be readonly' —
+                // zend checks props in declaration order (m11b).
                 props.push(PropDecl {
                     name: pname,
                     default,

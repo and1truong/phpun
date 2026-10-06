@@ -1105,6 +1105,17 @@ impl<'a> Parser<'a> {
             });
         }
         if self.ident_is("clone") {
+            // `clone($o)` / `clone($o, [...])` — PHP 8.5's function
+            // form parses as a normal call to the `clone` builtin;
+            // bare `clone $o` stays the unary operator (R3 #13).
+            if matches!(self.peek2(), Some(Token::Op("("))) {
+                self.pos += 2;
+                let args = self.args()?;
+                return Ok(Expr::Call {
+                    name: Box::new(Expr::Str("\u{1}clone".to_string())),
+                    args,
+                });
+            }
             self.pos += 1;
             let e = self.unary()?;
             return Ok(Expr::Clone(Box::new(e)));
@@ -2276,10 +2287,26 @@ impl<'a> Parser<'a> {
                             ));
                         }
                     }
+                    let mut ctor_parens = false;
                     if self.at_op("(") {
                         self.pos += 1;
                         ctor_args = self.args()?;
                         self.check_no_fcc_ctor(&ctor_args)?;
+                        ctor_parens = true;
+                    }
+                    // A bare `new A` (no ctor parens) can't chain member
+                    // access — zend parse-errors on the next op:
+                    // 'unexpected token "->"' (parens or `new A()` do
+                    // chain: `(new A)->x`, `new A()->x` — m15 vs oracle).
+                    if !ctor_parens {
+                        if let Some(Token::Op(o)) = self.peek() {
+                            if matches!(&**o, "->" | "?->" | "[") {
+                                return Err(PhpError::parse(
+                                    format!("syntax error, unexpected token \"{}\"", o),
+                                    self.line(),
+                                ));
+                            }
+                        }
                     }
                     Ok(Expr::New {
                         class: Box::new(class),

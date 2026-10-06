@@ -607,109 +607,7 @@ impl<'a> Interp<'a> {
             Expr::ClassConst { class, name } => self.class_const(class, name),
             Expr::Clone(e) => {
                 let v = self.eval(e)?;
-                match v {
-                    Value::Object(o) => {
-                        let ob = o.borrow();
-                        let mut props = HashMap::new();
-                        // References survive clone — the clone's prop
-                        // shares the same zval and keeps the typed gate
-                        // (typed_properties_081).
-                        let mut shared: Vec<(String, Cell)> = Vec::new();
-                        for (k, c) in ob.props.iter() {
-                            if self.is_ref_cell(c) && Rc::strong_count(c) > 1 {
-                                shared.push((k.clone(), c.clone()));
-                            }
-                            props.insert(k.clone(), cell(c.borrow().clone()));
-                        }
-                        let new_obj = PhpObject {
-                            class: ob.class.clone(),
-                            props,
-                            prop_order: ob.prop_order.clone(),
-                            id: 0,
-                            internal: match &ob.internal {
-                                Some(ObjectInternal::Exception {
-                                    file,
-                                    line,
-                                    trace,
-                                    thrown,
-                                    full_msg,
-                                    eval_ctx,
-                                    frames,
-                                }) => Some(ObjectInternal::Exception {
-                                    file: file.clone(),
-                                    line: *line,
-                                    trace: trace.clone(),
-                                    thrown: *thrown,
-                                    full_msg: full_msg.clone(),
-                                    eval_ctx: *eval_ctx,
-                                    frames: frames.clone(),
-                                }),
-                                _ => None,
-                            },
-                            unset_props: ob.unset_props.clone(),
-                        };
-                        drop(ob);
-                        let nv = Value::Object(self.alloc_obj(new_obj));
-                        // Rebind shared cells into the clone and give it
-                        // its own slot owner so type checks keep
-                        // resolving against the clone's prop.
-                        if let Value::Object(no) = &nv {
-                            for (k, c) in shared {
-                                let ptr = Rc::as_ptr(&c) as usize;
-                                no.borrow_mut().props.insert(k.clone(), c);
-                                if let Some(a) = self.slot_anchor.get_mut(&ptr) {
-                                    if let SlotAnchor::Obj(w, sk) = a {
-                                        if sk == &k
-                                            && w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, &o))
-                                        {
-                                            *a = SlotAnchor::Obj(Rc::downgrade(no), k.clone());
-                                        }
-                                    }
-                                }
-                                if let Some(owners) = self.slot_owners.get_mut(&ptr) {
-                                    for (_, _, _, a) in owners.iter_mut() {
-                                        // Repoint owners that anchored
-                                        // the SOURCE object's prop to
-                                        // the clone's slot.
-                                        if let SlotAnchor::Obj(w, sk) = a {
-                                            if sk == &k
-                                                && w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, &o))
-                                            {
-                                                *a = SlotAnchor::Obj(Rc::downgrade(no), k.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if let Value::Object(no) = &nv {
-                            let ncls = no.borrow().class.clone();
-                            if self.find_method_in(&ncls, "__clone").is_some() {
-                                self.method_invoke(no.clone(), "__clone", CallArgs::empty())?;
-                            }
-                        }
-                        Ok(nv)
-                    }
-                    Value::Callable(c) => {
-                        // `clone $closure` — fresh handle id; captured
-                        // cells stay shared so by-ref uses still alias
-                        // the outer var (closure_024).
-                        let nc = self.new_callable((*c).clone());
-                        Ok(Value::Callable(nc))
-                    }
-                    _ => {
-                        let e = self.exception("Error", "Cannot clone non-object");
-                        self.pending_exception = Some(e);
-                        Err(PhpError {
-                            trace: None,
-                            thrown_line: None,
-                            display_msg: None,
-                            kind: ErrorKind::Throw,
-                            message: "clone".into(),
-                            line: 0,
-                        })
-                    }
-                }
+                self.builtin_clone(&v, None)
             }
             Expr::Cast { kind, e } => {
                 let v = self.eval(e)?;
@@ -2329,7 +2227,7 @@ impl<'a> Interp<'a> {
             let (key, keyv) = match ke {
                 Some(ke) => {
                     let kv = self.eval(ke)?;
-                    (to_key(&kv), kv)
+                    (self.destructure_key(&kv)?, kv)
                 }
                 None => (ArrKey::Int(i as i64), Value::Int(i as i64)),
             };
@@ -2589,6 +2487,146 @@ impl<'a> Interp<'a> {
         self.fail(e)
     }
 
+    /// Clone an object: copy prop cells (shared `&`-cells rebind to the
+    /// clone's slot owners) and run `__clone` when declared. Shared by
+    /// the `clone $o` operator and `clone($o, [...])`.
+    pub(crate) fn clone_object(&mut self, o: &Rc<RefCell<PhpObject>>) -> Result<Value, PhpError> {
+        let ob = o.borrow();
+        let mut props = HashMap::new();
+        // References survive clone — the clone's prop
+        // shares the same zval and keeps the typed gate
+        // (typed_properties_081).
+        let mut shared: Vec<(String, Cell)> = Vec::new();
+        for (k, c) in ob.props.iter() {
+            if self.is_ref_cell(c) && Rc::strong_count(c) > 1 {
+                shared.push((k.clone(), c.clone()));
+            }
+            props.insert(k.clone(), cell(c.borrow().clone()));
+        }
+        let new_obj = PhpObject {
+            class: ob.class.clone(),
+            props,
+            prop_order: ob.prop_order.clone(),
+            id: 0,
+            internal: match &ob.internal {
+                Some(ObjectInternal::Exception {
+                    file,
+                    line,
+                    trace,
+                    thrown,
+                    full_msg,
+                    eval_ctx,
+                    frames,
+                }) => Some(ObjectInternal::Exception {
+                    file: file.clone(),
+                    line: *line,
+                    trace: trace.clone(),
+                    thrown: *thrown,
+                    full_msg: full_msg.clone(),
+                    eval_ctx: *eval_ctx,
+                    frames: frames.clone(),
+                }),
+                _ => None,
+            },
+            unset_props: ob.unset_props.clone(),
+        };
+        drop(ob);
+        let nv = Value::Object(self.alloc_obj(new_obj));
+        // Rebind shared cells into the clone and give it
+        // its own slot owner so type checks keep
+        // resolving against the clone's prop.
+        if let Value::Object(no) = &nv {
+            for (k, c) in shared {
+                let ptr = Rc::as_ptr(&c) as usize;
+                no.borrow_mut().props.insert(k.clone(), c);
+                if let Some(a) = self.slot_anchor.get_mut(&ptr) {
+                    if let SlotAnchor::Obj(w, sk) = a {
+                        if sk == &k && w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, &o)) {
+                            *a = SlotAnchor::Obj(Rc::downgrade(no), k.clone());
+                        }
+                    }
+                }
+                if let Some(owners) = self.slot_owners.get_mut(&ptr) {
+                    for (_, _, _, a) in owners.iter_mut() {
+                        // Repoint owners that anchored
+                        // the SOURCE object's prop to
+                        // the clone's slot.
+                        if let SlotAnchor::Obj(w, sk) = a {
+                            if sk == &k && w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, &o)) {
+                                *a = SlotAnchor::Obj(Rc::downgrade(no), k.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Value::Object(no) = &nv {
+            let ncls = no.borrow().class.clone();
+            if self.find_method_in(&ncls, "__clone").is_some() {
+                self.method_invoke(no.clone(), "__clone", CallArgs::empty())?;
+            }
+        }
+        Ok(nv)
+    }
+
+    /// The `clone()` builtin's dispatch: objects clone (with optional
+    /// with-properties), closures re-clone like the keyword form,
+    /// anything else is the arg-1 TypeError.
+    pub(crate) fn builtin_clone(
+        &mut self,
+        v: &Value,
+        with: Option<&Rc<RefCell<PhpArray>>>,
+    ) -> Result<Value, PhpError> {
+        match v {
+            Value::Object(o) => self.clone_with(o, with),
+            Value::Callable(c) => Ok(Value::Callable(self.new_callable((**c).clone()))),
+            other => self.fail(PhpError::uncaught(
+                "TypeError",
+                format!(
+                    "clone(): Argument #1 ($object) must be of type object, {} given",
+                    other.debug_type()
+                ),
+                0,
+            )),
+        }
+    }
+
+    /// `clone($o, ['k' => v, ...])` — PHP 8.5's second arg applies
+    /// prop writes AFTER `__clone` runs, through the normal write
+    /// path except readonly's init-once gate: a with-write may
+    /// overwrite an already-initialized readonly prop, but the
+    /// set-visibility scope check still applies ('Cannot modify
+    /// protected(set) readonly property ... from global scope').
+    pub(crate) fn clone_with(
+        &mut self,
+        o: &Rc<RefCell<PhpObject>>,
+        with: Option<&Rc<RefCell<PhpArray>>>,
+    ) -> Result<Value, PhpError> {
+        let nv = self.clone_object(o)?;
+        if let (Value::Object(no), Some(w)) = (&nv, with) {
+            let entries: Vec<(ArrKey, Value)> = w
+                .borrow()
+                .iter()
+                .map(|(k, c)| (k.clone(), c.borrow().clone()))
+                .collect();
+            self.clone_write = true;
+            let res = (|| {
+                for (k, v) in entries {
+                    let pn = match k {
+                        ArrKey::Int(i) => i.to_string(),
+                        ArrKey::Str(s) => s.to_string(),
+                        ArrKey::Tomb => continue,
+                    };
+                    self.store_prop(Value::Object(no.clone()), &pn, v)?;
+                }
+                Ok(())
+            })();
+            self.clone_write = false;
+            res?;
+        }
+        Ok(nv)
+    }
+
     /// Dynamic property names starting with `\0` hit zend's
     /// private-name-mangle check — a catchable Error, not magic
     /// (bug52484).
@@ -2630,9 +2668,12 @@ impl<'a> Interp<'a> {
                     if pd.readonly {
                         // readonly implies protected(set): one-time init
                         // from the declaring scope only; later writes
-                        // always fail (readonly_property tests).
+                        // always fail (readonly_property tests). Inside
+                        // `clone($o, [...])` with-writes the init-once
+                        // gate is lifted — only the scope check below
+                        // still applies (R3 finding 13).
                         let key = self.obj_prop_key(&o, pn).unwrap_or_else(|| pn.to_string());
-                        if o.borrow().props.contains_key(&key) {
+                        if !self.clone_write && o.borrow().props.contains_key(&key) {
                             return self.fail(PhpError::uncaught(
                                 "Error",
                                 format!(
@@ -3353,22 +3394,57 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// `$a[$k]` keys: object/closure keys are a catchable Error
-    /// naming the class (closure_array_key_error/offset_error).
+    /// `$a[$k]` keys: array/object/closure keys are a catchable
+    /// TypeError naming the type (closure_array_key_error/offset_error).
     fn check_offset_key(&mut self, v: &Value) -> Result<(), PhpError> {
-        let cn = match v {
-            Value::Object(o) => Some(o.borrow().class.name().to_string()),
-            Value::Callable(_) => Some("Closure".to_string()),
-            _ => None,
-        };
-        if let Some(cn) = cn {
+        if let Some(tn) = Self::illegal_offset_ty(v) {
             return self.fail(PhpError::uncaught(
-                "Error",
-                format!("Cannot access offset of type {} on array", cn),
+                "TypeError",
+                format!("Cannot access offset of type {} on array", tn),
                 0,
             ));
         }
         Ok(())
+    }
+
+    /// Keyed-destructure key validation — zend runs the same offset
+    /// checks as a dim read on the key expr's value: array/object keys
+    /// are a TypeError ('Cannot access offset of type K on array'),
+    /// float truncates with Deprecated, null is Deprecated, and a
+    /// resource warns and casts to its id int (m9 vs silent to_key).
+    pub(in crate::interp) fn destructure_key(&mut self, v: &Value) -> Result<ArrKey, PhpError> {
+        match v {
+            Value::Array(_) | Value::Object(_) | Value::Callable(_) => {
+                let tn = Self::illegal_offset_ty(v).unwrap();
+                self.fail(PhpError::uncaught(
+                    "TypeError",
+                    format!("Cannot access offset of type {} on array", tn),
+                    0,
+                ))
+            }
+            Value::Float(f) => {
+                self.deprecated(&format!(
+                    "Implicit conversion from float {} to int loses precision",
+                    Value::Float(*f).to_php_string()
+                ))?;
+                Ok(to_key(v))
+            }
+            Value::Null => {
+                self.deprecated(
+                    "Using null as an array offset is deprecated, use an empty string instead",
+                )?;
+                Ok(to_key(v))
+            }
+            Value::Resource(r) => {
+                let id = r.borrow().id();
+                self.warn(&format!(
+                    "Resource ID#{} used as offset, casting to integer ({})",
+                    id, id
+                ))?;
+                Ok(ArrKey::Int(id as i64))
+            }
+            _ => Ok(to_key(v)),
+        }
     }
 
     /// `set_index` with an already-evaluated key.
