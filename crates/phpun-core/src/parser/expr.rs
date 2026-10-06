@@ -144,7 +144,9 @@ impl<'a> Parser<'a> {
             // optional constructor args before body
             let ctor_args = if self.at_op("(") {
                 self.pos += 1;
-                self.args()?
+                let mut args = self.args()?;
+                Self::dyn_arglines(&mut args);
+                args
             } else {
                 Vec::new()
             };
@@ -411,12 +413,14 @@ impl<'a> Parser<'a> {
                         e = Expr::Index { e: Box::new(e), i };
                     } else if self.eat_op("->") {
                         // `new $this->prop` (bug21669); `->m()` stays ctor args.
+                        let site = self.line();
                         match self.next() {
                             Some(Token::Ident(pn)) => {
                                 e = Expr::Prop {
                                     obj: Box::new(e),
                                     name: PropName::Name(pn),
                                     nullsafe: false,
+                                    site,
                                 };
                             }
                             _ => {
@@ -1025,11 +1029,6 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn postfix(&mut self) -> Result<Expr, PhpError> {
-        // First token of the whole postfix chain — a dynamic
-        // `callable_expr(...)` call sites at its callee's line (zend
-        // DO_FCALL's lineno is the call node's = the callee node's
-        // lineno), which a `(` on a later line must not move.
-        let callee_line = self.line();
         let mut e = self.primary()?;
         loop {
             if self.eat_op("++") {
@@ -1073,13 +1072,17 @@ impl<'a> Parser<'a> {
                 e = Expr::Index { e: Box::new(e), i };
             } else if self.at_op("(") {
                 // `callable_expr(...)` — Zend sites the frame at the
-                // callee's first-token line, not the `(`.
+                // `(` token's line (the DO_FCALL op's lineno).
+                let paren_line = self.line();
                 self.pos += 1;
-                let args = self.args()?;
+                let mut args = self.args()?;
+                if !Self::literal_dyn_callee(&e) {
+                    Self::dyn_arglines(&mut args);
+                }
                 e = Self::fcc_wrap(Expr::Call {
                     name: Box::new(e),
                     args,
-                    site: callee_line,
+                    site: paren_line,
                 })?;
             } else if self.at_op("->") || self.at_op("?->") {
                 let nullsafe = self.at_op("?->");
@@ -1090,7 +1093,8 @@ impl<'a> Parser<'a> {
                 let name = self.prop_name()?;
                 if self.at_op("(") {
                     self.pos += 1;
-                    let args = self.args()?;
+                    let mut args = self.args()?;
+                    Self::dyn_arglines(&mut args);
                     e = Self::fcc_wrap(Expr::MethodCall {
                         obj: Box::new(e),
                         name,
@@ -1103,6 +1107,7 @@ impl<'a> Parser<'a> {
                         obj: Box::new(e),
                         name,
                         nullsafe,
+                        site,
                     };
                 }
             } else if self.eat_op("::") {
@@ -1191,7 +1196,10 @@ impl<'a> Parser<'a> {
                                     }
                                 }
                             }
-                            let args = self.args()?;
+                            let mut args = self.args()?;
+                            if !Self::literal_static_class(&e) {
+                                Self::dyn_arglines(&mut args);
+                            }
                             e = Self::fcc_wrap(Expr::StaticCall {
                                 class: Box::new(e),
                                 name: n,
@@ -1211,7 +1219,8 @@ impl<'a> Parser<'a> {
                             // name comes from the variable's value
                             // (tests/lang/044).
                             self.pos += 1;
-                            let args = self.args()?;
+                            let mut args = self.args()?;
+                            Self::dyn_arglines(&mut args);
                             e = Self::fcc_wrap(Expr::StaticCallDyn {
                                 class: Box::new(e),
                                 name: Box::new(Expr::Var(n)),
@@ -1236,6 +1245,9 @@ impl<'a> Parser<'a> {
                         self.expect_op("}")?;
                         if self.at_op("(") {
                             self.pos += 1;
+                            // `Cls::{expr}(...)` keeps per-arg send
+                            // lines — zend treats the `::{` member
+                            // call like a named static call.
                             let args = self.args()?;
                             e = Expr::MethodCall {
                                 obj: Box::new(e),
@@ -1274,7 +1286,8 @@ impl<'a> Parser<'a> {
                         };
                         if self.at_op("(") {
                             self.pos += 1;
-                            let args = self.args()?;
+                            let mut args = self.args()?;
+                            Self::dyn_arglines(&mut args);
                             e = Expr::MethodCall {
                                 obj: Box::new(e),
                                 name: PropName::Expr(Box::new(inner)),
@@ -1440,6 +1453,91 @@ impl<'a> Parser<'a> {
                 op: "argline", r, ..
             } => Self::unmark_argline(*r),
             e => e,
+        }
+    }
+
+    /// By-ref variant of `unmark_argline`.
+    pub(in crate::parser) fn unmark_argline_r(e: &Expr) -> &Expr {
+        match e {
+            Expr::Binary {
+                op: "argline", r, ..
+            } => Self::unmark_argline_r(r),
+            e => e,
+        }
+    }
+
+    /// The `argline` marker's line on an arg, if any.
+    fn argline_of(e: &Expr) -> Option<usize> {
+        match e {
+            Expr::Binary {
+                op: "argline", l, ..
+            } => match l.as_ref() {
+                Expr::Int(n) => Some(*n as usize),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// A call arg whose send op is a bare CV — `f($x)` or `f(n: $x)`.
+    /// Zend compiles it to a plain send whose lineno is the call's
+    /// arg-head line for non-literal callees; any other arg shape
+    /// emits ops on its own lines first.
+    fn bare_var_arg(e: &Expr) -> bool {
+        match Self::unmark_argline_r(e) {
+            Expr::Var(_) => true,
+            Expr::Binary { op: "named", r, .. } => {
+                matches!(Self::unmark_argline_r(r), Expr::Var(_))
+            }
+            _ => false,
+        }
+    }
+
+    /// Non-literal callee (`$f()`, `$o->m()`, `new`, `parent::m()`,
+    /// `static::m()`, `self::m()`, `$cls::m()`, `C::$m()`, `Cls::${e}()`,
+    /// `expr()`, string callables containing `::`): zend sites each
+    /// bare-CV arg's send at the FIRST arg's line — rewrite those
+    /// argline markers. Args with their own ops (calls, binaries,
+    /// index, unpack, var-var, …) keep their own lines.
+    pub(in crate::parser) fn dyn_arglines(args: &mut [Expr]) {
+        let Some(first) = args.first().and_then(Self::argline_of) else {
+            return;
+        };
+        for a in args.iter_mut().skip(1) {
+            if Self::bare_var_arg(a) {
+                *a = Self::markline(
+                    Self::unmark_argline(std::mem::replace(a, Expr::Null)),
+                    first,
+                );
+            }
+        }
+    }
+
+    /// `expr(...)` callee literalness for arg send lines: only a
+    /// source string literal naming a plain function (`'g'()`,
+    /// `('g')()`, `"g"()`) resolves like `g()` — a `Cls::m` string
+    /// callable goes through dynamic resolution like any other
+    /// non-literal callee.
+    fn literal_dyn_callee(e: &Expr) -> bool {
+        match Self::unmark_argline_r(e) {
+            Expr::Str(s) => !s.contains("::"),
+            _ => false,
+        }
+    }
+
+    /// `X::m(...)` class literalness for arg send lines: literal class
+    /// names (`O::sm`, `\O::sm`, `A\B::m`, `('O')::sm`) keep per-arg
+    /// send lines; `self`/`parent`/`static` and dynamic class exprs
+    /// (`$cls::m`) take the first-arg line.
+    fn literal_static_class(e: &Expr) -> bool {
+        match Self::unmark_argline_r(e) {
+            Expr::Const(n) => {
+                !n.eq_ignore_ascii_case("self")
+                    && !n.eq_ignore_ascii_case("parent")
+                    && !n.eq_ignore_ascii_case("static")
+            }
+            Expr::Str(_) => true,
+            _ => false,
         }
     }
 
@@ -1669,6 +1767,7 @@ impl<'a> Parser<'a> {
                     if self.at_op("(") {
                         self.pos += 1;
                         ctor_args = self.args()?;
+                        Self::dyn_arglines(&mut ctor_args);
                         self.check_no_fcc_ctor(&ctor_args)?;
                     }
                     Ok(Expr::New {

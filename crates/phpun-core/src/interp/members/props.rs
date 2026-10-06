@@ -1343,9 +1343,18 @@ impl<'a> Interp<'a> {
         obj: &Expr,
         name: &PropName,
         nullsafe: bool,
+        site: usize,
     ) -> Result<Value, PhpError> {
         let ov = self.eval(obj)?;
         let pn = self.prop_name(name)?;
+        // Zend sites the prop fetch at the member's end: the name
+        // token's line for `->p`, the name expr's last line for
+        // `->{e}`.
+        self.cur_line = match name {
+            PropName::Expr(inner) => Self::inner_end_line(inner).unwrap_or(site),
+            _ => site,
+        };
+        self.send_line = Some(self.cur_line);
         self.prop_read_value(ov, &pn, nullsafe)
     }
 
@@ -1519,9 +1528,18 @@ impl<'a> Interp<'a> {
         obj: &Expr,
         name: &PropName,
         _nullsafe: bool,
+        site: usize,
     ) -> Result<Cell, PhpError> {
         let pn = self.prop_name(name)?;
         let ov = self.eval(obj)?;
+        // Same member-end re-site as prop_read: write-path diags
+        // (default-object creation, magic __get/__set) also site at
+        // the member name's end.
+        self.cur_line = match name {
+            PropName::Expr(inner) => Self::inner_end_line(inner).unwrap_or(site),
+            _ => site,
+        };
+        self.send_line = Some(self.cur_line);
         match ov {
             Value::Object(o) => {
                 // Hooks intercept the cell path entirely — `[]`, `&`,

@@ -1494,6 +1494,7 @@ impl<'a> Parser<'a> {
                                 obj: Box::new(Expr::Var("this".into())),
                                 name: PropName::Name(pname.to_string()),
                                 nullsafe: false,
+                                site: line,
                             }),
                             op: "=",
                             value: Box::new(e),

@@ -443,6 +443,9 @@ pub enum Expr {
         obj: Box<Expr>,
         name: PropName,
         nullsafe: bool,
+        /// Trace site: the member-name token's line
+        /// (zend_ast_get_lineno(prop_ast)).
+        site: usize,
     },
     MethodCall {
         obj: Box<Expr>,

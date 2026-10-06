@@ -7,32 +7,52 @@ use super::*;
 impl<'a> Interp<'a> {
     // ----- expressions -----
 
-    /// The line a `{$expr}`/`${expr}` part's trailing read or
-    /// conversion reports when the re-parsed inner `e` ends in a
-    /// call: the deepest last-arg marker line (zend's post-arg-eval
-    /// lineno) — a call's dispatch leaves `cur_line` at the call's
-    /// own site instead. `None` when `e` isn't call-shaped or has no
-    /// args (cur_line already holds the right line).
-    fn inner_end_line(e: &Expr) -> Option<usize> {
-        let args = match e {
+    /// The line an expression's evaluation ends at — zend's
+    /// post-eval lineno. A call leaves it at the deepest last-arg
+    /// marker (dispatch re-sites at the call's own site), a prop
+    /// read at the member name's line, a ternary/binary at the last
+    /// source operand's end. `None` when `e` has no recorded end
+    /// (cur_line already holds the right line).
+    pub(in crate::interp) fn inner_end_line(e: &Expr) -> Option<usize> {
+        match e {
             Expr::Call { args, .. }
             | Expr::MethodCall { args, .. }
             | Expr::StaticCall { args, .. }
             | Expr::StaticCallDyn { args, .. }
-            | Expr::New { args, .. } => args,
-            _ => return None,
-        };
-        let last = args.last()?;
-        if let Some(l) = Self::inner_end_line(Self::unmark_arg(last)) {
-            return Some(l);
-        }
-        match last {
+            | Expr::New { args, .. } => Self::inner_end_line(args.last()?),
             Expr::Binary {
-                op: "argline", l, ..
-            } => match l.as_ref() {
+                op: "argline",
+                l,
+                r,
+            } => Self::inner_end_line(r).or_else(|| match l.as_ref() {
                 Expr::Int(n) => Some(*n as usize),
                 _ => None,
+            }),
+            Expr::Binary { r, .. } => Self::inner_end_line(r),
+            Expr::Ternary { f, .. } => Self::inner_end_line(f),
+            Expr::Prop { name, site, .. } => match name {
+                PropName::Expr(inner) => Self::inner_end_line(inner).or(Some(*site)),
+                _ => Some(*site),
             },
+            Expr::Index { e, i } => i
+                .as_deref()
+                .and_then(Self::inner_end_line)
+                .or_else(|| Self::inner_end_line(e)),
+            Expr::Paren(e)
+            | Expr::VarVar(e)
+            | Expr::PreInc(e)
+            | Expr::PreDec(e)
+            | Expr::PostInc(e)
+            | Expr::PostDec(e)
+            | Expr::Print(e)
+            | Expr::Clone(e)
+            | Expr::Unpack(e)
+            | Expr::Fcc(e)
+            | Expr::Throw(e)
+            | Expr::YieldFrom(e)
+            | Expr::Empty(e) => Self::inner_end_line(e),
+            Expr::Unary { e, .. } | Expr::Cast { e, .. } => Self::inner_end_line(e),
+            Expr::Assign { value, .. } => Self::inner_end_line(value),
             _ => None,
         }
     }
@@ -122,6 +142,14 @@ impl<'a> Interp<'a> {
             Expr::Var(name) => self.var_get(name),
             Expr::VarVar(inner) => {
                 let n = self.eval(inner)?;
+                // The name-conversion + variable read site at the
+                // inner expr's last evaluated line (zend's post-eval
+                // lineno) — same re-site as the `{$...}` re-parse
+                // path above.
+                if let Some(l) = Self::inner_end_line(inner) {
+                    self.cur_line = l;
+                }
+                self.send_line = Some(self.cur_line);
                 let name = self.conv_str(&n)?;
                 self.var_get(&name)
             }
@@ -634,7 +662,8 @@ impl<'a> Interp<'a> {
                 obj,
                 name,
                 nullsafe,
-            } => self.prop_read(obj, name, *nullsafe),
+                site,
+            } => self.prop_read(obj, name, *nullsafe, *site),
             Expr::MethodCall {
                 obj,
                 name,
@@ -1036,6 +1065,7 @@ impl<'a> Interp<'a> {
                 obj,
                 name,
                 nullsafe,
+                site: _,
             } => {
                 // Missing/inaccessible props consult __isset first
                 // (bug63462, bug44899); a re-entrant isset inside
@@ -1223,7 +1253,8 @@ impl<'a> Interp<'a> {
                 obj,
                 name,
                 nullsafe,
-            } => self.prop_read(obj, name, *nullsafe),
+                site,
+            } => self.prop_read(obj, name, *nullsafe, *site),
             _ => self.eval(e),
         }
     }
@@ -1744,7 +1775,8 @@ impl<'a> Interp<'a> {
                 obj,
                 name,
                 nullsafe,
-            } => self.prop_cell(obj, name, *nullsafe),
+                site,
+            } => self.prop_cell(obj, name, *nullsafe, *site),
             Expr::VarVar(inner) => {
                 let n = self.eval(inner)?;
                 let name = self.conv_str(&n)?;
@@ -2092,9 +2124,15 @@ impl<'a> Interp<'a> {
                 obj,
                 name,
                 nullsafe: _,
+                site,
             } => {
                 let pn = self.prop_name(name)?;
                 let ov = self.eval(obj)?;
+                self.cur_line = match name {
+                    PropName::Expr(inner) => Self::inner_end_line(inner).unwrap_or(*site),
+                    _ => *site,
+                };
+                self.send_line = Some(self.cur_line);
                 self.store_prop(ov, &pn, v).map(|_| ())
             }
             _ => self.fail(PhpError::fatal("Cannot assign to this expression", 0)),
@@ -2914,8 +2952,9 @@ impl<'a> Interp<'a> {
                 obj,
                 name,
                 nullsafe,
+                site,
             } => {
-                let c = self.prop_cell(obj, name, *nullsafe)?;
+                let c = self.prop_cell(obj, name, *nullsafe, *site)?;
                 self.index_into_key(c, key)
             }
             Expr::StaticProp { class, name } => {
@@ -3174,7 +3213,8 @@ impl<'a> Interp<'a> {
                 obj,
                 name,
                 nullsafe,
-            } => Some(self.prop_cell(obj, name, *nullsafe)?),
+                site,
+            } => Some(self.prop_cell(obj, name, *nullsafe, *site)?),
             Expr::StaticProp { class, name } => Some(self.static_prop_cell(class, name)?),
             Expr::VarVar(inner) => {
                 let n = self.eval(inner)?;
