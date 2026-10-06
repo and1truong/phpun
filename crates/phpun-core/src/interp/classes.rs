@@ -152,8 +152,11 @@ impl<'a> Interp<'a> {
         let mut d = (*decl).clone();
         // Declaring file — prop/const default exprs bind __FILE__/__DIR__
         // to it (composer's generated `__DIR__ . '/../..' . ...` paths).
+        // A class decl inside a function attributes to the FUNCTION's
+        // file, not whatever file happens to be executing at call time
+        // (oracle m8c: 'previously declared in m8c.php:3').
         if d.file.is_empty() {
-            d.file = self.cur_file.clone();
+            d.file = self.diag_file();
         }
 
         // Synthesize PropDecls from promoted constructor params

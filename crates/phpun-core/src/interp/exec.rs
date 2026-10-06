@@ -313,7 +313,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let mut d = d.clone();
-                d.file = self.cur_file.clone();
+                d.file = self.diag_file();
                 self.functions.insert(key, Rc::new(d));
                 Flow::Normal
             }
