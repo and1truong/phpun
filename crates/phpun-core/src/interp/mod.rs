@@ -233,8 +233,10 @@ pub struct Interp<'a> {
     /// Classes whose const initializers were already link-evaluated.
     consts_linked: std::collections::HashSet<String>,
     /// Top-level parentless classes registered by hoisting (early
-    /// binding); their decl stmt then no-ops (namespaces/ns_060).
-    early_bound_classes: HashSet<String>,
+    /// binding): name → AST decl ptr, so only the SAME decl stmt
+    /// no-ops on execution — a different decl site claiming the name
+    /// still hits the 'Cannot redeclare' check (namespaces/ns_060).
+    early_bound_classes: HashMap<String, usize>,
     /// Functions registered by hoisting; their decl stmt no-ops like
     /// PHP's early binding (the redeclare fatal only fires when a
     /// DIFFERENT decl claims an existing name).
@@ -806,7 +808,7 @@ impl<'a> Interp<'a> {
             enum_cases: std::collections::HashMap::new(),
             consts_linked: std::collections::HashSet::new(),
             decl_aliases: Vec::new(),
-            early_bound_classes: HashSet::new(),
+            early_bound_classes: HashMap::new(),
             early_bound_funcs: HashSet::new(),
             include_ns: Vec::new(),
             constants,
@@ -1382,17 +1384,24 @@ impl<'a> Interp<'a> {
                     if d.parent.is_none() && d.implements.is_empty() && d.traits.is_empty() =>
                 {
                     let key = d.name.to_lowercase();
-                    if !self.classes.contains_key(&key) && !self.early_bound_classes.contains(&key)
-                    {
-                        let mut d = (**d).clone();
-                        for m in &mut d.methods {
-                            let mut mm = (**m).clone();
-                            mm.decl.file = self.cur_file.clone();
-                            *m = Rc::new(mm);
-                        }
-                        if self.register_class(Rc::new(d)).is_ok() {
-                            self.early_bound_classes.insert(key);
-                        }
+                    if let Some((kind, file, line)) = self.existing_class_site(&key) {
+                        // A second unconditional decl of an occupied
+                        // name is Zend's compile-time 'Cannot
+                        // redeclare' fatal.
+                        return Err(PhpError::compile_fatal(
+                            Self::redeclare_class_msg(kind, &d.name, &file, line),
+                            d.line,
+                        ));
+                    }
+                    let site = Rc::as_ptr(d) as usize;
+                    let mut d = (**d).clone();
+                    for m in &mut d.methods {
+                        let mut mm = (**m).clone();
+                        mm.decl.file = self.cur_file.clone();
+                        *m = Rc::new(mm);
+                    }
+                    if self.register_class(Rc::new(d)).is_ok() {
+                        self.early_bound_classes.insert(key, site);
                     }
                 }
                 _ => {}
@@ -2976,10 +2985,6 @@ fn assert_arg_repr(v: &Value) -> String {
 const SPL_ITERATOR_PRELUDE: &str = r#"
 interface OuterIterator extends Iterator {
     public function getInnerIterator();
-}
-interface RecursiveIterator extends Iterator {
-    public function hasChildren();
-    public function getChildren();
 }
 class IteratorIterator implements OuterIterator {
     protected $inner;

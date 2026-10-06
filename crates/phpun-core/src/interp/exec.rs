@@ -288,6 +288,7 @@ impl<'a> Interp<'a> {
             }
             Stmt::Function(d) => {
                 if let Err(e) = self.decl_type_checks(&d.name, d, None) {
+                    let e = self.decl_fatal_ctx(e);
                     return self.err_flow(e);
                 }
                 let key = d.name.to_lowercase();
@@ -298,13 +299,14 @@ impl<'a> Interp<'a> {
                         && prev.file == self.cur_file
                         && self.early_bound_funcs.contains(&key);
                     if !self_decl {
-                        return self.err_flow(PhpError::fatal(
+                        let e = self.decl_fatal_ctx(PhpError::fatal(
                             format!(
                                 "Cannot redeclare function {}() (previously declared in {}:{})",
                                 d.name, prev.file, prev.line
                             ),
                             self.cur_line,
                         ));
+                        return self.err_flow(e);
                     }
                 }
                 let mut d = d.clone();
@@ -313,11 +315,26 @@ impl<'a> Interp<'a> {
                 Flow::Normal
             }
             Stmt::Class(d) => {
+                let key = d.name.to_lowercase();
+                // The same decl site early-bound at compile time is a
+                // no-op; a DIFFERENT decl claiming an occupied name is
+                // the 'Cannot redeclare' fatal.
+                if self.early_bound_classes.get(&key) == Some(&(Rc::as_ptr(d) as usize)) {
+                    return Flow::Normal;
+                }
+                if let Some((kind, file, line)) = self.existing_class_site(&key) {
+                    let e = self.decl_fatal_ctx(PhpError::fatal(
+                        Self::redeclare_class_msg(kind, &d.name, &file, line),
+                        self.cur_line,
+                    ));
+                    return self.err_flow(e);
+                }
                 for m in &d.methods {
                     let fname = format!("{}::{}", d.name, m.decl.name);
                     if let Err(e) =
                         self.decl_type_checks(&fname, &m.decl, Some((&d.name, d.parent.clone())))
                     {
+                        let e = self.decl_fatal_ctx(e);
                         return self.err_flow(e);
                     }
                 }
@@ -326,9 +343,6 @@ impl<'a> Interp<'a> {
                     let mut mm = (**m).clone();
                     mm.decl.file = self.cur_file.clone();
                     *m = Rc::new(mm);
-                }
-                if self.early_bound_classes.contains(&d.name.to_lowercase()) {
-                    return Flow::Normal;
                 }
                 if let Err(e) = self.register_class(Rc::new(d)) {
                     return self.err_flow(e);

@@ -49,6 +49,7 @@ impl<'a> Interp<'a> {
                     .collect(),
                 consts: vec![],
                 file: String::new(),
+                line: 0,
             }
         }
         fn method(name: &str, _params: &[&str]) -> Rc<MethodDecl> {
@@ -127,6 +128,7 @@ impl<'a> Interp<'a> {
             props: vec![],
             consts: vec![],
             file: String::new(),
+            line: 0,
         };
         reg(iface("Throwable", &[], &[]), true);
         reg(iface("Stringable", &[], &["__toString"]), true);
@@ -332,6 +334,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -356,6 +359,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -386,6 +390,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -425,6 +430,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -451,6 +457,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -506,6 +513,7 @@ impl<'a> Interp<'a> {
                     fsi_const("FOLLOW_SYMLINKS", 16384),
                 ],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -531,6 +539,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -735,6 +744,7 @@ impl<'a> Interp<'a> {
                     },
                 ],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -769,6 +779,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -793,6 +804,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -868,6 +880,7 @@ impl<'a> Interp<'a> {
                     },
                 ],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -899,6 +912,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -918,6 +932,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -1053,6 +1068,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -1129,6 +1145,7 @@ impl<'a> Interp<'a> {
                     enum_case: false,
                 }],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -1244,6 +1261,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -1279,6 +1297,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -1357,6 +1376,7 @@ impl<'a> Interp<'a> {
                 })
                 .collect(),
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -1385,6 +1405,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -1422,6 +1443,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -1447,6 +1469,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -1548,6 +1571,7 @@ impl<'a> Interp<'a> {
                     },
                 ],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -1592,6 +1616,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -1615,6 +1640,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -1640,6 +1666,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );
@@ -1676,6 +1703,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             ClassDecl {
                 name: "ReflectionObject".into(),
@@ -1692,6 +1720,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             ClassDecl {
                 name: "ReflectionEnum".into(),
@@ -1715,6 +1744,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             ClassDecl {
                 name: "ReflectionEnumUnitCase".into(),
@@ -1731,6 +1761,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             ClassDecl {
                 name: "ReflectionEnumBackedCase".into(),
@@ -1747,6 +1778,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             ClassDecl {
                 name: "ReflectionType".into(),
@@ -1763,6 +1795,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             ClassDecl {
                 name: "ReflectionUnionType".into(),
@@ -1782,6 +1815,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             ClassDecl {
                 name: "ReflectionIntersectionType".into(),
@@ -1801,6 +1835,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             ClassDecl {
                 name: "ReflectionExtension".into(),
@@ -1821,6 +1856,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             ClassDecl {
                 name: "ReflectionZendExtension".into(),
@@ -1844,6 +1880,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             ClassDecl {
                 name: "ReflectionGenerator".into(),
@@ -1868,6 +1905,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             ClassDecl {
                 name: "ReflectionReference".into(),
@@ -1890,6 +1928,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             ClassDecl {
                 name: "ReflectionConstant".into(),
@@ -1913,6 +1952,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
         ] {
             reg(d, false);
@@ -1945,6 +1985,7 @@ impl<'a> Interp<'a> {
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
+            line: 0,
             },
             false,
         );

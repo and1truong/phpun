@@ -8,6 +8,43 @@ use super::*;
 impl<'a> Interp<'a> {
     // ----- classes -----
 
+    /// Class-ish name already registered — (prev-kind word, file,
+    /// line) for 'Cannot redeclare' diagnostics. Zend's message names
+    /// the previously declared kind (an enum counts as a class).
+    pub(in crate::interp) fn existing_class_site(
+        &self,
+        key: &str,
+    ) -> Option<(&'static str, String, usize)> {
+        if let Some(c) = self.classes.get(key) {
+            return Some(("class", c.decl.file.clone(), c.decl.line));
+        }
+        if let Some(c) = self.interfaces.get(key) {
+            return Some(("interface", c.file.clone(), c.line));
+        }
+        if let Some(c) = self.traits.get(key) {
+            return Some(("trait", c.file.clone(), c.line));
+        }
+        None
+    }
+
+    /// 'Cannot redeclare K N' — internal classes carry no
+    /// (previously declared in FILE:LINE) suffix.
+    pub(in crate::interp) fn redeclare_class_msg(
+        kind: &str,
+        name: &str,
+        file: &str,
+        line: usize,
+    ) -> String {
+        if file.is_empty() {
+            format!("Cannot redeclare {} {}", kind, name)
+        } else {
+            format!(
+                "Cannot redeclare {} {} (previously declared in {}:{})",
+                kind, name, file, line
+            )
+        }
+    }
+
     pub(in crate::interp) fn register_class(
         &mut self,
         decl: Rc<ClassDecl>,
@@ -19,7 +56,12 @@ impl<'a> Interp<'a> {
         self.declaring.push(decl.clone());
         let res = self.register_class_inner(decl);
         self.declaring.pop();
-        res
+        match res {
+            // Class-linking errors are compile-class fatals — Zend
+            // attaches the live backtrace even at runtime.
+            Err(e) => Err(self.decl_fatal_ctx(e)),
+            r => r,
+        }
     }
 
     fn register_class_inner(&mut self, decl: Rc<ClassDecl>) -> Result<(), PhpError> {
@@ -3342,6 +3384,7 @@ impl<'a> Interp<'a> {
                             props: vec![],
                             consts: vec![],
                             file: String::new(),
+                            line: 0,
                         }),
                         statics: RefCell::new(HashMap::new()),
                         statics_init: RefCell::new(true),

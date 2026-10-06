@@ -364,6 +364,7 @@ impl<'a> Parser<'a> {
                     props,
                     consts,
                     file: String::new(),
+                    line: self.line(),
                 })),
                 ctor_args,
             ));

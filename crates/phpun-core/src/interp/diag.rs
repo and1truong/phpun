@@ -449,6 +449,18 @@ impl<'a> Interp<'a> {
             .collect()
     }
 
+    /// Declaration/linking-time fatals (Cannot redeclare, abstract
+    /// method, class-const redefinition, variance, ...) are
+    /// compile-class errors in Zend: they always print a `Stack
+    /// trace:` block with the live frames — `#0 {main}` at top level —
+    /// unlike plain runtime E_ERRORs which show no trace.
+    pub(in crate::interp) fn decl_fatal_ctx(&mut self, mut e: PhpError) -> PhpError {
+        if matches!(e.kind, ErrorKind::Fatal) {
+            e.trace = Some(self.compile_err_frames());
+        }
+        e
+    }
+
     /// File diagnostics attribute to: the executing frame's declaring
     /// file, else the file currently being included/run (warnings inside
     /// autoloaded/library code report the library file, not the caller).
