@@ -869,6 +869,7 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn class_decl(&mut self) -> Result<Stmt, PhpError> {
+        let decl_line = self.line();
         // `#[Attr]` groups may precede the class modifiers (or were
         // already consumed at the statement level).
         let attrs = if self.pending_class_attrs.is_empty() {
@@ -1295,6 +1296,7 @@ impl<'a> Parser<'a> {
             props,
             consts,
             file: String::new(),
+            line: decl_line,
         })))
     }
 

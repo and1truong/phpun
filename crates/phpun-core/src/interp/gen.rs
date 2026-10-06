@@ -269,15 +269,26 @@ impl<'a> Interp<'a> {
         self.gen_auto = saved_auto;
         self.gen_run_state = saved_run;
         let collected = std::mem::take(&mut *items.borrow_mut());
-        let mut st = state.borrow_mut();
-        st.items = collected;
-        st.finished = true;
+        {
+            let mut st = state.borrow_mut();
+            st.items = collected;
+            st.finished = true;
+        }
         match r {
             Ok(rv) => {
-                st.return_val = rv;
+                state.borrow_mut().return_val = rv;
                 Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // A fatal unwinding out of the gen body must not
+                // strand output the body emitted after a yield: flush
+                // this run's deferred bytes now that the outer
+                // run-state is restored — they defer into the outer
+                // gen's pending_out (which print_fatal still flushes)
+                // or write out directly at top level.
+                self.gen_flush_out(state, usize::MAX);
+                Err(e)
+            }
         }
     }
 

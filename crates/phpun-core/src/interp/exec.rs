@@ -55,6 +55,15 @@ impl<'a> Interp<'a> {
         Flow::Normal
     }
 
+    /// A loop/switch body: one enclosing context for `break`/`continue`
+    /// level counting (zend's loop_var_stack depth).
+    fn exec_loop_body(&mut self, stmts: &[Stmt]) -> Flow {
+        self.loop_depth += 1;
+        let f = self.exec_block(stmts);
+        self.loop_depth -= 1;
+        f
+    }
+
     fn exec(&mut self, s: &Stmt) -> Flow {
         match s {
             Stmt::Line(l) => {
@@ -182,7 +191,7 @@ impl<'a> Interp<'a> {
                             _ => {}
                         }
                     }
-                    match self.exec_block(body) {
+                    match self.exec_loop_body(body) {
                         Flow::Break(0) | Flow::Break(1) => break,
                         Flow::Break(n) => return Flow::Break(n - 1),
                         Flow::Continue(0) | Flow::Continue(1) => {}
@@ -259,9 +268,17 @@ impl<'a> Interp<'a> {
                 if let Some(si) = start {
                     // Run all cases from `start`, stopping at Break.
                     for (_, body) in &cases[si..] {
-                        match self.exec_block(body) {
+                        match self.exec_loop_body(body) {
                             Flow::Break(0) | Flow::Break(1) => return Flow::Normal,
                             Flow::Break(n) => return Flow::Break(n - 1),
+                            // A `continue` aimed at the switch itself acts
+                            // as `break` (Zend warns at compile time, which
+                            // our unit gate mirrors); a deeper `continue N`
+                            // escapes toward the enclosing loop.
+                            Flow::Continue(0) | Flow::Continue(1) => {
+                                return Flow::Normal;
+                            }
+                            Flow::Continue(n) => return Flow::Continue(n - 1),
                             Flow::Normal => {}
                             f => return f,
                         }
@@ -271,23 +288,28 @@ impl<'a> Interp<'a> {
             }
             Stmt::Function(d) => {
                 if let Err(e) = self.decl_type_checks(&d.name, d, None) {
+                    let e = self.decl_fatal_ctx(e);
                     return self.err_flow(e);
                 }
                 let key = d.name.to_lowercase();
-                if let Some(prev) = self.functions.get(&key) {
-                    // Early-bound decls are compile-time registered —
-                    // reaching their own stmt is a no-op, not a collision.
-                    let self_decl = prev.line == d.line
-                        && prev.file == self.cur_file
-                        && self.early_bound_funcs.contains(&key);
-                    if !self_decl {
-                        return self.err_flow(PhpError::fatal(
+                let site = std::ptr::from_ref(d) as usize;
+                // The decl site early-bound at compile no-ops on
+                // execution; a DIFFERENT decl (a conditional decl in an
+                // if/loop, or a decl in another unit) claiming the
+                // occupied name is the 'Cannot redeclare' fatal — a
+                // line+file match is not enough, two decls can share
+                // a line.
+                let self_decl = self.early_bound_funcs.get(&key) == Some(&(self.cur_unit_id, site));
+                if !self_decl {
+                    if let Some(prev) = self.functions.get(&key) {
+                        let e = self.decl_fatal_ctx(PhpError::fatal(
                             format!(
                                 "Cannot redeclare function {}() (previously declared in {}:{})",
                                 d.name, prev.file, prev.line
                             ),
                             self.cur_line,
                         ));
+                        return self.err_flow(e);
                     }
                 }
                 let mut d = d.clone();
@@ -296,13 +318,32 @@ impl<'a> Interp<'a> {
                 Flow::Normal
             }
             Stmt::Class(d) => {
+                // Method-decl diagnostics run even for early-bound
+                // classes (implicit-nullable deprecations, default-
+                // value fatals) — they are decl checks, not
+                // registration side effects.
                 for m in &d.methods {
                     let fname = format!("{}::{}", d.name, m.decl.name);
                     if let Err(e) =
                         self.decl_type_checks(&fname, &m.decl, Some((&d.name, d.parent.clone())))
                     {
+                        let e = self.decl_fatal_ctx(e);
                         return self.err_flow(e);
                     }
+                }
+                let key = d.name.to_lowercase();
+                // The same decl site early-bound at compile time is a
+                // no-op; a DIFFERENT decl claiming an occupied name is
+                // the 'Cannot redeclare' fatal.
+                if self.early_bound_classes.get(&key) == Some(&(Rc::as_ptr(d) as usize)) {
+                    return Flow::Normal;
+                }
+                if let Some((kind, file, line)) = self.existing_class_site(&key) {
+                    let e = self.decl_fatal_ctx(PhpError::fatal(
+                        Self::redeclare_class_msg(kind, &d.name, &file, line),
+                        self.cur_line,
+                    ));
+                    return self.err_flow(e);
                 }
                 let mut d = (**d).clone();
                 for m in &mut d.methods {
@@ -310,41 +351,63 @@ impl<'a> Interp<'a> {
                     mm.decl.file = self.cur_file.clone();
                     *m = Rc::new(mm);
                 }
-                if self.early_bound_classes.contains(&d.name.to_lowercase()) {
-                    return Flow::Normal;
-                }
                 if let Err(e) = self.register_class(Rc::new(d)) {
                     return self.err_flow(e);
                 }
                 Flow::Normal
             }
-            Stmt::Static { vars, line } => {
-                let key = self.fn_statics_key();
+            Stmt::Static { vars, .. } => {
+                let mut key = self.fn_statics_key();
+                // Static storage keys on the op_array the decl was
+                // compiled into: a function body's own table (bare key),
+                // eval/include unit code executing inside a frame
+                // (`key\0u{unit}` — a fresh table per unit, re-initialized
+                // on every call like Zend's fresh op_array), or top-level
+                // code where the executing unit itself is the owner.
+                let unit = if self.stack.is_empty() {
+                    Some(self.cur_unit_id)
+                } else {
+                    self.stack.last().and_then(|f| f.statics_unit)
+                };
+                if let Some(u) = unit {
+                    key = format!("{}\u{0}u{}", key, u);
+                }
+                // Site identity: (compile unit, stmt node). A `static $a`
+                // redeclared at a different statement in the same scope
+                // and unit is a compile fatal — even on the same line
+                // (static_basic_002) — while re-executing the same
+                // statement (loops) or redeclaring in a different unit
+                // — a separate include/eval/run, which Zend compiles to
+                // a fresh op_array — is not. The serial (not the file
+                // string) keys the unit: a re-parsed unit may recycle
+                // the freed Vec's stmt ptr and must still count as new.
+                let site = (self.cur_unit_id, vars.as_ptr() as usize);
                 for (name, default) in vars {
-                    // `static $a` redeclared at a different site in the same
-                    // scope is a compile fatal (tests/lang/static_basic_002).
-                    let prev = self
+                    // Every site is kept: a decl in a different unit is
+                    // legal AND must not erase the same-unit record a
+                    // later duplicate checks against.
+                    let sites = self
                         .static_decls
                         .entry(key.clone())
                         .or_default()
-                        .insert(name.clone(), *line);
-                    if prev.is_some_and(|l| l != *line) {
-                        return self.err_flow(PhpError::fatal(
+                        .entry(name.clone())
+                        .or_default();
+                    let dup = sites.iter().any(|(u, l)| u == &site.0 && *l != site.1);
+                    sites.insert(site);
+                    if dup {
+                        // A compile fatal in Zend — carry the compile-
+                        // context backtrace (include chain minus context).
+                        let mut e = PhpError::compile_fatal(
                             format!("Duplicate declaration of static variable ${}", name),
                             self.cur_line,
-                        ));
+                        );
+                        e.trace = Some(self.compile_err_frames());
+                        return self.err_flow(e);
                     }
                     // Statics live per-function-decl: inside a function
                     // they never fall back to the top-level table
                     // (static_variation_001).
-                    let exists = {
-                        let table = if self.stack.is_empty() {
-                            Some(&self.global_statics)
-                        } else {
-                            self.statics.get(&key)
-                        };
-                        table.and_then(|t| t.get(name).cloned())
-                    };
+                    let exists = self.statics.get(&key).and_then(|t| t.get(name).cloned());
                     let cellv = match exists {
                         Some(c) => c,
                         None => {
@@ -362,14 +425,10 @@ impl<'a> Interp<'a> {
                                 None => Value::Null,
                             };
                             let c = cell(v);
-                            if self.stack.is_empty() {
-                                self.global_statics.insert(name.clone(), c.clone());
-                            } else {
-                                self.statics
-                                    .entry(key.clone())
-                                    .or_default()
-                                    .insert(name.clone(), c.clone());
-                            }
+                            self.statics
+                                .entry(key.clone())
+                                .or_default()
+                                .insert(name.clone(), c.clone());
                             c
                         }
                     };
@@ -434,20 +493,8 @@ impl<'a> Interp<'a> {
                 };
                 Flow::Return(v)
             }
-            Stmt::Break(e) => {
-                let n = match e {
-                    Some(e) => self.eval(e).map(|v| v.to_int()).unwrap_or(1).max(1) as u32,
-                    None => 1,
-                };
-                Flow::Break(n)
-            }
-            Stmt::Continue(e) => {
-                let n = match e {
-                    Some(e) => self.eval(e).map(|v| v.to_int()).unwrap_or(1).max(1) as u32,
-                    None => 1,
-                };
-                Flow::Continue(n)
-            }
+            Stmt::Break(e) => self.exec_break_continue(e, true),
+            Stmt::Continue(e) => self.exec_break_continue(e, false),
             Stmt::Goto(l) => Flow::Goto(l.clone()),
             Stmt::Label(_) => Flow::Normal,
             Stmt::Global(names) => {
@@ -578,6 +625,12 @@ impl<'a> Interp<'a> {
                         let mut result = Flow::Throw(v.clone());
                         for c in catches {
                             if self.catch_matches(&v, &c.types) {
+                                // The throwable's raise-site stamp is
+                                // consumed here — a later engine error
+                                // must not inherit its file
+                                // (a caught include-time throwable
+                                // would otherwise poison attribution).
+                                self.last_err_file.clear();
                                 if let Some(var) = &c.var {
                                     // Binding the catch var is a normal
                                     // assign — a `&`-bound typed ref
@@ -642,10 +695,12 @@ impl<'a> Interp<'a> {
                     // compile-time fatal (namespaces/ns_075).
                     let short = n.rsplit('\\').next().unwrap_or(n);
                     if matches!(short.to_uppercase().as_str(), "TRUE" | "FALSE" | "NULL") {
-                        return self.err_flow(PhpError::fatal(
+                        let mut e = PhpError::compile_fatal(
                             format!("Cannot redeclare constant '{}'", short),
                             self.cur_line,
-                        ));
+                        );
+                        e.trace = Some(self.compile_err_frames());
+                        return self.err_flow(e);
                     }
                     match self.eval_const(e) {
                         Ok(v) => self.define_const(n, v),
@@ -682,12 +737,77 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `break`/`continue` — Zend checks the operand (a literal positive
+    /// int) and the enclosing loop/switch depth at compile time, so the
+    /// operand errors are fatals, not runtime values; escaping the last
+    /// context surfaces later as `not in the 'loop' or 'switch' context`
+    /// at the unit boundary.
+    fn exec_break_continue(&mut self, e: &Option<Expr>, is_break: bool) -> Flow {
+        let kw = if is_break { "break" } else { "continue" };
+        let operand_fatal = |interp: &mut Self, msg: String| -> Flow {
+            let mut e = PhpError::compile_fatal(msg, interp.cur_line);
+            e.trace = Some(interp.compile_err_frames());
+            interp.err_flow(e)
+        };
+        let n = match e {
+            Some(e) => {
+                // `break (2)` is a parenthesized literal — still valid;
+                // variables/arithmetic are not supported operands.
+                let mut inner = e;
+                while let Expr::Paren(p) = inner {
+                    inner = p;
+                }
+                match inner {
+                    Expr::Int(i) if *i > 0 => *i as u32,
+                    // Any scalar literal that isn't a positive int:
+                    // `'break' operator accepts only positive integers`
+                    // (zend checks the literal zval's type at compile).
+                    Expr::Int(_) | Expr::Float(_) | Expr::Str(_) => {
+                        return operand_fatal(
+                            self,
+                            format!("'{}' operator accepts only positive integers", kw),
+                        );
+                    }
+                    Expr::Interp(parts)
+                        if parts
+                            .iter()
+                            .all(|p| matches!(p, crate::lexer::StringPart::Lit(_))) =>
+                    {
+                        return operand_fatal(
+                            self,
+                            format!("'{}' operator accepts only positive integers", kw),
+                        );
+                    }
+                    _ => {
+                        return operand_fatal(
+                            self,
+                            format!(
+                                "'{}' operator with non-integer operand is no longer supported",
+                                kw
+                            ),
+                        );
+                    }
+                }
+            }
+            None => 1,
+        };
+        if self.loop_depth > 0 && n > self.loop_depth {
+            return operand_fatal(self, format!("Cannot '{}' {} levels", kw, n));
+        }
+        if is_break {
+            Flow::Break(n)
+        } else {
+            Flow::Continue(n)
+        }
+    }
+
     fn exec_while(&mut self, cond: &Expr, body: &[Stmt], do_first: bool) -> Flow {
         if do_first {
-            match self.exec_block(body) {
+            match self.exec_loop_body(body) {
                 Flow::Break(0) | Flow::Break(1) => return Flow::Normal,
                 Flow::Break(n) => return Flow::Break(n - 1),
-                Flow::Normal | Flow::Continue(_) => {}
+                Flow::Normal | Flow::Continue(0) | Flow::Continue(1) => {}
+                Flow::Continue(n) => return Flow::Continue(n - 1),
                 f => return f,
             }
         }
@@ -697,7 +817,7 @@ impl<'a> Interp<'a> {
                 Err(e) => return self.err_flow(e),
                 _ => {}
             }
-            match self.exec_block(body) {
+            match self.exec_loop_body(body) {
                 Flow::Break(0) | Flow::Break(1) => break,
                 Flow::Break(n) => return Flow::Break(n - 1),
                 Flow::Continue(0) | Flow::Continue(1) => continue,
@@ -717,10 +837,11 @@ impl<'a> Interp<'a> {
         body: &[Stmt],
     ) -> Flow {
         if matches!(key, Some(ForeachKey::ByRef)) {
-            return self.err_flow(PhpError::fatal(
-                "Key element cannot be a reference",
-                self.cur_line,
-            ));
+            // A compile fatal in Zend (`foreach as &$k => $v` dies at
+            // compile time with a `{main}`-or-chain backtrace).
+            let mut e = PhpError::compile_fatal("Key element cannot be a reference", self.cur_line);
+            e.trace = Some(self.compile_err_frames());
+            return self.err_flow(e);
         }
         let src = match self.eval(arr) {
             Ok(v) => v,
@@ -805,7 +926,7 @@ impl<'a> Interp<'a> {
                                 if self.foreach_list(items, &c.borrow().clone()).is_err() {}
                             }
                         }
-                        match self.exec_block(body) {
+                        match self.exec_loop_body(body) {
                             Flow::Break(0) | Flow::Break(1) => break Flow::Normal,
                             Flow::Break(n) => break Flow::Break(n - 1),
                             Flow::Continue(0) | Flow::Continue(1) => continue,
@@ -849,7 +970,7 @@ impl<'a> Interp<'a> {
                             if self.foreach_list(items, &c.borrow().clone()).is_err() {}
                         }
                     }
-                    match self.exec_block(body) {
+                    match self.exec_loop_body(body) {
                         Flow::Break(0) | Flow::Break(1) => break,
                         Flow::Break(n) => return Flow::Break(n - 1),
                         Flow::Continue(0) | Flow::Continue(1) => continue,
@@ -1108,7 +1229,7 @@ impl<'a> Interp<'a> {
                             let _ = self.foreach_list(items, &c.borrow().clone());
                         }
                     }
-                    match self.exec_block(body) {
+                    match self.exec_loop_body(body) {
                         Flow::Break(0) | Flow::Break(1) => break,
                         Flow::Break(n) => return Flow::Break(n - 1),
                         Flow::Normal | Flow::Continue(0) | Flow::Continue(1) => {}
@@ -1242,7 +1363,7 @@ impl<'a> Interp<'a> {
                     let _ = self.foreach_list(items, &v);
                 }
             }
-            match self.exec_block(body) {
+            match self.exec_loop_body(body) {
                 Flow::Break(0) | Flow::Break(1) => break,
                 Flow::Break(n) => return Flow::Break(n - 1),
                 Flow::Continue(0) | Flow::Continue(1) => {}

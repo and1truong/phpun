@@ -134,6 +134,12 @@ impl<'a> Interp<'a> {
             }
         };
         let canon = path.canonicalize().unwrap_or(path);
+        // Zend's include/require backtrace entries carry the RESOLVED
+        // canonical path as their arg (trace_arg truncates it to 15
+        // chars at render).
+        if let Some(f) = self.call_trace.last_mut() {
+            f.args[0] = cell(Value::str(canon.display().to_string()));
+        }
         if matches!(kind, IncludeKind::IncludeOnce | IncludeKind::RequireOnce) {
             if self.included.contains(&canon) {
                 inc_pop(self);
@@ -158,11 +164,60 @@ impl<'a> Interp<'a> {
             Ok(s) => s,
             Err(e) => {
                 match e.kind {
-                    ErrorKind::Parse => self.print_parse_at(&e, &fname),
-                    _ => self.print_fatal(&e),
+                    ErrorKind::Parse => {
+                        // A parse error in the included file raises a
+                        // catchable ParseError in Zend — attributed to
+                        // the included file — like eval()'d code does.
+                        let msg = e.message.clone();
+                        // The throwable's own trace omits the include
+                        // pseudo-frame (Zend: `#0 file(N): deep()
+                        // #1 {main}` — include frames are internal).
+                        inc_pop(self);
+                        let v = self.exception("ParseError", &msg);
+                        if let Value::Object(o) = &v {
+                            if let Some(ObjectInternal::Exception {
+                                file, line, thrown, ..
+                            }) = &mut o.borrow_mut().internal
+                            {
+                                // getFile() is the bad file; getLine()
+                                // is the parse error's own line inside
+                                // it (the EOF line for unclosed
+                                // brackets — Zend quirk).
+                                *file = fname.clone();
+                                *line = e.line as u32;
+                                *thrown = e.line as u32;
+                            }
+                        }
+                        self.pending_exception = Some(v);
+                        return Err(PhpError {
+                            trace: None,
+                            thrown_line: None,
+                            display_msg: None,
+                            kind: ErrorKind::Throw,
+                            message: "include".into(),
+                            line: 0,
+                        });
+                    }
+                    // Non-parse fatals raised while compiling the included
+                    // file still attribute to the included file.
+                    _ => {
+                        self.last_err_file = fname.clone();
+                        self.print_fatal(&e);
+                    }
                 }
                 inc_pop(self);
-                return Ok(Value::Bool(false));
+                // A failed compile of the included file is fatal in Zend
+                // even through include() — the script dies rather than
+                // include returning false (false only covers open/read
+                // failures above).
+                return Err(PhpError {
+                    trace: None,
+                    thrown_line: None,
+                    display_msg: None,
+                    kind: ErrorKind::Fatal,
+                    message: "\u{1}exit:255".into(),
+                    line: 0,
+                });
             }
         };
         // Include executes in the current scope (PHP semantics); the
@@ -183,12 +238,82 @@ impl<'a> Interp<'a> {
         // line space; restore the includer's line so a later call in the same
         // statement still reports the call-site line (gh19653_2).
         let saved_line = self.cur_line;
-        let flow = match Self::const_closure_gate(&stmts).and_then(|_| self.hoist_funcs(&stmts)) {
-            Err(e) => self.err_flow(e),
+        // Compile-error flows pop the include pseudo-frame themselves so
+        // the backtrace fill sees the same stack Zend prints.
+        let mut inc_frame_popped = false;
+        // The included unit is compiled separately in Zend —
+        // `break`/`continue` operands in it count only ITS enclosing
+        // loop/switch contexts, not the includer's.
+        let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
+        // ...and it is a fresh op_array — a new compile-unit serial
+        // for `static` decl site identity. `static` decls in the
+        // included unit's own top-level code belong to ITS op_array,
+        // so while it executes inside a caller's frame they key under
+        // this unit (a fresh table per include execution in Zend);
+        // the frame's own table stays untouched.
+        let saved_unit = self.begin_unit();
+        let saved_su = self
+            .stack
+            .last_mut()
+            .map(|f| f.statics_unit.replace(self.cur_unit_id));
+        let flow = match Self::const_closure_gate(&stmts)
+            .and_then(|_| self.flow_gate(&stmts))
+            .and_then(|_| self.hoist_funcs(&stmts))
+        {
+            Err(mut e) => {
+                // Compile fatals raised while compiling the included file
+                // attribute to the included file (cur_file still holds it
+                // here), mirroring the eval()'d-code branch. Zend attaches
+                // the compile-context backtrace — the live stack minus
+                // this include's own pseudo-frame — and prints the block
+                // even when it is just `{main}`.
+                self.last_err_file = self.cur_file.clone();
+                e.trace = Some(self.compile_err_frames());
+                inc_pop(self);
+                inc_frame_popped = true;
+                self.err_flow(e)
+            }
             Ok(()) => self.exec_block(&stmts),
         };
+        self.loop_depth = saved_depth;
+        self.cur_unit_id = saved_unit;
+        if let Some(su) = saved_su {
+            if let Some(f) = self.stack.last_mut() {
+                f.statics_unit = su;
+            }
+        }
         self.include_ns.pop();
-        inc_pop(self);
+        // break/continue/goto leaking out of the unit are compile fatals
+        // in Zend too: same compile-context backtrace (needs our
+        // pseudo-frame and the inc file's line still in place) and the
+        // same attribution to the included file.
+        let flow = match flow {
+            Flow::Break(_) | Flow::Continue(_) | Flow::Goto(_) => {
+                self.last_err_file = fname.clone();
+                let mut e = match &flow {
+                    Flow::Goto(l) => PhpError::compile_fatal(
+                        format!("'goto' to undefined label '{}'", l),
+                        self.cur_line,
+                    ),
+                    Flow::Continue(_) => PhpError::compile_fatal(
+                        "'continue' not in the 'loop' or 'switch' context",
+                        self.cur_line,
+                    ),
+                    _ => PhpError::compile_fatal(
+                        "'break' not in the 'loop' or 'switch' context",
+                        self.cur_line,
+                    ),
+                };
+                e.trace = Some(self.compile_err_frames());
+                inc_pop(self);
+                inc_frame_popped = true;
+                self.err_flow(e)
+            }
+            f => f,
+        };
+        if !inc_frame_popped {
+            inc_pop(self);
+        }
         self.cur_line = saved_line;
         self.cur_file = saved_file;
         if let Some(old) = saved_frame_file {
@@ -219,21 +344,11 @@ impl<'a> Interp<'a> {
                     line: 0,
                 })
             }
-            Flow::Break(_) | Flow::Continue(_) => {
-                self.fail(PhpError::fatal("'break'/'continue' in included file", 0))
-            }
-            Flow::Goto(l) => self.fail(PhpError::fatal(
-                format!("'goto' to undefined label '{}'", l),
-                0,
-            )),
+            // break/continue/goto escaping the unit already funnelled
+            // through the compile-fatal arm above and came back as
+            // Exit/Throw — no remaining variants.
+            Flow::Break(_) | Flow::Continue(_) | Flow::Goto(_) => unreachable!(),
         }
-    }
-
-    fn print_parse_at(&mut self, e: &PhpError, file: &str) {
-        self.emit(&format!(
-            "\nParse error: {} in {} on line {}\n",
-            e.message, file, e.line
-        ));
     }
 
     pub(in crate::interp) fn eval_code(&mut self, code: &str) -> Result<Value, PhpError> {
@@ -250,15 +365,83 @@ impl<'a> Interp<'a> {
                 // cur_file (a nested eval composes the context).
                 let eval_ctx = format!("{}({}) : eval()'d code", self.cur_file, self.cur_line);
                 let saved_file = std::mem::replace(&mut self.cur_file, eval_ctx);
-                let flow = match Self::const_closure_gate(&stmts) {
-                    Err(e) => {
+                // eval'd code is its own compile unit — `break`/`continue`
+                // operands count only ITS enclosing loop/switch contexts.
+                let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
+                // ...a fresh op_array: its own unit serial too. The
+                // eval'd unit's own `static` decls key under it (fresh
+                // table per eval() call, Zend-compiled op_array), even
+                // though they bind into the executing frame's vars.
+                let saved_unit = self.begin_unit();
+                let saved_su = self
+                    .stack
+                    .last_mut()
+                    .map(|f| f.statics_unit.replace(self.cur_unit_id));
+                // Zend traces through eval'd code carry a `FILE(N):
+                // eval()` frame at the call site (rendered bare — the
+                // eval'd source is not an arg in backtraces).
+                self.call_trace.push(TraceFrame {
+                    function: "eval".to_string(),
+                    class: None,
+                    ty: String::new(),
+                    file: saved_file.clone(),
+                    line: saved_line as u32,
+                    args: Vec::new(),
+                    named_args: Vec::new(),
+                    internal: true,
+                });
+                let flow = match Self::const_closure_gate(&stmts)
+                    .and_then(|_| self.flow_gate(&stmts))
+                    // eval'd code early-binds its unconditional decls
+                    // like any compile unit (`eval('a(); function a(){}')`
+                    // works; a collision is a compile fatal here).
+                    .and_then(|_| self.hoist_funcs(&stmts))
+                {
+                    Err(mut e) => {
                         // Gate errors are compile fatals of the eval'd
-                        // unit — attribute to the eval()'d-code context.
+                        // unit — attribute to the eval()'d-code context
+                        // and carry the live backtrace (Zend compiles
+                        // eval'd code at the call site).
                         self.last_err_file = self.cur_file.clone();
+                        e.trace = Some(self.compile_err_frames());
                         self.err_flow(e)
                     }
                     Ok(()) => self.exec_block(&stmts),
                 };
+                self.loop_depth = saved_depth;
+                self.cur_unit_id = saved_unit;
+                if let Some(su) = saved_su {
+                    if let Some(f) = self.stack.last_mut() {
+                        f.statics_unit = su;
+                    }
+                }
+                // break/continue/goto leaking out of the eval'd unit are
+                // compile fatals in Zend, attributed to the eval()'d-code
+                // context (cur_file/cur_line still hold it here) with the
+                // compile-context backtrace — same arm as include().
+                let flow = match flow {
+                    Flow::Break(_) | Flow::Continue(_) | Flow::Goto(_) => {
+                        self.last_err_file = self.cur_file.clone();
+                        let mut e = match &flow {
+                            Flow::Goto(l) => PhpError::compile_fatal(
+                                format!("'goto' to undefined label '{}'", l),
+                                self.cur_line,
+                            ),
+                            Flow::Continue(_) => PhpError::compile_fatal(
+                                "'continue' not in the 'loop' or 'switch' context",
+                                self.cur_line,
+                            ),
+                            _ => PhpError::compile_fatal(
+                                "'break' not in the 'loop' or 'switch' context",
+                                self.cur_line,
+                            ),
+                        };
+                        e.trace = Some(self.compile_err_frames());
+                        self.err_flow(e)
+                    }
+                    f => f,
+                };
+                self.call_trace.pop();
                 self.cur_line = saved_line;
                 self.cur_file = saved_file;
                 match flow {
@@ -283,24 +466,29 @@ impl<'a> Interp<'a> {
                             line: 0,
                         })
                     }
-                    Flow::Break(_) | Flow::Continue(_) => Ok(Value::Null),
-                    Flow::Goto(l) => Err(PhpError {
-                        trace: None,
-                        thrown_line: None,
-                        display_msg: None,
-                        kind: ErrorKind::Fatal,
-                        message: format!("'goto' to undefined label '{}'", l),
-                        line: 0,
-                    }),
+                    Flow::Break(_) | Flow::Continue(_) | Flow::Goto(_) => unreachable!(),
                 }
             }
             Err(e) => {
                 let msg = e.message.clone();
                 let v = self.exception("ParseError", &msg);
                 if let Value::Object(o) = &v {
-                    if let Some(ObjectInternal::Exception { eval_ctx, .. }) =
-                        &mut o.borrow_mut().internal
+                    if let Some(ObjectInternal::Exception {
+                        file,
+                        line,
+                        thrown,
+                        eval_ctx,
+                        ..
+                    }) = &mut o.borrow_mut().internal
                     {
+                        // getFile() is the composite eval context
+                        // (`FILE(N) : eval()'d code`); getLine() is
+                        // the error's own line inside the eval
+                        // string. eval_ctx stays >0 as the marker the
+                        // uncaught render keys on.
+                        *file = format!("{}({}) : eval()'d code", self.cur_file, self.cur_line);
+                        *line = e.line as u32;
+                        *thrown = e.line as u32;
                         *eval_ctx = e.line as u32;
                     }
                 }

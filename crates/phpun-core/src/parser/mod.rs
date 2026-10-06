@@ -74,7 +74,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
 /// `parse` honoring `short_open_tag` (INI `short_open_tag=On`).
 pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
     let toks = lex_with(src, short_open)?;
-    parse_toks(toks)
+    parse_toks(toks, 1 + src.bytes().filter(|&b| b == b'\n').count())
 }
 
 /// phpun source mode: PHP code from byte 0, no `<?php` required (a
@@ -103,10 +103,12 @@ pub fn parse_source(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> 
 /// eval()'d code, which in PHP is always tag-free source.
 pub fn parse_pure(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
     let toks = crate::lexer::lex_php_source(src, short_open)?;
-    parse_toks(toks)
+    parse_toks(toks, 1 + src.bytes().filter(|&b| b == b'\n').count())
 }
 
-fn parse_toks(toks: Vec<Lexed>) -> Result<Vec<Stmt>, PhpError> {
+/// `eof_line` is Zend's scanner line at end-of-input (one past the
+/// last consumed newline) — where EOF-attributed errors are reported.
+fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> {
     // Compile-time diagnostics ride the token stream; drain them and
     // emit before execution (Zend emits compile warnings upfront).
     let mut lex_diags: Vec<(String, &'static str, usize)> = Vec::new();
@@ -120,28 +122,33 @@ fn parse_toks(toks: Vec<Lexed>) -> Result<Vec<Stmt>, PhpError> {
             _ => Some(t),
         })
         .collect();
-    bracket_check(&toks)?;
-    let mut p = Parser {
-        toks: &toks,
-        pos: 0,
-        deprecations: Vec::new(),
-        compile_warnings: Vec::new(),
-        cur_class: String::new(),
-        hook_ctx: None,
-        pending_class_attrs: Vec::new(),
-        cur_ns: String::new(),
-        use_map: std::collections::HashMap::new(),
-        use_fn_map: std::collections::HashMap::new(),
-        use_const_map: std::collections::HashMap::new(),
-        declared_types: std::collections::HashSet::new(),
-        in_braced_ns: false,
-        ns_style: 0,
-        class_ctx: Vec::new(),
-        first_stmt_slot: false,
-        strict_slot: false,
-        in_closure: false,
+    let bracket_err = bracket_check(&toks, eof_line);
+    let mut p = Parser::new(&toks);
+    let mut stmts = match p.program() {
+        Ok(s) => s,
+        Err(pe) => {
+            // Zend reports the earliest error. The scanner dies at its
+            // own token before that token ever reaches the parser, so
+            // a bracket error at index i only loses to a parser error
+            // that a re-parse of the token PREFIX before i still
+            // produces (and the prefix parse must die on a real token —
+            // an end-of-input error there means the parser was simply
+            // still waiting for the dead token).
+            if let Some((be, bpos)) = bracket_err {
+                let mut p2 = Parser::new(&toks[..bpos]);
+                match p2.program() {
+                    Err(pe2) if !pe2.message.starts_with("syntax error, unexpected end of") => {
+                        return Err(pe2);
+                    }
+                    _ => return Err(be),
+                }
+            }
+            return Err(pe);
+        }
     };
-    let mut stmts = p.program()?;
+    if let Some((be, _)) = bracket_err {
+        return Err(be);
+    }
     let mut diags: Vec<(String, &'static str, usize)> = lex_diags;
     diags.extend(
         std::mem::take(&mut p.deprecations)
@@ -160,13 +167,40 @@ fn parse_toks(toks: Vec<Lexed>) -> Result<Vec<Stmt>, PhpError> {
     Ok(stmts)
 }
 
+impl<'a> Parser<'a> {
+    fn new(toks: &'a [Lexed]) -> Self {
+        Self {
+            toks,
+            pos: 0,
+            deprecations: Vec::new(),
+            compile_warnings: Vec::new(),
+            cur_class: String::new(),
+            hook_ctx: None,
+            pending_class_attrs: Vec::new(),
+            cur_ns: String::new(),
+            use_map: std::collections::HashMap::new(),
+            use_fn_map: std::collections::HashMap::new(),
+            use_const_map: std::collections::HashMap::new(),
+            declared_types: std::collections::HashSet::new(),
+            in_braced_ns: false,
+            ns_style: 0,
+            class_ctx: Vec::new(),
+            first_stmt_slot: false,
+            strict_slot: false,
+            in_closure: false,
+        }
+    }
+}
+
 /// Zend-style bracket-balance pre-pass: mismatched/unclosed/mismatched
 /// closers report as `Unclosed 'X'`, `Unmatched 'Y'`,
-/// `Unclosed 'X' does not match 'Y'` (syntax_errors).
-fn bracket_check(toks: &[crate::lexer::Lexed]) -> Result<(), PhpError> {
+/// `Unclosed 'X' does not match 'Y'` (syntax_errors). The error comes
+/// back with the token index where the scanner would have died
+/// (`toks.len()` for an EOF-unclosed bracket) so the caller can order
+/// it against parser errors by position.
+fn bracket_check(toks: &[crate::lexer::Lexed], eof_line: usize) -> Option<(PhpError, usize)> {
     let mut stack: Vec<(&'static str, usize)> = Vec::new();
-    let last_line = toks.last().map(|t| t.line).unwrap_or(1);
-    for t in toks {
+    for (i, t) in toks.iter().enumerate() {
         let Token::Op(op) = &t.token else { continue };
         match *op {
             "(" | "[" | "{" | "#[" => stack.push((if *op == "#[" { "[" } else { op }, t.line)),
@@ -185,23 +219,29 @@ fn bracket_check(toks: &[crate::lexer::Lexed]) -> Result<(), PhpError> {
                         } else {
                             format!("Unclosed '{}' does not match '{}'", o, op)
                         };
-                        return Err(PhpError::parse(msg, t.line));
+                        return Some((PhpError::parse(msg, t.line), i));
                     }
-                    None => return Err(PhpError::parse(format!("Unmatched '{}'", op), t.line)),
+                    None => {
+                        return Some((PhpError::parse(format!("Unmatched '{}'", op), t.line), i));
+                    }
                 }
             }
             _ => {}
         }
     }
     if let Some((o, ol)) = stack.pop() {
-        let msg = if ol != last_line {
+        // The opener's line is named only when it differs from the
+        // error line — so real files (EOF lands a line past the last
+        // newline) always get `Unclosed 'X' on line N` while a
+        // single-line eval() string reports a bare `Unclosed 'X'`.
+        let msg = if ol != eof_line {
             format!("Unclosed '{}' on line {}", o, ol)
         } else {
             format!("Unclosed '{}'", o)
         };
-        return Err(PhpError::parse(msg, last_line));
+        return Some((PhpError::parse(msg, eof_line), toks.len()));
     }
-    Ok(())
+    None
 }
 
 /// A compile-time diagnostic produced while re-lexing an embedded

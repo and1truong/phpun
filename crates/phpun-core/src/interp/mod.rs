@@ -25,6 +25,7 @@ mod classes;
 mod diag;
 mod exec;
 mod expr;
+mod flow;
 mod gen;
 mod include;
 mod members;
@@ -150,6 +151,12 @@ pub struct Frame {
     /// Name diagnostics report for this call — `[$closure,'__invoke']`
     /// runs as `Closure::__invoke` (closure_invoke_ref_warning).
     call_alias: Option<String>,
+    /// While eval()/include() unit code executes inside this frame: the
+    /// executing compile unit. `static` decls in that code store under
+    /// `key\0u{unit}` — a fresh table per unit, matching Zend's fresh
+    /// op_array (and fresh static_variables) per eval/include call.
+    /// None = the frame's own op_array, whose statics persist.
+    statics_unit: Option<u64>,
 }
 
 impl Frame {
@@ -170,6 +177,7 @@ impl Frame {
             trait_origin: None,
             closure_rc: None,
             call_alias: None,
+            statics_unit: None,
         }
     }
 }
@@ -233,12 +241,16 @@ pub struct Interp<'a> {
     /// Classes whose const initializers were already link-evaluated.
     consts_linked: std::collections::HashSet<String>,
     /// Top-level parentless classes registered by hoisting (early
-    /// binding); their decl stmt then no-ops (namespaces/ns_060).
-    early_bound_classes: HashSet<String>,
-    /// Functions registered by hoisting; their decl stmt no-ops like
-    /// PHP's early binding (the redeclare fatal only fires when a
-    /// DIFFERENT decl claims an existing name).
-    early_bound_funcs: HashSet<String>,
+    /// binding): name → AST decl ptr, so only the SAME decl stmt
+    /// no-ops on execution — a different decl site claiming the name
+    /// still hits the 'Cannot redeclare' check (namespaces/ns_060).
+    early_bound_classes: HashMap<String, usize>,
+    /// Function decl sites early-bound at compile: lname →
+    /// (compile unit, decl node ptr) — reaching that same site at
+    /// runtime is a no-op, any OTHER decl into the occupied name is
+    /// 'Cannot redeclare'. The unit guards against a freed AST Vec
+    /// recycling the node ptr across re-parses.
+    early_bound_funcs: HashMap<String, (u64, usize)>,
     /// Per-include top-level namespace: `(stack depth at include,
     /// file's current ns)`. An included file's `namespace` decl governs
     /// ITS top-level code, not the calling frame's (php-parser's
@@ -306,13 +318,24 @@ pub struct Interp<'a> {
     /// Autoload/lookup error swallowed by the last `is_callable_value`
     /// probe — re-raised when a `callable` param type rejects the arg.
     callable_probe_err: Option<(Value, PhpError)>,
-    /// Function-scoped static storage: fn name → var → cell.
+    /// Function-scoped static storage: scope key → var → cell. The key
+    /// is fn_statics_key() for a function's own op_array; eval/include
+    /// unit code executing inside a frame suffixes `\0u{unit}` so each
+    /// unit gets a fresh table, and top-level code uses the executing
+    /// unit under the global scope key (Zend: static vars live in the
+    /// op_array that declared them).
     pub(crate) statics: HashMap<String, HashMap<String, Cell>>,
-    /// Global static vars (`static` at top level).
-    global_statics: HashMap<String, Cell>,
-    /// static-decl sites per function scope (fn key → var → source line) —
-    /// PHP fatals on a same-scope redeclaration at a different site.
-    static_decls: HashMap<String, HashMap<String, usize>>,
+    /// static-decl sites per function scope (fn key → var → decl
+    /// (unit serial, stmt ptr)) — PHP fatals on a same-unit
+    /// redeclaration at a different statement site. The unit serial is
+    /// bumped at every parse boundary (include/eval/run) since Zend
+    /// compiles each into a fresh op_array — a freed Vec may recycle
+    /// the same stmt ptr across re-parses.
+    static_decls: HashMap<String, HashMap<String, std::collections::HashSet<(u64, usize)>>>,
+    /// Serial of the compile unit currently executing (see static_decls).
+    cur_unit_id: u64,
+    /// Next unit serial to hand out — bumps monotonically.
+    next_unit_id: u64,
     /// include_once/require_once registry (canonical paths).
     included: HashSet<std::path::PathBuf>,
     /// Pending exception carried across an Err(Throw) return.
@@ -461,6 +484,11 @@ pub struct Interp<'a> {
     /// File the last `fail()` was raised in (uncaught-print attribution
     /// for engine errors — `self.file` is always the entry script).
     last_err_file: String,
+    /// Enclosing loop/switch contexts in the current compile unit
+    /// (zend's loop_var_stack depth) — a `break`/`continue` operand
+    /// larger than this is the `Cannot 'break' N levels` compile fatal;
+    /// reset at function/include/eval boundaries.
+    loop_depth: u32,
     /// Rendered arg list of the current `assert()` call — the
     /// AssertionError message shows `assert(<args>)` as written
     /// (named_params/assert's `assert(assertion: false)`).
@@ -800,8 +828,8 @@ impl<'a> Interp<'a> {
             enum_cases: std::collections::HashMap::new(),
             consts_linked: std::collections::HashSet::new(),
             decl_aliases: Vec::new(),
-            early_bound_classes: HashSet::new(),
-            early_bound_funcs: HashSet::new(),
+            early_bound_classes: HashMap::new(),
+            early_bound_funcs: HashMap::new(),
             include_ns: Vec::new(),
             constants,
             out: Vec::new(),
@@ -818,8 +846,9 @@ impl<'a> Interp<'a> {
             ob_stack: Vec::new(),
             silence: 0,
             statics: HashMap::new(),
-            global_statics: HashMap::new(),
             static_decls: HashMap::new(),
+            cur_unit_id: 0,
+            next_unit_id: 1,
             included: HashSet::new(),
             pending_exception: None,
             call_trace: Vec::new(),
@@ -869,6 +898,7 @@ impl<'a> Interp<'a> {
             builtin_ifaces: std::collections::HashSet::new(),
             dep_seen: std::collections::HashSet::new(),
             last_err_file: String::new(),
+            loop_depth: 0,
             assert_src: String::new(),
             mem_used: 0,
             mem_last: 0,
@@ -1335,26 +1365,36 @@ impl<'a> Interp<'a> {
     /// PHP binds a compilation unit's unconditional top-level function
     /// decls before executing it (bug23279's later-declared handler).
     /// A name collision is PHP's compile-time "Cannot redeclare" fatal.
+    /// Early-bind one unconditional top-level `function` decl — Zend
+    /// inserts into the function table while compiling the stmt, so a
+    /// name collision is the compile-time 'Cannot redeclare' fatal.
+    /// Called from the flow gate at the decl's position (flow.rs).
+    fn hoist_func(&mut self, d: &FunctionDecl) -> Result<(), PhpError> {
+        let _ = self.decl_type_checks(&d.name, d, None);
+        let key = d.name.to_lowercase();
+        if let Some(prev) = self.functions.get(&key) {
+            // Early binding dies at compile time in Zend —
+            // the include/eval arms attach the compile-
+            // context backtrace to this error.
+            return Err(PhpError::compile_fatal(
+                format!(
+                    "Cannot redeclare function {}() (previously declared in {}:{})",
+                    d.name, prev.file, prev.line
+                ),
+                d.line,
+            ));
+        }
+        let site = std::ptr::from_ref(d) as usize;
+        let mut d = d.clone();
+        d.file = self.cur_file.clone();
+        self.functions.insert(key.clone(), Rc::new(d));
+        self.early_bound_funcs.insert(key, (self.cur_unit_id, site));
+        Ok(())
+    }
+
     fn hoist_funcs(&mut self, stmts: &[Stmt]) -> Result<(), PhpError> {
         for s in stmts {
             match s {
-                Stmt::Function(d) => {
-                    let _ = self.decl_type_checks(&d.name, d, None);
-                    let key = d.name.to_lowercase();
-                    if let Some(prev) = self.functions.get(&key) {
-                        return Err(PhpError::fatal(
-                            format!(
-                                "Cannot redeclare function {}() (previously declared in {}:{})",
-                                d.name, prev.file, prev.line
-                            ),
-                            d.line,
-                        ));
-                    }
-                    let mut d = d.clone();
-                    d.file = self.cur_file.clone();
-                    self.functions.insert(key.clone(), Rc::new(d));
-                    self.early_bound_funcs.insert(key);
-                }
                 // `namespace X { stmts }` parses as
                 // Block[Namespace, Block[stmts]] — decls inside are still
                 // unconditional top-level for early binding (ns_085).
@@ -1372,17 +1412,24 @@ impl<'a> Interp<'a> {
                     if d.parent.is_none() && d.implements.is_empty() && d.traits.is_empty() =>
                 {
                     let key = d.name.to_lowercase();
-                    if !self.classes.contains_key(&key) && !self.early_bound_classes.contains(&key)
-                    {
-                        let mut d = (**d).clone();
-                        for m in &mut d.methods {
-                            let mut mm = (**m).clone();
-                            mm.decl.file = self.cur_file.clone();
-                            *m = Rc::new(mm);
-                        }
-                        if self.register_class(Rc::new(d)).is_ok() {
-                            self.early_bound_classes.insert(key);
-                        }
+                    if let Some((kind, file, line)) = self.existing_class_site(&key) {
+                        // A second unconditional decl of an occupied
+                        // name is Zend's compile-time 'Cannot
+                        // redeclare' fatal.
+                        return Err(PhpError::compile_fatal(
+                            Self::redeclare_class_msg(kind, &d.name, &file, line),
+                            d.line,
+                        ));
+                    }
+                    let site = Rc::as_ptr(d) as usize;
+                    let mut d = (**d).clone();
+                    for m in &mut d.methods {
+                        let mut mm = (**m).clone();
+                        mm.decl.file = self.cur_file.clone();
+                        *m = Rc::new(mm);
+                    }
+                    if self.register_class(Rc::new(d)).is_ok() {
+                        self.early_bound_classes.insert(key, site);
                     }
                 }
                 _ => {}
@@ -1391,7 +1438,17 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// Stamp a fresh compile-unit serial (a separate Zend op_array —
+    /// include/eval/another run) and return the previous one so the
+    /// caller can restore it after the unit finishes.
+    fn begin_unit(&mut self) -> u64 {
+        let id = self.next_unit_id;
+        self.next_unit_id += 1;
+        std::mem::replace(&mut self.cur_unit_id, id)
+    }
+
     pub fn run(&mut self, stmts: &[Stmt]) -> RunResult {
+        self.begin_unit();
         // hard_timeout ini is the absolute deadline (045).
         let ht = self.ini_bytes("hard_timeout");
         if ht > 0 {
@@ -1399,15 +1456,22 @@ impl<'a> Interp<'a> {
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(ht as u64));
             self.deadline_secs = ht;
         }
-        if let Err(e) = Self::const_closure_gate(stmts).and_then(|_| self.hoist_funcs(stmts)) {
+        if let Err(e) = Self::const_closure_gate(stmts)
+            .and_then(|_| self.flow_gate(stmts))
+            .and_then(|_| self.hoist_funcs(stmts))
+        {
             let flow = self.err_flow(e);
-            let result = self.finish(flow);
-            self.run_shutdown();
+            let mut result = self.finish(flow);
+            if let Some(c) = self.run_shutdown() {
+                result.exit_code = c;
+            }
             return result;
         }
         let flow = self.exec_block(stmts);
-        let result = self.finish(flow);
-        self.run_shutdown();
+        let mut result = self.finish(flow);
+        if let Some(c) = self.run_shutdown() {
+            result.exit_code = c;
+        }
         result
     }
 
@@ -1451,9 +1515,24 @@ impl<'a> Interp<'a> {
                     fatal: Some(PhpError::fatal("uncaught exception", 0)),
                 }
             }
-            Flow::Break(_) | Flow::Continue(_) => {
-                let e =
-                    PhpError::fatal("'break' or 'continue' outside of loop or switch context", 0);
+            Flow::Break(_) => {
+                let e = PhpError::compile_fatal(
+                    "'break' not in the 'loop' or 'switch' context",
+                    self.cur_line,
+                );
+                self.last_err_file = self.diag_file();
+                self.print_fatal(&e);
+                RunResult {
+                    exit_code: 255,
+                    fatal: Some(e),
+                }
+            }
+            Flow::Continue(_) => {
+                let e = PhpError::compile_fatal(
+                    "'continue' not in the 'loop' or 'switch' context",
+                    self.cur_line,
+                );
+                self.last_err_file = self.diag_file();
                 self.print_fatal(&e);
                 RunResult {
                     exit_code: 255,
@@ -1461,7 +1540,11 @@ impl<'a> Interp<'a> {
                 }
             }
             Flow::Goto(l) => {
-                let e = PhpError::fatal(format!("'goto' to undefined label '{}'", l), 0);
+                let e = PhpError::compile_fatal(
+                    format!("'goto' to undefined label '{}'", l),
+                    self.cur_line,
+                );
+                self.last_err_file = self.diag_file();
                 self.print_fatal(&e);
                 RunResult {
                     exit_code: 255,
@@ -1471,10 +1554,31 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn run_shutdown(&mut self) {
+    /// Run registered shutdown functions then the deferred __destruct
+    /// sweep. A shutdown function that exits or dies stops the rest,
+    /// but destructors still run (Zend); the produced exit code —
+    /// `exit(N)`'s N or 255 for a fatal — is returned so the caller can
+    /// override the script's exit code (a shutdown `exit` rewrites even
+    /// a main-path fatal's code).
+    fn run_shutdown(&mut self) -> Option<i32> {
+        // Shutdown functions and the deferred dtor sweep are invoked by
+        // the engine — their callees' trace callsites are `[internal
+        // function]`, like callbacks inside builtins.
+        self.internal_cb += 1;
         let fns = std::mem::take(&mut self.shutdown_fns);
+        let mut shutdown_code = None;
         for (f, args) in fns {
-            let _ = self.call_value(&f, CallArgs::positional(args));
+            if let Err(e) = self.call_value(&f, CallArgs::positional(args)) {
+                shutdown_code = Some(match self.err_flow(e) {
+                    Flow::Exit(c) => c,
+                    Flow::Throw(v) => {
+                        self.uncaught(&v);
+                        255
+                    }
+                    _ => 255,
+                });
+                break;
+            }
         }
         // Zend calls __destruct on live objects after shutdown functions
         // and before output buffers flush — destructors still see their
@@ -1491,6 +1595,11 @@ impl<'a> Interp<'a> {
             }
         }
         cv_objs.sort_by_key(|(id, _)| *id);
+        // A __destruct that errors unwinds like a shutdown-function
+        // error: exit(N) supplies the exit code, a throw prints its
+        // uncaught block — and Zend stops the whole sweep after any
+        // shutdown-time error, so later destructors do not run.
+        let mut dtor_stop = false;
         for (_, o) in cv_objs.into_iter().rev() {
             // strong_count 2 = the var's cell + our clone.
             if Rc::strong_count(&o) != 2 {
@@ -1501,46 +1610,73 @@ impl<'a> Interp<'a> {
                 .is_some()
                 && self.mark_destructed(&o)
             {
-                let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                if let Err(e) = self.method_invoke(o.clone(), "__destruct", CallArgs::empty()) {
+                    shutdown_code = Some(match self.err_flow(e) {
+                        Flow::Exit(c) => c,
+                        Flow::Throw(v) => {
+                            self.uncaught(&v);
+                            255
+                        }
+                        _ => 255,
+                    });
+                    dtor_stop = true;
+                    break;
+                }
             }
         }
         self.globals.vars.clear();
         // Objects a dtor spawns may land in already-visited recycled
         // handle slots — rescan until a full pass runs nothing new
         // (bug51822/bug74053).
-        loop {
-            let mut progressed = false;
-            let mut i = 0;
-            while i < self.obj_handles.len() {
-                let w = match &self.obj_handles[i] {
-                    ObjHandle::Obj(w) => w.clone(),
-                    _ => {
-                        i += 1;
+        if !dtor_stop {
+            'sweep: loop {
+                let mut progressed = false;
+                let mut i = 0;
+                while i < self.obj_handles.len() {
+                    let w = match &self.obj_handles[i] {
+                        ObjHandle::Obj(w) => w.clone(),
+                        _ => {
+                            i += 1;
+                            continue;
+                        }
+                    };
+                    i += 1;
+                    let Some(o) = w.upgrade() else { continue };
+                    let key = Rc::as_ptr(&o) as usize;
+                    if self.destructed.contains_key(&key) {
                         continue;
                     }
-                };
-                i += 1;
-                let Some(o) = w.upgrade() else { continue };
-                let key = Rc::as_ptr(&o) as usize;
-                if self.destructed.contains_key(&key) {
-                    continue;
+                    if self
+                        .find_method_in(&o.borrow().class, "__destruct")
+                        .is_some()
+                    {
+                        self.mark_destructed(&o);
+                        progressed = true;
+                        if let Err(e) =
+                            self.method_invoke(o.clone(), "__destruct", CallArgs::empty())
+                        {
+                            shutdown_code = Some(match self.err_flow(e) {
+                                Flow::Exit(c) => c,
+                                Flow::Throw(v) => {
+                                    self.uncaught(&v);
+                                    255
+                                }
+                                _ => 255,
+                            });
+                            break 'sweep;
+                        }
+                    }
                 }
-                if self
-                    .find_method_in(&o.borrow().class, "__destruct")
-                    .is_some()
-                {
-                    self.mark_destructed(&o);
-                    progressed = true;
-                    let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                if !progressed {
+                    break;
                 }
-            }
-            if !progressed {
-                break;
             }
         }
         if !self.mem_exceeded {
             self.flush_ob_all();
         }
+        self.internal_cb -= 1;
+        shutdown_code
     }
 
     /// Free the expression statement's temporaries: an object with no
@@ -1604,7 +1740,15 @@ impl<'a> Interp<'a> {
                 .is_some()
                 && self.mark_destructed(&o)
             {
-                let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                // A fatal/throw inside the dtor aborts the script
+                // (Zend). While another exception unwinds Zend chains
+                // the dtor error as `Next ...` — not yet modelled, so
+                // it stays swallowed there (bug52361).
+                if self.pending_exception.is_some() {
+                    let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                } else {
+                    self.method_invoke(o.clone(), "__destruct", CallArgs::empty())?;
+                }
             }
         }
         Ok(())
@@ -1647,10 +1791,17 @@ impl<'a> Interp<'a> {
             {
                 self.mark_destructed(&o);
                 // A throw inside the dtor must not clobber the
-                // in-flight exception being unwound (bug52361).
+                // in-flight exception being unwound (bug52361) — Zend
+                // chains it as `Next ...` (not yet modelled). On a
+                // clean frame exit the dtor's error propagates and
+                // aborts the script instead.
                 let saved = self.pending_exception.take();
-                let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                let r = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
+                let was_unwinding = saved.is_some();
                 self.pending_exception = saved.or(self.pending_exception.take());
+                if !was_unwinding {
+                    r?;
+                }
             }
         }
         Ok(())
@@ -1789,12 +1940,16 @@ impl<'a> Interp<'a> {
     pub fn run_source_ret(&mut self, src: &str) -> (RunResult, Option<Value>) {
         match parser::parse_source(src, self.ini_on("short_open_tag")) {
             Ok(stmts) => {
-                if let Err(e) =
-                    Self::const_closure_gate(&stmts).and_then(|_| self.hoist_funcs(&stmts))
+                self.begin_unit();
+                if let Err(e) = Self::const_closure_gate(&stmts)
+                    .and_then(|_| self.flow_gate(&stmts))
+                    .and_then(|_| self.hoist_funcs(&stmts))
                 {
                     let flow = self.err_flow(e);
-                    let res = self.finish(flow);
-                    self.run_shutdown();
+                    let mut res = self.finish(flow);
+                    if let Some(c) = self.run_shutdown() {
+                        res.exit_code = c;
+                    }
                     return (res, None);
                 }
                 let flow = self.exec_block(&stmts);
@@ -1802,8 +1957,10 @@ impl<'a> Interp<'a> {
                     Flow::Return(v) => Some(v.clone()),
                     _ => None,
                 };
-                let res = self.finish(flow);
-                self.run_shutdown();
+                let mut res = self.finish(flow);
+                if let Some(c) = self.run_shutdown() {
+                    res.exit_code = c;
+                }
                 (res, rv)
             }
             Err(e) => {
@@ -1835,6 +1992,7 @@ impl<'a> Interp<'a> {
         self.pending_exception = None;
         self.call_trace.clear();
         self.deadline = None;
+        self.loop_depth = 0;
     }
 
     /// Record an object as destructed: true iff newly marked.
@@ -1854,7 +2012,7 @@ impl<'a> Interp<'a> {
     /// Worker-mode request end: registered shutdown functions and
     /// destructors for request-created objects.
     pub fn end_request(&mut self) {
-        self.run_shutdown();
+        let _ = self.run_shutdown();
     }
 
     fn cur(&mut self) -> &mut Frame {
@@ -2889,10 +3047,6 @@ fn assert_arg_repr(v: &Value) -> String {
 const SPL_ITERATOR_PRELUDE: &str = r#"
 interface OuterIterator extends Iterator {
     public function getInnerIterator();
-}
-interface RecursiveIterator extends Iterator {
-    public function hasChildren();
-    public function getChildren();
 }
 class IteratorIterator implements OuterIterator {
     protected $inner;

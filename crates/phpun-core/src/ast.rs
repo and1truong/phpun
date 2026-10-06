@@ -116,6 +116,8 @@ pub struct ClassDecl {
     /// Declaring file — filled at registration; const-exprs inside
     /// (prop/const defaults) bind __FILE__/__DIR__ to it.
     pub file: String,
+    /// Declaration line — feeds 'Cannot redeclare' diagnostics.
+    pub line: usize,
 }
 
 /// One rule inside a `use T { ... }` trait-use block.

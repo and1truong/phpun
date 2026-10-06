@@ -417,7 +417,9 @@ impl<'a> Interp<'a> {
                                 .map(|c| c.name().to_string())
                         });
                 }
-                self.decl_type_checks(&fname, &decl, None)?;
+                if let Err(e) = self.decl_type_checks(&fname, &decl, None) {
+                    return Err(self.decl_fatal_ctx(e));
+                }
                 let mut captures = Vec::new();
                 if c.arrow {
                     // `fn` captures whole scope by value — the zval

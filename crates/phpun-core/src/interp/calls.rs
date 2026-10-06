@@ -1948,9 +1948,11 @@ impl<'a> Interp<'a> {
         // (internal_cb: ob handlers, sort callbacks) has call site
         // `[internal function]`; engine callbacks like the error handler
         // invoked mid-eval instead report the builtin's own call site
-        // (bug32828 vs bug28213).
+        // (bug32828 vs bug28213). At shutdown the trace is empty — the
+        // engine itself is the caller, which is also `[internal
+        // function]` (registered shutdown fns, the dtor sweep).
         let from_builtin =
-            self.internal_cb > 0 && self.call_trace.last().map(|f| f.internal).unwrap_or(false);
+            self.internal_cb > 0 && self.call_trace.last().map(|f| f.internal).unwrap_or(true);
         let (site_file, site_line) = if from_builtin {
             ("[internal function]".to_string(), 0)
         } else {
@@ -2074,9 +2076,15 @@ impl<'a> Interp<'a> {
         self.cur_line = saved_line;
         // Zend decrefs the frame's CVs at unwind — a local object
         // whose last strong refs are that frame's cells runs its
-        // __destruct now (bug52361).
+        // __destruct now (bug52361). A dtor error on a clean return
+        // replaces the result and aborts; during unwind it chains —
+        // destruct_frame_objs guards that itself.
         if let Some(f) = self.last_popped_frame.take() {
-            let _ = self.destruct_frame_objs(&f);
+            let dtor_err = self.destruct_frame_objs(&f).err();
+            match (r, dtor_err) {
+                (Ok(_), Some(e)) => return Err(e),
+                (r, _) => return r,
+            }
         }
         r
     }
@@ -4003,7 +4011,11 @@ impl<'a> Interp<'a> {
                 let _ = self.store_prop(Value::Object(obj), &pname, v)?;
             }
         }
+        // The body is its own compile unit — loop/switch depth for
+        // `break N` operand checks restarts here, not at the caller's.
+        let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
         let flow = self.exec_block(&decl.body);
+        self.loop_depth = saved_depth;
         let ret_fname = self.decl_fname(decl);
         // `static` resolves against THIS frame's called class — after
         // the pop, `stack.last()` is the caller (static_type_return).
@@ -4012,7 +4024,11 @@ impl<'a> Interp<'a> {
         // Zend decrefs the frame's CVs at unwind — the popped frame
         // is handed to bind_and_run, which runs its __destruct pass
         // after the call-trace pop so the dtor's trace attributes to
-        // the caller's site (bug52361).
+        // the caller's site (bug52361). Its declaring file is kept:
+        // a body-level compile fatal (stray break/continue/goto)
+        // attributes to the declaring unit, not the caller frame
+        // `diag_file()` would now see.
+        let popped_file = popped.as_ref().map(|f| f.file.clone());
         self.last_popped_frame = popped;
         match flow {
             Flow::Return(v) => {
@@ -4109,14 +4125,46 @@ impl<'a> Interp<'a> {
                 message: format!("\u{1}exit:{}", c),
                 line: 0,
             }),
-            Flow::Break(_) | Flow::Continue(_) => self.fail(PhpError::fatal(
-                "'break' or 'continue' outside of loop or switch context",
-                0,
-            )),
-            Flow::Goto(l) => self.fail(PhpError::fatal(
-                format!("'goto' to undefined label '{}'", l),
-                0,
-            )),
+            Flow::Break(_) => {
+                // Compile fatal in Zend (function bodies are compiled
+                // eagerly) — carry the compile-context backtrace and
+                // attribute to the declaring file, whose unit died at
+                // compile.
+                let mut e = PhpError::compile_fatal(
+                    "'break' not in the 'loop' or 'switch' context",
+                    self.cur_line,
+                );
+                e.trace = Some(self.compile_err_frames());
+                let r = self.fail(e);
+                if let Some(f) = &popped_file {
+                    self.last_err_file = f.clone();
+                }
+                r
+            }
+            Flow::Continue(_) => {
+                let mut e = PhpError::compile_fatal(
+                    "'continue' not in the 'loop' or 'switch' context",
+                    self.cur_line,
+                );
+                e.trace = Some(self.compile_err_frames());
+                let r = self.fail(e);
+                if let Some(f) = &popped_file {
+                    self.last_err_file = f.clone();
+                }
+                r
+            }
+            Flow::Goto(l) => {
+                let mut e = PhpError::compile_fatal(
+                    format!("'goto' to undefined label '{}'", l),
+                    self.cur_line,
+                );
+                e.trace = Some(self.compile_err_frames());
+                let r = self.fail(e);
+                if let Some(f) = &popped_file {
+                    self.last_err_file = f.clone();
+                }
+                r
+            }
             Flow::Normal => {
                 // Falling off the end of a typed function still checks
                 // the return type: `none returned` TypeError for real

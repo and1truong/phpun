@@ -175,10 +175,6 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn print_parse(&mut self, e: &PhpError) {
-        self.emit(&format!(
-            "\nParse error: {} in {} on line {}\n",
-            e.message, self.file, e.line
-        ));
         let log_errors = self
             .ini
             .get("log_errors")
@@ -189,9 +185,25 @@ impl<'a> Interp<'a> {
                 e.message, self.file, e.line
             ));
         }
+        self.emit(&format!(
+            "\nParse error: {} in {} on line {}\n",
+            e.message, self.file, e.line
+        ));
     }
 
     pub(in crate::interp) fn print_fatal(&mut self, e: &PhpError) {
+        // A fatal raised while a generator body runs must not be
+        // swallowed by the yield output-deferral — flush pending bytes
+        // and print with the deferral lifted.
+        let run = self.gen_run_state.take();
+        if let Some(run) = &run {
+            self.gen_flush_out(run, usize::MAX);
+        }
+        self.print_fatal_inner(e);
+        self.gen_run_state = run;
+    }
+
+    fn print_fatal_inner(&mut self, e: &PhpError) {
         match e.kind {
             ErrorKind::Uncaught { ref class } => {
                 // Zend's display path checks PG(error_reporting) &
@@ -295,6 +307,10 @@ impl<'a> Interp<'a> {
         if let Value::Object(o) = v {
             let o = o.borrow();
             let class = o.class.name().to_string();
+            // Only the exact builtin ParseError class takes the plain
+            // `Parse error:` render — subclasses (and any other
+            // Throwable) render the `Uncaught X:` block.
+            let is_parse_err = class == "ParseError";
             let msg = o
                 .props
                 .get("message")
@@ -339,10 +355,30 @@ impl<'a> Interp<'a> {
             drop(o);
             if eval_ctx > 0 {
                 // ParseError inside eval'd code prints the plain
-                // `Parse error:` form (tests/lang/019).
+                // `Parse error:` form (tests/lang/019) — `file` is
+                // already the `FILE(N) : eval()'d code` composite and
+                // eval_ctx the line inside the eval string.
                 self.emit(&format!(
-                    "\nParse error: {} in {}({}) : eval()'d code on line {}\n",
-                    msg, file, line, eval_ctx
+                    "\nParse error: {} in {} on line {}\n",
+                    msg, file, eval_ctx
+                ));
+            } else if is_parse_err {
+                // Any uncaught ParseError renders Zend's plain
+                // `Parse error:` form — the message carries its own
+                // position and the in-clause attributes to the bad
+                // file — never the 'Uncaught ParseError:' block.
+                let log_errors = self.ini.get("log_errors").is_none_or(|v| {
+                    matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
+                });
+                if log_errors {
+                    self.diag_stderr(&format!(
+                        "PHP Parse error:  {} in {} on line {}\n",
+                        msg, file, line
+                    ));
+                }
+                self.emit(&format!(
+                    "\nParse error: {} in {} on line {}\n",
+                    msg, file, line
                 ));
             } else if self.error_level & 1 != 0 {
                 // error_reporting masks the uncaught display too
@@ -385,21 +421,86 @@ impl<'a> Interp<'a> {
 
     /// Turn an eval error into control flow. `\u{1}exit:N` is the exit
     /// sentinel; `ErrorKind::Throw` carries pending_exception.
-    pub(in crate::interp) fn err_flow(&mut self, e: PhpError) -> Flow {
+    pub(in crate::interp) fn err_flow(&mut self, mut e: PhpError) -> Flow {
         if let Some(code) = e.message.strip_prefix("\u{1}exit:") {
             return Flow::Exit(code.parse().unwrap_or(0));
         }
         if e.kind == ErrorKind::Throw {
             return Flow::Throw(self.pending_exception.take().unwrap_or(Value::Null));
         }
+        // Raise sites that never passed fail() leave last_err_file unset
+        // — attribute the fatal to the executing code unit (the frame's
+        // file, else the file being included/eval'd) like Zend instead
+        // of falling back to the main script.
+        if self.last_err_file.is_empty() {
+            self.last_err_file = self.diag_file();
+        }
+        // Zend attaches the live backtrace to runtime fatals: uncaught
+        // throwables and compile fatals carry one even when it's just
+        // `{main}`; plain E_ERRORs only when a real frame remains.
+        if e.trace.is_none() {
+            let frames = self.fatal_frames();
+            if e.kind != ErrorKind::Fatal || !frames.is_empty() {
+                e.trace = Some(frames);
+            }
+        }
         self.print_fatal(&e);
         Flow::Exit(255)
+    }
+
+    /// Frames for a compile-family fatal's `Stack trace` block: Zend
+    /// reports these while the unit is being *compiled* — the compiling
+    /// context's own frame (the innermost include/require pseudo-frame,
+    /// or the `eval()` frame of the eval'd unit) is excluded, together
+    /// with anything pushed above it. An eval'd unit's own compile
+    /// fatal drops its eval frame (`#0 {main}` at top level); a unit
+    /// included FROM eval'd code keeps it (`#0 FILE(N): eval()`).
+    pub(crate) fn compile_err_frames(&self) -> Vec<String> {
+        let upto = self
+            .call_trace
+            .iter()
+            .rposition(|f| crate::value::include_frame(f) || (f.internal && f.function == "eval"))
+            .unwrap_or(self.call_trace.len());
+        self.call_trace[..upto]
+            .iter()
+            .rev()
+            .filter(|f| !crate::value::trace_frame_hidden(f))
+            .enumerate()
+            .map(|(i, f)| crate::value::trace_frame_str_at(f, i))
+            .collect()
+    }
+
+    /// Declaration/linking-time fatals (Cannot redeclare, abstract
+    /// method, class-const redefinition, variance, ...) are
+    /// compile-class errors in Zend: they always print a `Stack
+    /// trace:` block — unlike plain runtime E_ERRORs which show no
+    /// trace. These sites all fire at EXEC time (conditional decls),
+    /// so the block carries the live call chain — `#0 {main}` at top
+    /// level, the real frames inside a function call.
+    pub(in crate::interp) fn decl_fatal_ctx(&mut self, mut e: PhpError) -> PhpError {
+        if matches!(e.kind, ErrorKind::Fatal) {
+            e.trace = Some(
+                self.call_trace
+                    .iter()
+                    .rev()
+                    .filter(|f| !crate::value::trace_frame_hidden(f))
+                    .enumerate()
+                    .map(|(i, f)| crate::value::trace_frame_str_at(f, i))
+                    .collect(),
+            );
+        }
+        e
     }
 
     /// File diagnostics attribute to: the executing frame's declaring
     /// file, else the file currently being included/run (warnings inside
     /// autoloaded/library code report the library file, not the caller).
+    /// Inside eval'd code cur_file is the `FILE(N) : eval()'d code`
+    /// context — Zend attributes every diagnostic there.
     pub(in crate::interp) fn diag_file(&self) -> String {
+        if self.cur_file.contains("eval()'d code") {
+            return self.cur_file.clone();
+        }
         self.stack
             .last()
             .map(|f| f.file.clone())
