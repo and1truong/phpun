@@ -2267,15 +2267,11 @@ impl<'a> Interp<'a> {
     }
 
     /// Zend backtrace text for debug_print_backtrace(): innermost-first
-    /// frames, no `{main}` line (bug28213).
+    /// frames, no `{main}` line (bug28213). The innermost frame is the
+    /// builtin itself — everything after it is a frame Zend keeps
+    /// (visible non-trampoline internal calls included).
     pub fn format_backtrace(&self) -> String {
-        let frames: Vec<TraceFrame> = self
-            .call_trace
-            .iter()
-            .rev()
-            .skip_while(|f| f.internal)
-            .cloned()
-            .collect();
+        let frames: Vec<TraceFrame> = self.call_trace.iter().rev().skip(1).cloned().collect();
         format_backtrace_frames(&frames)
     }
 
@@ -2284,7 +2280,8 @@ impl<'a> Interp<'a> {
         self.call_trace
             .iter()
             .rev()
-            .skip_while(|f| f.internal)
+            .skip(1)
+            .filter(|f| !crate::value::trace_frame_hidden(f))
             .cloned()
             .collect()
     }

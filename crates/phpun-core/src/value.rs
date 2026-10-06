@@ -244,15 +244,20 @@ pub fn int_prop_index(k: &str) -> Option<i64> {
 /// ZEND_ACC_CALL_VIA_TRAMPOLINE — Zend omits them from backtraces
 /// (named_params/call_user_func_array_variadic shows only the
 /// forwarded `array_multisort(: 1)` frame).
+/// `!visible` frames — literal calls Zend compile-specializes into
+/// dedicated opcodes (rope sprintf) — emit no call at all, so every
+/// render path (backtraces, exception traces, fatal frames) skips
+/// them here rather than at each call site.
 pub fn trace_frame_hidden(fr: &TraceFrame) -> bool {
-    fr.internal
-        && matches!(
-            fr.function.as_str(),
-            "call_user_func"
-                | "call_user_func_array"
-                | "forward_static_call"
-                | "forward_static_call_array"
-        )
+    !fr.visible
+        || (fr.internal
+            && matches!(
+                fr.function.as_str(),
+                "call_user_func"
+                    | "call_user_func_array"
+                    | "forward_static_call"
+                    | "forward_static_call_array"
+            ))
 }
 
 pub fn format_trace(frames: &[TraceFrame]) -> String {
