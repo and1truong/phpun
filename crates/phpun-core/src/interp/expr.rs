@@ -1594,16 +1594,12 @@ impl<'a> Interp<'a> {
                             self.cur_line,
                         ));
                     }
-                    if let OffWrite::Stored(byte) =
-                        self.str_offset_write(&mut bytes, off, &newv)?
-                    {
+                    if let OffWrite::Stored(byte) = self.str_offset_write(&mut bytes, off, &newv)? {
                         let mut b = base.borrow_mut();
                         if let Value::Str(s) = &mut *b {
                             *s = bytes.into();
                         }
-                        return Ok(Value::str(
-                            String::from_utf8_lossy(&[byte]).into_owned(),
-                        ));
+                        return Ok(Value::str(String::from_utf8_lossy(&[byte]).into_owned()));
                     }
                 }
             }
@@ -2370,9 +2366,7 @@ impl<'a> Interp<'a> {
                         if let Value::Str(s) = &mut *b {
                             *s = bytes.into();
                         }
-                        return Ok(Value::str(
-                            String::from_utf8_lossy(&[byte]).into_owned(),
-                        ));
+                        return Ok(Value::str(String::from_utf8_lossy(&[byte]).into_owned()));
                     }
                 }
             }
@@ -2623,9 +2617,7 @@ impl<'a> Interp<'a> {
                         };
                         drop(b);
                         let off = self.str_offset_key(key.as_ref())?;
-                        if let OffWrite::Stored(_) =
-                            self.str_offset_write(&mut bytes, off, &v)?
-                        {
+                        if let OffWrite::Stored(_) = self.str_offset_write(&mut bytes, off, &v)? {
                             *arr_cell.borrow_mut() =
                                 Value::str(String::from_utf8_lossy(&bytes).into_owned());
                         }
