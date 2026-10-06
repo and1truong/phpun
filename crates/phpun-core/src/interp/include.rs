@@ -183,7 +183,7 @@ impl<'a> Interp<'a> {
         // line space; restore the includer's line so a later call in the same
         // statement still reports the call-site line (gh19653_2).
         let saved_line = self.cur_line;
-        let flow = match self.hoist_funcs(&stmts) {
+        let flow = match Self::const_closure_gate(&stmts).and_then(|_| self.hoist_funcs(&stmts)) {
             Err(e) => self.err_flow(e),
             Ok(()) => self.exec_block(&stmts),
         };
@@ -244,8 +244,23 @@ impl<'a> Interp<'a> {
                 // Same cur_line clobber as include(): `f(eval(...))` must keep
                 // the call-site line for later calls in the statement.
                 let saved_line = self.cur_line;
-                let flow = self.exec_block(&stmts);
+                // Zend compiles eval'd code as its own unit attributed to
+                // the call site — `FILE(N) : eval()'d code` — which
+                // __FILE__, decl files and every diagnostic read via
+                // cur_file (a nested eval composes the context).
+                let eval_ctx = format!("{}({}) : eval()'d code", self.cur_file, self.cur_line);
+                let saved_file = std::mem::replace(&mut self.cur_file, eval_ctx);
+                let flow = match Self::const_closure_gate(&stmts) {
+                    Err(e) => {
+                        // Gate errors are compile fatals of the eval'd
+                        // unit — attribute to the eval()'d-code context.
+                        self.last_err_file = self.cur_file.clone();
+                        self.err_flow(e)
+                    }
+                    Ok(()) => self.exec_block(&stmts),
+                };
                 self.cur_line = saved_line;
+                self.cur_file = saved_file;
                 match flow {
                     Flow::Return(v) => Ok(v),
                     Flow::Normal => Ok(Value::Null),
