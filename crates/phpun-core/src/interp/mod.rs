@@ -2504,7 +2504,8 @@ impl<'a> Interp<'a> {
     pub fn putenv_pub(&mut self, s: &str) -> bool {
         match s.split_once('=') {
             Some((k, v)) => {
-                self.env_overrides.insert(k.to_string(), Some(v.to_string()));
+                self.env_overrides
+                    .insert(k.to_string(), Some(v.to_string()));
             }
             None => {
                 self.env_overrides.insert(s.to_string(), None);

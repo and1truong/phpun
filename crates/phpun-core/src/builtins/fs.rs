@@ -1052,9 +1052,7 @@ pub(crate) fn dispatch(
                             ));
                             mk(base)
                         }
-                        PhpResource::Mem {
-                            eof, uri, mode, ..
-                        } => {
+                        PhpResource::Mem { eof, uri, mode, .. } => {
                             // zend quirk: php://memory reports the full
                             // 9-key meta, but temp streams (TEMP) omit
                             // timed_out/blocked/eof entirely.
@@ -2106,46 +2104,43 @@ fn stream_select(it: &mut Interp, fname: &str, args: &[Cell]) -> Result<Option<V
             Value::Array(a) => {
                 for (k, c) in a.borrow().iter() {
                     let item = c.borrow().clone();
-                    match item {
-                        Value::Resource(ref r) => {
-                            let fd = {
-                                let rb = r.borrow();
-                                match &*rb {
-                                    PhpResource::File { file, .. }
-                                    | PhpResource::Pipe { file, .. } => file.as_raw_fd(),
-                                    PhpResource::Stdio { which, .. } if *which <= 2 => {
-                                        *which as i32
+                    let Value::Resource(ref r) = item else {
+                        // Non-resource elements are skipped silently.
+                        continue;
+                    };
+                    let fd = {
+                        let rb = r.borrow();
+                        match &*rb {
+                            PhpResource::File { file, .. } | PhpResource::Pipe { file, .. } => {
+                                file.as_raw_fd()
+                            }
+                            PhpResource::Stdio { which, .. } if *which <= 2 => *which as i32,
+                            // Closed resources are skipped silently;
+                            // non-fd streams warn with zend's stream
+                            // type name.
+                            PhpResource::Closed { .. } => continue,
+                            other => {
+                                let ty = match other {
+                                    PhpResource::Mem { uri, .. } => {
+                                        if uri == "php://memory" {
+                                            "MEMORY"
+                                        } else {
+                                            "TEMP"
+                                        }
                                     }
-                                    // Closed resources and non-stream
-                                    // elements are skipped silently;
-                                    // non-fd streams warn with zend's
-                                    // stream type name.
-                                    PhpResource::Closed { .. } => continue,
-                                    other => {
-                                        let ty = match other {
-                                            PhpResource::Mem { uri, .. } => {
-                                                if uri == "php://memory" {
-                                                    "MEMORY"
-                                                } else {
-                                                    "TEMP"
-                                                }
-                                            }
-                                            PhpResource::Input { .. } => "Input",
-                                            PhpResource::Stdio { .. } => "Output",
-                                            o => o.type_name(),
-                                        };
-                                        it.warn_pub(&format!(
-                                            "{}(): Cannot represent a stream of type {} as a select()able descriptor",
-                                            fname, ty
-                                        ))?;
-                                        continue;
-                                    }
-                                }
-                            };
-                            sets[ai].push((k.clone(), item, fd));
+                                    PhpResource::Input { .. } => "Input",
+                                    PhpResource::Stdio { .. } => "Output",
+                                    o => o.type_name(),
+                                };
+                                it.warn_pub(&format!(
+                                    "{}(): Cannot represent a stream of type {} as a select()able descriptor",
+                                    fname, ty
+                                ))?;
+                                continue;
+                            }
                         }
-                        _ => {}
-                    }
+                    };
+                    sets[ai].push((k.clone(), item, fd));
                 }
             }
             Value::Null => {}
