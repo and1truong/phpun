@@ -3128,11 +3128,15 @@ impl<'a> Interp<'a> {
         ))
     }
 
-    /// Resolve a class expression to a class name.
+    /// Resolve a class expression to a class name. Scope keywords
+    /// (`self`/`static`/`parent`) resolve ONLY from the literal
+    /// keyword node — a runtime string naming one looks up literally
+    /// and misses ('Class "self" not found', m6 oracle).
     pub(in crate::interp) fn class_name_of(&mut self, e: &Expr) -> Result<String, PhpError> {
         match e {
             Expr::Const(n) => Ok(self.resolve_class_name(n)),
-            Expr::Str(s) => Ok(self.resolve_class_name(s)),
+            Expr::Str(s) => Ok(s.trim_start_matches('\\').to_string()),
+            Expr::Paren(inner) => self.class_name_of(inner),
             Expr::AnonClass(d) => {
                 self.register_class(d.clone())?;
                 Ok(d.name.clone())
@@ -3141,7 +3145,7 @@ impl<'a> Interp<'a> {
                 let v = self.eval(e)?;
                 match v {
                     Value::Object(o) => Ok(o.borrow().class.name().to_string()),
-                    other => Ok(self.resolve_class_name(&other.to_php_string())),
+                    other => Ok(other.to_php_string().trim_start_matches('\\').to_string()),
                 }
             }
         }

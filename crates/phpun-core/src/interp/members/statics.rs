@@ -588,10 +588,21 @@ impl<'a> Interp<'a> {
     /// resolution — member-style access (`X::$p`, `new X`, `X::K`,
     /// extends/catch) on an unresolved scope keyword throws the
     /// catchable `Cannot access "X" when no class scope is active`;
-    /// `parent` inside a class without one is the compile fatal
-    /// 'Cannot use "parent" when current class scope has no parent'
-    /// (p15/probe10new vs oracle).
-    pub(in crate::interp) fn scope_kw_err(&mut self, name: &str) -> Result<(), PhpError> {
+    /// `parent` inside a class without one is the catchable Error
+    /// 'Cannot access "parent" when current class scope has no parent'
+    /// (a `parent::` literal in a NON-trait/non-closure parentless
+    /// class still parse-fatals upstream; traits and closures reach
+    /// this runtime gate). `literal` gates all of it to operands that
+    /// were the literal keyword node — a runtime string 'parent' is an
+    /// ordinary unknown class ('Class "parent" not found').
+    pub(in crate::interp) fn scope_kw_err(
+        &mut self,
+        name: &str,
+        literal: bool,
+    ) -> Result<(), PhpError> {
+        if !literal {
+            return Ok(());
+        }
         let lw = name.to_lowercase();
         if !matches!(lw.as_str(), "self" | "static" | "parent") {
             return Ok(());
@@ -601,9 +612,10 @@ impl<'a> Interp<'a> {
             return Ok(());
         }
         if lw == "parent" && self.has_class_scope() {
-            return Err(PhpError::compile_fatal(
-                "Cannot use \"parent\" when current class scope has no parent",
-                self.cur_line,
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot access \"parent\" when current class scope has no parent".to_string(),
+                0,
             ));
         }
         self.fail(PhpError::uncaught(
@@ -611,6 +623,18 @@ impl<'a> Interp<'a> {
             format!("Cannot access \"{}\" when no class scope is active", lw),
             0,
         ))
+    }
+
+    /// Whether `e` is a syntactic class reference — a bare identifier
+    /// (parens peeled): `Foo`, `self`, `static`, `parent`. Only those
+    /// get scope-keyword error semantics and `::class` name returns;
+    /// runtime strings look up literally.
+    pub(in crate::interp) fn is_lit_class_ref(e: &Expr) -> bool {
+        match e {
+            Expr::Paren(inner) => Self::is_lit_class_ref(inner),
+            Expr::Const(_) => true,
+            _ => false,
+        }
     }
 
     /// Whether any class scope is live — an executing method frame or a
@@ -625,8 +649,9 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn class_of(&mut self, e: &Expr) -> Result<Rc<PhpClass>, PhpError> {
+        let lit = Self::is_lit_class_ref(e);
         let name = self.class_name_of(e)?;
-        self.scope_kw_err(&name)?;
+        self.scope_kw_err(&name, lit)?;
         if !self.classes.contains_key(&name.to_lowercase()) {
             self.run_autoload(&name)?;
         }
@@ -645,17 +670,33 @@ impl<'a> Interp<'a> {
         class: &Expr,
         name: &str,
     ) -> Result<Value, PhpError> {
+        let lit = Self::is_lit_class_ref(class);
+        if name == "class" && !lit {
+            // `::class` on a runtime operand: an object gives its
+            // class name (`$o::class`); a string is an Error (zend's
+            // 'Cannot use "::class" on string').
+            let v = self.eval(class)?;
+            return match v {
+                Value::Object(o) => Ok(Value::str(o.borrow().class.name().to_string())),
+                _ => self.fail(PhpError::uncaught(
+                    "Error",
+                    "Cannot use \"::class\" on string".to_string(),
+                    0,
+                )),
+            };
+        }
         let cname = self.class_name_of(class)?;
         if name == "class" {
             // `X::class` on an unresolved scope keyword carries its own
             // messages: 'Cannot use "X" in the global scope'; in a class
-            // without parent, `parent::class` is the no-parent compile
-            // fatal (p15/t).
+            // without parent, `parent::class` is the catchable no-parent
+            // Error (p15/t/m6 vs oracle).
             match cname.to_lowercase().as_str() {
                 "parent" if self.has_class_scope() => {
-                    return Err(PhpError::compile_fatal(
-                        "Cannot use \"parent\" when current class scope has no parent",
-                        self.cur_line,
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        "Cannot use \"parent\" when current class scope has no parent".to_string(),
+                        0,
                     ));
                 }
                 "self" | "static" | "parent" => {
@@ -671,7 +712,7 @@ impl<'a> Interp<'a> {
                 _ => {}
             }
         }
-        self.scope_kw_err(&cname)?;
+        self.scope_kw_err(&cname, lit)?;
         self.class_const_named(&cname, name)
     }
 
@@ -710,6 +751,7 @@ impl<'a> Interp<'a> {
             // Const on an interface (e.g. `FastRoute\Dispatcher::FOUND`):
             // walk it and its extended interfaces.
             let mut seen = std::collections::HashSet::new();
+            let iname = iface.name.clone();
             let mut stack = vec![iface];
             while let Some(c) = stack.pop() {
                 if !seen.insert(c.name.to_lowercase()) {
@@ -739,7 +781,7 @@ impl<'a> Interp<'a> {
             }
             return self.fail(PhpError::uncaught(
                 "Error",
-                format!("Undefined constant {}::{}", cname, name),
+                format!("Undefined constant {}::{}", iname, name),
                 0,
             ));
         }
@@ -806,9 +848,11 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        // Oracle names the RESOLVED class (canonical case) in the
+        // miss error, not the caller's spelling (`$a::N` → 'A::N').
         self.fail(PhpError::uncaught(
             "Error",
-            format!("Undefined constant {}::{}", cname, name),
+            format!("Undefined constant {}::{}", cls.decl.name, name),
             0,
         ))
     }

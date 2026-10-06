@@ -1915,8 +1915,7 @@ impl<'a> Interp<'a> {
                                 // zend's wording tucks 'readonly' into
                                 // the protected(set) form only — the
                                 // private(set) message drops it.
-                                let rw = if pd.readonly
-                                    && eff == crate::ast::Visibility::Protected
+                                let rw = if pd.readonly && eff == crate::ast::Visibility::Protected
                                 {
                                     " readonly"
                                 } else {

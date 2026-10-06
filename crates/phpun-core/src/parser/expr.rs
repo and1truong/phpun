@@ -1693,10 +1693,12 @@ impl<'a> Parser<'a> {
                 // `parent::` inside a non-trait class with no parent is
                 // zend's compile-time fatal — the whole file fails
                 // before executing (p15/t/ch vs oracle). Traits defer
-                // the check to the using class.
+                // the check to the using class, and closures defer it
+                // to invocation (catchable Error).
                 if let Expr::Const(n) = &e {
                     if n.eq_ignore_ascii_case("parent")
                         && self.class_ctx.last().map(|c| !c.1 && !c.0).unwrap_or(false)
+                        && !self.in_closure
                     {
                         return Err(PhpError::compile_fatal(
                             "Cannot use \"parent\" when current class scope has no parent",
@@ -2261,10 +2263,12 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     let (class, mut ctor_args) = self.new_class_expr()?;
                     // `new parent()` in a parentless class — same
-                    // compile-time gate as `parent::` (p10new/ch3).
+                    // compile-time gate as `parent::` (p10new/ch3);
+                    // inside a closure it defers to the runtime Error.
                     if let Expr::Const(n) = &class {
                         if n.eq_ignore_ascii_case("parent")
                             && self.class_ctx.last().map(|c| !c.1 && !c.0).unwrap_or(false)
+                            && !self.in_closure
                         {
                             return Err(PhpError::compile_fatal(
                                 "Cannot use \"parent\" when current class scope has no parent",

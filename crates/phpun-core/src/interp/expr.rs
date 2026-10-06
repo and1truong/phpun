@@ -530,11 +530,13 @@ impl<'a> Interp<'a> {
                 Ok(Value::Callable(callable))
             }
             Expr::New { class, args } => {
+                let lit = Self::is_lit_class_ref(class);
                 let name = self.class_name_of(class)?;
                 // `new self`/`static`/`parent` outside class scope is the
-                // no-scope Error; `parent` inside a parentless class is
-                // the compile fatal (p10new vs oracle).
-                self.scope_kw_err(&name)?;
+                // no-scope Error; literal `parent` inside a parentless
+                // class is the catchable no-parent Error (traits/
+                // closures defer here — p10new/m45 vs oracle).
+                self.scope_kw_err(&name, lit)?;
                 let params = self
                     .classes
                     .get(&name.to_lowercase())
@@ -1403,24 +1405,20 @@ impl<'a> Interp<'a> {
                 // zend fetches the object operand in write context —
                 // an intermediate readonly prop holding a non-object
                 // dies here, naming THAT prop (R3 finding 3).
-                match self.eval_lvalue_obj(obj) {
-                    Ok(ov) => {
-                        // A {dynamic} name expr resolves now (side effects +
-                        // the var-var temp is read early, matching Zend);
-                        // a plain $var name reads late at write time.
-                        if matches!(name, PropName::Expr(_)) {
-                            let pn = self.prop_name(name)?;
-                            late = Late::PropStr { ov, pn };
-                        } else {
-                            late = Late::Prop {
-                                ov,
-                                name: Some(name.clone()),
-                            };
-                        }
-                        None
-                    }
-                    Err(e) => return Err(e),
+                let ov = self.eval_lvalue_obj(obj)?;
+                // A {dynamic} name expr resolves now (side effects +
+                // the var-var temp is read early, matching Zend);
+                // a plain $var name reads late at write time.
+                if matches!(name, PropName::Expr(_)) {
+                    let pn = self.prop_name(name)?;
+                    late = Late::PropStr { ov, pn };
+                } else {
+                    late = Late::Prop {
+                        ov,
+                        name: Some(name.clone()),
+                    };
                 }
+                None
             }
             Expr::Index { e, i } if has_prop(e) => {
                 // Prop-chain index: the container resolves early; the dim
@@ -1810,10 +1808,9 @@ impl<'a> Interp<'a> {
     /// `$c->a['x']->p = 5` gates on `a`). Non-chain forms read normally.
     pub(in crate::interp) fn eval_lvalue_obj(&mut self, obj: &Expr) -> Result<Value, PhpError> {
         match obj {
-            Expr::Prop { .. }
-            | Expr::Index { .. }
-            | Expr::StaticProp { .. }
-            | Expr::VarVar(_) => Ok(self.eval_cell(obj)?.borrow().clone()),
+            Expr::Prop { .. } | Expr::Index { .. } | Expr::StaticProp { .. } | Expr::VarVar(_) => {
+                Ok(self.eval_cell(obj)?.borrow().clone())
+            }
             Expr::Paren(inner) => match &**inner {
                 Expr::Prop { .. }
                 | Expr::Index { .. }
