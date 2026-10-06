@@ -1328,6 +1328,26 @@ impl<'a> Interp<'a> {
             self.bind_cell(target, src.clone())?;
             return Ok(src.borrow().clone());
         }
+        if op == "=" {
+            if let Expr::List(items) = target {
+                if items.iter().flatten().any(|t| matches!(t, Expr::ByRef(_))) {
+                    // `[$a, &$b] = $src` — `&` elements bind the source's
+                    // real cells; literal sources already compile-fataled
+                    // in the parser and other temps get zend's
+                    // per-element 'set reference' notice (probe5f/5h).
+                    let refable = matches!(
+                        value,
+                        Expr::Var(_)
+                            | Expr::Index { .. }
+                            | Expr::Prop { .. }
+                            | Expr::StaticProp { .. }
+                            | Expr::VarVar(_)
+                    );
+                    let v = self.eval(value)?;
+                    return self.store_list_byref(items, v, refable);
+                }
+            }
+        }
         let needs_read = op != "=";
         // PHP evaluates the LHS lvalue chain (index exprs' side effects)
         // BEFORE the RHS: `$a[f()][g()] = rhs` calls f,g first
@@ -2108,12 +2128,48 @@ impl<'a> Interp<'a> {
                             }
                         },
                         other => {
-                            if items[i].is_some() {
-                                // list() on a non-array warns "Cannot use T
-                                // as array" (engine_assignExecutionOrder_002).
-                                self.warn(&format!("Cannot use {} as array", other.debug_type()))?;
+                            if items[i].is_none() {
+                                Value::Null
+                            } else {
+                                match other {
+                                    // `[$a] = null` is silent (probe5s).
+                                    Value::Null => Value::Null,
+                                    Value::Object(o) if self.obj_is_a(o, "ArrayAccess") => {
+                                        // ArrayAccess destructures via
+                                        // offsetGet (probe5t).
+                                        self.method_invoke(
+                                            o.clone(),
+                                            "offsetGet",
+                                            CallArgs::positional(vec![cell(Value::Int(i as i64))]),
+                                        )?
+                                    }
+                                    Value::Object(o) => {
+                                        let cn = o.borrow().class.name().to_string();
+                                        return self.fail(PhpError::uncaught(
+                                            "Error",
+                                            format!("Cannot use object of type {} as array", cn),
+                                            self.cur_line,
+                                        ));
+                                    }
+                                    Value::Callable(_) => {
+                                        return self.fail(PhpError::uncaught(
+                                            "Error",
+                                            "Cannot use object of type Closure as array",
+                                            self.cur_line,
+                                        ));
+                                    }
+                                    // list() on a scalar warns "Cannot
+                                    // use T as array"
+                                    // (engine_assignExecutionOrder_002).
+                                    _ => {
+                                        self.warn(&format!(
+                                            "Cannot use {} as array",
+                                            other.type_name()
+                                        ))?;
+                                        Value::Null
+                                    }
+                                }
                             }
-                            Value::Null
                         }
                     };
                     vals.push(vi);
@@ -2136,6 +2192,141 @@ impl<'a> Interp<'a> {
             }
             _ => self.fail(PhpError::fatal("Cannot assign to this expression", 0)),
         }
+    }
+
+    /// `[$a, &$b] = $src` / `list($a, &$b) = $src` — a destructure
+    /// carrying `&` elements. Lvalue sources (`refable`) bind the
+    /// source's real element cells — a missing index auto-creates
+    /// `&NULL` like foreach (probe5o); temps and call results take
+    /// zend's 'Attempting to set reference to non referenceable value'
+    /// notice per `&` and assign by value (probe5h/5p). Non-array
+    /// sources run zend's matrix: objects (and Closures) error on ANY
+    // element, scalars/strings warn on plain elements and error on
+    /// `&`, null destructures silently (probe5q/5r).
+    fn store_list_byref(
+        &mut self,
+        items: &[Option<Expr>],
+        v: Value,
+        refable: bool,
+    ) -> Result<Value, PhpError> {
+        match &v {
+            Value::Array(a) => {
+                for (i, t) in items.iter().enumerate() {
+                    let Some(t) = t else { continue };
+                    let k = ArrKey::Int(i as i64);
+                    match t {
+                        Expr::ByRef(inner) if refable => {
+                            let c = {
+                                let mut arr = a.borrow_mut();
+                                match arr.get_cell(&k) {
+                                    Some(c) => c,
+                                    None => {
+                                        let nc = cell(Value::Null);
+                                        arr.bind_cell(k.clone(), nc.clone());
+                                        nc
+                                    }
+                                }
+                            };
+                            self.bind_cell(inner, c)?;
+                        }
+                        Expr::ByRef(inner) => {
+                            self.notice("Attempting to set reference to non referenceable value")?;
+                            let vi = match a.borrow().get(&k) {
+                                Some(vi) => vi,
+                                None => {
+                                    self.warn(&format!("Undefined array key {}", i))?;
+                                    Value::Null
+                                }
+                            };
+                            self.store(inner, vi)?;
+                        }
+                        _ => {
+                            let vi = match a.borrow().get(&k) {
+                                Some(vi) => vi,
+                                None => {
+                                    self.warn(&format!("Undefined array key {}", i))?;
+                                    Value::Null
+                                }
+                            };
+                            self.store(t, vi)?;
+                        }
+                    }
+                }
+            }
+            Value::Null => {
+                for t in items.iter().flatten() {
+                    match t {
+                        Expr::ByRef(inner) => self.bind_cell(inner, cell(Value::Null))?,
+                        _ => self.store(t, Value::Null)?,
+                    }
+                }
+            }
+            other => {
+                for (i, t) in items.iter().enumerate() {
+                    let Some(t) = t else { continue };
+                    let (inner, by_ref) = match t {
+                        Expr::ByRef(inner) => (inner.as_ref(), true),
+                        _ => (t, false),
+                    };
+                    // ArrayAccess sources read every element through
+                    // offsetGet; `&` adds the overloaded notice
+                    // (probe5q).
+                    if let Value::Object(o) = other {
+                        if self.obj_is_a(o, "ArrayAccess") {
+                            let iv = self
+                                .method_invoke(
+                                    o.clone(),
+                                    "offsetGet",
+                                    CallArgs::positional(vec![cell(Value::Int(i as i64))]),
+                                )
+                                .unwrap_or(Value::Null);
+                            if by_ref {
+                                let cn = o.borrow().class.name().to_string();
+                                self.notice(&format!(
+                                    "Indirect modification of overloaded element of {} has no effect",
+                                    cn
+                                ))?;
+                            }
+                            self.store(inner, iv)?;
+                            continue;
+                        }
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Cannot use object of type {} as array",
+                                o.borrow().class.name()
+                            ),
+                            self.cur_line,
+                        ));
+                    }
+                    if let Value::Callable(_) = other {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            "Cannot use object of type Closure as array",
+                            self.cur_line,
+                        ));
+                    }
+                    if by_ref && refable {
+                        let msg = if matches!(other, Value::Str(_)) {
+                            "Cannot create references to/from string offsets"
+                        } else {
+                            "Cannot use a scalar value as an array"
+                        };
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            msg.to_string(),
+                            self.cur_line,
+                        ));
+                    }
+                    if by_ref {
+                        self.notice("Attempting to set reference to non referenceable value")?;
+                    }
+                    self.warn(&format!("Cannot use {} as array", other.type_name()))?;
+                    self.store(inner, Value::Null)?;
+                }
+            }
+        }
+        Ok(v.clone())
     }
 
     /// Write `$ov->$pn = v` — private-slot, `__set` or dynamic-prop rules.
@@ -3078,7 +3269,7 @@ impl<'a> Interp<'a> {
                         // Nested dim on a scalar is a Warning, not an Error
                         // (engine_assignExecutionOrder_002) — write is skipped.
                         Ok(bc) => {
-                            let t = bc.borrow().debug_type();
+                            let t = bc.borrow().type_name().to_string();
                             drop(bc);
                             self.warn(&format!("Cannot use {} as array", t))?;
                             Ok(())

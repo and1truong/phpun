@@ -512,6 +512,7 @@ impl<'a> Parser<'a> {
                 }
                 let rhs = self.assign()?;
                 let target = self.list_target(e)?;
+                self.check_list_ref_literal(op, &target, &rhs)?;
                 return Ok(Expr::Assign {
                     target: Box::new(target),
                     op,
@@ -936,6 +937,7 @@ impl<'a> Parser<'a> {
                 }
                 let rhs = self.assign()?;
                 let target = self.list_target(e)?;
+                self.check_list_ref_literal(op, &target, &rhs)?;
                 return Ok(Expr::Assign {
                     target: Box::new(target),
                     op,
@@ -944,6 +946,34 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(e)
+    }
+
+    /// `[$a, &$b] = [..]` — a `&` element against a literal array RHS
+    /// is a zend compile fatal: temporaries can't be reference sources
+    /// (probe5j). `=` reaches the parser at both the statement and the
+    /// unary level, so both call sites check.
+    fn check_list_ref_literal(&self, op: &str, target: &Expr, rhs: &Expr) -> Result<(), PhpError> {
+        if op != "=" {
+            return Ok(());
+        }
+        let Expr::List(items) = target else {
+            return Ok(());
+        };
+        let has_ref = items.iter().flatten().any(|t| matches!(t, Expr::ByRef(_)));
+        if !has_ref {
+            return Ok(());
+        }
+        let mut lit = rhs;
+        while let Expr::Paren(inner) = lit {
+            lit = inner;
+        }
+        if matches!(lit, Expr::ArrayLit(_) | Expr::List(_)) {
+            return Err(PhpError::compile_fatal(
+                "Cannot assign reference to non referenceable value",
+                self.line(),
+            ));
+        }
+        Ok(())
     }
 
     pub(in crate::parser) fn postfix(&mut self) -> Result<Expr, PhpError> {
@@ -1038,29 +1068,56 @@ impl<'a> Parser<'a> {
                 self.line(),
             ));
         }
+        // `new_variable` parens must be followed by a deref link —
+        // `=& ($x)` / `=& (f())` / `=& ($$v)` are parse errors while
+        // `(&$x)[0]` and `=& ($f)()` are legal (probe7 vs oracle).
+        if self.at_op("(") {
+            let mut depth = 0usize;
+            let mut i = self.pos;
+            while let Some(t) = self.toks.get(i).map(|l| &l.token) {
+                match t {
+                    Token::Op("(") => depth += 1,
+                    Token::Op(")") => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let next = self.toks.get(i + 1).map(|l| &l.token);
+            if !matches!(
+                next,
+                Some(Token::Op("["))
+                    | Some(Token::Op("->"))
+                    | Some(Token::Op("?->"))
+                    | Some(Token::Op("("))
+            ) {
+                return Err(PhpError::parse(
+                    format!(
+                        "syntax error, unexpected {}, expecting \"->\" or \"?->\" or \"[\"",
+                        desc_t(next)
+                    ),
+                    self.line(),
+                ));
+            }
+        }
         let e = self.postfix()?;
         // Deepest chain root: container of `x[...]`/`x->y`/`x->m()`.
-        // Parens are transparent; a Call node is itself a legal root
-        // (`=& f()`, `=& ($f)()`), so call names are NOT unwrapped.
-        // `linked` = a real deref link was consumed — a parenthesized
-        // expr alone is NOT a `new_variable` (`=& (1)` stays a parse
-        // error, not the temporary-expression fatal).
+        // Parens are transparent for the ROOT search; a Call node is
+        // itself a legal root (`=& f()`, `=& ($f)()`), so call names
+        // are NOT unwrapped. `linked` = the OUTERMOST node is a real
+        // deref link — parens at the top level are NOT a
+        // `new_variable` (`=& ($x)`, `=& ($a[0])`, `=& (f())` all
+        // parse-error expecting "->"/"?->"/"[", while `(&$x)[0]` is
+        // legal because the link is outside).
+        let linked = matches!(&e, Index { .. } | Prop { .. } | MethodCall { .. });
         let mut leaf: &Expr = &e;
-        let mut linked = false;
         loop {
             leaf = match leaf {
-                Index { e: c, .. } => {
-                    linked = true;
-                    c.as_ref()
-                }
-                Prop { obj, .. } => {
-                    linked = true;
-                    obj.as_ref()
-                }
-                MethodCall { obj, .. } => {
-                    linked = true;
-                    obj.as_ref()
-                }
+                Index { e: c, .. } | Prop { obj: c, .. } | MethodCall { obj: c, .. } => c.as_ref(),
                 Paren(inner) => inner.as_ref(),
                 _ => break,
             };
@@ -1073,8 +1130,10 @@ impl<'a> Parser<'a> {
             }
         };
         if !linked {
-            // No deref link — the leaf IS the whole expr (mod parens).
-            match leaf {
+            // No deref link — zend's new_variable is a bare variable or
+            // a call, never a parenthesized expr (`=& ($x)` /
+            // `=& (f())` / `=& ($$v)` → parse error).
+            match &e {
                 Var(_) | VarVar(_) | StaticProp { .. } => {}
                 Call { .. }
                 | MethodCall { .. }
@@ -1115,9 +1174,11 @@ impl<'a> Parser<'a> {
             }
         } else {
             // A chain consumed at least one link — the ROOT must be a
-            // variable/call/string family; literal and const-expr roots
-            // (`true[0]`, `C::CONST[0]`, `new C()->x`) are a compile
-            // fatal.
+            // variable/call family; literal, string/interpolated-string
+            // and const-expr roots (`"abc"[0]`, `"a$v"[0]`, `true[0]`,
+            // `C::CONST[0]`, `new C()->x`) are a compile fatal —
+            // string literals are temporaries, not new_variables
+            // (probe6/6b vs oracle).
             match leaf {
                 Var(_)
                 | VarVar(_)
@@ -1127,8 +1188,6 @@ impl<'a> Parser<'a> {
                 | StaticCallDyn { .. }
                 | Fcc(_)
                 | Paren(_)
-                | Str(_)
-                | Interp(_)
                 | StaticProp { .. } => {}
                 _ => {
                     return Err(PhpError::compile_fatal(
@@ -1205,7 +1264,10 @@ impl<'a> Parser<'a> {
                 self.expect_op("]")?;
                 e = Expr::Index { e: Box::new(e), i };
             } else if self.eat_op("(") {
-                let args = self.args()?;
+                // `list($a, &$b)` is the one call site zend's grammar
+                // allows `&` elements in (destructuring builtin).
+                let is_list = matches!(&e, Expr::Str(n) if n.eq_ignore_ascii_case("list"));
+                let args = self.args_flags(is_list)?;
                 e = Self::fcc_wrap(Expr::Call {
                     name: Box::new(e),
                     args,
@@ -1486,6 +1548,12 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn args(&mut self) -> Result<Vec<Expr>, PhpError> {
+        self.args_flags(false)
+    }
+
+    /// `list($a, &$b)` — zend's destructuring builtin accepts `&`
+    /// elements; every other call site rejects them at parse time.
+    pub(in crate::parser) fn args_flags(&mut self, allow_ref: bool) -> Result<Vec<Expr>, PhpError> {
         let mut args = Vec::new();
         let mut unpacked = false;
         let mut seen_named = false;
@@ -1535,7 +1603,12 @@ impl<'a> Parser<'a> {
                         self.line(),
                     ));
                 }
-                args.push(self.expr()?);
+                if allow_ref && self.at_op("&") {
+                    self.pos += 1;
+                    args.push(Expr::ByRef(Box::new(self.ref_variable(false)?)));
+                } else {
+                    args.push(self.expr()?);
+                }
             }
             if !self.eat_op(",") {
                 break;
@@ -1774,7 +1847,14 @@ impl<'a> Parser<'a> {
                             self.pos += 1;
                             continue;
                         }
-                        items.push(Some(self.expr()?));
+                        // `list($a, &$b)` — zend's destructuring `&`
+                        // element (probe5b): binds the source cell.
+                        if self.at_op("&") {
+                            self.pos += 1;
+                            items.push(Some(Expr::ByRef(Box::new(self.ref_variable(false)?))));
+                        } else {
+                            items.push(Some(self.expr()?));
+                        }
                         if !self.eat_op(",") {
                             break;
                         }
