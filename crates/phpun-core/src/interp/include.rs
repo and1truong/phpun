@@ -246,8 +246,16 @@ impl<'a> Interp<'a> {
         // loop/switch contexts, not the includer's.
         let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
         // ...and it is a fresh op_array — a new compile-unit serial
-        // for `static` decl site identity.
+        // for `static` decl site identity. `static` decls in the
+        // included unit's own top-level code belong to ITS op_array,
+        // so while it executes inside a caller's frame they key under
+        // this unit (a fresh table per include execution in Zend);
+        // the frame's own table stays untouched.
         let saved_unit = self.begin_unit();
+        let saved_su = self
+            .stack
+            .last_mut()
+            .map(|f| std::mem::replace(&mut f.statics_unit, Some(self.cur_unit_id)));
         let flow = match Self::const_closure_gate(&stmts)
             .and_then(|_| self.flow_gate(&stmts))
             .and_then(|_| self.hoist_funcs(&stmts))
@@ -269,6 +277,11 @@ impl<'a> Interp<'a> {
         };
         self.loop_depth = saved_depth;
         self.cur_unit_id = saved_unit;
+        if let Some(su) = saved_su {
+            if let Some(f) = self.stack.last_mut() {
+                f.statics_unit = su;
+            }
+        }
         self.include_ns.pop();
         // break/continue/goto leaking out of the unit are compile fatals
         // in Zend too: same compile-context backtrace (needs our
@@ -355,8 +368,15 @@ impl<'a> Interp<'a> {
                 // eval'd code is its own compile unit — `break`/`continue`
                 // operands count only ITS enclosing loop/switch contexts.
                 let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
-                // ...a fresh op_array: its own unit serial too.
+                // ...a fresh op_array: its own unit serial too. The
+                // eval'd unit's own `static` decls key under it (fresh
+                // table per eval() call, Zend-compiled op_array), even
+                // though they bind into the executing frame's vars.
                 let saved_unit = self.begin_unit();
+                let saved_su = self
+                    .stack
+                    .last_mut()
+                    .map(|f| std::mem::replace(&mut f.statics_unit, Some(self.cur_unit_id)));
                 // Zend traces through eval'd code carry a `FILE(N):
                 // eval()` frame at the call site (rendered bare — the
                 // eval'd source is not an arg in backtraces).
@@ -385,6 +405,11 @@ impl<'a> Interp<'a> {
                     };
                 self.loop_depth = saved_depth;
                 self.cur_unit_id = saved_unit;
+                if let Some(su) = saved_su {
+                    if let Some(f) = self.stack.last_mut() {
+                        f.statics_unit = su;
+                    }
+                }
                 // break/continue/goto leaking out of the eval'd unit are
                 // compile fatals in Zend, attributed to the eval()'d-code
                 // context (cur_file/cur_line still hold it here) with the

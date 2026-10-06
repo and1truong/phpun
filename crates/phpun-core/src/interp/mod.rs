@@ -151,6 +151,12 @@ pub struct Frame {
     /// Name diagnostics report for this call — `[$closure,'__invoke']`
     /// runs as `Closure::__invoke` (closure_invoke_ref_warning).
     call_alias: Option<String>,
+    /// While eval()/include() unit code executes inside this frame: the
+    /// executing compile unit. `static` decls in that code store under
+    /// `key\0u{unit}` — a fresh table per unit, matching Zend's fresh
+    /// op_array (and fresh static_variables) per eval/include call.
+    /// None = the frame's own op_array, whose statics persist.
+    statics_unit: Option<u64>,
 }
 
 impl Frame {
@@ -171,6 +177,7 @@ impl Frame {
             trait_origin: None,
             closure_rc: None,
             call_alias: None,
+            statics_unit: None,
         }
     }
 }
@@ -309,10 +316,13 @@ pub struct Interp<'a> {
     /// Autoload/lookup error swallowed by the last `is_callable_value`
     /// probe — re-raised when a `callable` param type rejects the arg.
     callable_probe_err: Option<(Value, PhpError)>,
-    /// Function-scoped static storage: fn name → var → cell.
+    /// Function-scoped static storage: scope key → var → cell. The key
+    /// is fn_statics_key() for a function's own op_array; eval/include
+    /// unit code executing inside a frame suffixes `\0u{unit}` so each
+    /// unit gets a fresh table, and top-level code uses the executing
+    /// unit under the global scope key (Zend: static vars live in the
+    /// op_array that declared them).
     pub(crate) statics: HashMap<String, HashMap<String, Cell>>,
-    /// Global static vars (`static` at top level).
-    global_statics: HashMap<String, Cell>,
     /// static-decl sites per function scope (fn key → var → decl
     /// (unit serial, stmt ptr)) — PHP fatals on a same-unit
     /// redeclaration at a different statement site. The unit serial is
@@ -834,7 +844,6 @@ impl<'a> Interp<'a> {
             ob_stack: Vec::new(),
             silence: 0,
             statics: HashMap::new(),
-            global_statics: HashMap::new(),
             static_decls: HashMap::new(),
             cur_unit_id: 0,
             next_unit_id: 1,

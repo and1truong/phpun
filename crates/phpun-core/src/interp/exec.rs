@@ -354,7 +354,21 @@ impl<'a> Interp<'a> {
                 Flow::Normal
             }
             Stmt::Static { vars, .. } => {
-                let key = self.fn_statics_key();
+                let mut key = self.fn_statics_key();
+                // Static storage keys on the op_array the decl was
+                // compiled into: a function body's own table (bare key),
+                // eval/include unit code executing inside a frame
+                // (`key\0u{unit}` — a fresh table per unit, re-initialized
+                // on every call like Zend's fresh op_array), or top-level
+                // code where the executing unit itself is the owner.
+                let unit = if self.stack.is_empty() {
+                    Some(self.cur_unit_id)
+                } else {
+                    self.stack.last().and_then(|f| f.statics_unit)
+                };
+                if let Some(u) = unit {
+                    key = format!("{}\u{0}u{}", key, u);
+                }
                 // Site identity: (compile unit, stmt node). A `static $a`
                 // redeclared at a different statement in the same scope
                 // and unit is a compile fatal — even on the same line
@@ -390,14 +404,7 @@ impl<'a> Interp<'a> {
                     // Statics live per-function-decl: inside a function
                     // they never fall back to the top-level table
                     // (static_variation_001).
-                    let exists = {
-                        let table = if self.stack.is_empty() {
-                            Some(&self.global_statics)
-                        } else {
-                            self.statics.get(&key)
-                        };
-                        table.and_then(|t| t.get(name).cloned())
-                    };
+                    let exists = self.statics.get(&key).and_then(|t| t.get(name).cloned());
                     let cellv = match exists {
                         Some(c) => c,
                         None => {
@@ -415,14 +422,10 @@ impl<'a> Interp<'a> {
                                 None => Value::Null,
                             };
                             let c = cell(v);
-                            if self.stack.is_empty() {
-                                self.global_statics.insert(name.clone(), c.clone());
-                            } else {
-                                self.statics
-                                    .entry(key.clone())
-                                    .or_default()
-                                    .insert(name.clone(), c.clone());
-                            }
+                            self.statics
+                                .entry(key.clone())
+                                .or_default()
+                                .insert(name.clone(), c.clone());
                             c
                         }
                     };
