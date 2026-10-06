@@ -391,6 +391,8 @@ impl<'a> Interp<'a> {
                     args: Vec::new(),
                     named_args: Vec::new(),
                     internal: true,
+                    visible: true,
+                    named_dispatch: false,
                 });
                 let flow = match Self::const_closure_gate(&stmts)
                     .and_then(|_| self.flow_gate(&stmts))

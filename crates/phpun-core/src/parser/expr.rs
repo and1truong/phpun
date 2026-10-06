@@ -31,6 +31,15 @@ impl<'a> Parser<'a> {
         let by_ref = self.eat_op("&");
         let prev_hook = self.hook_ctx.take();
         let params = self.params()?;
+        // Zend names a closure by its enclosing context in the
+        // optional-before-required notice: `{closure:enclosing():L}`
+        // nested, `{closure:FILE:L}` at top level (\u{1} is the file,
+        // substituted when the diagnostic is emitted).
+        let clo_name = match self.fn_ctx.last() {
+            Some(parent) => format!("{{closure:{}():{}}}", parent, line),
+            None => format!("{{closure:{}:{}}}", '\u{1}', line),
+        };
+        self.opt_before_required(&params, &clo_name, line);
         if !arrow && self.ident_is("use") {
             self.pos += 1;
             self.expect_op("(")?;
@@ -85,6 +94,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        self.fn_ctx.push(clo_name);
         let (body, end_line) = if arrow {
             self.expect_op("=>")?;
             let e = self.expr()?;
@@ -97,6 +107,7 @@ impl<'a> Parser<'a> {
             let el = self.prev_line();
             (b, el)
         };
+        self.fn_ctx.pop();
         self.hook_ctx = prev_hook;
         Ok(Expr::Closure(ClosureExpr {
             decl: FunctionDecl {
@@ -1241,8 +1252,11 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Parses `(arg, ...)`: returns the arg exprs, the last wrapped in
+    /// an `argline` marker carrying that arg's own line (call-site
+    /// attribution for pushed frames — zend's last-SEND line).
     pub(in crate::parser) fn args(&mut self) -> Result<Vec<Expr>, PhpError> {
-        let mut args = Vec::new();
+        let mut args: Vec<(Expr, usize)> = Vec::new();
         let mut unpacked = false;
         let mut seen_named = false;
         while !self.at_op(")") {
@@ -1258,7 +1272,8 @@ impl<'a> Parser<'a> {
                         self.line(),
                     ));
                 }
-                args.push(Expr::Unpack(Box::new(self.expr()?)));
+                let vline = self.line();
+                args.push((Expr::Unpack(Box::new(self.expr()?)), vline));
                 unpacked = true;
                 if !self.eat_op(",") {
                     break;
@@ -1267,16 +1282,21 @@ impl<'a> Parser<'a> {
             }
             let named = matches!(self.peek(), Some(Token::Ident(_)))
                 && matches!(self.peek2(), Some(Token::Op(":")));
+            let vline = self.line();
             if named {
                 // named arguments `name:` — name recorded via Str marker
                 let n = self.ident().unwrap();
                 self.pos += 1; // :
+                let vline = self.line();
                 let v = self.expr()?;
-                args.push(Expr::Binary {
-                    op: "named",
-                    l: Box::new(Expr::Str(n)),
-                    r: Box::new(v),
-                });
+                args.push((
+                    Expr::Binary {
+                        op: "named",
+                        l: Box::new(Expr::Str(n)),
+                        r: Box::new(v),
+                    },
+                    vline,
+                ));
                 seen_named = true;
             } else {
                 if seen_named {
@@ -1291,14 +1311,24 @@ impl<'a> Parser<'a> {
                         self.line(),
                     ));
                 }
-                args.push(self.expr()?);
+                args.push((self.expr()?, vline));
             }
             if !self.eat_op(",") {
                 break;
             }
         }
         self.expect_op(")")?;
-        Ok(args)
+        // Zend attributes a call's pushed frames to the line of the last
+        // SEND op — the last argument's own line. Mark it for the interp.
+        if let Some((last, l)) = args.last_mut() {
+            let e = std::mem::replace(last, Expr::Null);
+            *last = Expr::Binary {
+                op: "argline",
+                l: Box::new(Expr::Int(*l as i64)),
+                r: Box::new(e),
+            };
+        }
+        Ok(args.into_iter().map(|(e, _)| e).collect())
     }
 
     pub(in crate::parser) fn prop_name(&mut self) -> Result<PropName, PhpError> {

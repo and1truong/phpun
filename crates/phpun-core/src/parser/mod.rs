@@ -24,6 +24,10 @@ pub struct Parser<'a> {
     compile_warnings: Vec<(String, usize)>,
     /// Enclosing class name while parsing members (hook error text).
     cur_class: String,
+    /// Display names of the function-likes being parsed (innermost
+    /// last) — Zend names a nested closure `{closure:enclosing():L}` in
+    /// the optional-before-required Deprecated notice.
+    fn_ctx: Vec<String>,
     /// (prop name, is_get) while inside a hook body — gates
     /// `parent::$p::get()/set()` syntax.
     hook_ctx: Option<(String, bool)>,
@@ -175,6 +179,7 @@ impl<'a> Parser<'a> {
             deprecations: Vec::new(),
             compile_warnings: Vec::new(),
             cur_class: String::new(),
+            fn_ctx: Vec::new(),
             hook_ctx: None,
             pending_class_attrs: Vec::new(),
             cur_ns: String::new(),
@@ -272,6 +277,7 @@ pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
         deprecations: Vec::new(),
         compile_warnings: Vec::new(),
         cur_class: String::new(),
+        fn_ctx: Vec::new(),
         hook_ctx: None,
         pending_class_attrs: Vec::new(),
         cur_ns: String::new(),

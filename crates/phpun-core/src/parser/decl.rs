@@ -843,6 +843,14 @@ impl<'a> Parser<'a> {
                             // which warn at bind time).
                             let mut seen = std::collections::HashSet::new();
                             for a in &list {
+                                // See through the last-arg `argline`
+                                // call-site marker.
+                                let a = match a {
+                                    Expr::Binary {
+                                        op: "argline", r, ..
+                                    } => r.as_ref(),
+                                    _ => a,
+                                };
                                 if let Expr::Binary { op: "named", l, .. } = a {
                                     if let Expr::Str(n) = l.as_ref() {
                                         if !seen.insert(n.clone()) {
@@ -1320,11 +1328,20 @@ impl<'a> Parser<'a> {
         let name = self.ident().unwrap_or_default();
         let prev_hook = self.hook_ctx.take();
         let params = self.params()?;
+        // Anonymous-class methods report just `class@anonymous` in this
+        // notice; named classes report `Cls::m`.
+        let owner = if self.cur_class == "class@anonymous" {
+            "class@anonymous".to_string()
+        } else {
+            format!("{}::{}", self.cur_class, name)
+        };
+        self.opt_before_required(&params, &owner, line);
         let ret = if self.eat_op(":") {
             self.take_type()?
         } else {
             None
         };
+        self.fn_ctx.push(format!("{}::{}", self.cur_class, name));
         let (body, end_line) = if self.eat_op(";") {
             (Vec::new(), line)
         } else {
@@ -1332,6 +1349,7 @@ impl<'a> Parser<'a> {
             let e = self.prev_line();
             (b, e)
         };
+        self.fn_ctx.pop();
         self.hook_ctx = prev_hook;
         Ok(MethodDecl {
             decl: FunctionDecl {
@@ -1529,6 +1547,35 @@ impl<'a> Parser<'a> {
             true
         } else {
             false
+        }
+    }
+
+    /// Zend compile-time Deprecated for an optional param declared
+    /// before a required one: one notice per offending param, naming
+    /// the last required param (`opt2($a=1, $b=2, $c)` flags both $a
+    /// and $b, each "before required parameter $c").
+    pub(in crate::parser) fn opt_before_required(
+        &mut self,
+        params: &[Param],
+        owner: &str,
+        line: usize,
+    ) {
+        let Some(ri) = params
+            .iter()
+            .rposition(|p| p.default.is_none() && !p.variadic)
+        else {
+            return;
+        };
+        for p in &params[..ri] {
+            if p.default.is_some() {
+                self.deprecations.push((
+                    format!(
+                        "{owner}(): Optional parameter ${} declared before required parameter ${} is implicitly treated as a required parameter",
+                        p.name, params[ri].name
+                    ),
+                    line,
+                ));
+            }
         }
     }
 
@@ -1745,16 +1792,19 @@ impl<'a> Parser<'a> {
         })?;
         let prev_hook = self.hook_ctx.take();
         let params = self.params()?;
+        let name = self.ns_qualify(&name);
+        self.opt_before_required(&params, &name, line);
         // Return type declarations (: int).
         let ret = if self.eat_op(":") {
             self.take_type()?
         } else {
             None
         };
+        self.fn_ctx.push(name.clone());
         let body = self.body()?;
+        self.fn_ctx.pop();
         let end_line = self.prev_line();
         self.hook_ctx = prev_hook;
-        let name = self.ns_qualify(&name);
         Ok(Stmt::Function(FunctionDecl {
             name,
             params,
