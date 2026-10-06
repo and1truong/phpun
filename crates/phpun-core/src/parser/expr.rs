@@ -1410,6 +1410,19 @@ impl<'a> Parser<'a> {
                 }
             }
             Some(Token::Ident(_)) => {
+                // Statement keywords never appear in expression
+                // position — Zend lexes them as distinct tokens the
+                // expr grammar rejects outright (`$x ??= break`,
+                // `fn() => break`, even `break()`/`break::X`).
+                if self.ident_is("break") || self.ident_is("continue") || self.ident_is("goto") {
+                    return Err(PhpError::parse(
+                        format!(
+                            "syntax error, unexpected token \"{}\"",
+                            self.ident().unwrap()
+                        ),
+                        self.line(),
+                    ));
+                }
                 if self.ident_is("true") {
                     self.pos += 1;
                     Ok(Expr::Bool(true))
