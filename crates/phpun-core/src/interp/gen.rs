@@ -691,12 +691,22 @@ impl<'a> Interp<'a> {
             let fq = st.fin_q.clone();
             let mut fq = fq.borrow_mut();
             if let Some((v, i)) = fq.injected.take() {
-                let parked = fq.yields.iter().any(|(y, _)| *y == st.pos);
+                let parked = fq.at_fin_yield(st.pos);
                 if parked {
                     fq.injected = Some((v, st.pos));
                 } else if st.pos > i {
                     drop(fq);
                     drop(st);
+                    // The injected throwable surfaced — the unwind it
+                    // was mid-way through is complete, so the gen is
+                    // closed (its post-finally items never run).
+                    {
+                        let mut st = state.borrow_mut();
+                        st.finished = true;
+                        st.closed = true;
+                        st.items.clear();
+                        st.pending_out.clear();
+                    }
                     // The injected death is the gen's own — the body's
                     // pending error never ran past that yield.
                     state.borrow_mut().deferred_err = None;
@@ -1055,48 +1065,56 @@ impl<'a> Interp<'a> {
                 // first yield first — its body (and queued finally
                 // output) exists before the kill.
                 self.gen_start(&state)?;
-                // Suspended on a yield inside `finally`: Zend
-                // delivers that item to throw() and parks the
-                // injected throwable — the unwind continues on the
-                // next resume (gen_raise_deferred).
-                let parked = {
+                let (at_fin, next_fin) = {
                     let st = state.borrow();
-                    if st
-                        .fin_q
-                        .borrow()
-                        .yields
-                        .iter()
-                        .any(|(y, _)| *y == st.pos)
-                    {
-                        Some((
-                            st.items
-                                .get(st.pos)
-                                .map(|(_, v)| v.borrow().clone())
-                                .unwrap_or(Value::Null),
-                            st.pos,
-                        ))
-                    } else {
-                        None
-                    }
+                    let fq = st.fin_q.borrow();
+                    (fq.at_fin_yield(st.pos), fq.next_fin_yield(st.pos))
                 };
-                if let Some((v, pos)) = parked {
-                    state.borrow().fin_q.borrow_mut().injected = Some((e, pos));
+                if at_fin {
+                    // Suspended AT a yield inside `finally`: the
+                    // injected throwable lands on the suspended yield
+                    // expression itself — the rest of the finally
+                    // never runs and the throwable surfaces at this
+                    // throw() call.
+                    let fq = state.borrow().fin_q.clone();
+                    std::mem::take(&mut *fq.borrow_mut());
+                    let mut st = state.borrow_mut();
+                    st.finished = true;
+                    st.closed = true;
+                    st.items.clear();
+                    st.pending_out.clear();
+                    st.deferred_err = None;
+                    return Err(self.throw(e));
+                }
+                if let Some(idx) = next_fin {
+                    // A `finally` yield ahead of the suspension
+                    // point: the unwind echoes the queued output up
+                    // to that journal point, delivers its item from
+                    // throw() and parks the throwable — it
+                    // re-surfaces at the consumer's next resume
+                    // (gen_raise_deferred).
+                    self.gen_flush_out(&state, idx);
+                    let v = {
+                        let mut st = state.borrow_mut();
+                        st.set_pos(idx);
+                        st.items
+                            .get(idx)
+                            .map(|(_, v)| v.borrow().clone())
+                            .unwrap_or(Value::Null)
+                    };
+                    state.borrow().fin_q.borrow_mut().injected = Some((e, idx));
                     return Ok(Some(v));
                 }
                 {
                     // Closing a suspended generator runs the finally
                     // chains of the try-regions enclosing its
                     // suspension point BEFORE the throwable
-                    // propagates — replay the queued finally bytes.
+                    // propagates — replay the suspended delegation
+                    // chain's queued bytes (innermost first).
                     let fq = state.borrow().fin_q.clone();
-                    let bytes = std::mem::take(&mut fq.borrow_mut().bytes);
-                    for (_, b, is_err) in &bytes {
-                        if *is_err {
-                            self.diag_stderr(&String::from_utf8_lossy(b));
-                        } else {
-                            self.emit_bytes(b);
-                        }
-                    }
+                    let fin = std::mem::take(&mut *fq.borrow_mut());
+                    let pos = fin.pos;
+                    self.gen_fin_bytes(&fin, pos);
                     // Zend's closed generator: the kill discards the
                     // buffered item stream — subsequent reads report
                     // exhausted (valid() false, current()/key() null),

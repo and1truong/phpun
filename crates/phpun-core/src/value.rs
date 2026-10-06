@@ -1719,6 +1719,87 @@ pub struct GenFinData {
     /// point, `[internal function]: g()` at request shutdown).
     pub fn_name: String,
     pub file: String,
+    /// Journals of `yield from` delegates that merged into this
+    /// stream — a delegate replays only while the consumer's cursor
+    /// sits inside its spliced range (`entry <= pos < entry + span`),
+    /// since Zend force-closes just the actually-suspended
+    /// delegation chain.
+    pub delegates: Vec<FinDelegate>,
+}
+
+/// A delegated `yield from` journal merged into the parent's — its
+/// item-space tags are already retagged into the parent's space.
+#[derive(Clone)]
+pub struct FinDelegate {
+    /// Parent item index where this delegate's stream begins, and
+    /// how many items it spliced there.
+    pub entry: usize,
+    pub span: usize,
+    /// The delegate's own destruction journal.
+    pub fin: GenFinData,
+}
+
+impl GenFinData {
+    /// Shift every item-space index in this journal by `base` —
+    /// applied when it merges into a `yield from` parent's item
+    /// space.
+    pub fn retag(&mut self, base: usize) {
+        for (t, ..) in &mut self.bytes {
+            *t += base;
+        }
+        for (i, _) in &mut self.yields {
+            *i += base;
+        }
+        if let Some((_, i)) = &mut self.injected {
+            *i += base;
+        }
+        for d in &mut self.delegates {
+            d.entry += base;
+            d.fin.retag(base);
+        }
+    }
+
+    /// The delegates whose spliced range holds consumer cursor `pos`
+    /// — the suspended delegation chain, innermost first.
+    pub fn active_delegates_at(&self, pos: usize) -> Vec<&FinDelegate> {
+        let mut out: Vec<&FinDelegate> = self
+            .delegates
+            .iter()
+            .filter(|d| d.entry <= pos && pos < d.entry + d.span)
+            .collect();
+        // Innermost suspended level unwinds first.
+        out.sort_by_key(|d| std::cmp::Reverse(d.entry));
+        out
+    }
+
+    /// The first `yield`-inside-`finally` index ahead of `pos` along
+    /// the suspended delegation chain — where a `throw()`-driven
+    /// unwind parks next.
+    pub fn next_fin_yield(&self, pos: usize) -> Option<usize> {
+        let mut best = self
+            .yields
+            .iter()
+            .filter(|(i, _)| *i > pos)
+            .map(|(i, _)| *i)
+            .min();
+        for d in self.active_delegates_at(pos) {
+            if let Some(i) = d.fin.next_fin_yield(pos) {
+                best = Some(best.map_or(i, |b| b.min(i)));
+            }
+        }
+        best
+    }
+
+    /// Whether `pos` itself is a `yield` inside `finally` on the
+    /// suspended chain — a `throw()` injects at the suspended yield
+    /// and surfaces immediately.
+    pub fn at_fin_yield(&self, pos: usize) -> bool {
+        self.yields.iter().any(|(i, _)| *i == pos)
+            || self
+                .active_delegates_at(pos)
+                .iter()
+                .any(|d| d.fin.at_fin_yield(pos))
+    }
 }
 
 pub type FinQueue = Rc<RefCell<GenFinData>>;
