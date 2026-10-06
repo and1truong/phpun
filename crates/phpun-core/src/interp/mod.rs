@@ -298,6 +298,10 @@ pub struct Interp<'a> {
     silence: u32,
     /// Cell returned by the last `&fn()` call (returnByReference tests).
     last_ret_cell: Option<Cell>,
+    /// The object a write-context prop_cell resolved (lets `=&` reuse
+    /// it for the typed-prop decl lookup without re-evaluating the
+    /// receiver expr — `$x =& $o->m()->p` must call m() once).
+    last_prop_ov: Option<Value>,
     /// The last invoked function was declared `&name()` (returns by ref).
     last_call_by_ref: bool,
     /// Set just before invoking `[$closure,'__invoke']` so the callee
@@ -800,6 +804,7 @@ impl<'a> Interp<'a> {
             file,
             globals: Frame::new(String::new()),
             last_ret_cell: None,
+            last_prop_ov: None,
             last_call_by_ref: false,
             pending_call_alias: None,
             globals_order: Vec::new(),

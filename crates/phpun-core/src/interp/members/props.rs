@@ -1515,6 +1515,7 @@ impl<'a> Interp<'a> {
         name: &PropName,
         _nullsafe: bool,
     ) -> Result<Cell, PhpError> {
+        self.last_prop_ov = None;
         let pn = self.prop_name(name)?;
         // Write-context chains evaluate every link as a write fetch —
         // `$i->p->sub` dies with 'Attempt to modify property "p" on
@@ -1533,6 +1534,7 @@ impl<'a> Interp<'a> {
             },
             _ => self.eval(obj)?,
         };
+        self.last_prop_ov = Some(ov.clone());
         match ov {
             Value::Object(o) => {
                 // Hooks intercept the cell path entirely — `[]`, `&`,
@@ -1731,6 +1733,20 @@ impl<'a> Interp<'a> {
                 let slot = ob.props.get(&key).unwrap().clone();
                 drop(ob);
                 if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
+                    // Every write-context surface (`[]`, `+=`, `++`,
+                    // `&`, `unset`, foreach-&) dies the same way on a
+                    // readonly declared prop (finding 8).
+                    if pd.readonly {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Cannot indirectly modify readonly property {}::${}",
+                                dcls.name(),
+                                pd.name
+                            ),
+                            0,
+                        ));
+                    }
                     if let Some(tys) = &pd.ty {
                         let p = Rc::as_ptr(&slot) as usize;
                         self.typed_slots.insert(

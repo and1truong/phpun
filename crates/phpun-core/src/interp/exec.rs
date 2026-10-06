@@ -859,9 +859,32 @@ impl<'a> Interp<'a> {
         // to the foreach statement itself — capture its line before
         // `arr` evaluation drifts cur_line into arg positions.
         let stmt_line = self.cur_line;
-        let src = match self.eval(arr) {
-            Ok(v) => v,
-            Err(e) => return self.err_flow(e),
+        // A `&` target fetches the source as a writable cell — zend's
+        // 'Cannot indirectly modify readonly property' surfaces here
+        // (`foreach ($r->a as &$v)`, finding 8), and prop/index
+        // sources iterate their real cells.
+        let mut arr_e = arr;
+        while let Expr::Paren(inner) = arr_e {
+            arr_e = inner.as_ref();
+        }
+        let cell_src = Self::foreach_target_by_ref(val)
+            && matches!(
+                arr_e,
+                Expr::Prop { .. }
+                    | Expr::StaticProp { .. }
+                    | Expr::Index { .. }
+                    | Expr::VarVar(_)
+            );
+        let src = if cell_src {
+            match self.eval_cell(arr) {
+                Ok(c) => c.borrow().clone(),
+                Err(e) => return self.err_flow(e),
+            }
+        } else {
+            match self.eval(arr) {
+                Ok(v) => v,
+                Err(e) => return self.err_flow(e),
+            }
         };
         match src {
             Value::Array(rc) => {

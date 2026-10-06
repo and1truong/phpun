@@ -1284,10 +1284,13 @@ impl<'a> Interp<'a> {
                     let c = c?;
                     // A `=&` source that is itself a typed-prop slot
                     // carries that prop's declared type into the
-                    // conflict check (typed_properties_068/076).
+                    // conflict check (typed_properties_068/076). The
+                    // receiver value comes from prop_cell's stash —
+                    // re-evaluating obj would double `$o->m()`'s side
+                    // effects (finding 6).
                     let decl = match value {
-                        Expr::Prop { obj, name, .. } => {
-                            let ov = self.eval(obj)?;
+                        Expr::Prop { name, .. } => {
+                            let ov = self.last_prop_ov.take().unwrap_or(Value::Null);
                             match (&ov, self.prop_name(name)) {
                                 (Value::Object(o), Ok(pn)) => {
                                     self.decl_prop(o, &pn).map(|(pd, dc)| {
@@ -1421,7 +1424,7 @@ impl<'a> Interp<'a> {
                 match self.eval_cell(e) {
                     Ok(c) => {
                         let key = match i.as_deref() {
-                            Some(ie) => self.dim_key(ie).ok().flatten(),
+                            Some(ie) => self.dim_key(ie)?,
                             None => None,
                         };
                         late = Late::Index {
@@ -1453,10 +1456,9 @@ impl<'a> Interp<'a> {
                 let mut keys = Vec::with_capacity(dims.len());
                 for d in dims {
                     match d {
-                        Some(ie) => match self.dim_key(ie) {
-                            Ok(k) => keys.push(k),
-                            Err(_) => keys.push(None),
-                        },
+                        // A throwing key expr propagates — swallowing
+                        // it as `None` would silently append (finding 7).
+                        Some(ie) => keys.push(self.dim_key(ie)?),
                         None => keys.push(None),
                     }
                 }
@@ -1506,6 +1508,37 @@ impl<'a> Interp<'a> {
                                 let keys = [key.clone()];
                                 self.compound_dim_read(base.clone(), &keys, $quiet)?
                             }
+                            // Prop targets read through the CACHED object
+                            // (evaluated once, above) — re-evaluating
+                            // `$o->m()->p .= v`'s target would call m()
+                            // twice (finding 6).
+                            Late::Prop { ov, name } if matches!(ov, Value::Object(_)) => {
+                                let pn = match name {
+                                    Some(n) => self.prop_name(n)?,
+                                    // Late::Prop always carries Some
+                                    // (None was the dead register-quirk
+                                    // arm).
+                                    None => String::new(),
+                                };
+                                if $quiet {
+                                    self.silence += 1;
+                                }
+                                let c = self.prop_read_value(ov.clone(), &pn, false);
+                                if $quiet {
+                                    self.silence -= 1;
+                                }
+                                c.unwrap_or(Value::Null)
+                            }
+                            Late::PropStr { ov, pn } if matches!(ov, Value::Object(_)) => {
+                                if $quiet {
+                                    self.silence += 1;
+                                }
+                                let c = self.prop_read_value(ov.clone(), pn, false);
+                                if $quiet {
+                                    self.silence -= 1;
+                                }
+                                c.unwrap_or(Value::Null)
+                            }
                             _ => {
                                 // `$i->p += v` on a non-object base: the
                                 // write throws zend's assign Error and
@@ -1513,8 +1546,7 @@ impl<'a> Interp<'a> {
                                 // read property' warning first (probe4i).
                                 if matches!(
                                     &late,
-                                    Late::Prop { ov, .. } | Late::PropStr { ov, .. }
-                                        if !matches!(ov, Value::Object(_))
+                                    Late::Prop { .. } | Late::PropStr { .. }
                                 ) {
                                     Value::Null
                                 } else {
