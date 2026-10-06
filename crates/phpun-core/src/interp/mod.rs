@@ -313,7 +313,7 @@ pub struct Interp<'a> {
     /// static-decl sites per function scope (fn key → var → decl
     /// (file, stmt ptr)) — PHP fatals on a same-unit redeclaration at a
     /// different statement site.
-    static_decls: HashMap<String, HashMap<String, (String, usize)>>,
+    static_decls: HashMap<String, HashMap<String, std::collections::HashSet<(String, usize)>>>,
     /// include_once/require_once registry (canonical paths).
     included: HashSet<std::path::PathBuf>,
     /// Pending exception carried across an Err(Throw) return.

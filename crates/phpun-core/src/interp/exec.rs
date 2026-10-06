@@ -337,12 +337,20 @@ impl<'a> Interp<'a> {
                 // Zend keeps separate statics for — is not.
                 let site = (self.cur_file.clone(), *line);
                 for (name, default) in vars {
-                    let prev = self
+                    // Every site is kept: a decl in a different unit is
+                    // legal AND must not erase the same-unit record a
+                    // later duplicate checks against.
+                    let sites = self
                         .static_decls
                         .entry(key.clone())
                         .or_default()
-                        .insert(name.clone(), site.clone());
-                    if prev.is_some_and(|(pu, ps)| pu == site.0 && ps != site.1) {
+                        .entry(name.clone())
+                        .or_default();
+                    let dup = sites
+                        .iter()
+                        .any(|(u, l)| u == &site.0 && *l != site.1);
+                    sites.insert(site.clone());
+                    if dup {
                         // A compile fatal in Zend — carry the compile-
                         // context backtrace (include chain minus context).
                         let mut e = PhpError::compile_fatal(
