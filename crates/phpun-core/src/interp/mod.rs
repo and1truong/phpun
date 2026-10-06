@@ -2535,15 +2535,10 @@ impl<'a> Interp<'a> {
             visible,
             // A cufa-family call with named args is a real frame, not
             // a transparent trampoline (zend only inlines positional
-            // cufa calls).
+            // cufa calls). forward_static_call* always render — they
+            // are ordinary internal functions, not trampolines.
             named_dispatch: !args.named.is_empty()
-                && matches!(
-                    name,
-                    "call_user_func"
-                        | "call_user_func_array"
-                        | "forward_static_call"
-                        | "forward_static_call_array"
-                ),
+                && matches!(name, "call_user_func" | "call_user_func_array"),
         });
         if name == "assert" {
             // AssertionError message = `assert(<args>)` as written.
@@ -2576,8 +2571,9 @@ impl<'a> Interp<'a> {
             } else if let Some(i) = cb_named {
                 args.named[i].1.borrow().clone()
             } else {
-                self.call_trace.pop();
-                return self.fail(PhpError::uncaught(
+                // fail() captures call_trace — the frame must still be
+                // there (Zend keeps the cufa frame in this trace).
+                let r = self.fail(PhpError::uncaught(
                     "ArgumentCountError",
                     format!(
                         "{}() expects at least 1 argument, {} given",
@@ -2586,17 +2582,20 @@ impl<'a> Interp<'a> {
                     ),
                     0,
                 ));
+                self.call_trace.pop();
+                return r;
             };
             if fwd && args.named.iter().any(|(n, ..)| n != "callback") {
                 // '*' variadic: the reject fires after the arity
                 // checks — `forward_static_call(x:)` with no callback
                 // reports the missing param first.
-                self.call_trace.pop();
-                return self.fail(PhpError::uncaught(
+                let r = self.fail(PhpError::uncaught(
                     "ArgumentCountError",
                     format!("{}() does not accept unknown named parameters", name),
                     0,
                 ));
+                self.call_trace.pop();
+                return r;
             }
             let ca = CallArgs {
                 cells: args.cells[1.min(args.cells.len())..].to_vec(),
@@ -2625,8 +2624,9 @@ impl<'a> Interp<'a> {
             if !self.is_callable_value(&cb) {
                 if fwd {
                     if let Some(pe) = self.take_callable_probe_err() {
+                        let r = self.fail(pe);
                         self.call_trace.pop();
-                        return self.fail(pe);
+                        return r;
                     }
                 }
                 let msg = format!(
@@ -2641,12 +2641,13 @@ impl<'a> Interp<'a> {
                 return r;
             }
             if fwd && self.caller_scope_name().is_none() {
-                self.call_trace.pop();
-                return self.fail(PhpError::uncaught(
+                let r = self.fail(PhpError::uncaught(
                     "Error",
                     "Cannot call forward_static_call() when no class scope is active",
                     0,
                 ));
+                self.call_trace.pop();
+                return r;
             }
             // Forwarded names bind against the CALLEE's params at this
             // frame's level in Zend (zend_call_function resolves the

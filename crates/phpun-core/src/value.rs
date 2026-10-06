@@ -240,10 +240,12 @@ pub fn int_prop_index(k: &str) -> Option<i64> {
 /// Render Zend-style stack frames innermost-first, `#N {main}` last:
 /// `#0 file(7): fn('a', 2)` / `#0 [internal function]: cb('x')`.
 /// Internal callees hide their args (PHP: no arg info for builtins).
-/// call_user_func*/forward_static_call trampolines are
-/// ZEND_ACC_CALL_VIA_TRAMPOLINE — Zend omits them from backtraces
-/// (named_params/call_user_func_array_variadic shows only the
-/// forwarded `array_multisort(: 1)` frame).
+/// call_user_func* are ZEND_ACC_CALL_VIA_TRAMPOLINE — Zend omits them
+/// from backtraces (named_params/call_user_func_array_variadic shows
+/// only the forwarded `array_multisort(: 1)` frame).
+/// forward_static_call* are ORDINARY internal functions — their frames
+/// always render, and callees they dispatch sit at
+/// `[internal function]`.
 /// `!visible` frames — literal calls Zend compile-specializes into
 /// dedicated opcodes (rope sprintf) — emit no call at all, so every
 /// render path (backtraces, exception traces, fatal frames) skips
@@ -254,10 +256,7 @@ pub fn trace_frame_hidden(fr: &TraceFrame) -> bool {
             && !fr.named_dispatch
             && matches!(
                 fr.function.as_str(),
-                "call_user_func"
-                    | "call_user_func_array"
-                    | "forward_static_call"
-                    | "forward_static_call_array"
+                "call_user_func" | "call_user_func_array"
             ))
 }
 

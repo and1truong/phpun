@@ -133,8 +133,9 @@ pub(crate) fn dispatch(
                 None
             };
             // forward_static_call forwards the current called_scope —
-            // no scope, nothing to forward (zend_execute_API).
-            if name.starts_with("forward_static_call") && it.caller_scope_name().is_none() {
+            // no scope, nothing to forward (zend_execute_API). The
+            // *_array form does NOT require a scope (it runs top-level).
+            if name == "forward_static_call" && it.caller_scope_name().is_none() {
                 return err::<Option<Value>>(
                     "Error",
                     "Cannot call forward_static_call() when no class scope is active",
