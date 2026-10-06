@@ -285,13 +285,10 @@ impl<'a> Interp<'a> {
                     line: 0,
                 })
             }
-            Flow::Break(_) | Flow::Continue(_) => {
-                self.fail(PhpError::fatal("'break'/'continue' in included file", 0))
-            }
-            Flow::Goto(l) => self.fail(PhpError::fatal(
-                format!("'goto' to undefined label '{}'", l),
-                0,
-            )),
+            // break/continue/goto escaping the unit already funnelled
+            // through the compile-fatal arm above and came back as
+            // Exit/Throw — no remaining variants.
+            Flow::Break(_) | Flow::Continue(_) | Flow::Goto(_) => unreachable!(),
         }
     }
 
