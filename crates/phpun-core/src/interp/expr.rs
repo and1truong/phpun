@@ -1705,6 +1705,22 @@ impl<'a> Interp<'a> {
                 }
             }
             Late::Static { class, pn } => {
+                // A plain `=` on a set-restricted static is 'Cannot
+                // modify ... (set)' — the cell path below reports
+                // 'indirectly modify' for compound/dim/by-ref writes.
+                if !needs_read {
+                    if let Expr::StaticProp { .. } = target {
+                        if let Ok((cls, _)) = self.member_class_of(&class) {
+                            if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pn) {
+                                if let Some(sv) = pd.set_vis {
+                                    if self.set_vis_scope_denied(&dcls, sv) {
+                                        return self.set_visibility_error(&dcls, &pd.name, sv);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let c = self.static_prop_named(&class, &pn)?;
                 // Static prop writes coerce to the declared type like
                 // instance props (typed_properties_023).
@@ -2040,6 +2056,17 @@ impl<'a> Interp<'a> {
                         // Binding a ref into a TYPED prop validates the
                         // source (076/068 conflict); the shared cell
                         // then stays gated through typed_slots (071).
+                        // `X =& $v` on a set-restricted prop is an
+                        // indirect write — 'Cannot indirectly modify'.
+                        if let Some((pd, dcls)) = self.decl_prop(o, &pn) {
+                            if let Some(sv) = pd.set_vis {
+                                if !self.hook_scope_allows(o, &dcls, &pn, sv) {
+                                    return self.set_visibility_indirect_error(
+                                        &dcls, &pd.name, sv,
+                                    );
+                                }
+                            }
+                        }
                         let mut merged: Option<Vec<String>> = None;
                         let mut owner_ty: Option<Vec<String>> = None;
                         if let Some((pd, dcls)) = self.decl_prop(o, &pn) {
@@ -2096,6 +2123,15 @@ impl<'a> Interp<'a> {
                 let pn = self.prop_name(name)?;
                 let (cls, _t) = self.member_class_of(class)?;
                 self.statics_init(&cls)?;
+                // `X =& $v` on a set-restricted static — 'Cannot
+                // indirectly modify'.
+                if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pn) {
+                    if let Some(sv) = pd.set_vis {
+                        if self.set_vis_scope_denied(&dcls, sv) {
+                            return self.set_visibility_indirect_error(&dcls, &pd.name, sv);
+                        }
+                    }
+                }
                 let mut merged: Option<Vec<String>> = None;
                 if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pn) {
                     if pd.ty.is_some() {
@@ -2173,6 +2209,18 @@ impl<'a> Interp<'a> {
             }
             Expr::Index { e, i } => self.set_index(e, i.as_deref(), v),
             Expr::StaticProp { class, name } => {
+                // A plain `=` on a set-visibility-restricted static is
+                // 'Cannot modify ... (set)' — gated before the cell
+                // fetch (the cell path reports 'indirectly modify').
+                let pname0 = self.prop_name(name)?;
+                let (cls0, _) = self.member_class_of(class)?;
+                if let Some((pd, dcls)) = self.find_static_prop_decl(&cls0, &pname0) {
+                    if let Some(sv) = pd.set_vis {
+                        if self.set_vis_scope_denied(&dcls, sv) {
+                            return self.set_visibility_error(&dcls, &pd.name, sv);
+                        }
+                    }
+                }
                 let c = self.static_prop_cell(class, name)?;
                 let (cls, _) = self.member_class_of(class)?;
                 let pname = self.prop_name(name)?;
@@ -4071,29 +4119,48 @@ impl<'a> Interp<'a> {
         // Roots with real storage cells resolve once (prop_cell invokes
         // __get a single time for an overloaded prop); a missing plain
         // variable warns and no-ops (zend undefined-variable semantics).
-        let root_cell: Option<Cell> = match cur {
-            Expr::Var(name) => match self.var_cell_opt(name) {
-                Some(c) => Some(c),
-                None => {
-                    if self.silence == 0 {
-                        self.warn(&format!("Undefined variable ${}", name))?;
-                    }
-                    return Ok(());
-                }
-            },
-            Expr::Prop {
-                obj,
-                name,
-                nullsafe,
-            } => Some(self.prop_cell(obj, name, *nullsafe)?),
-            Expr::StaticProp { class, name } => Some(self.static_prop_cell(class, name)?),
-            Expr::VarVar(inner) => {
-                let n = self.eval(inner)?;
-                let name = self.conv_str(&n)?;
-                Some(self.var_cell(&name))
-            }
-            _ => None,
+        // Whole-target unsets suppress the indirect set-visibility
+        // checks so unset's own errors win; dim-unsets (`unset($o->p[k])`)
+        // stay gated — they are indirect modification.
+        let was_unset = if idxs.is_empty() && i.is_none() {
+            std::mem::replace(&mut self.in_unset, true)
+        } else {
+            self.in_unset
         };
+        let root_cell_r: Result<Option<Cell>, PhpError> = (|| {
+            Ok(match cur {
+                Expr::Var(name) => match self.var_cell_opt(name) {
+                    Some(c) => Some(c),
+                    None => {
+                        if self.silence == 0 {
+                            self.warn(&format!("Undefined variable ${}", name))?;
+                        }
+                        // missing var → whole unset no-ops (below)
+                        None
+                    }
+                },
+                Expr::Prop {
+                    obj,
+                    name,
+                    nullsafe,
+                } => Some(self.prop_cell(obj, name, *nullsafe)?),
+                Expr::StaticProp { class, name } => Some(self.static_prop_cell(class, name)?),
+                Expr::VarVar(inner) => {
+                    let n = self.eval(inner)?;
+                    let name = self.conv_str(&n)?;
+                    Some(self.var_cell(&name))
+                }
+                _ => None,
+            })
+        })();
+        self.in_unset = was_unset;
+        let root_cell = match root_cell_r {
+            Ok(c) => c,
+            Err(e) => return self.fail::<()>(e),
+        };
+        if root_cell.is_none() && matches!(cur, Expr::Var(_)) {
+            return Ok(());
+        }
         // Roots without storage cells evaluate once — zend runs the
         // root expression a single time and unsets inside the result
         // (`unset(ret()["a"])` calls ret() once). The value rides a
@@ -4840,6 +4907,39 @@ impl<'a> Interp<'a> {
                 ))
             }
         };
+        // ++/-- is a read-write fetch: set-visibility gates there —
+        // statics name 'Cannot indirectly modify', instance props
+        // 'Cannot modify' (the same fetch already produced `old`, so
+        // uninit-typed 'must not be accessed' still wins).
+        match target {
+            Expr::StaticProp { class, name } => {
+                if let Ok(pn) = self.prop_name(name) {
+                    if let Ok((cls, _)) = self.member_class_of(class) {
+                        if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pn) {
+                            if let Some(sv) = pd.set_vis {
+                                if self.set_vis_scope_denied(&dcls, sv) {
+                                    return self.set_visibility_indirect_error(
+                                        &dcls, &pd.name, sv,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::Prop { .. } => {
+                if let Some((o, pn)) = &ro_target {
+                    if let Some((pd, dcls)) = self.decl_prop(o, pn) {
+                        if let Some(sv) = pd.set_vis {
+                            if !self.hook_scope_allows(o, &dcls, pn, sv) {
+                                return self.set_visibility_error(&dcls, &pd.name, sv);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
         // `++`/`--` on a declared readonly prop is a direct slot write:
         // zend's 'Cannot modify readonly property' precedes the
         // increment verb — `$c->o++` on an object-held readonly prop

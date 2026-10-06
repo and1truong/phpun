@@ -1302,6 +1302,58 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Whether the caller's scope violates set-visibility `sv` on a
+    /// prop declared in `dcls` — objectless counterpart of
+    /// hook_scope_allows for statics.
+    pub(in crate::interp) fn set_vis_scope_denied(
+        &mut self,
+        dcls: &Rc<PhpClass>,
+        sv: crate::ast::Visibility,
+    ) -> bool {
+        let scope = self.caller_scope_name();
+        match (sv, scope.as_deref()) {
+            (crate::ast::Visibility::Public, _) => false,
+            (crate::ast::Visibility::Private, s) => s != Some(dcls.name()),
+            (crate::ast::Visibility::Protected, Some(s)) => {
+                !(self.is_a_str(s, dcls.name()) || self.is_a_str(dcls.name(), s))
+            }
+            (crate::ast::Visibility::Protected, None) => true,
+        }
+    }
+
+    /// `private(set)`/`protected(set)` violation on INDIRECT writes
+    /// (`[]`, `&`, compound, `++`, by-ref args) — zend names it
+    /// 'Cannot indirectly modify ... (set)' instead of 'Cannot modify'.
+    pub(in crate::interp) fn set_visibility_indirect_error<T>(
+        &mut self,
+        dcls: &Rc<PhpClass>,
+        pname: &str,
+        sv: crate::ast::Visibility,
+    ) -> Result<T, PhpError> {
+        let visname = match sv {
+            crate::ast::Visibility::Private => "private",
+            crate::ast::Visibility::Protected => "protected",
+            crate::ast::Visibility::Public => "public",
+        };
+        let from = self
+            .stack
+            .last()
+            .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()))
+            .map(|c| format!("scope {}", c.name()))
+            .unwrap_or_else(|| "global scope".to_string());
+        self.fail(PhpError::uncaught(
+            "Error",
+            format!(
+                "Cannot indirectly modify {}(set) property {}::${} from {}",
+                visname,
+                dcls.name(),
+                pname,
+                from
+            ),
+            0,
+        ))
+    }
+
     /// `private(set)`/`protected(set)` violation message — distinct from
     /// the read-side "Cannot access" (asymmetric_visibility).
     pub(in crate::interp) fn set_visibility_error<T>(
@@ -1618,6 +1670,19 @@ impl<'a> Interp<'a> {
                                     0,
                                 )),
                             };
+                        }
+                        // private(set)/protected(set): every cell fetch
+                        // is an indirect write — `[]`, `&`, `&arg`,
+                        // `+=`, `++`, foreach-by-ref all name it (a
+                        // whole-prop unset carries its own error).
+                        if !self.in_unset {
+                            if let Some(sv) = pd.set_vis {
+                                if !self.hook_scope_allows(&o, &dcls, &pn, sv) {
+                                    return self.set_visibility_indirect_error(
+                                        &dcls, &pd.name, sv,
+                                    );
+                                }
+                            }
                         }
                     }
                 }

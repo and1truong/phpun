@@ -167,6 +167,19 @@ impl<'a> Interp<'a> {
         }
         self.statics_init(&cls)?;
         self.static_prop_vis(&cls, name)?;
+        // private(set)/protected(set): the cell path IS an indirect
+        // write (`[]`, `&`, compound, `++`, by-ref args) — plain `=`
+        // is gated in store() with 'Cannot modify' first, and unsets
+        // carry their own 'Attempt to unset static property'.
+        if !self.in_unset {
+            if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
+                if let Some(sv) = pd.set_vis {
+                    if self.set_vis_scope_denied(&dcls, sv) {
+                        return self.set_visibility_indirect_error(&dcls, &pd.name, sv);
+                    }
+                }
+            }
+        }
         let found = cls.statics.borrow().get(name).cloned();
         match found {
             Some(c) => {
