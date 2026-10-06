@@ -741,6 +741,13 @@ impl<'a> Parser<'a> {
         if !from_ns {
             if let Some(target) = map.get(&key) {
                 if segs.len() == 1 {
+                    // A `use function` alias binds at compile time —
+                    // mark it fully qualified so the call is treated
+                    // like a literal `\target` (Zend specializes it
+                    // exactly like a global unqualified call).
+                    if kind == NsKind::Func {
+                        return format!("\\{}", target);
+                    }
                     return target.clone();
                 }
                 return format!("{}\\{}", target, segs[1..].join("\\"));

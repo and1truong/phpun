@@ -524,7 +524,10 @@ impl<'a> Interp<'a> {
         let mut ns_resolved = false;
         // When the ns\name fallback misses too, the undefined-function
         // error names the ns-qualified candidate (bugs/77376).
-        let mut miss_name = fname.trim_start_matches('\u{1}').to_string();
+        let mut miss_name = fname
+            .trim_start_matches('\u{1}')
+            .trim_start_matches('\\')
+            .to_string();
         if decl.is_none() && unqualified {
             let ns = self.caller_ns();
             if !ns.is_empty() {
@@ -577,7 +580,7 @@ impl<'a> Interp<'a> {
             decl.as_deref()
                 .map(|d| d.params.as_slice())
                 .unwrap_or(&builtin_params),
-            &format!("{}()", fname.trim_start_matches('\u{1}')),
+            &format!("{}()", fname.trim_start_matches('\u{1}').trim_start_matches('\\')),
             decl.is_none(),
         )?;
         if !ns_resolved {
@@ -625,7 +628,14 @@ impl<'a> Interp<'a> {
             // fmt>, <exact arg count>)` → rope-concat
             // (sprintf_rope_optimization_002). Dynamic dispatches —
             // `$fn()`, `f(...$a)`, callables — are always real calls.
-            let literal = fname.starts_with('\u{1}') || fname.starts_with('\\');
+            // Compile-bound literal = a fully-qualified `\f`, or an
+            // unqualified literal whose binding can't vary at runtime:
+            // global scope (no ns\name fallback) or a `use function`
+            // alias (ns_resolve already rewrote it to `\target`).
+            // Unqualified calls inside a namespace bind at runtime, so
+            // Zend can't specialize them — the frame is real.
+            let literal = fname.starts_with('\\')
+                || (fname.starts_with('\u{1}') && self.caller_ns().is_empty());
             let visible = args.iter().any(|a| matches!(a, Expr::Unpack(_)))
                 || !(literal && zend_literal_no_frame(&lname, args));
             if let Some(v) = self.call_builtin(&lname, &argvals, visible)? {
