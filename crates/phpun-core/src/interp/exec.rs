@@ -50,7 +50,15 @@ impl<'a> Interp<'a> {
                 }
             }
             match self.exec(s) {
-                Flow::Normal => {}
+                Flow::Normal => {
+                    // Generators that died at this statement (unset(),
+                    // overwrite, foreach abandon) replay their
+                    // suspended finally chains here — Zend destroys
+                    // them at last-ref drop.
+                    if !self.live_gens.is_empty() {
+                        self.gen_gc_sweep(false);
+                    }
+                }
                 Flow::Goto(mut l) => loop {
                     if let Some(&t) = labels.get(l.as_str()) {
                         i = t + 1;
@@ -685,6 +693,9 @@ impl<'a> Interp<'a> {
                         _ => {}
                     }
                 }
+                // A released generator replays its suspended
+                // finally chains now — unset() is its GC moment.
+                self.gen_gc_sweep(false);
                 Flow::Normal
             }
             Stmt::Try {
@@ -797,10 +808,22 @@ impl<'a> Interp<'a> {
     /// Normal.
     fn try_finally(&mut self, out: Flow, finally: &Option<Vec<Stmt>>) -> Flow {
         match finally {
-            Some(fb) => match self.exec_block(fb) {
-                Flow::Normal => out,
-                f => f,
-            },
+            Some(fb) => {
+                // Output of a finally region inside a generator body
+                // is death-time output (Zend replays it when the
+                // suspended gen is destroyed) — tag it for fin_q.
+                if self.gen_run_state.is_some() {
+                    self.gen_fin_depth += 1;
+                }
+                let f = match self.exec_block(fb) {
+                    Flow::Normal => out,
+                    f => f,
+                };
+                if self.gen_run_state.is_some() {
+                    self.gen_fin_depth -= 1;
+                }
+                f
+            }
             None => out,
         }
     }

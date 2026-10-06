@@ -119,9 +119,15 @@ impl<'a> Interp<'a> {
                 .map(|s| s.borrow().len())
                 .unwrap_or(0);
             if done > 0 {
+                let is_fin = self.gen_fin_depth > 0;
                 run.borrow_mut()
                     .pending_out
-                    .push((done - 1, s.as_bytes().to_vec(), true));
+                    .push((done - 1, s.as_bytes().to_vec(), true, is_fin));
+                if is_fin {
+                    if let Some(q) = &self.gen_fin_q {
+                        q.borrow_mut().push((done - 1, s.as_bytes().to_vec(), true));
+                    }
+                }
                 return;
             }
         }

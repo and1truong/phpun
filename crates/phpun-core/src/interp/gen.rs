@@ -187,10 +187,16 @@ impl<'a> Interp<'a> {
             auto_key: 0,
             sends: Vec::new(),
             pending_out: Vec::new(),
+            fin_q: Rc::new(RefCell::new(Vec::new())),
             deferred_err: None,
             dead: false,
             closed: false,
         }));
+        // GC-time finally replay: the weak dies with the object —
+        // unset()/overwrite then replays fin_q; unit end replays it
+        // for gens still suspended (request shutdown).
+        self.live_gens
+            .push((Rc::downgrade(&state), state.borrow().fin_q.clone()));
         let cls = self
             .classes
             .get("generator")
@@ -254,6 +260,10 @@ impl<'a> Interp<'a> {
         let saved_sends = std::mem::replace(&mut self.gen_sends, sends.into_iter().collect());
         let saved_auto = std::mem::replace(&mut self.gen_auto, 0);
         let saved_run = self.gen_run_state.replace(state.clone());
+        let saved_fin_q = self
+            .gen_fin_q
+            .replace(state.borrow().fin_q.clone());
+        let saved_fin_depth = std::mem::replace(&mut self.gen_fin_depth, 0);
         self.gen_pending_fatal = None;
         // The body frame lands at call_trace[trace_base] — everything
         // above it at death time (eval()/include() pseudo-frames,
@@ -277,6 +287,8 @@ impl<'a> Interp<'a> {
         self.gen_sends = saved_sends;
         self.gen_auto = saved_auto;
         self.gen_run_state = saved_run;
+        self.gen_fin_q = saved_fin_q;
+        self.gen_fin_depth = saved_fin_depth;
         let collected = std::mem::take(&mut *items.borrow_mut());
         {
             let mut st = state.borrow_mut();
@@ -645,6 +657,9 @@ impl<'a> Interp<'a> {
         }
         // The body's tail output belongs to this final resume.
         self.gen_flush_out(state, usize::MAX);
+        // The error unwind already ran the body's finally chains —
+        // the queue drains with them so shutdown doesn't replay.
+        state.borrow().fin_q.borrow_mut().clear();
         let (mut e, throwable, raise_frames) = state.borrow_mut().deferred_err.take().unwrap();
         if e.kind == crate::error::ErrorKind::Throw {
             // Restore the throwable captured at death — consumer calls
@@ -813,6 +828,7 @@ impl<'a> Interp<'a> {
                         st.items.clear();
                         st.pos = 0;
                         st.pending_out.clear();
+                        st.fin_q.borrow_mut().clear();
                         st.deferred_err = None;
                         st.dead = false;
                         st.closed = false;
@@ -837,7 +853,25 @@ impl<'a> Interp<'a> {
             }
             "throw" => {
                 let e = args.cells.first().map(|c| c.borrow().clone()).unwrap_or(Value::Null);
+                // throw() into an unstarted gen resumes it to the
+                // first yield first — its body (and queued finally
+                // output) exists before the kill.
+                self.gen_start(&state)?;
                 {
+                    // Closing a suspended generator runs the finally
+                    // chains of the try-regions enclosing its
+                    // suspension point BEFORE the throwable
+                    // propagates — replay the queued finally bytes.
+                    let fq = state.borrow().fin_q.clone();
+                    let bytes: Vec<(usize, Vec<u8>, bool)> =
+                        std::mem::take(&mut *fq.borrow_mut());
+                    for (_, b, is_err) in &bytes {
+                        if *is_err {
+                            self.diag_stderr(&String::from_utf8_lossy(b));
+                        } else {
+                            self.emit_bytes(b);
+                        }
+                    }
                     // Zend's closed generator: the kill discards the
                     // buffered item stream — subsequent reads report
                     // exhausted (valid() false, current()/key() null),

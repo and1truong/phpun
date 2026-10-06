@@ -1703,9 +1703,20 @@ pub struct GenState {
     /// Output produced after a yield suspends mid-expression — Zend
     /// defers it to resume; buffered per yield index and emitted when
     /// the consumer advances `pos` past it (closure_call_leak). The
-    /// bool marks stderr-diag bytes so `PHP Fatal error:`/`PHP Warning:`
-    /// lines defer in the same emission order as stdout's.
-    pub pending_out: Vec<(usize, Vec<u8>, bool)>,
+    /// first bool marks stderr-diag bytes so `PHP Fatal error:`/`PHP
+    /// Warning:` lines defer in the same emission order as stdout's;
+    /// the second marks bytes produced inside a `finally` region —
+    /// Zend runs the finally chains enclosing the suspension point
+    /// when a suspended generator is destroyed (Generator->throw(),
+    /// unset()/GC, request shutdown), so they also accumulate in
+    /// fin_q keyed the same way.
+    pub pending_out: Vec<(usize, Vec<u8>, bool, bool)>,
+    /// Buffered finally-region output of a suspended body — survives
+    /// the GenState itself (shared with the interpreter's live_gens
+    /// registry) so a GC'd generator's finally still replays.
+    /// (yield-tag, bytes, is_err); entries are dropped as normal
+    /// flushes cover them.
+    pub fin_q: Rc<RefCell<Vec<(usize, Vec<u8>, bool)>>>,
     /// The body's terminal error, held until the consumer's next
     /// resume past the last collected item — Zend's lazy body dies
     /// inside `Generator->next()`/friends, after the bytes the

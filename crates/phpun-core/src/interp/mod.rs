@@ -400,6 +400,20 @@ pub struct Interp<'a> {
     /// call frame there (Zend runs the handler at the caller site),
     /// not at the diagnostic's in-unit position.
     compile_callsite: Option<(String, u32)>,
+    /// Depth of `finally` regions executing inside a generator body —
+    /// their output is the gen's death-time output (Zend replays it
+    /// when the suspended gen is destroyed), so emit_bytes tags it
+    /// for fin_q.
+    gen_fin_depth: u32,
+    /// The running gen's fin_q (mirrors its GenState.fin_q; a stack-
+    /// style save/restore like gen_sink).
+    gen_fin_q: Option<Rc<RefCell<Vec<(usize, Vec<u8>, bool)>>>>,
+    /// Every generator object minted this run, as (weak state, fin_q).
+    /// A dead weak means the object was released (unset()/overwrite) —
+    /// Zend then runs the suspended body's finally chains, replayed
+    /// from fin_q; a sweep at unit end models the shutdown GC.
+    live_gens:
+        Vec<(std::rc::Weak<RefCell<crate::value::GenState>>, Rc<RefCell<Vec<(usize, Vec<u8>, bool)>>>)>,
     /// Declaring class of the method about to be invoked (set by
     /// invoke_method, consumed by invoke_fn to fill Frame::decl_class).
     pending_decl_class: Option<Rc<PhpClass>>,
@@ -902,6 +916,9 @@ impl<'a> Interp<'a> {
             gen_pending_fatal: None,
             gen_raise_ctx: Vec::new(),
             compile_callsite: None,
+            gen_fin_depth: 0,
+            gen_fin_q: None,
+            live_gens: Vec::new(),
             pending_decl_class: None,
             pending_called_class: None,
             pending_hook_prop: None,
@@ -1515,6 +1532,9 @@ impl<'a> Interp<'a> {
             return result;
         }
         let flow = self.exec_block(stmts);
+        // Request-end GC: generators still suspended replay their
+        // enclosing finally chains before the result is tallied.
+        self.gen_gc_sweep(true);
         let mut result = self.finish(flow);
         if let Some(c) = self.run_shutdown() {
             result.exit_code = c;
@@ -2400,9 +2420,15 @@ impl<'a> Interp<'a> {
                 .map(|s| s.borrow().len())
                 .unwrap_or(0);
             if done > 0 {
+                let is_fin = self.gen_fin_depth > 0;
                 run.borrow_mut()
                     .pending_out
-                    .push((done - 1, b.to_vec(), false));
+                    .push((done - 1, b.to_vec(), false, is_fin));
+                if is_fin {
+                    if let Some(q) = &self.gen_fin_q {
+                        q.borrow_mut().push((done - 1, b.to_vec(), false));
+                    }
+                }
                 return;
             }
         }
@@ -2433,11 +2459,65 @@ impl<'a> Interp<'a> {
             std::mem::swap(&mut st.pending_out, &mut rest);
             rest
         };
-        for (_, b, is_err) in ready {
+        for (_, b, is_err, _) in ready {
             if is_err {
                 self.diag_stderr(&String::from_utf8_lossy(&b));
             } else {
                 self.emit_bytes(&b);
+            }
+        }
+        // Entries just shown are no longer part of the suspended
+        // region's death-time finally output.
+        state
+            .borrow()
+            .fin_q
+            .borrow_mut()
+            .retain(|(t, ..)| *t >= pos);
+    }
+
+    /// Zend destroys a suspended generator by running the finally
+    /// chains of the try-regions enclosing its suspension point. The
+    /// eager body already buffered those bytes (fin_q): replay them
+    /// when the gen dies (dead weak ref) and once at unit end for
+    /// gens still suspended (request shutdown).
+    pub(in crate::interp) fn gen_gc_sweep(&mut self, at_unit_end: bool) {
+        if self.live_gens.is_empty() {
+            return;
+        }
+        let entries = std::mem::take(&mut self.live_gens);
+        for (weak, q) in entries {
+            let bytes: Vec<(usize, Vec<u8>, bool)> = std::mem::take(&mut *q.borrow_mut());
+            match weak.upgrade() {
+                None => {
+                    for (_, b, is_err) in &bytes {
+                        if *is_err {
+                            self.diag_stderr(&String::from_utf8_lossy(b));
+                        } else {
+                            self.emit_bytes(b);
+                        }
+                    }
+                    // Dead entry — the object is gone.
+                }
+                Some(state) => {
+                    let _ = state;
+                    // The queue only holds unflushed finally bytes —
+                    // a gen whose stream drained or closed has none,
+                    // so at unit end whatever remains is its
+                    // shutdown-GC finally output.
+                    if at_unit_end && !bytes.is_empty() {
+                        for (_, b, is_err) in &bytes {
+                            if *is_err {
+                                self.diag_stderr(&String::from_utf8_lossy(b));
+                            } else {
+                                self.emit_bytes(b);
+                            }
+                        }
+                    } else {
+                        // Still alive — keep watching it.
+                        *q.borrow_mut() = bytes;
+                        self.live_gens.push((weak, q));
+                    }
+                }
             }
         }
     }
