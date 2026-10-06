@@ -2188,7 +2188,7 @@ impl<'a> Interp<'a> {
                 .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
                 .unwrap_or(false);
             if stub {
-                if let Some(v) = self.throwable_method(&obj, name, &args) {
+                if let Some(v) = self.throwable_method(&obj, name, &args)? {
                     return Ok(v);
                 }
             }
@@ -2401,10 +2401,10 @@ impl<'a> Interp<'a> {
         obj: &Rc<RefCell<PhpObject>>,
         name: &str,
         _args: &[Cell],
-    ) -> Option<Value> {
+    ) -> Result<Option<Value>, PhpError> {
         let ob = obj.borrow();
         let lname = name.to_lowercase();
-        match lname.as_str() {
+        Ok(match lname.as_str() {
             "getmessage" => Some(
                 ob.props
                     .get("message")
@@ -2519,7 +2519,7 @@ impl<'a> Interp<'a> {
                 )))
             }
             "__construct" => {
-                // Builtin ctor: props from args message/code.
+                // Builtin ctor: props from args message/code/previous.
                 drop(ob);
                 let mut ob = obj.borrow_mut();
                 let msg = _args
@@ -2533,10 +2533,47 @@ impl<'a> Interp<'a> {
                     ob.prop_order.push("message".into());
                     ob.prop_order.push("code".into());
                 }
+                // zend's Throwable ctor takes ?Throwable $previous — a
+                // non-Throwable arg3 is a TypeError; a Throwable lands
+                // in the `previous` prop for getPrevious().
+                if let Some(c) = _args.get(2) {
+                    let pv = c.borrow().clone();
+                    let ok = match &pv {
+                        Value::Null => true,
+                        Value::Object(o) => {
+                            let cn = o.borrow().class.decl.name.clone();
+                            self.is_throwable_name(&cn)
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        // zend names the ctor's DECLARING scope (the
+                        // builtin ancestor — Exception for a userland
+                        // subclass), not the constructed class.
+                        let cls_name = self
+                            .find_method_in(&ob.class, "__construct")
+                            .map(|(_, c)| c.name().to_string())
+                            .unwrap_or_else(|| ob.class.name().to_string());
+                        let tn = self.zval_type_name(&pv);
+                        return Err(self.spl_throw(
+                            "TypeError",
+                            format!(
+                                "{}::__construct(): Argument #3 ($previous) must be of type ?Throwable, {} given",
+                                cls_name, tn
+                            ),
+                        ));
+                    }
+                    if !matches!(pv, Value::Null) {
+                        ob.props.insert("previous".into(), cell(pv));
+                        if !ob.prop_order.contains(&"previous".into()) {
+                            ob.prop_order.push("previous".into());
+                        }
+                    }
+                }
                 Some(Value::Null)
             }
             _ => None,
-        }
+        })
     }
 
     /// `X::` member access where X may be a trait: traits resolve to a
