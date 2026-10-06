@@ -1477,9 +1477,11 @@ pub(in crate::builtins) fn write_resource(
     }
 }
 
-/// Read up to `n` bytes from a pipe fd. EOF (read 0) latches `eof`;
-/// EAGAIN on a nonblocking stream reads "" silently — zend returns
-/// "" there rather than retrying.
+/// Read up to `n` bytes from a pipe fd — a single read(2) capped at
+/// zend's 8192 chunk size (php_stream_read does one fill_read_buffer,
+/// so fread($p, 200000) returns at most 8192). EOF (read 0) latches
+/// `eof`; EAGAIN on a nonblocking stream reads "" silently — zend
+/// returns "" there rather than retrying.
 fn read_pipe(
     file: &mut std::fs::File,
     eof: &mut bool,
@@ -1491,7 +1493,7 @@ fn read_pipe(
     if *eof {
         return Ok(StreamRead::Data(Vec::new()));
     }
-    let mut buf = vec![0u8; n];
+    let mut buf = vec![0u8; n.min(8192)];
     match file.read(&mut buf) {
         Ok(0) => {
             *eof = true;
