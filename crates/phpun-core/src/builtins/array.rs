@@ -659,7 +659,14 @@ pub(crate) fn dispatch(
         }
         "array_walk" => {
             let cb = arg(args, 1);
-            let extra = arg(args, 2);
+            // zend passes userdata to the callback ONLY when the caller
+            // supplied it — otherwise the cb gets (value, key) exactly
+            // (bug24658's `typehint(1, 1)` trace frame).
+            let extra = if args.len() > 2 {
+                Some(arg(args, 2))
+            } else {
+                None
+            };
             // array_walk on an object iterates its property entries
             // (gh18268: hooked props yield their serialized value).
             let obj = match &*args[0].borrow() {
@@ -687,14 +694,11 @@ pub(crate) fn dispatch(
                         .next_back()
                         .unwrap_or(&n)
                         .to_string();
-                    it.call_value(
-                        &cb,
-                        crate::interp::CallArgs::positional(vec![
-                            cell(v),
-                            cell(Value::str(plain)),
-                            cell(extra.clone()),
-                        ]),
-                    )?;
+                    let mut cb_args = vec![cell(v), cell(Value::str(plain))];
+                    if let Some(e) = &extra {
+                        cb_args.push(cell(e.clone()));
+                    }
+                    it.call_value(&cb, crate::interp::CallArgs::positional(cb_args))?;
                 }
                 if walked {
                     return Ok(Some(Value::Bool(true)));
@@ -703,18 +707,18 @@ pub(crate) fn dispatch(
             if let Some(rc) = it.arr_mut(&args[0]) {
                 let cells: Vec<(ArrKey, Cell)> = rc.borrow().iter().cloned().collect();
                 for (k, c) in cells {
-                    it.call_value(
-                        &cb,
-                        crate::interp::CallArgs::positional(vec![
-                            c.clone(),
-                            cell(match k {
-                                ArrKey::Int(i) => Value::Int(i),
-                                ArrKey::Str(s) => Value::str(s.to_string()),
-                                ArrKey::Tomb => Value::Null,
-                            }),
-                            cell(extra.clone()),
-                        ]),
-                    )?;
+                    let mut cb_args = vec![
+                        c.clone(),
+                        cell(match k {
+                            ArrKey::Int(i) => Value::Int(i),
+                            ArrKey::Str(s) => Value::str(s.to_string()),
+                            ArrKey::Tomb => Value::Null,
+                        }),
+                    ];
+                    if let Some(e) = &extra {
+                        cb_args.push(cell(e.clone()));
+                    }
+                    it.call_value(&cb, crate::interp::CallArgs::positional(cb_args))?;
                 }
             }
             Value::Bool(true)

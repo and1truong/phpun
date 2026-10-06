@@ -307,7 +307,10 @@ impl<'a> Interp<'a> {
                             pos += 1;
                         }
                     }
-                    Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. } => {
+                    Expr::Call { .. }
+                    | Expr::MethodCall { .. }
+                    | Expr::StaticCall { .. }
+                    | Expr::StaticCallDyn { .. } => {
                         // `f(g())`: binds only when g() returns by reference,
                         // otherwise a notice and pass by value (passByReference_004/007).
                         let (c, was_ref) = self.eval_call_cell(expr)?;
@@ -3695,7 +3698,16 @@ impl<'a> Interp<'a> {
                 // internal `Closure::__invoke` ( `$f->__invoke()` or
                 // `[$f,'__invoke']`) drops it (closure_059).
                 let call_alias = self.stack.last().and_then(|f| f.call_alias.clone());
-                let msg = if call_alias.is_some() {
+                // A callback dispatched from inside a builtin
+                // (array_walk, usort, ob handlers) traces from
+                // `[internal function]` — zend's message then drops the
+                // `called in ... and defined` tail too (bug24658).
+                let internal_site = self
+                    .call_trace
+                    .last()
+                    .map(|f| f.file == "[internal function]")
+                    .unwrap_or(false);
+                let msg = if call_alias.is_some() || internal_site {
                     format!(
                         "{}(): Argument #{} (${}) must be of type {}, {} given",
                         fname,
@@ -3716,7 +3728,11 @@ impl<'a> Interp<'a> {
                         self.cur_line
                     )
                 };
-                let display = format!("{} and defined", msg);
+                let display = if internal_site {
+                    msg.clone()
+                } else {
+                    format!("{} and defined", msg)
+                };
                 let argdesc = args
                     .iter()
                     .map(|a| trace_arg(&a.borrow()))
@@ -3735,13 +3751,22 @@ impl<'a> Interp<'a> {
                     "::"
                 };
                 let tname = fname.replacen("::", arrow, 1);
-                let frame = format!(
-                    "{}({}): {}({})",
-                    self.diag_file(),
-                    self.cur_line,
-                    tname,
-                    argdesc
-                );
+                let frame = if internal_site {
+                    // The callee's own pushed frame carries the
+                    // `[internal function]` site and the callback args.
+                    self.call_trace
+                        .last()
+                        .map(crate::value::trace_frame_str)
+                        .unwrap_or_default()
+                } else {
+                    format!(
+                        "{}({}): {}({})",
+                        self.diag_file(),
+                        self.cur_line,
+                        tname,
+                        argdesc
+                    )
+                };
                 let call_line = self.cur_line;
                 // Frames below the call site (include/require and
                 // outer calls) join the synthetic #0 — the callee's
