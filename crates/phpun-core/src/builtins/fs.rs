@@ -538,7 +538,16 @@ pub(crate) fn dispatch(
                         PhpResource::File { pos, .. } | PhpResource::Mem { pos, .. } => {
                             Value::Int(*pos as i64)
                         }
-                        PhpResource::Pipe { .. } => Value::Bool(false),
+                        // zend's pipe position lags one byte behind the
+                        // consumed count: false before any read, then
+                        // bytes_consumed-1.
+                        PhpResource::Pipe { pos, .. } => {
+                            if *pos == 0 {
+                                Value::Bool(false)
+                            } else {
+                                Value::Int(*pos as i64 - 1)
+                            }
+                        }
                         _ => Value::Int(0),
                     },
                     _ => Value::Int(0),
