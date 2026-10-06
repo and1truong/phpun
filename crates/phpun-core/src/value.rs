@@ -1851,6 +1851,11 @@ pub struct GenState {
     /// (catch delivery, `return`-in-finally swallow, suspend at a
     /// yield inside `finally`).
     pub throws: Vec<(usize, Value)>,
+    /// The throwable most recently queued by `Generator->throw()` —
+    /// an uncaught injected throwable keeps its own trace (built at
+    /// the `new` site) when it escapes, unlike a body-raised `throw`
+    /// whose uncaught render is the resume stack.
+    pub injected_throwable: Option<Value>,
     /// Output produced after a yield suspends mid-expression — Zend
     /// defers it to resume; buffered per yield index and emitted when
     /// the consumer advances `pos` past it (closure_call_leak). The

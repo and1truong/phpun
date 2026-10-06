@@ -192,6 +192,7 @@ impl<'a> Interp<'a> {
             auto_key: 0,
             sends: Vec::new(),
             throws: Vec::new(),
+            injected_throwable: None,
             pending_out: Vec::new(),
             fin_q,
             deferred_err: None,
@@ -714,6 +715,17 @@ impl<'a> Interp<'a> {
             fin.fin_err = None;
         }
         let (mut e, throwable, raise_frames, _) = state.borrow_mut().deferred_err.take().unwrap();
+        // A consumer-injected throwable (Generator->throw()) keeps its
+        // own trace when it escapes — Zend renders the trace captured
+        // at `new`, not the gen's resume stack.
+        let injected = {
+            let st = state.borrow();
+            matches!(
+                (&st.injected_throwable, &throwable),
+                (Some(Value::Object(a)), Some(Value::Object(b)))
+                    if std::rc::Rc::ptr_eq(a, b)
+            )
+        };
         if e.kind == crate::error::ErrorKind::Throw {
             // Restore the throwable captured at death — consumer calls
             // since then may have overwritten the ambient slot.
@@ -766,14 +778,16 @@ impl<'a> Interp<'a> {
                 frames.push(crate::value::trace_frame_str(fr));
             }
             if e.kind == crate::error::ErrorKind::Throw {
-                self.rewrite_throwable_trace(&frames);
+                if !injected {
+                    self.rewrite_throwable_trace(&frames);
+                }
             } else {
                 e.trace = Some(frames);
             }
             return Err(e);
         }
         let mut frames = self.gen_resume_frames(state, method, args, self.gen_internal_resume == 0);
-        if e.kind == crate::error::ErrorKind::Throw {
+        if e.kind == crate::error::ErrorKind::Throw && !injected {
             // Frames suspended between the throw site and the gen body
             // — eval()/include() pseudo-frames and userland calls —
             // lead the resume stack in Zend's render.
@@ -789,7 +803,7 @@ impl<'a> Interp<'a> {
             // The uncaught render reads the Throwable's own trace —
             // swap it for the resume stack.
             self.rewrite_throwable_trace(&frames);
-        } else {
+        } else if e.kind != crate::error::ErrorKind::Throw {
             e.trace = Some(frames);
         }
         Err(e)
@@ -1106,6 +1120,7 @@ impl<'a> Interp<'a> {
                     let mut st = state.borrow_mut();
                     let prev = st.pos;
                     st.throws.push((prev, e.clone()));
+                    st.injected_throwable = Some(e.clone());
                     st.started = false;
                     st.finished = false;
                     st.items.clear();
