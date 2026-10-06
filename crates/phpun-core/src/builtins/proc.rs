@@ -22,6 +22,29 @@ pub(crate) fn dispatch(
         "proc_close" => proc_close(it, args)?,
         "proc_get_status" => proc_get_status(it, args)?,
         "proc_terminate" => proc_terminate(it, args)?,
+        "proc_nice" => {
+            if args.is_empty() {
+                return err(
+                    "ArgumentCountError",
+                    "proc_nice() expects exactly 1 argument, 0 given",
+                );
+            }
+            let n = zpp_long_arg(it, args, 0, "proc_nice", 1, "$priority")? as i32;
+            unsafe {
+                *libc::__errno_location() = 0;
+                let ret = libc::nice(n);
+                if ret == -1 && *libc::__errno_location() != 0 {
+                    // EPERM — nice() also fails this way for an
+                    // unprivileged priority increase.
+                    it.warn_pub(
+                        "proc_nice(): Only a super user may attempt to increase the priority of a process",
+                    )?;
+                    Value::Bool(false)
+                } else {
+                    Value::Bool(true)
+                }
+            }
+        }
         "shell_exec" => shell_exec(it, args)?,
         "exec" => php_exec(it, name, args, if args.len() >= 2 { 2 } else { 0 })?,
         "system" => php_exec(it, name, args, 1)?,
