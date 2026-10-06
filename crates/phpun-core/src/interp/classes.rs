@@ -2312,7 +2312,7 @@ impl<'a> Interp<'a> {
                         "Get hook of backed property {}::{} with set hook may not return by reference",
                         d.name, p.name
                     ),
-                    self.cur_line,
+                    p.line,
                 ));
             }
             // A hook without a body is only legal in an interface or on

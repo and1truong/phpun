@@ -4610,6 +4610,17 @@ impl<'a> Interp<'a> {
                         return self.incdec_aa(o.clone(), key, delta, post);
                     }
                 }
+                // `++`/`--` never lands on a string offset — zend's
+                // catchable Error beats the non-numeric-increment
+                // deprecation the byte value would otherwise take
+                // (finding 15).
+                if matches!(base, Value::Str(_)) {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        "Cannot increment/decrement string offsets",
+                        self.cur_line,
+                    ));
+                }
                 // Errors from the read propagate — a plain-object dim
                 // is zend's catchable Error, not a silent null.
                 self.index_read_base(base, key)?

@@ -1895,9 +1895,14 @@ impl<'a> Parser<'a> {
                 // op that can follow (`?`, `??`, binary ops keep going
                 // on the Assign node). The RHS is Zend's restricted
                 // `new_variable` grammar, not a full expression.
+                let eq_pos = self.pos;
                 self.pos += 2;
                 let rhs = self.ref_variable(false)?;
                 let target = self.list_target(e)?;
+                // Non-lvalue =& targets are zend's parse error at the
+                // `=` (`($c ? $a : $b) =& $x`, finding 16) — the gate
+                // normalizes '=&' to '=' for the message.
+                self.assign_target_gate(&target, "=&", start, eq_pos)?;
                 e = Expr::Assign {
                     target: Box::new(target),
                     op: "=&",
