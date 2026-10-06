@@ -64,7 +64,7 @@ impl<'a> Interp<'a> {
             }
             Stmt::Static { vars, .. } => vars
                 .iter()
-                .any(|(_, e)| e.as_ref().is_some_and(Self::expr_contains_yield)),
+                .any(|(_, e, _)| e.as_ref().is_some_and(Self::expr_contains_yield)),
             Stmt::Unset(v) | Stmt::Global(v) => v.iter().any(Self::expr_contains_yield),
             Stmt::ConstDecl(v) => v.iter().any(|(_, e)| Self::expr_contains_yield(e)),
             Stmt::Declare { value, .. } => Self::expr_contains_yield(value),

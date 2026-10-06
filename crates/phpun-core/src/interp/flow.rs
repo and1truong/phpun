@@ -239,12 +239,14 @@ impl<'a> Interp<'a> {
                         ));
                     }
                 }
-                Stmt::Static { vars, line: sl } => {
-                    for (name, _) in vars {
-                        if sc.statics.insert(name.clone(), *sl).is_some() {
+                Stmt::Static { vars, .. } => {
+                    for (name, _, vl) in vars {
+                        // Zend reports the redeclared var's own
+                        // declarator line, not the `static` keyword's.
+                        if sc.statics.insert(name.clone(), *vl).is_some() {
                             return Err(PhpError::compile_fatal(
                                 format!("Duplicate declaration of static variable ${}", name),
-                                *sl,
+                                *vl,
                             ));
                         }
                     }

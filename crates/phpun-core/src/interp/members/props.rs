@@ -308,7 +308,7 @@ impl<'a> Interp<'a> {
             }
             Stmt::Static { vars, .. } => vars
                 .iter()
-                .filter_map(|(_, d)| d.as_ref())
+                .filter_map(|(_, d, _)| d.as_ref())
                 .any(|e| Self::expr_uses_this_prop(e, pn)),
             Stmt::Declare { value, .. } => Self::expr_uses_this_prop(value, pn),
             _ => false,

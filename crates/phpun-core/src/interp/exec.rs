@@ -159,13 +159,6 @@ impl<'a> Interp<'a> {
                 self.cur_line = *line;
                 Flow::Normal
             }
-            Stmt::Deprecated { msg, line } => {
-                self.cur_line = *line;
-                match self.deprecated(msg) {
-                    Ok(()) => Flow::Normal,
-                    Err(e) => self.err_flow(e),
-                }
-            }
             Stmt::Inline(t) => {
                 self.emit(t);
                 Flow::Normal
@@ -462,7 +455,7 @@ impl<'a> Interp<'a> {
                 // string) keys the unit: a re-parsed unit may recycle
                 // the freed Vec's stmt ptr and must still count as new.
                 let site = (self.cur_unit_id, vars.as_ptr() as usize);
-                for (name, default) in vars {
+                for (name, default, var_line) in vars {
                     // Every site is kept: a decl in a different unit is
                     // legal AND must not erase the same-unit record a
                     // later duplicate checks against.
@@ -479,7 +472,7 @@ impl<'a> Interp<'a> {
                         // context backtrace (include chain minus context).
                         let mut e = PhpError::compile_fatal(
                             format!("Duplicate declaration of static variable ${}", name),
-                            self.cur_line,
+                            *var_line,
                         );
                         e.trace = Some(self.compile_err_frames());
                         return self.err_flow(e);

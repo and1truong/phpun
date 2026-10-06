@@ -1108,7 +1108,7 @@ impl<'a> Interp<'a> {
             // `static $x = ...` inside a body is a RUNTIME initializer —
             // closure literals are legal there (probe_f4d).
             Stmt::Static { vars, .. } => {
-                for (_, d) in vars {
+                for (_, d, ..) in vars {
                     if let Some(e) = d {
                         Self::gate_expr(e, &GateMode::Runtime)?;
                     }

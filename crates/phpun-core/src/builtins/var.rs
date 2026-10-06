@@ -577,7 +577,7 @@ fn static_var_names(stmts: &[crate::ast::Stmt], out: &mut Vec<String>) {
     for st in stmts {
         match st {
             Stmt::Static { vars, .. } => {
-                for (n, _) in vars {
+                for (n, ..) in vars {
                     if !out.iter().any(|x| x == n) {
                         out.push(n.clone());
                     }

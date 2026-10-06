@@ -4575,10 +4575,10 @@ fn closure_static_vars(stmts: &[Stmt], out: &mut Vec<(String, Option<Expr>, usiz
     use crate::ast::Stmt;
     for st in stmts {
         match st {
-            Stmt::Static { vars, line } => {
-                for (n, d) in vars {
+            Stmt::Static { vars, .. } => {
+                for (n, d, vl) in vars {
                     if !out.iter().any(|(x, ..)| x == n) {
-                        out.push((n.clone(), d.clone(), *line));
+                        out.push((n.clone(), d.clone(), *vl));
                     }
                 }
             }

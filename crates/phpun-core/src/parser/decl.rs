@@ -16,6 +16,7 @@ impl<'a> Parser<'a> {
         self.pos += 1; // static
         let mut vars = Vec::new();
         loop {
+            let var_line = self.line();
             let name = match self.next() {
                 Some(Token::Variable(n)) => n,
                 t => {
@@ -33,7 +34,7 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            vars.push((name, default));
+            vars.push((name, default, var_line));
             if !self.eat_op(",") {
                 break;
             }
