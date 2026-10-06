@@ -885,8 +885,18 @@ impl<'a> Interp<'a> {
                     } else {
                         None
                     };
+                    // zend types every arginfo param, but this table
+                    // carries no member names for internal functions —
+                    // the flag drives object-vs-NULL instead.
+                    let hasty = obj
+                        .borrow()
+                        .props
+                        .get("\0rp\0hasty")
+                        .is_some_and(|c| c.borrow().is_truthy());
                     match tys {
-                        Some(ta) => {
+                        // No declared type -> NULL (zend returns NULL
+                        // for an untyped param, not a named type).
+                        Some(ta) if hasty || !ta.borrow().entries.is_empty() => {
                             let members: Vec<String> = ta
                                 .borrow()
                                 .entries
@@ -905,7 +915,7 @@ impl<'a> Interp<'a> {
                             }
                             Ok(Some(nt))
                         }
-                        None => Ok(Some(Value::Null)),
+                        _ => Ok(Some(Value::Null)),
                     }
                 }
             }
@@ -1007,10 +1017,23 @@ impl<'a> Interp<'a> {
                         .unwrap_or(Value::Null);
                     self.callable_decl(&cb)
                 };
-                // (name, variadic, has-default, default, type members)
-                // — userland decls read Param, internal functions
-                // synthesize from arginfo (builtin_params).
-                let mut prs: Vec<(String, bool, bool, Value, Vec<String>, bool)> = Vec::new();
+                // (name, variadic, has-default, default, type members,
+                //  has-type, optional, by-ref, allows-null,
+                //  default-const name) — userland decls read Param,
+                // internal functions synthesize from arginfo
+                // (builtin_params).
+                let mut prs: Vec<(
+                    String,
+                    bool,
+                    bool,
+                    Value,
+                    Vec<String>,
+                    bool,
+                    bool,
+                    bool,
+                    bool,
+                    Option<String>,
+                )> = Vec::new();
                 let bp: Option<&'static [(&'static str, crate::builtins::BDef)]> = if is_method {
                     None
                 } else {
@@ -1050,7 +1073,22 @@ impl<'a> Interp<'a> {
                                 d,
                                 crate::builtins::BDef::Unk | crate::builtins::BDef::OptReq
                             );
-                        prs.push((pn.to_string(), var, has, d.val(), Vec::new(), opt));
+                        // arginfo carries no type/nullable info here —
+                        // zend marks internal params non-nullable
+                        // unless arginfo says otherwise (strlen $string),
+                        // but every arginfo param does have a type.
+                        prs.push((
+                            pn.to_string(),
+                            var,
+                            has,
+                            d.val(),
+                            Vec::new(),
+                            true,
+                            opt,
+                            false,
+                            false,
+                            None,
+                        ));
                     }
                 } else if let Some(d) = &decl {
                     let req = d
@@ -1069,18 +1107,55 @@ impl<'a> Interp<'a> {
                         } else {
                             Value::Null
                         };
+                        let tys = p.ty.clone().unwrap_or_default();
+                        // allowsNull: untyped, explicit ?T/T|null, mixed,
+                        // or the (deprecated) implicit-nullable
+                        // `T $a = null` form.
+                        let allow_null = tys.is_empty()
+                            || tys.iter().any(|t| {
+                                t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("mixed")
+                            })
+                            || (has && matches!(dv, Value::Null));
+                        // zend's isDefaultValueConstant flags literal
+                        // constant refs (CONST, self::C) — not constant
+                        // expressions like `1+2` or `'a'.'b'`.
+                        let const_name = if has {
+                            match p.default.as_ref().unwrap() {
+                                Expr::Const(n) => Some(n.clone()),
+                                Expr::ClassConst { class, name }
+                                    if matches!(class.as_ref(), Expr::Const(_)) =>
+                                {
+                                    let cn = match class.as_ref() {
+                                        Expr::Const(cn) => cn.clone(),
+                                        _ => unreachable!(),
+                                    };
+                                    Some(format!("{}::{}", cn, name))
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
                         prs.push((
                             p.name.clone(),
                             p.variadic,
                             has,
                             dv,
-                            p.ty.clone().unwrap_or_default(),
+                            tys.clone(),
+                            !tys.is_empty(),
                             has || p.variadic,
+                            p.by_ref,
+                            allow_null,
+                            const_name,
                         ));
                     }
                 }
                 let mut arr = PhpArray::default();
-                for (pos, (pn, variadic, has_def, dv, ty, opt)) in prs.iter().enumerate() {
+                for (
+                    pos,
+                    (pn, variadic, has_def, dv, ty, hasty, opt, by_ref, allow_null, const_name),
+                ) in prs.iter().enumerate()
+                {
                     let rp = self.instantiate("reflectionparameter", &[])?;
                     if let Value::Object(o) = &rp {
                         o.borrow_mut()
@@ -1103,6 +1178,16 @@ impl<'a> Interp<'a> {
                             .insert("\0rp\0hasdef".into(), cell(Value::Bool(*has_def)));
                         ob.props.insert("\0rp\0opt".into(), cell(Value::Bool(*opt)));
                         ob.props.insert("\0rp\0def".into(), cell(dv.clone()));
+                        ob.props
+                            .insert("\0rp\0byref".into(), cell(Value::Bool(*by_ref)));
+                        ob.props
+                            .insert("\0rp\0hasty".into(), cell(Value::Bool(*hasty)));
+                        ob.props
+                            .insert("\0rp\0allownull".into(), cell(Value::Bool(*allow_null)));
+                        if let Some(cn) = const_name {
+                            ob.props
+                                .insert("\0rp\0defconst".into(), cell(Value::str(cn.clone())));
+                        }
                         let mut ta = PhpArray::default();
                         for m in ty {
                             ta.push(Value::str(m));
@@ -1122,6 +1207,59 @@ impl<'a> Interp<'a> {
                     .get("\0rp\0variadic")
                     .is_some_and(|c| c.borrow().is_truthy()),
             ))),
+            "ispassedbyreference" => Ok(Some(Value::Bool(
+                obj.borrow()
+                    .props
+                    .get("\0rp\0byref")
+                    .is_some_and(|c| c.borrow().is_truthy()),
+            ))),
+            "allowsnull" => Ok(Some(Value::Bool(
+                obj.borrow()
+                    .props
+                    .get("\0rp\0allownull")
+                    .is_some_and(|c| c.borrow().is_truthy()),
+            ))),
+            // zend throws ReflectionException when the param carries
+            // no default at all — a non-const default answers false
+            // for is* / NULL for get*Name.
+            "isdefaultvalueconstant" => {
+                let has = obj
+                    .borrow()
+                    .props
+                    .get("\0rp\0hasdef")
+                    .is_some_and(|c| c.borrow().is_truthy());
+                if !has {
+                    return self.fail(PhpError::uncaught(
+                        "ReflectionException",
+                        "Internal error: Failed to retrieve the default value",
+                        0,
+                    ));
+                }
+                Ok(Some(Value::Bool(
+                    obj.borrow().props.contains_key("\0rp\0defconst"),
+                )))
+            }
+            "getdefaultvalueconstantname" => {
+                let has = obj
+                    .borrow()
+                    .props
+                    .get("\0rp\0hasdef")
+                    .is_some_and(|c| c.borrow().is_truthy());
+                if !has {
+                    return self.fail(PhpError::uncaught(
+                        "ReflectionException",
+                        "Internal error: Failed to retrieve the default value",
+                        0,
+                    ));
+                }
+                let v = obj
+                    .borrow()
+                    .props
+                    .get("\0rp\0defconst")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                Ok(Some(v))
+            }
             "getposition" => Ok(Some(Value::Int(
                 obj.borrow()
                     .props
@@ -1172,13 +1310,19 @@ impl<'a> Interp<'a> {
                 let has = obj
                     .borrow()
                     .props
-                    .get("\0rp\0ty")
-                    .map(|c| c.borrow().clone())
-                    .and_then(|v| match v {
-                        Value::Array(a) => Some(!a.borrow().entries.is_empty()),
-                        _ => None,
-                    })
-                    .unwrap_or(false);
+                    .get("\0rp\0hasty")
+                    .map(|c| c.borrow().is_truthy())
+                    .unwrap_or_else(|| {
+                        obj.borrow()
+                            .props
+                            .get("\0rp\0ty")
+                            .map(|c| c.borrow().clone())
+                            .and_then(|v| match v {
+                                Value::Array(a) => Some(!a.borrow().entries.is_empty()),
+                                _ => None,
+                            })
+                            .unwrap_or(false)
+                    });
                 Ok(Some(Value::Bool(has)))
             }
             "getclass" => {
