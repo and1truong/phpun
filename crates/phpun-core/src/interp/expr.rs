@@ -2517,6 +2517,7 @@ impl<'a> Interp<'a> {
                     full_msg,
                     eval_ctx,
                     frames,
+                    previous,
                 }) => Some(ObjectInternal::Exception {
                     file: file.clone(),
                     line: *line,
@@ -2525,6 +2526,7 @@ impl<'a> Interp<'a> {
                     full_msg: full_msg.clone(),
                     eval_ctx: *eval_ctx,
                     frames: frames.clone(),
+                    previous: previous.clone(),
                 }),
                 _ => None,
             },
@@ -4797,7 +4799,10 @@ impl<'a> Interp<'a> {
         // `++`/`--` on a declared readonly prop is a direct slot write:
         // zend's 'Cannot modify readonly property' precedes the
         // increment verb — `$c->o++` on an object-held readonly prop
-        // must not reach 'Cannot increment Inner' (R3 finding 12).
+        // must not reach 'Cannot increment Inner' as the thrown error,
+        // but zend still runs the increment-ability check and chains
+        // its TypeError as `previous` (R3 finding 12, R4 finding 4 —
+        // getPrevious()/the leading `Uncaught TypeError:` block).
         // Runs post-read so an uninitialized typed prop still reports
         // 'must not be accessed before initialization' first.
         if let Some((o, pn)) = &ro_target {
@@ -4809,15 +4814,40 @@ impl<'a> Interp<'a> {
                         pd.name.clone()
                     };
                     if o.borrow().props.contains_key(&dk) {
-                        return self.fail(PhpError::uncaught(
+                        let prev = if matches!(
+                            old,
+                            Value::Array(_)
+                                | Value::Object(_)
+                                | Value::Resource(_)
+                                | Value::Callable(_)
+                        ) {
+                            let dir = if delta > 0 { "increment" } else { "decrement" };
+                            let what = match &old {
+                                Value::Array(_) => "array".to_string(),
+                                Value::Object(ob) => ob.borrow().class.name().to_string(),
+                                Value::Callable(_) => "Closure".to_string(),
+                                _ => "resource".to_string(),
+                            };
+                            Some(self.exception("TypeError", &format!("Cannot {} {}", dir, what)))
+                        } else {
+                            None
+                        };
+                        let err = self.exception(
                             "Error",
-                            format!(
+                            &format!(
                                 "Cannot modify readonly property {}::${}",
                                 dcls.name(),
                                 pd.name
                             ),
-                            0,
-                        ));
+                        );
+                        if let (Value::Object(eo), Some(p)) = (&err, prev) {
+                            if let Some(ObjectInternal::Exception { previous, .. }) =
+                                &mut eo.borrow_mut().internal
+                            {
+                                *previous = Some(p);
+                            }
+                        }
+                        return Err(self.throw(err));
                     }
                 }
             }

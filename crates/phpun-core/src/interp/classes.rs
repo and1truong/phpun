@@ -3558,6 +3558,7 @@ impl<'a> Interp<'a> {
                 thrown: self.cur_line as u32,
                 full_msg: String::new(),
                 eval_ctx: 0,
+                previous: None,
                 frames: Rc::new(self.call_trace.clone()),
             })
         } else {

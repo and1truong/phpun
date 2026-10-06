@@ -1626,6 +1626,11 @@ pub enum ObjectInternal {
         eval_ctx: u32,
         /// Call stack snapshot at construction → getTrace() (tests/lang/038).
         frames: Rc<Vec<TraceFrame>>,
+        /// Chained exception from the ctor's `previous` arg (or the
+        /// engine's own chains — e.g. the incdec TypeError attached
+        /// under a readonly-modify Error). Uncaught display renders
+        /// the deepest first as `Uncaught`, each enclosing as `Next`.
+        previous: Option<Value>,
     },
     /// SPL ArrayIterator state: shared storage slot + iteration cursor.
     ArrayIter {

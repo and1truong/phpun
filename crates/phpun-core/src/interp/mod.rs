@@ -2554,6 +2554,7 @@ impl<'a> Interp<'a> {
                 full_msg: String::new(),
                 eval_ctx: 0,
                 frames: Rc::new(self.call_trace.clone()),
+                previous: None,
             });
             if !o.prop_order.contains(&"message".into()) {
                 o.prop_order.push("message".into());

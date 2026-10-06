@@ -2458,7 +2458,12 @@ impl<'a> Interp<'a> {
                 }
                 _ => Some(Value::str("#0 {main}")),
             },
-            "getprevious" => Some(Value::Null),
+            "getprevious" => match &ob.internal {
+                Some(ObjectInternal::Exception { previous, .. }) => {
+                    Some(previous.clone().unwrap_or(Value::Null))
+                }
+                _ => Some(Value::Null),
+            },
             "__tostring" => {
                 let msg = ob
                     .props
@@ -2501,7 +2506,9 @@ impl<'a> Interp<'a> {
                 )))
             }
             "__construct" => {
-                // Builtin ctor: props from args message/code.
+                // Builtin ctor: props from args message/code; arg 3
+                // (`previous`) chains under the new throwable and
+                // surfaces via getPrevious()/'Next X:' uncaught blocks.
                 drop(ob);
                 let mut ob = obj.borrow_mut();
                 let msg = _args
@@ -2511,6 +2518,11 @@ impl<'a> Interp<'a> {
                 let code = _args.get(1).map(|c| c.borrow().to_int()).unwrap_or(0);
                 ob.props.insert("message".into(), cell(Value::str(msg)));
                 ob.props.insert("code".into(), cell(Value::Int(code)));
+                if let Some(prev @ Value::Object(_)) = _args.get(2).map(|c| c.borrow().clone()) {
+                    if let Some(ObjectInternal::Exception { previous, .. }) = &mut ob.internal {
+                        *previous = Some(prev);
+                    }
+                }
                 if !ob.prop_order.contains(&"message".into()) {
                     ob.prop_order.push("message".into());
                     ob.prop_order.push("code".into());
