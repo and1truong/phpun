@@ -880,19 +880,33 @@ fn interp_scan(
                             }
                         }
                     }
+                    let inner = &src[pos + n + 2..pos + k];
+                    // Zend's two deprecated forms: `${label}` and
+                    // `${label[...]}` read the variable directly and
+                    // deprecate as "${var}"; anything else is a
+                    // variable-variable and deprecates as "${expr}".
+                    let (_, ilen) = ident(inner, 0);
+                    let is_var =
+                        ilen > 0 && matches!(inner.as_bytes().get(ilen), None | Some(&b'['));
+                    let (msg, part) = if is_var {
+                        (
+                            "Using ${var} in strings is deprecated, use {$var} instead",
+                            StringPart::Expr(format!("${}", inner)),
+                        )
+                    } else {
+                        (
+                            "Using ${expr} (variable variables) in strings is deprecated, use {${expr}} instead",
+                            StringPart::DollarBraceExpr(inner.to_string()),
+                        )
+                    };
                     diags.push(Lexed {
-                        token: Token::Diag(
-                            "Deprecated",
-                            "Using ${expr} (variable variables) in strings is deprecated, use {${expr}} instead".into(),
-                        ),
+                        token: Token::Diag("Deprecated", msg.into()),
                         line: line + s_matches(&src[pos..pos + n]),
                         ws_adj: 0,
                         start: usize::MAX,
                         end: usize::MAX,
                     });
-                    parts.push(StringPart::DollarBraceExpr(
-                        src[pos + n + 2..pos + k].to_string(),
-                    ));
+                    parts.push(part);
                     n = k + 1;
                 } else {
                     let (name, len) = ident(src, pos + n + 1);

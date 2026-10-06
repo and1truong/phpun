@@ -70,17 +70,13 @@ impl<'a> Interp<'a> {
                 self.cur_line = *l;
                 Flow::Normal
             }
-            Stmt::Diag { level, msg, line } => {
+            // Compile-time diagnostics park before their source stmt;
+            // the flow gate already emitted each at its position (they
+            // are properties of the compiled unit, not the executed
+            // path — `if(0){ echo "${a}"; }` still deprecates).
+            Stmt::Diag { line, .. } => {
                 self.cur_line = *line;
-                let r = match *level {
-                    "Warning" => self.warn(msg),
-                    "Notice" => self.notice(msg),
-                    _ => self.deprecated(msg),
-                };
-                match r {
-                    Ok(()) => Flow::Normal,
-                    Err(e) => self.err_flow(e),
-                }
+                Flow::Normal
             }
             Stmt::Deprecated { msg, line } => {
                 self.cur_line = *line;
