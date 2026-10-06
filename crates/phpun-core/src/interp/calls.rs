@@ -304,7 +304,7 @@ impl<'a> Interp<'a> {
                 }
                 let trav = matches!(&v, Value::Object(_));
                 let mut unpack_named = false;
-                for (k, c) in self.unpack_items(&v)? {
+                for (k, c) in self.unpack_items(&v, true)? {
                     match k {
                         Some(n) => {
                             seen_named = true;
@@ -474,7 +474,17 @@ impl<'a> Interp<'a> {
     /// Spreadable items of `...$v`: arrays yield entries, Traversables
     /// iterate via the rewind/valid/current/key/next protocol
     /// (IteratorAggregate chains resolve first). `None` key = positional.
-    pub(in crate::interp) fn unpack_items(&mut self, v: &Value) -> Result<SpreadItems, PhpError> {
+    ///
+    /// The non-iterable diagnostic's class splits by context:
+    /// call-arg spread `f(...$v)` throws TypeError for every
+    /// non-iterable (zend's arg-type check), while array-literal
+    /// `[...$v]` throws Error for scalars/null and TypeError only for
+    /// objects — the object arm below already throws TypeError.
+    pub(in crate::interp) fn unpack_items(
+        &mut self,
+        v: &Value,
+        in_call_args: bool,
+    ) -> Result<SpreadItems, PhpError> {
         match v {
             Value::Array(a) => {
                 // Element cells are handed to the call as potential
@@ -551,7 +561,7 @@ impl<'a> Interp<'a> {
                 Ok(out)
             }
             _ => self.fail(PhpError::uncaught(
-                "TypeError",
+                if in_call_args { "TypeError" } else { "Error" },
                 format!(
                     "Only arrays and Traversables can be unpacked, {} given",
                     self.zval_type_name(v)

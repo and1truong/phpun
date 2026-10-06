@@ -1227,6 +1227,7 @@ impl<'a> Interp<'a> {
                 {
                     if let Expr::Int(n) = l.as_ref() {
                         self.cur_line = *n as usize;
+                        self.send_line = Some(*n as usize);
                     }
                 }
                 match Self::unmark_arg(a) {

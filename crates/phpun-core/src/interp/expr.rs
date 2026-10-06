@@ -108,7 +108,7 @@ impl<'a> Interp<'a> {
                             // positionally, string keys set (PHP 8.1+).
                             if let Expr::Unpack(e) = shape {
                                 let sv = self.eval(e)?;
-                                for (sk, c) in self.unpack_items(&sv)? {
+                                for (sk, c) in self.unpack_items(&sv, false)? {
                                     match sk {
                                         Some(s) => arr.set(ArrKey::Str(s), c.borrow().clone()),
                                         None => arr.push(c.borrow().clone()),
