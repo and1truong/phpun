@@ -2329,13 +2329,38 @@ impl<'a> Interp<'a> {
                         Err(e) => return Err(e),
                     }
                 }
+                // Internal spl storage (ArrayObject & friends) hands back
+                // the real bucket cell — writes through it reach the
+                // object, like zend's by-ref spl read_dimension.
+                if matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. })) {
+                    let arr = self.ao_arr(&o);
+                    let k2 = to_key(&k.clone().unwrap_or(Value::Null));
+                    let mut a = arr.borrow_mut();
+                    c = match a.get_cell(&k2) {
+                        Some(cc) => cc,
+                        None => {
+                            let cc = cell(Value::Null);
+                            a.bind_cell(k2, cc.clone());
+                            cc
+                        }
+                    };
+                    continue;
+                }
+                // Userland ArrayAccess can't alias its element — zend's
+                // indirect-modification notice, writes land on a
+                // throwaway cell.
                 let iv = self
                     .method_invoke(
-                        o,
+                        o.clone(),
                         "offsetGet",
                         CallArgs::positional(vec![cell(k.clone().unwrap_or(Value::Null))]),
                     )
                     .unwrap_or(Value::Null);
+                let cn = o.borrow().class.name().to_string();
+                self.notice(&format!(
+                    "Indirect modification of overloaded element of {} has no effect",
+                    cn
+                ))?;
                 c = cell(iv);
                 continue;
             }
@@ -2350,7 +2375,7 @@ impl<'a> Interp<'a> {
                     }
                     c = nc;
                 }
-                Err(_) => {
+                Err(e2) => {
                     let is_str = matches!(*c.borrow(), Value::Str(_));
                     if is_str {
                         // String offset write (final level only).
@@ -2398,16 +2423,9 @@ impl<'a> Interp<'a> {
                         }
                         return Ok(v);
                     }
-                    let t = c.borrow().debug_type();
-                    if keys.len() == 1 {
-                        return self.fail(PhpError::uncaught(
-                            "Error",
-                            "Cannot use a scalar value as an array",
-                            self.cur_line,
-                        ));
-                    }
-                    self.warn(&format!("Cannot use {} as array", t))?;
-                    return Ok(v);
+                    // Scalar/object intermediate: the engine Error from
+                    // index_into_key is the real zend diagnostic — keep it.
+                    return Err(e2);
                 }
             }
         }
@@ -2587,14 +2605,10 @@ impl<'a> Interp<'a> {
                                 Err(e) => Err(e),
                             }
                         }
-                        // Nested dim on a scalar is a Warning, not an Error
-                        // (engine_assignExecutionOrder_002) — write is skipped.
-                        Ok(bc) => {
-                            let t = bc.borrow().debug_type();
-                            drop(bc);
-                            self.warn(&format!("Cannot use {} as array", t))?;
-                            Ok(())
-                        }
+                        // Nested dim on a non-container: zend throws the
+                        // real engine Error ("Cannot use a scalar value
+                        // as an array" et al.) — keep it, don't downgrade.
+                        Ok(_) => Err(e2),
                         _ => Err(e2),
                     },
                 }
@@ -2707,8 +2721,28 @@ impl<'a> Interp<'a> {
             drop(b);
             self.index_cell_object(&c, key)
         } else {
+            let is_str = matches!(*b, Value::Str(_));
             drop(b);
-            self.fail(PhpError::fatal("Cannot use scalar value as an array", 0))
+            if is_str {
+                match key.map(|k| to_key(&k)) {
+                    Some(ArrKey::Str(_)) => self.fail(PhpError::uncaught(
+                        "TypeError",
+                        "Cannot access offset of type string on string",
+                        self.cur_line,
+                    )),
+                    _ => self.fail(PhpError::uncaught(
+                        "Error",
+                        "Cannot use string offset as an array",
+                        self.cur_line,
+                    )),
+                }
+            } else {
+                self.fail(PhpError::uncaught(
+                    "Error",
+                    "Cannot use a scalar value as an array",
+                    self.cur_line,
+                ))
+            }
         }
     }
 
@@ -2723,6 +2757,50 @@ impl<'a> Interp<'a> {
         let mut b = c.borrow_mut();
         if matches!(*b, Value::Null) {
             *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+        }
+        if let Value::Object(o) = &*b {
+            // `$o[k] =& $x`: spl ArrayObject storage binds `src` into the
+            // named bucket; everything else — userland ArrayAccess dims
+            // and the append form `$o[] =& $x` zend can't address — gets
+            // the indirect-modification notice then the assign-by-ref
+            // catchable Error.
+            let o = o.clone();
+            drop(b);
+            let spl_arr = if matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. })) {
+                Some(self.ao_arr(&o))
+            } else {
+                None
+            };
+            if let (Some(arr), Some(k)) = (spl_arr, &key) {
+                arr.borrow_mut().bind_cell(to_key(k), src);
+                return Ok(());
+            }
+            let cn = o.borrow().class.name().to_string();
+            self.notice(&format!(
+                "Indirect modification of overloaded element of {} has no effect",
+                cn
+            ))?;
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot assign by reference to an array dimension of an object",
+                self.cur_line,
+            ));
+        }
+        if let Value::Str(_) = &*b {
+            let k = key.map(|k| to_key(&k));
+            drop(b);
+            return match k {
+                Some(ArrKey::Str(_)) => self.fail(PhpError::uncaught(
+                    "TypeError",
+                    "Cannot access offset of type string on string",
+                    self.cur_line,
+                )),
+                _ => self.fail(PhpError::uncaught(
+                    "Error",
+                    "Cannot create references to/from string offsets",
+                    self.cur_line,
+                )),
+            };
         }
         if let Value::Array(_) = &mut *b {
             self.cow_split(&mut b);
@@ -2742,7 +2820,11 @@ impl<'a> Interp<'a> {
             Ok(())
         } else {
             drop(b);
-            self.fail(PhpError::fatal("Cannot use scalar value as an array", 0))
+            self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot use a scalar value as an array",
+                self.cur_line,
+            ))
         }
     }
 
@@ -2760,7 +2842,7 @@ impl<'a> Interp<'a> {
         // created silently inside offsetGet.
         let was = std::mem::replace(&mut self.dim_by_ref, true);
         let rv = self.method_invoke(
-            o,
+            o.clone(),
             "offsetGet",
             CallArgs::positional(vec![cell(key.unwrap_or(Value::Null))]),
         );
@@ -2770,7 +2852,18 @@ impl<'a> Interp<'a> {
                 self.mark_ref(&rc);
                 Ok(rc)
             }
-            None => Ok(cell(rv?)),
+            None => {
+                // offsetGet returned by value — the element can't be
+                // aliased, so writes through this fetch silently no-op
+                // (zend: "Indirect modification of overloaded element").
+                let v = rv?;
+                let cn = o.borrow().class.name().to_string();
+                self.notice(&format!(
+                    "Indirect modification of overloaded element of {} has no effect",
+                    cn
+                ))?;
+                Ok(cell(v))
+            }
         }
     }
 
