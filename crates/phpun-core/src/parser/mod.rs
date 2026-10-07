@@ -566,7 +566,7 @@ impl<'a> Parser<'a> {
             }
             Some(Token::Variable(s)) => format!("variable \"${}\"", s),
             Some(Token::Int(v)) => format!("integer \"{}\"", v),
-            Some(Token::Float(v)) => format!("float {}", v),
+            Some(Token::Float(v)) => format!("floating-point number \"{}\"", v),
             Some(Token::Op(o)) => format!("token \"{}\"", o),
             Some(_) => "token".to_string(),
         }
@@ -1058,7 +1058,7 @@ pub(in crate::parser) fn desc_t(t: Option<&Token>) -> String {
         Some(Token::Variable(s)) => format!("variable \"${}\"", s),
         Some(Token::Op(o)) => format!("token \"{}\"", o),
         Some(Token::Int(v)) => format!("integer \"{}\"", v),
-        Some(Token::Float(v)) => format!("float {}", v),
+        Some(Token::Float(v)) => format!("floating-point number \"{}\"", v),
         _ => "token".to_string(),
     }
 }

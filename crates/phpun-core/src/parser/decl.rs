@@ -333,11 +333,11 @@ impl<'a> Parser<'a> {
             let l = self.line();
             return match self.next() {
                 Some(Token::Variable(n)) => Ok(ForeachTarget::ByRef(n)),
+                // zend's `& variable` pair rejects non-variables with a
+                // bare `unexpected <tok>` (`foreach ($x as &5)` sites
+                // `unexpected integer "5"` — no "expecting" list).
                 t => Err(PhpError::parse(
-                    format!(
-                        "syntax error, unexpected {}, expecting variable",
-                        desc_t(t.as_ref())
-                    ),
+                    format!("syntax error, unexpected {}", desc_t(t.as_ref())),
                     l,
                 )),
             };

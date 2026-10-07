@@ -2532,10 +2532,10 @@ impl<'a> Parser<'a> {
                             continue;
                         }
                         let el = self.line();
-                        let e = if self.eat_op("&") {
+                        let e = if self.at_op("&") {
                             // `list(&$r)` — zend's array_pair accepts
                             // `&` elements exactly like `[&$r]`.
-                            Expr::ByRef(Box::new(Self::markline(self.expr()?, el)))
+                            self.array_elem()?
                         } else {
                             self.expr()?
                         };
@@ -2817,10 +2817,79 @@ impl<'a> Parser<'a> {
             let l = self.line();
             Ok(Expr::Unpack(Box::new(Self::markline(self.expr()?, l))))
         } else if self.eat_op("&") {
-            let l = self.line();
-            Ok(Expr::ByRef(Box::new(Self::markline(self.expr()?, l))))
+            self.ref_target_elem()
         } else {
             self.expr()
         }
+    }
+
+    /// `&` inside a `list()`/`[..]` element (zend's `& variable` pair):
+    /// the operand is a variable chain — `$v`, `$$v`, `$a[0]`, `$o->p`,
+    /// `f()->p`, `C::$s` — or a dereferencable base (`"s"`, `CONST`,
+    /// `(expr)`, `[...]`, `array(...)`, `new`) that MUST take at least
+    /// one `->`/`?->`/`[` continuation (`&"s"`/`&FOO`/`&(1)` are
+    /// `unexpected token "…", expecting "->" or "?->" or "["`). Number
+    /// literals, keywords and operators can't even start the operand
+    /// (`&5` → `unexpected integer "5"`, `&const` → `unexpected token
+    /// "const"`). A var/call-rooted operand ends at `,`/`]`/`)` —
+    /// anything else is the same "expecting continuation" error
+    /// (`&$x+1` → `unexpected token "+"`).
+    fn ref_target_elem(&mut self) -> Result<Expr, PhpError> {
+        let l = self.line();
+        let cont_err = |p: &Self| {
+            PhpError::parse(
+                format!(
+                    "syntax error, unexpected {}, expecting \"->\" or \"?->\" or \"[\"",
+                    crate::parser::desc_t(p.peek())
+                ),
+                p.line(),
+            )
+        };
+        match self.peek() {
+            Some(Token::Int(_)) | Some(Token::Float(_)) => {
+                return Err(PhpError::parse(
+                    format!(
+                        "syntax error, unexpected {}",
+                        crate::parser::desc_t(self.peek())
+                    ),
+                    l,
+                ));
+            }
+            Some(Token::Ident(n))
+                if crate::lexer::is_keyword(n)
+                    && !matches!(
+                        n.to_ascii_lowercase().as_str(),
+                        // `new`/`array` start dereferencable bases;
+                        // null/true/false parse as constants.
+                        "new" | "array" | "null" | "true" | "false"
+                    ) =>
+            {
+                return Err(PhpError::parse(
+                    format!(
+                        "syntax error, unexpected token \"{}\"",
+                        n.to_ascii_lowercase()
+                    ),
+                    l,
+                ));
+            }
+            _ => {}
+        }
+        let e = Self::markline(self.postfix()?, l);
+        let rooted = Self::rhs_var_or_call(&e);
+        let continued = matches!(
+            Self::unmark_argline_r(&e),
+            Expr::Index { .. } | Expr::Prop { .. } | Expr::MethodCall { .. }
+        );
+        if !rooted && !continued {
+            // Dereferencable without a continuation — `&"s"`, `&FOO`,
+            // `&(1)`, `&[$a]` — zend was still expecting `->`/`?->`/`[`.
+            return Err(cont_err(self));
+        }
+        // Operand complete: only `,`/`]`/`)` may follow (`&$x+1`,
+        // `&$x=>…`, `&$x.` all fail here with the continuation error).
+        if !matches!(self.peek(), Some(Token::Op("," | "]" | ")"))) {
+            return Err(cont_err(self));
+        }
+        Ok(Expr::ByRef(Box::new(e)))
     }
 }
