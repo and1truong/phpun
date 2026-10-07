@@ -264,7 +264,17 @@ fn run_script(args: &[String]) -> ExitCode {
     // `-r` code wins over an earlier `-f` file; with neither, php
     // reads stdin (pseudo-path "Standard input code").
     let (src, label): (String, &str) = match (&code, &file) {
-        (Some(code), _) => (code.clone(), "Command line code"),
+        (Some(code), f) => {
+            // The -f operand is still validated when -r wins — zend
+            // reports 'Could not open input file' for a missing one.
+            if let Some(f) = f {
+                if std::fs::File::open(f).is_err() {
+                    eprintln!("Could not open input file: {}", f);
+                    return ExitCode::FAILURE;
+                }
+            }
+            (code.clone(), "Command line code")
+        }
         (None, Some(file)) => match std::fs::read_to_string(file) {
             Ok(s) => (s, file.as_str()),
             Err(_) => {
