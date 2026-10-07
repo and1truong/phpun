@@ -5023,6 +5023,15 @@ impl<'a> Interp<'a> {
         }
         let lv = self.eval(l)?;
         let rv = self.eval(r)?;
+        if let Some(stamp) = self.scan_stamp {
+            // Same scanned-cond stamp as the CV-left path: the op
+            // sites at CG(zend_lineno) after the right operand's
+            // compile (a folded leaf there = subject-end stamp).
+            if let Some(l2) = self.unfold_tail_site(r, stamp) {
+                self.cur_line = l2;
+                self.send_line = Some(l2);
+            }
+        }
         Ok((lv, rv))
     }
 
