@@ -1,6 +1,7 @@
 //! Statement execution: `exec_block`/`exec` plus the loop and
 //! foreach drivers — the first seam a bytecode pipeline replaces.
 
+use super::expr::CondFold;
 use super::util::*;
 use super::*;
 
@@ -215,14 +216,73 @@ impl<'a> Interp<'a> {
                 body,
             } => self.exec_foreach(arr, key, val, body),
             Stmt::Switch { cond, cases } => {
-                // zend: a CV subject (bare or folded varvar) binds
-                // inside each case's CASE op — its read sites at the
-                // case cond's end line and warns once per compare
-                // evaluated; the jumptable SWITCH op reads it
-                // silently. With no real cases the subject is never
-                // read.
+                // zend compiles the subject once, then const-scans the
+                // case exprs L→R (`determine_switch_jumptable_type`):
+                // each foldable case rewrites to a zval stamped at the
+                // subject's compiled end line; the scan stops at the
+                // first that can't fold to an int/string zval. That
+                // scan decides both the SWITCH_* jumptable op AND the
+                // lineno of every CASE op zend still emits as a
+                // fallback — so whether or not the jumptable fires,
+                // a CV subject's warnings site per case at the case's
+                // scanned line (the SWITCH op itself reads an undef CV
+                // silently and falls through to the chain).
                 let cond_u = Self::unmark_rhs(cond);
                 let cv_subject = Self::is_cv(cond_u);
+                // CG(zend_lineno) after the subject's compile — where
+                // every folded case's stamped zval sites.
+                let subj_site = if cv_subject {
+                    Self::cv_site_of(cond, cond_u).unwrap_or(self.cur_line)
+                } else {
+                    match cond_u {
+                        Expr::Binary { .. } if is_compile_const(cond_u) => {
+                            Self::inner_end_line(cond)
+                                .map(|l| l + 1)
+                                .unwrap_or(self.cur_line)
+                        }
+                        Expr::Binary { .. } => Self::inner_end_line(cond).unwrap_or(self.cur_line),
+                        _ => Self::marked_line(cond).unwrap_or(self.cur_line),
+                    }
+                };
+                // The const scan's per-case compare line and operand
+                // — entries exist only for the scanned prefix; later
+                // cases fall back to their own end line. The operand
+                // differs from the case expr only when zend's scan
+                // spliced a `??`/`?:` survivor into the slot.
+                let mut sites: Vec<(usize, &Expr)> = Vec::with_capacity(cases.len());
+                'scan: for (c, _) in cases {
+                    let Some(ce) = c else { continue };
+                    match self.cond_fold(ce) {
+                        CondFold::Literal(e, v) => {
+                            sites.push((
+                                Self::marked_line(e)
+                                    .or_else(|| Self::inner_end_line(e))
+                                    .unwrap_or(subj_site),
+                                ce,
+                            ));
+                            if !matches!(v, Value::Int(_) | Value::Str(_)) {
+                                break 'scan;
+                            }
+                        }
+                        CondFold::Folded(v) => {
+                            sites.push((subj_site, ce));
+                            if !matches!(v, Value::Int(_) | Value::Str(_)) {
+                                break 'scan;
+                            }
+                        }
+                        CondFold::Unfolded(u) => {
+                            sites.push((
+                                Self::inner_end_line(u)
+                                    .or_else(|| Self::marked_line(u))
+                                    .or_else(|| Self::inner_end_line(ce))
+                                    .or_else(|| Self::marked_line(ce))
+                                    .unwrap_or(self.cur_line),
+                                u,
+                            ));
+                            break 'scan;
+                        }
+                    }
+                }
                 let cv: Option<Value> = if cv_subject {
                     None
                 } else {
@@ -234,54 +294,77 @@ impl<'a> Interp<'a> {
                 // Find first matching case (loose ==); default is fallback.
                 let mut start: Option<usize> = None;
                 let mut default_idx: Option<usize> = None;
+                let mut ci = 0;
                 for (i, (c, _)) in cases.iter().enumerate() {
                     match c {
                         Some(ce) => {
+                            let (cl, operand) = sites.get(ci).copied().unwrap_or_else(|| {
+                                (
+                                    Self::inner_end_line(ce)
+                                        .or_else(|| Self::marked_line(ce))
+                                        .unwrap_or(self.cur_line),
+                                    ce,
+                                )
+                            });
+                            ci += 1;
+                            self.cur_line = cl;
                             if start.is_none() {
-                                match self.eval(ce) {
-                                    Ok(v) => {
-                                        let cvv = match &cv {
-                                            Some(cv) => cv.clone(),
-                                            None => {
-                                                let cl = Self::inner_end_line(ce)
-                                                    .unwrap_or(self.cur_line);
-                                                match self.eval_cv_at(cond_u, cl) {
-                                                    Ok(v) => v,
-                                                    Err(e) => return self.err_flow(e),
-                                                }
-                                            }
-                                        };
-                                        // ZEND_CASE (TMP|VAR subjects) is
-                                        // noncommutative — subject stays
-                                        // left; CONST|CV subjects emit
-                                        // IS_EQUAL which pass_two
-                                        // commutative-swaps when the case
-                                        // operand ranks higher.
-                                        let r = compare_operand_rank(cond);
-                                        let (x, y) = if (r & 6) == 0 && r < compare_operand_rank(ce)
-                                        {
-                                            (&v, &cvv)
-                                        } else {
-                                            (&cvv, &v)
-                                        };
-                                        crate::value::clear_cmp_depth_err();
-                                        if compare(x, y) == Ordering::Equal {
-                                            start = Some(i);
-                                        }
-                                        if let Err(e) = self.emit_cmp_notices() {
-                                            return self.err_flow(e);
-                                        }
-                                        if crate::value::cmp_depth_err() {
-                                            if let Err(e) = self.fail::<()>(PhpError::uncaught(
-                                                "Error",
-                                                "Nesting level too deep - recursive dependency?",
-                                                self.cur_line,
-                                            )) {
-                                                return self.err_flow(e);
-                                            }
-                                        }
+                                // ZEND_CASE binds op1 (subject) then
+                                // op2 (case) inside the compare op:
+                                // a CV case's own read sites there —
+                                // its warn follows the subject's bind.
+                                // Other cases emit their ops first.
+                                let cu = Self::unmark_rhs(operand);
+                                let (v, cvv) = if cv.is_none() && Self::is_cv(cu) {
+                                    let cvv = match self.eval_cv_at(cond_u, cl) {
+                                        Ok(v) => v,
+                                        Err(e) => return self.err_flow(e),
+                                    };
+                                    match self.eval(operand) {
+                                        Ok(v) => (v, cvv),
+                                        Err(e) => return self.err_flow(e),
                                     }
-                                    Err(e) => return self.err_flow(e),
+                                } else {
+                                    let v = match self.eval(operand) {
+                                        Ok(v) => v,
+                                        Err(e) => return self.err_flow(e),
+                                    };
+                                    let cvv = match &cv {
+                                        Some(cv) => cv.clone(),
+                                        None => match self.eval_cv_at(cond_u, cl) {
+                                            Ok(v) => v,
+                                            Err(e) => return self.err_flow(e),
+                                        },
+                                    };
+                                    (v, cvv)
+                                };
+                                // ZEND_CASE (TMP|VAR subjects) is
+                                // noncommutative — subject stays
+                                // left; CONST|CV subjects emit
+                                // IS_EQUAL which pass_two
+                                // commutative-swaps when the case
+                                // operand ranks higher.
+                                let r = compare_operand_rank(cond);
+                                let (x, y) = if (r & 6) == 0 && r < compare_operand_rank(ce) {
+                                    (&v, &cvv)
+                                } else {
+                                    (&cvv, &v)
+                                };
+                                crate::value::clear_cmp_depth_err();
+                                if compare(x, y) == Ordering::Equal {
+                                    start = Some(i);
+                                }
+                                if let Err(e) = self.emit_cmp_notices() {
+                                    return self.err_flow(e);
+                                }
+                                if crate::value::cmp_depth_err() {
+                                    if let Err(e) = self.fail::<()>(PhpError::uncaught(
+                                        "Error",
+                                        "Nesting level too deep - recursive dependency?",
+                                        self.cur_line,
+                                    )) {
+                                        return self.err_flow(e);
+                                    }
                                 }
                             }
                         }

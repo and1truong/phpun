@@ -44,6 +44,31 @@ fn leading_src_lines(src: &str) -> usize {
     lines
 }
 
+/// One match/switch cond's shape after zend's compile-time const
+/// scan (`zend_eval_const_expr` inside the jumptable probes) — see
+/// `Interp::cond_fold`.
+pub(in crate::interp) enum CondFold<'a> {
+    /// Already a zval — the compare keeps this node's own token line
+    /// (the scanned expr carries its `argline` marker).
+    Literal(&'a Expr, Value),
+    /// Folded to a zval stamped at the subject's compiled-end line.
+    Folded(Value),
+    /// Didn't fold — ends the const scan. The node is what remains in
+    /// the cond slot: zend_eval_const_expr splices the surviving `??`
+    /// /`?:` branch INTO it, so the compare's operand is that child
+    /// (a CV there binds inside the compare like any other).
+    Unfolded(&'a Expr),
+}
+
+impl CondFold<'_> {
+    fn value(&self) -> &Value {
+        match self {
+            CondFold::Literal(_, v) | CondFold::Folded(v) => v,
+            CondFold::Unfolded(_) => &Value::Null,
+        }
+    }
+}
+
 impl<'a> Interp<'a> {
     // ----- expressions -----
 
@@ -458,29 +483,83 @@ impl<'a> Interp<'a> {
                 }
             }
             Expr::Match { subject, arms } => {
-                // zend: all-const int/str conds && ≥2 total → a single
-                // MATCH op reads the subject at the subject's own line.
-                // Otherwise a CV subject (bare or folded varvar) binds
-                // inside each compare op — its read sites at each
-                // cond's end line, warning once per evaluated compare.
-                // With no non-default conds the subject is never read.
+                // zend compiles the subject once, then const-scans the
+                // conds L→R (`can_match_use_jumptable` — the same scan
+                // that picks the MATCH jumptable): each foldable cond
+                // rewrites to a zval stamped with CG(zend_lineno) —
+                // the subject's compiled end line — and the scan stops
+                // at the first cond that can't fold to an int/string
+                // zval. Everything qualifies and ≥2 conds → a single
+                // MATCH op binds the subject at its own line. Otherwise
+                // a CV subject binds inside each CASE op — warning once
+                // per evaluated compare at the cond's scan line.
                 let num_conds: usize = arms.iter().map(|a| a.conds.len()).sum();
-                let jumptable = num_conds >= 2
-                    && arms.iter().all(|a| {
-                        a.conds.iter().all(|c| {
-                            is_compile_const(Self::unmark_rhs(c))
-                                && matches!(
-                                    self.eval_const(Self::unmark_rhs(c)),
-                                    Ok(Value::Int(_) | Value::Str(_))
-                                )
-                        })
-                    });
                 let subj_u = Self::unmark_rhs(subject);
                 let cv_subject = Self::is_cv(subj_u);
-                // A jumptable MATCH op binds a CV subject at the CV's
-                // own site (a folded varvar's inner name line, a plain
-                // var's first-token line).
                 let cv_site = Self::cv_site_of(subject, subj_u).unwrap_or(self.cur_line);
+                // CG(zend_lineno) after the subject's compile — where
+                // every folded cond's stamped zval sites.
+                let subj_site = if cv_subject {
+                    cv_site
+                } else {
+                    match subj_u {
+                        // TYPE_CHECK sites on a non-CV subject: const-
+                        // folded binaries site one past their end.
+                        Expr::Binary { .. } if is_compile_const(subj_u) => {
+                            Self::inner_end_line(subject)
+                                .map(|l| l + 1)
+                                .unwrap_or(self.cur_line)
+                        }
+                        Expr::Binary { .. } => {
+                            Self::inner_end_line(subject).unwrap_or(self.cur_line)
+                        }
+                        _ => Self::marked_line(subject).unwrap_or(self.cur_line),
+                    }
+                };
+                // The const scan's per-cond compare line and operand
+                // — only entries for the scanned prefix exist; later
+                // conds fall back to their own end line. The operand
+                // differs from the cond only when zend's scan spliced
+                // a `??`/`?:` survivor into the slot.
+                let mut sites: Vec<(usize, &Expr)> = Vec::with_capacity(num_conds);
+                let mut jumptable = num_conds >= 2;
+                'scan: for arm in arms {
+                    for c in &arm.conds {
+                        match self.cond_fold(c) {
+                            CondFold::Literal(e, v) => {
+                                sites.push((
+                                    Self::marked_line(e)
+                                        .or_else(|| Self::inner_end_line(e))
+                                        .unwrap_or(subj_site),
+                                    c,
+                                ));
+                                if !matches!(v, Value::Int(_) | Value::Str(_)) {
+                                    jumptable = false;
+                                    break 'scan;
+                                }
+                            }
+                            CondFold::Folded(v) => {
+                                sites.push((subj_site, c));
+                                if !matches!(v, Value::Int(_) | Value::Str(_)) {
+                                    jumptable = false;
+                                    break 'scan;
+                                }
+                            }
+                            CondFold::Unfolded(u) => {
+                                sites.push((
+                                    Self::inner_end_line(u)
+                                        .or_else(|| Self::marked_line(u))
+                                        .or_else(|| Self::inner_end_line(c))
+                                        .or_else(|| Self::marked_line(c))
+                                        .unwrap_or(self.cur_line),
+                                    u,
+                                ));
+                                jumptable = false;
+                                break 'scan;
+                            }
+                        }
+                    }
+                }
                 let sv: Option<Value> = if jumptable {
                     Some(if cv_subject {
                         self.eval_cv_at(subj_u, cv_site)?
@@ -494,50 +573,49 @@ impl<'a> Interp<'a> {
                 };
                 let mut default: Option<&Expr> = None;
                 let mut last_cmp = self.cur_line;
+                let mut ci = 0;
                 for arm in arms {
                     if arm.conds.is_empty() {
                         default = Some(&arm.result);
                         continue;
                     }
                     for c in &arm.conds {
-                        // TYPE_CHECK conds (null/bool/const array) bind
-                        // the CV at the subject's own line; other
-                        // conds' compare ops bind it at the cond's end
-                        // line. A non-CV subject's TYPE_CHECK line is
-                        // its compiled end line. MATCH_ERROR sites at
-                        // the last compare op's lineno (zend_lineno
-                        // stays there when MATCH_ERROR emits).
-                        let cu = Self::unmark_rhs(c);
-                        let tc = matches!(cu, Expr::Null | Expr::Bool(_))
-                            || matches!(cu, Expr::ArrayLit(..) if is_compile_const(cu));
-                        let cl = if !tc {
-                            Self::inner_end_line(c).unwrap_or(self.cur_line)
-                        } else if cv_subject {
-                            cv_site
-                        } else {
-                            // TYPE_CHECK on a non-CV subject sites at
-                            // the subject's first token — const-folded
-                            // binaries site one past their end.
-                            match subj_u {
-                                Expr::Binary { .. } if is_compile_const(subj_u) => {
-                                    Self::inner_end_line(subject)
-                                        .map(|l| l + 1)
-                                        .unwrap_or(self.cur_line)
-                                }
-                                Expr::Binary { .. } => {
-                                    Self::inner_end_line(subject).unwrap_or(self.cur_line)
-                                }
-                                _ => Self::marked_line(subject).unwrap_or(self.cur_line),
-                            }
-                        };
+                        // Folded conds' compares site at the subject's
+                        // compiled end (their stamped zval); unfolded
+                        // conds at their own end line. MATCH_ERROR
+                        // sites at the last compare op's lineno.
+                        let (cl, operand) = sites.get(ci).copied().unwrap_or_else(|| {
+                            (
+                                Self::inner_end_line(c)
+                                    .or_else(|| Self::marked_line(c))
+                                    .unwrap_or(self.cur_line),
+                                c,
+                            )
+                        });
+                        ci += 1;
                         last_cmp = cl;
-                        let cv = self.eval(c)?;
-                        // A deferred CV subject is read inside THIS
-                        // compare op — a fresh read each time (zend's
-                        // CV operand binds per op: warns per cond line).
-                        let svv = match &sv {
-                            Some(sv) => sv.clone(),
-                            None => self.eval_cv_at(subj_u, cl)?,
+                        self.cur_line = cl;
+                        // IS_IDENTICAL binds op1 (subject) then op2
+                        // (cond) inside the compare op: a CV cond's
+                        // read happens there too, so its warn follows
+                        // the subject's. Any other cond emits its own
+                        // ops first — its warnings precede the bind.
+                        let cu = Self::unmark_rhs(operand);
+                        let (cv, svv) = if sv.is_none() && Self::is_cv(cu) {
+                            let svv = self.eval_cv_at(subj_u, cl)?;
+                            let cv = self.eval(operand)?;
+                            (cv, svv)
+                        } else {
+                            let cv = self.eval(operand)?;
+                            // A deferred CV subject is read inside THIS
+                            // compare op — a fresh read each time
+                            // (zend's CV operand binds per op: warns
+                            // per cond line).
+                            let svv = match &sv {
+                                Some(sv) => sv.clone(),
+                                None => self.eval_cv_at(subj_u, cl)?,
+                            };
+                            (cv, svv)
                         };
                         crate::value::clear_cmp_depth_err();
                         // ZEND_CASE_STRICT (TMP|VAR subjects) is
@@ -1644,6 +1722,166 @@ impl<'a> Interp<'a> {
         let r = self.eval(e);
         self.vv_rhs_site = prev;
         r
+    }
+
+    /// What zend's compile-time const scan (`zend_eval_const_expr`,
+    /// run by `can_match_use_jumptable`/`determine_switch_jumptable_type`
+    /// before the compare loop) makes of one match/switch cond:
+    /// - `Literal(node, v)` — already a zval (a scalar literal, or a
+    ///   concat zend's parser folded keeping op1's line): the compare
+    ///   op keeps the node's own token line. `v` is the zval's value
+    ///   for the int/string continuation check.
+    /// - `Folded(v)` — rewrote to a fresh zval stamped with
+    ///   `CG(zend_lineno)` at scan time — the subject's compiled end
+    ///   line — and the compare sites there.
+    /// - `Unfolded` — stays an expr: the scan stops and the compare
+    ///   sites at the cond's own end line.
+    ///
+    /// `??`/`?:` splice: their surviving branch classifies instead —
+    /// `zend_eval_const_expr` applies to it first, so a folded branch
+    /// carries the subject stamp while a literal one keeps its own
+    /// line.
+    pub(in crate::interp) fn cond_fold<'e>(&mut self, e: &'e Expr) -> CondFold<'e> {
+        let u = Self::unmark_rhs(e);
+        match u {
+            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) => match self.eval_const(u) {
+                Ok(v) => CondFold::Literal(e, v),
+                Err(_) => CondFold::Unfolded(e),
+            },
+            Expr::Interp(parts) if parts.iter().all(|p| matches!(p, StringPart::Lit(_))) => {
+                match self.eval_const(u) {
+                    Ok(v) => CondFold::Literal(e, v),
+                    Err(_) => CondFold::Unfolded(e),
+                }
+            }
+            Expr::Binary { op: ".", l, r } if Self::zval_lit(l) && Self::zval_lit(r) => {
+                // zend_ast_create_concat_op folds at parse — the
+                // resulting zval keeps op1's lexer line, i.e. the
+                // cond behaves like a literal.
+                match self.eval_const(u) {
+                    Ok(v) => CondFold::Literal(e, v),
+                    Err(_) => CondFold::Unfolded(e),
+                }
+            }
+            Expr::Null | Expr::Bool(_) => self.fold_eval(e),
+            Expr::MagicConst(_) => {
+                // `__LINE__` reads cur_line — evaluate it at the
+                // cond's own marker line like zend's parse.
+                let l = Self::marked_line(e).unwrap_or(self.cur_line);
+                let prev = self.cur_line;
+                self.cur_line = l;
+                let r = self.eval_const(u);
+                self.cur_line = prev;
+                match r {
+                    Ok(v) => CondFold::Folded(v),
+                    Err(_) => CondFold::Unfolded(e),
+                }
+            }
+            Expr::Const(n) if self.foldable_const(n) => self.fold_eval(e),
+            Expr::Index {
+                e: arr,
+                i: Some(dim),
+            } if self.foldable_shape(Self::unmark_rhs(arr))
+                && self.foldable_shape(Self::unmark_rhs(dim)) =>
+            {
+                // zend's DIM fold only resolves when the key exists —
+                // a miss stays unfolded (and must not warn here).
+                self.silence += 1;
+                let r = self.eval_const(u);
+                self.silence -= 1;
+                match r {
+                    Ok(v) if !matches!(v, Value::Null) => CondFold::Folded(v),
+                    _ => CondFold::Unfolded(e),
+                }
+            }
+            Expr::Binary { op: "??", l, r } => match self.cond_fold(l) {
+                // The lhs couldn't reduce to a zval — `??` stays,
+                // the whole cond is the compare's operand.
+                CondFold::Unfolded(_) => CondFold::Unfolded(e),
+                k => match k.value() {
+                    // Null lhs splices the (already scanned) rhs into
+                    // the cond slot.
+                    Value::Null => self.cond_fold(r),
+                    _ => k,
+                },
+            },
+            Expr::Ternary { c, t, f } => match self.cond_fold(c) {
+                CondFold::Unfolded(_) => CondFold::Unfolded(e),
+                k => {
+                    if k.value().is_truthy() {
+                        match t {
+                            Some(t) => self.cond_fold(t),
+                            // `?:` splices the (already scanned) cond.
+                            None => k,
+                        }
+                    } else {
+                        self.cond_fold(f)
+                    }
+                }
+            },
+            _ if self.foldable_shape(u) => {
+                // ClassConst/Index lookups can legitimately miss at
+                // compile time — suppress their diagnostics for the
+                // speculative scan (a miss stays unfolded anyway).
+                self.silence += 1;
+                let r = self.eval_const(u);
+                self.silence -= 1;
+                match r {
+                    Ok(v) => CondFold::Folded(v),
+                    Err(_) => CondFold::Unfolded(e),
+                }
+            }
+            _ => CondFold::Unfolded(e),
+        }
+    }
+
+    /// What zend_eval_const_expr can reduce to a zval: pure compile
+    /// consts plus const fetches zend resolves at compile time —
+    /// engine/user constants, class constants, magic constants and
+    /// const-array dims.
+    fn foldable_shape(&self, e: &Expr) -> bool {
+        match Self::unmark_rhs(e) {
+            Expr::Const(n) => self.foldable_const(n),
+            Expr::ClassConst { .. } | Expr::MagicConst(_) => true,
+            Expr::Index { e: arr, i: Some(d) } => {
+                self.foldable_shape(arr) && self.foldable_shape(d)
+            }
+            Expr::Binary { l, r, .. } => self.foldable_shape(l) && self.foldable_shape(r),
+            Expr::Unary { e, .. } | Expr::Cast { e, .. } | Expr::Paren(e) => self.foldable_shape(e),
+            Expr::ArrayLit(items) => items.iter().all(|(k, v)| {
+                k.as_ref().map(|k| self.foldable_shape(k)).unwrap_or(true) && self.foldable_shape(v)
+            }),
+            _ => is_compile_const(e),
+        }
+    }
+
+    /// A constant name zend's const fetch could resolve while
+    /// compiling this file — the engine constants present in the
+    /// table at compile start. User `const` decls and `define` calls
+    /// are runtime ops: their names can't fold a cond even though
+    /// the interp's table holds them by the time it runs.
+    fn foldable_const(&self, n: &str) -> bool {
+        self.engine_consts.contains(n.trim_start_matches('\\'))
+    }
+
+    /// A plain zval in zend's AST: scalar literals and literal-only
+    /// concats (which `zend_ast_create_concat_op` folds at parse).
+    fn zval_lit(e: &Expr) -> bool {
+        match Self::unmark_rhs(e) {
+            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) => true,
+            Expr::Interp(parts) => parts.iter().all(|p| matches!(p, StringPart::Lit(_))),
+            Expr::Binary { op: ".", l, r } => Self::zval_lit(l) && Self::zval_lit(r),
+            _ => false,
+        }
+    }
+
+    /// A compile-foldable cond evaluates to a fresh stamped zval —
+    /// or stays unfolded when the const eval can't resolve it.
+    fn fold_eval<'e>(&mut self, e: &'e Expr) -> CondFold<'e> {
+        match self.eval_const(e) {
+            Ok(v) => CondFold::Folded(v),
+            Err(_) => CondFold::Unfolded(e),
+        }
     }
 
     fn assign(
@@ -3305,7 +3543,7 @@ impl<'a> Interp<'a> {
     }
 
     /// The line a sub-expression's `argline` marker records, if any.
-    fn marked_line(e: &Expr) -> Option<usize> {
+    pub(in crate::interp) fn marked_line(e: &Expr) -> Option<usize> {
         match e {
             Expr::Binary {
                 op: "argline", l, ..
