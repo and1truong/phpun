@@ -473,7 +473,41 @@ impl<'a> Interp<'a> {
                     Flow::Break(_) | Flow::Continue(_) | Flow::Goto(_) => unreachable!(),
                 }
             }
-            Err(e) => {
+            Err(mut e) => {
+                if e.kind != ErrorKind::Parse {
+                    // Engine compile checks raised while compiling
+                    // eval'd code (destructure writability verify,
+                    // write-context gates, ...) are E_COMPILE_ERRORs
+                    // in Zend — uncatchable, attributed
+                    // `FILE(N) : eval()'d code`, carrying the
+                    // compile-context backtrace with the eval frame
+                    // itself dropped like the exec-time gates below.
+                    self.call_trace.push(TraceFrame {
+                        function: "eval".to_string(),
+                        class: None,
+                        ty: String::new(),
+                        file: self.cur_file.clone(),
+                        line: self.cur_line as u32,
+                        args: Vec::new(),
+                        named_args: Vec::new(),
+                        internal: true,
+                        visible: true,
+                        named_dispatch: false,
+                    });
+                    self.last_err_file =
+                        format!("{}({}) : eval()'d code", self.cur_file, self.cur_line);
+                    e.trace = Some(self.compile_err_frames());
+                    self.call_trace.pop();
+                    self.print_fatal(&e);
+                    return Err(PhpError {
+                        trace: None,
+                        thrown_line: None,
+                        display_msg: None,
+                        kind: ErrorKind::Fatal,
+                        message: "\u{1}exit:255".into(),
+                        line: 0,
+                    });
+                }
                 let msg = e.message.clone();
                 let v = self.exception("ParseError", &msg);
                 if let Value::Object(o) = &v {
