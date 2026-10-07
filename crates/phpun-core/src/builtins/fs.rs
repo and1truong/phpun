@@ -831,6 +831,7 @@ pub(crate) fn dispatch(
                     // with empty input + the closing flag, writes the
                     // trailing bytes, then calls onClose on every
                     // php_user_filter (userfilter_dtor).
+                    let mut close_err: Option<PhpError> = None;
                     if let Some(filters) = it.stream_filters.get(&id).cloned() {
                         if filters.iter().any(|f| f.write) {
                             drop(rb);
@@ -838,8 +839,13 @@ pub(crate) fn dispatch(
                             // stream zval is still live — ->stream is
                             // the real resource on this call (zend
                             // only NULLs it at request-shutdown frees).
+                            // A filter exception still frees the chain
+                            // (php_stream_free completes under a pending
+                            // exception): capture it, tear down below,
+                            // then re-raise so shutdown does not re-run
+                            // the close.
                             let sv = Value::Resource(r.clone());
-                            let (out, _) = run_filter_chain(
+                            match run_filter_chain(
                                 it,
                                 id,
                                 &sv,
@@ -848,9 +854,13 @@ pub(crate) fn dispatch(
                                 true,
                                 false,
                                 &mut None,
-                            )?;
-                            if !out.is_empty() {
-                                let _ = write_resource_raw(it, r, &out)?;
+                            ) {
+                                Ok((out, _)) => {
+                                    if !out.is_empty() {
+                                        let _ = write_resource_raw(it, r, &out);
+                                    }
+                                }
+                                Err(e) => close_err = Some(e),
                             }
                             rb = r.borrow_mut();
                         }
@@ -891,6 +901,9 @@ pub(crate) fn dispatch(
                             let mut fb = fres.borrow_mut();
                             *fb = PhpResource::Closed { id: fid };
                         }
+                    }
+                    if let Some(e) = close_err {
+                        return Err(e);
                     }
                 }
             }
@@ -7260,8 +7273,12 @@ pub(crate) fn stream_dtor_flush(
     let Some(filters) = it.stream_filters.get(&sid).cloned() else {
         return Ok(());
     };
+    // The closing flush's error must not bail before teardown —
+    // php_stream_free completes under a pending exception, and a
+    // half-torn chain re-runs the close at the next teardown pass.
+    let mut close_err: Option<PhpError> = None;
     if filters.iter().any(|f| f.write) {
-        let (out, _) = run_filter_chain(
+        match run_filter_chain(
             it,
             sid,
             &Value::Null,
@@ -7270,9 +7287,13 @@ pub(crate) fn stream_dtor_flush(
             true,
             false,
             &mut None,
-        )?;
-        if !out.is_empty() {
-            let _ = write_resource_raw(it, r, &out);
+        ) {
+            Ok((out, _)) => {
+                if !out.is_empty() {
+                    let _ = write_resource_raw(it, r, &out);
+                }
+            }
+            Err(e) => close_err = Some(e),
         }
     }
     for f in &filters {
@@ -7298,7 +7319,10 @@ pub(crate) fn stream_dtor_flush(
             *fb = PhpResource::Closed { id: fid };
         }
     }
-    Ok(())
+    match close_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Filtered fgets over an in-memory store (Mem/Input unspilled).
