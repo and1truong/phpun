@@ -4789,8 +4789,26 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
+                // The OUTERMOST gen-body frame in the construction
+                // stack: everything at/below it is the eager run's
+                // drive — engine resumes (`IteratorIterator->rewind()`
+                // and friends) leave real method frames there citing
+                // the FIRST resume, and a `Generator->{m}()` push
+                // cites its own call site. Zend constructs the
+                // throwable inside the CURRENT resume, so its stored
+                // stack only ever holds the live drive — drop that
+                // prefix and let `frames` supply it. Nested-gen
+                // bodies sit BETWEEN the outermost body and the
+                // construction point: they keep their suspended
+                // call/drain frames (`f()`, `It->getIterator()` in
+                // gh15275).
+                let cut = cframes
+                    .iter()
+                    .position(|f| f.gen_body)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
                 let mut parts: Vec<String> = Vec::new();
-                for fr in cframes.clone().iter().rev() {
+                for fr in cframes.clone()[cut..].iter().rev() {
                     if crate::value::trace_frame_hidden(fr) {
                         continue;
                     }
@@ -5008,6 +5026,7 @@ impl<'a> Interp<'a> {
             named_dispatch: !args.named.is_empty()
                 && matches!(name, "call_user_func" | "call_user_func_array"),
             gen_resume: false,
+            gen_body: false,
         });
         if name == "assert" {
             // AssertionError message = `assert(<args>)` as written.

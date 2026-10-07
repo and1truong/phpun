@@ -1607,6 +1607,10 @@ pub struct TraceFrame {
     /// the CURRENT resume — a stale resumer frame drops out of the
     /// rewritten trace (the live resume stack supplies the real one).
     pub gen_resume: bool,
+    /// The generator BODY's own frame. A throwable constructed inside
+    /// the body snapshots the drive stack that ran it below this
+    /// frame — stale resume context the deferred rewrite drops.
+    pub gen_body: bool,
 }
 
 /// Shared storage slot for spl array-objects — zend's `intern->array`

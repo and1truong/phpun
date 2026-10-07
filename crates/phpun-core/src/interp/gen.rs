@@ -1098,7 +1098,31 @@ impl<'a> Interp<'a> {
         // A userland `Generator->{m}()` is a real call — Zend emits
         // its frame in backtraces (`FILE(n): Generator->send(5)`);
         // engine-driven resumes (foreach/iterator_*) aren't calls.
-        let userland = self.iter_calls == 0 && self.gen_internal_resume == 0;
+        // The SPL iterator-wrapper stubs are plain-PHP stand-ins for
+        // Zend's C-level delegation — `IteratorIterator->next()`
+        // driving the inner generator isn't a userland call either,
+        // so it emits neither the resume frame nor its `eval()'d
+        // code` pseudo-site.
+        const SPL_PRELUDE_CLASSES: &[&str] = &[
+            "OuterIterator",
+            "IteratorIterator",
+            "FilterIterator",
+            "RecursiveFilterIterator",
+            "CallbackFilterIterator",
+            "RecursiveIteratorIterator",
+            "AppendIterator",
+        ];
+        let caller_is_spl_stub = self
+            .stack
+            .last()
+            .and_then(|f| f.decl_class.as_ref())
+            .map(|c| {
+                SPL_PRELUDE_CLASSES
+                    .iter()
+                    .any(|n| c.name().eq_ignore_ascii_case(n))
+            })
+            .unwrap_or(false);
+        let userland = self.iter_calls == 0 && self.gen_internal_resume == 0 && !caller_is_spl_stub;
         if userland {
             self.call_trace.push(TraceFrame {
                 function: name.to_string(),
@@ -1116,6 +1140,7 @@ impl<'a> Interp<'a> {
                 visible: true,
                 named_dispatch: false,
                 gen_resume: true,
+                gen_body: false,
             });
         }
         let saved_site = self.gen_resume_site;
