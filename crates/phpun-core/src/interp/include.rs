@@ -266,8 +266,16 @@ impl<'a> Interp<'a> {
             .stack
             .last_mut()
             .map(|f| f.statics_unit.replace(self.cur_unit_id));
+        // A compile diagnostic's handler runs at THIS include's callsite.
+        let saved_callsite = self
+            .compile_callsite
+            .replace((saved_file.clone(), saved_line as u32));
+        // yield_gate applies per-unit: a top-level yield in included
+        // code is invalid even when the includer is itself a generator
+        // body — Zend compiles each unit with its own function context.
         let flow = match Self::const_closure_gate(&stmts)
             .and_then(|_| self.flow_gate(&stmts))
+            .and_then(|_| Self::yield_gate(&stmts))
             .and_then(|_| self.hoist_funcs(&stmts))
         {
             Err(mut e) => {
@@ -290,6 +298,7 @@ impl<'a> Interp<'a> {
             }
             Ok(()) => self.exec_block(&stmts),
         };
+        self.compile_callsite = saved_callsite;
         self.loop_depth = saved_depth;
         self.cur_unit_id = saved_unit;
         if let Some(su) = saved_su {
@@ -390,6 +399,13 @@ impl<'a> Interp<'a> {
                 let site_file = self.diag_file();
                 let eval_ctx = format!("{}({}) : eval()'d code", site_file, self.cur_line);
                 let saved_file = std::mem::replace(&mut self.cur_file, eval_ctx);
+                // eval'd top-level stmts execute in the caller's frame —
+                // attribution (throwable file, __FILE__) reads the frame's
+                // file, so it swaps to the eval context like include() does.
+                let saved_frame_file = self
+                    .stack
+                    .last_mut()
+                    .map(|f| std::mem::replace(&mut f.file, self.cur_file.clone()));
                 // eval'd code is its own compile unit — `break`/`continue`
                 // operands count only ITS enclosing loop/switch contexts.
                 let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
@@ -419,8 +435,15 @@ impl<'a> Interp<'a> {
                     named_args: Vec::new(),
                     internal: true,
                 });
+                // A compile diagnostic's handler runs at THIS eval()'s callsite.
+                let saved_callsite = self
+                    .compile_callsite
+                    .replace((saved_file.clone(), saved_line as u32));
                 let flow = match Self::const_closure_gate(&stmts)
                     .and_then(|_| self.flow_gate(&stmts))
+                    // eval'd code is its own compile unit — a top-level
+                    // yield fatals even when the caller is a generator.
+                    .and_then(|_| Self::yield_gate(&stmts))
                     // eval'd code early-binds its unconditional decls
                     // like any compile unit (`eval('a(); function a(){}')`
                     // works; a collision is a compile fatal here).
@@ -444,6 +467,7 @@ impl<'a> Interp<'a> {
                     }
                     Ok(()) => self.exec_block(&stmts),
                 };
+                self.compile_callsite = saved_callsite;
                 self.loop_depth = saved_depth;
                 self.cur_unit_id = saved_unit;
                 if let Some(su) = saved_su {
@@ -480,6 +504,11 @@ impl<'a> Interp<'a> {
                 self.call_trace.pop();
                 self.cur_line = saved_line;
                 self.cur_file = saved_file;
+                if let Some(old) = saved_frame_file {
+                    if let Some(f) = self.stack.last_mut() {
+                        f.file = old;
+                    }
+                }
                 match flow {
                     Flow::Return(v) => Ok(v),
                     Flow::Normal => Ok(Value::Null),

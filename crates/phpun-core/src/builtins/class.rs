@@ -76,11 +76,35 @@ pub(crate) fn dispatch(
             }
             _ => Value::Bool(false),
         },
-        "get_class" => match arg(args, 0) {
-            // zend returns the INTERNAL class name — anon classes keep
-            // their `\0file:line$seq` mangled suffix.
-            Value::Object(o) => Value::str(o.borrow().class.decl.name.clone()),
-            _ => Value::Bool(false),
+        "get_class" => match args.first() {
+            Some(c) => match &*c.borrow() {
+                // zend returns the INTERNAL class name — anon classes keep
+                // their `\0file:line$seq` mangled suffix.
+                Value::Object(o) => Value::str(o.borrow().class.decl.name.clone()),
+                v => {
+                    return err(
+                        "TypeError",
+                        format!(
+                            "get_class(): Argument #1 ($object) must be of type object, {} given",
+                            zval_word(v)
+                        ),
+                    )
+                }
+            },
+            // zend fetches the executing class scope: deprecated inside
+            // a method (the method's DECLARING class), Error outside.
+            None => match it.executed_scope_name() {
+                Some(n) => {
+                    it.deprecated_pub("Calling get_class() without arguments is deprecated")?;
+                    Value::str(n)
+                }
+                None => {
+                    return err(
+                        "Error",
+                        "get_class() without arguments must be called from within a class",
+                    )
+                }
+            },
         },
         "get_parent_class" => match arg(args, 0) {
             Value::Object(o) => match &o.borrow().class.decl.parent {

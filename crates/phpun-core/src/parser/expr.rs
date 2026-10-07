@@ -36,6 +36,7 @@ impl<'a> Parser<'a> {
             self.expect_op("(")?;
             while !self.at_op(")") {
                 let by_ref = self.eat_op("&");
+                let l = self.line();
                 match self.next() {
                     Some(Token::Variable(n)) => uses.push((n, by_ref)),
                     t => {
@@ -44,7 +45,7 @@ impl<'a> Parser<'a> {
                                 "syntax error, unexpected {}, expecting variable",
                                 desc_t(t.as_ref())
                             ),
-                            self.line(),
+                            l,
                         ))
                     }
                 }
@@ -57,13 +58,13 @@ impl<'a> Parser<'a> {
             let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
             for (n, _) in &uses {
                 if n == "GLOBALS" {
-                    return Err(PhpError::fatal(
+                    return Err(PhpError::compile_fatal(
                         "Cannot use auto-global as lexical variable",
                         self.prev_line(),
                     ));
                 }
                 if !seen.insert(n.as_str()) {
-                    return Err(PhpError::fatal(
+                    return Err(PhpError::compile_fatal(
                         format!("Cannot use variable ${} twice", n),
                         self.prev_line(),
                     ));
@@ -71,7 +72,7 @@ impl<'a> Parser<'a> {
             }
             for (n, _) in &uses {
                 if params.iter().any(|p| p.name == *n) {
-                    return Err(PhpError::fatal(
+                    return Err(PhpError::compile_fatal(
                         format!("Cannot use lexical variable ${} as a parameter name", n),
                         self.prev_line(),
                     ));
@@ -310,6 +311,7 @@ impl<'a> Parser<'a> {
                 };
                 self.check_prop_ty(&pty, pline)?;
                 loop {
+                    let pl = self.line();
                     let pname = match self.next() {
                         Some(Token::Variable(n)) => n,
                         t => {
@@ -318,7 +320,7 @@ impl<'a> Parser<'a> {
                                     "syntax error, unexpected {}, expecting variable",
                                     desc_t(t.as_ref())
                                 ),
-                                self.line(),
+                                pl,
                             ))
                         }
                     };
@@ -522,7 +524,7 @@ impl<'a> Parser<'a> {
         self.pos += 1; // match
         self.expect_op("(")?;
         let subject = self.expr()?;
-        self.expect_op(")")?;
+        self.expect_group(")")?;
         self.expect_op("{")?;
         let mut arms = Vec::new();
         while !self.at_op("}") {
@@ -1153,10 +1155,12 @@ impl<'a> Parser<'a> {
             // → return-value fatal, `++"s"[0]`/`++new C()->x` →
             // temporary-expression fatal, `++$x?->y` → nullsafe fatal).
             let e = self.ref_variable(true)?;
+
             return Ok(Expr::PreInc(Box::new(e)));
         }
         if self.eat_op("--") {
             let e = self.ref_variable(true)?;
+
             return Ok(Expr::PreDec(Box::new(e)));
         }
         if self.eat_op("@") {
@@ -1745,9 +1749,11 @@ impl<'a> Parser<'a> {
         loop {
             if self.eat_op("++") {
                 e = self.incdec_operand(e, "++", start)?;
+
                 e = Expr::PostInc(Box::new(e));
             } else if self.eat_op("--") {
                 e = self.incdec_operand(e, "--", start)?;
+
                 e = Expr::PostDec(Box::new(e));
             } else if self.eat_op("[") {
                 let i = if self.at_op("]") {
@@ -1974,14 +1980,14 @@ impl<'a> Parser<'a> {
                                                 || n.eq_ignore_ascii_case("set"))
                                         {
                                             if self.cur_class.is_empty() {
-                                                return Err(PhpError::fatal(
+                                                return Err(PhpError::compile_fatal(
                                                 "Cannot use \"parent\" when no class scope is active",
                                                 self.line(),
                                             ));
                                             }
                                             match &self.hook_ctx {
                                             None => {
-                                                return Err(PhpError::fatal(
+                                                return Err(PhpError::compile_fatal(
                                                     format!(
                                                         "Must not use parent::${}::{}() outside a property hook",
                                                         pn, n
@@ -1991,7 +1997,7 @@ impl<'a> Parser<'a> {
                                             }
                                             Some((hp, hg)) => {
                                                 if hp != pn {
-                                                    return Err(PhpError::fatal(
+                                                    return Err(PhpError::compile_fatal(
                                                         format!(
                                                             "Must not use parent::${}::{}() in a different property (${})",
                                                             pn, n, hp
@@ -2000,7 +2006,7 @@ impl<'a> Parser<'a> {
                                                     ));
                                                 }
                                                 if *hg != n.eq_ignore_ascii_case("get") {
-                                                    return Err(PhpError::fatal(
+                                                    return Err(PhpError::compile_fatal(
                                                         format!(
                                                             "Must not use parent::${}::{}() in a different property hook ({})",
                                                             pn,
@@ -2172,7 +2178,7 @@ impl<'a> Parser<'a> {
         // (`$o?->p->m(...)`) — is a compile-time fatal
         // (first_class_callable_012/013).
         if Self::has_nullsafe(&node) {
-            return Err(PhpError::fatal(
+            return Err(PhpError::compile_fatal(
                 "Cannot combine nullsafe operator with Closure creation",
                 0,
             ));
@@ -2184,7 +2190,7 @@ impl<'a> Parser<'a> {
     /// ("Cannot create Closure for new expression" — zend_compile.c).
     pub(in crate::parser) fn check_no_fcc_ctor(&self, args: &[Expr]) -> Result<(), PhpError> {
         if args.len() == 1 && matches!(args[0], Expr::FccMark) {
-            return Err(PhpError::fatal(
+            return Err(PhpError::compile_fatal(
                 "Cannot create Closure for new expression",
                 self.line(),
             ));
@@ -2300,23 +2306,27 @@ impl<'a> Parser<'a> {
                     self.expect_op("}")?;
                     Ok(PropName::Expr(Box::new(Expr::VarVar(Box::new(e)))))
                 } else {
+                    // The offending token's own line, not the EOF
+                    // sentinel line (eof_line applies to end-of-input
+                    // errors only).
+                    let l = self.line();
                     match self.next() {
                         Some(Token::Variable(n)) => Ok(PropName::Expr(Box::new(Expr::VarVar(
                             Box::new(Expr::Var(n)),
                         )))),
                         t => Err(PhpError::parse(
                             format!(
-                                "syntax error, unexpected {}, expecting identifier",
+                                "syntax error, unexpected {}, expecting variable or \"{{\" or \"$\"",
                                 desc_t(t.as_ref())
                             ),
-                            self.line(),
+                            l,
                         )),
                     }
                 }
             }
             t => Err(PhpError::parse(
                 format!(
-                    "syntax error, unexpected {}, expecting identifier",
+                    "syntax error, unexpected {}, expecting identifier or variable or \"{{\" or \"$\"",
                     desc_t(t.as_ref())
                 ),
                 self.line(),
@@ -2349,7 +2359,7 @@ impl<'a> Parser<'a> {
             Some(Token::Op("(")) => {
                 self.pos += 1;
                 let e = self.expr()?;
-                self.expect_op(")")?;
+                self.expect_group(")")?;
                 // Mark parenthesized class-prop refs so `(X::$p)::m()`
                 // is not confused with the `X::$p::m()` hook syntax.
                 Ok(if matches!(e, Expr::StaticProp { .. }) {
@@ -2390,6 +2400,19 @@ impl<'a> Parser<'a> {
                 }
             }
             Some(Token::Ident(_)) => {
+                // Statement keywords never appear in expression
+                // position — Zend lexes them as distinct tokens the
+                // expr grammar rejects outright (`$x ??= break`,
+                // `fn() => break`, even `break()`/`break::X`).
+                if self.ident_is("break") || self.ident_is("continue") || self.ident_is("goto") {
+                    return Err(PhpError::parse(
+                        format!(
+                            "syntax error, unexpected token \"{}\"",
+                            self.ident().unwrap()
+                        ),
+                        self.line(),
+                    ));
+                }
                 if self.ident_is("true") {
                     self.pos += 1;
                     Ok(Expr::Bool(true))
@@ -2409,7 +2432,7 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     self.expect_op("(")?;
                     let e = self.expr()?;
-                    self.expect_op(")")?;
+                    self.expect_group(")")?;
                     Ok(Expr::Empty(Box::new(e)))
                 } else if self.ident_is("yield") {
                     self.pos += 1;
@@ -2633,7 +2656,7 @@ impl<'a> Parser<'a> {
                     let e = if kind == IncludeKind::Eval {
                         self.expect_op("(")?;
                         let e = self.expr()?;
-                        self.expect_op(")")?;
+                        self.expect_group(")")?;
                         e
                     } else {
                         self.expr()?

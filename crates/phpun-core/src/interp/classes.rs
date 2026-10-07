@@ -3460,24 +3460,58 @@ impl<'a> Interp<'a> {
 
     fn push_handle(&mut self, w: ObjHandle) -> u64 {
         // Zend reuses the most recently freed handle first (its free
-        // list is a LIFO stack), so scan dead slots back-to-front
-        // (namespace_004: call2's $c reuses call1's $d handle, then
-        // $d reuses call1's $c — not the other way around).
-        let n = self.obj_handles.len();
-        for i in (0..n).rev() {
-            if !self.obj_handles[i].alive() {
-                if let ObjHandle::Callable(_, Some(name)) = &self.obj_handles[i] {
-                    // The dead closure's per-instance statics table dies
-                    // with it — the recycled id must not leak stale
-                    // entries to an unrelated decl of the same name.
-                    self.statics.remove(&format!("{}\u{0}c{}", name, i + 1));
-                }
-                self.obj_handles[i] = w;
-                return (i + 1) as u64;
+        // list is a LIFO stack): `dead_slots` is that stack — deaths
+        // push their slot in `mark_obj_died`, allocation pops it.
+        // Silently-dead slots (no dtor ran) aren't stamped, so fall
+        // back to a bounded scan from the tail when the stack empties
+        // (namespace_004, gh10168).
+        self.spawn_seq += 1;
+        let mut best: Option<usize> = None;
+        while let Some(i) = self.dead_slots.pop() {
+            if i < self.obj_handles.len()
+                && !self.obj_handles[i].alive()
+                && self.obj_died.get(i).copied().unwrap_or(0) != 0
+            {
+                best = Some(i);
+                break;
             }
         }
+        if best.is_none() {
+            let n = self.obj_handles.len();
+            for i in (0..n).rev().take(256) {
+                if !self.obj_handles[i].alive() {
+                    best = Some(i);
+                    break;
+                }
+            }
+        }
+        if let Some(i) = best {
+            if let ObjHandle::Callable(_, Some(name)) = &self.obj_handles[i] {
+                // The dead closure's per-instance statics table dies
+                // with it — the recycled id must not leak stale
+                // entries to an unrelated decl of the same name.
+                self.statics.remove(&format!("{}\u{0}c{}", name, i + 1));
+            }
+            self.obj_handles[i] = w;
+            self.obj_born[i] = self.spawn_seq;
+            self.obj_died[i] = 0;
+            return (i + 1) as u64;
+        }
         self.obj_handles.push(w);
+        self.obj_born.push(self.spawn_seq);
+        self.obj_died.push(0);
         self.obj_handles.len() as u64
+    }
+
+    /// A handle slot's zval hit refcount 0 — stamp its death order so
+    /// the next allocation reuses the most recently freed slot.
+    pub(in crate::interp) fn mark_obj_died(&mut self, o: &Rc<RefCell<PhpObject>>) {
+        let id = o.borrow().id as usize;
+        if id >= 1 && id <= self.obj_died.len() && self.obj_died[id - 1] == 0 {
+            self.spawn_seq += 1;
+            self.obj_died[id - 1] = self.spawn_seq;
+            self.dead_slots.push(id - 1);
+        }
     }
 
     /// Wrap a PhpCallable assigning its object-store id.
@@ -3494,6 +3528,40 @@ impl<'a> Interp<'a> {
         let id = self.next_obj_id(&rc);
         rc.borrow_mut().id = id;
         rc
+    }
+
+    /// `WeakReference::create($obj)` — object holding a weak handle to
+    /// $obj (the WeakRef internal; get() upgrades it). Zend keeps a
+    /// per-handle weakref list: repeated create() on the same live
+    /// target returns the identical wrapper (`===` true).
+    pub(in crate::interp) fn new_weakref(
+        &mut self,
+        target: Rc<RefCell<PhpObject>>,
+    ) -> Result<Value, PhpError> {
+        let target_id = target.borrow().id;
+        if let Some(existing) = self.weakrefs.get(&target_id).and_then(|w| w.upgrade()) {
+            return Ok(Value::Object(existing));
+        }
+        let cls = match self.classes.get("weakreference").cloned() {
+            Some(c) => c,
+            None => {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    "Class \"WeakReference\" not found",
+                    0,
+                ))
+            }
+        };
+        let rc = self.alloc_obj(PhpObject {
+            class: cls,
+            props: HashMap::new(),
+            prop_order: vec![],
+            id: 0,
+            internal: Some(ObjectInternal::WeakRef(Rc::downgrade(&target))),
+            unset_props: std::collections::HashSet::new(),
+        });
+        self.weakrefs.insert(target_id, Rc::downgrade(&rc));
+        Ok(Value::Object(rc))
     }
 
     /// `new X(args)` — instantiate + call __construct.
@@ -3528,6 +3596,13 @@ impl<'a> Interp<'a> {
             return self.fail(PhpError::uncaught(
                 "Error",
                 "Instantiation of class Closure is not allowed",
+                0,
+            ));
+        }
+        if cls.name().eq_ignore_ascii_case("weakreference") {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Direct instantiation of WeakReference is not allowed, use WeakReference::create instead",
                 0,
             ));
         }
@@ -3715,8 +3790,19 @@ impl<'a> Interp<'a> {
             }
         }
         let internal = if self.is_throwable_name(&cls.decl.name) {
+            // A throwable's file/line attribute to the executing code
+            // unit — inside a call frame that's the frame's own file
+            // (an error handler declared in the caller's file reports
+            // there even when invoked for an eval'd unit's diag); only
+            // outside frames does the ambient diag file apply.
+            let exec_file = self
+                .stack
+                .last()
+                .map(|f| f.file.clone())
+                .filter(|f| !f.is_empty())
+                .unwrap_or_else(|| self.diag_file());
             Some(ObjectInternal::Exception {
-                file: self.diag_file(),
+                file: exec_file,
                 line: self.cur_line as u32,
                 trace: String::new(),
                 thrown: self.cur_line as u32,

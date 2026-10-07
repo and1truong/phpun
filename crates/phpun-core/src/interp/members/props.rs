@@ -329,7 +329,7 @@ impl<'a> Interp<'a> {
             }
             Stmt::Static { vars, .. } => vars
                 .iter()
-                .filter_map(|(_, d)| d.as_ref())
+                .filter_map(|(_, d, _)| d.as_ref())
                 .any(|e| Self::expr_uses_this_prop(e, pn)),
             Stmt::Declare { value, .. } => Self::expr_uses_this_prop(value, pn),
             _ => false,
@@ -2083,7 +2083,10 @@ impl<'a> Interp<'a> {
                     // ARRAY_AS_PROPS: undeclared unsets delete from the
                     // storage hash — zend never reaches __unset.
                     let arr = self.ao_state(&o).0;
-                    arr.borrow_mut().unset(&ArrKey::Str(Rc::from(pn.as_str())));
+                    let evicted = arr.borrow_mut().unset(&ArrKey::Str(Rc::from(pn.as_str())));
+                    if let Some(v) = evicted {
+                        self.destruct_dying_value(&v)?;
+                    }
                 } else if self.find_method_in(&cls, "__unset").is_some()
                     && self
                         .magic_guards

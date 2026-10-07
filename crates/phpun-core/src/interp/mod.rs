@@ -182,6 +182,15 @@ impl Frame {
     }
 }
 
+/// stream_filter_remove's binding record: (stream res id, filter name,
+/// the filter resource itself, the stream resource for ->stream props).
+pub(crate) type FilterBinding = (
+    u64,
+    String,
+    Rc<RefCell<PhpResource>>,
+    Rc<RefCell<PhpResource>>,
+);
+
 pub struct Interp<'a> {
     pub file: &'a str,
     globals: Frame,
@@ -246,10 +255,13 @@ pub struct Interp<'a> {
     /// Classes whose const initializers were already link-evaluated.
     consts_linked: std::collections::HashSet<String>,
     /// Top-level parentless classes registered by hoisting (early
-    /// binding): name → AST decl ptr, so only the SAME decl stmt
-    /// no-ops on execution — a different decl site claiming the name
-    /// still hits the 'Cannot redeclare' check (namespaces/ns_060).
-    early_bound_classes: HashMap<String, usize>,
+    /// binding): name → (compile unit, AST decl ptr), so only the SAME
+    /// decl site in the SAME unit no-ops on execution — a different
+    /// decl site claiming the name still hits the 'Cannot redeclare'
+    /// check (namespaces/ns_060). The unit guards against a freed AST
+    /// Vec recycling the node ptr across re-parses (a second eval's
+    /// decl can land on the freed allocation of the first's).
+    early_bound_classes: HashMap<String, (u64, usize)>,
     /// Function decl sites early-bound at compile: lname →
     /// (compile unit, decl node ptr) — reaching that same site at
     /// runtime is a no-op, any OTHER decl into the occupied name is
@@ -301,8 +313,65 @@ pub struct Interp<'a> {
     /// Real upload tmp paths created this request — is_uploaded_file()
     /// and move_uploaded_file() check membership.
     pub uploads: Vec<std::path::PathBuf>,
+    /// Per-stream chunk size set by stream_set_chunk_size(), keyed by
+    /// resource id — the function returns the PREVIOUS size (zend
+    /// default 8192).
+    pub stream_chunk_sizes: std::collections::HashMap<u64, i64>,
+    /// Filters attached by stream_filter_append/prepend, keyed by the
+    /// STREAM resource id — zend's readfilters/writefilters chains.
+    /// A stream with any entry is 'filtered' and every non-STDIO cast
+    /// fails (cast.c:300).
+    pub stream_filters: std::collections::HashMap<u64, Vec<crate::value::StreamFilter>>,
+    /// Filter RESOURCE id → (stream resource id, filter name, the
+    /// filter resource, the STREAM resource) — stream_filter_remove()
+    /// detaches the right chain entry, fclose() invalidates held
+    /// filter handles when their stream dies, and the flush in
+    /// remove() hands filter() callbacks their ->stream prop (zend's
+    /// stream zval on the filter call).
+    pub stream_filter_bindings: std::collections::HashMap<u64, FilterBinding>,
+    /// stream_filter_register() — name → userland class name (zend's
+    /// BG(user_filter_map); the class is resolved lazily at attach).
+    /// Insertion-ordered so stream_get_filters() lists them in the
+    /// order they were registered.
+    pub user_filter_map: Vec<(String, String)>,
+    /// userfilter.bucket brigade resource id → the brigade's queue of
+    /// bucket payloads — populated while a php_user_filter::filter()
+    /// call is in flight.
+    pub stream_brigades: std::collections::HashMap<u64, std::collections::VecDeque<Vec<u8>>>,
+    /// userfilter.bucket resource id → the bucket's raw bytes — the
+    /// backing for StreamBucket::$bucket.
+    pub stream_buckets: std::collections::HashMap<u64, Vec<u8>>,
+    /// The stream resource id a php_user_filter::filter() call is
+    /// running on (zend's PHP_STREAM_FLAG_NO_FCLOSE): an fclose() on
+    /// it from inside the callback warns 'cannot close the provided
+    /// stream' and returns false.
+    pub filter_no_fclose: Option<u64>,
+    /// The builtin name zend's php_error_docref would use for warnings
+    /// raised inside filter() calls ('fread(): Unprocessed filter
+    /// buckets...'). fs::dispatch refreshes it per call.
+    pub filter_warn_ctx: String,
+    /// Stream resource ids whose php_user_filter::filter() call is in
+    /// flight — zend fails stream reads re-entered on the stream the
+    /// fill loop owns.
+    pub stream_filter_busy: std::collections::HashSet<u64>,
+    /// Streaming codec objects for FilterState::Codec entries, keyed
+    /// by filter id (compressors can't clone). Seeded at attach and
+    /// dropped with the chain entry.
+    /// Live codec objects keyed (filter res id, read-chain flag) —
+    /// an ALL-mode attach shares one res id across its two chain
+    /// entries, so the direction disambiguates them.
+    pub codec_states: std::collections::HashMap<(u64, bool), crate::builtins::fs::CodecState>,
+    /// Live WeakReference wrapper per target object id — zend keeps a
+    /// per-handle weakref list so repeated create() calls on the same
+    /// live object return the identical wrapper (`===` true).
+    pub weakrefs: std::collections::HashMap<u64, std::rc::Weak<RefCell<crate::value::PhpObject>>>,
     /// Output buffer stack for ob_*().
     ob_stack: Vec<ObLevel>,
+    /// Buffers opened inside a generator body past a yield — they
+    /// leave the real stack while the body is suspended and
+    /// rematerialize when the consumer's cursor passes each open tag
+    /// (Zend's buffers are global across suspends).
+    suspended_obs: Vec<ObLevel>,
     /// While >0, warnings are suppressed (implements `??`, `isset`,
     /// `empty`, `@`).
     silence: u32,
@@ -388,8 +457,10 @@ pub struct Interp<'a> {
     exception_handler_stack: Vec<Value>,
     /// error_reporting() level mask (E_* bits).
     pub(crate) error_level: i64,
-    /// putenv() overrides read back by getenv() (no real process-env mutation).
-    env_overrides: HashMap<String, String>,
+    /// putenv() overrides read back by getenv() (no real process-env
+    /// mutation). `None` = tombstone from `putenv("KEY")` (unset),
+    /// which shadows a same-named var in the real environment.
+    env_overrides: HashMap<String, Option<String>>,
     /// Raw argv entries after the script path, for `getopt()`.
     pub script_args: Vec<String>,
     exception_handler: Option<Value>,
@@ -431,8 +502,19 @@ pub struct Interp<'a> {
     /// Active generator body's yield collector — `Expr::Yield` pushes
     /// (key, value) here while a generator function's body runs.
     gen_sink: Option<Rc<RefCell<Vec<crate::value::GenItem>>>>,
-    /// send() queue feeding `yield`-expr results in the running body.
-    gen_sends: std::collections::VecDeque<Value>,
+    /// send() queue feeding `yield`-expr results in the running body
+    /// — (yield index, value) entries.
+    gen_sends: std::collections::VecDeque<(usize, Value)>,
+    /// throw() queue for the running body — (yield index, throwable)
+    /// entries the `yield` expression raises as its result when the
+    /// replay reaches them, so the body's own try/catch/finally does
+    /// the unwind.
+    gen_throws: std::collections::VecDeque<(usize, Value)>,
+    /// Yield indices a queued throw actually fired at during the
+    /// current gen run — `Generator->throw()` checks this to tell a
+    /// delivered injection from one that couldn't land (exhausted
+    /// gen, suspension point inside a `yield from` splice).
+    gen_throws_fired: Vec<usize>,
     /// Auto-key counter for keyless `yield $v` — counts keyless yields
     /// only (explicit keys and `yield from` items don't advance it).
     gen_auto: i64,
@@ -441,6 +523,85 @@ pub struct Interp<'a> {
     /// and buffered on the GenState until the consumer resumes past
     /// it (closure_call_leak_with_exception).
     gen_run_state: Option<Rc<RefCell<crate::value::GenState>>>,
+    /// Nonzero while a method call is driven by foreach's internal
+    /// iteration — a deferred gen-body death raised under it keeps
+    /// the body's original call-frame trace (`FILE(n): g()`), while a
+    /// userland `Generator->next()`-style resume renders the engine's
+    /// internal resume stack instead.
+    iter_calls: u32,
+    /// Nonzero while an internal materializer (iterator_to_array,
+    /// iterator_count) drives the iteration — a deferred death renders
+    /// the resume stack WITHOUT the `Generator->{method}()`
+    /// pseudo-frame (`[internal function]: g()` then the caller).
+    gen_internal_resume: u32,
+    /// Invocation line of the outermost live Generator-method dispatch
+    /// — Zend frees a finished gen's execute_data inside the resume
+    /// call, so destructors it runs cite the resume's line (the
+    /// `->next()` call / foreach header), not the body's last line.
+    gen_resume_site: Option<usize>,
+    /// A fatal surfaced by err_flow while a generator body runs —
+    /// stored instead of printed so the deferred death restamps the
+    /// resume-stack trace and prints once at the consumer's resume.
+    gen_pending_fatal: Option<PhpError>,
+    /// call_trace snapshot at the last raise while a gen body ran —
+    /// the suspended throw-site context (eval()/include() pseudo-
+    /// frames, userland calls) the deferred death renders ahead of
+    /// the resume stack.
+    gen_raise_ctx: Vec<crate::value::TraceFrame>,
+    /// While a unit's compile gate runs (eval()/include() flow_gate +
+    /// hoisting), the callsite that triggered compilation — the user
+    /// error handler invoked for a compile diagnostic reports its
+    /// call frame there (Zend runs the handler at the caller site),
+    /// not at the diagnostic's in-unit position.
+    compile_callsite: Option<(String, u32)>,
+    /// Depth of `finally` regions executing inside a generator body —
+    /// their output is the gen's death-time output (Zend replays it
+    /// when the suspended gen is destroyed), so emit_bytes tags it
+    /// for fin_q.
+    gen_fin_depth: u32,
+    /// Set while a gen body runs and a `finally` region's own flow
+    /// died — marks the body's terminal error as finally-region, so
+    /// a force-close surfaces it at destruction (not the resume).
+    /// Saved/restored at gen_start like the other gen-run slots.
+    gen_fin_err: bool,
+    /// send()'s/throw()'s re-run horizon: the body replays with the
+    /// new send/throw queued, and output belonging to yields the
+    /// consumer already observed (tag < horizon) is suppressed —
+    /// Zend's lazy resume produces only post-resume bytes. Scoped to
+    /// the re-running gen's own frames — a nested gen's run shares
+    /// the interpreter, not the horizon.
+    gen_replay_horizon: Option<(usize, Rc<RefCell<crate::value::GenState>>)>,
+    /// A `yield from` snapshots the inner gen's destruction journal
+    /// right after its start (before the drain prunes it) so the
+    /// splice can merge it into the OUTER gen's journal — inner+outer
+    /// finally replay together at the outer's destruction.
+    gen_yield_from_fin: Option<crate::value::GenFinData>,
+    /// While a `yield from` drains an inner iterator inside a gen
+    /// run: the outer item index the inner items splice at. The
+    /// inner's flushed stream bytes retag into the OUTER's deferred
+    /// queue at `base + inner_tag` — a live emit would echo inner
+    /// output before the consumer reached it.
+    gen_collect_base: Option<usize>,
+    /// Items the in-flight `yield from` collection has produced so
+    /// far — a plain delegate's side-effect output (its next()
+    /// echoing, etc.) journals at `base + seen - 1`, matching Zend
+    /// driving the delegate's next() lazily on each resume.
+    gen_collect_seen: usize,
+    /// The gen whose `yield from` collection is in flight — the
+    /// seen count belongs to that gen's sink; a delegate's own run
+    /// must not fold it into its `done`.
+    gen_collect_run: Option<Rc<RefCell<crate::value::GenState>>>,
+    /// The running gen's fin_q (mirrors its GenState.fin_q; a stack-
+    /// style save/restore like gen_sink).
+    gen_fin_q: Option<crate::value::FinQueue>,
+    /// Every generator object minted this run, as (weak state, fin_q).
+    /// A dead weak means the object was released (unset()/overwrite) —
+    /// Zend then runs the suspended body's finally chains, replayed
+    /// from fin_q; a sweep at unit end models the shutdown GC.
+    live_gens: Vec<(
+        std::rc::Weak<RefCell<crate::value::GenState>>,
+        crate::value::FinQueue,
+    )>,
     /// Declaring class of the method about to be invoked (set by
     /// invoke_method, consumed by invoke_fn to fill Frame::decl_class).
     pending_decl_class: Option<Rc<PhpClass>>,
@@ -453,13 +614,51 @@ pub struct Interp<'a> {
     /// Live object handles for PHP's var_dump `#N` id: the lowest freed
     /// slot is reused, matching Zend's object store recycling.
     obj_handles: Vec<ObjHandle>,
+    /// Birth order stamp per handle slot (parallel to `obj_handles`):
+    /// the shutdown destruct sweep visits objects in creation order
+    /// like Zend — a recycled low slot must not let a newborn object
+    /// jump ahead of older live ones (bug74053).
+    obj_born: Vec<u64>,
+    /// Death order stamp per handle slot: Zend's object store frees a
+    /// slot when the zval decrefs — a dtor-triggered death inside
+    /// another dtor lands BEFORE the outer object's own free, so the
+    /// free list hands the OUTER slot to the next `new` first
+    /// (gh10168). 0 = alive / silently dead (order unknown).
+    obj_died: Vec<u64>,
+    /// Freed handle slots in death order (Zend's LIFO free list) —
+    /// `mark_obj_died` pushes, `push_handle` pops the freshest.
+    dead_slots: Vec<usize>,
+    /// Weak registry of arrays that gained a reference (`=&`) element
+    /// — only those can join a cycle, so the GC pass scans just them
+    /// (Zend roots every refcounted array, this is the cheap subset
+    /// that matters for `gc_collect_cycles` counting).
+    arr_handles: Vec<std::rc::Weak<RefCell<PhpArray>>>,
+    /// Approximation of Zend's root buffer: potential-cycle entries
+    /// added since the last collect (`=&` binds, object allocation,
+    /// displaced zvals that stayed alive). At 10_000 the collector
+    /// auto-runs like `gc_collect_roots` on buffer overflow
+    /// (gc/bug70805).
+    gc_pending: usize,
+    /// Re-entrancy guard — a collect runs userland `__destruct`s whose
+    /// own unsets/displaces must not nest a second collect (Zend's
+    /// GC_GCOLLECTED flag).
+    gc_collecting: bool,
+    /// Values already rooted (Zend's "already purple" bit): binds and
+    /// surviving decrefs each count a zval once — cleared on collect.
+    gc_purpled: HashSet<usize>,
+    spawn_seq: u64,
     /// Per-callsite unqualified fn resolution cache — Zend resolves
     /// `ns\f -> f` once per call site (constexpr/namespace_004).
     fcc_fn_cache: HashMap<(String, String, String), Option<String>>,
-    /// Objects whose __destruct already ran (shutdown pass). The Rc
-    /// is pinned so a later object's allocation can't reuse the
-    /// address and collide with an entry (bug74053).
-    destructed: HashMap<usize, Rc<RefCell<PhpObject>>>,
+    /// Objects whose __destruct already ran (shutdown pass). Weak
+    /// handles don't inflate strong_count (an Rc pin kept every
+    /// destructed object alive forever) and go stale with the object
+    /// — a dead entry at a recycled address is simply unmarked
+    /// (bug74053).
+    destructed: HashMap<usize, std::rc::Weak<RefCell<PhpObject>>>,
+    /// Next `destructed` size that triggers a stale-weak prune —
+    /// doubling growth like `ref_cells_prune`.
+    destructed_prune: usize,
     /// `new` temporaries of the running expression statement — swept
     /// at statement end so unowned objects destruct promptly
     /// (bug29368_2/_3).
@@ -529,6 +728,15 @@ pub struct Interp<'a> {
     pub ref_cells: std::collections::HashMap<usize, std::rc::Weak<RefCell<Value>>>,
     /// Next `mark_ref` inserts past this size first sweep dead marks.
     ref_cells_prune: usize,
+    /// Cells bound to storage owned outside the executing frame —
+    /// `static $s` aliases its function's statics table, so the cell
+    /// outlives every call. Like is_ref cells, a suspended gen frame's
+    /// release decrefs the binding but must not null the referent:
+    /// the table keeps it live for sibling calls/gen instances
+    /// (bug64979). Same Weak-pin ABA scheme as `ref_cells`.
+    pub shared_cells: std::collections::HashMap<usize, std::rc::Weak<RefCell<Value>>>,
+    /// Next `mark_shared` inserts past this size first sweep dead marks.
+    shared_cells_prune: usize,
     /// Zend's per-op magic-property guards, keyed
     /// (object-ptr, kind, prop-name): while `__get($o,$p)` runs, an
     /// access to `$o->$p` bypasses magic and hits real storage
@@ -621,13 +829,145 @@ pub struct ObLevel {
     /// Set after the handler's first invocation — PHP's
     /// PHP_OUTPUT_HANDLER_START bit is only passed once (bug24951).
     pub started: bool,
+    /// When the buffer was opened inside a generator body past its
+    /// first yield: the owning gen's fin queue, whose mirrored `pos`
+    /// tracks how far the consumer advanced — Zend buffers live on
+    /// the global stack and survive the suspend, so deferred bytes
+    /// merge into `buf` in cursor order rather than echoing raw at
+    /// replay.
+    pub gen_q: Option<crate::value::FinQueue>,
+    /// The consumer cursor position at which the body's `ob_start`
+    /// ran — the buffer exists consumer-side only once `pos` reaches
+    /// it; before that it lives in `suspended_obs`.
+    pub gen_open: Option<usize>,
+    /// When the body's ob-pop op ran (ob_get_clean & friends), in
+    /// consumer cursor space — the buffer keeps capturing consumer
+    /// writes while `pos` sits inside [gen_open, gen_close), like
+    /// Zend's still-live global buffer.
+    pub gen_close: Option<usize>,
+    /// Deferred gen bytes captured while this buffer is open, tagged
+    /// by the yield index they follow — merged into `buf` when the
+    /// cursor passes them (or in full inside the body itself, where
+    /// they already ran).
+    pub gen_pending: Vec<(usize, Vec<u8>)>,
+    /// Deferred bytes drained into `buf` so far — the tail of a
+    /// body-pop value (buf[..len-drained] is pre-pop writes, the rest
+    /// is the resume segment it captured).
+    pub gen_drained: usize,
+    /// A body-popped window mirror: the pop value's head — the
+    /// direct (pre-first-yield) writes that precede every tagged
+    /// segment. Consumer captures splice into the segment stream
+    /// when the journaled pop echo is rewritten at window close.
+    pub pop_head: Option<Vec<u8>>,
+    /// The pop value's per-tag segments (bytes the body's resumes
+    /// appended, keyed by the item index each followed) — a consumer
+    /// write at cursor `pos` splices ahead of every segment whose
+    /// tag is >= pos, matching the global stack's write order.
+    pub pop_segs: Vec<(usize, Vec<u8>)>,
+    /// Segment boundaries of journaled bytes drained into `buf`, as
+    /// (tag, buf offset, byte len) per entry — lets a later pop split
+    /// `buf`'s drained regions back into segments for `pop_segs` and
+    /// lets teardown drop a killed gen's un-run tail in place.
+    pub drained_segs: Vec<(usize, usize, usize)>,
+    /// Consumer writes this mirror captured, each tagged by the
+    /// journal cursor they arrived at — the splice input for
+    /// `ob_mirror_close`.
+    pub caps: Vec<(usize, Vec<u8>)>,
+    /// Buf ranges holding consumer captures, as (tag, offset, len)
+    /// per entry — lets a content rebuild exclude cap bytes from the
+    /// direct-write head and re-insert them at cursor position
+    /// (`ob_level_content`, end-of-request patches).
+    pub cap_segs: Vec<(usize, usize, usize)>,
+    /// Buffer views the body materialized eagerly — (yield index,
+    /// head, per-tag segments) per read. Consumer captures that
+    /// arrive between the suspend and the read's resume belong
+    /// inside them (Zend runs the read lazily); the window's close
+    /// rewrites the stored values to the resolved content.
+    pub read_vals: Vec<ObReadVal>,
+    /// Stack slot the level occupied when the body suspended —
+    /// consumer levels pushed during the suspension stay above it
+    /// in Zend's shared stack, so promotion re-inserts here rather
+    /// than at the top.
+    pub suspend_base: usize,
+    /// The owning generator's state — stale-drop rewrites its
+    /// deferred journal entries still holding the stale pop value.
+    pub gen_state: Option<std::rc::Weak<RefCell<crate::value::GenState>>>,
 }
+
+/// A buffer view a gen body materialized eagerly: (yield index,
+/// direct-write head, per-tag journaled segments). Window close
+/// rewrites the stored value against the captures its resume saw.
+pub(in crate::interp) type ObReadVal = (usize, Vec<u8>, Vec<(usize, Vec<u8>)>);
 
 /// Result of a top-level program run.
 pub struct RunResult {
     pub exit_code: i32,
     /// Set when a fatal error terminated execution.
     pub fatal: Option<PhpError>,
+}
+
+/// Rebuild the bytes one shared output buffer held: the body's
+/// per-tag segments in tag order, with each consumer capture
+/// spliced ahead of the segment whose tag is >= its arrival cursor
+/// — the global stack's real write order across suspends.
+pub(in crate::interp) fn ob_splice(
+    head: &[u8],
+    segs: &[(usize, Vec<u8>)],
+    caps: &[(usize, Vec<u8>)],
+) -> Vec<u8> {
+    let mut v = head.to_vec();
+    let mut ci = 0;
+    for (t, s) in segs {
+        while ci < caps.len() && caps[ci].0 <= *t {
+            v.extend_from_slice(&caps[ci].1);
+            ci += 1;
+        }
+        v.extend_from_slice(s);
+    }
+    while ci < caps.len() {
+        v.extend_from_slice(&caps[ci].1);
+        ci += 1;
+    }
+    v
+}
+
+/// Split a buffer view at the level's recorded drain offsets into a
+/// direct-write head and per-tag journaled segments — same layout
+/// `ob_splice` consumes.
+pub(in crate::interp) fn ob_split_view(
+    l: &ObLevel,
+    content: &[u8],
+) -> (Vec<u8>, Vec<(usize, Vec<u8>)>) {
+    let first = l
+        .drained_segs
+        .first()
+        .map(|(_, s, _)| (*s).min(content.len()))
+        .unwrap_or(content.len());
+    let head = content[..first].to_vec();
+    let mut segs: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut off = first;
+    for &(t, s, n) in &l.drained_segs {
+        let s = s.min(content.len());
+        let e = (s + n).min(content.len());
+        if s < off {
+            continue;
+        }
+        // Real writes between two journaled segs ride with the
+        // following one — they ran later.
+        if s > off {
+            if let Some(prev) = segs.last_mut() {
+                prev.1.extend_from_slice(&content[off..s]);
+            } else {
+                segs.push((t, content[off..s].to_vec()));
+            }
+        }
+        segs.push((t, content[s..e].to_vec()));
+        off = e;
+    }
+    if off < content.len() {
+        segs.push((usize::MAX, content[off..].to_vec()));
+    }
+    (head, segs)
 }
 
 impl<'a> Interp<'a> {
@@ -660,6 +1000,7 @@ impl<'a> Interp<'a> {
                 Value::Resource(Rc::new(RefCell::new(crate::value::PhpResource::Stdio {
                     id: which as u64 + 1,
                     which,
+                    pos: 0,
                 }))),
             );
         }
@@ -735,6 +1076,65 @@ impl<'a> Interp<'a> {
         constants.insert("E_USER_WARNING".into(), Value::Int(512));
         constants.insert("E_USER_NOTICE".into(), Value::Int(1024));
         constants.insert("E_USER_DEPRECATED".into(), Value::Int(16384));
+        for (name, n) in [
+            ("SIGHUP", 1),
+            ("SIGINT", 2),
+            ("SIGQUIT", 3),
+            ("SIGILL", 4),
+            ("SIGTRAP", 5),
+            ("SIGABRT", 6),
+            ("SIGIOT", 6),
+            ("SIGBUS", 7),
+            ("SIGFPE", 8),
+            ("SIGKILL", 9),
+            ("SIGUSR1", 10),
+            ("SIGSEGV", 11),
+            ("SIGUSR2", 12),
+            ("SIGPIPE", 13),
+            ("SIGALRM", 14),
+            ("SIGTERM", 15),
+            ("SIGSTKFLT", 16),
+            ("SIGCHLD", 17),
+            ("SIGCLD", 17),
+            ("SIGCONT", 18),
+            ("SIGSTOP", 19),
+            ("SIGTSTP", 20),
+            ("SIGTTIN", 21),
+            ("SIGTTOU", 22),
+            ("SIGURG", 23),
+            ("SIGXCPU", 24),
+            ("SIGXFSZ", 25),
+            ("SIGVTALRM", 26),
+            ("SIGPROF", 27),
+            ("SIGWINCH", 28),
+            ("SIGIO", 29),
+            ("SIGPOLL", 29),
+            ("SIGPWR", 30),
+            ("SIGSYS", 31),
+            ("SIG_BLOCK", 0),
+            ("SIG_UNBLOCK", 1),
+            ("SIG_SETMASK", 2),
+            ("SIG_DFL", 0),
+            ("SIG_IGN", 1),
+            ("SIG_ERR", -1),
+            ("SIGBABY", 31),
+            ("WNOHANG", 1),
+            ("WUNTRACED", 2),
+            ("WCONTINUED", 8),
+            ("PRIO_PROCESS", 0),
+        ] {
+            constants.insert(name.into(), Value::Int(n));
+        }
+        constants.insert("SEEK_SET".into(), Value::Int(0));
+        constants.insert("SEEK_CUR".into(), Value::Int(1));
+        constants.insert("SEEK_END".into(), Value::Int(2));
+        constants.insert("STREAM_FILTER_READ".into(), Value::Int(1));
+        constants.insert("STREAM_FILTER_WRITE".into(), Value::Int(2));
+        constants.insert("STREAM_FILTER_ALL".into(), Value::Int(3));
+        // php_stream_filter_status_t — php_user_filter::filter() returns.
+        constants.insert("PSFS_ERR_FATAL".into(), Value::Int(0));
+        constants.insert("PSFS_FEED_ME".into(), Value::Int(1));
+        constants.insert("PSFS_PASS_ON".into(), Value::Int(2));
         constants.insert("PHP_OUTPUT_HANDLER_START".into(), Value::Int(1));
         constants.insert("PHP_OUTPUT_HANDLER_WRITE".into(), Value::Int(0));
         constants.insert("PHP_OUTPUT_HANDLER_CONT".into(), Value::Int(0));
@@ -902,6 +1302,27 @@ impl<'a> Interp<'a> {
             tentative: {
                 let mut t = HashSet::new();
                 t.insert(("datetimezone".into(), "listidentifiers".into()));
+                // php_user_filter's methods carry tentative return
+                // types — overrides without matching types warn
+                // (ReturnTypeWillChange suppresses).
+                for m in [
+                    "filter",
+                    "oncreate",
+                    "onclose",
+                    "onflush",
+                    "onread",
+                    "onwrite",
+                    "onappend",
+                    "onprepend",
+                    "onstart",
+                    "onstop",
+                    "onseek",
+                    "onskip",
+                    "oneof",
+                    "ondetach",
+                ] {
+                    t.insert(("php_user_filter".into(), m.into()));
+                }
                 t
             },
             interfaces: HashMap::new(),
@@ -925,7 +1346,19 @@ impl<'a> Interp<'a> {
             valid_utf8: std::collections::HashMap::new(),
             php_input: std::rc::Rc::new(Vec::new()),
             uploads: Vec::new(),
+            stream_chunk_sizes: std::collections::HashMap::new(),
+            stream_filters: std::collections::HashMap::new(),
+            stream_filter_bindings: std::collections::HashMap::new(),
+            user_filter_map: Vec::new(),
+            stream_brigades: std::collections::HashMap::new(),
+            stream_buckets: std::collections::HashMap::new(),
+            filter_no_fclose: None,
+            filter_warn_ctx: String::new(),
+            stream_filter_busy: std::collections::HashSet::new(),
+            codec_states: std::collections::HashMap::new(),
+            weakrefs: std::collections::HashMap::new(),
             ob_stack: Vec::new(),
+            suspended_obs: Vec::new(),
             silence: 0,
             isset_quiet: 0,
             statics: HashMap::new(),
@@ -935,8 +1368,9 @@ impl<'a> Interp<'a> {
             included: HashSet::new(),
             pending_exception: None,
             call_trace: Vec::new(),
-            // Zend burns resource ids 1-4 on STDIN/STDOUT/STDERR plus
-            // one internal stream — the first userland resource is #5.
+            // zend's regular_list already holds stdin/stdout/stderr
+            // plus the default stream context, so the first userland
+            // resource is id 5.
             res_counter: 4,
             shutdown_fns: Vec::new(),
             error_handler: None,
@@ -957,8 +1391,25 @@ impl<'a> Interp<'a> {
             gen_sink: None,
             pending_gen_captures: Vec::new(),
             gen_sends: std::collections::VecDeque::new(),
+            gen_throws: std::collections::VecDeque::new(),
+            gen_throws_fired: Vec::new(),
             gen_auto: 0,
             gen_run_state: None,
+            iter_calls: 0,
+            gen_internal_resume: 0,
+            gen_resume_site: None,
+            gen_pending_fatal: None,
+            gen_raise_ctx: Vec::new(),
+            compile_callsite: None,
+            gen_fin_depth: 0,
+            gen_fin_err: false,
+            gen_replay_horizon: None,
+            gen_yield_from_fin: None,
+            gen_collect_base: None,
+            gen_collect_seen: 0,
+            gen_collect_run: None,
+            gen_fin_q: None,
+            live_gens: Vec::new(),
             pending_decl_class: None,
             pending_called_class: None,
             pending_hook_prop: None,
@@ -969,8 +1420,17 @@ impl<'a> Interp<'a> {
             engine_consts,
             autoload_fns: Vec::new(),
             obj_handles: Vec::new(),
+            obj_born: Vec::new(),
+            obj_died: Vec::new(),
+            dead_slots: Vec::new(),
+            arr_handles: Vec::new(),
+            gc_pending: 0,
+            gc_collecting: false,
+            gc_purpled: HashSet::new(),
+            spawn_seq: 0,
             fcc_fn_cache: HashMap::new(),
             destructed: HashMap::new(),
+            destructed_prune: 1024,
             expr_temps: Vec::new(),
             last_popped_frame: None,
             dump_stack: std::collections::HashSet::new(),
@@ -983,6 +1443,8 @@ impl<'a> Interp<'a> {
             slot_anchor: std::collections::HashMap::new(),
             ref_cells: std::collections::HashMap::new(),
             ref_cells_prune: 1024,
+            shared_cells: std::collections::HashMap::new(),
+            shared_cells_prune: 1024,
             magic_guards: std::collections::HashSet::new(),
             readonly_cells: std::collections::HashMap::new(),
             clone_write: false,
@@ -1211,7 +1673,7 @@ impl<'a> Interp<'a> {
             // `static $x = ...` inside a body is a RUNTIME initializer —
             // closure literals are legal there (probe_f4d).
             Stmt::Static { vars, .. } => {
-                for (_, d) in vars {
+                for (_, d, ..) in vars {
                     if let Some(e) = d {
                         Self::gate_expr(e, &GateMode::Runtime)?;
                     }
@@ -1491,7 +1953,17 @@ impl<'a> Interp<'a> {
     /// name collision is the compile-time 'Cannot redeclare' fatal.
     /// Called from the flow gate at the decl's position (flow.rs).
     fn hoist_func(&mut self, d: &FunctionDecl) -> Result<(), PhpError> {
-        let _ = self.decl_type_checks(&d.name, d, None);
+        if let Err(e) = self.decl_type_checks(&d.name, d, None) {
+            // A throwable from the user error handler (e.g. throwing
+            // on a signature deprecation) escapes at the caller site —
+            // the eval()/include() call — and dies uncaught, it is not
+            // a compile diagnostic to re-emit at exec time. Compile
+            // fatals stay deferred: the exec-time decl arm re-runs
+            // the same checks through err_flow.
+            if e.kind == ErrorKind::Throw {
+                return Err(e);
+            }
+        }
         let key = d.name.to_lowercase();
         if let Some(prev) = self.functions.get(&key) {
             // Early binding dies at compile time in Zend —
@@ -1621,7 +2093,8 @@ impl<'a> Interp<'a> {
                     let r = self.register_class(Rc::new(d));
                     self.cur_line = saved_line;
                     r?;
-                    self.early_bound_classes.insert(key, site);
+                    self.early_bound_classes
+                        .insert(key, (self.cur_unit_id, site));
                 }
                 _ => {}
             }
@@ -1649,6 +2122,7 @@ impl<'a> Interp<'a> {
         }
         if let Err(e) = Self::const_closure_gate(stmts)
             .and_then(|_| self.flow_gate(stmts))
+            .and_then(|_| Self::yield_gate(stmts))
             .and_then(|_| self.hoist_funcs(stmts))
         {
             let flow = self.err_flow(e);
@@ -1659,6 +2133,21 @@ impl<'a> Interp<'a> {
             return result;
         }
         let flow = self.exec_block(stmts);
+        // A generator destroyed by the unwind (last ref dropped as
+        // the error propagated) replays its finally before the fatal
+        // renders — Zend tears objects down between diagnosing and
+        // displaying it. Gens still referenced stay for the
+        // shutdown pass (run_shutdown replays them AFTER the
+        // display, in reverse creation order).
+        if !matches!(flow, Flow::Normal | Flow::Return(_) | Flow::Exit(_)) {
+            let _ = self.gen_gc_sweep(false);
+        }
+        // Generators still suspended at request end replay their
+        // enclosing finally chains during shutdown — Zend renders a
+        // terminal error first, then tears objects down (shutdown
+        // functions, CV teardown, object store). The sweep inside
+        // run_shutdown raises a destruction-time error as a second
+        // fatal.
         let mut result = self.finish(flow);
         if let Some(c) = self.run_shutdown() {
             result.exit_code = c;
@@ -1745,6 +2234,53 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Live objects in the store (strong pins) — used to catch drops
+    /// inside a shutdown-time dtor.
+    fn live_obj_pins(&self) -> Vec<Rc<RefCell<PhpObject>>> {
+        self.obj_handles
+            .iter()
+            .filter_map(|h| match h {
+                ObjHandle::Obj(w) => w.upgrade(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Invoke a shutdown-time `__destruct`, then fire the dtors of
+    /// objects whose last real ref was dropped inside it. Zend decrefs
+    /// a zval's contents the moment it is overwritten — `self::$b =
+    /// new b` inside a dtor runs the old object's __destruct
+    /// immediately, at any depth (bug74053). Pinning the store around
+    /// the call keeps such drops reclaimable (a dead Weak could never
+    /// be destructed); the drain recurses since a dropped object's own
+    /// dtor can drop further objects.
+    fn shutdown_dtor_invoke(&mut self, o: Rc<RefCell<PhpObject>>) -> Result<(), PhpError> {
+        let mut pins = self.live_obj_pins();
+        // Drops fire oldest-first — same creation order as the sweep.
+        pins.sort_by_key(|p| {
+            self.obj_born
+                .get(p.borrow().id.saturating_sub(1) as usize)
+                .copied()
+                .unwrap_or(0)
+        });
+        self.method_invoke(o, "__destruct", CallArgs::empty())?;
+        for p in pins {
+            // count==1: only `pins` still holds it — every real ref
+            // died during the dtor that just ran.
+            if Rc::strong_count(&p) != 1
+                || self.was_destructed(Rc::as_ptr(&p) as usize)
+                || self
+                    .find_method_in(&p.borrow().class, "__destruct")
+                    .is_none()
+                || !self.mark_destructed(&p)
+            {
+                continue;
+            }
+            self.shutdown_dtor_invoke(p)?;
+        }
+        Ok(())
+    }
+
     /// Run registered shutdown functions then the deferred __destruct
     /// sweep. A shutdown function that exits or dies stops the rest,
     /// but destructors still run (Zend); the produced exit code —
@@ -1796,12 +2332,37 @@ impl<'a> Interp<'a> {
             if Rc::strong_count(&o) != 2 {
                 continue;
             }
+            // A suspended generator torn down here replays its
+            // finally journal at its own slot in the teardown order
+            // — Zend kills the generator handle when the global var
+            // frees it, interleaved with real __destruct calls.
+            let gen_q = match &o.borrow().internal {
+                Some(crate::value::ObjectInternal::Generator(st)) => {
+                    Some(st.borrow().fin_q.clone())
+                }
+                _ => None,
+            };
+            if let Some(q) = gen_q {
+                if let Some(e) = self.gen_fin_replay(&q, true) {
+                    shutdown_code = Some(match self.err_flow(e) {
+                        Flow::Exit(c) => c,
+                        Flow::Throw(v) => {
+                            self.uncaught(&v);
+                            255
+                        }
+                        _ => 255,
+                    });
+                    dtor_stop = true;
+                    break;
+                }
+                continue;
+            }
             if self
                 .find_method_in(&o.borrow().class, "__destruct")
                 .is_some()
                 && self.mark_destructed(&o)
             {
-                if let Err(e) = self.method_invoke(o.clone(), "__destruct", CallArgs::empty()) {
+                if let Err(e) = self.shutdown_dtor_invoke(o.clone()) {
                     shutdown_code = Some(match self.err_flow(e) {
                         Flow::Exit(c) => c,
                         Flow::Throw(v) => {
@@ -1814,27 +2375,79 @@ impl<'a> Interp<'a> {
                     break;
                 }
             }
+            // Prop cells free with the object — a suspended
+            // generator held only by them force-closes at this same
+            // teardown slot (Zend frees the prop table alongside the
+            // dtor, interleaved with the CV pass).
+            if let Some(e) = self.gen_prop_sweep(&o) {
+                shutdown_code = Some(match self.err_flow(e) {
+                    Flow::Exit(c) => c,
+                    Flow::Throw(v) => {
+                        self.uncaught(&v);
+                        255
+                    }
+                    _ => 255,
+                });
+                dtor_stop = true;
+                break;
+            }
         }
-        self.globals.vars.clear();
+        // zend's resource-list teardown rides the symbol-table free:
+        // each still-filtered stream flushes its write chain and runs
+        // the userfilter dtor with ->stream NULL (the stream zval is
+        // already dead). An error stops the sweep like a dtor failure.
+        if !dtor_stop {
+            let mut sres = Vec::new();
+            for c in self.globals.vars.values() {
+                if let Value::Resource(r) = &*c.borrow() {
+                    if self.stream_filters.contains_key(&r.borrow().id()) {
+                        sres.push(r.clone());
+                    }
+                }
+            }
+            for r in sres {
+                if let Err(e) = crate::builtins::fs::stream_dtor_flush(self, &r) {
+                    shutdown_code = Some(match self.err_flow(e) {
+                        Flow::Exit(c) => c,
+                        Flow::Throw(v) => {
+                            self.uncaught(&v);
+                            255
+                        }
+                        _ => 255,
+                    });
+                    break;
+                }
+            }
+        }
         // Objects a dtor spawns may land in already-visited recycled
         // handle slots — rescan until a full pass runs nothing new
         // (bug51822/bug74053).
         if !dtor_stop {
             'sweep: loop {
+                // Zend destructs objects in creation order; handle
+                // slots recycle mid-dtor, so slot order must not
+                // decide which spawned object runs next (bug74053).
+                let mut todo: Vec<(u64, Rc<RefCell<PhpObject>>)> = self
+                    .obj_handles
+                    .iter()
+                    .filter_map(|h| match h {
+                        ObjHandle::Obj(w) => w.upgrade(),
+                        _ => None,
+                    })
+                    .map(|o| {
+                        let born = self
+                            .obj_born
+                            .get(o.borrow().id.saturating_sub(1) as usize)
+                            .copied()
+                            .unwrap_or(0);
+                        (born, o)
+                    })
+                    .collect();
+                todo.sort_by_key(|(b, _)| *b);
                 let mut progressed = false;
-                let mut i = 0;
-                while i < self.obj_handles.len() {
-                    let w = match &self.obj_handles[i] {
-                        ObjHandle::Obj(w) => w.clone(),
-                        _ => {
-                            i += 1;
-                            continue;
-                        }
-                    };
-                    i += 1;
-                    let Some(o) = w.upgrade() else { continue };
+                for (_, o) in todo {
                     let key = Rc::as_ptr(&o) as usize;
-                    if self.destructed.contains_key(&key) {
+                    if self.was_destructed(key) {
                         continue;
                     }
                     if self
@@ -1843,9 +2456,7 @@ impl<'a> Interp<'a> {
                     {
                         self.mark_destructed(&o);
                         progressed = true;
-                        if let Err(e) =
-                            self.method_invoke(o.clone(), "__destruct", CallArgs::empty())
-                        {
+                        if let Err(e) = self.shutdown_dtor_invoke(o.clone()) {
                             shutdown_code = Some(match self.err_flow(e) {
                                 Flow::Exit(c) => c,
                                 Flow::Throw(v) => {
@@ -1857,11 +2468,44 @@ impl<'a> Interp<'a> {
                             break 'sweep;
                         }
                     }
+                    // Same prop-free rule as the CV pass — a
+                    // prop-held generator force-closes at this
+                    // object's slot in the store pass.
+                    if let Some(e) = self.gen_prop_sweep(&o) {
+                        shutdown_code = Some(match self.err_flow(e) {
+                            Flow::Exit(c) => c,
+                            Flow::Throw(v) => {
+                                self.uncaught(&v);
+                                255
+                            }
+                            _ => 255,
+                        });
+                        break 'sweep;
+                    }
                 }
                 if !progressed {
                     break;
                 }
             }
+        }
+        // The symbol table frees only after every shutdown dtor ran —
+        // a dtor's `global $x` still binds the (dead) object zval like
+        // Zend, whose store destructors all precede CV teardown
+        // (gh10168 with_prop_ref variants).
+        self.globals.vars.clear();
+        // Generators still suspended — not torn down through the CV
+        // pass above (locals, containers, live references) — force
+        // close now: Zend kills every remaining generator handle at
+        // request end, newest first.
+        if let Err(e) = self.gen_gc_sweep(true) {
+            shutdown_code = Some(match self.err_flow(e) {
+                Flow::Exit(c) => c,
+                Flow::Throw(v) => {
+                    self.uncaught(&v);
+                    255
+                }
+                _ => 255,
+            });
         }
         if !self.mem_exceeded {
             self.flush_ob_all();
@@ -1883,7 +2527,7 @@ impl<'a> Interp<'a> {
                 continue;
             }
             let key = Rc::as_ptr(&o) as usize;
-            if self.destructed.contains_key(&key) {
+            if self.was_destructed(key) {
                 continue;
             }
             if self
@@ -1892,15 +2536,35 @@ impl<'a> Interp<'a> {
             {
                 self.mark_destructed(&o);
                 self.method_invoke(o.clone(), "__destruct", CallArgs::empty())?;
+                self.mark_obj_died(&o);
             }
         }
         Ok(())
     }
 
+    /// Store into a live cell: the new value lands first, then the
+    /// displaced zval decrefs — its __destruct (when this was the
+    /// last ref) sees the new value already in place (gh10168).
+    pub(in crate::interp) fn cell_store(&mut self, c: &Cell, v: Value) -> Result<(), PhpError> {
+        let old = std::mem::replace(&mut *c.borrow_mut(), v);
+        self.destruct_dying_value(&old)
+    }
+
     /// Objects whose last refs live inside a dropped value run
     /// __destruct — `unset($closure)` decrefs the closure's bound
     /// $this and captures (Zend refcount semantics — closure_005).
-    fn destruct_dying_value(&mut self, v: &Value) -> Result<(), PhpError> {
+    pub(in crate::interp) fn destruct_dying_value(&mut self, v: &Value) -> Result<(), PhpError> {
+        // A displaced zval that stays alive is Zend's purple-add — a
+        // potential cycle root entering the buffer (gc/bug70805).
+        let purple = match v {
+            Value::Object(o) if Rc::strong_count(o) > 1 => Some(Rc::as_ptr(o) as usize),
+            Value::Array(a) if Rc::strong_count(a) > 1 => Some(Rc::as_ptr(a) as usize),
+            Value::Callable(c) if Rc::strong_count(c) > 1 => Some(Rc::as_ptr(c) as usize),
+            _ => None,
+        };
+        if let Some(k) = purple {
+            self.gc_note_purple(k);
+        }
         let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
         let mut tally = |o: &Rc<RefCell<PhpObject>>| {
             held.entry(Rc::as_ptr(o) as usize)
@@ -1936,11 +2600,16 @@ impl<'a> Interp<'a> {
                 // (Zend). While another exception unwinds Zend chains
                 // the dtor error as `Next ...` — not yet modelled, so
                 // it stays swallowed there (bug52361).
+
                 if self.pending_exception.is_some() {
                     let _ = self.method_invoke(o.clone(), "__destruct", CallArgs::empty());
                 } else {
                     self.method_invoke(o.clone(), "__destruct", CallArgs::empty())?;
                 }
+                // The slot frees when the dtor returns — nested dtor
+                // deaths (stamped inside) precede it in Zend's free
+                // list (gh10168 handle reuse).
+                self.mark_obj_died(&o);
             }
         }
         Ok(())
@@ -1951,24 +2620,38 @@ impl<'a> Interp<'a> {
     /// to drop runs its __destruct now — Zend's behavior at function
     /// exit and exception unwind (bug52361).
     fn destruct_frame_objs(&mut self, f: &Frame) -> Result<(), PhpError> {
+        let mut cells: Vec<Cell> = f.vars.values().cloned().collect();
+        cells.extend(f.args.iter().cloned());
+        if let Some(o) = &f.this_obj {
+            cells.push(cell(Value::Object(o.clone())));
+        }
+        self.destruct_cells(&cells)
+    }
+
+    /// `destruct_frame_objs` over a bare cell list — the suspended
+    /// generator frame's stashed CVs decref the same way when its
+    /// execute_data is freed.
+    pub(in crate::interp) fn destruct_cells(&mut self, cells: &[Cell]) -> Result<(), PhpError> {
+        // Only a cell DYING with this batch decrefs its zval: a shared
+        // cell (`=&` alias still owned by props/statics/another var)
+        // keeps its content — the frame's handle dropping is not a
+        // zval decref (gh10168: call1's $tmp survives in $box->value).
+        let mut cell_refs: HashMap<usize, usize> = HashMap::new();
+        for c in cells {
+            *cell_refs.entry(Rc::as_ptr(c) as usize).or_default() += 1;
+        }
         let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
-        let mut tally = |c: &Cell| {
+        for c in cells {
+            let seen = cell_refs[&(Rc::as_ptr(c) as usize)];
+            // +1 = the owner's map slot being torn down after us.
+            if Rc::strong_count(c) > seen + 1 {
+                continue;
+            }
             if let Value::Object(o) = &*c.borrow() {
                 held.entry(Rc::as_ptr(o) as usize)
                     .or_insert_with(|| (0, o.clone()))
                     .0 += 1;
             }
-        };
-        for c in f.vars.values() {
-            tally(c);
-        }
-        for c in f.args.iter() {
-            tally(c);
-        }
-        if let Some(o) = &f.this_obj {
-            held.entry(Rc::as_ptr(o) as usize)
-                .or_insert_with(|| (0, o.clone()))
-                .0 += 1;
         }
         for (_, (n, o)) in held {
             // +1 for the `o` clone sitting in `held` itself.
@@ -1976,7 +2659,7 @@ impl<'a> Interp<'a> {
                 continue;
             }
             let key = Rc::as_ptr(&o) as usize;
-            if !self.destructed.contains_key(&key)
+            if !self.was_destructed(key)
                 && self
                     .find_method_in(&o.borrow().class, "__destruct")
                     .is_some()
@@ -2135,6 +2818,7 @@ impl<'a> Interp<'a> {
                 self.begin_unit();
                 if let Err(e) = Self::const_closure_gate(&stmts)
                     .and_then(|_| self.flow_gate(&stmts))
+                    .and_then(|_| Self::yield_gate(&stmts))
                     .and_then(|_| self.hoist_funcs(&stmts))
                 {
                     let flow = self.err_flow(e);
@@ -2180,6 +2864,7 @@ impl<'a> Interp<'a> {
         self.resp_code = 200;
         self.uploads.clear();
         self.ob_stack.clear();
+        self.suspended_obs.clear();
         self.silence = 0;
         self.isset_quiet = 0;
         self.detached_dim = false;
@@ -2191,11 +2876,28 @@ impl<'a> Interp<'a> {
         self.loop_depth = 0;
     }
 
-    /// Record an object as destructed: true iff newly marked.
+    /// Record an object as destructed: true iff newly marked. A
+    /// stale weak (its object freed) counts as unmarked — the slot
+    /// at that address is simply a different object now.
     fn mark_destructed(&mut self, o: &Rc<RefCell<PhpObject>>) -> bool {
+        let key = Rc::as_ptr(o) as usize;
+        if self.was_destructed(key) {
+            return false;
+        }
+        self.destructed.insert(key, Rc::downgrade(o));
+        if self.destructed.len() > self.destructed_prune {
+            self.destructed.retain(|_, w| w.strong_count() > 0);
+            self.destructed_prune = (self.destructed.len() * 2).max(1024);
+        }
+        true
+    }
+
+    /// `destructed` membership liveness-aware: a weak whose object
+    /// is gone is a stale entry, not a live mark.
+    fn was_destructed(&self, key: usize) -> bool {
         self.destructed
-            .insert(Rc::as_ptr(o) as usize, o.clone())
-            .is_none()
+            .get(&key)
+            .is_some_and(|w| w.upgrade().is_some())
     }
 
     /// Worker mode: objects created during boot are application state and
@@ -2203,6 +2905,13 @@ impl<'a> Interp<'a> {
     /// phase so per-request shutdown only sweeps request objects.
     pub fn seal_boot_objects(&mut self) {
         self.obj_handles.clear();
+        self.obj_born.clear();
+        self.dead_slots.clear();
+        self.gc_pending = 0;
+        self.gc_collecting = false;
+        self.gc_purpled.clear();
+        self.arr_handles.clear();
+        self.obj_died.clear();
     }
 
     /// Worker-mode request end: registered shutdown functions and
@@ -2260,6 +2969,26 @@ impl<'a> Interp<'a> {
             self.ref_cells.retain(|_, w| w.strong_count() > 0);
             self.ref_cells_prune = (self.ref_cells.len() * 2).max(1024);
         }
+    }
+
+    /// Mark `c` as bound to storage outside the frame (statics table).
+    pub(crate) fn mark_shared(&mut self, c: &Cell) {
+        self.shared_cells
+            .insert(Rc::as_ptr(c) as usize, Rc::downgrade(c));
+        if self.shared_cells.len() > self.shared_cells_prune {
+            self.shared_cells.retain(|_, w| w.strong_count() > 0);
+            self.shared_cells_prune = (self.shared_cells.len() * 2).max(1024);
+        }
+    }
+
+    /// Is `c` a live frame-external binding? Same Weak-pin proof as
+    /// `is_ref_cell`.
+    pub(crate) fn is_shared_cell(&self, c: &Cell) -> bool {
+        self.shared_cells
+            .get(&(Rc::as_ptr(c) as usize))
+            .and_then(|w| w.upgrade())
+            .map(|u| Rc::ptr_eq(&u, c))
+            .unwrap_or(false)
     }
 
     /// Is `c` a live IS_REFERENCE cell? The Weak pins the allocation,
@@ -2489,15 +3218,20 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn var_set(&mut self, name: &str, v: Value) {
+    /// Write a var slot: the displaced zval decrefs first — its
+    /// __destruct (when this was the last ref) runs immediately and
+    /// sees the NEW value already in place (gh10168).
+    fn var_set(&mut self, name: &str, v: Value) -> Result<(), PhpError> {
         match self.var_cell_opt(name) {
             Some(c) => {
-                *c.borrow_mut() = v;
+                let old = std::mem::replace(&mut *c.borrow_mut(), v);
+                self.destruct_dying_value(&old)
             }
             None => {
                 self.cur()
                     .vars
                     .insert(name.to_string(), Rc::new(RefCell::new(v)));
+                Ok(())
             }
         }
     }
@@ -2510,8 +3244,8 @@ impl<'a> Interp<'a> {
         match self.var_cell_opt(name) {
             Some(c) => {
                 let nv = self.typed_slot_store_mode(&c, v, strict)?;
-                *c.borrow_mut() = nv;
-                Ok(())
+                let old = std::mem::replace(&mut *c.borrow_mut(), nv);
+                self.destruct_dying_value(&old)
             }
             None => {
                 self.cur()
@@ -2559,18 +3293,136 @@ impl<'a> Interp<'a> {
         // Inside a generator run, output after a yield is deferred to
         // resume — `f(yield)` must not observe the call (nor its echo)
         // until the consumer advances past that yield.
-        if let Some(run) = &self.gen_run_state {
+        if self.gen_run_state.is_some() {
             let done = self
                 .gen_sink
                 .as_ref()
                 .map(|s| s.borrow().len())
-                .unwrap_or(0);
+                .unwrap_or(0)
+                + if self
+                    .gen_collect_run
+                    .as_ref()
+                    .zip(self.gen_run_state.as_ref())
+                    .is_some_and(|(a, b)| Rc::ptr_eq(a, b))
+                {
+                    self.gen_collect_seen
+                } else {
+                    0
+                };
+            // send()/throw() re-runs replay the prefix the consumer
+            // already echoed — suppress live echo AND re-journal for
+            // the covered span: the prior run journaled (and mostly
+            // emitted) those bytes, and the restart dropped only the
+            // stale run's un-emitted tail.
+            if self.gen_horizon_suppresses(done) {
+                return;
+            }
+            if done == 0 {
+                // A delegate re-collected under an outer's replay
+                // horizon: its pre-first-yield bytes were already
+                // echoed by the run the consumer saw.
+                let suppress = self
+                    .gen_run_state
+                    .as_ref()
+                    .is_some_and(|s| s.borrow().suppress_prefix);
+                if suppress {
+                    return;
+                }
+            }
             if done > 0 {
-                run.borrow_mut().pending_out.push((done - 1, b.to_vec()));
+                // An ob opened inside this gen captures the deferred
+                // output like Zend's global buffer — journaled per
+                // tag so it merges with consumer writes in cursor
+                // order instead of echoing raw at replay.
+                if let Some(l) = self.ob_stack.last_mut() {
+                    // A popped window's mirror must not take the
+                    // re-run's writes — those belong to the body's
+                    // own deferred journal (the pop already closed
+                    // the real buffer).
+                    let owns = match (&l.gen_q, &self.gen_run_state) {
+                        (Some(q), Some(s)) => {
+                            std::rc::Rc::ptr_eq(q, &s.borrow().fin_q) && l.gen_close.is_none()
+                        }
+                        _ => false,
+                    };
+                    if owns {
+                        // finally-region output belongs to the
+                        // destruction journal — a gen-owned capture
+                        // window dies before it could replay them.
+                        if self.gen_fin_depth == 0 {
+                            l.gen_pending.push((done - 1, b.to_vec()));
+                            return;
+                        }
+                    }
+                }
+
+                let is_fin = self.gen_fin_depth > 0;
+                self.gen_buf_out(done - 1, b, false, is_fin);
                 return;
             }
         }
+        self.ob_promote();
+        self.emit_routed(b);
+    }
+
+    /// Emit journaled/replayed bytes at their materialization point:
+    /// inside another gen's run they join its deferred journal (an
+    /// inner's death bytes attribute to the outer's cursor window);
+    /// consumer-side they go through emit_passthrough.
+    fn emit_replay(&mut self, b: &[u8], tag: usize) {
+        if self.gen_run_state.is_some() {
+            self.emit_bytes(b);
+        } else {
+            self.emit_passthrough(b, tag);
+        }
+    }
+
+    /// Emit already-journaled bytes bound for real output. Replayed
+    /// entries capture into the topmost level that was open at the
+    /// entry's logical write time (a live consumer `ob_start`, or a
+    /// gen window whose open tag the entry reaches) — Zend's shared
+    /// stack routes the resume echo the same way. Gen windows the
+    /// entry predates never see it: those bytes were journaled into
+    /// the level's own `gen_pending`, not `pending_out`.
+    fn emit_passthrough(&mut self, b: &[u8], tag: usize) {
+        if let Some(l) = self
+            .ob_stack
+            .iter_mut()
+            .rev()
+            .find(|l| l.gen_q.is_none() || l.gen_open.is_some_and(|o| tag >= o))
+        {
+            if l.gen_q.is_some() {
+                // A gen window's journaled captures splice by tag like
+                // consumer writes — keep the bookkeeping in step.
+                let pos = l.gen_q.as_ref().map(|q| q.borrow().vis_pos).unwrap_or(0);
+                l.caps.push((pos, b.to_vec()));
+                l.cap_segs.push((pos, l.buf.len(), b.len()));
+            }
+            l.buf.extend_from_slice(b);
+            return;
+        }
+        if self.live_io {
+            use std::io::Write;
+            let mut so = std::io::stdout().lock();
+            let _ = so.write_all(b);
+            let _ = so.flush();
+        } else {
+            self.out.extend_from_slice(b);
+        }
+    }
+
+    fn emit_routed(&mut self, b: &[u8]) {
         if let Some(buf) = self.ob_stack.last_mut() {
+            // Cursor-past journaled captures precede this write.
+            Self::ob_drain_level(buf, false);
+            if buf.gen_q.is_some() {
+                // A gen-owned level (live window or pop mirror):
+                // tag the write by the cursor it arrived at — kill
+                // teardown and mirror-close splices need it.
+                let pos = buf.gen_q.as_ref().map(|q| q.borrow().vis_pos).unwrap_or(0);
+                buf.caps.push((pos, b.to_vec()));
+                buf.cap_segs.push((pos, buf.buf.len(), b.len()));
+            }
             buf.buf.extend_from_slice(b);
         } else if self.live_io {
             use std::io::Write;
@@ -2582,23 +3434,1540 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// A send()/throw() restart replaces the body's earlier run: the
+    /// post-yield bytes that run journaled into its own ob windows
+    /// (`gen_pending`, plus any tail already drained into `buf`) are
+    /// stale — the re-run produces the window's real contents.
+    /// Consumer captures (`caps`) are real writes and stay.
+    pub(in crate::interp) fn ob_gen_restart(&mut self, fq: &crate::value::FinQueue) {
+        let owned = |l: &ObLevel| l.gen_q.as_ref().is_some_and(|q| std::rc::Rc::ptr_eq(q, fq));
+        let sweep = |l: &mut ObLevel| {
+            if l.pop_head.is_some() {
+                // A pop mirror is pure replay bookkeeping — the pop
+                // will re-run in the fresh body pass.
+                return true;
+            }
+            l.gen_pending.clear();
+            if l.gen_drained > 0 {
+                // Drop journaled bytes already merged into buf —
+                // the drained tail is the stale run's writes. They
+                // interleave with consumer captures, so cut each
+                // recorded seg range instead of truncating the tail.
+                let mut segs = std::mem::take(&mut l.drained_segs);
+                segs.sort_by_key(|(_, off, _)| *off);
+                let mut v = Vec::with_capacity(l.buf.len());
+                let mut off = 0;
+                for &(_, s, e) in &segs {
+                    v.extend_from_slice(&l.buf[off..s.min(l.buf.len())]);
+                    off = (s + e).min(l.buf.len());
+                }
+                v.extend_from_slice(&l.buf[off..]);
+                // Cap offsets ride on the same buf — shift each by
+                // the bytes the excision cut before it.
+                for c in l.cap_segs.iter_mut() {
+                    c.1 = segs.iter().fold(c.1, |o, (_, s, e)| {
+                        o.saturating_sub((*e).min(o.saturating_sub(*s)))
+                    });
+                }
+                l.buf = v;
+                l.gen_drained = 0;
+            }
+            false
+        };
+        let mut i = 0;
+        while i < self.suspended_obs.len() {
+            if owned(&self.suspended_obs[i]) && sweep(&mut self.suspended_obs[i]) {
+                self.suspended_obs.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        let mut i = 0;
+        while i < self.ob_stack.len() {
+            if owned(&self.ob_stack[i]) && sweep(&mut self.ob_stack[i]) {
+                self.ob_stack.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Move the suspended gen-owned buffers whose open tag the
+    /// consumer's cursor passed back onto the real stack — Zend's
+    /// buffers are global, so they materialize at resume time,
+    /// below anything the consumer pushed while suspended.
+    fn ob_promote(&mut self) {
+        // A promoted capture window closes once the cursor passes
+        // the body's pop point — its consumer writes splice into
+        // the journaled pop value before it drops.
+        let mut i = 0;
+        while i < self.ob_stack.len() {
+            let stale = self.ob_stack[i].gen_close.is_some_and(|c| {
+                self.ob_stack[i]
+                    .gen_q
+                    .as_ref()
+                    .is_some_and(|q| q.borrow().vis_pos >= c)
+            });
+            if stale {
+                let l = self.ob_stack.remove(i);
+                self.ob_mirror_close(&l);
+            } else {
+                i += 1;
+            }
+        }
+        // Dead mirrors (cursor at/past the body's pop) stay dead —
+        // same splice for one demoted back to suspended_obs by a
+        // body re-run before it could re-materialize.
+        let mut i = 0;
+        while i < self.suspended_obs.len() {
+            let dead = self.suspended_obs[i].gen_close.is_some_and(|c| {
+                self.suspended_obs[i]
+                    .gen_q
+                    .as_ref()
+                    .is_some_and(|q| q.borrow().vis_pos >= c)
+            });
+            if dead {
+                let l = self.suspended_obs.remove(i);
+                self.ob_mirror_close(&l);
+            } else {
+                i += 1;
+            }
+        }
+        let mut i = 0;
+        while i < self.suspended_obs.len() {
+            let l = &self.suspended_obs[i];
+            let ready = l
+                .gen_open
+                .is_some_and(|t| l.gen_q.as_ref().is_some_and(|q| q.borrow().vis_pos >= t))
+                && l.gen_close
+                    .is_none_or(|c| l.gen_q.as_ref().is_some_and(|q| q.borrow().vis_pos < c))
+                // Pop mirrors are consumer-side bookkeeping, not real
+                // stack levels — during the body's own run they stay
+                // parked so a body pop reaches the level it pushed.
+                && (self.gen_run_state.is_none() || l.pop_head.is_none());
+            if ready {
+                let l = self.suspended_obs.remove(i);
+                let at = l.suspend_base.min(self.ob_stack.len());
+                self.ob_stack.insert(at, l);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// The body's own buffers leave the real stack when it suspends
+    /// (they were opened inside the eager run but exist consumer-side
+    /// only once its yield index passes) — park them keyed by open
+    /// tag until `ob_promote` restores them.
+    fn ob_suspend(&mut self, fq: &crate::value::FinQueue) {
+        let mut moved = Vec::new();
+        let mut i = self.ob_stack.len();
+        while i > 0 {
+            i -= 1;
+            let owned = self.ob_stack[i].gen_open.is_some()
+                && self.ob_stack[i]
+                    .gen_q
+                    .as_ref()
+                    .is_some_and(|q| std::rc::Rc::ptr_eq(q, fq));
+            if owned {
+                let mut l = self.ob_stack.remove(i);
+                l.suspend_base = i;
+                moved.push(l);
+            }
+        }
+        moved.reverse();
+        self.suspended_obs.extend(moved);
+    }
+
+    /// A gen window mirror that just closed: the consumer writes it
+    /// captured splice into the pop value Zend's shared buffer held
+    /// — rewrite the gen's deferred journal entries still carrying
+    /// the stale value (head+tail) to the corrected
+    /// (head+captures+tail).
+    fn ob_mirror_close(&mut self, l: &ObLevel) {
+        let Some(head) = &l.pop_head else {
+            return;
+        };
+        // Body-pop retarget: the body's pop popped whatever sat on
+        // top of Zend's global stack at resume time. A consumer level
+        // still on the stack at window close means the pop took IT —
+        // its content replaces the journaled pop value and the level
+        // is consumed.
+        let stolen = self
+            .ob_stack
+            .iter()
+            .rposition(|x| x.gen_q.is_none() && x.pop_head.is_none())
+            .map(|i| self.ob_stack.remove(i));
+        if let Some(st) = stolen {
+            let mut old_v = head.clone();
+            for (_, s) in &l.pop_segs {
+                old_v.extend_from_slice(s);
+            }
+            let min_tag = l.gen_close.unwrap_or(0).saturating_sub(1);
+            if !old_v.is_empty() {
+                let new_v = st.buf;
+                if let Some(gs) = &l.gen_state {
+                    if let Some(st2) = gs.upgrade() {
+                        let mut st2 = st2.borrow_mut();
+                        for (t, b, ..) in &mut st2.pending_out {
+                            if *t >= min_tag {
+                                Self::bytes_replace(b, &old_v, &new_v);
+                            }
+                        }
+                        Self::gen_patch_values(&mut st2, &old_v, &new_v);
+                    }
+                }
+                if let Some(q) = &l.gen_q {
+                    for (t, b, _) in &mut q.borrow_mut().bytes {
+                        if *t >= min_tag {
+                            Self::bytes_replace(b, &old_v, &new_v);
+                        }
+                    }
+                }
+            }
+            // The body's pop took the consumer level — the gen's own
+            // buffer was never popped: it stays open on the shared
+            // stack and keeps capturing (request-end flush).
+            if let Some(head) = &l.pop_head {
+                let mut buf = head.clone();
+                for (_, s) in &l.pop_segs {
+                    buf.extend_from_slice(s);
+                }
+                for (_, c) in &l.caps {
+                    buf.extend_from_slice(c);
+                }
+                self.ob_stack.push(ObLevel {
+                    buf,
+                    handler: l.handler.clone(),
+                    started: l.started,
+                    gen_q: l.gen_q.clone(),
+                    gen_open: l.gen_open,
+                    gen_close: None,
+                    gen_pending: Vec::new(),
+                    gen_drained: 0,
+                    pop_head: None,
+                    pop_segs: Vec::new(),
+                    // Keep the journaled segment and capture
+                    // positions so later consumer writes still
+                    // splice at cursor order.
+                    drained_segs: {
+                        let mut off = head.len();
+                        l.pop_segs
+                            .iter()
+                            .map(|(t, s)| {
+                                let e = (*t, off, s.len());
+                                off += s.len();
+                                e
+                            })
+                            .collect()
+                    },
+                    caps: l.caps.clone(),
+                    cap_segs: {
+                        let mut off = l.pop_head.as_ref().map(|h| h.len()).unwrap_or(0)
+                            + l.pop_segs.iter().map(|(_, s)| s.len()).sum::<usize>();
+                        l.caps
+                            .iter()
+                            .map(|(t, c)| {
+                                let e = (*t, off, c.len());
+                                off += c.len();
+                                e
+                            })
+                            .collect()
+                    },
+                    read_vals: l.read_vals.clone(),
+                    suspend_base: l.suspend_base,
+                    gen_state: l.gen_state.clone(),
+                });
+            }
+            return;
+        }
+        if l.caps.is_empty() {
+            return;
+        }
+        let merged = ob_splice(&[], &l.pop_segs, &l.caps);
+        let mut old_v = head.clone();
+        for (_, s) in &l.pop_segs {
+            old_v.extend_from_slice(s);
+        }
+        // The pop ran inside the resume that produced item close-1 —
+        // only deferred entries from that segment on can carry the
+        // pop value.
+        let min_tag = l.gen_close.unwrap_or(0).saturating_sub(1);
+        // Buffer views the body materialized eagerly — each read
+        // resolves against the captures that arrived while the
+        // cursor sat at tags below its resume.
+        if !l.read_vals.is_empty() {
+            if let Some(gs) = &l.gen_state {
+                if let Some(st) = gs.upgrade() {
+                    let mut st = st.borrow_mut();
+                    for (k, rhead, rsegs) in &l.read_vals {
+                        let caps: Vec<(usize, Vec<u8>)> =
+                            l.caps.iter().filter(|(t, _)| *t < *k).cloned().collect();
+                        let mut stale = rhead.clone();
+                        for (_, s) in rsegs {
+                            stale.extend_from_slice(s);
+                        }
+                        let mut v = rhead.clone();
+                        v.extend_from_slice(&ob_splice(&[], rsegs, &caps));
+                        Self::gen_patch_values(&mut st, &stale, &v);
+                    }
+                }
+            }
+        }
+        if old_v.is_empty() {
+            // The journaled pop value is the empty string — no anchor
+            // to rewrite. Splice into the body's first deferred echo
+            // after the pop: that is where the popped value's print
+            // lands (typical `echo "...$c\n"` shape).
+            let mut done = false;
+            if let Some(gs) = &l.gen_state {
+                if let Some(st) = gs.upgrade() {
+                    for (t, b, ..) in &mut st.borrow_mut().pending_out {
+                        if !done && *t >= min_tag {
+                            if let Some(p) = b.iter().rposition(|c| *c == b'\n') {
+                                b.splice(p..p, merged.iter().copied());
+                            } else {
+                                b.extend_from_slice(&merged);
+                            }
+                            done = true;
+                        }
+                    }
+                }
+            }
+            if !done {
+                if let Some(q) = &l.gen_q {
+                    for (t, b, _) in &mut q.borrow_mut().bytes {
+                        if !done && *t >= min_tag {
+                            if let Some(p) = b.iter().rposition(|c| *c == b'\n') {
+                                b.splice(p..p, merged.iter().copied());
+                            } else {
+                                b.extend_from_slice(&merged);
+                            }
+                            done = true;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        let mut new_v = head.clone();
+        new_v.extend_from_slice(&merged);
+        if let Some(gs) = &l.gen_state {
+            if let Some(st) = gs.upgrade() {
+                for (t, b, ..) in &mut st.borrow_mut().pending_out {
+                    if *t >= min_tag {
+                        Self::bytes_replace(b, &old_v, &new_v);
+                    }
+                }
+            }
+        }
+        if let Some(q) = &l.gen_q {
+            for (t, b, _) in &mut q.borrow_mut().bytes {
+                if *t >= min_tag {
+                    Self::bytes_replace(b, &old_v, &new_v);
+                }
+            }
+        }
+        // Values the body already materialized from the window's
+        // stale content (ob_get_contents reads stored into CVs,
+        // yielded items, the return value) — Zend ran those reads at
+        // resume with the captures inside.
+        if let Some(gs) = &l.gen_state {
+            if let Some(st) = gs.upgrade() {
+                Self::gen_patch_values(&mut st.borrow_mut(), &old_v, &new_v);
+            }
+        }
+    }
+
+    /// Rewrite a gen's stored values that materialized a window's
+    /// stale content: string cells equal to `old` become `new`, and
+    /// an Int cell equal to `old`'s byte length inside a container
+    /// that held such a string becomes `new`'s (ob_get_length reads
+    /// pair with ob_get_contents ones).
+    fn gen_patch_values(st: &mut crate::value::GenState, old: &[u8], new: &[u8]) {
+        if old == new || old.is_empty() {
+            return;
+        }
+        let patch = |v: &mut Value| Self::value_replace(v, old, new);
+        patch(&mut st.return_val);
+        for (k, c) in &mut st.items {
+            patch(k);
+            patch(&mut c.borrow_mut());
+        }
+        let fin = st.fin_q.clone();
+        let mut f = fin.borrow_mut();
+        for (_, c) in &mut f.suspended {
+            patch(&mut c.borrow_mut());
+        }
+    }
+
+    /// Deep cell rewrite for `gen_patch_values` — returns the number
+    /// of string cells replaced so the enclosing array can also patch
+    /// sibling length reads.
+    fn value_replace(v: &mut Value, old: &[u8], new: &[u8]) -> usize {
+        match v {
+            Value::Str(s) if s.as_ref() == old => {
+                *v = Value::bytes(new.to_vec());
+                1
+            }
+            Value::Array(a) => {
+                let cells: Vec<crate::value::Cell> =
+                    a.borrow().iter().map(|(_, c)| c.clone()).collect();
+                let mut n = 0;
+                for c in &cells {
+                    n += Self::value_replace(&mut c.borrow_mut(), old, new);
+                }
+                if n > 0 {
+                    for c in &cells {
+                        if let Value::Int(i) = &mut *c.borrow_mut() {
+                            if *i == old.len() as i64 {
+                                *i = new.len() as i64;
+                            }
+                        }
+                    }
+                }
+                n
+            }
+            _ => 0,
+        }
+    }
+
+    /// Replace every occurrence of `old` in `b` with `new`.
+    fn bytes_replace(b: &mut Vec<u8>, old: &[u8], new: &[u8]) {
+        if old.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i + old.len() <= b.len() {
+            match b[i..].windows(old.len()).position(|w| w == old) {
+                Some(p) => {
+                    let at = i + p;
+                    b.splice(at..at + old.len(), new.iter().copied());
+                    i = at + new.len();
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Merge a gen-opened buffer's journaled deferred bytes into its
+    /// buf: an entry tagged `t` ran inside the resume that produced
+    /// item `t`, so it lands in the buffer once the cursor passes
+    /// item `t` (`t < pos`) — or all of them for a read inside the
+    /// body itself (`all`), or once the body's gen finished (every
+    /// tag is stream-past).
+    fn ob_drain_level(level: &mut ObLevel, all: bool) {
+        if level.gen_pending.is_empty() {
+            return;
+        }
+        let (pos, fin, killed) = level
+            .gen_q
+            .as_ref()
+            .map(|q| {
+                let f = q.borrow();
+                // The whole journal is confirmed once the body ran
+                // to its end AND the consumer's cursor reached it —
+                // a mid-consumption gen's post-yield tails still wait
+                // on resume confirmation. Delegate snapshots freeze
+                // at pos=0 so this stays false for them.
+                (f.vis_pos, f.finished && f.vis_pos >= f.total, f.killed)
+            })
+            .unwrap_or((usize::MAX, true, false));
+        // An orphaned journal (owning state displaced/freed) whose
+        // stream was never consumed is a kill — the un-run tail can
+        // never confirm. A consumed gen ran those writes; Zend
+        // emitted them.
+        let killed = killed
+            || (!fin
+                && level
+                    .gen_state
+                    .as_ref()
+                    .is_some_and(|w| w.upgrade().is_none()));
+        // A tail entry tagged `t` (written after yield index `t`)
+        // ran in Zend's frame only once a resume delivered item
+        // `t + 1` — a consumed-then-unclosed gen's whole journal is
+        // confirmed; a killed gen's cursor froze at the kill so its
+        // un-run tail never materializes.
+        let take = level
+            .gen_pending
+            .iter()
+            .take_while(|(t, _)| all || (fin && !killed) || *t < pos)
+            .count();
+
+        for (t, b) in level.gen_pending.drain(..take) {
+            level.gen_drained += b.len();
+            level.drained_segs.push((t, level.buf.len(), b.len()));
+            level.buf.extend_from_slice(&b);
+        }
+    }
+
+    /// Drain the top buffer's journaled gen captures — `all` when the
+    /// read runs inside the owning gen's body (its tags are source-
+    /// ordered already); otherwise by the mirrored consumer cursor.
+    pub(in crate::interp) fn ob_drain_pending(&mut self) {
+        self.ob_promote();
+        if let Some(l) = self.ob_stack.last_mut() {
+            let all = match (&l.gen_q, &self.gen_run_state) {
+                (Some(q), Some(s)) => std::rc::Rc::ptr_eq(q, &s.borrow().fin_q),
+                _ => false,
+            };
+            Self::ob_drain_level(l, all);
+        }
+    }
+
+    /// Stack entries the consumer can see through the suspended-gen
+    /// windows — used by ob_get_level & friends so a detached gen
+    /// buffer still counts like Zend's shared stack.
+    pub(in crate::interp) fn ob_suspended_visible(&self) -> usize {
+        self.suspended_obs
+            .iter()
+            .filter(|l| {
+                l.gen_open
+                    .is_some_and(|t| l.gen_q.as_ref().is_some_and(|q| q.borrow().vis_pos > t))
+                    && l.gen_close
+                        .is_none_or(|c| l.gen_q.as_ref().is_some_and(|q| q.borrow().vis_pos <= c))
+            })
+            .count()
+    }
+
     /// Emit generator-deferred output whose suspending yield the
     /// consumer has now advanced past (`pos > tag`). Pass
     /// `usize::MAX` to flush everything (getReturn runs to the end).
     fn gen_flush_out(&mut self, state: &Rc<RefCell<crate::value::GenState>>, pos: usize) {
+        // Buffers the body opened past a yield materialize once the
+        // cursor passes their open tag.
+        self.ob_promote();
         let ready = {
             let mut st = state.borrow_mut();
             let split = st
                 .pending_out
                 .iter()
-                .position(|(t, _)| *t >= pos)
+                .position(|(t, ..)| *t >= pos)
                 .unwrap_or(st.pending_out.len());
             let mut rest = st.pending_out.split_off(split);
             std::mem::swap(&mut st.pending_out, &mut rest);
             rest
         };
-        for (_, b) in ready {
-            self.emit_bytes(&b);
+        for (t, b, is_err, is_fin) in ready {
+            // Inside a `yield from` drain the inner's flushed bytes
+            // retag into the OUTER gen's deferred queue — emitting
+            // live would echo inner output before the consumer
+            // reached it.
+            if let (Some(base), Some(run)) = (self.gen_collect_base, &self.gen_run_state) {
+                run.borrow_mut()
+                    .pending_out
+                    .push((base + t, b, is_err, is_fin));
+                continue;
+            }
+            if is_err {
+                self.diag_stderr(&String::from_utf8_lossy(&b));
+            } else {
+                self.emit_replay(&b, t);
+            }
+        }
+        // Entries just shown are no longer part of the suspended
+        // region's death-time finally output.
+        state
+            .borrow()
+            .fin_q
+            .borrow_mut()
+            .bytes
+            .retain(|(t, ..)| *t >= pos);
+    }
+
+    /// Buffer output inside a running gen body — the deferred stream
+    /// (pending_out) plus, for finally-region bytes, the destruction
+    /// journal (fin_q). Shared by emit_bytes and diag_stderr.
+    fn gen_buf_out(&mut self, tag: usize, b: &[u8], is_err: bool, is_fin: bool) {
+        if let Some(run) = &self.gen_run_state {
+            run.borrow_mut()
+                .pending_out
+                .push((tag, b.to_vec(), is_err, is_fin));
+        }
+        if is_fin {
+            if let Some(q) = &self.gen_fin_q {
+                q.borrow_mut().bytes.push((tag, b.to_vec(), is_err));
+            }
+        }
+    }
+
+    /// Whether a re-run's prefix suppression covers the current emit:
+    /// only the re-running gen's own frames replay the consumer-seen
+    /// prefix — a nested gen's body (created inside the re-run, run
+    /// by its own gen_start) emits and journals normally.
+    pub(in crate::interp) fn gen_horizon_suppresses(&self, done: usize) -> bool {
+        let r = match &self.gen_replay_horizon {
+            Some((k, tgt)) => {
+                done <= *k
+                    && self
+                        .gen_run_state
+                        .as_ref()
+                        .is_some_and(|s| Rc::ptr_eq(s, tgt))
+            }
+            None => false,
+        };
+
+        r
+    }
+
+    /// Rebuild a level's real buffer content in write order: the
+    /// direct-write head pieces stay inline, journaled segs emit
+    /// once the consumer cursor confirms them, and consumer captures
+    /// splice ahead of the first seg whose tag is >= their arrival
+    /// cursor — the shared stack's real ordering. A killed gen's
+    /// tail entries (`t + 1 >= pos`) never ran in Zend's frame and
+    /// drop out.
+    fn ob_level_content(l: &ObLevel, pos: usize, killed: bool) -> Vec<u8> {
+        if let Some(head) = &l.pop_head {
+            // Pop mirror — the body's pop ran only in the eager
+            // re-run; at teardown the real buffer's content is
+            // its pre-window head plus whatever the consumer
+            // captured while suspended.
+            let mut v = head.clone();
+            for (_, c) in &l.caps {
+                v.extend_from_slice(c);
+            }
+            return v;
+        }
+        // Walk the recorded seg/cap ranges in buf order: head slices
+        // copy through, cap bytes hold for their tag position, and
+        // each confirmed seg first emits every capture that arrived
+        // before its resume.
+        let mut events: Vec<(usize, usize, usize, bool)> = Vec::new();
+        for &(t, s, n) in &l.drained_segs {
+            events.push((s, t, n, false));
+        }
+        for &(t, s, n) in &l.cap_segs {
+            events.push((s, t, n, true));
+        }
+        events.sort_by_key(|(s, _, _, c)| (*s, *c));
+        let mut v = Vec::new();
+        let mut off = 0usize;
+        let mut ci = 0usize;
+        for (s, t, n, is_cap) in events {
+            let s = s.min(l.buf.len());
+            let e = (s + n).min(l.buf.len());
+            if s < off {
+                continue;
+            }
+            v.extend_from_slice(&l.buf[off..s]);
+            if !is_cap && t + usize::from(killed) < pos {
+                while ci < l.caps.len() && l.caps[ci].0 <= t {
+                    v.extend_from_slice(&l.caps[ci].1);
+                    ci += 1;
+                }
+                v.extend_from_slice(&l.buf[s..e]);
+            }
+            off = e;
+        }
+        v.extend_from_slice(&l.buf[off..]);
+        while ci < l.caps.len() {
+            v.extend_from_slice(&l.caps[ci].1);
+            ci += 1;
+        }
+        v
+    }
+
+    /// A dead gen's open output buffers tear down like Zend closing
+    /// the frame's levels: their real contents flush to the parent
+    /// level (or stdout), while journaled-but-unflushed captures
+    /// — the suspended body's writes the frame never ran — drop
+    /// with the window. Pop mirrors die silently: their captures
+    /// belonged to a window the body already consumed.
+    fn ob_dead_gen(&mut self, fq: &crate::value::FinQueue) {
+        let owned = |l: &ObLevel| l.gen_q.as_ref().is_some_and(|q| std::rc::Rc::ptr_eq(q, fq));
+        let (pos, total) = {
+            let q = fq.borrow();
+            (q.pos, q.total)
+        };
+        if pos >= total {
+            // The gen ran to its end — Zend leaves its output buffers
+            // on the global stack; they flush at request end like any
+            // orphaned level. Only a gen destroyed mid-flight has its
+            // buffers force-flushed at teardown.
+            return;
+        }
+        // Mid-flight teardown — the eager tail's un-confirmed
+        // journaled captures never ran in Zend's frame.
+        fq.borrow_mut().kill_tree();
+        let killed = true;
+        // Zend leaves the dead gen's output buffers ON the global
+        // stack: a suspended window's content materializes at the
+        // confirmed cursor, consumer writes keep capturing into it,
+        // and its handler fires at the final flush like any orphaned
+        // level. Promote each owned level to a real consumer level at
+        // the slot it occupied (suspend_base for parked windows).
+        for l in self
+            .suspended_obs
+            .iter_mut()
+            .chain(self.ob_stack.iter_mut())
+            .filter(|l| owned(l))
+        {
+            Self::ob_drain_level(l, false);
+            l.buf = Self::ob_level_content(l, pos, killed);
+            l.drained_segs.clear();
+            l.cap_segs.clear();
+            l.caps.clear();
+            l.gen_pending.clear();
+            l.read_vals.clear();
+            l.gen_drained = 0;
+            l.gen_q = None;
+            l.gen_open = None;
+            l.gen_close = None;
+        }
+        let mut promote: Vec<(usize, ObLevel)> = Vec::new();
+        let mut i = self.suspended_obs.len();
+        while i > 0 {
+            i -= 1;
+            if self.suspended_obs[i].gen_q.is_none() {
+                let l = self.suspended_obs.remove(i);
+                promote.push((l.suspend_base, l));
+            }
+        }
+        promote.sort_by_key(|(b, _)| *b);
+        for (base, l) in promote {
+            self.ob_stack.insert(base.min(self.ob_stack.len()), l);
+        }
+    }
+
+    /// Zend destroys a suspended generator by running the finally
+    /// chains of the try-regions enclosing its suspension point. The
+    /// eager body already buffered those bytes plus the markers a
+    /// force-close raises after them (yield-inside-finally fatal, a
+    /// parked `throw()` throwable, the body's own finally-region
+    /// death) — replay when the gen dies (dead weak ref) and once at
+    /// unit end for gens still suspended (request shutdown).
+    pub(in crate::interp) fn gen_gc_sweep(&mut self, at_unit_end: bool) -> Result<(), PhpError> {
+        if self.live_gens.is_empty() {
+            return Ok(());
+        }
+        let mut entries = std::mem::take(&mut self.live_gens);
+        // Request teardown destroys newest handles first.
+        if at_unit_end {
+            entries.reverse();
+        }
+        let mut terminal = None;
+        for (weak, q) in entries {
+            let dead = weak.upgrade().is_none();
+            if !dead && !at_unit_end {
+                // Still suspended — keep watching it.
+                self.live_gens.push((weak, q));
+                continue;
+            }
+            if terminal.is_none() {
+                terminal = self.gen_fin_replay(&q, at_unit_end);
+            } else if !dead {
+                // Teardown stopped at the first raise — keep the
+                // rest watched for a later destruction point.
+                self.live_gens.push((weak, q));
+            }
+        }
+        match terminal {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// An object freed at this teardown slot drops its prop cells
+    /// with it — a suspended generator whose only owners are those
+    /// cells force-closes right here (Zend frees the property table
+    /// alongside the object, interleaved with the destruct pass,
+    /// not at the unit-end gen sweep). Returns the first terminal
+    /// raise, like `gen_fin_replay` callers expect.
+    fn gen_prop_sweep(&mut self, o: &Rc<RefCell<PhpObject>>) -> Option<PhpError> {
+        // Tally the prop cells referencing each generator object —
+        // the gen dies with this object iff every strong ref lives
+        // in its prop table (plus the clone we hold for the check).
+        let mut gens: Vec<(Rc<RefCell<PhpObject>>, usize)> = Vec::new();
+        {
+            let b = o.borrow();
+            for name in &b.prop_order {
+                let Some(c) = b.props.get(name) else {
+                    continue;
+                };
+                if let Value::Object(go) = &*c.borrow() {
+                    if !matches!(
+                        &go.borrow().internal,
+                        Some(crate::value::ObjectInternal::Generator(_))
+                    ) {
+                        continue;
+                    }
+                    if let Some((_, n)) = gens.iter_mut().find(|(g, _)| Rc::ptr_eq(g, go)) {
+                        *n += 1;
+                    } else {
+                        gens.push((go.clone(), 1));
+                    }
+                }
+            }
+        }
+        let mut terminal = None;
+        for (go, n) in gens {
+            if Rc::strong_count(&go) != n + 1 {
+                continue;
+            }
+            let q = match &go.borrow().internal {
+                Some(crate::value::ObjectInternal::Generator(st)) => st.borrow().fin_q.clone(),
+                _ => continue,
+            };
+            if terminal.is_none() {
+                terminal = self.gen_fin_replay(&q, true);
+            }
+        }
+        terminal
+    }
+
+    /// Zend's cycle collector, driven by `gc_collect_cycles()`: an
+    /// object reachable only through other objects — the classic
+    /// object-prop ↔ suspended-gen-frame cycle (`$a->g = $a->g()`
+    /// where the gen's `$this` is `$a`) — is freed at the call, so a
+    /// dead cycle's generator force-closes and replays its finally
+    /// journal mid-script rather than at shutdown.
+    ///
+    /// The pass marks every live object, seeds roots as objects with
+    /// more strong refs than the refs found inside the candidate
+    /// universe (props / gen frames' suspended cells, yielded items,
+    /// pending sends and throws, setup args/captures/$this), and
+    /// flood-fills through internal edges; what's left is a dead
+    /// cycle. Dead gens replay their journal, dead objects run
+    /// `__destruct`, then the dead set's held cells release so the
+    /// weak handles in `live_gens`/`obj_handles` go stale like Zend
+    /// freeing the zvals.
+    pub fn gc_cycle_collect(&mut self) -> Result<usize, PhpError> {
+        // Zend's collect keeps re-rooting values that dtors unroot
+        // mid-pass (gc/bug70805: C's dtor unsets $a, whose cycle then
+        // dies inside the same collect). Re-run the mark until a pass
+        // finds nothing, accumulating the root count.
+        let mut total = 0;
+        for _ in 0..8 {
+            let n = self.gc_cycle_collect_pass()?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        self.gc_purpled.clear();
+        Ok(total)
+    }
+
+    fn gc_cycle_collect_pass(&mut self) -> Result<usize, PhpError> {
+        let objs: Vec<Rc<RefCell<PhpObject>>> = self
+            .obj_handles
+            .iter()
+            .filter_map(|h| match h {
+                ObjHandle::Obj(w) => w.upgrade(),
+                _ => None,
+            })
+            .collect();
+        // Registered arrays are graph nodes too — only arrays that
+        // took a `=&` element can join a cycle (`$a[] =& $a`).
+        let arrs: Vec<Rc<RefCell<PhpArray>>> = self
+            .arr_handles
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .collect();
+        // Refs to objects held inside the universe, per target.
+        let mut internal: HashMap<usize, usize> = HashMap::new();
+        let mut edges: HashMap<usize, Vec<usize>> = HashMap::new();
+        for o in &objs {
+            let mut out = Vec::new();
+            Self::gc_obj_out_refs(o, &mut out);
+            let mut cands = Vec::new();
+            Self::gc_obj_out_cands(o, &mut cands, &mut HashSet::new());
+            for v in &cands {
+                out.push(Self::gc_val_ptr(v));
+            }
+            for t in &out {
+                *internal.entry(*t).or_insert(0) += 1;
+            }
+            edges.insert(Rc::as_ptr(o) as usize, out);
+        }
+        for a in &arrs {
+            let mut out = Vec::new();
+            let mut visited = HashSet::new();
+            for (_, c) in &a.borrow().entries {
+                Self::gc_edge_val(&c.borrow(), &mut out, 16, &mut visited);
+            }
+            for t in &out {
+                *internal.entry(*t).or_insert(0) += 1;
+            }
+            edges.insert(Rc::as_ptr(a) as usize, out);
+        }
+        // Roots: a strong ref count above the internal tally + our
+        // own scan clone means an external holder (variable, frame,
+        // static) — the cycle can't die while that holder lives.
+        let mut reach: HashSet<usize> = objs
+            .iter()
+            .filter(|o| {
+                Rc::strong_count(o)
+                    > internal
+                        .get(&(Rc::as_ptr(o) as usize))
+                        .copied()
+                        .unwrap_or(0)
+                        + 1
+            })
+            .map(|o| Rc::as_ptr(o) as usize)
+            .collect();
+        reach.extend(
+            arrs.iter()
+                .filter(|a| {
+                    Rc::strong_count(a)
+                        > internal
+                            .get(&(Rc::as_ptr(a) as usize))
+                            .copied()
+                            .unwrap_or(0)
+                            + 1
+                })
+                .map(|a| Rc::as_ptr(a) as usize),
+        );
+        let mut stack: Vec<usize> = reach.iter().copied().collect();
+        while let Some(p) = stack.pop() {
+            if let Some(out) = edges.get(&p) {
+                for t in out {
+                    if reach.insert(*t) {
+                        stack.push(*t);
+                    }
+                }
+            }
+        }
+        let dead_arrs: Vec<Rc<RefCell<PhpArray>>> = arrs
+            .into_iter()
+            .filter(|a| !reach.contains(&(Rc::as_ptr(a) as usize)))
+            .collect();
+        let dead: Vec<Rc<RefCell<PhpObject>>> = objs
+            .into_iter()
+            .filter(|o| !reach.contains(&(Rc::as_ptr(o) as usize)))
+            .collect();
+        if dead.is_empty() && dead_arrs.is_empty() {
+            return Ok(0);
+        }
+        // Zend's count is per collected *root*, not per object — dead
+        // closures and refcounted arrays held only inside the dead set
+        // are freed too (a suspended gen's own closure, a `use (&$g)`
+        // capture cycle). Track each candidate's incoming edges from
+        // dead nodes; a candidate whose strong count is only those
+        // edges (+ our bookkeeping clone) dies with the set.
+        let mut cand_edges: HashMap<usize, usize> = HashMap::new();
+        let mut cand_map: HashMap<usize, Value> = HashMap::new();
+        for o in &dead {
+            let mut held = Vec::new();
+            Self::gc_obj_out_cands(o, &mut held, &mut HashSet::new());
+            for v in held {
+                let key = match &v {
+                    Value::Array(a) => Rc::as_ptr(a) as usize,
+                    Value::Callable(c) => Rc::as_ptr(c) as usize,
+                    _ => continue,
+                };
+                *cand_edges.entry(key).or_insert(0) += 1;
+                cand_map.entry(key).or_insert(v);
+            }
+        }
+        let mut dead_roots = dead.len();
+        let mut died: HashSet<usize> = HashSet::new();
+        let mut work: Vec<usize> = Vec::new();
+        // Dead arrays are confirmed roots themselves — count them and
+        // propagate their released cells' edges to deeper candidates.
+        for a in &dead_arrs {
+            died.insert(Rc::as_ptr(a) as usize);
+            dead_roots += 1;
+            let mut held = Vec::new();
+            let mut visited = HashSet::new();
+            for (_, c) in &a.borrow().entries {
+                Self::gc_scan_val(&c.borrow(), &mut held, 16, &mut visited);
+            }
+            for v in held {
+                let key = Self::gc_val_ptr(&v);
+                if key == 0 {
+                    continue;
+                }
+                *cand_edges.entry(key).or_insert(0) += 1;
+                cand_map.entry(key).or_insert(v);
+                work.push(key);
+            }
+        }
+        work.extend(cand_map.keys());
+        // Worklist: a candidate dies when every remaining strong ref is
+        // an edge from a dead node (+ our bookkeeping clone). Deaths
+        // release its cells, adding edges to deeper candidates that
+        // re-enter the worklist — same reachability as a fixpoint but
+        // linear in the number of edges.
+        while let Some(key) = work.pop() {
+            if died.contains(&key) {
+                continue;
+            }
+            let Some(v) = cand_map.remove(&key) else {
+                continue;
+            };
+            let strong = match &v {
+                Value::Array(a) => Rc::strong_count(a),
+                Value::Callable(c) => Rc::strong_count(c),
+                _ => continue,
+            };
+            if strong <= cand_edges[&key] + 1 {
+                died.insert(key);
+                dead_roots += 1;
+                let mut deeper = Vec::new();
+                let mut visited = HashSet::new();
+                match &v {
+                    Value::Array(a) => {
+                        for (_, c) in &a.borrow().entries {
+                            Self::gc_scan_val(&c.borrow(), &mut deeper, 16, &mut visited);
+                        }
+                    }
+                    Value::Callable(c) => {
+                        for (_, cap, _) in &c.captures {
+                            Self::gc_scan_val(&cap.borrow(), &mut deeper, 16, &mut visited);
+                        }
+                    }
+                    _ => {}
+                }
+                for d in deeper {
+                    let k = Self::gc_val_ptr(&d);
+                    if k == 0 || k == key {
+                        continue;
+                    }
+                    *cand_edges.entry(k).or_insert(0) += 1;
+                    cand_map.entry(k).or_insert(d);
+                    work.push(k);
+                }
+            }
+        }
+        let mut first_err = None;
+        for o in &dead {
+            let gen_q = match &o.borrow().internal {
+                Some(crate::value::ObjectInternal::Generator(st)) => {
+                    Some(st.borrow().fin_q.clone())
+                }
+                _ => None,
+            };
+            if let Some(q) = gen_q {
+                if let Some(e) = self.gen_fin_replay(&q, false) {
+                    first_err = Some(e);
+                }
+            } else if self
+                .find_method_in(&o.borrow().class, "__destruct")
+                .is_some()
+                && self.mark_destructed(o)
+            {
+                if let Err(e) = self.method_invoke(o.clone(), "__destruct", CallArgs::empty()) {
+                    first_err = Some(e);
+                }
+            }
+        }
+        // Release the dead set's cells last — dropping them earlier
+        // would let a freed prop's value (a gen handle) run its own
+        // close ahead of the journal replay above.
+        for a in &dead_arrs {
+            a.borrow_mut().entries.clear();
+        }
+        for o in &dead {
+            o.borrow_mut().props.clear();
+            if let Some(crate::value::ObjectInternal::Generator(st)) = &o.borrow().internal {
+                let mut st = st.borrow_mut();
+                st.items.clear();
+                st.sends.clear();
+                st.throws.clear();
+                st.injected_throwable = None;
+                let GenSetup::Invoke {
+                    args,
+                    this_obj,
+                    captures,
+                    ..
+                } = &mut st.setup;
+                args.cells.clear();
+                *this_obj = None;
+                captures.clear();
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(dead_roots),
+        }
+    }
+
+    /// The refcounted GC-root candidates held inside `o` — arrays and
+    /// closures. Same sources as `gc_obj_out_refs`; objects are
+    /// classified by the main pass instead.
+    fn gc_obj_out_cands(
+        o: &Rc<RefCell<PhpObject>>,
+        out: &mut Vec<Value>,
+        visited: &mut HashSet<usize>,
+    ) {
+        let ob = o.borrow();
+        for c in ob.props.values() {
+            Self::gc_scan_val(&c.borrow(), out, 16, visited);
+        }
+        let Some(crate::value::ObjectInternal::Generator(st)) = &ob.internal else {
+            return;
+        };
+        let st = st.borrow();
+        for (k, c) in &st.items {
+            Self::gc_scan_val(k, out, 16, visited);
+            Self::gc_scan_val(&c.borrow(), out, 16, visited);
+        }
+        for (_, v) in &st.sends {
+            Self::gc_scan_val(v, out, 16, visited);
+        }
+        for (_, v) in &st.throws {
+            Self::gc_scan_val(v, out, 16, visited);
+        }
+        if let Some(v) = &st.injected_throwable {
+            Self::gc_scan_val(v, out, 16, visited);
+        }
+        let GenSetup::Invoke {
+            args,
+            captures,
+            closure_rc,
+            ..
+        } = &st.setup;
+        for c in &args.cells {
+            Self::gc_scan_val(&c.borrow(), out, 16, visited);
+        }
+        for (_, c, _) in captures {
+            Self::gc_scan_val(&c.borrow(), out, 16, visited);
+        }
+        if let Some(rc) = closure_rc {
+            out.push(Value::Callable(rc.clone()));
+        }
+        let mut journals = vec![st.fin_q.clone()];
+        while let Some(q) = journals.pop() {
+            let f = q.borrow();
+            for (_, c) in &f.suspended {
+                Self::gc_scan_val(&c.borrow(), out, 16, visited);
+            }
+            for d in &f.delegates {
+                for (_, c) in &d.fin.suspended {
+                    Self::gc_scan_val(&c.borrow(), out, 16, visited);
+                }
+            }
+        }
+    }
+
+    /// Graph-node pointer for a value (0 = not a refcounted node).
+    fn gc_val_ptr(v: &Value) -> usize {
+        match v {
+            Value::Array(a) => Rc::as_ptr(a) as usize,
+            Value::Callable(c) => Rc::as_ptr(c) as usize,
+            Value::Object(o) => Rc::as_ptr(o) as usize,
+            _ => 0,
+        }
+    }
+
+    /// Push the graph-node pointer of every refcounted target in `v`,
+    /// recursing through array cells and closure captures.
+    fn gc_edge_val(v: &Value, out: &mut Vec<usize>, depth: u8, visited: &mut HashSet<usize>) {
+        if depth == 0 {
+            return;
+        }
+        match v {
+            Value::Object(o) => out.push(Rc::as_ptr(o) as usize),
+            Value::Array(a) => {
+                out.push(Rc::as_ptr(a) as usize);
+                if visited.insert(Rc::as_ptr(a) as usize) {
+                    for (_, c) in &a.borrow().entries {
+                        Self::gc_edge_val(&c.borrow(), out, depth - 1, visited);
+                    }
+                }
+            }
+            Value::Callable(c) => {
+                out.push(Rc::as_ptr(c) as usize);
+                if visited.insert(Rc::as_ptr(c) as usize) {
+                    for (_, cap, _) in &c.captures {
+                        Self::gc_edge_val(&cap.borrow(), out, depth - 1, visited);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Register an array-valued cell in the GC universe: a cell
+    /// holding an array that just got reference-bound into another
+    /// container can form a pure-array cycle (`$a[] =& $a`).
+    pub(in crate::interp) fn reg_arr_ref(&mut self, c: &Cell) {
+        if let Value::Array(a) = &*c.borrow() {
+            self.arr_handles.push(std::rc::Rc::downgrade(a));
+        }
+    }
+
+    /// A zval became a potential cycle root (Zend's purple-add): count
+    /// it once per buffer epoch, then run the collector on overflow.
+    pub(in crate::interp) fn gc_note_purple(&mut self, key: usize) {
+        if self.gc_purpled.insert(key) {
+            self.gc_pending += 1;
+            self.gc_maybe_collect();
+        }
+    }
+
+    /// Zend auto-collects when its 10k-entry root buffer overflows:
+    /// run the same pass here once enough potential roots piled up.
+    /// Errors raised mid-collect are dropped — Zend likewise collects
+    /// silently (its own buffer-overflow call has no error channel).
+    pub(in crate::interp) fn gc_maybe_collect(&mut self) {
+        if self.gc_pending <= 10_000 || self.gc_collecting {
+            return;
+        }
+        self.gc_collecting = true;
+        let _ = self.gc_cycle_collect();
+        // Post-collect the buffer holds only live roots — recount so
+        // the next trigger needs a fresh 10k.
+        self.arr_handles.retain(|w| w.upgrade().is_some());
+        self.gc_pending =
+            self.arr_handles.len() + self.obj_handles.iter().filter(|h| h.alive()).count();
+        self.gc_collecting = false;
+    }
+
+    /// One edge into each array/closure reachable from `v` (through
+    /// array cells and closure captures).
+    fn gc_scan_val(v: &Value, out: &mut Vec<Value>, depth: u8, visited: &mut HashSet<usize>) {
+        if depth == 0 {
+            return;
+        }
+        match v {
+            Value::Array(a) => {
+                out.push(v.clone());
+                if visited.insert(Rc::as_ptr(a) as usize) {
+                    for (_, c) in &a.borrow().entries {
+                        Self::gc_scan_val(&c.borrow(), out, depth - 1, visited);
+                    }
+                }
+            }
+            Value::Callable(c) => {
+                out.push(v.clone());
+                if visited.insert(Rc::as_ptr(c) as usize) {
+                    for (_, cap, _) in &c.captures {
+                        Self::gc_scan_val(&cap.borrow(), out, depth - 1, visited);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every object reference held inside `o` — prop cells, and for a
+    /// generator the suspended frame's stashed CVs, buffered items,
+    /// queued sends/throws and the saved call setup. The cycle
+    /// collector treats these as the graph's internal edges.
+    fn gc_obj_out_refs(o: &Rc<RefCell<PhpObject>>, out: &mut Vec<usize>) {
+        fn walk(v: &Value, out: &mut Vec<usize>, depth: u8) {
+            if depth == 0 {
+                return;
+            }
+            match v {
+                Value::Object(o) => out.push(Rc::as_ptr(o) as usize),
+                Value::Callable(c) => {
+                    if let Some(o) = &c.this_obj {
+                        out.push(Rc::as_ptr(o) as usize);
+                    }
+                    for (_, cap, _) in &c.captures {
+                        walk(&cap.borrow(), out, depth - 1);
+                    }
+                }
+                Value::Array(a) => {
+                    for (_, c) in &a.borrow().entries {
+                        walk(&c.borrow(), out, depth - 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ob = o.borrow();
+        for c in ob.props.values() {
+            walk(&c.borrow(), out, 16);
+        }
+        let Some(crate::value::ObjectInternal::Generator(st)) = &ob.internal else {
+            return;
+        };
+        let st = st.borrow();
+        for (k, c) in &st.items {
+            walk(k, out, 16);
+            walk(&c.borrow(), out, 16);
+        }
+        for (_, v) in &st.sends {
+            walk(v, out, 16);
+        }
+        for (_, v) in &st.throws {
+            walk(v, out, 16);
+        }
+        if let Some(v) = &st.injected_throwable {
+            walk(v, out, 16);
+        }
+        let GenSetup::Invoke {
+            args,
+            this_obj,
+            captures,
+            ..
+        } = &st.setup;
+        for c in &args.cells {
+            walk(&c.borrow(), out, 16);
+        }
+        if let Some(t) = this_obj {
+            out.push(Rc::as_ptr(t) as usize);
+        }
+        for (_, c, _) in captures {
+            walk(&c.borrow(), out, 16);
+        }
+        // Suspended frame CVs — the journal outlives the state, and
+        // delegation snapshots carry their own inner frames' cells.
+        let mut journals = vec![st.fin_q.clone()];
+        while let Some(q) = journals.pop() {
+            let f = q.borrow();
+            for (_, c) in &f.suspended {
+                walk(&c.borrow(), out, 16);
+            }
+            for d in &f.delegates {
+                for (_, c) in &d.fin.suspended {
+                    walk(&c.borrow(), out, 16);
+                }
+            }
+        }
+    }
+
+    /// Drain one gen's destruction journal: emit the suspended
+    /// delegation chain's queued finally output (innermost level
+    /// first) and return the level's own terminal raise — the
+    /// `yield`-inside-`finally` fatal or the body's `finally`-region
+    /// death. The suspended frame's CVs decref last — Zend frees
+    /// execute_data after the finally chain, so locals' `__destruct`
+    /// and held gens' own teardown land here, not in the body's
+    /// (already-past) output window.
+    pub(in crate::interp) fn gen_fin_replay(
+        &mut self,
+        q: &crate::value::FinQueue,
+        at_unit_end: bool,
+    ) -> Option<PhpError> {
+        {
+            let mut f = q.borrow_mut();
+
+            // Every replay path is a destruction — a gen torn down
+            // mid-flight or displaced by a re-run leaves an un-run
+            // journaled tail; a fully-consumed gen's tail ran. A
+            // delegate torn down while suspended inside the outer's
+            // yield-from drain is likewise a kill: its pos mirror
+            // counts the collect drive's internal resumes, not real
+            // consumer resumes.
+            if f.pos < f.total || f.suppressed || (!at_unit_end && self.gen_collect_base.is_some())
+            {
+                f.kill_tree();
+            }
+        }
+        if q.borrow().suppressed {
+            // Re-run artifact — the displaced incarnation's close is
+            // bookkeeping, not a real generator destruction.
+            return None;
+        }
+        self.ob_dead_gen(q);
+        let mut fin = std::mem::take(&mut *q.borrow_mut());
+        let pos = fin.pos;
+        // The take blanks the journal — parked ob windows still read
+        // this fin as their cursor mirror. Restore the bookkeeping
+        // fields they gate on.
+        {
+            let mut f = q.borrow_mut();
+            f.pos = fin.pos;
+            f.vis_pos = fin.vis_pos;
+            f.total = fin.total;
+            f.finished = fin.finished;
+            f.killed = fin.killed;
+            f.suppressed = fin.suppressed;
+            f.delegate_fins = fin.delegate_fins.clone();
+        }
+        let terminal = self.gen_fin_emit(&fin, pos, at_unit_end);
+        let dtor = self
+            .gen_release_cells(std::mem::take(&mut fin.suspended))
+            .err();
+        terminal.or(dtor)
+    }
+
+    /// Emit a journal's queued bytes for the suspended chain the
+    /// consumer is inside, innermost level first, then the level's
+    /// own bytes, then its terminal raise.
+    fn gen_fin_emit(
+        &mut self,
+        fin: &crate::value::GenFinData,
+        pos: usize,
+        at_unit_end: bool,
+    ) -> Option<PhpError> {
+        for d in fin.active_delegates_at(pos) {
+            if let Some(e) = self.gen_fin_emit(&d.fin, pos, at_unit_end) {
+                return Some(e);
+            }
+        }
+        // Suspended AT a yield inside `finally` (iteration reached it
+        // normally, or a throw()-driven unwind parked there): Zend
+        // abandons the gen silently — the yield already suspended,
+        // so the finally's tail bytes and any terminal raise never
+        // run.
+        if fin.yields.iter().any(|(i, _)| *i == pos) {
+            return None;
+        }
+        self.gen_fin_own_bytes(fin, pos);
+        self.gen_fin_terminal(fin, pos, at_unit_end)
+    }
+
+    /// Bytes-only replay of the suspended chain (innermost first) —
+    /// the `throw()` close path, whose terminal is the injected
+    /// throwable itself.
+    fn gen_fin_bytes(&mut self, fin: &crate::value::GenFinData, pos: usize) {
+        for d in fin.active_delegates_at(pos) {
+            self.gen_fin_bytes(&d.fin, pos);
+        }
+        self.gen_fin_own_bytes(fin, pos);
+    }
+
+    /// This level's output bytes whose tags the consumer hasn't
+    /// passed (already-shown tags were flushed through `pending_out`
+    /// during normal iteration). A `yield`-inside-`finally` past the
+    /// suspension point ends the unwind — bytes it or anything after
+    /// it emitted never replay.
+    fn gen_fin_own_bytes(&mut self, fin: &crate::value::GenFinData, pos: usize) {
+        let cap = fin
+            .yields
+            .iter()
+            .filter(|(i, _)| *i > pos)
+            .map(|(i, _)| *i)
+            .min();
+        for (t, b, is_err) in &fin.bytes {
+            if *t < pos {
+                continue;
+            }
+            if cap.is_some_and(|y| *t >= y) {
+                continue;
+            }
+            if *is_err {
+                self.diag_stderr(&String::from_utf8_lossy(b));
+            } else {
+                self.emit_replay(b, *t);
+            }
+        }
+    }
+
+    /// The destruction-time raise for a force-closed or shutdown gen,
+    /// in unwind order: a `yield` past the suspension point inside a
+    /// `finally` region fatals; the body's own error replays when it
+    /// died inside `finally`.
+    fn gen_fin_terminal(
+        &mut self,
+        fin: &crate::value::GenFinData,
+        pos: usize,
+        at_unit_end: bool,
+    ) -> Option<PhpError> {
+        if let Some((_, yline)) = fin.yields.iter().find(|(i, _)| *i > pos) {
+            let v = self.exception(
+                "Error",
+                "Cannot yield from finally in a force-closed generator",
+            );
+            if let Value::Object(o) = &v {
+                let mut b = o.borrow_mut();
+                if let Some(crate::value::ObjectInternal::Exception {
+                    file, line, thrown, ..
+                }) = &mut b.internal
+                {
+                    *file = if fin.file.is_empty() {
+                        self.diag_file()
+                    } else {
+                        fin.file.clone()
+                    };
+                    *line = *yline as u32;
+                    *thrown = *yline as u32;
+                }
+            }
+            let e = self.throw(v);
+            let frames = self.gen_gc_frames(&fin.fn_name, at_unit_end);
+            self.rewrite_throwable_trace(&frames);
+            return Some(e);
+        }
+        if let Some((mut e, throwable)) = fin.fin_err.clone() {
+            let frames = self.gen_gc_frames(&fin.fn_name, at_unit_end);
+            if e.kind == crate::error::ErrorKind::Throw {
+                if throwable.is_some() {
+                    self.pending_exception = throwable;
+                }
+                self.rewrite_throwable_trace(&frames);
+            } else {
+                e.trace = Some(frames);
+            }
+            return Some(e);
+        }
+        None
+    }
+
+    /// Destruction-site frames for a force-close / shutdown raise:
+    /// `FILE(line): g()` at an unset/overwrite point, `[internal
+    /// function]: g()` at request shutdown — under the consumer's
+    /// own frames.
+    fn gen_gc_frames(&mut self, fn_name: &str, at_unit_end: bool) -> Vec<String> {
+        let mut frames = vec![if at_unit_end {
+            format!("[internal function]: {}()", fn_name)
+        } else {
+            format!("{}({}): {}()", self.diag_file(), self.cur_line, fn_name)
+        }];
+        for fr in self.call_trace.iter().rev() {
+            if crate::value::trace_frame_hidden(fr) {
+                continue;
+            }
+            frames.push(crate::value::trace_frame_str(fr));
+        }
+        frames
+    }
+
+    /// Swap the pending throwable's trace for a rendered frame list —
+    /// the uncaught display reads the Throwable's own trace.
+    fn rewrite_throwable_trace(&mut self, frames: &[String]) {
+        if let Some(Value::Object(o)) = &self.pending_exception {
+            let mut obj = o.borrow_mut();
+            if let Some(crate::value::ObjectInternal::Exception {
+                trace,
+                frames: cframes,
+                ..
+            }) = &mut obj.internal
+            {
+                // The throwable's own construction stack leads the
+                // render (Zend keeps the frames live at `new` time);
+                // construction frames the resume stack already
+                // reports drop out — suspended gen bodies surface
+                // as `[internal function]: f()` (call-resume) or a
+                // `FILE(line): f()` frame (foreach-resume), and an
+                // engine error raised while in-body calls were live
+                // re-reports those calls in raise_frames.
+                let mut names: Vec<String> = frames
+                    .iter()
+                    .filter_map(|f| {
+                        f.strip_prefix("[internal function]: ")
+                            .and_then(|s| s.split('(').next())
+                            .map(|n| n.to_string())
+                    })
+                    .collect();
+                for f in frames {
+                    if let Some(pos) = f.find("): ") {
+                        let call = &f[pos + 3..];
+                        if let Some(end) = call.find('(') {
+                            names.push(call[..end].to_string());
+                        }
+                    }
+                }
+                let mut parts: Vec<String> = Vec::new();
+                for fr in cframes.clone().iter().rev() {
+                    if crate::value::trace_frame_hidden(fr) {
+                        continue;
+                    }
+                    let callee = fr
+                        .class
+                        .as_ref()
+                        .map(|c| format!("{}{}{}", c, fr.ty, fr.function))
+                        .unwrap_or_else(|| fr.function.clone());
+                    if names.contains(&fr.function) || names.contains(&callee) {
+                        continue;
+                    }
+                    parts.push(crate::value::trace_frame_str(fr));
+                }
+                parts.extend(frames.iter().cloned());
+                let mut t = String::new();
+                for (i, fr) in parts.iter().enumerate() {
+                    t.push_str(&format!("#{} {}\n", i, fr));
+                }
+                t.push_str(&format!("#{} {{main}}", parts.len()));
+                *trace = t;
+            }
         }
     }
 
@@ -2633,23 +5002,50 @@ impl<'a> Interp<'a> {
         self.coerce_int(v)
     }
 
-    /// getenv(): putenv() overrides win over the process environment.
+    /// getenv(): putenv() overrides win over the process environment;
+    /// an unset tombstone makes the name read back as unset.
     pub fn getenv_pub(&self, name: &str) -> Option<String> {
-        self.env_overrides
-            .get(name)
-            .cloned()
-            .or_else(|| std::env::var(name).ok())
+        match self.env_overrides.get(name) {
+            Some(v) => v.clone(),
+            None => std::env::var(name).ok(),
+        }
     }
 
-    /// putenv("K=V") → true on success.
+    /// getenv() with no args: the whole environment as name → value,
+    /// minus tombstoned names.
+    pub fn getenv_all_pub(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = std::env::vars()
+            .filter(|(k, _)| !matches!(self.env_overrides.get(k), Some(None)))
+            .collect();
+        for (k, v) in &self.env_overrides {
+            let Some(v) = v else { continue };
+            match out.iter_mut().find(|(ek, _)| ek == k) {
+                Some(e) => e.1 = v.clone(),
+                None => out.push((k.clone(), v.clone())),
+            }
+        }
+        out
+    }
+
+    /// putenv("K=V") sets, putenv("K") unsets (zend's unsetenv form) —
+    /// both return true.
     pub fn putenv_pub(&mut self, s: &str) -> bool {
         match s.split_once('=') {
             Some((k, v)) => {
-                self.env_overrides.insert(k.to_string(), v.to_string());
-                true
+                self.env_overrides
+                    .insert(k.to_string(), Some(v.to_string()));
             }
-            None => false,
+            None => {
+                self.env_overrides.insert(s.to_string(), None);
+            }
         }
+        true
+    }
+
+    /// putenv() state for spawning children: set/overrides/unset pairs
+    /// applied on top of the inherited process environment.
+    pub fn env_overrides_pub(&self) -> &HashMap<String, Option<String>> {
+        &self.env_overrides
     }
 
     /// Build a throwable object (used for internal errors).
@@ -2682,6 +5078,9 @@ impl<'a> Interp<'a> {
 
     /// Raise `throw $v` as an error result.
     fn throw(&mut self, v: Value) -> PhpError {
+        if self.gen_run_state.is_some() {
+            self.gen_raise_ctx = self.call_trace.clone();
+        }
         self.pending_exception = Some(v);
         PhpError {
             trace: None,
@@ -3138,6 +5537,9 @@ impl<'a> Interp<'a> {
                 e.message
             );
         }
+        if self.gen_run_state.is_some() {
+            self.gen_raise_ctx = self.call_trace.clone();
+        }
         self.last_err_file = self.diag_file();
         if let ErrorKind::Uncaught { class } = e.kind {
             // Errors raised mid-const-expr get a pseudo-frame for the
@@ -3274,7 +5676,7 @@ fn assert_arg_repr(v: &Value) -> String {
         Value::Array(_) => "Array".into(),
         Value::Object(o) => format!("Object({})", o.borrow().class.name()),
         Value::Callable(_) => "Object(Closure)".into(),
-        Value::Resource(_) => "Resource id #1".into(),
+        Value::Resource(r) => format!("Resource id #{}", r.borrow().id()),
     }
 }
 

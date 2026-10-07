@@ -24,12 +24,16 @@ pub enum ConstCtx {
 pub struct Parser<'a> {
     toks: &'a [Lexed],
     pos: usize,
-    /// Compile-time deprecation diagnostics (msg, line) — PHP emits them
-    /// before execution; `parse_with` prepends them as `Stmt::Deprecated`.
-    deprecations: Vec<(String, usize)>,
-    /// Compile-time warnings (msg, line) — confusable type names
+    /// Compile-time deprecation diagnostics (msg, line, token pos) — PHP
+    /// emits them at their position while compiling; `parse_toks` binds
+    /// each to the stmt it was lexed/parsed inside as `Stmt::Diag`.
+    deprecations: Vec<(String, usize, usize)>,
+    /// Compile-time warnings (msg, line, pos) — confusable type names
     /// (confusable_type_warning). Drained into `Stmt::Diag`.
-    compile_warnings: Vec<(String, usize)>,
+    compile_warnings: Vec<(String, usize, usize)>,
+    /// Token index where each top-level stmt of `program()` began —
+    /// used to bind compile-time diagnostics to their source stmt.
+    stmt_starts: Vec<usize>,
     /// Enclosing class name while parsing members (hook error text).
     cur_class: String,
     /// (prop name, is_get) while inside a hook body — gates
@@ -65,6 +69,10 @@ pub struct Parser<'a> {
     /// `declare(strict_types=1)` can't claim the slot
     /// (scalar_strict_declaration_placement_*, strict_nested).
     first_stmt_slot: bool,
+    /// Zend's scanner line at end-of-input (one past the last
+    /// consumed newline) — where `unexpected end of file` reports,
+    /// not the last token's line.
+    eof_line: usize,
     /// True only while the literal first statement is a
     /// `declare` — the only place `strict_types` is legal.
     strict_slot: bool,
@@ -142,22 +150,29 @@ pub fn parse_pure(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
 /// `eof_line` is Zend's scanner line at end-of-input (one past the
 /// last consumed newline) — where EOF-attributed errors are reported.
 fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> {
-    // Compile-time diagnostics ride the token stream; drain them and
-    // emit before execution (Zend emits compile warnings upfront).
-    let mut lex_diags: Vec<(String, &'static str, usize)> = Vec::new();
+    // Compile-time diagnostics ride the token stream; each records the
+    // index it would occupy in the filtered stream — its binding
+    // position for stmt attribution (Zend emits a diagnostic while
+    // compiling the stmt that produced it, so a compile-fatal on an
+    // earlier stmt suppresses later ones).
+    let mut lex_diags: Vec<(usize, String, &'static str, usize)> = Vec::new();
+    let mut kept = 0usize;
     let toks: Vec<Lexed> = toks
         .into_iter()
         .filter_map(|t| match t.token {
             Token::Diag(level, msg) => {
-                lex_diags.push((msg, level, t.line));
+                lex_diags.push((kept, msg, level, t.line));
                 None
             }
-            _ => Some(t),
+            _ => {
+                kept += 1;
+                Some(t)
+            }
         })
         .collect();
     let bracket_err = bracket_check(&toks, eof_line);
-    let mut p = Parser::new(&toks);
-    let mut stmts = match p.program() {
+    let mut p = Parser::new(&toks, eof_line);
+    let stmts = match p.program() {
         Ok(s) => s,
         Err(pe) => {
             // Zend reports the earliest error. The scanner dies at its
@@ -168,7 +183,10 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
             // an end-of-input error there means the parser was simply
             // still waiting for the dead token).
             if let Some((be, bpos)) = bracket_err {
-                let mut p2 = Parser::new(&toks[..bpos]);
+                let mut p2 = Parser::new(
+                    &toks[..bpos],
+                    toks.get(bpos).map(|t| t.line).unwrap_or(eof_line),
+                );
                 match p2.program() {
                     Err(pe2) if !pe2.message.starts_with("syntax error, unexpected end of") => {
                         return Err(pe2);
@@ -188,31 +206,54 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
     if let Some((msg, line)) = p.write_ctx_errs.first() {
         return Err(PhpError::compile_fatal(msg.clone(), *line));
     }
-    let mut diags: Vec<(String, &'static str, usize)> = lex_diags;
+    // Bind each diagnostic to the stmt whose token span covers its
+    // position and park it directly before that stmt: `echo "${a}";
+    // break;` prints the Deprecated before the break fatal, while
+    // `break; echo "${a}";` dies on the break first and never emits it.
+    let mut diags: Vec<(usize, String, &'static str, usize)> = lex_diags;
     diags.extend(
         std::mem::take(&mut p.deprecations)
             .into_iter()
-            .map(|(msg, line)| (msg, "Deprecated", line)),
+            .map(|(msg, line, pos)| (pos, msg, "Deprecated", line)),
     );
     diags.extend(
         std::mem::take(&mut p.compile_warnings)
             .into_iter()
-            .map(|(msg, line)| (msg, "Warning", line)),
+            .map(|(msg, line, pos)| (pos, msg, "Warning", line)),
     );
-    diags.sort_by_key(|(_, _, line)| *line);
-    for (i, (msg, level, line)) in diags.into_iter().enumerate() {
-        stmts.insert(i, Stmt::Diag { level, msg, line });
+    diags.sort_by_key(|(pos, ..)| *pos);
+    let mut diags = diags.into_iter().peekable();
+    let mut stmt_idx = 0usize;
+    let mut out = Vec::with_capacity(stmts.len() + 8);
+    for s in stmts {
+        if !matches!(s, Stmt::Line(_)) {
+            let lo = p.stmt_starts.get(stmt_idx).copied().unwrap_or(usize::MAX);
+            let hi = p
+                .stmt_starts
+                .get(stmt_idx + 1)
+                .copied()
+                .unwrap_or(usize::MAX);
+            while let Some((_, msg, level, line)) =
+                diags.next_if(|(pos, ..)| *pos >= lo && *pos < hi)
+            {
+                out.push(Stmt::Diag { level, msg, line });
+            }
+            stmt_idx += 1;
+        }
+        out.push(s);
     }
-    Ok(stmts)
+    Ok(out)
 }
 
 impl<'a> Parser<'a> {
-    fn new(toks: &'a [Lexed]) -> Self {
+    fn new(toks: &'a [Lexed], eof_line: usize) -> Self {
         Self {
             toks,
             pos: 0,
+            eof_line,
             deprecations: Vec::new(),
             compile_warnings: Vec::new(),
+            stmt_starts: Vec::new(),
             cur_class: String::new(),
             hook_ctx: None,
             pending_class_attrs: Vec::new(),
@@ -312,8 +353,10 @@ pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
     let mut p = Parser {
         toks: &toks,
         pos: 0,
+        eof_line: toks.last().map(|t| t.line).unwrap_or(1),
         deprecations: Vec::new(),
         compile_warnings: Vec::new(),
+        stmt_starts: Vec::new(),
         cur_class: String::new(),
         hook_ctx: None,
         pending_class_attrs: Vec::new(),
@@ -354,7 +397,7 @@ impl<'a> Parser<'a> {
         self.toks
             .get(self.pos)
             .map(|l| l.line)
-            .unwrap_or_else(|| self.toks.last().map(|l| l.line).unwrap_or(1))
+            .unwrap_or(self.eof_line)
     }
 
     pub(in crate::parser) fn next(&mut self) -> Option<Token> {
@@ -410,10 +453,105 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `expect_op` that never prints the ", expecting" clause — Zend's
+    /// yacc expected-set at a grouping or statement-condition close is
+    /// too large to report, so `if (`, `elseif`, `while`/`do-while`,
+    /// `switch (`, `match (`, `(expr`, `empty(`, `eval(` and casts all
+    /// stop at `unexpected token "X"`.
+    pub(in crate::parser) fn expect_group(&mut self, op: &str) -> Result<(), PhpError> {
+        if self.eat_op(op) {
+            Ok(())
+        } else {
+            Err(PhpError::parse(
+                format!("syntax error, unexpected {}", self.describe()),
+                self.line(),
+            ))
+        }
+    }
+
+    /// `expect_op` that always prints the clause — Zend DOES report the
+    /// single-token set at `for`-header separators (`expecting ";"`),
+    /// unlike a statement-end `;` which stays silent.
+    pub(in crate::parser) fn expect_op_full(&mut self, op: &str) -> Result<(), PhpError> {
+        if self.eat_op(op) {
+            Ok(())
+        } else {
+            Err(PhpError::parse(
+                format!(
+                    "syntax error, unexpected {}, expecting \"{}\"",
+                    self.describe(),
+                    op
+                ),
+                self.line(),
+            ))
+        }
+    }
+
+    /// Stmt-end of a comma-separated list — `echo` args and the
+    /// `global`/`static`/`const`/`use` declarator lists: Zend's yacc
+    /// expected-set there is exactly `"," or ";"` (syntax_errors).
+    pub(in crate::parser) fn expect_op_list_end(&mut self) -> Result<(), PhpError> {
+        if self.eat_op(";") {
+            Ok(())
+        } else {
+            Err(PhpError::parse(
+                format!(
+                    "syntax error, unexpected {}, expecting \",\" or \";\"",
+                    self.describe()
+                ),
+                self.line(),
+            ))
+        }
+    }
+
+    /// The optional operand of `return`/`break`/`continue`: when the
+    /// operand fails to start at all Zend reports the yacc state whose
+    /// expected-set is just `";"` (`return ::` → `expecting ";"`), but
+    /// an operand that started and failed mid-expression keeps the
+    /// inner error (`return 1 +` → bare `unexpected end of file`).
+    pub(in crate::parser) fn expr_semi_operand(&mut self) -> Result<Expr, PhpError> {
+        let start = self.pos;
+        self.expr().map_err(|mut e| {
+            if self.pos == start
+                && e.message.starts_with("syntax error, unexpected ")
+                && !e.message.contains(", expecting ")
+            {
+                e.message.push_str(", expecting \";\"");
+            }
+            e
+        })
+    }
+
     pub(in crate::parser) fn describe(&self) -> String {
         match self.peek() {
             None => "end of file".to_string(),
-            Some(Token::Ident(s)) => format!("identifier \"{}\"", s),
+            Some(Token::Ident(s)) => {
+                // A qualified name is one T_NAME_QUALIFIED in Zend —
+                // `unexpected namespaced name "A\B"`.
+                if matches!(
+                    self.toks.get(self.pos + 1).map(|l| &l.token),
+                    Some(Token::Op(o)) if *o == "\\"
+                ) {
+                    let mut n = s.clone();
+                    let mut i = self.pos + 1;
+                    loop {
+                        match (
+                            self.toks.get(i).map(|l| &l.token),
+                            self.toks.get(i + 1).map(|l| &l.token),
+                        ) {
+                            (Some(Token::Op(o)), Some(Token::Ident(seg))) if *o == "\\" => {
+                                n.push('\\');
+                                n.push_str(seg);
+                                i += 2;
+                            }
+                            _ => break,
+                        }
+                    }
+                    format!("namespaced name \"{}\"", n)
+                } else {
+                    format!("identifier \"{}\"", s)
+                }
+            }
             Some(Token::Variable(s)) => format!("variable \"${}\"", s),
             Some(Token::Int(v)) => format!("integer \"{}\"", v),
             Some(Token::Float(v)) => format!("float {}", v),
@@ -458,6 +596,7 @@ impl<'a> Parser<'a> {
         let mut halted = false;
         while self.peek().is_some() {
             let stmt_line = self.line();
+            self.stmt_starts.push(self.pos);
             stmts.push(Stmt::Line(stmt_line));
             self.first_stmt_slot = !saw_any;
             let s = self.stmt()?;
@@ -471,7 +610,7 @@ impl<'a> Parser<'a> {
                 // unreachable (guarded above); keeps the flow explicit.
             }
             if is_ns && !saw_ns && saw_code {
-                return Err(PhpError::fatal(
+                return Err(PhpError::compile_fatal(
                     "Namespace declaration statement has to be the very first statement or after any declare call in the script".to_string(),
                     self.line(),
                 ));
@@ -496,7 +635,7 @@ impl<'a> Parser<'a> {
                 && !matches!(&s, Stmt::Declare { .. })
                 && !matches!(&s, Stmt::Expr(Expr::Null))
             {
-                return Err(PhpError::fatal(
+                return Err(PhpError::compile_fatal(
                     "No code may exist outside of namespace {}".to_string(),
                     stmt_line,
                 ));
@@ -585,14 +724,14 @@ impl<'a> Parser<'a> {
             Some(Token::Echo) => {
                 self.pos += 1;
                 let args = self.expr_list()?;
-                self.eat_op(";");
+                self.expect_op_list_end()?;
                 Ok(Stmt::Echo(args))
             }
             Some(Token::Ident(_)) => {
                 if self.ident_is("echo") {
                     self.pos += 1;
                     let args = self.expr_list()?;
-                    self.expect_op(";")?;
+                    self.expect_op_list_end()?;
                     Ok(Stmt::Echo(args))
                 } else if self.ident_is("if") {
                     self.if_stmt()
@@ -600,7 +739,7 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     self.expect_op("(")?;
                     let cond = self.expr()?;
-                    self.expect_op(")")?;
+                    self.expect_group(")")?;
                     let body = self.body_any("endwhile")?;
                     Ok(Stmt::While { cond, body })
                 } else if self.ident_is("do") {
@@ -614,7 +753,7 @@ impl<'a> Parser<'a> {
                     }
                     self.expect_op("(")?;
                     let cond = self.expr()?;
-                    self.expect_op(")")?;
+                    self.expect_group(")")?;
                     self.expect_op(";")?;
                     Ok(Stmt::DoWhile { body, cond })
                 } else if self.ident_is("for") {
@@ -627,14 +766,14 @@ impl<'a> Parser<'a> {
                         self.pos += 1;
                         Ok(Stmt::Return(None))
                     } else {
-                        let e = self.expr()?;
+                        let e = self.expr_semi_operand()?;
                         if self.ret_by_ref && Self::has_nullsafe(&e) {
                             self.write_ctx_errs.push((
                                 "Cannot take reference of a nullsafe chain".to_string(),
                                 self.line(),
                             ));
                         }
-                        self.expect_op(";")?;
+                        self.expect_op_full(";")?;
                         Ok(Stmt::Return(Some(e)))
                     }
                 } else if self.ident_is("break") || self.ident_is("continue") {
@@ -643,9 +782,9 @@ impl<'a> Parser<'a> {
                     let arg = if self.at_op(";") {
                         None
                     } else {
-                        Some(self.expr()?)
+                        Some(self.expr_semi_operand()?)
                     };
-                    self.expect_op(";")?;
+                    self.expect_op_full(";")?;
                     Ok(if is_break {
                         Stmt::Break(arg)
                     } else {
@@ -661,7 +800,10 @@ impl<'a> Parser<'a> {
                             }
                             _ => {
                                 return Err(PhpError::parse(
-                                    "syntax error, unexpected token, expecting variable",
+                                    format!(
+                                        "syntax error, unexpected {}, expecting variable or \"$\"",
+                                        self.describe()
+                                    ),
                                     self.line(),
                                 ))
                             }
@@ -670,7 +812,7 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
-                    self.expect_op(";")?;
+                    self.expect_op_list_end()?;
                     Ok(Stmt::Global(names))
                 } else if self.ident_is("static")
                     && matches!(self.peek2(), Some(Token::Variable(_)))
@@ -698,7 +840,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect_op(")")?;
-                    self.expect_op(";")?;
+                    self.expect_op_full(";")?;
                     Ok(Stmt::Unset(xs))
                 } else if self.ident_is("try") {
                     self.try_stmt()
@@ -734,7 +876,7 @@ impl<'a> Parser<'a> {
                                 self.line(),
                             ));
                         }
-                        return Err(PhpError::fatal(
+                        return Err(PhpError::compile_fatal(
                             format!("Cannot use '{}' as namespace name", name),
                             self.line(),
                         ));
@@ -746,7 +888,7 @@ impl<'a> Parser<'a> {
                     self.declared_types.clear();
                     let braced = self.at_op("{");
                     if self.in_braced_ns {
-                        return Err(PhpError::fatal(
+                        return Err(PhpError::compile_fatal(
                             if braced {
                                 "Namespace declarations cannot be nested".to_string()
                             } else {
@@ -757,7 +899,7 @@ impl<'a> Parser<'a> {
                     }
                     let style = if braced { 2 } else { 1 };
                     if self.ns_style != 0 && self.ns_style != style {
-                        return Err(PhpError::fatal(
+                        return Err(PhpError::compile_fatal(
                             "Cannot mix bracketed namespace declarations with unbracketed namespace declarations".to_string(),
                             self.line(),
                         ));
@@ -837,7 +979,7 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
-                    self.expect_op(";")?;
+                    self.expect_op_list_end()?;
                     Ok(Stmt::ConstDecl(defs))
                 } else if self.ident_is("use")
                     && matches!(self.peek2(), Some(Token::Ident(_)) | Some(Token::Op("\\")))
@@ -855,7 +997,7 @@ impl<'a> Parser<'a> {
                         }
                     };
                     self.pos += 1;
-                    self.expect_op(";")?;
+                    self.expect_op_full(";")?;
                     Ok(Stmt::Goto(label))
                 } else if matches!(self.peek2(), Some(Token::Op(":"))) {
                     // `name:` — a goto label; can't start any expression.

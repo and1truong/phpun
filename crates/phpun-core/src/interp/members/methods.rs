@@ -541,7 +541,13 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let k = self.ao_dim_key(obj, &raw_k)?;
-                arr.borrow_mut().unset(&k);
+                // The evicted payload's last ref dies with the
+                // cell — held objects/gens destruct now. Drop the
+                // borrow before dtors run (bug65051).
+                let evicted = arr.borrow_mut().unset(&k);
+                if let Some(v) = evicted {
+                    self.destruct_dying_value(&v)?;
+                }
                 // Object-backed storage mirrors props — the unset
                 // removes the backing prop as well (spl backing has
                 // no props; the arr.unset above already hit storage).
@@ -1344,7 +1350,9 @@ impl<'a> Interp<'a> {
                 let mut a = arr.borrow_mut();
                 match a.get_cell(&k) {
                     Some(c) if Rc::ptr_eq(&c, pc) => {}
-                    _ => a.bind_cell(k, pc.clone()),
+                    _ => {
+                        a.bind_cell(k, pc.clone());
+                    }
                 }
             }
         }
@@ -1359,7 +1367,11 @@ impl<'a> Interp<'a> {
             .collect();
         drop(so);
         for k in stale {
-            arr.borrow_mut().unset(&k);
+            // Drop the borrow before the evicted payload's dtors run.
+            let evicted = arr.borrow_mut().unset(&k);
+            if let Some(v) = evicted {
+                let _ = self.destruct_dying_value(&v);
+            }
         }
     }
 
@@ -2163,6 +2175,23 @@ impl<'a> Interp<'a> {
                 || self.is_throwable_name(&ob.class.decl.name)
         };
         let cls = obj.borrow().class.clone();
+        // WeakReference::get() — upgrades the weak handle (null when
+        // the target was collected).
+        if name.eq_ignore_ascii_case("get") {
+            let w = {
+                let ob = obj.borrow();
+                match &ob.internal {
+                    Some(ObjectInternal::WeakRef(w)) => Some(w.upgrade()),
+                    _ => None,
+                }
+            };
+            if let Some(u) = w {
+                return Ok(match u {
+                    Some(o) => Value::Object(o),
+                    None => Value::Null,
+                });
+            }
+        }
         if is_throwable {
             // Native method only when the resolved method is a builtin
             // registration (line 0 — userland always runs, even an empty
@@ -2179,12 +2208,29 @@ impl<'a> Interp<'a> {
                     if let Some(v) = self.throwable_ctor(&obj, &args)? {
                         return Ok(v);
                     }
-                } else if let Some(v) = self.throwable_method(&obj, name, &args.cells) {
+                } else if let Some(v) = self.throwable_method(&obj, name, &args.cells)? {
                     return Ok(v);
                 }
             }
         }
-        // Reflection stubs are native: constructor stores the target
+        // php_user_filter stubs — zend's internal defaults: filter()
+        // returns PSFS_ERR_FATAL, onCreate() true, onClose() void, the
+        // on* hooks true. Only fires when the resolved method is the
+        // registered stub — a userland override runs its own body.
+        if self.obj_is_a_str(cls.name(), "php_user_filter") {
+            let stub = self
+                .find_method_in(&cls, name)
+                .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
+                .unwrap_or(false);
+            if stub {
+                return Ok(match name.to_lowercase().as_str() {
+                    "filter" => Value::Int(0),
+                    "oncreate" => Value::Bool(true),
+                    "onclose" => Value::Null,
+                    _ => Value::Bool(true),
+                });
+            }
+        }
         // name, methods act on it (gh15438_2).
         if cls.name().starts_with("Reflection") || cls.name().starts_with("reflection") {
             let stub = self
@@ -2392,10 +2438,10 @@ impl<'a> Interp<'a> {
         obj: &Rc<RefCell<PhpObject>>,
         name: &str,
         _args: &[Cell],
-    ) -> Option<Value> {
+    ) -> Result<Option<Value>, PhpError> {
         let ob = obj.borrow();
         let lname = name.to_lowercase();
-        match lname.as_str() {
+        Ok(match lname.as_str() {
             "getmessage" => Some(
                 ob.props
                     .get("message")
@@ -2466,7 +2512,12 @@ impl<'a> Interp<'a> {
                 Some(ObjectInternal::Exception { previous, .. }) => {
                     Some(previous.clone().unwrap_or(Value::Null))
                 }
-                _ => Some(Value::Null),
+                _ => Some(
+                    ob.props
+                        .get("previous")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null),
+                ),
             },
             "__tostring" => {
                 // zend renders the whole previous-chain innermost
@@ -2546,7 +2597,7 @@ impl<'a> Interp<'a> {
                     .unwrap_or(Value::Int(1)),
             ),
             _ => None,
-        }
+        })
     }
 
     /// zend materializes its engine state into the dump-visible prop
@@ -2563,6 +2614,8 @@ impl<'a> Interp<'a> {
         };
         let trace_v = self
             .throwable_method(o, "getTrace", &[])
+            .ok()
+            .flatten()
             .unwrap_or(Value::Null);
         let (file, line) = {
             let ob = o.borrow();

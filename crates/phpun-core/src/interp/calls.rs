@@ -691,6 +691,7 @@ impl<'a> Interp<'a> {
                         frame.call_alias = self.pending_call_alias.take();
                         frame.fn_line = decl.line;
                         frame.file = decl.file.clone();
+                        frame.ns = decl.ns.clone();
                         frame.ret_by_ref = decl.by_ref;
                         for (n, cap, by_ref) in &c.captures {
                             // By-value captures re-import the stored
@@ -1993,10 +1994,94 @@ impl<'a> Interp<'a> {
         // replaces the result and aborts; during unwind it chains —
         // destruct_frame_objs guards that itself.
         let out = if let Some(f) = self.last_popped_frame.take() {
-            let dtor_err = self.destruct_frame_objs(&f).err();
-            match (r, dtor_err) {
-                (Ok(_), Some(e)) => Err(e),
-                (r, _) => r,
+            // A generator body's frame pops as a suspension, not a
+            // return — Zend keeps its CVs live in execute_data until
+            // the gen closes or is destroyed, then decrefs them after
+            // the finally journal. Stash the cells on the journal
+            // rather than destructing at this (eager) run's end.
+            let suspended = self
+                .gen_run_state
+                .as_ref()
+                .is_some_and(|st| st.borrow().owns_frame(decl));
+            if suspended {
+                let st = self.gen_run_state.clone().unwrap();
+                // CV order ~ the variable's first source position —
+                // the frame teardown decrefs in that order, so a
+                // held object's __destruct / gen release lands at
+                // its own slot (HashMap order would scramble it).
+                let body_src = format!("{:?}", decl.body);
+                let mut pairs: Vec<(String, Cell)> =
+                    f.vars.iter().map(|(n, c)| (n.clone(), c.clone())).collect();
+                pairs.sort_by_cached_key(|(n, _)| {
+                    body_src
+                        .find(&format!("Var(\"{}\")", n))
+                        .unwrap_or(usize::MAX)
+                });
+                for (i, c) in f.args.iter().enumerate() {
+                    pairs.push((format!("\u{0}arg{i}"), c.clone()));
+                }
+                if let Some(o) = f.this_obj.clone() {
+                    pairs.push(("\u{0}this".to_string(), cell(Value::Object(o))));
+                }
+                let fin_rc = st.borrow().fin_q.clone();
+                let mut fin = fin_rc.borrow_mut();
+                let prev = std::mem::take(&mut fin.suspended);
+                if !prev.is_empty() {
+                    // Re-run: the resumed frame's CVs are the current
+                    // state — per name its cell wins; names the re-run
+                    // never re-materialized keep the suspended cell
+                    // (Zend's parked frame still holds them).
+                    for (n, c) in &prev {
+                        if !pairs.iter().any(|(m, _)| m == n) {
+                            pairs.push((n.clone(), c.clone()));
+                        }
+                    }
+                    // Cells the new frame displaced die with `prev`
+                    // — a gen among them whose every ref lives in the
+                    // displaced set is a re-run artifact: suppress its
+                    // destruction journal (the logical successor's own
+                    // teardown owns the close, not this bookkeeping
+                    // death). Cells kept by name above don't drop.
+                    let mut tally: HashMap<usize, usize> = HashMap::new();
+                    for (_, c) in prev
+                        .iter()
+                        .filter(|(n, _)| pairs.iter().any(|(m, _)| m == n))
+                    {
+                        if let Value::Object(o) = &*c.borrow() {
+                            *tally.entry(Rc::as_ptr(o) as usize).or_insert(0) += 1;
+                        }
+                    }
+                    for (_, c) in prev
+                        .iter()
+                        .filter(|(n, _)| pairs.iter().any(|(m, _)| m == n))
+                    {
+                        if let Value::Object(o) = &*c.borrow() {
+                            let n = tally.get(&(Rc::as_ptr(o) as usize)).copied().unwrap_or(0);
+                            if n == 0 || Rc::strong_count(o) != n {
+                                continue;
+                            }
+                            if let Some(crate::value::ObjectInternal::Generator(gs)) =
+                                &o.borrow().internal
+                            {
+                                let fq = gs.borrow().fin_q.clone();
+                                let mut f = fq.borrow_mut();
+                                f.suppressed = true;
+                                // The displaced incarnation's journaled
+                                // tail never ran — its orphaned ob
+                                // windows drop un-confirmed captures.
+                                f.kill_tree();
+                            }
+                        }
+                    }
+                }
+                fin.suspended = pairs;
+                r
+            } else {
+                let dtor_err = self.destruct_frame_objs(&f).err();
+                match (r, dtor_err) {
+                    (Ok(_), Some(e)) => Err(e),
+                    (r, _) => r,
+                }
             }
         } else {
             r
@@ -2181,32 +2266,14 @@ impl<'a> Interp<'a> {
             "void", "never", "false", "true", "self", "parent", "static", "null",
         ];
         let saved = self.cur_line;
+        // Signature deprecations (implicit-nullable, optional-before-
+        // required) must precede the param checks' default-value
+        // fatals — Zend emits them while compiling the params.
+        self.sig_deprecations(fname, decl)?;
         for p in &decl.params {
             let Some(ty) = &p.ty else { continue };
             self.cur_line = decl.line;
-            // `mixed` already spans null (and `?mixed` is a parse error),
-            // so `mixed $x = null` is never the implicit-nullable case.
-            let nullable = ty
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case("null") || m.eq_ignore_ascii_case("mixed"));
-            let null_default = match &p.default {
-                Some(Expr::Null) => true,
-                Some(Expr::Const(c)) => c.eq_ignore_ascii_case("null"),
-                _ => false,
-            };
             match &p.default {
-                _ if null_default => {
-                    if !nullable
-                        && self
-                            .dep_seen
-                            .insert(format!("{}\0{}\0{}", decl.file, decl.line, p.name))
-                    {
-                        self.deprecated(&format!(
-                            "{}(): Implicitly marking parameter ${} as nullable is deprecated, the explicit nullable type must be used instead",
-                            fname, p.name
-                        ))?;
-                    }
-                }
                 Some(Expr::Int(_))
                 | Some(Expr::Float(_))
                 | Some(Expr::Str(_))
@@ -4474,6 +4541,9 @@ fn builtin_byref(name: &str) -> Option<&'static [bool]> {
         "sscanf" | "fscanf" => &[false, false],
         "exec" => &[false, true, true],
         "passthru" | "system" => &[false, true],
+        "proc_open" => &[false, false, true],
+        "stream_select" => &[true, true, true, false, false],
+        "flock" => &[false, false, true],
         "preg_grep" => &[false],
         _ => return None,
     })

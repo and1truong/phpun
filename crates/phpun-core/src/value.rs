@@ -116,28 +116,35 @@ impl PhpArray {
     }
 
     /// Bind an element slot to a specific cell (`$a[k] =& $x`).
-    pub fn bind_cell(&mut self, k: ArrKey, c: Cell) {
+    /// Returns the displaced slot cell — an object it held dies only
+    /// after the new binding is visible (its __destruct writes land
+    /// on the shared cell, gh10168).
+    pub fn bind_cell(&mut self, k: ArrKey, c: Cell) -> Option<Cell> {
         if let ArrKey::Int(i) = k {
             if i >= self.next {
                 self.next = i + 1;
             }
         }
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
-            slot.1 = c;
+            Some(std::mem::replace(&mut slot.1, c))
         } else {
             self.entries.push((k, c));
+            None
         }
     }
 
     /// Remove a key (unset). The bucket is tombstoned — position kept,
-    /// value gone (see ArrKey::Tomb). Returns whether it existed.
-    pub fn unset(&mut self, k: &ArrKey) -> bool {
+    /// value released (see ArrKey::Tomb). Returns the evicted payload
+    /// when the table owned the cell outright — an aliased (by-ref)
+    /// slot keeps sharing its value with the other holders.
+    pub fn unset(&mut self, k: &ArrKey) -> Option<Value> {
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| ek == k) {
             slot.0 = ArrKey::Tomb;
-            true
-        } else {
-            false
+            if Rc::strong_count(&slot.1) == 1 {
+                return Some(std::mem::replace(&mut *slot.1.borrow_mut(), Value::Null));
+            }
         }
+        None
     }
 
     /// First live (non-tombstone) index at or after `i`.
@@ -335,7 +342,7 @@ pub fn trace_arg(v: &Value) -> String {
         Value::Null => "NULL".into(),
         Value::Bool(b) => if *b { "true" } else { "false" }.into(),
         Value::Callable(_) => "Object(Closure)".into(),
-        Value::Resource(_) => "Resource id #1".into(),
+        Value::Resource(r) => format!("Resource id #{}", r.borrow().id()),
         Value::Float(f) => {
             if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e16 {
                 format!("{f:.1}")
@@ -1713,6 +1720,9 @@ pub enum ObjectInternal {
         /// (RecursiveDirectoryIterator::getSubPath).
         sub_path: String,
     },
+    /// WeakReference::create($obj) payload — a weak handle; get()
+    /// upgrades to the object or null once freed.
+    WeakRef(std::rc::Weak<RefCell<PhpObject>>),
     /// DateTime, closures-as-objects, etc. — opaque marker.
     None,
 }
@@ -1723,6 +1733,199 @@ pub type GenItem = (Value, Cell);
 
 /// Generator internal state (object internal behind the `Generator`
 /// class, which implements `Iterator`).
+/// A generator's suspended-finally journal — shared between the gen
+/// state and the interpreter's `live_gens` GC registry, so a dead
+/// weak can still replay it after the object is gone. Beyond the
+/// buffered finally bytes it carries the destruction-time markers
+/// the object can no longer answer once dropped: yields recorded
+/// inside `finally` regions (a force-close unwinding into one dies
+/// 'Cannot yield from finally in a force-closed generator'), the
+/// body's error when it died inside `finally` (replayed as a raise),
+/// a `$gen->throw()` parked at a finally-yield, and a mirror of the
+/// consumer cursor plus the body's identity for the
+/// destruction-site trace.
+#[derive(Default, Clone)]
+pub struct GenFinData {
+    /// (yield-tag, bytes, is_err) — finally-region output buffered
+    /// for destruction replay; entries drop as normal flushes cover
+    /// them.
+    pub bytes: Vec<(usize, Vec<u8>, bool)>,
+    /// (item idx, line) of each `yield` emitted while a `finally`
+    /// region ran.
+    pub yields: Vec<(usize, usize)>,
+    /// The body's terminal error when it died inside a `finally`
+    /// region — (err, throwable), mirrors `GenState::deferred_err`'s
+    /// finally component so a dead weak still surfaces it.
+    pub fin_err: Option<(crate::error::PhpError, Option<Value>)>,
+    /// Mirrored `GenState::pos` — the object is gone when a dead
+    /// weak's entry replays.
+    pub pos: usize,
+    /// Consumer-visible cursor: `pos` counts the body's own resumes
+    /// (a `yield from` drain drives them eagerly), while this mirrors
+    /// what the outermost consumer has reached — the value ob
+    /// windows, drains, and journal gates actually check.
+    pub vis_pos: usize,
+    /// The body closed or died — its deferred-output journal is
+    /// complete, so every buffered byte it tagged is materialized
+    /// for reads from then on. (Not mirrored from
+    /// `GenState::finished`: eager collection marks that at run end,
+    /// long before the consumer exhausts the items.)
+    pub finished: bool,
+    /// The gen was force-closed (throw() bounce, injected throwable
+    /// uncaught, dead-weak/shutdown teardown) rather than consumed
+    /// to exhaustion — its post-yield journaled tail never ran in
+    /// Zend's frame, so journaled ob captures materialize only for
+    /// tags a subsequent real resume confirmed (`pos > t + 1`).
+    pub killed: bool,
+    /// Total items collected by the eager run — the consumer-side
+    /// "exhausted" condition is `pos >= total`, which is when the
+    /// tail bytes (emitted after the last yield) may drain.
+    pub total: usize,
+    /// The body's function name and file — destruction-site frames
+    /// attribute the raise (`FILE(n): g()` at an unset/overwrite
+    /// point, `[internal function]: g()` at request shutdown).
+    pub fn_name: String,
+    pub file: String,
+    /// Journals of `yield from` delegates that merged into this
+    /// stream — a delegate replays only while the consumer's cursor
+    /// sits inside its spliced range (`entry <= pos < entry + span`),
+    /// since Zend force-closes just the actually-suspended
+    /// delegation chain.
+    pub delegates: Vec<FinDelegate>,
+    /// (name, cell) pairs of the body's suspended frame in CV order —
+    /// Zend keeps a suspended generator's CVs live in execute_data
+    /// until the frame is freed (force-close, exhaustion,
+    /// destruction), then decrefs them after the finally journal.
+    /// Stashed on the journal because it outlives the dead-weak state.
+    pub suspended: Vec<(String, Cell)>,
+    /// The owner died as a re-run artifact — the resumed incarnation
+    /// displaced this frame — so its destruction replay stays silent.
+    pub suppressed: bool,
+    /// Live journals of `yield from` delegates this gen collected —
+    /// (parent item index where the delegate's stream begins, its
+    /// journal). Killing this incarnation displaces them: their
+    /// un-run tails are kill-dropped too.
+    pub delegate_fins: Vec<(usize, FinQueue)>,
+}
+
+impl GenFinData {
+    /// Mark this journal and every delegated journal beneath it
+    /// force-closed — a re-run's displaced incarnations and a
+    /// teardown's delegate chain alike leave eager tails un-run.
+    pub fn kill_tree(&mut self) {
+        self.killed = true;
+        for (_, d) in &self.delegate_fins {
+            d.borrow_mut().kill_tree();
+        }
+    }
+}
+
+/// A delegated `yield from` journal merged into the parent's — its
+/// item-space tags are already retagged into the parent's space.
+#[derive(Clone)]
+pub struct FinDelegate {
+    /// Parent item index where this delegate's stream begins, and
+    /// how many items it spliced there.
+    pub entry: usize,
+    pub span: usize,
+    /// The delegate's own destruction journal.
+    pub fin: GenFinData,
+}
+
+impl GenFinData {
+    /// Whether the consumer has consumed everything the body could
+    /// emit — dead/closed, or the cursor passed the last item.
+    pub fn consumed(&self) -> bool {
+        self.finished || self.pos >= self.total
+    }
+
+    /// Shift every item-space index in this journal by `base` —
+    /// applied when it merges into a `yield from` parent's item
+    /// space.
+    pub fn retag(&mut self, base: usize) {
+        for (t, ..) in &mut self.bytes {
+            *t += base;
+        }
+        for (i, _) in &mut self.yields {
+            *i += base;
+        }
+        for d in &mut self.delegates {
+            d.entry += base;
+            d.fin.retag(base);
+        }
+    }
+
+    /// Mirror the consumer cursor down the suspended delegation
+    /// chain — a delegate's own journal positions (open/close tags on
+    /// buffers the delegate opened) live in its own item space, offset
+    /// from the parent's by `entry`.
+    pub fn set_pos_tree(&mut self, pos: usize) {
+        self.pos = pos;
+        for d in &mut self.delegates {
+            d.fin.set_pos_tree(pos.saturating_sub(d.entry));
+        }
+        self.set_vis_tree(pos);
+    }
+
+    /// Mirror only the consumer-visible cursor down the chain — a
+    /// delegate's own `pos` (its production cursor) stays at
+    /// whatever its eager drain left behind. Item `pos` of this
+    /// gen's stream is item `pos - entry` inside a delegate's.
+    pub fn set_vis_tree(&mut self, pos: usize) {
+        self.vis_pos = pos;
+        for d in &mut self.delegates {
+            d.fin.set_vis_tree(pos.saturating_sub(d.entry));
+        }
+        for (entry, q) in &self.delegate_fins {
+            q.borrow_mut().set_vis_tree(pos.saturating_sub(*entry));
+        }
+    }
+
+    /// The delegates whose spliced range holds consumer cursor `pos`
+    /// — the suspended delegation chain, innermost first.
+    pub fn active_delegates_at(&self, pos: usize) -> Vec<&FinDelegate> {
+        let mut out: Vec<&FinDelegate> = self
+            .delegates
+            .iter()
+            .filter(|d| d.entry <= pos && pos < d.entry + d.span)
+            .collect();
+        // Innermost suspended level unwinds first.
+        out.sort_by_key(|d| std::cmp::Reverse(d.entry));
+        out
+    }
+
+    /// The first `yield`-inside-`finally` index ahead of `pos` along
+    /// the suspended delegation chain — where a `throw()`-driven
+    /// unwind parks next.
+    pub fn next_fin_yield(&self, pos: usize) -> Option<usize> {
+        let mut best = self
+            .yields
+            .iter()
+            .filter(|(i, _)| *i > pos)
+            .map(|(i, _)| *i)
+            .min();
+        for d in self.active_delegates_at(pos) {
+            if let Some(i) = d.fin.next_fin_yield(pos) {
+                best = Some(best.map_or(i, |b| b.min(i)));
+            }
+        }
+        best
+    }
+
+    /// Whether `pos` itself is a `yield` inside `finally` on the
+    /// suspended chain — a `throw()` injects at the suspended yield
+    /// and surfaces immediately.
+    pub fn at_fin_yield(&self, pos: usize) -> bool {
+        self.yields.iter().any(|(i, _)| *i == pos)
+            || self
+                .active_delegates_at(pos)
+                .iter()
+                .any(|d| d.fin.at_fin_yield(pos))
+    }
+}
+
+pub type FinQueue = Rc<RefCell<GenFinData>>;
+
 pub struct GenState {
     /// Everything needed to re-enter the function frame later.
     pub setup: GenSetup,
@@ -1740,13 +1943,98 @@ pub struct GenState {
     pub by_ref: bool,
     /// Auto keys for keyless `yield $v` (0, 1, 2…).
     pub auto_key: i64,
-    /// Every send() value ever passed, in call order — the k-th send
-    /// feeds the k-th yield expression when the body (re)runs.
-    pub sends: Vec<Value>,
+    /// Every send() value ever passed, as (yield index, value) —
+    /// send() delivers to the yield the gen is suspended at, so a
+    /// re-run must not hand an early send to a preceding yield.
+    pub sends: Vec<(usize, Value)>,
+    /// Every `Generator->throw()` injection, as (yield index,
+    /// throwable) — the body re-runs on each resume, so the queued
+    /// throwable is raised as the result of that yield expression and
+    /// the body's own try/catch/finally performs the real unwind
+    /// (catch delivery, `return`-in-finally swallow, suspend at a
+    /// yield inside `finally`).
+    pub throws: Vec<(usize, Value)>,
+    /// `yield from` splice windows into this gen's item stream:
+    /// (first spliced index, item count). Consumer sends/throws
+    /// landing inside a window route into the delegate when it is
+    /// re-collected — injection arrives as the delegate's own
+    /// suspended-yield index (`outer - base`).
+    pub delegate_gens: Vec<(usize, usize)>,
+    /// The throwable most recently queued by `Generator->throw()` —
+    /// an uncaught injected throwable keeps its own trace (built at
+    /// the `new` site) when it escapes, unlike a body-raised `throw`
+    /// whose uncaught render is the resume stack.
+    pub injected_throwable: Option<Value>,
     /// Output produced after a yield suspends mid-expression — Zend
     /// defers it to resume; buffered per yield index and emitted when
-    /// the consumer advances `pos` past it (closure_call_leak).
-    pub pending_out: Vec<(usize, Vec<u8>)>,
+    /// the consumer advances `pos` past it (closure_call_leak). The
+    /// first bool marks stderr-diag bytes so `PHP Fatal error:`/`PHP
+    /// Warning:` lines defer in the same emission order as stdout's;
+    /// the second marks bytes produced inside a `finally` region —
+    /// Zend runs the finally chains enclosing the suspension point
+    /// when a suspended generator is destroyed (Generator->throw(),
+    /// unset()/GC, request shutdown), so they also accumulate in
+    /// fin_q keyed the same way.
+    pub pending_out: Vec<(usize, Vec<u8>, bool, bool)>,
+    /// Buffered finally-region output of a suspended body — survives
+    /// the GenState itself (shared with the interpreter's live_gens
+    /// registry) so a GC'd generator's finally still replays.
+    /// (yield-tag, bytes, is_err); entries are dropped as normal
+    /// flushes cover them.
+    pub fin_q: FinQueue,
+    /// The body's terminal error, held until the consumer's next
+    /// resume past the last collected item — Zend's lazy body dies
+    /// inside `Generator->next()`/friends, after the bytes the
+    /// consumer already echoed between yields. Carries the throwable
+    /// itself for Throw deaths (the ambient pending_exception slot is
+    /// transient — consumer calls between death and resume clobber
+    /// it) and the call-trace frames suspended between the throw site
+    /// and the gen body (eval()/include() pseudo-frames, userland
+    /// calls) so the resume render can prepend them. The last flag
+    /// marks a death that originated inside a `finally` region — a
+    /// force-close then surfaces it at destruction instead.
+    pub deferred_err: Option<(crate::error::PhpError, Option<Value>, Vec<TraceFrame>, bool)>,
+    /// The body died by error — getReturn() reports 'hasn't returned'
+    /// even after the deferred error was consumed.
+    pub dead: bool,
+    /// Killed by `Generator->throw()` — buffered items are dropped and
+    /// consumer reads behave like an exhausted generator (`valid()`
+    /// false, `current()`/`key()` null), like Zend's closed gen.
+    pub closed: bool,
+    /// The body's eager run is in flight right now — resuming ops
+    /// (`next`/`send`/`throw`) on the object are guarded ('Cannot
+    /// resume an already running generator') so a body that reaches
+    /// its own handle cannot re-enter the cursor machinery mid-frame.
+    pub running: bool,
+    /// The sink filling up while `running` — consumer read ops
+    /// (`valid`/`current`/`key`) consult it so a mid-run probe sees
+    /// the yields already produced, like Zend's live execute_data.
+    pub live: Option<Rc<RefCell<Vec<GenItem>>>>,
+    /// This gen is being re-collected as a `yield from` delegate of a
+    /// gen whose own send()/throw() replay is in flight: its
+    /// pre-first-yield bytes were already echoed by the delegate run
+    /// the consumer saw, so emit suppression covers its `done==0`
+    /// prefix even though the active horizon targets the outer gen.
+    pub suppress_prefix: bool,
+}
+
+impl GenState {
+    /// Advance the consumer cursor, mirroring it into the shared
+    /// finally journal so a dead weak's destruction check can still
+    /// gate on the suspension point.
+    pub fn set_pos(&mut self, pos: usize) {
+        self.pos = pos;
+        self.fin_q.borrow_mut().set_pos_tree(pos);
+    }
+
+    /// Whether `decl` is this generator's own body — the popped
+    /// frame for that decl is a suspension (its CVs stay live in
+    /// execute_data) rather than a call return.
+    pub fn owns_frame(&self, decl: &crate::ast::FunctionDecl) -> bool {
+        match &self.setup {
+            GenSetup::Invoke { decl: d, .. } => std::ptr::eq(d.as_ref(), decl),
+        }
+    }
 }
 
 pub enum GenSetup {
@@ -1776,6 +2064,7 @@ impl std::fmt::Debug for ObjectInternal {
             ObjectInternal::DirIter { .. } => f.write_str("DirIter"),
             ObjectInternal::Sqlite { .. } => f.write_str("Sqlite"),
             ObjectInternal::SqliteStmt { .. } => f.write_str("SqliteStmt"),
+            ObjectInternal::WeakRef(_) => f.write_str("WeakRef"),
             ObjectInternal::None => f.write_str("None"),
         }
     }
@@ -1826,14 +2115,54 @@ pub enum PhpResource {
         /// Byte position used for reads (we do our own buffering for fgets).
         pos: u64,
         eof: bool,
+        /// Stream-level read buffer + capacity — zend buffers plain
+        /// file streams, so rbuf.len() is zend's writepos-readpos
+        /// (buffered-but-unread bytes) for cast resyncs and the
+        /// stream_select emulate shortcut.
+        rbuf: std::collections::VecDeque<u8>,
+        rcap: usize,
+        /// tmpfile() only — zend removes the temp file when the stream
+        /// closes (Drop unlinks `path`).
+        unlink_on_close: bool,
+        /// Path and mode as given to fopen() — stream_get_meta_data().
+        path: String,
+        mode: String,
     },
     /// STDIN/STDOUT/STDERR — php:// and the CLI-SAPI constants.
-    Stdio { id: u64, which: u8 },
+    /// `which` > 2 is php://output: a write-only stream whose ftell
+    /// counts bytes written (zend tracks them on the stream struct).
+    Stdio { id: u64, which: u8, pos: u64 },
     /// php://input — the request body, readable like a file.
     Input {
         id: u64,
         body: std::rc::Rc<Vec<u8>>,
         pos: u64,
+        eof: bool,
+        /// zend's stream->position = -1 marker after a failed seek:
+        /// ftell reports pos-1 (false) while IO resumes at pos=0.
+        pos_broken: bool,
+        /// The URI the stream was opened with ("php://input", "data:...")
+        /// — reported verbatim in stream_get_meta_data()'s 'uri' key.
+        uri: String,
+        /// The fopen() mode, verbatim — stream_get_meta_data() 'mode'.
+        mode: String,
+        /// fd claimed by a PHP_STREAM_AS_FD_FOR_SELECT cast (zend's
+        /// php_stream_temp_cast spills an RFC2397 buffer into a
+        /// tmpfile() the stream then KEEPS — later casts reuse it and
+        /// flock(2)/fstat(2) see it).
+        spilled_fd: Option<std::os::unix::io::RawFd>,
+        /// zend stream->readbuf — read(2) fills land here while
+        /// spilled, and FILTERED bytes land here once a read filter is
+        /// attached (zend's fill applies the chain before buffering).
+        srbuf: std::collections::VecDeque<u8>,
+        /// zend stream->readbuflen for srbuf — grows one chunk_size
+        /// whenever a fill finds less than a chunk of free space.
+        rcap: usize,
+        /// The raw store cursor (zend's inner-stream fpos): filtered
+        /// fills slice the body from here while pos stays the
+        /// delivered count. Unfiltered reads bypass the buffer, so
+        /// fraw tracks pos then.
+        fraw: u64,
     },
     /// php://memory / php://temp — an in-memory byte buffer that is
     /// always read/write, seekable (Composer's BufferIO).
@@ -1842,15 +2171,89 @@ pub enum PhpResource {
         buf: Vec<u8>,
         pos: u64,
         eof: bool,
+        /// zend's stream->position = -1 marker after a failed
+        /// CUR/END-below-zero seek: ftell reports pos-1 (false) while
+        /// IO resumes at pos=0; a successful seek clears it.
+        pos_broken: bool,
         /// fwrite honors the fopen mode ('r' → false); fprintf does not
         /// (zend php_stream_printf bypasses the check).
         write: bool,
+        /// zend's TEMP_STREAM_APPEND: an 'a'-mode buffer write lands at
+        /// end-of-buffer regardless of position. Lost once the stream
+        /// spills — the tmpfile is a plain r+b file (zend likewise).
+        append: bool,
+        /// The php:// URI the stream was opened with ("php://memory",
+        /// "php://temp", "php://temp/maxmemory:N") — reported verbatim
+        /// in stream_get_meta_data()'s 'uri' key.
+        uri: String,
+        /// zend's normalized open mode for meta ('rb', 'w+b', 'a+b').
+        mode: String,
+        /// php://temp* only: zend's ts->smax — the /maxmemory:N budget
+        /// (default PHP_STREAM_MAX_MEM = 2MB). A write reaching
+        /// stream->position+count >= smax spills the buffer to a
+        /// tmpfile BEFORE the inner stream's readonly check runs.
+        /// None on php://memory: never spills and not fd-castable.
+        temp_smax: Option<u64>,
+        /// fd claimed by a PHP_STREAM_AS_FD_FOR_SELECT cast or a write
+        /// that crossed temp_smax — zend's php_stream_temp_cast /
+        /// php_stream_temp_write spills a TEMP buffer into a tmpfile()
+        /// the stream then KEEPS (later casts reuse it and
+        /// flock(2)/fstat(2) see it). php://memory is not castable.
+        spilled_fd: Option<std::os::unix::io::RawFd>,
+        /// zend stream->readbuf — read(2) fills land here while
+        /// spilled, and FILTERED bytes land here once a read filter is
+        /// attached (zend's fill applies the chain before buffering).
+        srbuf: std::collections::VecDeque<u8>,
+        /// zend stream->readbuflen for srbuf — grows one chunk_size
+        /// whenever a fill finds less than a chunk of free space.
+        rcap: usize,
+        /// The raw store cursor (zend ms->fpos): filtered fills slice
+        /// the buffer from here while pos stays the delivered count.
+        /// Unfiltered reads bypass the buffer, so fraw tracks pos.
+        fraw: u64,
     },
     /// A resource closed via fclose()/fclose-aliased wrappers — Zend
     /// keeps the zval `resource (closed)` (gettype "resource (closed)",
     /// var_dump "of type (Unknown)", is_resource() false) and every
     /// stream function on it throws "must be an open stream resource".
     Closed { id: u64 },
+    /// A proc_open() pipe end (or socketpair/pty end) as seen by the
+    /// parent: a raw fd wrapped in File. `write` mirrors zend's
+    /// mode; reads always hit the real fd so EBADF reports like zend.
+    Pipe {
+        id: u64,
+        file: std::fs::File,
+        write: bool,
+        /// ["socket"] descriptor pair — bidirectional, different
+        /// stream_type in stream_get_meta_data().
+        socket: bool,
+        /// ["pty"] descriptor — the parent's end is the pty master,
+        /// opened 'r+' in zend's meta.
+        pty: bool,
+        /// stream_set_blocking($s, false) — reads return "" instead
+        /// of waiting (fcntl O_NONBLOCK on the fd).
+        nonblock: bool,
+        pos: u64,
+        eof: bool,
+        /// read-buffered but unconsumed bytes (zend's readbuf/writepos/
+        /// readpos): a php_stream_read() call drains this and performs
+        /// at most ONE underlying fill of stream_set_chunk_size() bytes.
+        rbuf: std::collections::VecDeque<u8>,
+    },
+    /// proc_open() process handle — type "process" in zend.
+    Proc {
+        id: u64,
+        pid: i32,
+        command: String,
+        /// Raw waitpid status cached after a WIFEXITED reap
+        /// (zend's waitpid_cached: only normal exits are cached).
+        cached_status: Option<i32>,
+        /// proc_close() already consumed this handle.
+        closed: bool,
+        /// The proc's pipe streams — zend's proc dtor zend_list_close()s
+        /// them, so proc_close()/GC turns every $pipes entry "Unknown".
+        pipes: Vec<std::rc::Rc<std::cell::RefCell<PhpResource>>>,
+    },
     /// curl/db handles etc. — opaque placeholder.
     Other { id: u64, kind: &'static str },
 }
@@ -1863,6 +2266,8 @@ impl PhpResource {
             PhpResource::Input { id, .. } => *id,
             PhpResource::Mem { id, .. } => *id,
             PhpResource::Closed { id, .. } => *id,
+            PhpResource::Pipe { id, .. } => *id,
+            PhpResource::Proc { id, .. } => *id,
             PhpResource::Other { id, .. } => *id,
         }
     }
@@ -1872,8 +2277,171 @@ impl PhpResource {
     pub fn type_name(&self) -> &'static str {
         match self {
             PhpResource::Closed { .. } => "Unknown",
+            PhpResource::Proc { .. } => "process",
             PhpResource::Other { kind, .. } => kind,
             _ => "stream",
+        }
+    }
+}
+
+/// A stream filter attached by stream_filter_append/prepend — zend's
+/// php_stream_filter on a stream's read/write chains. `read`/`write`
+/// say which chain it sits on (STREAM_FILTER_READ=1, WRITE=2, ALL=3 —
+/// ALL creates TWO entries, one per chain, with separate state).
+#[derive(Debug, Clone)]
+pub struct StreamFilter {
+    pub name: String,
+    pub read: bool,
+    pub write: bool,
+    /// The filter resource's own id — stream_filter_remove() detaches
+    /// the chain entry by this, not by name (two same-name filters
+    /// stay distinct).
+    pub fid: u64,
+    /// zend's filter->abstract — per-instance state.
+    pub state: FilterState,
+}
+
+/// Per-instance state for the stateful stream filters.
+#[derive(Debug, Clone)]
+pub enum FilterState {
+    /// Stateless transforms (string.rot13/toupper/tolower) and
+    /// recognized-but-unimplemented factories (zlib.*, bzip2.*).
+    Plain,
+    /// `consumed` — passes bytes through while counting them; on the
+    /// closing flush zend seeks the stream back to offset+consumed
+    /// (filters.c consumed_filter_filter).
+    Consumed {
+        count: u64,
+        /// stream->position captured on the first filter call.
+        offset: Option<u64>,
+    },
+    /// `dechunk` — the HTTP chunked-transfer decoder's state machine
+    /// (filters.c php_dechunk): bytes between calls.
+    Dechunk(Dechunk),
+    /// convert.iconv.FROM/TO — normalized encoding pair plus the
+    /// partial multibyte sequence carried between calls.
+    Iconv {
+        from: String,
+        to: String,
+        /// the original `from"=>"to` spec for the invalid-seq warn.
+        disp: String,
+        pending: Vec<u8>,
+        /// UTF-16/32's BOM already emitted (iconv emits it once).
+        bom_done: bool,
+        /// to-charset carried //IGNORE — unrepresentable cps drop.
+        ignore: bool,
+    },
+    /// convert.base64-encode / -decode — tail bytes carried between
+    /// calls (3-in/4-out groupings).
+    Base64 { decode: bool, tail: Vec<u8> },
+    /// convert.quoted-printable-encode / -decode. `col` is the
+    /// encoder's line-wrap column (75), `tail` the decoder's
+    /// partial-escape carry.
+    Qp {
+        encode: bool,
+        col: usize,
+        tail: Vec<u8>,
+    },
+    /// zlib.inflate/deflate, bzip2.compress/decompress — the codec
+    /// object lives in Interp::codec_states[fid] (compressors don't
+    /// clone).
+    Codec(CodecKind),
+    /// A php_user_filter subclass instance created at attach time.
+    User(std::rc::Rc<std::cell::RefCell<PhpObject>>),
+}
+
+/// Which streaming codec backs a FilterState::Codec entry — the
+/// compressor/decompressor lives in Interp::codec_states[fid].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecKind {
+    /// zlib.deflate — raw RFC1951 deflate stream.
+    ZlibDeflate,
+    /// zlib.inflate — raw RFC1951 inflate; bad data → 'zlib: data error'.
+    ZlibInflate,
+    /// bzip2.compress.
+    BzDeflate,
+    /// bzip2.decompress — bad data → 'bzip2 decompression failed'.
+    BzInflate,
+}
+
+/// The `dechunk` filter's persistent state machine — a byte-for-byte
+/// port of zend's php_chunked_filter_data (filters.c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DechunkState {
+    SizeStart,
+    Size,
+    SizeExt,
+    SizeCr,
+    SizeLf,
+    Body,
+    BodyCr,
+    BodyLf,
+    Trailer,
+    Error,
+}
+
+/// `dechunk` filter instance data (zend's php_chunked_filter_data).
+#[derive(Debug, Clone)]
+pub struct Dechunk {
+    pub chunk_size: u64,
+    pub state: DechunkState,
+}
+
+/// A dropped process handle closes its pipes and gets one non-blocking
+/// reap so exited children don't stay zombies (zend's proc dtor does
+/// the same — pipes first, then waitpid).
+impl Drop for PhpResource {
+    fn drop(&mut self) {
+        if let PhpResource::Proc {
+            pid,
+            cached_status,
+            closed,
+            pipes,
+            ..
+        } = self
+        {
+            for p in pipes {
+                let mut b = p.borrow_mut();
+                if let PhpResource::Pipe { id, .. } = &*b {
+                    *b = PhpResource::Closed { id: *id };
+                }
+            }
+            if !*closed && cached_status.is_none() {
+                unsafe {
+                    let mut st = 0;
+                    libc::waitpid(*pid, &mut st, libc::WNOHANG);
+                }
+            }
+        }
+        // tmpfile(): zend removes the temp file on stream close.
+        if let PhpResource::File {
+            unlink_on_close: true,
+            path,
+            ..
+        } = self
+        {
+            let _ = std::fs::remove_file(&*path);
+        }
+        let fd = match self {
+            PhpResource::Mem { spilled_fd, .. } | PhpResource::Input { spilled_fd, .. } => {
+                spilled_fd.take()
+            }
+            _ => None,
+        };
+        if let Some(fd) = fd {
+            unsafe {
+                // A spilled temp stream maps a real filesystem entry
+                // (zend php_stream_temp_cast unlinks it only when the
+                // stream closes): remove it via the procfs link target
+                // before dropping the last descriptor we own.
+                if let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{fd}")) {
+                    let t = target.to_string_lossy();
+                    if !t.ends_with(" (deleted)") {
+                        let _ = std::fs::remove_file(&*t);
+                    }
+                }
+                libc::close(fd);
+            }
         }
     }
 }

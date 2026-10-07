@@ -367,10 +367,20 @@ pub(crate) fn dispatch(
 
         // ----- env/process -----
         "getenv" => {
-            let name = arg_str(it, args, 0);
-            match it.getenv_pub(&name) {
-                Some(v) => Value::str(v),
-                None => Value::Bool(false),
+            // ?string $name = null — an explicit null means the default:
+            // the full environment array, same as a 0-arg call.
+            if args.is_empty() || matches!(arg(args, 0), Value::Null) {
+                let mut a = PhpArray::new();
+                for (k, v) in it.getenv_all_pub() {
+                    a.set(ArrKey::Str(k.into()), Value::str(v));
+                }
+                Value::Array(Rc::new(RefCell::new(a)))
+            } else {
+                let name = arg_str(it, args, 0);
+                match it.getenv_pub(&name) {
+                    Some(v) => Value::str(v),
+                    None => Value::Bool(false),
+                }
             }
         }
         "putenv" => {
@@ -622,7 +632,8 @@ pub(crate) fn dispatch(
                 .unwrap_or(0),
             std::process::id()
         )),
-        "gc_collect_cycles" | "gc_enable" | "gc_disable" | "gc_mem_caches" => Value::Int(0),
+        "gc_collect_cycles" => Value::Int(it.gc_cycle_collect()? as i64),
+        "gc_enable" | "gc_disable" | "gc_mem_caches" => Value::Int(0),
         "gc_status" => {
             let mut a = PhpArray::new();
             for (k, v) in [
@@ -656,8 +667,6 @@ pub(crate) fn dispatch(
             }
             _ => Value::Bool(false),
         },
-        "proc_open" | "proc_close" | "proc_get_status" | "proc_terminate" => Value::Bool(false),
-        "shell_exec" | "exec" | "system" | "passthru" => Value::Null,
         // exit()/die() exist in zend's function table too — reachable
         // through 'exit'/'die' string callables (FCC, call_user_func).
         // Top-level exit() parses to Expr::Exit and never lands here.
@@ -691,6 +700,15 @@ pub(crate) fn dispatch(
             let v = arg_str(it, args, 0);
             it.ini.insert("include_path".into(), v);
             Value::str(prev)
+        }
+        "restore_include_path" => {
+            // zend restores the ini default registered at startup — the
+            // same compiled-in path Interp::new seeds.
+            it.ini.insert(
+                "include_path".into(),
+                ".:/home/linuxbrew/.linuxbrew/Cellar/php/8.5.11/share/php/pear".to_string(),
+            );
+            Value::Bool(false)
         }
         "token_get_all" | "token_name" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
         "highlight_string" => {

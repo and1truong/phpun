@@ -556,6 +556,41 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        // WeakReference::create — zend's only public constructor path
+        // (`new` is rejected in new_instance).
+        if cls.name().eq_ignore_ascii_case("weakreference") {
+            if name.eq_ignore_ascii_case("create") {
+                let n = args.cells.len();
+                if n != 1 {
+                    return self.fail(PhpError::uncaught(
+                        "ArgumentCountError",
+                        format!(
+                            "WeakReference::create() expects exactly 1 argument, {} given",
+                            n
+                        ),
+                        0,
+                    ));
+                }
+                let v = args.cells[0].borrow().clone();
+                let Value::Object(o) = v else {
+                    let tn = self.zval_type_name(&v);
+                    let e = self.exception(
+                        "TypeError",
+                        &format!(
+                            "WeakReference::create(): Argument #1 ($object) must be of type object, {} given",
+                            tn
+                        ),
+                    );
+                    return Err(self.throw(e));
+                };
+                return self.new_weakref(o);
+            }
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!("Call to undefined method WeakReference::{}()", name),
+                0,
+            ));
+        }
         // Throwable methods are instance-only; look up incl. parents.
         match self.find_method_in(&cls, name) {
             Some((m, dc)) => {
@@ -599,7 +634,7 @@ impl<'a> Interp<'a> {
                                 if let Some(v) = self.throwable_ctor(o, &args)? {
                                     return Ok(v);
                                 }
-                            } else if let Some(v) = self.throwable_method(o, name, &args.cells) {
+                            } else if let Some(v) = self.throwable_method(o, name, &args.cells)? {
                                 return Ok(v);
                             }
                         }
