@@ -6582,14 +6582,16 @@ fn filter_apply_one(
                 if !had_pending {
                     pending.clear();
                 }
-                // zend's iconv filter warns + returns FEED_ME — the
-                // brigade is discarded and the fill retries/ends.
+                // zend's iconv filter warns + returns PSFS_ERR_FATAL —
+                // the brigade is discarded and the fill FAILS, so the
+                // read builtin reports false (the write path drops the
+                // brigade the same either way).
                 deferred_warn = Some(format!(
                     "{}(): iconv stream filter ({}): invalid multibyte sequence",
                     it.filter_warn_ctx, disp
                 ));
                 buf.clear();
-                status = 1;
+                status = 0;
             }
         }
         FilterState::Base64 { decode, tail } => {
