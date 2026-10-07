@@ -2488,6 +2488,10 @@ impl<'a> Interp<'a> {
                 } else {
                     None
                 };
+                // An array-valued src bound into a container cell is a
+                // GC candidate root (zend purple-adds it) — `$a[] =& $a`
+                // cycles are unreachable without this registration.
+                self.reg_arr_ref(&src);
                 let mut b = slot.borrow_mut();
                 match &mut *b {
                     Value::Null => {
@@ -2498,11 +2502,18 @@ impl<'a> Interp<'a> {
                         };
                         *b = Value::Array(Rc::new(RefCell::new(arr)));
                     }
-                    Value::Array(rc) => {
+                    Value::Array(_) => {
+                        // `$b = $a; $b['k'] =& $r` — bind through a COW
+                        // split or the write corrupts the shared table.
+                        self.cow_split(&mut b);
+                        let rc = match &*b {
+                            Value::Array(rc) => rc.clone(),
+                            _ => unreachable!(),
+                        };
                         let is_globals = self
                             .globals_arr
                             .as_ref()
-                            .map(|g| Rc::ptr_eq(g, rc))
+                            .map(|g| Rc::ptr_eq(g, &rc))
                             .unwrap_or(false);
                         let bk = match &key {
                             Some(k) => Some(self.arr_key(k)?),
@@ -2529,12 +2540,64 @@ impl<'a> Interp<'a> {
                     }
                     _ => {
                         drop(b);
+                        // `$o[k] =& $x`: spl ArrayObject storage binds
+                        // `src` into the named bucket; everything else —
+                        // userland ArrayAccess dims and the append form
+                        // `$o[] =& $x` zend can't address — gets the
+                        // indirect-modification notice then the
+                        // assign-by-ref catchable Error.
+                        let spl_arr = match &*slot.borrow() {
+                            Value::Object(o)
+                                if matches!(
+                                    o.borrow().internal,
+                                    Some(ObjectInternal::ArrayIter { .. })
+                                ) =>
+                            {
+                                Some(self.ao_arr(o))
+                            }
+                            _ => None,
+                        };
+                        if let Some(arr) = spl_arr {
+                            if let Some(k) = &key {
+                                let old = arr
+                                    .borrow_mut()
+                                    .bind_cell(self.arr_key(k)?, src);
+                                return self.destruct_displaced(old);
+                            }
+                            // `$ao[] =& $x`: zend's append fetch finds
+                            // nothing to alias — overloaded notice
+                            // then the assign-by-ref Error, no write.
+                            if let Value::Object(o) = &*slot.borrow() {
+                                let cn = o.borrow().class.name().to_string();
+                                self.notice(&format!(
+                                    "Indirect modification of overloaded element of {} has no effect",
+                                    cn
+                                ))?;
+                            }
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                "Cannot assign by reference to an array dimension of an object",
+                                self.cur_line,
+                            ));
+                        }
+                        if matches!(&*slot.borrow(), Value::Object(_)) {
+                            // zend fetches the element (BP_VAR_RW
+                            // read_dimension — the `&offsetGet` /
+                            // object-element notice rule applies)
+                            // before the assign-by-ref Error.
+                            let _ =
+                                self.index_cell_object(&slot, key.clone().map(cell))?;
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                "Cannot assign by reference to an array dimension of an object",
+                                self.cur_line,
+                            ));
+                        }
                         // `=&` onto a non-indexable container — zend's
                         // catchable matrix (probe4a/4e): scalars and
                         // Closures name the generic errors, objects their
                         // class, string offsets split append/str-key/
-                        // int-key, ArrayAccess dies with the overloaded
-                        // notice after an offsetGet read.
+                        // int-key.
                         let (class, msg) = match &*slot.borrow() {
                             Value::Str(_) => match &key {
                                 None => {
