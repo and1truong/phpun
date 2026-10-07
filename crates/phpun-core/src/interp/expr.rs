@@ -1329,6 +1329,11 @@ impl<'a> Interp<'a> {
         // RHS read warns 'Undefined variable' (assign_coalesce_007).
         // The base is a detached Null cell re-resolved at write time.
         let mut undef_root: Option<String> = None;
+        // A var-rooted dim write binds its container cell before the
+        // key exprs run — a handler that rebinds the var detaches the
+        // pending write onto the stale slot (assign_dim_014).
+        let mut dim_root: Option<(String, Cell)> = None;
+        let mut dim_det = false;
         // Dynamic-prop slots materialized below record themselves so
         // the read side can replay zend's 'Undefined property' warns.
         self.fresh_dyn_props.clear();
@@ -1402,7 +1407,11 @@ impl<'a> Interp<'a> {
                         _ => self.eval_cell(base)?,
                     }
                 } else {
-                    self.eval_cell(base)?
+                    let c = self.eval_cell(base)?;
+                    if let Expr::Var(n) = base {
+                        dim_root = Some((n.clone(), c.clone()));
+                    }
+                    c
                 };
                 let mut keys = Vec::with_capacity(dims.len());
                 for d in dims {
@@ -1414,6 +1423,13 @@ impl<'a> Interp<'a> {
                     }
                 }
                 late = Late::Keyed { base: c, keys };
+                // Detachment decided by the bound slot vs a
+                // handler-touched rebind — checked again at the write
+                // so RHS-time rebinds count too.
+                dim_det = match &dim_root {
+                    Some((n, pc)) => self.dim_detached(&Some(pc.clone()), n),
+                    None => false,
+                };
                 None
             }
             Expr::StaticProp { class, name } => {
@@ -1554,7 +1570,7 @@ impl<'a> Interp<'a> {
                 // Reaching here means the isset read found null/missing.
                 Value::Null
             } else {
-                dim_read!(false)
+                dim_read!(dim_det)
             }
         } else {
             Value::Null
@@ -1573,7 +1589,7 @@ impl<'a> Interp<'a> {
         // gate (or the offset TypeError) rather than an operand error
         // on the fetched Null, and scalars/plain objects name their
         // 'Cannot use ... as array' Error ahead of the arith (p12h/p12k).
-        if needs_read && op != "??=" {
+        if needs_read && op != "??=" && !dim_det {
             match &late {
                 Late::Index { base, key, append } => {
                     // `[]` keeps its own gate: '[] operator not
@@ -1791,7 +1807,33 @@ impl<'a> Interp<'a> {
                     Some(n) => self.var_cell(&n),
                     None => base.clone(),
                 };
-                newv = self.assign_index_path(base, &keys, newv, needs_read)?;
+                // A handler-rebound container writes into the stale
+                // pre-bound slot — silently, and invisibly: a scratch
+                // cell stands in so a write-through rebind (the var is
+                // still the same cell) never shows the dim's value.
+                let mut detached = false;
+                let target = match &dim_root {
+                    Some((n, pc)) if self.dim_detached(&Some(pc.clone()), n) => {
+                        detached = true;
+                        self.detached_dim = true;
+                        cell(base.borrow().clone())
+                    }
+                    _ => base,
+                };
+                // A stale scalar slot takes no dim write — the op
+                // vanishes where zend would throw on the live slot.
+                if detached
+                    && matches!(
+                        &*target.borrow(),
+                        Value::Int(_) | Value::Float(_) | Value::Bool(_)
+                    )
+                {
+                    self.detached_dim = false;
+                    return Ok(newv);
+                }
+                let r = self.assign_index_path(target, &keys, newv, needs_read);
+                self.detached_dim = false;
+                newv = r?;
             }
             Late::None => match target_cell {
                 Some(c) => {
@@ -1892,6 +1934,12 @@ impl<'a> Interp<'a> {
                 // re-point to the bound cell too — the two are one
                 // symbol table (030's `$x =& $y` alias survives sync).
                 let synced = self.stack.is_empty() && self.globals_synced.contains(n.as_str());
+                if self.in_handler {
+                    if let Some(old) = self.cur().vars.get(n.as_str()) {
+                        let old = old.clone();
+                        self.touch_write(&old);
+                    }
+                }
                 self.cur().vars.insert(n.clone(), src.clone());
                 if synced {
                     if let Some(a) = &self.globals_arr {
@@ -1934,9 +1982,20 @@ impl<'a> Interp<'a> {
                             .as_ref()
                             .map(|g| Rc::ptr_eq(g, rc))
                             .unwrap_or(false);
+                        let bk = match &key {
+                            Some(k) => Some(self.arr_key(k)?),
+                            None => None,
+                        };
+                        if self.in_handler {
+                            if let Some(ak) = &bk {
+                                if let Some(ec) = rc.borrow().get_cell(ak) {
+                                    self.touch_write(&ec);
+                                }
+                            }
+                        }
                         let mut arr = rc.borrow_mut();
-                        match &key {
-                            Some(k) => arr.bind_cell(self.arr_key(k)?, src.clone()),
+                        match bk {
+                            Some(ak) => arr.bind_cell(ak, src.clone()),
                             None => {
                                 let k = ArrKey::Int(arr.next);
                                 arr.bind_cell(k, src.clone());
@@ -3027,13 +3086,70 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Did an error handler inside the dim-key eval rebind/write the
+    /// container slot `pre` resolved before the key ran?
+    fn dim_detached(&mut self, pre: &Option<Cell>, name: &str) -> bool {
+        let post = self.var_cell_opt(name);
+        match (pre, &post) {
+            (None, None) => false,
+            (Some(_), None) | (None, Some(_)) => true,
+            (Some(a), Some(b)) => {
+                !Rc::ptr_eq(a, b) || self.handler_writes.contains_key(&(Rc::as_ptr(b) as usize))
+            }
+        }
+    }
+
     /// `$arr[$k] = v` / `$arr[] = v`.
     fn set_index(&mut self, e: &Expr, i: Option<&Expr>, v: Value) -> Result<(), PhpError> {
+        // zend binds the dim container's slot before the key evaluates;
+        // an error handler inside the key eval that REASSIGNS the var
+        // leaves the pending write on the stale slot — it lands
+        // invisible and converts its key silently (assign_dim_014).
+        // Writes during the RHS eval don't detach — the slot binds
+        // after them — so only entries from the key eval count.
+        self.handler_writes.clear();
+        self.handler_reads.clear();
+        let pre_cell = match e {
+            Expr::Var(n) => self.var_cell_opt(n),
+            _ => None,
+        };
         let key = match i {
             Some(ie) => Some(self.eval(ie)?),
             None => None,
         };
-        self.set_index_val(e, key, v)
+        if let Expr::Var(n) = e {
+            if let Some(kv) = &key {
+                if self.dim_detached(&pre_cell, n) {
+                    let scratch = cell(pre_cell.map(|c| c.borrow().clone()).unwrap_or(Value::Null));
+                    self.detached_dim = true;
+                    let r = self.set_index_var(&scratch, key, None, v);
+                    self.detached_dim = false;
+                    return r;
+                }
+                // The key conversion diagnostics run as part of the
+                // write op — their error handler can still detach the
+                // slot, so convert BEFORE the detach re-check and carry
+                // the ArrKey through (the stale write stays silent).
+                let converts_early = match &pre_cell {
+                    Some(c) => matches!(&*c.borrow(), Value::Null | Value::Array(_)),
+                    None => true,
+                };
+                let ak = if converts_early {
+                    Some(self.arr_key(kv)?)
+                } else {
+                    None
+                };
+                if self.dim_detached(&pre_cell, n) {
+                    let scratch = cell(pre_cell.map(|c| c.borrow().clone()).unwrap_or(Value::Null));
+                    self.detached_dim = true;
+                    let r = self.set_index_var(&scratch, key, ak, v);
+                    self.detached_dim = false;
+                    return r;
+                }
+                return self.set_index_val(e, key, ak, v);
+            }
+        }
+        self.set_index_val(e, key, None, v)
     }
 
     /// `$e[k1][k2]... = v` with already-evaluated keys, traversed at write
@@ -3077,7 +3193,7 @@ impl<'a> Interp<'a> {
                     self.cur_line,
                 ));
             }
-            if compound {
+            if compound && !self.detached_dim {
                 // Container/key checks fire BEFORE the dim write in a
                 // compound assign — zend throws at whatever level fails.
                 self.compound_dim_gate(&c, k)?;
@@ -3124,6 +3240,7 @@ impl<'a> Interp<'a> {
             match self.index_into_key(c.clone(), k.as_ref().map(|kc| kc.borrow().clone())) {
                 Ok(nc) => {
                     if n == last {
+                        self.touch_write(&nc);
                         // `$ref[k] = v` where the element cell is bound to
                         // a typed prop stays type-gated (064).
                         let nv = self.typed_slot_store(&nc, v.clone())?;
@@ -3584,6 +3701,12 @@ impl<'a> Interp<'a> {
     /// representable' (NaN emits both), null is Deprecated, and a
     /// resource warns and casts to its id int.
     pub(crate) fn arr_key(&mut self, v: &Value) -> Result<ArrKey, PhpError> {
+        // A detached dim write (its container slot was rebound by an
+        // error handler inside the key eval) lands on the stale slot —
+        // zend converts the key without diagnostics (assign_dim_014).
+        if self.detached_dim {
+            return Ok(to_key(v));
+        }
         match v {
             Value::Array(_) | Value::Object(_) | Value::Callable(_) => {
                 let tn = Self::illegal_offset_ty(v).unwrap();
@@ -3641,8 +3764,125 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// `set_index` with an already-evaluated key.
-    fn set_index_val(&mut self, e: &Expr, key: Option<Value>, v: Value) -> Result<(), PhpError> {
+    /// `$cell[$key] = v` write into a var cell — shared by the plain
+    /// `Expr::Var` path and detached dim writes (a scratch cell stands
+    /// in for a container slot an error handler rebound mid-key-eval).
+    fn set_index_var(
+        &mut self,
+        arr_cell: &Cell,
+        key: Option<Value>,
+        ak: Option<ArrKey>,
+        v: Value,
+    ) -> Result<(), PhpError> {
+        let mut b = arr_cell.borrow_mut();
+        match &mut *b {
+            Value::Null => {
+                let mut arr = PhpArray::new();
+                match ak {
+                    Some(ak) => arr.set(ak, v),
+                    None => match key {
+                        Some(k) => arr.set(self.arr_key(&k)?, v),
+                        None => arr.push(v),
+                    },
+                }
+                *b = Value::Array(Rc::new(RefCell::new(arr)));
+            }
+            Value::Array(_) => {
+                // CoW: shared arrays get replaced wholesale by callers
+                // through the cell, so mutate in place via borrow_mut —
+                // PHP semantics: write through to all aliases... PHP
+                // separates unreferenced copies; our Rc aliases share.
+                // For `$a = $b; $a[0]=1` PHP copies. Handle via split.
+                self.cow_split(&mut b);
+                let rc = match &*b {
+                    Value::Array(rc) => rc.clone(),
+                    _ => unreachable!(),
+                };
+                // Drop the container borrow before mutating: an
+                // element cell can alias this very cell
+                // ($a = [&$a]) and the write-through needs it
+                // unborrowed.
+                drop(b);
+                let ak = match ak {
+                    Some(ak) => Some(ak),
+                    None => match &key {
+                        Some(k) => Some(self.arr_key(k)?),
+                        None => None,
+                    },
+                };
+                if self.in_handler {
+                    if let Some(ak) = &ak {
+                        if let Some(ec) = rc.borrow().get_cell(ak) {
+                            self.touch_write(&ec);
+                        }
+                    }
+                }
+                let mut arr = rc.borrow_mut();
+                match ak {
+                    Some(ak) => arr.set(ak, v),
+                    None => arr.push(v),
+                }
+            }
+            Value::Str(s) => {
+                let mut bytes = s.to_vec();
+                match key {
+                    Some(k) => {
+                        // zend warns once per non-int scalar
+                        // key cast on a string offset.
+                        if matches!(k, Value::Bool(_) | Value::Float(_)) && !self.detached_dim {
+                            self.warn_ns("String offset cast occurred")?;
+                        }
+                        // PHP 8: negative offsets index from the
+                        // end; beyond -len is illegal (bug22592).
+                        let orig = k.to_int();
+                        let idx = if orig < 0 {
+                            orig + bytes.len() as i64
+                        } else {
+                            orig
+                        };
+                        if idx < 0 {
+                            drop(b);
+                            self.warn(&format!("Illegal string offset {}", orig))?;
+                            return Ok(());
+                        }
+                        let idx = idx as usize;
+                        let vs = self.conv_bytes(&v).unwrap_or_default();
+                        if idx >= bytes.len() {
+                            bytes.resize(idx + 1, b' ');
+                        }
+                        bytes[idx] = vs.first().copied().unwrap_or(b' ');
+                        if vs.len() > 1 {
+                            drop(b);
+                            self.warn("Only the first byte will be assigned to the string offset")?;
+                            return Ok(());
+                        }
+                    }
+                    None => bytes.extend_from_slice(v.to_php_string().as_bytes()),
+                }
+                *b = Value::str(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            _ => {
+                drop(b);
+                // Catchable Error: `$int[0] = x` (engine_..._002).
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    "Cannot use a scalar value as an array",
+                    self.cur_line,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `set_index` with an already-evaluated key; `ak` is the
+    /// pre-converted ArrKey when conversion ran before a detach check.
+    fn set_index_val(
+        &mut self,
+        e: &Expr,
+        key: Option<Value>,
+        ak: Option<ArrKey>,
+        v: Value,
+    ) -> Result<(), PhpError> {
         if let Some(k) = &key {
             // ArrayAccess containers take any key type — zend hands it
             // to offsetSet untouched (SplObjectStorage keys on objects).
@@ -3660,89 +3900,7 @@ impl<'a> Interp<'a> {
         match e {
             Expr::Var(name) => {
                 let arr_cell = self.var_cell(name);
-                let mut b = arr_cell.borrow_mut();
-                match &mut *b {
-                    Value::Null => {
-                        let mut arr = PhpArray::new();
-                        match key {
-                            Some(k) => arr.set(self.arr_key(&k)?, v),
-                            None => arr.push(v),
-                        }
-                        *b = Value::Array(Rc::new(RefCell::new(arr)));
-                    }
-                    Value::Array(_) => {
-                        // CoW: shared arrays get replaced wholesale by callers
-                        // through the cell, so mutate in place via borrow_mut —
-                        // PHP semantics: write through to all aliases... PHP
-                        // separates unreferenced copies; our Rc aliases share.
-                        // For `$a = $b; $a[0]=1` PHP copies. Handle via split.
-                        self.cow_split(&mut b);
-                        let rc = match &*b {
-                            Value::Array(rc) => rc.clone(),
-                            _ => unreachable!(),
-                        };
-                        // Drop the container borrow before mutating: an
-                        // element cell can alias this very cell
-                        // ($a = [&$a]) and the write-through needs it
-                        // unborrowed.
-                        drop(b);
-                        let mut arr = rc.borrow_mut();
-                        match key {
-                            Some(k) => arr.set(self.arr_key(&k)?, v),
-                            None => arr.push(v),
-                        }
-                    }
-                    Value::Str(s) => {
-                        let mut bytes = s.to_vec();
-                        match key {
-                            Some(k) => {
-                                // zend warns once per non-int scalar
-                                // key cast on a string offset.
-                                if matches!(k, Value::Bool(_) | Value::Float(_)) {
-                                    self.warn_ns("String offset cast occurred")?;
-                                }
-                                // PHP 8: negative offsets index from the
-                                // end; beyond -len is illegal (bug22592).
-                                let orig = k.to_int();
-                                let idx = if orig < 0 {
-                                    orig + bytes.len() as i64
-                                } else {
-                                    orig
-                                };
-                                if idx < 0 {
-                                    drop(b);
-                                    self.warn(&format!("Illegal string offset {}", orig))?;
-                                    return Ok(());
-                                }
-                                let idx = idx as usize;
-                                let vs = self.conv_bytes(&v).unwrap_or_default();
-                                if idx >= bytes.len() {
-                                    bytes.resize(idx + 1, b' ');
-                                }
-                                bytes[idx] = vs.first().copied().unwrap_or(b' ');
-                                if vs.len() > 1 {
-                                    drop(b);
-                                    self.warn(
-                                        "Only the first byte will be assigned to the string offset",
-                                    )?;
-                                    return Ok(());
-                                }
-                            }
-                            None => bytes.extend_from_slice(v.to_php_string().as_bytes()),
-                        }
-                        *b = Value::str(String::from_utf8_lossy(&bytes).into_owned());
-                    }
-                    _ => {
-                        drop(b);
-                        // Catchable Error: `$int[0] = x` (engine_..._002).
-                        return self.fail(PhpError::uncaught(
-                            "Error",
-                            "Cannot use a scalar value as an array",
-                            self.cur_line,
-                        ));
-                    }
-                }
-                Ok(())
+                self.set_index_var(&arr_cell, key, ak, v)
             }
             // Nested lvalue bases ($a[0][1], $a->b[0], C::$a[0], $$v[0]):
             // resolve the element cell generically and write into it.
@@ -4495,6 +4653,11 @@ impl<'a> Interp<'a> {
                     self.cow_split(&mut b);
                     if let (Value::Array(rc), Some(k)) = (&*b, &key) {
                         let ak = self.arr_key(k)?;
+                        if self.in_handler {
+                            if let Some(ec) = rc.borrow().get_cell(&ak) {
+                                self.touch_write(&ec);
+                            }
+                        }
                         rc.borrow_mut().unset(&ak);
                     }
                     return Ok(());

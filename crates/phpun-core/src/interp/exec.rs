@@ -551,11 +551,18 @@ impl<'a> Interp<'a> {
                             // table entry too.
                             if self.stack.is_empty() {
                                 if let Some(arr) = self.globals_arr.clone() {
-                                    arr.borrow_mut().unset(&ArrKey::Str(Rc::from(n.as_str())));
+                                    let ak = ArrKey::Str(Rc::from(n.as_str()));
+                                    if self.in_handler {
+                                        if let Some(ec) = arr.borrow().get_cell(&ak) {
+                                            self.touch_write(&ec);
+                                        }
+                                    }
+                                    arr.borrow_mut().unset(&ak);
                                 }
                                 self.globals_synced.remove(n);
                             }
                             if let Some(c) = self.cur().vars.remove(n) {
+                                self.touch_write(&c);
                                 // Removing the last handle runs
                                 // __destruct immediately — for a
                                 // Callable that also decrefs its bound

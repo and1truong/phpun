@@ -1784,17 +1784,22 @@ impl<'a> Parser<'a> {
                         ));
                     }
                     if self.const_ctx == ConstCtx::Slot {
-                        // Compile-time constants: a `::` CALL or static
-                        // prop in the slot is zend's invalid-operations
-                        // fatal regardless of the class side
-                        // (`self::m()`, `C::m()`, `static::$p` all die
-                        // the same way vs oracle). `self::`/`parent::`
-                        // constants defer scope checks to the slot's
-                        // runtime eval (catchable at call/init).
-                        if matches!(self.peek(), Some(Token::Variable(_)) | Some(Token::Op("$")))
-                            || (matches!(self.peek(), Some(Token::Ident(_)))
-                                && matches!(self.peek2(), Some(Token::Op("("))))
-                        {
+                        // Compile-time constants: a static PROP in the
+                        // slot is zend's invalid-operations fatal
+                        // regardless of the class side (`F::$p`,
+                        // `static::$p`, `self::$p` all die the same
+                        // way vs oracle). A `::` CALL defers like a
+                        // constant fetch — `F::m(...)` FCC inits
+                        // lazily (unknown class → 'Class "F" not
+                        // found' at eval), and `self::`/`parent::`
+                        // defer their scope checks to the slot's
+                        // runtime eval (catchable at call/init). Only
+                        // `static::` is the compile fatal, and the
+                        // wording splits on the member kind:
+                        // `static::m(...)`/`static::$p` get
+                        // '"static"', bare `static::K` gets
+                        // '"static::"'.
+                        if matches!(self.peek(), Some(Token::Variable(_)) | Some(Token::Op("$"))) {
                             return Err(PhpError::compile_fatal(
                                 "Constant expression contains invalid operations",
                                 self.line(),
@@ -1804,12 +1809,15 @@ impl<'a> Parser<'a> {
                             && !matches!(self.peek(), Some(Token::Ident(m)) if m == "class")
                         {
                             // `static::class` falls through to the
-                            // class-name-resolution gate below; bare
-                            // `static::K` is the '"static::"' fatal.
-                            return Err(PhpError::compile_fatal(
-                                "\"static::\" is not allowed in compile-time constants",
-                                self.line(),
-                            ));
+                            // class-name-resolution gate below.
+                            let msg = if matches!(self.peek(), Some(Token::Ident(_)))
+                                && matches!(self.peek2(), Some(Token::Op("(")))
+                            {
+                                "\"static\" is not allowed in compile-time constants"
+                            } else {
+                                "\"static::\" is not allowed in compile-time constants"
+                            };
+                            return Err(PhpError::compile_fatal(msg, self.line()));
                         }
                     } else if self.const_ctx == ConstCtx::Runtime {
                         // Inside a NAMED function there is no class scope at

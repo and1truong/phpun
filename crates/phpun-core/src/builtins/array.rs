@@ -1679,34 +1679,66 @@ fn compact_one(
     out: &mut PhpArray,
     active: &mut std::collections::HashSet<usize>,
 ) -> Result<(), PhpError> {
-    match v {
-        Value::Str(s) => {
-            let n = crate::value::lossy(s);
-            match it.lookup_var(&n) {
-                Some(val) => out.set(ArrKey::Str(n.into_owned().into()), val),
-                None => {
-                    it.warn_pub(&format!("compact(): Undefined variable ${}", n))?;
+    // Iterative expansion — a nested-array arg walks down arbitrarily
+    // deep without native recursion. zend charges each level against
+    // zend.max_allowed_stack_size (~a few hundred bytes per compact
+    // frame, 256 used here): past the limit it throws a catchable
+    // 'Maximum call stack size' Error instead of dying (gh23115).
+    enum Work {
+        Val(Value),
+        Pop(usize),
+    }
+    let limit = it.ini_bytes("zend.max_allowed_stack_size");
+    const LEVEL_BYTES: i64 = 256;
+    let mut depth: i64 = 0;
+    let mut stack = vec![Work::Val(v.clone())];
+    while let Some(w) = stack.pop() {
+        match w {
+            Work::Pop(id) => {
+                active.remove(&id);
+                depth -= 1;
+            }
+            Work::Val(v) => match v {
+                Value::Str(s) => {
+                    let n = crate::value::lossy(&s);
+                    match it.lookup_var(&n) {
+                        Some(val) => out.set(ArrKey::Str(n.into_owned().into()), val),
+                        None => {
+                            it.warn_pub(&format!("compact(): Undefined variable ${}", n))?;
+                        }
+                    }
                 }
-            }
+                Value::Array(a) => {
+                    let id = Rc::as_ptr(&a) as usize;
+                    if !active.insert(id) {
+                        let e = it.exception("Error", "Recursion detected");
+                        return Err(it.throw_value(e));
+                    }
+                    depth += 1;
+                    if limit > 0 && depth * LEVEL_BYTES > limit {
+                        let e = it.exception(
+                            "Error",
+                            &format!(
+                                "Maximum call stack size of {} bytes (zend.max_allowed_stack_size - zend.reserved_stack_size) reached. Infinite recursion?",
+                                depth * LEVEL_BYTES
+                            ),
+                        );
+                        return Err(it.throw_value(e));
+                    }
+                    let entries: Vec<Value> = a
+                        .borrow()
+                        .entries
+                        .iter()
+                        .map(|(_, c)| c.borrow().clone())
+                        .collect();
+                    stack.push(Work::Pop(id));
+                    for e in entries.into_iter().rev() {
+                        stack.push(Work::Val(e));
+                    }
+                }
+                _ => {}
+            },
         }
-        Value::Array(a) => {
-            let id = Rc::as_ptr(a) as usize;
-            if !active.insert(id) {
-                let e = it.exception("Error", "Recursion detected");
-                return Err(it.throw_value(e));
-            }
-            let entries: Vec<Value> = a
-                .borrow()
-                .entries
-                .iter()
-                .map(|(_, c)| c.borrow().clone())
-                .collect();
-            for e in &entries {
-                compact_one(it, e, out, active)?;
-            }
-            active.remove(&id);
-        }
-        _ => {}
     }
     Ok(())
 }

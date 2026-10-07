@@ -389,6 +389,19 @@ pub struct Interp<'a> {
     pub script_args: Vec<String>,
     exception_handler: Option<Value>,
     in_handler: bool,
+    /// Cells written while an error handler ran — zend binds a dim
+    /// write's container slot BEFORE the dim key evaluates, so a
+    /// handler that reassigns the container leaves the pending write
+    /// on the stale slot: invisible and silent (assign_dim_014). The
+    /// stored Rcs pin the allocations so a freed cell's address can't
+    /// recycle into a false hit.
+    handler_writes: std::collections::HashMap<usize, Cell>,
+    /// Cells read while an error handler ran — a prior read links the
+    /// binding, so a later write stays on the live slot.
+    handler_reads: std::collections::HashMap<usize, Cell>,
+    /// The current dim write is detached (see `handler_writes`) —
+    /// offset-key conversions stay silent.
+    detached_dim: bool,
     /// Current line estimate for error messages (best-effort).
     pub cur_line: usize,
     /// Active generator body's yield collector — `Expr::Yield` pushes
@@ -909,6 +922,9 @@ impl<'a> Interp<'a> {
             script_args: Vec::new(),
             exception_handler: None,
             in_handler: false,
+            handler_writes: std::collections::HashMap::new(),
+            handler_reads: std::collections::HashMap::new(),
+            detached_dim: false,
             cur_line: 1,
             gen_sink: None,
             pending_gen_captures: Vec::new(),
@@ -2124,6 +2140,9 @@ impl<'a> Interp<'a> {
         self.ob_stack.clear();
         self.silence = 0;
         self.isset_quiet = 0;
+        self.handler_writes.clear();
+        self.handler_reads.clear();
+        self.detached_dim = false;
         self.pending_exception = None;
         self.call_trace.clear();
         self.deadline = None;
@@ -2253,19 +2272,44 @@ impl<'a> Interp<'a> {
         Some(c)
     }
 
+    /// Record a read of `c` while an error handler runs — a prior read
+    /// links the binding for zend's pending-write semantics.
+    pub(crate) fn touch_read(&mut self, c: &Cell) {
+        if self.in_handler {
+            self.handler_reads.insert(Rc::as_ptr(c) as usize, c.clone());
+        }
+    }
+
+    /// Record a write of `c` while an error handler runs — a write
+    /// without a prior read detaches any pending dim write whose
+    /// container was this cell.
+    pub(crate) fn touch_write(&mut self, c: &Cell) {
+        if self.in_handler {
+            let p = Rc::as_ptr(c) as usize;
+            if !self.handler_reads.contains_key(&p) {
+                self.handler_writes.insert(p, c.clone());
+            }
+        }
+    }
+
     /// Does the variable name resolve to an existing cell?
     fn var_lookup(&mut self, name: &str) -> Option<Cell> {
-        if self.stack.is_empty() {
+        let r = if self.stack.is_empty() {
             if let Some(c) = self.global_var_cell(name) {
                 return Some(c);
             }
-            return self.superglobal_cell(name);
+            self.superglobal_cell(name)
+        } else {
+            self.cur()
+                .vars
+                .get(name)
+                .cloned()
+                .or_else(|| self.superglobal_cell(name))
+        };
+        if let Some(c) = &r {
+            self.touch_read(c);
         }
-        self.cur()
-            .vars
-            .get(name)
-            .cloned()
-            .or_else(|| self.superglobal_cell(name))
+        r
     }
 
     fn var_get(&mut self, name: &str) -> Result<Value, PhpError> {
@@ -2284,9 +2328,11 @@ impl<'a> Interp<'a> {
         // still sitting in vars (unset($GLOBALS['x'])).
         if self.stack.is_empty() {
             if let Some(c) = self.global_var_cell(name) {
+                self.touch_read(&c);
                 return Ok(c.borrow().clone());
             }
             if let Some(c) = self.superglobal_cell(name) {
+                self.touch_read(&c);
                 return Ok(c.borrow().clone());
             }
             if !self.is_quiet() {
@@ -2294,10 +2340,17 @@ impl<'a> Interp<'a> {
             }
             return Ok(Value::Null);
         }
-        match self.cur().vars.get(name) {
-            Some(c) => Ok(c.borrow().clone()),
+        let found = self.cur().vars.get(name).cloned();
+        match found {
+            Some(c) => {
+                self.touch_read(&c);
+                Ok(c.borrow().clone())
+            }
             None => match self.superglobal_cell(name) {
-                Some(c) => Ok(c.borrow().clone()),
+                Some(c) => {
+                    self.touch_read(&c);
+                    Ok(c.borrow().clone())
+                }
                 None => {
                     // Inside any function frame, a missing $this is a
                     // hard "Using $this when not in object context"
@@ -2427,7 +2480,10 @@ impl<'a> Interp<'a> {
 
     fn var_set(&mut self, name: &str, v: Value) {
         match self.var_cell_opt(name) {
-            Some(c) => *c.borrow_mut() = v,
+            Some(c) => {
+                self.touch_write(&c);
+                *c.borrow_mut() = v;
+            }
             None => {
                 self.cur()
                     .vars
@@ -2443,6 +2499,7 @@ impl<'a> Interp<'a> {
     fn var_set_gated(&mut self, name: &str, v: Value, strict: bool) -> Result<(), PhpError> {
         match self.var_cell_opt(name) {
             Some(c) => {
+                self.touch_write(&c);
                 let nv = self.typed_slot_store_mode(&c, v, strict)?;
                 *c.borrow_mut() = nv;
                 Ok(())
