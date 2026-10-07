@@ -93,7 +93,16 @@ impl PhpArray {
             if Rc::ptr_eq(&slot.1, &c) {
                 return;
             }
-            *slot.1.borrow_mut() = c.borrow().clone();
+            // A self-referential array ($a = [&$a]) can alias the very cell
+            // an ancestor frame is borrowing — never panic on the reentrant
+            // borrow: write through when possible, else rebind the entry.
+            let new_v = c.try_borrow().map(|b| b.clone());
+            let writable = slot.1.try_borrow_mut().is_ok();
+            match (new_v, writable) {
+                (Ok(v), true) => *slot.1.borrow_mut() = v,
+                (Ok(v), false) => slot.1 = Rc::new(RefCell::new(v)),
+                (Err(_), _) => slot.1 = c,
+            }
             return;
         }
         if let ArrKey::Int(i) = k {

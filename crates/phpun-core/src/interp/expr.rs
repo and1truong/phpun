@@ -3578,12 +3578,19 @@ impl<'a> Interp<'a> {
                         // separates unreferenced copies; our Rc aliases share.
                         // For `$a = $b; $a[0]=1` PHP copies. Handle via split.
                         self.cow_split(&mut b);
-                        if let Value::Array(rc) = &mut *b {
-                            let mut arr = rc.borrow_mut();
-                            match key {
-                                Some(k) => arr.set(to_key(&k), v),
-                                None => arr.push(v),
-                            }
+                        let rc = match &*b {
+                            Value::Array(rc) => rc.clone(),
+                            _ => unreachable!(),
+                        };
+                        // Drop the container borrow before mutating: an
+                        // element cell can alias this very cell
+                        // ($a = [&$a]) and the write-through needs it
+                        // unborrowed.
+                        drop(b);
+                        let mut arr = rc.borrow_mut();
+                        match key {
+                            Some(k) => arr.set(to_key(&k), v),
+                            None => arr.push(v),
                         }
                     }
                     Value::Str(s) => {
