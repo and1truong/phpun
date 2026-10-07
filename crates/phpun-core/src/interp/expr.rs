@@ -189,7 +189,9 @@ impl<'a> Interp<'a> {
                                 let sv = self.eval(e)?;
                                 for (sk, c) in self.unpack_items(&sv)? {
                                     match sk {
-                                        Some(s) => arr.set(ArrKey::Str(s), c.borrow().clone()),
+                                        Some(s) => {
+                                            arr.set(ArrKey::Str(s), c.borrow().clone());
+                                        }
                                         None => arr.push(c.borrow().clone()),
                                     }
                                 }
@@ -2045,15 +2047,18 @@ impl<'a> Interp<'a> {
                             None => None,
                         };
                         let mut arr = rc.borrow_mut();
-                        if append {
+                        let old = if append {
                             arr.push(newv.clone());
+                            None
                         } else {
                             let key = match ak {
                                 Some(k) => k,
                                 None => to_key(&newv),
                             };
-                            arr.set(key, newv.clone());
-                        }
+                            arr.set(key, newv.clone())
+                        };
+                        drop(arr);
+                        self.destruct_displaced(old)?;
                     }
                 }
                 if matches!(&*base.borrow(), Value::Str(_)) {
@@ -2812,7 +2817,9 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let c = self.eval_cell(target)?;
-                *c.borrow_mut() = src.borrow().clone();
+                let nv = src.borrow().clone();
+                let old = std::mem::replace(&mut *c.borrow_mut(), nv);
+                self.destruct_dying_value(&old)?;
                 Ok(())
             }
             Expr::StaticProp { class, name } => {
@@ -3577,7 +3584,8 @@ impl<'a> Interp<'a> {
                     if let Some(src) = self.ao_src_obj(&o) {
                         self.ao_obj_dim_write(&o, &src, &arr, k, v.clone());
                     } else {
-                        arr.borrow_mut().set(k, v.clone());
+                        let old = arr.borrow_mut().set(k, v.clone());
+                        self.destruct_displaced(old)?;
                     }
                     return Ok(v);
                 }
@@ -3586,6 +3594,7 @@ impl<'a> Interp<'a> {
                     // Write into the existing slot — a `&`-bound
                     // reference must see the update (typed_properties_010).
                     if let Some(existing) = ob.props.get(&k) {
+
                         let existing = existing.clone();
                         drop(ob);
                         // The slot may be shared with a DIFFERENT typed
@@ -4308,7 +4317,12 @@ impl<'a> Interp<'a> {
                         // upstream borrow (a handler's write reaching
                         // this slot) drops the write invisibly (B1).
                         if let Ok(mut nb) = nc.try_borrow_mut() {
-                            *nb = nv;
+                            // zend runs the evicted zval's dtor at
+                            // refcount 0 — `$a[k] = new D` fires the
+                            // old object's __destruct eagerly.
+                            let old = std::mem::replace(&mut *nb, nv);
+                            drop(nb);
+                            self.destruct_dying_value(&old)?;
                         }
                         return Ok(v);
                     }
@@ -4936,7 +4950,9 @@ impl<'a> Interp<'a> {
                 Value::Null => {
                     let mut arr = PhpArray::new();
                     match ak {
-                        Some(ak) => arr.set(ak, v),
+                        Some(ak) => {
+                            arr.set(ak, v);
+                        }
                         None => arr.push(v),
                     }
                     *b = Value::Array(Rc::new(RefCell::new(arr)));
@@ -4957,10 +4973,15 @@ impl<'a> Interp<'a> {
                     // unborrowed.
                     drop(b);
                     let mut arr = rc.borrow_mut();
-                    match ak {
+                    let old = match ak {
                         Some(ak) => arr.set(ak, v),
-                        None => arr.push(v),
-                    }
+                        None => {
+                            arr.push(v);
+                            None
+                        }
+                    };
+                    drop(arr);
+                    self.destruct_displaced(old)?;
                 }
                 _ => {}
             }
@@ -5210,7 +5231,9 @@ impl<'a> Interp<'a> {
                 match self.index_cell_key(e, key.clone()) {
                     Ok(c) => {
                         if let Ok(mut cb) = c.try_borrow_mut() {
-                            *cb = v;
+                            let old = std::mem::replace(&mut *cb, v);
+                            drop(cb);
+                            self.destruct_dying_value(&old)?;
                         }
                         Ok(())
                     }
@@ -6983,7 +7006,8 @@ impl<'a> Interp<'a> {
         match rc {
             Some(c) => {
                 let nv = self.typed_slot_store(&c, new.clone())?;
-                *c.borrow_mut() = nv;
+                let old = std::mem::replace(&mut *c.borrow_mut(), nv);
+                self.destruct_dying_value(&old)?;
             }
             None => {
                 self.method_invoke(

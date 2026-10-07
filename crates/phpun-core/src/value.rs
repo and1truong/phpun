@@ -80,30 +80,35 @@ impl PhpArray {
         self.next += 1;
     }
 
-    pub fn set(&mut self, k: ArrKey, v: Value) {
-        self.set_cell(k, Rc::new(RefCell::new(v)));
+    /// Insert or update; returns the displaced slot (in-place writes
+    /// wrap the old value in a fresh cell) so zend's refcount-0
+    /// destruct discipline can run on it.
+    pub fn set(&mut self, k: ArrKey, v: Value) -> Option<Cell> {
+        self.set_cell(k, Rc::new(RefCell::new(v)))
     }
 
     /// Insert or update. An existing key's cell is replaced with the new
     /// value (so aliases bound to the cell see it); a missing key appends.
-    pub fn set_cell(&mut self, k: ArrKey, c: Cell) {
+    pub fn set_cell(&mut self, k: ArrKey, c: Cell) -> Option<Cell> {
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
             // Same cell on both sides (a $GLOBALS sync can alias the slot to
             // its own global) — writing it would borrow_mut+borrow itself.
             if Rc::ptr_eq(&slot.1, &c) {
-                return;
+                return None;
             }
             // A self-referential array ($a = [&$a]) can alias the very cell
             // an ancestor frame is borrowing — never panic on the reentrant
             // borrow: write through when possible, else rebind the entry.
             let new_v = c.try_borrow().map(|b| b.clone());
             let writable = slot.1.try_borrow_mut().is_ok();
-            match (new_v, writable) {
-                (Ok(v), true) => *slot.1.borrow_mut() = v,
-                (Ok(v), false) => slot.1 = Rc::new(RefCell::new(v)),
-                (Err(_), _) => slot.1 = c,
-            }
-            return;
+            return match (new_v, writable) {
+                (Ok(v), true) => {
+                    let old = std::mem::replace(&mut *slot.1.borrow_mut(), v);
+                    Some(Rc::new(RefCell::new(old)))
+                }
+                (Ok(v), false) => Some(std::mem::replace(&mut slot.1, Rc::new(RefCell::new(v)))),
+                (Err(_), _) => Some(std::mem::replace(&mut slot.1, c)),
+            };
         }
         if let ArrKey::Int(i) = k {
             if i >= self.next {
@@ -113,6 +118,7 @@ impl PhpArray {
         } else {
             self.entries.push((k, c));
         }
+        None
     }
 
     /// Bind an element slot to a specific cell (`$a[k] =& $x`).

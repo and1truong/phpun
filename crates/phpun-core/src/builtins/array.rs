@@ -289,7 +289,9 @@ pub(crate) fn dispatch(
                     for (k, c) in m.borrow().iter() {
                         match k {
                             ArrKey::Int(_) => out.push(c.borrow().clone()),
-                            _ => out.set(k.clone(), c.borrow().clone()),
+                            _ => {
+                            out.set(k.clone(), c.borrow().clone());
+                        }
                         }
                     }
                 }
@@ -325,7 +327,9 @@ pub(crate) fn dispatch(
                             rec(&mut fresh, &oa.borrow());
                             base.set(k.clone(), Value::Array(Rc::new(RefCell::new(fresh))));
                         }
-                        _ => base.set(k.clone(), v),
+                        _ => {
+                            base.set(k.clone(), v);
+                        }
                     }
                 }
             }
@@ -447,7 +451,9 @@ pub(crate) fn dispatch(
                 // PHP renumbers every integer key in the result (string
                 // keys are kept); replacement values always append.
                 let put = |arr: &mut PhpArray, k: &ArrKey, c: &Cell| match k {
-                    ArrKey::Str(s) => arr.set_cell(ArrKey::Str(s.clone()), c.clone()),
+                    ArrKey::Str(s) => {
+                        arr.set_cell(ArrKey::Str(s.clone()), c.clone());
+                    }
                     _ => arr.push_cell(c.clone()),
                 };
                 for (k, c) in head {
@@ -1703,7 +1709,9 @@ fn compact_one(
                 Value::Str(s) => {
                     let n = crate::value::lossy(&s);
                     match it.lookup_var(&n) {
-                        Some(val) => out.set(ArrKey::Str(n.into_owned().into()), val),
+                        Some(val) => {
+                            out.set(ArrKey::Str(n.into_owned().into()), val);
+                        }
                         None => {
                             it.warn_pub(&format!("compact(): Undefined variable ${}", n))?;
                         }
