@@ -210,10 +210,22 @@ pub(crate) fn dispatch(
             let n = arg(args, 1).to_int();
             let v = arg(args, 2);
             let mut out = PhpArray::new();
+            // Keys are sequential and unique — append O(1) each
+            // instead of set()'s O(n) key search (a 2M fill was
+            // quadratic). zend packs it the same way.
+            out.entries.reserve(n.max(0) as usize);
             for i in 0..n.max(0) {
-                out.set(ArrKey::Int(start + i), v.clone());
+                out.entries.push((ArrKey::Int(start + i), cell(v.clone())));
             }
-            Value::Array(Rc::new(RefCell::new(out)))
+            out.next = start + n.max(0);
+            // zend allocates the packed arData up front — charge the
+            // whole capacity (pow2 slots * 16B + 8 header) so a huge
+            // fill trips the limit where the oracle does.
+            let cap = (n.max(0) as u64).next_power_of_two().max(1);
+            let want = cap.saturating_mul(16).saturating_add(8);
+            let rc = Rc::new(RefCell::new(out));
+            it.mem_track(&rc, want, want);
+            Value::Array(rc)
         }
         "array_fill_keys" => {
             let mut out = PhpArray::new();
@@ -291,6 +303,7 @@ pub(crate) fn dispatch(
                     removed.push(c.borrow().clone());
                     let _ = k;
                 }
+                let cut_n = cut.len() as u64;
                 // PHP renumbers every integer key in the result (string
                 // keys are kept); replacement values always append.
                 let put = |arr: &mut PhpArray, k: &ArrKey, c: &Cell| match k {
@@ -336,6 +349,14 @@ pub(crate) fn dispatch(
                 }
                 arr.next = i;
                 arr.iter_pos = 0;
+                let ins = (arr.len() as u64).saturating_sub((head.len() + tail2.len()) as u64);
+                let final_len = arr.len() as u64;
+                drop(arr);
+                // Buckets freed for the cut, charged for the repl.
+                it.mem_credit(&rc, 32 * cut_n);
+                if ins > 0 {
+                    it.mem_track(&rc, 32 * ins, final_len.next_power_of_two() * 32 + 8);
+                }
             }
             Value::Array(Rc::new(RefCell::new(removed)))
         }
@@ -346,6 +367,9 @@ pub(crate) fn dispatch(
                     arr.push(a.borrow().clone());
                 }
                 let n = arr.len() as i64;
+                let grown = (args.len() - 1) as u64;
+                drop(arr);
+                it.mem_track(&rc, 32 * grown, (n as u64).next_power_of_two() * 32 + 8);
                 return Ok(Some(Value::Int(n)));
             }
             Value::Null
@@ -371,6 +395,8 @@ pub(crate) fn dispatch(
                             }
                         }
                         arr.entries[f].0 = ArrKey::Tomb;
+                        drop(arr);
+                        it.mem_credit(&rc, 32);
                         return Ok(Some(c.borrow().clone()));
                     }
                     None => return Ok(Some(Value::Null)),
@@ -400,6 +426,8 @@ pub(crate) fn dispatch(
                             }
                         }
                         arr.next = ni;
+                        drop(arr);
+                        it.mem_credit(&rc, 32);
                         return Ok(Some(c.borrow().clone()));
                     }
                     None => return Ok(Some(Value::Null)),
@@ -424,7 +452,14 @@ pub(crate) fn dispatch(
                 }
                 new_entries.append(&mut arr.entries);
                 arr.entries = new_entries;
-                return Ok(Some(Value::Int(arr.len() as i64)));
+                let n = arr.len() as i64;
+                drop(arr);
+                it.mem_track(
+                    &rc,
+                    32 * add as u64,
+                    (n as u64).next_power_of_two() * 32 + 8,
+                );
+                return Ok(Some(Value::Int(n)));
             }
             Value::Null
         }

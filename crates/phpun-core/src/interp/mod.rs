@@ -716,6 +716,15 @@ pub struct Interp<'a> {
     /// crossed memory_limit — zend's OOM bailout reports the
     /// allocating call, not the stmt boundary that raises the fatal.
     oom_at: Option<(usize, Vec<String>)>,
+    /// Allocations whose charge is tied to a live Rc — data pointer
+    /// → (charged bytes, liveness probe). zend tracks emalloc/efree:
+    /// when every strong ref to a tracked alloc dies its bytes release
+    /// back into mem_used, so reclaimable churn never trips the limit
+    /// while genuinely-growing structures do.
+    mem_tracked: HashMap<usize, (u64, Box<dyn Fn() -> bool>)>,
+    /// Registry size that trips the next dead-entry sweep — bounds the
+    /// tracker footprint for alloc-churn loops.
+    mem_sweep_at: usize,
     /// Execution deadline set by set_time_limit/hard_timeout (045).
     deadline: Option<std::time::Instant>,
     /// Seconds figure for the 'Maximum execution time' message.
@@ -1372,6 +1381,8 @@ impl<'a> Interp<'a> {
             mem_last: 0,
             mem_exceeded: false,
             oom_at: None,
+            mem_tracked: HashMap::new(),
+            mem_sweep_at: 4096,
             deadline: None,
             deadline_secs: 0,
             ini: HashMap::from([
@@ -3113,6 +3124,18 @@ impl<'a> Interp<'a> {
     pub fn mem_charge(&mut self, n: u64) {
         self.mem_used += n;
         self.mem_last = n;
+        // efree half of emalloc/efree: dead tracked allocs release
+        // their charge. Sweep when the registry grew past its bound,
+        // or when the counter crosses the limit — the fatal below
+        // must not fire on bytes whose owners already died.
+        if !self.mem_tracked.is_empty() {
+            let limit = self.ini_bytes("memory_limit");
+            if self.mem_tracked.len() >= self.mem_sweep_at
+                || (limit > 0 && self.mem_used as i64 > limit)
+            {
+                self.mem_sweep();
+            }
+        }
         // First crossing remembers the allocating call site — zend's
         // OOM bailout backtraces from inside that call, while the
         // fatal itself raises at the next statement boundary.
@@ -3122,6 +3145,94 @@ impl<'a> Interp<'a> {
                 self.oom_at = Some((self.cur_line, self.fatal_frames()));
             }
         }
+    }
+
+    /// Charge `bytes` and tie the charge to `rc`'s lifetime: repeated
+    /// growth on the same container accumulates under its data
+    /// pointer, and the accrued total releases once every strong ref
+    /// dies (zend's efree on the alloc). `report` overrides mem_last —
+    /// for container growth zend's 'tried to allocate N' names the
+    /// realloc request (capacity-sized), not the last element.
+    pub(crate) fn mem_track<T: ?Sized + 'static>(&mut self, rc: &Rc<T>, bytes: u64, report: u64) {
+        let key = Rc::as_ptr(rc) as *const u8 as usize;
+        match self.mem_tracked.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if !(e.get().1)() {
+                    // The allocator recycled a dead owner's pointer —
+                    // release its stale charge, then re-register.
+                    self.mem_used = self.mem_used.saturating_sub(e.get().0);
+                    e.get_mut().0 = 0;
+                    let weak = Rc::downgrade(rc);
+                    e.get_mut().1 = Box::new(move || weak.strong_count() > 0);
+                }
+                e.get_mut().0 += bytes;
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let weak = Rc::downgrade(rc);
+                e.insert((bytes, Box::new(move || weak.strong_count() > 0)));
+            }
+        }
+        self.mem_charge(bytes);
+        self.mem_last = report;
+    }
+
+    /// Release charges whose owning Rc died — the efree counterpart
+    /// of the mem_charge accumulation.
+    fn mem_sweep(&mut self) {
+        let mut credit = 0u64;
+        self.mem_tracked.retain(|_, (b, alive)| {
+            if alive() {
+                true
+            } else {
+                credit += *b;
+                false
+            }
+        });
+        self.mem_used = self.mem_used.saturating_sub(credit);
+        self.mem_sweep_at = self.mem_tracked.len() + 4096;
+    }
+
+    /// Partial efree inside a *living* container: zend frees a
+    /// bucket's zval on unset/evict while the table itself survives —
+    /// subtract `bytes` from the container's accrued charge. Entries
+    /// for containers never charged through mem_track are absent, so
+    /// untracked owners neither pay nor get refunded.
+    pub(crate) fn mem_credit<T: ?Sized + 'static>(&mut self, rc: &Rc<T>, bytes: u64) {
+        let key = Rc::as_ptr(rc) as *const u8 as usize;
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.mem_tracked.entry(key) {
+            if !(e.get().1)() {
+                // Stale entry of a dead owner at a recycled pointer —
+                // release it now, but the caller's container was never
+                // charged for it.
+                let (dead, _) = e.remove();
+                self.mem_used = self.mem_used.saturating_sub(dead);
+            } else {
+                let sub = bytes.min(e.get().0);
+                e.get_mut().0 -= sub;
+                self.mem_used = self.mem_used.saturating_sub(sub);
+            }
+        }
+    }
+
+    /// The memory_limit fatal as raised mid-call by an oversized alloc
+    /// — zend bails out inside emalloc, so a builtin that cannot afford
+    /// the real allocation (huge result buffers) returns this itself
+    /// instead of waiting for the stmt boundary.
+    pub fn oom_fatal(&self) -> PhpError {
+        let limit = self.ini_bytes("memory_limit");
+        let (line, frames) = self
+            .oom_at
+            .clone()
+            .unwrap_or((self.cur_line, self.fatal_frames()));
+        let mut e = PhpError::fatal(
+            format!(
+                "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
+                limit, self.mem_last
+            ),
+            line,
+        );
+        e.trace = Some(frames);
+        e
     }
 
     /// Byte-faithful emit — program output is bytes (echo of binary

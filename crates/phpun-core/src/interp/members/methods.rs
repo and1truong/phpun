@@ -544,7 +544,11 @@ impl<'a> Interp<'a> {
                 // The evicted payload's last ref dies with the
                 // cell — held objects/gens destruct now. Drop the
                 // borrow before dtors run (bug65051).
+                let had = arr.borrow().get_cell(&k).is_some();
                 let evicted = arr.borrow_mut().unset(&k);
+                if had {
+                    self.mem_credit(&arr, 32);
+                }
                 if let Some(v) = evicted {
                     self.destruct_dying_value(&v)?;
                 }
@@ -564,7 +568,9 @@ impl<'a> Interp<'a> {
                                 Some(ObjectInternal::ArrayIter { .. })
                             );
                         if !spl_src {
-                            src.borrow_mut().props.remove(&pname);
+                            if src.borrow_mut().props.remove(&pname).is_some() {
+                                self.mem_credit(&src, 32);
+                            }
                         }
                     }
                 }
@@ -1368,7 +1374,11 @@ impl<'a> Interp<'a> {
         drop(so);
         for k in stale {
             // Drop the borrow before the evicted payload's dtors run.
+            let had = arr.borrow().get_cell(&k).is_some();
             let evicted = arr.borrow_mut().unset(&k);
+            if had {
+                self.mem_credit(&arr, 32);
+            }
             if let Some(v) = evicted {
                 let _ = self.destruct_dying_value(&v);
             }

@@ -651,8 +651,12 @@ impl<'a> Interp<'a> {
                                 if let Some(arr) = self.globals_arr.clone() {
                                     // The borrow must end before the
                                     // evicted payload's dtors run.
-                                    let evicted =
-                                        arr.borrow_mut().unset(&ArrKey::Str(Rc::from(n.as_str())));
+                                    let kk = ArrKey::Str(Rc::from(n.as_str()));
+                                    let had = arr.borrow().get_cell(&kk).is_some();
+                                    let evicted = arr.borrow_mut().unset(&kk);
+                                    if had {
+                                        self.mem_credit(&arr, 32);
+                                    }
                                     if let Some(v) = evicted {
                                         if let Err(e) = self.destruct_dying_value(&v) {
                                             return self.err_flow(e);

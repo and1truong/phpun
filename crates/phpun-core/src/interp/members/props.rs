@@ -1805,6 +1805,8 @@ impl<'a> Interp<'a> {
                     drop(ob);
                     if let Some(ptr) = prune {
                         self.prune_typed_slot(ptr);
+                        // efree the prop bucket — charged at insert.
+                        self.mem_credit(&o, 32);
                     }
                 } else if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
                     // unset() on an uninitialized declared prop still
@@ -1823,7 +1825,12 @@ impl<'a> Interp<'a> {
                     // ARRAY_AS_PROPS: undeclared unsets delete from the
                     // storage hash — zend never reaches __unset.
                     let arr = self.ao_state(&o).0;
-                    let evicted = arr.borrow_mut().unset(&ArrKey::Str(Rc::from(pn.as_str())));
+                    let kk = ArrKey::Str(Rc::from(pn.as_str()));
+                    let had = arr.borrow().get_cell(&kk).is_some();
+                    let evicted = arr.borrow_mut().unset(&kk);
+                    if had {
+                        self.mem_credit(&arr, 32);
+                    }
                     if let Some(v) = evicted {
                         self.destruct_dying_value(&v)?;
                     }

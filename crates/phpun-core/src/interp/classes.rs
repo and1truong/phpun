@@ -3364,9 +3364,11 @@ impl<'a> Interp<'a> {
     pub fn alloc_obj(&mut self, o: PhpObject) -> Rc<RefCell<PhpObject>> {
         // zend emalloc: the object store handle + zval + its
         // default_properties_table (~56B struct + 16B/prop slot) — the
-        // bulk of `while(true) { $a[] = new X }` growth.
-        self.mem_charge(72 + 16 * o.props.len() as u64);
+        // bulk of `while(true) { $a[] = new X }` growth. Tracked: the
+        // charge releases when the object dies (efree).
+        let bytes = 72 + 16 * o.props.len() as u64;
         let rc = Rc::new(RefCell::new(o));
+        self.mem_track(&rc, bytes, bytes);
         let id = self.next_obj_id(&rc);
         rc.borrow_mut().id = id;
         rc
