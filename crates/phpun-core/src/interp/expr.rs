@@ -61,6 +61,7 @@ impl<'a> Interp<'a> {
                     if let Expr::ByRef(e) = v {
                         let c = self.eval_cell(e)?;
                         self.mark_ref(&c);
+                        self.reg_arr_ref(&c);
                         match k {
                             Some(ke) => {
                                 let kv = self.eval(ke)?;
@@ -1750,7 +1751,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let nv = self.typed_slot_store(&c, newv.clone())?;
-                *c.borrow_mut() = nv;
+                self.cell_store(&c, nv)?;
             }
             Late::Keyed { e, keys } => {
                 newv = self.assign_index_path(&e, &keys, newv, op != "=" && op != "??=")?;
@@ -1758,7 +1759,7 @@ impl<'a> Interp<'a> {
             Late::None => match target_cell {
                 Some(c) => {
                     let nv = self.typed_slot_store(&c, newv.clone())?;
-                    *c.borrow_mut() = nv;
+                    self.cell_store(&c, nv)?;
                 }
                 None => self.store(target, newv.clone())?,
             },
@@ -1818,14 +1819,38 @@ impl<'a> Interp<'a> {
     }
 
     /// `$target =& $cell`
+    /// A `=&` bind displaced this slot's previous cell: Zend decrefs
+    /// it only after the new binding is visible, so its __destruct
+    /// reads and writes the shared cell (gh10168). A displaced cell
+    /// that still has live owners (another prop/static alias) keeps
+    /// its zval — Zend frees the zval only with the cell itself, so
+    /// `Test::$test =& $box->value` + `$box->value =& $tmp` leaves the
+    /// old shared cell alive under the static (assign_prop_ref_with_
+    /// prop_ref).
+    fn destruct_displaced(&mut self, old: Option<Cell>) -> Result<(), PhpError> {
+        if let Some(old) = old {
+            // Release dead bookkeeping refs first, then require the
+            // cell be truly orphaned — otherwise its zval stays alive.
+            self.prune_typed_slot(Rc::as_ptr(&old) as usize);
+
+            if Rc::strong_count(&old) != 1 {
+                return Ok(());
+            }
+            let v = old.borrow().clone();
+            drop(old);
+            self.destruct_dying_value(&v)?;
+        }
+        Ok(())
+    }
+
     fn bind_cell(&mut self, target: &Expr, src: Cell) -> Result<(), PhpError> {
         // `=&` creates Zend's IS_REFERENCE — writes through it say
         // "a reference held by property", not "property" (034/078).
         self.mark_ref(&src);
         match target {
             Expr::Var(n) => {
-                self.cur().vars.insert(n.clone(), src);
-                Ok(())
+                let old = self.cur().vars.insert(n.clone(), src);
+                self.destruct_displaced(old)
             }
             Expr::Index { e, i } => {
                 let key = match i {
@@ -1840,6 +1865,7 @@ impl<'a> Interp<'a> {
                     | Expr::Prop { .. }
                     | Expr::VarVar(..)
                     | Expr::StaticProp { .. } => {
+                        self.reg_arr_ref(&src);
                         let c = self.eval_cell(e)?;
                         self.bind_into_key(c, key, src)
                     }
@@ -1942,8 +1968,10 @@ impl<'a> Interp<'a> {
                         if !ob.prop_order.contains(&key) {
                             ob.prop_order.push(key.clone());
                         }
-                        ob.props.insert(key.clone(), src.clone());
+
+                        let old = ob.props.insert(key.clone(), src.clone());
                         drop(ob);
+                        self.destruct_displaced(old)?;
                         if let (Some(m), Some((_, dcls))) = (merged, self.decl_prop(o, &pn)) {
                             let sptr = Rc::as_ptr(&src) as usize;
                             // The FIRST owner is the ref's holder for
@@ -1994,7 +2022,10 @@ impl<'a> Interp<'a> {
                         merged = Some(self.bind_typed_check(&pd, &dcls, &src)?);
                     }
                 }
-                cls.statics.borrow_mut().insert(pn.clone(), src.clone());
+                let old = cls.statics.borrow_mut().insert(pn.clone(), src.clone());
+
+                self.destruct_displaced(old)?;
+
                 if let (Some(m), Some((pd, dcls))) = (merged, self.find_static_prop_decl(&cls, &pn))
                 {
                     let sptr = Rc::as_ptr(&src) as usize;
@@ -2038,13 +2069,13 @@ impl<'a> Interp<'a> {
                 if name == "this" {
                     return self.fail(PhpError::fatal("Cannot re-assign $this", 0));
                 }
-                self.var_set(name, v);
+                self.var_set(name, v)?;
                 Ok(())
             }
             Expr::VarVar(inner) => {
                 let n = self.eval(inner)?;
                 let name = self.conv_str(&n)?;
-                self.var_set(&name, v);
+                self.var_set(&name, v)?;
                 Ok(())
             }
             Expr::Index { e, i } => self.set_index(e, i.as_deref(), v),
@@ -2058,10 +2089,10 @@ impl<'a> Interp<'a> {
                 if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pname) {
                     let v2 = self.prop_typed_write_check(&pd, &dcls, v)?;
                     let nv = self.typed_slot_store(&c, v2)?;
-                    *c.borrow_mut() = nv;
+                    self.cell_store(&c, nv)?;
                 } else {
                     let nv = self.typed_slot_store(&c, v)?;
-                    *c.borrow_mut() = nv;
+                    self.cell_store(&c, nv)?;
                 }
                 Ok(())
             }
@@ -2309,7 +2340,7 @@ impl<'a> Interp<'a> {
                         // prop via `=&` — that prop's type still gates
                         // the write (typed_properties_062).
                         let nv = self.typed_slot_store(&existing, v)?;
-                        *existing.borrow_mut() = nv.clone();
+                        self.cell_store(&existing, nv.clone())?;
                         v = nv;
                     } else {
                         // A declared prop that was unset() is
@@ -3113,8 +3144,8 @@ impl<'a> Interp<'a> {
                 None
             };
             if let (Some(arr), Some(k)) = (spl_arr, &key) {
-                arr.borrow_mut().bind_cell(to_key(k), src);
-                return Ok(());
+                let old = arr.borrow_mut().bind_cell(to_key(k), src);
+                return self.destruct_displaced(old);
             }
             // zend fetches the element (BP_VAR_W read_dimension — the
             // `&offsetGet` / object-element notice rule applies) before
@@ -3150,15 +3181,18 @@ impl<'a> Interp<'a> {
                 _ => unreachable!(),
             };
             drop(b);
-            let mut arr = rc.borrow_mut();
-            match key {
-                Some(k) => arr.bind_cell(to_key(&k), src),
-                None => {
-                    let k = ArrKey::Int(arr.next);
-                    arr.bind_cell(k, src);
-                }
+            let old;
+            {
+                let mut arr = rc.borrow_mut();
+                old = match key {
+                    Some(k) => arr.bind_cell(to_key(&k), src),
+                    None => {
+                        let k = ArrKey::Int(arr.next);
+                        arr.bind_cell(k, src)
+                    }
+                };
             }
-            Ok(())
+            self.destruct_displaced(old)
         } else {
             drop(b);
             self.fail(PhpError::uncaught(

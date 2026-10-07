@@ -631,8 +631,8 @@ impl<'a> Interp<'a> {
     ) -> Result<Value, PhpError> {
         self.call_value(&Value::Callable(c.clone()), CallArgs::positional(args))
     }
-    pub fn var_name_set(&mut self, name: &str, v: Value) {
-        self.var_set(name, v);
+    pub fn var_name_set(&mut self, name: &str, v: Value) -> Result<(), PhpError> {
+        self.var_set(name, v)
     }
     pub fn warn_pub(&mut self, msg: &str) -> Result<(), PhpError> {
         self.warn(msg)

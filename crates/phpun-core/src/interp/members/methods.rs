@@ -1350,7 +1350,9 @@ impl<'a> Interp<'a> {
                 let mut a = arr.borrow_mut();
                 match a.get_cell(&k) {
                     Some(c) if Rc::ptr_eq(&c, pc) => {}
-                    _ => a.bind_cell(k, pc.clone()),
+                    _ => {
+                        a.bind_cell(k, pc.clone());
+                    }
                 }
             }
         }

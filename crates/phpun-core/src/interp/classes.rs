@@ -3239,27 +3239,53 @@ impl<'a> Interp<'a> {
 
     fn push_handle(&mut self, w: ObjHandle) -> u64 {
         // Zend reuses the most recently freed handle first (its free
-        // list is a LIFO stack), so scan dead slots back-to-front
-        // (namespace_004: call2's $c reuses call1's $d handle, then
-        // $d reuses call1's $c — not the other way around).
+        // list is a LIFO stack). Dtor-driven deaths are timestamped in
+        // `obj_died`; among silently-dead slots (stamp 0) the higher
+        // index approximates the fresher free (namespace_004, gh10168).
         let n = self.obj_handles.len();
         self.spawn_seq += 1;
+        let mut best: Option<usize> = None;
         for i in (0..n).rev() {
-            if !self.obj_handles[i].alive() {
-                if let ObjHandle::Callable(_, Some(name)) = &self.obj_handles[i] {
-                    // The dead closure's per-instance statics table dies
-                    // with it — the recycled id must not leak stale
-                    // entries to an unrelated decl of the same name.
-                    self.statics.remove(&format!("{}\u{0}c{}", name, i + 1));
-                }
-                self.obj_handles[i] = w;
-                self.obj_born[i] = self.spawn_seq;
-                return (i + 1) as u64;
+            if self.obj_handles[i].alive() {
+                continue;
             }
+            match best {
+                None => best = Some(i),
+                Some(b) => {
+                    if self.obj_died.get(i).copied().unwrap_or(0)
+                        > self.obj_died.get(b).copied().unwrap_or(0)
+                    {
+                        best = Some(i);
+                    }
+                }
+            }
+        }
+        if let Some(i) = best {
+            if let ObjHandle::Callable(_, Some(name)) = &self.obj_handles[i] {
+                // The dead closure's per-instance statics table dies
+                // with it — the recycled id must not leak stale
+                // entries to an unrelated decl of the same name.
+                self.statics.remove(&format!("{}\u{0}c{}", name, i + 1));
+            }
+            self.obj_handles[i] = w;
+            self.obj_born[i] = self.spawn_seq;
+            self.obj_died[i] = 0;
+            return (i + 1) as u64;
         }
         self.obj_handles.push(w);
         self.obj_born.push(self.spawn_seq);
+        self.obj_died.push(0);
         self.obj_handles.len() as u64
+    }
+
+    /// A handle slot's zval hit refcount 0 — stamp its death order so
+    /// the next allocation reuses the most recently freed slot.
+    pub(in crate::interp) fn mark_obj_died(&mut self, o: &Rc<RefCell<PhpObject>>) {
+        let id = o.borrow().id as usize;
+        if id >= 1 && id <= self.obj_died.len() {
+            self.spawn_seq += 1;
+            self.obj_died[id - 1] = self.spawn_seq;
+        }
     }
 
     /// Wrap a PhpCallable assigning its object-store id.

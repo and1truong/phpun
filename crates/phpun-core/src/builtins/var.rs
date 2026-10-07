@@ -1260,11 +1260,15 @@ pub(crate) fn php_unserialize(
                     let k = php_unserialize_key(s, pos)?;
                     let v = php_unserialize(it, s, pos, err, vhash)?;
                     match k {
-                        Value::Int(i) => slots.bind_cell(ArrKey::Int(i), v),
-                        Value::Str(ks) => slots.bind_cell(
-                            ArrKey::Str(Rc::from(crate::value::lossy(&ks).into_owned())),
-                            v,
-                        ),
+                        Value::Int(i) => {
+                            slots.bind_cell(ArrKey::Int(i), v);
+                        }
+                        Value::Str(ks) => {
+                            slots.bind_cell(
+                                ArrKey::Str(Rc::from(crate::value::lossy(&ks).into_owned())),
+                                v,
+                            );
+                        }
                         _ => return Err(()),
                     }
                 }

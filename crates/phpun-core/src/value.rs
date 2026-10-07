@@ -107,16 +107,20 @@ impl PhpArray {
     }
 
     /// Bind an element slot to a specific cell (`$a[k] =& $x`).
-    pub fn bind_cell(&mut self, k: ArrKey, c: Cell) {
+    /// Returns the displaced slot cell — an object it held dies only
+    /// after the new binding is visible (its __destruct writes land
+    /// on the shared cell, gh10168).
+    pub fn bind_cell(&mut self, k: ArrKey, c: Cell) -> Option<Cell> {
         if let ArrKey::Int(i) = k {
             if i >= self.next {
                 self.next = i + 1;
             }
         }
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
-            slot.1 = c;
+            Some(std::mem::replace(&mut slot.1, c))
         } else {
             self.entries.push((k, c));
+            None
         }
     }
 
