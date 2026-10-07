@@ -926,6 +926,11 @@ impl<'a> Interp<'a> {
         if cells.is_empty() {
             return Ok(());
         }
+        // Zend frees the frame inside the resume call — destructors
+        // cite the resume's line (`->next()` call / foreach header).
+        if let Some(l) = self.gen_resume_site {
+            self.cur_line = l;
+        }
         // Per-object count of the released cells — a value dies when
         // the frame's LAST cell holding it decrefs.
         let mut remaining: HashMap<usize, usize> = HashMap::new();
@@ -936,11 +941,16 @@ impl<'a> Interp<'a> {
         }
         let mut terminal = None;
         for (_, c) in cells {
-            let obj = match &*c.borrow() {
-                Value::Object(o) => Some(o.clone()),
+            // The frame's CV decrefs: the cell's stored value dies,
+            // not just this clone — journal snapshots (delegate fins)
+            // hold sibling clones of the same cell and must observe
+            // the release as Null instead of resurrecting the local.
+            let v = std::mem::replace(&mut *c.borrow_mut(), Value::Null);
+            drop(c);
+            let obj = match v {
+                Value::Object(o) => Some(o),
                 _ => None,
             };
-            drop(c);
             let Some(o) = obj else { continue };
             let key = Rc::as_ptr(&o) as usize;
             let Some(r) = remaining.get_mut(&key) else {
@@ -1061,6 +1071,33 @@ impl<'a> Interp<'a> {
     /// Native dispatch for the `Generator` class (Iterator + send/throw/
     /// getReturn). `obj` must carry a Generator internal.
     pub(in crate::interp) fn generator_method(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        name: &str,
+        args: &CallArgs,
+    ) -> Result<Option<Value>, PhpError> {
+        // The dispatch's invocation line is the resume's line —
+        // destructors the exhaust/close step runs cite it. Engine-
+        // driven nested dispatches (the `yield from` drain stepping a
+        // delegate, foreach/materializer internals) share the outer
+        // resume's line; a userland call — even one inside another
+        // gen's body — cites its own call line.
+        let engine_nested = self.gen_resume_site.is_some()
+            && (self.gen_collect_base.is_some()
+                || self.gen_internal_resume > 0
+                || self.iter_calls > 0);
+        let saved_site = self.gen_resume_site;
+        if !engine_nested {
+            self.gen_resume_site = Some(self.cur_line);
+        }
+        let r = self.generator_method_body(obj, name, args);
+        if !engine_nested {
+            self.gen_resume_site = saved_site;
+        }
+        r
+    }
+
+    fn generator_method_body(
         &mut self,
         obj: &Rc<RefCell<PhpObject>>,
         name: &str,

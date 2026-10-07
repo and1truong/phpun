@@ -401,6 +401,11 @@ pub struct Interp<'a> {
     /// the resume stack WITHOUT the `Generator->{method}()`
     /// pseudo-frame (`[internal function]: g()` then the caller).
     gen_internal_resume: u32,
+    /// Invocation line of the outermost live Generator-method dispatch
+    /// — Zend frees a finished gen's execute_data inside the resume
+    /// call, so destructors it runs cite the resume's line (the
+    /// `->next()` call / foreach header), not the body's last line.
+    gen_resume_site: Option<usize>,
     /// A fatal surfaced by err_flow while a generator body runs —
     /// stored instead of printed so the deferred death restamps the
     /// resume-stack trace and prints once at the consumer's resume.
@@ -1033,6 +1038,7 @@ impl<'a> Interp<'a> {
             gen_run_state: None,
             iter_calls: 0,
             gen_internal_resume: 0,
+            gen_resume_site: None,
             gen_pending_fatal: None,
             gen_raise_ctx: Vec::new(),
             compile_callsite: None,
@@ -3673,10 +3679,13 @@ impl<'a> Interp<'a> {
             {
                 // The throwable's own construction stack leads the
                 // render (Zend keeps the frames live at `new` time);
-                // frames the resume stack reports as `[internal
-                // function]: f()` are suspended gen bodies — the
-                // resume pseudo-frame already covers them.
-                let internals: Vec<String> = frames
+                // construction frames the resume stack already
+                // reports drop out — suspended gen bodies surface
+                // as `[internal function]: f()` (call-resume) or a
+                // `FILE(line): f()` frame (foreach-resume), and an
+                // engine error raised while in-body calls were live
+                // re-reports those calls in raise_frames.
+                let mut names: Vec<String> = frames
                     .iter()
                     .filter_map(|f| {
                         f.strip_prefix("[internal function]: ")
@@ -3684,12 +3693,25 @@ impl<'a> Interp<'a> {
                             .map(|n| n.to_string())
                     })
                     .collect();
+                for f in frames {
+                    if let Some(pos) = f.find("): ") {
+                        let call = &f[pos + 3..];
+                        if let Some(end) = call.find('(') {
+                            names.push(call[..end].to_string());
+                        }
+                    }
+                }
                 let mut parts: Vec<String> = Vec::new();
                 for fr in cframes.clone().iter().rev() {
                     if crate::value::trace_frame_hidden(fr) {
                         continue;
                     }
-                    if internals.contains(&fr.function) {
+                    let callee = fr
+                        .class
+                        .as_ref()
+                        .map(|c| format!("{}{}{}", c, fr.ty, fr.function))
+                        .unwrap_or_else(|| fr.function.clone());
+                    if names.contains(&fr.function) || names.contains(&callee) {
                         continue;
                     }
                     parts.push(crate::value::trace_frame_str(fr));
