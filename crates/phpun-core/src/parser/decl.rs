@@ -1796,6 +1796,13 @@ impl<'a> Parser<'a> {
         let prev_hook = self.hook_ctx.take();
         let params = self.params()?;
         let name = self.ns_qualify(&name);
+        // zend early-binds only unconditional top-level decls; the
+        // name enters the compile-time function table BEFORE the
+        // body compiles, so calls inside it (and later top-level
+        // calls) resolve bound — per-arg sends, not the fused one.
+        if self.fn_nest == 0 {
+            self.declared_funcs.insert(name.to_lowercase());
+        }
         self.opt_before_required(&params, &name, line);
         // Return type declarations (: int).
         let ret = if self.eat_op(":") {

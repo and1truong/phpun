@@ -2247,6 +2247,24 @@ impl<'a> Parser<'a> {
                         // Frameless icalls still specialize (they carry
                         // the ns delay inside the op) at the name line.
                         let delayed_ns = resolved.starts_with('\u{1}') && !self.cur_ns.is_empty();
+                        // zend's per-arg sends only emit for a callee
+                        // bound at compile time — an internal function
+                        // or a userland function already declared
+                        // unconditionally. Every unbound call shape
+                        // (forward refs, runtime decls, other-file
+                        // functions, delayed ns-fallbacks) fuses its
+                        // bare-CV sends at the FIRST arg's line, like
+                        // a dynamic call.
+                        let callee_bound = {
+                            let bare = resolved
+                                .strip_prefix('\u{1}')
+                                .or_else(|| resolved.strip_prefix('\\'))
+                                .unwrap_or(&resolved);
+                            let bare_l = bare.to_lowercase();
+                            (!bare_l.contains('\\')
+                                && crate::builtins::is_builtin(&bare_l))
+                                || self.declared_funcs.contains(&bare_l)
+                        };
                         // Frameless builtins fuse every bare-CV arg's
                         // read into the call op at the name's line;
                         // dedicated ops (array_key_exists, const-fmt
@@ -2257,6 +2275,8 @@ impl<'a> Parser<'a> {
                             Self::dyn_arglines(&mut args);
                         } else if Self::dedicated_call(&resolved, &args) {
                             Self::dedicated_arglines(&mut args, self.arg_end);
+                        } else if !callee_bound {
+                            Self::dyn_arglines(&mut args);
                         }
                         Self::fcc_wrap(Expr::Call {
                             name: Box::new(Expr::Str(resolved)),
@@ -2294,10 +2314,23 @@ impl<'a> Parser<'a> {
                 if self.at_op("(") {
                     self.pos += 1;
                     let mut args = self.args()?;
+                    // Same bound-at-compile rule as the plain-name
+                    // path: FQ calls have no ns fallback, so the only
+                    // bound callees are builtins and already-declared
+                    // userland functions — anything else sends its
+                    // bare-CV args fused at the first arg's line.
+                    let callee_bound = {
+                        let bare = name.trim_start_matches('\\');
+                        let bare_l = bare.to_lowercase();
+                        (!bare_l.contains('\\') && crate::builtins::is_builtin(&bare_l))
+                            || self.declared_funcs.contains(&bare_l)
+                    };
                     if Self::frameless_call(&name, &args) {
                         Self::frameless_arglines(&mut args, site);
                     } else if Self::dedicated_call(&name, &args) {
                         Self::dedicated_arglines(&mut args, self.arg_end);
+                    } else if !callee_bound {
+                        Self::dyn_arglines(&mut args);
                     }
                     Self::fcc_wrap(Expr::Call {
                         name: Box::new(Expr::Str(name)),

@@ -76,6 +76,16 @@ pub struct Parser<'a> {
     /// the no-class-scope compile fatal doesn't apply
     /// (static_type_return's unbound `{closure:...}(): static`).
     in_closure: bool,
+    /// Statement nesting under a conditional or runtime context —
+    /// a `function` decl only early-binds at depth 0 (the top-level
+    /// program or a braced-namespace body); inside if/loops/functions/
+    /// try it's a runtime decl zend can't bind calls to at compile.
+    fn_nest: u32,
+    /// Fully-qualified lowercase names of functions declared at top
+    /// level so far — zend's compile-time function table, used to tell
+    /// whether a call's bare-CV args send per-arg (bound callee) or
+    /// fused at the first arg's line (unbound or dynamic callee).
+    declared_funcs: std::collections::HashSet<String>,
 }
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
@@ -202,6 +212,8 @@ impl<'a> Parser<'a> {
             first_stmt_slot: false,
             strict_slot: false,
             in_closure: false,
+            fn_nest: 0,
+            declared_funcs: std::collections::HashSet::new(),
         }
     }
 }
@@ -327,6 +339,8 @@ pub fn parse_expr_src(src: &str, base: usize) -> Result<(Expr, SrcDiags), PhpErr
         first_stmt_slot: false,
         strict_slot: false,
         in_closure: false,
+        fn_nest: 0,
+        declared_funcs: std::collections::HashSet::new(),
     };
     // No rebase here: token lines are already absolute, so the
     // parser's own error lines report file lines.
@@ -514,10 +528,12 @@ impl<'a> Parser<'a> {
 
     /// A `{ ... }` block or a single statement body.
     pub(in crate::parser) fn body(&mut self) -> Result<Vec<Stmt>, PhpError> {
-        if self.eat_op("{") {
+        self.fn_nest += 1;
+        let r = if self.eat_op("{") {
             let mut v = Vec::new();
             while !self.eat_op("}") {
                 if self.peek().is_none() {
+                    self.fn_nest -= 1;
                     return Err(PhpError::parse(
                         "syntax error, unexpected end of file",
                         self.line(),
@@ -530,7 +546,9 @@ impl<'a> Parser<'a> {
         } else {
             let l = self.line();
             Ok(vec![Stmt::Line(l), self.stmt()?])
-        }
+        };
+        self.fn_nest -= 1;
+        r
     }
 
     /// Like `body()` but also accepts PHP's `:` alternative syntax:
@@ -548,12 +566,14 @@ impl<'a> Parser<'a> {
     /// Statements up to (not consuming) any terminator keyword — the
     /// body of a `:` alternative-syntax block.
     pub(in crate::parser) fn body_until(&mut self, stops: &[&str]) -> Result<Vec<Stmt>, PhpError> {
+        self.fn_nest += 1;
         let mut v = Vec::new();
         loop {
             if stops.iter().any(|s| self.ident_is(s)) {
                 break;
             }
             if self.peek().is_none() {
+                self.fn_nest -= 1;
                 return Err(PhpError::parse(
                     "syntax error, unexpected end of file",
                     self.line(),
@@ -562,6 +582,7 @@ impl<'a> Parser<'a> {
             v.push(Stmt::Line(self.line()));
             v.push(self.stmt()?);
         }
+        self.fn_nest -= 1;
         Ok(v)
     }
 
