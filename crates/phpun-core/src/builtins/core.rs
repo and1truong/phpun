@@ -633,28 +633,43 @@ pub(crate) fn dispatch(
             std::process::id()
         )),
         "gc_collect_cycles" => Value::Int(it.gc_cycle_collect()? as i64),
-        "gc_enable" | "gc_disable" | "gc_mem_caches" => Value::Int(0),
+        // gc_enable/gc_disable toggle the zend.enable_gc ini flag —
+        // ini_get reads it back and gc_enabled() reports it (gc_001-3).
+        "gc_enable" | "gc_disable" => {
+            it.ini.insert(
+                "zend.enable_gc".into(),
+                if name == "gc_enable" { "1" } else { "0" }.into(),
+            );
+            Value::Int(0)
+        }
+        "gc_mem_caches" => Value::Int(0),
         "gc_status" => {
             let mut a = PhpArray::new();
             for (k, v) in [
                 ("running", Value::Bool(false)),
                 ("protected", Value::Bool(false)),
                 ("full", Value::Bool(false)),
-                ("runs", Value::Int(0)),
-                ("collected", Value::Int(0)),
+                ("runs", Value::Int(it.gc_runs as i64)),
+                ("collected", Value::Int(it.gc_collected as i64)),
                 ("threshold", Value::Int(10001)),
                 ("buffer_size", Value::Int(16384)),
-                ("roots", Value::Int(0)),
-                ("application_time", Value::Float(0.0)),
-                ("collector_time", Value::Float(0.0)),
-                ("destructor_time", Value::Float(0.0)),
-                ("free_time", Value::Float(0.0)),
+                ("roots", Value::Int(it.gc_purpled.len() as i64)),
+                (
+                    "application_time",
+                    Value::Float(it.t0.elapsed().as_secs_f64()),
+                ),
+                ("collector_time", Value::Float(it.gc_collector_time)),
+                ("destructor_time", Value::Float(it.gc_destructor_time)),
+                (
+                    "free_time",
+                    Value::Float((it.gc_collector_time - it.gc_destructor_time).max(0.0)),
+                ),
             ] {
                 a.set(ArrKey::Str(k.into()), v);
             }
             Value::Array(Rc::new(RefCell::new(a)))
         }
-        "gc_enabled" => Value::Bool(false),
+        "gc_enabled" => Value::Bool(it.ini_on("zend.enable_gc")),
         "syslog" | "openlog" | "closelog" => Value::Bool(true),
         "call_func" => Value::Null,
         "get_resource_type" | "get_resource_id" => match arg(args, 0) {

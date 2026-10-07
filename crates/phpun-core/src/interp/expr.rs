@@ -1966,6 +1966,7 @@ impl<'a> Interp<'a> {
                     next: a.next,
                     is_ref: false,
                     iter_pos: a.iter_pos,
+                    foreach_pos: Vec::new(),
                 })))
             }
             v => v,
@@ -4239,13 +4240,20 @@ impl<'a> Interp<'a> {
                 Ok(nc) => {
                     if n == last {
                         // `$ref[k] = v` where the element cell is bound to
-                        // a typed prop stays type-gated (064).
+                        // a typed prop stays type-gated (064). The store
+                        // goes through cell_store so the displaced zval's
+                        // destructor runs (a shared cell can alias vars).
                         let nv = self.typed_slot_store(&nc, v.clone())?;
                         // Never panic on a re-entrant borrow — a live
                         // upstream borrow (a handler's write reaching
                         // this slot) drops the write invisibly (B1).
                         if let Ok(mut nb) = nc.try_borrow_mut() {
-                            *nb = nv;
+                            let old = std::mem::replace(&mut *nb, nv);
+                            drop(nb);
+                            // The displaced zval's destructor runs
+                            // (cell_store semantics) — a shared cell can
+                            // alias vars.
+                            self.destruct_dying_value(&old)?;
                         }
                         return Ok(v);
                     }
@@ -5262,6 +5270,7 @@ impl<'a> Interp<'a> {
             next: a.next,
             is_ref: a.is_ref,
             iter_pos: a.iter_pos,
+            foreach_pos: Vec::new(),
         };
         for (k, c) in &a.entries {
             // zend unwraps a refcount-1 IS_REFERENCE bucket on copy;

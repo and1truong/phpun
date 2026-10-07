@@ -645,7 +645,20 @@ pub struct Interp<'a> {
     gc_collecting: bool,
     /// Values already rooted (Zend's "already purple" bit): binds and
     /// surviving decrefs each count a zval once — cleared on collect.
-    gc_purpled: HashSet<usize>,
+    pub(crate) gc_purpled: HashSet<usize>,
+    /// In-flight slot decrefs from `gc_note_dying` walks: cell ptr →
+    /// count. A dying container still holds its cells while a collect
+    /// fires mid-walk — Zend's destructor has already decremented the
+    /// member refcounts, so the root test subtracts these holds.
+    gc_dying: HashMap<usize, usize>,
+    /// `gc_status()` counters: collect runs so far and roots collected
+    /// across them (Zend reports both verbatim), plus wall-clock
+    /// seconds spent collecting / running dtors / engine uptime.
+    pub(crate) gc_runs: u64,
+    pub(crate) gc_collected: u64,
+    pub(crate) gc_collector_time: f64,
+    pub(crate) gc_destructor_time: f64,
+    pub(crate) t0: std::time::Instant,
     spawn_seq: u64,
     /// Per-callsite unqualified fn resolution cache — Zend resolves
     /// `ns\f -> f` once per call site (constexpr/namespace_004).
@@ -968,6 +981,42 @@ pub(in crate::interp) fn ob_split_view(
         segs.push((usize::MAX, content[off..].to_vec()));
     }
     (head, segs)
+}
+
+/// Working maps for one `gc_cycle_collect_pass` scan: the
+/// reachability graph plus the cell-level accounting that decides
+/// which refcount holds are internal to the candidate universe.
+#[derive(Default)]
+struct GcScan {
+    /// Container ptr → direct refcounted targets (flood-fill edges);
+    /// covers unregistered containers reached transitively.
+    edges: HashMap<usize, Vec<usize>>,
+    /// Cell ptr → slots the cell occupies inside scanned containers.
+    cell_slots: HashMap<usize, usize>,
+    /// Cell ptr → the cell (kept for strong-count checks).
+    cells: HashMap<usize, Cell>,
+    /// Node ptr → cells directly holding a clone of it.
+    cell_edges: HashMap<usize, HashSet<usize>>,
+    /// Node ptr → bare clones held in non-cell positions (gen
+    /// sends/throws, buffered item keys, saved call setup).
+    raw_edges: HashMap<usize, usize>,
+    /// Universe node ptrs (objects + registered arrays) — the sweep
+    /// set; these hold their bookkeeping clone in the scan vectors.
+    universe: HashSet<usize>,
+    /// Non-universe containers discovered mid-scan — plain arrays and
+    /// closures; kept so their strong counts can be checked like the
+    /// nodes' (the map clone is each one's bookkeeping +1).
+    nodes: HashMap<usize, Value>,
+    /// In-flight slot decrefs (`gc_note_dying` walks) — a snapshot of
+    /// `Interp::gc_dying` taken at pass start.
+    dying: HashMap<usize, usize>,
+    /// Containers reached through internal-machinery prop cells only
+    /// (`\0Cls\0prop` on GC_PROPLESS_CLASSES): engine-modeled storage,
+    /// not zvals — dead ones don't count toward the collect total.
+    internal: HashSet<usize>,
+    /// Containers reached through at least one real zval edge — an
+    /// `internal`-marked container with a real edge counts normally.
+    plain: HashSet<usize>,
 }
 
 impl<'a> Interp<'a> {
@@ -1427,6 +1476,12 @@ impl<'a> Interp<'a> {
             gc_pending: 0,
             gc_collecting: false,
             gc_purpled: HashSet::new(),
+            gc_dying: HashMap::new(),
+            gc_runs: 0,
+            gc_collected: 0,
+            gc_collector_time: 0.0,
+            gc_destructor_time: 0.0,
+            t0: std::time::Instant::now(),
             spawn_seq: 0,
             fcc_fn_cache: HashMap::new(),
             destructed: HashMap::new(),
@@ -1463,6 +1518,7 @@ impl<'a> Interp<'a> {
                 ("error_reporting".to_string(), "30719".to_string()),
                 // Zend's compiled-in default (hardcoded in main/php.ini).
                 ("memory_limit".to_string(), "128M".to_string()),
+                ("zend.enable_gc".to_string(), "1".to_string()),
                 // Oracle PHP's compiled-in include_path (brew build) —
                 // `get_include_path` and the Failed-opening diagnostics
                 // print it verbatim.
@@ -2564,6 +2620,12 @@ impl<'a> Interp<'a> {
         };
         if let Some(k) = purple {
             self.gc_note_purple(k);
+        }
+        // A container taking its last ref decrefs every held slot —
+        // Zend buffers each surviving payload as a root candidate
+        // (gc_023's `unset($a)`); Rust's Drop would stay silent.
+        if matches!(v, Value::Array(_) | Value::Object(_) | Value::Callable(_)) {
+            self.gc_note_dying(&v.clone(), 8);
         }
         let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
         let mut tally = |o: &Rc<RefCell<PhpObject>>| {
@@ -4097,37 +4159,56 @@ impl<'a> Interp<'a> {
         // and its handler fires at the final flush like any orphaned
         // level. Promote each owned level to a real consumer level at
         // the slot it occupied (suspend_base for parked windows).
-        for l in self
-            .suspended_obs
-            .iter_mut()
-            .chain(self.ob_stack.iter_mut())
-            .filter(|l| owned(l))
-        {
-            Self::ob_drain_level(l, false);
-            l.buf = Self::ob_level_content(l, pos, killed);
-            l.drained_segs.clear();
-            l.cap_segs.clear();
-            l.caps.clear();
-            l.gen_pending.clear();
-            l.read_vals.clear();
-            l.gen_drained = 0;
-            l.gen_q = None;
-            l.gen_open = None;
-            l.gen_close = None;
-        }
+        // An owned pop mirror is a window the body's pop consumed —
+        // consumer-side that pop hasn't run, so its real content
+        // (pre-pop head + consumer captures) materializes into an
+        // ordinary poppable level; a mirror whose window never
+        // opened consumer-side dies silently.
         let mut promote: Vec<(usize, ObLevel)> = Vec::new();
         let mut i = self.suspended_obs.len();
         while i > 0 {
             i -= 1;
-            if self.suspended_obs[i].gen_q.is_none() {
-                let l = self.suspended_obs.remove(i);
-                promote.push((l.suspend_base, l));
+            if !owned(&self.suspended_obs[i]) {
+                continue;
             }
+            let mut l = self.suspended_obs.remove(i);
+            let never_opened = l.pop_head.is_some()
+                && l.gen_open
+                    .is_some_and(|o| l.gen_q.as_ref().is_some_and(|q| q.borrow().vis_pos < o));
+            if never_opened {
+                continue;
+            }
+            Self::ob_dead_level(&mut l, pos, killed);
+            promote.push((l.suspend_base, l));
+        }
+        for l in self.ob_stack.iter_mut().filter(|l| owned(l)) {
+            Self::ob_dead_level(l, pos, killed);
         }
         promote.sort_by_key(|(b, _)| *b);
         for (base, l) in promote {
             self.ob_stack.insert(base.min(self.ob_stack.len()), l);
         }
+    }
+
+    /// Materialize a dead gen's level into an ordinary consumer
+    /// level: real content at the confirmed cursor, all gen/mirror
+    /// bookkeeping cleared — a pop mirror becomes a normal poppable
+    /// level instead of a phantom that flushes raw and can't be
+    /// popped.
+    fn ob_dead_level(l: &mut ObLevel, pos: usize, killed: bool) {
+        Self::ob_drain_level(l, false);
+        l.buf = Self::ob_level_content(l, pos, killed);
+        l.drained_segs.clear();
+        l.cap_segs.clear();
+        l.caps.clear();
+        l.gen_pending.clear();
+        l.read_vals.clear();
+        l.gen_drained = 0;
+        l.gen_q = None;
+        l.gen_open = None;
+        l.gen_close = None;
+        l.pop_head = None;
+        l.pop_segs.clear();
     }
 
     /// Zend destroys a suspended generator by running the finally
@@ -4233,95 +4314,137 @@ impl<'a> Interp<'a> {
     /// weak handles in `live_gens`/`obj_handles` go stale like Zend
     /// freeing the zvals.
     pub fn gc_cycle_collect(&mut self) -> Result<usize, PhpError> {
+        self.gc_cycle_collect_impl(false)
+    }
+
+    /// `gc_collect_cycles()` runs the full buffer; the auto-collect
+    /// fired by `gc_maybe_collect` (buffer overflow) frees only dead
+    /// components holding a buffered root — members still streaming
+    /// into the buffer mid-decref wait for the next pass (gc_023's
+    /// trailing count lands on the manual call).
+    fn gc_cycle_collect_impl(&mut self, buffer_only: bool) -> Result<usize, PhpError> {
         // Zend's collect keeps re-rooting values that dtors unroot
         // mid-pass (gc/bug70805: C's dtor unsets $a, whose cycle then
         // dies inside the same collect). Re-run the mark until a pass
         // finds nothing, accumulating the root count.
+        let t = std::time::Instant::now();
         let mut total = 0;
+        // Zend counts a collector run only when the root buffer wasn't
+        // empty or the pass actually freed something — an idle
+        // `gc_collect_cycles()` on a drained buffer doesn't bump
+        // `gc_status().runs` (gc_037).
+        let buffered = !self.gc_purpled.is_empty();
         for _ in 0..8 {
-            let n = self.gc_cycle_collect_pass()?;
+            let n = self.gc_cycle_collect_pass(buffer_only)?;
             if n == 0 {
                 break;
             }
             total += n;
         }
+        if buffered || total > 0 {
+            self.gc_runs += 1;
+            self.gc_collected += total as u64;
+            self.gc_collector_time += t.elapsed().as_secs_f64();
+        }
         self.gc_purpled.clear();
+        // Any collect drains the candidate buffer — the hysteresis
+        // counter restarts from zero for the next overflow (F4).
+        self.gc_pending = 0;
         Ok(total)
     }
 
-    fn gc_cycle_collect_pass(&mut self) -> Result<usize, PhpError> {
-        let objs: Vec<Rc<RefCell<PhpObject>>> = self
-            .obj_handles
-            .iter()
-            .filter_map(|h| match h {
-                ObjHandle::Obj(w) => w.upgrade(),
-                _ => None,
-            })
-            .collect();
+    fn gc_cycle_collect_pass(&mut self, buffer_only: bool) -> Result<usize, PhpError> {
+        let mut objs: Vec<Rc<RefCell<PhpObject>>> = Vec::new();
+        let mut arrs: Vec<Rc<RefCell<PhpArray>>> = Vec::new();
+        // Dedup: a node registered more than once (`reg_arr_ref` fires
+        // per `=&` bind) must hold exactly one scan clone — the root
+        // test's bookkeeping assumes +1 per node.
+        let mut seen: HashSet<usize> = HashSet::new();
+        for h in &self.obj_handles {
+            if let ObjHandle::Obj(w) = h {
+                if let Some(o) = w.upgrade() {
+                    if seen.insert(Rc::as_ptr(&o) as usize) {
+                        objs.push(o);
+                    }
+                }
+            }
+        }
         // Registered arrays are graph nodes too — only arrays that
         // took a `=&` element can join a cycle (`$a[] =& $a`).
-        let arrs: Vec<Rc<RefCell<PhpArray>>> = self
-            .arr_handles
-            .iter()
-            .filter_map(|w| w.upgrade())
-            .collect();
-        // Refs to objects held inside the universe, per target.
-        let mut internal: HashMap<usize, usize> = HashMap::new();
-        let mut edges: HashMap<usize, Vec<usize>> = HashMap::new();
+        for w in &self.arr_handles {
+            if let Some(a) = w.upgrade() {
+                if seen.insert(Rc::as_ptr(&a) as usize) {
+                    arrs.push(a);
+                }
+            }
+        }
+        let mut scan = GcScan {
+            universe: seen,
+            dying: self.gc_dying.clone(),
+            ..GcScan::default()
+        };
+        // Scan the universe once. `cell_edges[t]` is the set of cells
+        // directly holding a clone of `t` — one cell contributes one
+        // ref no matter how many slots scan it; `raw_edges` counts
+        // bare clones in non-cell positions; `cell_slots` counts every
+        // slot a cell occupies inside scanned containers, so a cell
+        // shared with an unscanned holder (a plain array's slot, a
+        // var, a capture) shows an extra strong ref — an external
+        // holder that roots the clone's target. Unregistered
+        // containers get their own edge lists so reachability
+        // traverses them (a registered array inside a plain array
+        // inside a live object is reachable).
+        let mut visited: HashSet<usize> = HashSet::new();
         for o in &objs {
-            let mut out = Vec::new();
-            Self::gc_obj_out_refs(o, &mut out);
-            let mut cands = Vec::new();
-            Self::gc_obj_out_cands(o, &mut cands, &mut HashSet::new());
-            for v in &cands {
-                out.push(Self::gc_val_ptr(v));
+            let t = Rc::as_ptr(o) as usize;
+            if visited.insert(t) {
+                let mut out = Vec::new();
+                Self::gc_scan_obj_fields(o, &mut scan, &mut out, 16, &mut visited);
+                scan.edges.insert(t, out);
             }
-            for t in &out {
-                *internal.entry(*t).or_insert(0) += 1;
-            }
-            edges.insert(Rc::as_ptr(o) as usize, out);
         }
         for a in &arrs {
-            let mut out = Vec::new();
-            let mut visited = HashSet::new();
-            for (_, c) in &a.borrow().entries {
-                Self::gc_edge_val(&c.borrow(), &mut out, 16, &mut visited);
+            let t = Rc::as_ptr(a) as usize;
+            if visited.insert(t) {
+                let mut out = Vec::new();
+                for (_, c) in &a.borrow().entries {
+                    Self::gc_scan_cell(c, &mut scan, &mut out, 16, &mut visited, false);
+                }
+                scan.edges.insert(t, out);
             }
-            for t in &out {
-                *internal.entry(*t).or_insert(0) += 1;
-            }
-            edges.insert(Rc::as_ptr(a) as usize, out);
         }
-        // Roots: a strong ref count above the internal tally + our
-        // own scan clone means an external holder (variable, frame,
-        // static) — the cycle can't die while that holder lives.
-        let mut reach: HashSet<usize> = objs
-            .iter()
-            .filter(|o| {
-                Rc::strong_count(o)
-                    > internal
-                        .get(&(Rc::as_ptr(o) as usize))
-                        .copied()
-                        .unwrap_or(0)
-                        + 1
-            })
-            .map(|o| Rc::as_ptr(o) as usize)
-            .collect();
-        reach.extend(
-            arrs.iter()
-                .filter(|a| {
-                    Rc::strong_count(a)
-                        > internal
-                            .get(&(Rc::as_ptr(a) as usize))
-                            .copied()
-                            .unwrap_or(0)
-                            + 1
-                })
-                .map(|a| Rc::as_ptr(a) as usize),
-        );
+        // Roots: a strong count above the refs the scan accounts for
+        // — cells held only inside scanned slots + bare clones —
+        // means an external holder keeps the node alive. Non-universe
+        // containers discovered mid-scan root their targets too (a
+        // plain array held by a var is alive).
+        let mut reach: HashSet<usize> = HashSet::new();
+        for o in &objs {
+            let t = Rc::as_ptr(o) as usize;
+            if Self::gc_is_root(&scan, t, Rc::strong_count(o)) {
+                reach.insert(t);
+            }
+        }
+        for a in &arrs {
+            let t = Rc::as_ptr(a) as usize;
+            if Self::gc_is_root(&scan, t, Rc::strong_count(a)) {
+                reach.insert(t);
+            }
+        }
+        for (t, v) in &scan.nodes {
+            let strong = match v {
+                Value::Array(a) => Rc::strong_count(a),
+                Value::Callable(c) => Rc::strong_count(c),
+                Value::Object(o) => Rc::strong_count(o),
+                _ => continue,
+            };
+            if Self::gc_is_root(&scan, *t, strong) {
+                reach.insert(*t);
+            }
+        }
         let mut stack: Vec<usize> = reach.iter().copied().collect();
         while let Some(p) = stack.pop() {
-            if let Some(out) = edges.get(&p) {
+            if let Some(out) = scan.edges.get(&p) {
                 for t in out {
                     if reach.insert(*t) {
                         stack.push(*t);
@@ -4329,108 +4452,84 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        let dead_arrs: Vec<Rc<RefCell<PhpArray>>> = arrs
+        let mut dead_arrs: Vec<Rc<RefCell<PhpArray>>> = arrs
             .into_iter()
             .filter(|a| !reach.contains(&(Rc::as_ptr(a) as usize)))
             .collect();
-        let dead: Vec<Rc<RefCell<PhpObject>>> = objs
+        let mut dead: Vec<Rc<RefCell<PhpObject>>> = objs
             .into_iter()
             .filter(|o| !reach.contains(&(Rc::as_ptr(o) as usize)))
             .collect();
-        if dead.is_empty() && dead_arrs.is_empty() {
-            return Ok(0);
-        }
-        // Zend's count is per collected *root*, not per object — dead
-        // closures and refcounted arrays held only inside the dead set
-        // are freed too (a suspended gen's own closure, a `use (&$g)`
-        // capture cycle). Track each candidate's incoming edges from
-        // dead nodes; a candidate whose strong count is only those
-        // edges (+ our bookkeeping clone) dies with the set.
-        let mut cand_edges: HashMap<usize, usize> = HashMap::new();
-        let mut cand_map: HashMap<usize, Value> = HashMap::new();
-        for o in &dead {
-            let mut held = Vec::new();
-            Self::gc_obj_out_cands(o, &mut held, &mut HashSet::new());
-            for v in held {
-                let key = match &v {
-                    Value::Array(a) => Rc::as_ptr(a) as usize,
-                    Value::Callable(c) => Rc::as_ptr(c) as usize,
-                    _ => continue,
-                };
-                *cand_edges.entry(key).or_insert(0) += 1;
-                cand_map.entry(key).or_insert(v);
-            }
-        }
-        let mut dead_roots = dead.len();
-        let mut died: HashSet<usize> = HashSet::new();
-        let mut work: Vec<usize> = Vec::new();
-        // Dead arrays are confirmed roots themselves — count them and
-        // propagate their released cells' edges to deeper candidates.
-        for a in &dead_arrs {
-            died.insert(Rc::as_ptr(a) as usize);
-            dead_roots += 1;
-            let mut held = Vec::new();
-            let mut visited = HashSet::new();
-            for (_, c) in &a.borrow().entries {
-                Self::gc_scan_val(&c.borrow(), &mut held, 16, &mut visited);
-            }
-            for v in held {
-                let key = Self::gc_val_ptr(&v);
-                if key == 0 {
-                    continue;
-                }
-                *cand_edges.entry(key).or_insert(0) += 1;
-                cand_map.entry(key).or_insert(v);
-                work.push(key);
-            }
-        }
-        work.extend(cand_map.keys());
-        // Worklist: a candidate dies when every remaining strong ref is
-        // an edge from a dead node (+ our bookkeeping clone). Deaths
-        // release its cells, adding edges to deeper candidates that
-        // re-enter the worklist — same reachability as a fixpoint but
-        // linear in the number of edges.
-        while let Some(key) = work.pop() {
-            if died.contains(&key) {
+        // Dead non-node containers (a dead gen's captures, an object's
+        // nested plain arrays, a self-capturing closure): unreachable
+        // and not externally held, they die with the set by refcount
+        // drop and count toward the collect total like Zend zvals.
+        let mut dead_nodes: HashSet<usize> = HashSet::new();
+        for (t, v) in &scan.nodes {
+            if reach.contains(t) {
                 continue;
             }
-            let Some(v) = cand_map.remove(&key) else {
-                continue;
-            };
-            let strong = match &v {
+            let strong = match v {
                 Value::Array(a) => Rc::strong_count(a),
                 Value::Callable(c) => Rc::strong_count(c),
+                Value::Object(o) => Rc::strong_count(o),
                 _ => continue,
             };
-            if strong <= cand_edges[&key] + 1 {
-                died.insert(key);
-                dead_roots += 1;
-                let mut deeper = Vec::new();
-                let mut visited = HashSet::new();
-                match &v {
-                    Value::Array(a) => {
-                        for (_, c) in &a.borrow().entries {
-                            Self::gc_scan_val(&c.borrow(), &mut deeper, 16, &mut visited);
-                        }
-                    }
-                    Value::Callable(c) => {
-                        for (_, cap, _) in &c.captures {
-                            Self::gc_scan_val(&cap.borrow(), &mut deeper, 16, &mut visited);
-                        }
-                    }
-                    _ => {}
-                }
-                for d in deeper {
-                    let k = Self::gc_val_ptr(&d);
-                    if k == 0 || k == key {
-                        continue;
-                    }
-                    *cand_edges.entry(k).or_insert(0) += 1;
-                    cand_map.entry(k).or_insert(d);
-                    work.push(k);
-                }
+            if !Self::gc_is_root(&scan, *t, strong) {
+                dead_nodes.insert(*t);
             }
         }
+        if buffer_only {
+            // Overflow pass: free only dead components a buffered
+            // (purpled) root belongs to — Zend's buffer is the
+            // candidate set. Components without a buffered member
+            // keep waiting for their own decrefs to note them.
+            let mut dead_all: HashSet<usize> = dead_nodes.clone();
+            for o in &dead {
+                dead_all.insert(Rc::as_ptr(o) as usize);
+            }
+            for a in &dead_arrs {
+                dead_all.insert(Rc::as_ptr(a) as usize);
+            }
+            let mut freed: HashSet<usize> = HashSet::new();
+            let mut stack: Vec<usize> = dead_all
+                .iter()
+                .copied()
+                .filter(|t| self.gc_purpled.contains(t))
+                .collect();
+            for t in &stack {
+                freed.insert(*t);
+            }
+            while let Some(p) = stack.pop() {
+                if let Some(out) = scan.edges.get(&p) {
+                    for t in out {
+                        if dead_all.contains(t) && freed.insert(*t) {
+                            stack.push(*t);
+                        }
+                    }
+                }
+            }
+            dead.retain(|o| freed.contains(&(Rc::as_ptr(o) as usize)));
+            dead_arrs.retain(|a| freed.contains(&(Rc::as_ptr(a) as usize)));
+            dead_nodes.retain(|t| freed.contains(t));
+        }
+        // Zend counts every dead root — dead universe nodes plus the
+        // dead non-node containers that die with them. Containers reached
+        // only through internal-machinery props (SplObjectStorage's
+        // `$objs`/`$data`, SplFixedArray's `$data`) aren't zvals in Zend —
+        // its storage is C-level — so they don't count (bug69534); their
+        // slot contents are still scanned and do.
+        let counted = |t: &usize| !scan.internal.contains(t) || scan.plain.contains(t);
+        let dead_roots = dead
+            .iter()
+            .filter(|o| counted(&(Rc::as_ptr(o) as usize)))
+            .count()
+            + dead_arrs
+                .iter()
+                .filter(|a| counted(&(Rc::as_ptr(a) as usize)))
+                .count()
+            + dead_nodes.iter().filter(|t| counted(t)).count();
+        drop(scan);
         let mut first_err = None;
         for o in &dead {
             let gen_q = match &o.borrow().internal {
@@ -4448,9 +4547,11 @@ impl<'a> Interp<'a> {
                 .is_some()
                 && self.mark_destructed(o)
             {
+                let dt = std::time::Instant::now();
                 if let Err(e) = self.method_invoke(o.clone(), "__destruct", CallArgs::empty()) {
                     first_err = Some(e);
                 }
+                self.gc_destructor_time += dt.elapsed().as_secs_f64();
             }
         }
         // Release the dead set's cells last — dropping them earlier
@@ -4484,64 +4585,6 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// The refcounted GC-root candidates held inside `o` — arrays and
-    /// closures. Same sources as `gc_obj_out_refs`; objects are
-    /// classified by the main pass instead.
-    fn gc_obj_out_cands(
-        o: &Rc<RefCell<PhpObject>>,
-        out: &mut Vec<Value>,
-        visited: &mut HashSet<usize>,
-    ) {
-        let ob = o.borrow();
-        for c in ob.props.values() {
-            Self::gc_scan_val(&c.borrow(), out, 16, visited);
-        }
-        let Some(crate::value::ObjectInternal::Generator(st)) = &ob.internal else {
-            return;
-        };
-        let st = st.borrow();
-        for (k, c) in &st.items {
-            Self::gc_scan_val(k, out, 16, visited);
-            Self::gc_scan_val(&c.borrow(), out, 16, visited);
-        }
-        for (_, v) in &st.sends {
-            Self::gc_scan_val(v, out, 16, visited);
-        }
-        for (_, v) in &st.throws {
-            Self::gc_scan_val(v, out, 16, visited);
-        }
-        if let Some(v) = &st.injected_throwable {
-            Self::gc_scan_val(v, out, 16, visited);
-        }
-        let GenSetup::Invoke {
-            args,
-            captures,
-            closure_rc,
-            ..
-        } = &st.setup;
-        for c in &args.cells {
-            Self::gc_scan_val(&c.borrow(), out, 16, visited);
-        }
-        for (_, c, _) in captures {
-            Self::gc_scan_val(&c.borrow(), out, 16, visited);
-        }
-        if let Some(rc) = closure_rc {
-            out.push(Value::Callable(rc.clone()));
-        }
-        let mut journals = vec![st.fin_q.clone()];
-        while let Some(q) = journals.pop() {
-            let f = q.borrow();
-            for (_, c) in &f.suspended {
-                Self::gc_scan_val(&c.borrow(), out, 16, visited);
-            }
-            for d in &f.delegates {
-                for (_, c) in &d.fin.suspended {
-                    Self::gc_scan_val(&c.borrow(), out, 16, visited);
-                }
-            }
-        }
-    }
-
     /// Graph-node pointer for a value (0 = not a refcounted node).
     fn gc_val_ptr(v: &Value) -> usize {
         match v {
@@ -4552,49 +4595,402 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Push the graph-node pointer of every refcounted target in `v`,
-    /// recursing through array cells and closure captures.
-    fn gc_edge_val(v: &Value, out: &mut Vec<usize>, depth: u8, visited: &mut HashSet<usize>) {
+    /// Root test for one scanned node: its real strong count vs the
+    /// refs the scan accounts for. A contributing cell is internal
+    /// only while the cell itself sits in scanned slots alone (`+1`
+    /// is `GcScan::cells`' own bookkeeping clone); a cell shared with
+    /// an unscanned holder — a var frame, a plain array's slot, a
+    /// closure capture — is an external root hold of its target.
+    fn gc_is_root(scan: &GcScan, t: usize, strong: usize) -> bool {
+        let (cells, external) = scan
+            .cell_edges
+            .get(&t)
+            .map(|set| {
+                let ext = set
+                    .iter()
+                    .filter(|cp| {
+                        // The dying walk's in-flight decrefs don't
+                        // count as holders — Zend already subtracted
+                        // the dying container's member refcounts
+                        // before the collector ran (gc_023).
+                        let dying = scan.dying.get(*cp).copied().unwrap_or(0);
+                        Rc::strong_count(&scan.cells[*cp]) > scan.cell_slots[cp] + 1 + dying
+                    })
+                    .count();
+                (set.len(), ext)
+            })
+            .unwrap_or((0, 0));
+        let internal = cells - external + scan.raw_edges.get(&t).copied().unwrap_or(0);
+        strong > internal + 1
+    }
+
+    /// One universe slot holding cell `c`: tally the slot, then
+    /// record the cell value's direct refcounted target as this
+    /// cell's single contribution to that node's internal refs — and
+    /// recurse into the target's own slots on first visit.
+    fn gc_scan_cell(
+        c: &Cell,
+        scan: &mut GcScan,
+        out: &mut Vec<usize>,
+        depth: u8,
+        visited: &mut HashSet<usize>,
+        internal: bool,
+    ) {
         if depth == 0 {
             return;
         }
+        let cp = Rc::as_ptr(c) as usize;
+        *scan.cell_slots.entry(cp).or_insert(0) += 1;
+        scan.cells.entry(cp).or_insert_with(|| c.clone());
+        Self::gc_scan_held(&c.borrow(), Some(cp), scan, out, depth, visited, internal);
+    }
+
+    /// The refcounted target a held `v` points at. A cell-held clone
+    /// counts once per holding cell (`holder = Some(cell ptr)`); a
+    /// bare clone in a non-cell position counts itself. First visit
+    /// scans the container's own slots into its edge list.
+    fn gc_scan_held(
+        v: &Value,
+        holder: Option<usize>,
+        scan: &mut GcScan,
+        out: &mut Vec<usize>,
+        depth: u8,
+        visited: &mut HashSet<usize>,
+        internal: bool,
+    ) {
+        if depth == 0 {
+            return;
+        }
+        let t = Self::gc_val_ptr(v);
+        if t == 0 {
+            return;
+        }
+        out.push(t);
+        if internal {
+            scan.internal.insert(t);
+        } else {
+            scan.plain.insert(t);
+        }
+        match holder {
+            Some(cp) => {
+                scan.cell_edges.entry(t).or_default().insert(cp);
+            }
+            None => {
+                *scan.raw_edges.entry(t).or_insert(0) += 1;
+            }
+        }
+        // Non-universe containers need their own bookkeeping clone so
+        // their strong counts measure against the scan's +1 too.
+        if !scan.universe.contains(&t) {
+            scan.nodes.entry(t).or_insert_with(|| v.clone());
+        }
+        if !visited.insert(t) {
+            return;
+        }
+        let mut inner = Vec::new();
         match v {
-            Value::Object(o) => out.push(Rc::as_ptr(o) as usize),
             Value::Array(a) => {
-                out.push(Rc::as_ptr(a) as usize);
-                if visited.insert(Rc::as_ptr(a) as usize) {
-                    for (_, c) in &a.borrow().entries {
-                        Self::gc_edge_val(&c.borrow(), out, depth - 1, visited);
-                    }
+                for (_, c) in &a.borrow().entries {
+                    Self::gc_scan_cell(c, scan, &mut inner, depth - 1, visited, false);
                 }
             }
             Value::Callable(c) => {
-                out.push(Rc::as_ptr(c) as usize);
-                if visited.insert(Rc::as_ptr(c) as usize) {
-                    for (_, cap, _) in &c.captures {
-                        Self::gc_edge_val(&cap.borrow(), out, depth - 1, visited);
-                    }
+                for (_, cap, _) in &c.captures {
+                    Self::gc_scan_cell(cap, scan, &mut inner, depth - 1, visited, false);
+                }
+                // The bound `$this` / method-callable target object is a
+                // bare clone — count it as a raw edge so the cycle
+                // object ↔ closure closes correctly.
+                if let Some(o) = &c.this_obj {
+                    let v = Value::Object(o.clone());
+                    Self::gc_scan_held(&v, None, scan, &mut inner, depth - 1, visited, false);
+                }
+                if let crate::value::CallableKind::Method { obj: Some(o), .. } = &c.kind {
+                    let v = Value::Object(o.clone());
+                    Self::gc_scan_held(&v, None, scan, &mut inner, depth - 1, visited, false);
                 }
             }
+            Value::Object(o) => {
+                Self::gc_scan_obj_fields(o, scan, &mut inner, depth - 1, visited);
+            }
             _ => {}
+        }
+        scan.edges.insert(t, inner);
+    }
+
+    /// `\0Cls\0prop` private-prop keys whose owning class keeps storage
+    /// in pure-C structures rather than zval slots in Zend — phpun models
+    /// them as ordinary prop cells, so containers sitting inside count as
+    /// dead member containers while Zend counts none (bug69534 expects
+    /// int(2): SplObjectStorage's `$objs`/`$data` arrays aren't real).
+    /// Element contents still scan: attached objects are zvals in Zend
+    /// too. Only classes whose storage is NOT a zend HashTable/array
+    /// qualify — IteratorIterator's `$inner`, RII's `$stack`, CBFI's
+    /// `$callback` etc. are real zvals and stay counted.
+    const GC_PROPLESS_CLASSES: &'static [&'static str] = &["splobjectstorage", "splfixedarray"];
+
+    /// Whether `name` is a `\0Cls\0prop` private-prop key on a
+    /// GC_PROPLESS_CLASSES member (engine-modeled storage, not a zval).
+    fn gc_internal_prop(name: &str) -> bool {
+        if !name.starts_with('\0') {
+            return false;
+        }
+        let rest = &name[1..];
+        let Some(owner) = rest.split('\0').next() else {
+            return false;
+        };
+        Self::GC_PROPLESS_CLASSES
+            .iter()
+            .any(|c| owner.eq_ignore_ascii_case(c))
+    }
+
+    /// An object's in-graph edges: prop cells, and for a generator
+    /// the suspended frame's stashed CVs, buffered items, queued
+    /// sends/throws, saved call setup, and the destruction journal's
+    /// suspended cells. Cells count per cell; bare fields (`sends`,
+    /// `throws`, `injected_throwable`, item keys, `this_obj`,
+    /// `closure_rc`) count one raw clone each.
+    fn gc_scan_obj_fields(
+        o: &Rc<RefCell<PhpObject>>,
+        scan: &mut GcScan,
+        out: &mut Vec<usize>,
+        depth: u8,
+        visited: &mut HashSet<usize>,
+    ) {
+        if depth == 0 {
+            return;
+        }
+        let ob = o.borrow();
+        for (pname, c) in ob.props.iter() {
+            // Private props on classes whose Zend counterpart keeps its
+            // storage in pure-C structures (no zval slots): the container
+            // in that cell is engine modeling, counted out of the dead
+            // set — its contents still scan as real member zvals.
+            Self::gc_scan_cell(
+                c,
+                scan,
+                out,
+                depth - 1,
+                visited,
+                Self::gc_internal_prop(pname),
+            );
+        }
+        let Some(crate::value::ObjectInternal::Generator(st)) = &ob.internal else {
+            return;
+        };
+        let st = st.borrow();
+        for (k, c) in &st.items {
+            Self::gc_scan_held(k, None, scan, out, depth - 1, visited, false);
+            Self::gc_scan_cell(c, scan, out, depth - 1, visited, false);
+        }
+        for (_, v) in &st.sends {
+            Self::gc_scan_held(v, None, scan, out, depth - 1, visited, false);
+        }
+        for (_, v) in &st.throws {
+            Self::gc_scan_held(v, None, scan, out, depth - 1, visited, false);
+        }
+        if let Some(v) = &st.injected_throwable {
+            Self::gc_scan_held(v, None, scan, out, depth - 1, visited, false);
+        }
+        let GenSetup::Invoke {
+            args,
+            this_obj,
+            captures,
+            closure_rc,
+            ..
+        } = &st.setup;
+        for c in &args.cells {
+            Self::gc_scan_cell(c, scan, out, depth - 1, visited, false);
+        }
+        for (_, c, _) in captures {
+            Self::gc_scan_cell(c, scan, out, depth - 1, visited, false);
+        }
+        if let Some(t) = this_obj {
+            let v = Value::Object(t.clone());
+            Self::gc_scan_held(&v, None, scan, out, depth - 1, visited, false);
+        }
+        if let Some(rc) = closure_rc {
+            let v = Value::Callable(rc.clone());
+            Self::gc_scan_held(&v, None, scan, out, depth - 1, visited, false);
+        }
+        // Suspended frame CVs — the journal outlives the state, and
+        // delegation snapshots carry their own inner frames' cells.
+        // A `yield from` chain nests FinDelegate.fin recursively, so walk
+        // the delegate tree, not just the first level (gc_with_yield_from:
+        // a ≥3-deep chain left the innermost global-holding snapshot
+        // unscanned → phantom root kept the whole cycle alive). The
+        // Rc-shared `delegate_fins` live journals are skipped — they're
+        // owned by their own gens' states and get scanned there.
+        {
+            let f = st.fin_q.borrow();
+            let mut fins: Vec<&crate::value::GenFinData> = vec![&*f];
+            while let Some(g) = fins.pop() {
+                for (_, c) in &g.suspended {
+                    Self::gc_scan_cell(c, scan, out, depth - 1, visited, false);
+                }
+                for d in &g.delegates {
+                    fins.push(&d.fin);
+                }
+            }
         }
     }
 
     /// Register an array-valued cell in the GC universe: a cell
     /// holding an array that just got reference-bound into another
     /// container can form a pure-array cycle (`$a[] =& $a`).
-    pub(in crate::interp) fn reg_arr_ref(&mut self, c: &Cell) {
+    pub(crate) fn reg_arr_ref(&mut self, c: &Cell) {
         if let Value::Array(a) = &*c.borrow() {
             self.arr_handles.push(std::rc::Rc::downgrade(a));
         }
     }
 
+    /// Zend's container destructor decrefs every held zval — each
+    /// decref'd payload that survives becomes a root candidate. Rust's
+    /// Drop releases them silently, so a container taking its last ref
+    /// here walks its slots by hand (gc_023's `unset($a)` of a
+    /// 10k-element array buffers every element). `v` arrives as an
+    /// owned clone: the strong-count tests subtract that one hold.
+    /// No clone may outlive a slot visit — a held clone (cell or
+    /// payload) reads as an external root hold to a collect fired
+    /// mid-walk, wrongly rooting its own members.
+    fn gc_note_dying(&mut self, v: &Value, depth: u8) {
+        if depth == 0 {
+            return;
+        }
+        match v {
+            Value::Array(a) => {
+                if Rc::strong_count(a) - 1 > 1 {
+                    self.gc_note_purple(Rc::as_ptr(a) as usize);
+                } else {
+                    let dying = {
+                        let b = a.borrow();
+                        self.gc_dying_acquire(b.entries.iter().map(|(_, c)| Rc::as_ptr(c)))
+                    };
+                    for i in 0.. {
+                        let slot = {
+                            let b = a.borrow();
+                            b.entries
+                                .get(i)
+                                .map(|(_, c)| (Rc::strong_count(c), c.borrow().clone()))
+                        };
+                        let Some((cstrong, pv)) = slot else { break };
+                        self.gc_note_dying_slot(cstrong, &pv, depth - 1);
+                    }
+                    self.gc_dying_release(dying);
+                }
+            }
+            Value::Object(o) => {
+                if Rc::strong_count(o) - 1 > 1 {
+                    self.gc_note_purple(Rc::as_ptr(o) as usize);
+                } else {
+                    let dying = {
+                        let b = o.borrow();
+                        self.gc_dying_acquire(b.props.values().map(Rc::as_ptr))
+                    };
+                    for i in 0.. {
+                        let slot = {
+                            let b = o.borrow();
+                            b.props
+                                .values()
+                                .nth(i)
+                                .map(|c| (Rc::strong_count(c), c.borrow().clone()))
+                        };
+                        let Some((cstrong, pv)) = slot else { break };
+                        self.gc_note_dying_slot(cstrong, &pv, depth - 1);
+                    }
+                    self.gc_dying_release(dying);
+                }
+            }
+            Value::Callable(c) => {
+                if Rc::strong_count(c) - 1 > 1 {
+                    self.gc_note_purple(Rc::as_ptr(c) as usize);
+                } else {
+                    let dying =
+                        self.gc_dying_acquire(c.captures.iter().map(|(_, cap, _)| Rc::as_ptr(cap)));
+                    for i in 0.. {
+                        let slot = c
+                            .captures
+                            .get(i)
+                            .map(|(_, cap, _)| (Rc::strong_count(cap), cap.borrow().clone()));
+                        let Some((cstrong, pv)) = slot else { break };
+                        self.gc_note_dying_slot(cstrong, &pv, depth - 1);
+                    }
+                    if let Some(o) = &c.this_obj {
+                        self.gc_note_dying(&Value::Object(o.clone()), depth - 1);
+                    }
+                    self.gc_dying_release(dying);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A dying container still holds its slot cells while the walk
+    /// runs; a collect fired mid-walk would count those holds as
+    /// external roots (gc_023's inner arrays stay live through `$a`'s
+    /// slots). Zend's destructor has already decremented each member's
+    /// refcount before the collector runs — register the in-flight
+    /// decrefs so `gc_is_root` can subtract them, then release.
+    fn gc_dying_acquire(
+        &mut self,
+        ptrs: impl Iterator<Item = *const RefCell<Value>>,
+    ) -> Vec<usize> {
+        let mut held = Vec::new();
+        for c in ptrs {
+            let p = c as usize;
+            *self.gc_dying.entry(p).or_insert(0) += 1;
+            held.push(p);
+        }
+        held
+    }
+
+    fn gc_dying_release(&mut self, held: Vec<usize>) {
+        for p in held {
+            if let Some(n) = self.gc_dying.get_mut(&p) {
+                *n -= 1;
+                if *n == 0 {
+                    self.gc_dying.remove(&p);
+                }
+            }
+        }
+    }
+
+    /// One slot of a dying container decref'd: `cstrong` is the cell's
+    /// real strong count before the parent's drop and `pv` a clone of
+    /// its payload (its +1 is subtracted inside `gc_note_dying`). A
+    /// shared cell (`=&` alias) survives the drop — the payload was
+    /// decref'd and stays alive, so its node enters the buffer the
+    /// way Zend buffers the ref zval (gc_023's self-referencing
+    /// elements share cells between `$a` and their own entries). A
+    /// dying cell decrefs its payload once more — the same test
+    /// applied a level down.
+    fn gc_note_dying_slot(&mut self, cstrong: usize, pv: &Value, depth: u8) {
+        if depth == 0 {
+            return;
+        }
+        if cstrong > 1 {
+            match pv {
+                Value::Array(a) => self.gc_note_purple(Rc::as_ptr(a) as usize),
+                Value::Object(o) => self.gc_note_purple(Rc::as_ptr(o) as usize),
+                Value::Callable(k) => self.gc_note_purple(Rc::as_ptr(k) as usize),
+                _ => {}
+            }
+            return;
+        }
+        self.gc_note_dying(&pv.clone(), depth - 1);
+    }
+
     /// A zval became a potential cycle root (Zend's purple-add): count
-    /// it once per buffer epoch, then run the collector on overflow.
+    /// it once per buffer epoch. Zend's root buffer overflows at 10k
+    /// entries — the collector runs when the buffer is full BEFORE the
+    /// new root lands, so the triggering root isn't part of the pass
+    /// it fired (gc_023's trailing int(1)).
     pub(in crate::interp) fn gc_note_purple(&mut self, key: usize) {
-        if self.gc_purpled.insert(key) {
-            self.gc_pending += 1;
+        if !self.gc_purpled.contains(&key) {
             self.gc_maybe_collect();
+            if self.gc_purpled.insert(key) {
+                self.gc_pending += 1;
+            }
         }
     }
 
@@ -4603,123 +4999,17 @@ impl<'a> Interp<'a> {
     /// Errors raised mid-collect are dropped — Zend likewise collects
     /// silently (its own buffer-overflow call has no error channel).
     pub(in crate::interp) fn gc_maybe_collect(&mut self) {
-        if self.gc_pending <= 10_000 || self.gc_collecting {
+        if self.gc_pending < 10_000 || self.gc_collecting || !self.ini_on("zend.enable_gc") {
             return;
         }
         self.gc_collecting = true;
-        let _ = self.gc_cycle_collect();
-        // Post-collect the buffer holds only live roots — recount so
-        // the next trigger needs a fresh 10k.
+        let _ = self.gc_cycle_collect_impl(true);
+        // The pass drained the buffer (`gc_purpled` cleared): the
+        // next collect waits for a fresh 10k NEW purpled candidates,
+        // not the size of the live set.
         self.arr_handles.retain(|w| w.upgrade().is_some());
-        self.gc_pending =
-            self.arr_handles.len() + self.obj_handles.iter().filter(|h| h.alive()).count();
+        self.gc_pending = 0;
         self.gc_collecting = false;
-    }
-
-    /// One edge into each array/closure reachable from `v` (through
-    /// array cells and closure captures).
-    fn gc_scan_val(v: &Value, out: &mut Vec<Value>, depth: u8, visited: &mut HashSet<usize>) {
-        if depth == 0 {
-            return;
-        }
-        match v {
-            Value::Array(a) => {
-                out.push(v.clone());
-                if visited.insert(Rc::as_ptr(a) as usize) {
-                    for (_, c) in &a.borrow().entries {
-                        Self::gc_scan_val(&c.borrow(), out, depth - 1, visited);
-                    }
-                }
-            }
-            Value::Callable(c) => {
-                out.push(v.clone());
-                if visited.insert(Rc::as_ptr(c) as usize) {
-                    for (_, cap, _) in &c.captures {
-                        Self::gc_scan_val(&cap.borrow(), out, depth - 1, visited);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Every object reference held inside `o` — prop cells, and for a
-    /// generator the suspended frame's stashed CVs, buffered items,
-    /// queued sends/throws and the saved call setup. The cycle
-    /// collector treats these as the graph's internal edges.
-    fn gc_obj_out_refs(o: &Rc<RefCell<PhpObject>>, out: &mut Vec<usize>) {
-        fn walk(v: &Value, out: &mut Vec<usize>, depth: u8) {
-            if depth == 0 {
-                return;
-            }
-            match v {
-                Value::Object(o) => out.push(Rc::as_ptr(o) as usize),
-                Value::Callable(c) => {
-                    if let Some(o) = &c.this_obj {
-                        out.push(Rc::as_ptr(o) as usize);
-                    }
-                    for (_, cap, _) in &c.captures {
-                        walk(&cap.borrow(), out, depth - 1);
-                    }
-                }
-                Value::Array(a) => {
-                    for (_, c) in &a.borrow().entries {
-                        walk(&c.borrow(), out, depth - 1);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let ob = o.borrow();
-        for c in ob.props.values() {
-            walk(&c.borrow(), out, 16);
-        }
-        let Some(crate::value::ObjectInternal::Generator(st)) = &ob.internal else {
-            return;
-        };
-        let st = st.borrow();
-        for (k, c) in &st.items {
-            walk(k, out, 16);
-            walk(&c.borrow(), out, 16);
-        }
-        for (_, v) in &st.sends {
-            walk(v, out, 16);
-        }
-        for (_, v) in &st.throws {
-            walk(v, out, 16);
-        }
-        if let Some(v) = &st.injected_throwable {
-            walk(v, out, 16);
-        }
-        let GenSetup::Invoke {
-            args,
-            this_obj,
-            captures,
-            ..
-        } = &st.setup;
-        for c in &args.cells {
-            walk(&c.borrow(), out, 16);
-        }
-        if let Some(t) = this_obj {
-            out.push(Rc::as_ptr(t) as usize);
-        }
-        for (_, c, _) in captures {
-            walk(&c.borrow(), out, 16);
-        }
-        // Suspended frame CVs — the journal outlives the state, and
-        // delegation snapshots carry their own inner frames' cells.
-        let mut journals = vec![st.fin_q.clone()];
-        while let Some(q) = journals.pop() {
-            let f = q.borrow();
-            for (_, c) in &f.suspended {
-                walk(&c.borrow(), out, 16);
-            }
-            for d in &f.delegates {
-                for (_, c) in &d.fin.suspended {
-                    walk(&c.borrow(), out, 16);
-                }
-            }
-        }
     }
 
     /// Drain one gen's destruction journal: emit the suspended

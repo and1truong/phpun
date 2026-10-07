@@ -1181,8 +1181,11 @@ pub(crate) fn php_unserialize(
             } else {
                 // zend turns the target slot into an IS_REFERENCE
                 // bucket — the shared cell must mark so var_dump
-                // prints `&` and a later serialize re-emits R:.
+                // prints `&` and a later serialize re-emits R:. A
+                // reference-bound array joins the GC universe the same
+                // as a `=&` bind (unserialize can create cycles).
                 it.mark_ref(&target);
+                it.reg_arr_ref(&target);
                 vhash.push(target.clone());
                 Ok(target)
             }
