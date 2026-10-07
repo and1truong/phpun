@@ -375,12 +375,19 @@ pub(crate) fn dispatch(
                     srbuf: Default::default(),
                     rcap: 0,
                 })))
-            } else if path == "php://memory"
-                || path == "php://temp"
-                || path.starts_with("php://temp/maxmemory:")
-            {
+            } else if let Some(mem) = mem_uri_kind(&path) {
                 // php://memory and php://temp are always read/write
                 // internally; fwrite still honors the fopen mode.
+                let temp_smax = match mem {
+                    MemUri::Temp(smax) => Some(smax),
+                    MemUri::Memory => None,
+                    MemUri::NegMax => {
+                        return err(
+                            "ValueError",
+                            "fopen(): Argument #2 ($mode) must be greater than or equal to 0",
+                        );
+                    }
+                };
                 let id = it.next_res_id();
                 let w = mem_writeable(&mode);
                 // zend reports the URI verbatim and a normalized mode:
@@ -405,8 +412,10 @@ pub(crate) fn dispatch(
                     eof: false,
                     pos_broken: false,
                     write: w,
+                    append: mode.contains('a'),
                     uri: path.clone(),
                     mode: meta_mode.to_string(),
+                    temp_smax,
                     spilled_fd: None,
                     srbuf: Default::default(),
                     rcap: 0,
@@ -598,7 +607,7 @@ pub(crate) fn dispatch(
                             pos,
                             eof,
                             pos_broken,
-                            uri,
+                            temp_smax,
                             spilled_fd,
                             srbuf,
                             ..
@@ -623,7 +632,7 @@ pub(crate) fn dispatch(
                             // underflow early-fails in the generic layer
                             // (position untouched). php://memory breaks on
                             // either.
-                            let memory = uri == "php://memory";
+                            let memory = temp_smax.is_none();
                             let tell = if *pos_broken {
                                 *pos as i64 - 1
                             } else {
@@ -1619,11 +1628,17 @@ pub(crate) fn dispatch(
                             base.push(("uri", Value::str("php://output")));
                             mk(base)
                         }
-                        PhpResource::Mem { eof, uri, mode, .. } => {
+                        PhpResource::Mem {
+                            eof,
+                            uri,
+                            mode,
+                            temp_smax,
+                            ..
+                        } => {
                             // zend quirk: php://memory reports the full
                             // 9-key meta, but temp streams (TEMP) omit
                             // timed_out/blocked/eof entirely.
-                            if uri == "php://memory" {
+                            if temp_smax.is_none() {
                                 base.push(("eof", Value::Bool(*eof)));
                             } else {
                                 base.clear();
@@ -1631,7 +1646,7 @@ pub(crate) fn dispatch(
                             base.push(("wrapper_type", Value::str("PHP")));
                             base.push((
                                 "stream_type",
-                                Value::str(if uri == "php://memory" {
+                                Value::str(if temp_smax.is_none() {
                                     "MEMORY"
                                 } else {
                                     "TEMP"
@@ -1921,6 +1936,81 @@ fn mem_writeable(mode: &str) -> bool {
     mode.bytes().any(|b| matches!(b, b'w' | b'a' | b'+'))
 }
 
+/// The php:// URI kinds zend's php_stream_url_wrap_php maps to a
+/// memory-backed stream: a case-insensitive "temp" PREFIX match
+/// (php://tempxyz counts, php://tem does not) optionally followed by
+/// "/maxmemory:" + ZEND_STRTOL, vs an exact case-insensitive
+/// "memory". The "php://" scheme itself is compared
+/// case-insensitively too and reported verbatim in meta 'uri'.
+enum MemUri {
+    /// php://temp* — the value is ts->smax: the /maxmemory:N budget,
+    /// default PHP_STREAM_MAX_MEM = 2MB (spill on pos+count >= smax).
+    Temp(u64),
+    /// php://memory — never spills, not fd-castable.
+    Memory,
+    /// php://temp/maxmemory:<negative> → the caller's arg2 ValueError.
+    NegMax,
+}
+
+fn mem_uri_kind(path: &str) -> Option<MemUri> {
+    let b = path.as_bytes();
+    if b.len() < 6 || !b[..6].eq_ignore_ascii_case(b"php://") {
+        return None;
+    }
+    let rest = &b[6..];
+    if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case(b"temp") {
+        let tail = &rest[4..];
+        if tail.len() >= 11 && tail[..11].eq_ignore_ascii_case(b"/maxmemory:") {
+            let v = parse_strtol(&tail[11..]);
+            return Some(if v < 0 {
+                MemUri::NegMax
+            } else {
+                MemUri::Temp(v as u64)
+            });
+        }
+        Some(MemUri::Temp(2 * 1024 * 1024))
+    } else if rest.eq_ignore_ascii_case(b"memory") {
+        Some(MemUri::Memory)
+    } else {
+        None
+    }
+}
+
+/// C strtol(…, 10): skips leading whitespace, an optional +/- sign,
+/// then digits; a non-numeric tail is ignored, no digits → 0,
+/// overflow saturates (zend ZEND_STRTOL on maxmemory).
+fn parse_strtol(b: &[u8]) -> i64 {
+    let mut i = 0;
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        i += 1;
+    }
+    let mut neg = false;
+    match b.get(i) {
+        Some(b'-') => {
+            neg = true;
+            i += 1;
+        }
+        Some(b'+') => {
+            i += 1;
+        }
+        _ => {}
+    }
+    let mut v: i64 = 0;
+    let mut any = false;
+    while i < b.len() && b[i].is_ascii_digit() {
+        any = true;
+        v = v.saturating_mul(10).saturating_add((b[i] - b'0') as i64);
+        i += 1;
+    }
+    if !any {
+        0
+    } else if neg {
+        -v
+    } else {
+        v
+    }
+}
+
 /// fcntl helper for stream_set_blocking: set/clear O_NONBLOCK on a
 /// real fd (zend applies the flag to plain files as well as pipes).
 fn set_fd_nonblock(fd: std::os::fd::RawFd, blocking: bool) {
@@ -2161,14 +2251,16 @@ pub(in crate::builtins) fn write_resource(
                     pos,
                     eof,
                     write,
+                    append,
                     spilled_fd,
                     srbuf,
+                    temp_smax,
                     ..
                 } => {
-                    // Once temp_cast spills the buffer the stream io
-                    // hits the inner r+b tmpfile — writes land even on
-                    // 'r'-mode php://temp (the write flag only gates
-                    // the in-buffer op).
+                    // Once the buffer spills (temp_cast or a write that
+                    // crossed smax) the stream io hits the inner r+b
+                    // tmpfile — writes land even on 'r'-mode php://temp
+                    // (the write flag only gates the in-buffer op).
                     if let Some(fd) = *spilled_fd {
                         // zend's buffered write discards the read buffer
                         // and reseeks the fd to the logical position
@@ -2177,11 +2269,35 @@ pub(in crate::builtins) fn write_resource(
                         fd_resync(fd, *pos, srbuf);
                         return Ok(fd_stream_write(fd, pos, eof, data));
                     }
+                    // zend php_stream_temp_write: the whole buffer
+                    // spills to a tmpfile once stream->position+count
+                    // reaches smax — BEFORE the inner memory stream's
+                    // readonly check, so a spilling write lands even
+                    // on 'r'-mode temps.
+                    if let Some(smax) = *temp_smax {
+                        if *pos as u128 + data.len() as u128 >= smax as u128 {
+                            match temp_spill_fd(buf, *pos) {
+                                Some(fd) => {
+                                    *spilled_fd = Some(fd);
+                                    return Ok(fd_stream_write(fd, pos, eof, data));
+                                }
+                                None => {
+                                    it.warn_pub("Unable to create temporary file, Check permissions in temporary files directory.")?;
+                                    return Ok(StreamWrite::Partial(0));
+                                }
+                            }
+                        }
+                    }
                     // TEMP_STREAM_READONLY → php_stream_memory_write
                     // returns -1 and the bytes are silently dropped
                     // (no E_NOTICE — only plain stdio notices).
                     if !*write {
                         return Ok(StreamWrite::Discarded);
+                    }
+                    // TEMP_STREAM_APPEND: an 'a'-mode write lands at
+                    // end-of-buffer regardless of the current position.
+                    if *append {
+                        *pos = buf.len() as u64;
                     }
                     let start = *pos as usize;
                     if start > buf.len() {
@@ -3707,8 +3823,8 @@ fn is_data_uri(uri: &str) -> bool {
 /// php://temp* (incl. maxmemory), RFC2397 covers data:.
 pub(in crate::builtins) fn stream_ops_label(res: &PhpResource) -> &'static str {
     match res {
-        PhpResource::Mem { uri, .. } => {
-            if uri == "php://memory" {
+        PhpResource::Mem { temp_smax, .. } => {
+            if temp_smax.is_none() {
                 "MEMORY"
             } else {
                 "TEMP"
@@ -3784,12 +3900,12 @@ pub(in crate::builtins) fn spill_fd_for_stream(
 ) -> Option<std::os::unix::io::RawFd> {
     match res {
         PhpResource::Mem {
-            uri,
             buf,
             pos,
             spilled_fd,
+            temp_smax,
             ..
-        } if uri.starts_with("php://temp") => {
+        } if temp_smax.is_some() => {
             if spilled_fd.is_none() {
                 *spilled_fd = temp_spill_fd(buf, *pos);
             }

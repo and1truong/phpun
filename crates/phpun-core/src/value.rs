@@ -1839,14 +1839,25 @@ pub enum PhpResource {
         /// fwrite honors the fopen mode ('r' → false); fprintf does not
         /// (zend php_stream_printf bypasses the check).
         write: bool,
+        /// zend's TEMP_STREAM_APPEND: an 'a'-mode buffer write lands at
+        /// end-of-buffer regardless of position. Lost once the stream
+        /// spills — the tmpfile is a plain r+b file (zend likewise).
+        append: bool,
         /// The php:// URI the stream was opened with ("php://memory",
         /// "php://temp", "php://temp/maxmemory:N") — reported verbatim
         /// in stream_get_meta_data()'s 'uri' key.
         uri: String,
         /// zend's normalized open mode for meta ('rb', 'w+b', 'a+b').
         mode: String,
-        /// fd claimed by a PHP_STREAM_AS_FD_FOR_SELECT cast — zend's
-        /// php_stream_temp_cast spills a TEMP buffer into a tmpfile()
+        /// php://temp* only: zend's ts->smax — the /maxmemory:N budget
+        /// (default PHP_STREAM_MAX_MEM = 2MB). A write reaching
+        /// stream->position+count >= smax spills the buffer to a
+        /// tmpfile BEFORE the inner stream's readonly check runs.
+        /// None on php://memory: never spills and not fd-castable.
+        temp_smax: Option<u64>,
+        /// fd claimed by a PHP_STREAM_AS_FD_FOR_SELECT cast or a write
+        /// that crossed temp_smax — zend's php_stream_temp_cast /
+        /// php_stream_temp_write spills a TEMP buffer into a tmpfile()
         /// the stream then KEEPS (later casts reuse it and
         /// flock(2)/fstat(2) see it). php://memory is not castable.
         spilled_fd: Option<std::os::unix::io::RawFd>,
