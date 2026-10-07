@@ -320,13 +320,14 @@ pub(crate) fn dispatch(
             if k == "memory_limit" {
                 it.ini.insert(k.clone(), v);
                 let lim = it.ini_bytes(&k);
-                if lim > 0 && (it.mem_used as i64) > lim {
+                if lim > 0 && it.mem_total() > lim {
                     let _ = it
                         .ini
                         .insert(k.clone(), prev.clone().unwrap_or_else(|| "-1".into()));
                     it.warn_pub(&format!(
                         "Failed to set memory limit to {} bytes (Current memory usage is {} bytes)",
-                        lim, it.mem_used
+                        lim,
+                        it.mem_total()
                     ))?;
                     return Ok(Some(match prev {
                         Some(p) => Value::str(p),
@@ -534,9 +535,9 @@ pub(crate) fn dispatch(
         "phpversion" | "phpversion_strict" => Value::str("8.5.11-phpun"),
         "php_uname" => Value::str("Linux"),
         // 2M base (zend's post-boot floor) plus accounted use —
-        // emits and object shells both count toward it.
-        "memory_get_usage" => Value::Int(2097152 + it.mem_used as i64),
-        "memory_get_peak_usage" => Value::Int(2097152 + it.mem_used as i64),
+        // emits and live object shells both count toward it.
+        "memory_get_usage" => Value::Int(2097152 + it.mem_total()),
+        "memory_get_peak_usage" => Value::Int(2097152 + it.mem_total()),
         "memory_reset_peak_usage" => Value::Null,
         "zend_version" => Value::str("8.5.11-phpun"),
         "getmypid" => Value::Int(std::process::id() as i64),

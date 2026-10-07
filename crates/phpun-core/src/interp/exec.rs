@@ -27,7 +27,7 @@ impl<'a> Interp<'a> {
             i += 1;
             // memory_limit fires between statements (bug45392).
             let limit = self.ini_bytes("memory_limit");
-            if limit > 0 && self.mem_used as i64 > limit {
+            if limit > 0 && self.mem_total() > limit {
                 self.mem_exceeded = true;
                 // Zend's OOM fatal always prints a Stack trace:
                 // block (`#0 {main}` at top level) — a plain E_ERROR

@@ -69,7 +69,7 @@ pub(crate) fn dispatch(
             // fatals instead of OOMing (zend emalloc-check parity).
             let want = 32i128 + dec.max(0) as i128 + dp.len() as i128;
             let limit = it.ini_bytes("memory_limit");
-            if limit > 0 && (it.mem_used as i128) + want > limit as i128 {
+            if limit > 0 && (it.mem_total() as i128) + want > limit as i128 {
                 it.mem_used = limit.max(0) as u64 + 1;
                 it.mem_exceeded = true;
                 let mut e = PhpError::fatal(
@@ -89,7 +89,8 @@ pub(crate) fn dispatch(
                 let mut e = PhpError::fatal(
                     format!(
                         "Out of memory (allocated {} bytes) (tried to allocate {} bytes)",
-                        it.mem_used, want
+                        it.mem_total(),
+                        want
                     ),
                     it.cur_line,
                 );

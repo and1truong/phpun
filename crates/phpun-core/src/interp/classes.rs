@@ -3308,9 +3308,10 @@ impl<'a> Interp<'a> {
     pub fn alloc_obj(&mut self, o: PhpObject) -> Rc<RefCell<PhpObject>> {
         // Object shells count toward memory_limit — a flat cost per
         // allocation so a runaway `new` loop trips the limit even
-        // when nothing is emitted (new_oom).
-        self.mem_used += 512;
-        self.mem_last = 512;
+        // when nothing is emitted (new_oom). Drops decrement it like
+        // zend's arena, so GC churn doesn't accumulate.
+        crate::value::obj_charge();
+        self.mem_last = crate::value::OBJ_SHELL_BYTES as u64;
         let rc = Rc::new(RefCell::new(o));
         let id = self.next_obj_id(&rc);
         rc.borrow_mut().id = id;
@@ -3450,7 +3451,7 @@ impl<'a> Interp<'a> {
         let cls = match cls {
             Some(c) => c,
             None => {
-                return Ok(Value::Object(Rc::new(RefCell::new(PhpObject {
+                return Ok(Value::Object(self.alloc_obj(PhpObject {
                     class: Rc::new(PhpClass {
                         decl: Rc::new(ClassDecl {
                             name: lname.into(),
@@ -3477,7 +3478,7 @@ impl<'a> Interp<'a> {
                     id: 0,
                     internal: None,
                     unset_props: std::collections::HashSet::new(),
-                }))))
+                })))
             }
         };
         // Collect decl chain (self + parents, parent-first for prop order).

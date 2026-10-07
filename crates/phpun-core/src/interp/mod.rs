@@ -3205,6 +3205,13 @@ impl<'a> Interp<'a> {
         self.emit_routed(b);
     }
 
+    /// Zend-arena usage against memory_limit: emitted bytes plus live
+    /// object shells (PhpObject::drop decrements, mirroring the arena
+    /// returning freed memory to the pool).
+    pub(crate) fn mem_total(&self) -> i64 {
+        self.mem_used as i64 + crate::value::obj_live_bytes()
+    }
+
     /// Emit journaled/replayed bytes at their materialization point:
     /// inside another gen's run they join its deferred journal (an
     /// inner's death bytes attribute to the outer's cursor window);

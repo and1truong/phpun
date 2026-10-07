@@ -1554,6 +1554,25 @@ impl PhpClass {
     }
 }
 
+/// Flat per-object-shell charge against memory_limit — zend's arena
+/// counts LIVE allocations, so freeing the last Rc of an object
+/// returns its charge (gc_* tests churn hundreds of thousands of
+/// shells under 128M without exhausting).
+pub const OBJ_SHELL_BYTES: i64 = 512;
+
+static OBJ_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Charge one live object shell (alloc_obj).
+pub fn obj_charge() {
+    OBJ_LIVE.fetch_add(OBJ_SHELL_BYTES, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Live bytes held by object shells (clamped — objects wrapped before
+/// or outside `alloc_obj` can dip the counter briefly negative).
+pub fn obj_live_bytes() -> i64 {
+    OBJ_LIVE.load(std::sync::atomic::Ordering::Relaxed).max(0)
+}
+
 #[derive(Debug)]
 pub struct PhpObject {
     pub class: Rc<PhpClass>,
@@ -1568,6 +1587,12 @@ pub struct PhpObject {
     /// Typed props that were `unset()` — reads route to `__get` like
     /// undefined props instead of the uninitialized-typed Error.
     pub unset_props: std::collections::HashSet<String>,
+}
+
+impl Drop for PhpObject {
+    fn drop(&mut self) {
+        OBJ_LIVE.fetch_sub(OBJ_SHELL_BYTES, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// One recorded call for exception backtraces (getTrace()).
