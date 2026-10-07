@@ -555,11 +555,27 @@ pub struct Interp<'a> {
     /// free list hands the OUTER slot to the next `new` first
     /// (gh10168). 0 = alive / silently dead (order unknown).
     obj_died: Vec<u64>,
+    /// Freed handle slots in death order (Zend's LIFO free list) —
+    /// `mark_obj_died` pushes, `push_handle` pops the freshest.
+    dead_slots: Vec<usize>,
     /// Weak registry of arrays that gained a reference (`=&`) element
     /// — only those can join a cycle, so the GC pass scans just them
     /// (Zend roots every refcounted array, this is the cheap subset
     /// that matters for `gc_collect_cycles` counting).
     arr_handles: Vec<std::rc::Weak<RefCell<PhpArray>>>,
+    /// Approximation of Zend's root buffer: potential-cycle entries
+    /// added since the last collect (`=&` binds, object allocation,
+    /// displaced zvals that stayed alive). At 10_000 the collector
+    /// auto-runs like `gc_collect_roots` on buffer overflow
+    /// (gc/bug70805).
+    gc_pending: usize,
+    /// Re-entrancy guard — a collect runs userland `__destruct`s whose
+    /// own unsets/displaces must not nest a second collect (Zend's
+    /// GC_GCOLLECTED flag).
+    gc_collecting: bool,
+    /// Values already rooted (Zend's "already purple" bit): binds and
+    /// surviving decrefs each count a zval once — cleared on collect.
+    gc_purpled: HashSet<usize>,
     spawn_seq: u64,
     /// Per-callsite unqualified fn resolution cache — Zend resolves
     /// `ns\f -> f` once per call site (constexpr/namespace_004).
@@ -1317,7 +1333,11 @@ impl<'a> Interp<'a> {
             obj_handles: Vec::new(),
             obj_born: Vec::new(),
             obj_died: Vec::new(),
+            dead_slots: Vec::new(),
             arr_handles: Vec::new(),
+            gc_pending: 0,
+            gc_collecting: false,
+            gc_purpled: HashSet::new(),
             spawn_seq: 0,
             fcc_fn_cache: HashMap::new(),
             destructed: HashMap::new(),
@@ -2347,6 +2367,17 @@ impl<'a> Interp<'a> {
     /// __destruct — `unset($closure)` decrefs the closure's bound
     /// $this and captures (Zend refcount semantics — closure_005).
     pub(in crate::interp) fn destruct_dying_value(&mut self, v: &Value) -> Result<(), PhpError> {
+        // A displaced zval that stays alive is Zend's purple-add — a
+        // potential cycle root entering the buffer (gc/bug70805).
+        let purple = match v {
+            Value::Object(o) if Rc::strong_count(o) > 1 => Some(Rc::as_ptr(o) as usize),
+            Value::Array(a) if Rc::strong_count(a) > 1 => Some(Rc::as_ptr(a) as usize),
+            Value::Callable(c) if Rc::strong_count(c) > 1 => Some(Rc::as_ptr(c) as usize),
+            _ => None,
+        };
+        if let Some(k) = purple {
+            self.gc_note_purple(k);
+        }
         let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
         let mut tally = |o: &Rc<RefCell<PhpObject>>| {
             held.entry(Rc::as_ptr(o) as usize)
@@ -2684,6 +2715,10 @@ impl<'a> Interp<'a> {
     pub fn seal_boot_objects(&mut self) {
         self.obj_handles.clear();
         self.obj_born.clear();
+        self.dead_slots.clear();
+        self.gc_pending = 0;
+        self.gc_collecting = false;
+        self.gc_purpled.clear();
         self.arr_handles.clear();
         self.obj_died.clear();
     }
@@ -3992,6 +4027,23 @@ impl<'a> Interp<'a> {
     /// weak handles in `live_gens`/`obj_handles` go stale like Zend
     /// freeing the zvals.
     pub fn gc_cycle_collect(&mut self) -> Result<usize, PhpError> {
+        // Zend's collect keeps re-rooting values that dtors unroot
+        // mid-pass (gc/bug70805: C's dtor unsets $a, whose cycle then
+        // dies inside the same collect). Re-run the mark until a pass
+        // finds nothing, accumulating the root count.
+        let mut total = 0;
+        for _ in 0..8 {
+            let n = self.gc_cycle_collect_pass()?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        self.gc_purpled.clear();
+        Ok(total)
+    }
+
+    fn gc_cycle_collect_pass(&mut self) -> Result<usize, PhpError> {
         let objs: Vec<Rc<RefCell<PhpObject>>> = self
             .obj_handles
             .iter()
@@ -4014,7 +4066,7 @@ impl<'a> Interp<'a> {
             let mut out = Vec::new();
             Self::gc_obj_out_refs(o, &mut out);
             let mut cands = Vec::new();
-            Self::gc_obj_out_cands(o, &mut cands);
+            Self::gc_obj_out_cands(o, &mut cands, &mut HashSet::new());
             for v in &cands {
                 out.push(Self::gc_val_ptr(v));
             }
@@ -4025,8 +4077,9 @@ impl<'a> Interp<'a> {
         }
         for a in &arrs {
             let mut out = Vec::new();
+            let mut visited = HashSet::new();
             for (_, c) in &a.borrow().entries {
-                Self::gc_edge_val(&c.borrow(), &mut out, 16);
+                Self::gc_edge_val(&c.borrow(), &mut out, 16, &mut visited);
             }
             for t in &out {
                 *internal.entry(*t).or_insert(0) += 1;
@@ -4091,7 +4144,7 @@ impl<'a> Interp<'a> {
         let mut cand_map: HashMap<usize, Value> = HashMap::new();
         for o in &dead {
             let mut held = Vec::new();
-            Self::gc_obj_out_cands(o, &mut held);
+            Self::gc_obj_out_cands(o, &mut held, &mut HashSet::new());
             for v in held {
                 let key = match &v {
                     Value::Array(a) => Rc::as_ptr(a) as usize,
@@ -4104,14 +4157,16 @@ impl<'a> Interp<'a> {
         }
         let mut dead_roots = dead.len();
         let mut died: HashSet<usize> = HashSet::new();
+        let mut work: Vec<usize> = Vec::new();
         // Dead arrays are confirmed roots themselves — count them and
         // propagate their released cells' edges to deeper candidates.
         for a in &dead_arrs {
             died.insert(Rc::as_ptr(a) as usize);
             dead_roots += 1;
             let mut held = Vec::new();
+            let mut visited = HashSet::new();
             for (_, c) in &a.borrow().entries {
-                Self::gc_scan_val(&c.borrow(), &mut held, 16);
+                Self::gc_scan_val(&c.borrow(), &mut held, 16, &mut visited);
             }
             for v in held {
                 let key = Self::gc_val_ptr(&v);
@@ -4120,56 +4175,54 @@ impl<'a> Interp<'a> {
                 }
                 *cand_edges.entry(key).or_insert(0) += 1;
                 cand_map.entry(key).or_insert(v);
+                work.push(key);
             }
         }
-        loop {
-            let mut progressed = false;
-            let keys: Vec<usize> = cand_map.keys().copied().collect();
-            for key in keys {
-                if died.contains(&key) {
-                    continue;
-                }
-                let Some(v) = cand_map.get(&key) else {
-                    continue;
-                };
-                let strong = match v {
-                    Value::Array(a) => Rc::strong_count(a),
-                    Value::Callable(c) => Rc::strong_count(c),
-                    _ => continue,
-                };
-                // `cand_map` itself keeps one clone alive.
-                if strong <= cand_edges[&key] + 1 {
-                    died.insert(key);
-                    dead_roots += 1;
-                    progressed = true;
-                    // The candidate's own cells release — their held
-                    // values are fresh edges into deeper candidates.
-                    let mut deeper = Vec::new();
-                    match v {
-                        Value::Array(a) => {
-                            for (_, c) in &a.borrow().entries {
-                                Self::gc_scan_val(&c.borrow(), &mut deeper, 16);
-                            }
-                        }
-                        Value::Callable(c) => {
-                            for (_, cap, _) in &c.captures {
-                                Self::gc_scan_val(&cap.borrow(), &mut deeper, 16);
-                            }
-                        }
-                        _ => {}
-                    }
-                    for d in deeper {
-                        let k = Self::gc_val_ptr(&d);
-                        if k == 0 || k == key {
-                            continue;
-                        }
-                        *cand_edges.entry(k).or_insert(0) += 1;
-                        cand_map.entry(k).or_insert(d);
-                    }
-                }
+        work.extend(cand_map.keys());
+        // Worklist: a candidate dies when every remaining strong ref is
+        // an edge from a dead node (+ our bookkeeping clone). Deaths
+        // release its cells, adding edges to deeper candidates that
+        // re-enter the worklist — same reachability as a fixpoint but
+        // linear in the number of edges.
+        while let Some(key) = work.pop() {
+            if died.contains(&key) {
+                continue;
             }
-            if !progressed {
-                break;
+            let Some(v) = cand_map.remove(&key) else {
+                continue;
+            };
+            let strong = match &v {
+                Value::Array(a) => Rc::strong_count(a),
+                Value::Callable(c) => Rc::strong_count(c),
+                _ => continue,
+            };
+            if strong <= cand_edges[&key] + 1 {
+                died.insert(key);
+                dead_roots += 1;
+                let mut deeper = Vec::new();
+                let mut visited = HashSet::new();
+                match &v {
+                    Value::Array(a) => {
+                        for (_, c) in &a.borrow().entries {
+                            Self::gc_scan_val(&c.borrow(), &mut deeper, 16, &mut visited);
+                        }
+                    }
+                    Value::Callable(c) => {
+                        for (_, cap, _) in &c.captures {
+                            Self::gc_scan_val(&cap.borrow(), &mut deeper, 16, &mut visited);
+                        }
+                    }
+                    _ => {}
+                }
+                for d in deeper {
+                    let k = Self::gc_val_ptr(&d);
+                    if k == 0 || k == key {
+                        continue;
+                    }
+                    *cand_edges.entry(k).or_insert(0) += 1;
+                    cand_map.entry(k).or_insert(d);
+                    work.push(k);
+                }
             }
         }
         let mut first_err = None;
@@ -4228,27 +4281,31 @@ impl<'a> Interp<'a> {
     /// The refcounted GC-root candidates held inside `o` — arrays and
     /// closures. Same sources as `gc_obj_out_refs`; objects are
     /// classified by the main pass instead.
-    fn gc_obj_out_cands(o: &Rc<RefCell<PhpObject>>, out: &mut Vec<Value>) {
+    fn gc_obj_out_cands(
+        o: &Rc<RefCell<PhpObject>>,
+        out: &mut Vec<Value>,
+        visited: &mut HashSet<usize>,
+    ) {
         let ob = o.borrow();
         for c in ob.props.values() {
-            Self::gc_scan_val(&c.borrow(), out, 16);
+            Self::gc_scan_val(&c.borrow(), out, 16, visited);
         }
         let Some(crate::value::ObjectInternal::Generator(st)) = &ob.internal else {
             return;
         };
         let st = st.borrow();
         for (k, c) in &st.items {
-            Self::gc_scan_val(k, out, 16);
-            Self::gc_scan_val(&c.borrow(), out, 16);
+            Self::gc_scan_val(k, out, 16, visited);
+            Self::gc_scan_val(&c.borrow(), out, 16, visited);
         }
         for (_, v) in &st.sends {
-            Self::gc_scan_val(v, out, 16);
+            Self::gc_scan_val(v, out, 16, visited);
         }
         for (_, v) in &st.throws {
-            Self::gc_scan_val(v, out, 16);
+            Self::gc_scan_val(v, out, 16, visited);
         }
         if let Some(v) = &st.injected_throwable {
-            Self::gc_scan_val(v, out, 16);
+            Self::gc_scan_val(v, out, 16, visited);
         }
         let GenSetup::Invoke {
             args,
@@ -4257,10 +4314,10 @@ impl<'a> Interp<'a> {
             ..
         } = &st.setup;
         for c in &args.cells {
-            Self::gc_scan_val(&c.borrow(), out, 16);
+            Self::gc_scan_val(&c.borrow(), out, 16, visited);
         }
         for (_, c, _) in captures {
-            Self::gc_scan_val(&c.borrow(), out, 16);
+            Self::gc_scan_val(&c.borrow(), out, 16, visited);
         }
         if let Some(rc) = closure_rc {
             out.push(Value::Callable(rc.clone()));
@@ -4269,11 +4326,11 @@ impl<'a> Interp<'a> {
         while let Some(q) = journals.pop() {
             let f = q.borrow();
             for (_, c) in &f.suspended {
-                Self::gc_scan_val(&c.borrow(), out, 16);
+                Self::gc_scan_val(&c.borrow(), out, 16, visited);
             }
             for d in &f.delegates {
                 for (_, c) in &d.fin.suspended {
-                    Self::gc_scan_val(&c.borrow(), out, 16);
+                    Self::gc_scan_val(&c.borrow(), out, 16, visited);
                 }
             }
         }
@@ -4291,7 +4348,7 @@ impl<'a> Interp<'a> {
 
     /// Push the graph-node pointer of every refcounted target in `v`,
     /// recursing through array cells and closure captures.
-    fn gc_edge_val(v: &Value, out: &mut Vec<usize>, depth: u8) {
+    fn gc_edge_val(v: &Value, out: &mut Vec<usize>, depth: u8, visited: &mut HashSet<usize>) {
         if depth == 0 {
             return;
         }
@@ -4299,14 +4356,18 @@ impl<'a> Interp<'a> {
             Value::Object(o) => out.push(Rc::as_ptr(o) as usize),
             Value::Array(a) => {
                 out.push(Rc::as_ptr(a) as usize);
-                for (_, c) in &a.borrow().entries {
-                    Self::gc_edge_val(&c.borrow(), out, depth - 1);
+                if visited.insert(Rc::as_ptr(a) as usize) {
+                    for (_, c) in &a.borrow().entries {
+                        Self::gc_edge_val(&c.borrow(), out, depth - 1, visited);
+                    }
                 }
             }
             Value::Callable(c) => {
                 out.push(Rc::as_ptr(c) as usize);
-                for (_, cap, _) in &c.captures {
-                    Self::gc_edge_val(&cap.borrow(), out, depth - 1);
+                if visited.insert(Rc::as_ptr(c) as usize) {
+                    for (_, cap, _) in &c.captures {
+                        Self::gc_edge_val(&cap.borrow(), out, depth - 1, visited);
+                    }
                 }
             }
             _ => {}
@@ -4322,23 +4383,54 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// A zval became a potential cycle root (Zend's purple-add): count
+    /// it once per buffer epoch, then run the collector on overflow.
+    pub(in crate::interp) fn gc_note_purple(&mut self, key: usize) {
+        if self.gc_purpled.insert(key) {
+            self.gc_pending += 1;
+            self.gc_maybe_collect();
+        }
+    }
+
+    /// Zend auto-collects when its 10k-entry root buffer overflows:
+    /// run the same pass here once enough potential roots piled up.
+    /// Errors raised mid-collect are dropped — Zend likewise collects
+    /// silently (its own buffer-overflow call has no error channel).
+    pub(in crate::interp) fn gc_maybe_collect(&mut self) {
+        if self.gc_pending <= 10_000 || self.gc_collecting {
+            return;
+        }
+        self.gc_collecting = true;
+        let _ = self.gc_cycle_collect();
+        // Post-collect the buffer holds only live roots — recount so
+        // the next trigger needs a fresh 10k.
+        self.arr_handles.retain(|w| w.upgrade().is_some());
+        self.gc_pending =
+            self.arr_handles.len() + self.obj_handles.iter().filter(|h| h.alive()).count();
+        self.gc_collecting = false;
+    }
+
     /// One edge into each array/closure reachable from `v` (through
     /// array cells and closure captures).
-    fn gc_scan_val(v: &Value, out: &mut Vec<Value>, depth: u8) {
+    fn gc_scan_val(v: &Value, out: &mut Vec<Value>, depth: u8, visited: &mut HashSet<usize>) {
         if depth == 0 {
             return;
         }
         match v {
             Value::Array(a) => {
                 out.push(v.clone());
-                for (_, c) in &a.borrow().entries {
-                    Self::gc_scan_val(&c.borrow(), out, depth - 1);
+                if visited.insert(Rc::as_ptr(a) as usize) {
+                    for (_, c) in &a.borrow().entries {
+                        Self::gc_scan_val(&c.borrow(), out, depth - 1, visited);
+                    }
                 }
             }
             Value::Callable(c) => {
                 out.push(v.clone());
-                for (_, cap, _) in &c.captures {
-                    Self::gc_scan_val(&cap.borrow(), out, depth - 1);
+                if visited.insert(Rc::as_ptr(c) as usize) {
+                    for (_, cap, _) in &c.captures {
+                        Self::gc_scan_val(&cap.borrow(), out, depth - 1, visited);
+                    }
                 }
             }
             _ => {}

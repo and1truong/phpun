@@ -3239,24 +3239,28 @@ impl<'a> Interp<'a> {
 
     fn push_handle(&mut self, w: ObjHandle) -> u64 {
         // Zend reuses the most recently freed handle first (its free
-        // list is a LIFO stack). Dtor-driven deaths are timestamped in
-        // `obj_died`; among silently-dead slots (stamp 0) the higher
-        // index approximates the fresher free (namespace_004, gh10168).
-        let n = self.obj_handles.len();
+        // list is a LIFO stack): `dead_slots` is that stack — deaths
+        // push their slot in `mark_obj_died`, allocation pops it.
+        // Silently-dead slots (no dtor ran) aren't stamped, so fall
+        // back to a bounded scan from the tail when the stack empties
+        // (namespace_004, gh10168).
         self.spawn_seq += 1;
         let mut best: Option<usize> = None;
-        for i in (0..n).rev() {
-            if self.obj_handles[i].alive() {
-                continue;
+        while let Some(i) = self.dead_slots.pop() {
+            if i < self.obj_handles.len()
+                && !self.obj_handles[i].alive()
+                && self.obj_died.get(i).copied().unwrap_or(0) != 0
+            {
+                best = Some(i);
+                break;
             }
-            match best {
-                None => best = Some(i),
-                Some(b) => {
-                    if self.obj_died.get(i).copied().unwrap_or(0)
-                        > self.obj_died.get(b).copied().unwrap_or(0)
-                    {
-                        best = Some(i);
-                    }
+        }
+        if best.is_none() {
+            let n = self.obj_handles.len();
+            for i in (0..n).rev().take(256) {
+                if !self.obj_handles[i].alive() {
+                    best = Some(i);
+                    break;
                 }
             }
         }
@@ -3282,9 +3286,10 @@ impl<'a> Interp<'a> {
     /// the next allocation reuses the most recently freed slot.
     pub(in crate::interp) fn mark_obj_died(&mut self, o: &Rc<RefCell<PhpObject>>) {
         let id = o.borrow().id as usize;
-        if id >= 1 && id <= self.obj_died.len() {
+        if id >= 1 && id <= self.obj_died.len() && self.obj_died[id - 1] == 0 {
             self.spawn_seq += 1;
             self.obj_died[id - 1] = self.spawn_seq;
+            self.dead_slots.push(id - 1);
         }
     }
 
