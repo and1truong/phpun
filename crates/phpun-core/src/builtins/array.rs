@@ -208,7 +208,16 @@ pub(crate) fn dispatch(
             _ => Value::Null,
         },
         "array_key_exists" | "key_exists" => {
-            let k = to_key(&arg(args, 0));
+            let kv = arg(args, 0);
+            // null names the function, not the offset (zend zpp quirk).
+            let k = if matches!(kv, Value::Null) {
+                it.deprecated_pub(
+                    "Using null as the key parameter for array_key_exists() is deprecated, use an empty string instead",
+                )?;
+                to_key(&kv)
+            } else {
+                it.arr_key(&kv)?
+            };
             match arg(args, 1) {
                 Value::Array(a) => Value::Bool(a.borrow().get_cell(&k).is_some()),
                 _ => Value::Bool(false),

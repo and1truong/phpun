@@ -1658,7 +1658,7 @@ impl<'a> Interp<'a> {
                     let key = match ke {
                         Some(ke) => {
                             let kv = self.eval(ke)?;
-                            self.destructure_key(&kv)?
+                            self.arr_key(&kv)?
                         }
                         None => ArrKey::Int(i as i64),
                     };

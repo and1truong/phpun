@@ -376,7 +376,7 @@ impl<'a> Interp<'a> {
                     .first()
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
-                let k = self.ao_dim_key(obj, &raw_k);
+                let k = self.ao_dim_key(obj, &raw_k)?;
                 // zend read_dimension(BP_VAR_W|RW) trips nApplyCount —
                 // `$o[k]=`, `$o[k][j]=`, `$o[k]++`, `=& $o[k]` inside a
                 // sort callback all error; plain reads don't.
@@ -426,7 +426,7 @@ impl<'a> Interp<'a> {
                     .first()
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
-                let k = self.ao_dim_key(obj, &raw_k);
+                let k = self.ao_dim_key(obj, &raw_k)?;
                 Value::Bool(arr.borrow().get(&k).is_some())
             }
             "offsetset" => {
@@ -504,7 +504,7 @@ impl<'a> Interp<'a> {
                         arr.borrow_mut().push(v)
                     }
                     Some(kv) => {
-                        let k = self.ao_dim_key(obj, &kv);
+                        let k = self.ao_dim_key(obj, &kv)?;
                         // Object-backed storage IS the prop table: a
                         // dim write drops a fresh zval into the prop
                         // bucket — even severing a referenced prop.
@@ -540,7 +540,7 @@ impl<'a> Interp<'a> {
                     .first()
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
-                let k = self.ao_dim_key(obj, &raw_k);
+                let k = self.ao_dim_key(obj, &raw_k)?;
                 arr.borrow_mut().unset(&k);
                 // Object-backed storage mirrors props — the unset
                 // removes the backing prop as well (spl backing has
@@ -1248,7 +1248,7 @@ impl<'a> Interp<'a> {
     /// prop "0"), so int buckets written by `[]=` stay unreachable.
     /// An SPL backing object resolves through its own storage table —
     /// canonical array keys again, not prop names.
-    fn ao_dim_key(&mut self, obj: &Rc<RefCell<PhpObject>>, kv: &Value) -> ArrKey {
+    fn ao_dim_key(&mut self, obj: &Rc<RefCell<PhpObject>>, kv: &Value) -> Result<ArrKey, PhpError> {
         let spl_src = self.ao_src_obj(obj).is_some_and(|src| {
             !Rc::ptr_eq(&src, obj)
                 && matches!(
@@ -1261,9 +1261,9 @@ impl<'a> Interp<'a> {
                 Value::Str(s) => crate::value::lossy(s).into_owned(),
                 other => other.to_php_string(),
             };
-            ArrKey::Str(Rc::from(name.as_str()))
+            Ok(ArrKey::Str(Rc::from(name.as_str())))
         } else {
-            to_key(kv)
+            self.arr_key(kv)
         }
     }
 

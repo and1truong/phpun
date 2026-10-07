@@ -883,16 +883,31 @@ impl<'a> Parser<'a> {
     /// declaration's line (first_class_callable_011,
     /// named_params/attributes_*).
     pub(in crate::parser) fn line_after_attr_group(&self) -> usize {
+        // The error surfaces mid-args — nested `]` from array literals
+        // inside the args would end a naive forward scan early. Walk
+        // back to the enclosing group's `#[` first so the forward scan
+        // starts outside any nested bracket (R6 #22).
         let mut i = self.pos;
+        let mut d = 0i32;
+        while i > 0 {
+            i -= 1;
+            match &self.toks[i].token {
+                Token::Op("]") => d += 1,
+                Token::Op("[") | Token::Op("#[") => d -= 1,
+                _ => {}
+            }
+            if d < 0 && matches!(self.toks[i].token, Token::Op("#[")) {
+                break;
+            }
+        }
+        // i now sits on the group's `#[` (or 0 if unbalanced). Scan
+        // forward past it: the first `]` at depth 0 ends the group —
+        // `[` literals inside args nest deeper, `(`/`)` don't matter.
+        i += 1;
         let mut d = 0i32;
         while i < self.toks.len() {
             match &self.toks[i].token {
-                Token::Op("(") | Token::Op("[") | Token::Op("#[") => d += 1,
-                Token::Op(")") => {
-                    if d > 0 {
-                        d -= 1;
-                    }
-                }
+                Token::Op("[") | Token::Op("#[") => d += 1,
                 Token::Op("]") => {
                     if d == 0 {
                         i += 1;
@@ -904,8 +919,33 @@ impl<'a> Parser<'a> {
             }
             i += 1;
         }
-        while self.toks.get(i).is_some_and(|t| t.token == Token::Op("]")) {
-            i += 1;
+        // Sibling `#[..]` groups follow — the attributed declaration's
+        // line sits past ALL of them (`#[A(bad)] #[B] class` reports
+        // the class line).
+        loop {
+            while self.toks.get(i).is_some_and(|t| t.token == Token::Op("]")) {
+                i += 1;
+            }
+            if self.toks.get(i).map(|t| &t.token) == Some(&Token::Op("#[")) {
+                i += 1;
+                let mut d = 0i32;
+                while i < self.toks.len() {
+                    match &self.toks[i].token {
+                        Token::Op("[") | Token::Op("#[") => d += 1,
+                        Token::Op("]") => {
+                            if d == 0 {
+                                i += 1;
+                                break;
+                            }
+                            d -= 1;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            break;
         }
         self.toks.get(i).map(|t| t.line).unwrap_or(0)
     }

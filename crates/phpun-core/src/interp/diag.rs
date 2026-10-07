@@ -37,7 +37,22 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// Any active suppression: `@`'s silence or an isset/empty/??
+    /// quiet read.
+    pub(in crate::interp) fn is_quiet(&self) -> bool {
+        self.silence > 0 || self.isset_quiet > 0
+    }
+
     pub(in crate::interp) fn warn(&mut self, msg: &str) -> Result<(), PhpError> {
+        if self.is_quiet() || self.error_level & 2 == 0 {
+            return Ok(());
+        }
+        self.emit_diag("Warning", 2, msg)
+    }
+
+    /// Bypass isset/empty/?? quiet — zend still surfaces offset-key
+    /// cast warnings there; only `@` silences them.
+    pub(in crate::interp) fn warn_ns(&mut self, msg: &str) -> Result<(), PhpError> {
         if self.silence > 0 || self.error_level & 2 == 0 {
             return Ok(());
         }
@@ -140,7 +155,7 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn notice(&mut self, msg: &str) -> Result<(), PhpError> {
-        if self.silence > 0 || self.error_level & 8 == 0 {
+        if self.is_quiet() || self.error_level & 8 == 0 {
             return Ok(());
         }
         self.emit_diag("Notice", 8, msg)
@@ -156,6 +171,14 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn deprecated(&mut self, msg: &str) -> Result<(), PhpError> {
+        if self.is_quiet() || self.error_level & 8192 == 0 {
+            return Ok(());
+        }
+        self.emit_diag("Deprecated", 8192, msg)
+    }
+
+    /// Bypass isset/empty/?? quiet — offset-key casts still emit.
+    pub(in crate::interp) fn deprecated_ns(&mut self, msg: &str) -> Result<(), PhpError> {
         if self.silence > 0 || self.error_level & 8192 == 0 {
             return Ok(());
         }

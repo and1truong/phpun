@@ -301,6 +301,11 @@ pub struct Interp<'a> {
     /// While >0, warnings are suppressed (implements `??`, `isset`,
     /// `empty`, `@`).
     silence: u32,
+    /// isset/empty/?? quiet reads — zend suppresses only the
+    /// undefined-family diagnostics there while OFFSET-KEY casts
+    /// still surface deprecations/warnings; `_ns` emitters bypass
+    /// this counter, `@`'s `silence` suppresses them all.
+    isset_quiet: u32,
     /// Cell returned by the last `&fn()` call (returnByReference tests).
     last_ret_cell: Option<Cell>,
     /// The object a write-context prop_cell resolved (lets `=&` reuse
@@ -884,6 +889,7 @@ impl<'a> Interp<'a> {
             uploads: Vec::new(),
             ob_stack: Vec::new(),
             silence: 0,
+            isset_quiet: 0,
             statics: HashMap::new(),
             static_decls: HashMap::new(),
             cur_unit_id: 0,
@@ -2117,6 +2123,7 @@ impl<'a> Interp<'a> {
         self.uploads.clear();
         self.ob_stack.clear();
         self.silence = 0;
+        self.isset_quiet = 0;
         self.pending_exception = None;
         self.call_trace.clear();
         self.deadline = None;
@@ -2282,7 +2289,7 @@ impl<'a> Interp<'a> {
             if let Some(c) = self.superglobal_cell(name) {
                 return Ok(c.borrow().clone());
             }
-            if self.silence == 0 {
+            if !self.is_quiet() {
                 self.warn(&format!("Undefined variable ${}", name))?;
             }
             return Ok(Value::Null);
@@ -2302,7 +2309,7 @@ impl<'a> Interp<'a> {
                             0,
                         ));
                     }
-                    if self.silence == 0 {
+                    if !self.is_quiet() {
                         self.warn(&format!("Undefined variable ${}", name))?;
                     }
                     Ok(Value::Null)

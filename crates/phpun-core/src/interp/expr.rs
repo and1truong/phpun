@@ -64,8 +64,7 @@ impl<'a> Interp<'a> {
                         match k {
                             Some(ke) => {
                                 let kv = self.eval(ke)?;
-                                self.check_offset_key(&kv)?;
-                                arr.bind_cell(to_key(&kv), c);
+                                arr.bind_cell(self.arr_key(&kv)?, c);
                             }
                             None => {
                                 let key = ArrKey::Int(arr.next);
@@ -79,9 +78,8 @@ impl<'a> Interp<'a> {
                     match k {
                         Some(ke) => {
                             let kv = self.eval(ke)?;
-                            self.check_offset_key(&kv)?;
                             let val = self.eval(v)?;
-                            arr.set(to_key(&kv), val);
+                            arr.set(self.arr_key(&kv)?, val);
                         }
                         None => {
                             // `...$it` spread: int keys renumber
@@ -135,7 +133,7 @@ impl<'a> Interp<'a> {
             Expr::PostInc(t) => self.incdec(t, 1, true),
             Expr::PostDec(t) => self.incdec(t, -1, true),
             Expr::Isset(args) => {
-                self.silence += 1;
+                self.isset_quiet += 1;
                 let mut ok = true;
                 for a in args {
                     match self.isset_val_mode(a, 0) {
@@ -145,18 +143,18 @@ impl<'a> Interp<'a> {
                             break;
                         }
                         Err(e) => {
-                            self.silence -= 1;
+                            self.isset_quiet -= 1;
                             return Err(e);
                         }
                     }
                 }
-                self.silence -= 1;
+                self.isset_quiet -= 1;
                 Ok(Value::Bool(ok))
             }
             Expr::Empty(e) => {
-                self.silence += 1;
+                self.isset_quiet += 1;
                 let v = self.isset_val_mode(e, 1);
-                self.silence -= 1;
+                self.isset_quiet -= 1;
                 match v {
                     Ok(Some(v)) => Ok(Value::Bool(!v.is_truthy())),
                     Ok(None) => Ok(Value::Bool(true)),
@@ -744,9 +742,9 @@ impl<'a> Interp<'a> {
                 // throw on uninitialized typed properties. The base
                 // chains through isset semantics — absent segments
                 // short-circuit without __get (bug71359).
-                self.silence += 1;
+                self.isset_quiet += 1;
                 let base = self.isset_val_mode(e, 2);
-                self.silence -= 1;
+                self.isset_quiet -= 1;
                 let base = match base {
                     Ok(Some(b)) => b,
                     Ok(None) => return Ok(None),
@@ -770,7 +768,7 @@ impl<'a> Interp<'a> {
                     self.check_offset_key(&key)?;
                 }
                 match base {
-                    Value::Array(a) => Ok(match a.borrow().get(&to_key(&key)) {
+                    Value::Array(a) => Ok(match a.borrow().get(&self.arr_key(&key)?) {
                         Some(v) => match v {
                             Value::Null => None,
                             _ => Some(v.clone()),
@@ -778,7 +776,31 @@ impl<'a> Interp<'a> {
                         None => None,
                     }),
                     Value::Str(s) => {
-                        let i = key.to_int();
+                        // isset/empty on a string offset cast like a
+                        // read but emit zend's float→int deprecation
+                        // (not 'String offset cast occurred'); ?? stays
+                        // silent. A string key resolves only as a
+                        // leading int offset.
+                        let i = match &key {
+                            Value::Float(f)
+                                if mode != 2
+                                    && f.fract() != 0.0
+                                    && f.is_finite()
+                                    && *f < i64::MAX as f64
+                                    && *f > i64::MIN as f64 =>
+                            {
+                                self.deprecated_ns(&format!(
+                                    "Implicit conversion from float {} to int loses precision",
+                                    Value::Float(*f).to_php_string()
+                                ))?;
+                                *f as i64
+                            }
+                            Value::Str(ks) => match Self::str_off_key(ks) {
+                                StrOffKey::Int(i) => i,
+                                _ => return Ok(None),
+                            },
+                            _ => key.to_int(),
+                        };
                         Ok(if i >= 0 && (i as usize) < s.len() {
                             Some(Value::bytes(vec![s[i as usize]]))
                         } else {
@@ -904,9 +926,9 @@ impl<'a> Interp<'a> {
                                 if mode == 0 {
                                     return Ok(Some(Value::Bool(true)));
                                 }
-                                self.silence += 1;
+                                self.isset_quiet += 1;
                                 let v = self.prop_read_value(ov.clone(), &pn, false);
-                                self.silence -= 1;
+                                self.isset_quiet -= 1;
                                 return match v {
                                     Ok(v) => Ok(if matches!(v, Value::Null) {
                                         None
@@ -937,9 +959,9 @@ impl<'a> Interp<'a> {
                     }
                 }
                 self.check_prop_name(&pn)?;
-                self.silence += 1;
+                self.isset_quiet += 1;
                 let v = self.prop_read_value(ov.clone(), &pn, *nullsafe);
-                self.silence -= 1;
+                self.isset_quiet -= 1;
                 match v {
                     Ok(v) => Ok(if matches!(v, Value::Null) {
                         None
@@ -1302,6 +1324,11 @@ impl<'a> Interp<'a> {
             }
         }
         let mut late = Late::None;
+        // `??=` on an index target rooted at an UNDEFINED var must not
+        // materialize it — zend's isset check leaves it missing so the
+        // RHS read warns 'Undefined variable' (assign_coalesce_007).
+        // The base is a detached Null cell re-resolved at write time.
+        let mut undef_root: Option<String> = None;
         // Dynamic-prop slots materialized below record themselves so
         // the read side can replay zend's 'Undefined property' warns.
         self.fresh_dyn_props.clear();
@@ -1366,7 +1393,17 @@ impl<'a> Interp<'a> {
                     base = e;
                 }
                 dims.reverse();
-                let c = self.eval_cell(base)?;
+                let c = if op == "??=" {
+                    match base {
+                        Expr::Var(n) if self.var_cell_opt(n).is_none() => {
+                            undef_root = Some(n.clone());
+                            cell(Value::Null)
+                        }
+                        _ => self.eval_cell(base)?,
+                    }
+                } else {
+                    self.eval_cell(base)?
+                };
                 let mut keys = Vec::with_capacity(dims.len());
                 for d in dims {
                     match d {
@@ -1443,11 +1480,11 @@ impl<'a> Interp<'a> {
                                     None => String::new(),
                                 };
                                 if $quiet {
-                                    self.silence += 1;
+                                    self.isset_quiet += 1;
                                 }
                                 let c = self.prop_read_value(ov.clone(), &pn, false);
                                 if $quiet {
-                                    self.silence -= 1;
+                                    self.isset_quiet -= 1;
                                     c.unwrap_or(Value::Null)
                                 } else {
                                     // Compound reads propagate real
@@ -1459,11 +1496,11 @@ impl<'a> Interp<'a> {
                             }
                             Late::PropStr { ov, pn } if matches!(ov, Value::Object(_)) => {
                                 if $quiet {
-                                    self.silence += 1;
+                                    self.isset_quiet += 1;
                                 }
                                 let c = self.prop_read_value(ov.clone(), pn, false);
                                 if $quiet {
-                                    self.silence -= 1;
+                                    self.isset_quiet -= 1;
                                     c.unwrap_or(Value::Null)
                                 } else {
                                     c?
@@ -1491,11 +1528,11 @@ impl<'a> Interp<'a> {
                                     Value::Null
                                 } else {
                                     if $quiet {
-                                        self.silence += 1;
+                                        self.isset_quiet += 1;
                                     }
                                     let c = self.eval(target);
                                     if $quiet {
-                                        self.silence -= 1;
+                                        self.isset_quiet -= 1;
                                     }
                                     c.unwrap_or(Value::Null)
                                 }
@@ -1567,7 +1604,7 @@ impl<'a> Interp<'a> {
                             match &*b {
                                 Value::Array(rc) => k
                                     .as_ref()
-                                    .map(|kc| to_key(&kc.borrow()))
+                                    .map(|kc| self.arr_key(&kc.borrow()).unwrap_or(ArrKey::Tomb))
                                     .and_then(|ak| rc.borrow().get_cell(&ak)),
                                 _ => None,
                             }
@@ -1706,10 +1743,10 @@ impl<'a> Interp<'a> {
                         if append {
                             arr.push(newv.clone());
                         } else {
-                            let key = key
-                                .as_ref()
-                                .map(|k| to_key(&k.borrow()))
-                                .unwrap_or(to_key(&newv));
+                            let key = match key.as_ref() {
+                                Some(k) => self.arr_key(&k.borrow())?,
+                                None => to_key(&newv),
+                            };
                             arr.set(key, newv.clone());
                         }
                     }
@@ -1747,6 +1784,13 @@ impl<'a> Interp<'a> {
                 *c.borrow_mut() = nv;
             }
             Late::Keyed { base, keys } => {
+                // A `??=` detached root re-resolves AFTER the RHS — the
+                // RHS may have created the var (`$a[0] ??= ($a = [5])`),
+                // else this finally materializes it for the write.
+                let base = match undef_root.take() {
+                    Some(n) => self.var_cell(&n),
+                    None => base.clone(),
+                };
                 newv = self.assign_index_path(base, &keys, newv, needs_read)?;
             }
             Late::None => match target_cell {
@@ -1879,7 +1923,7 @@ impl<'a> Interp<'a> {
                     Value::Null => {
                         let mut arr = PhpArray::new();
                         match &key {
-                            Some(k) => arr.bind_cell(to_key(k), src),
+                            Some(k) => arr.bind_cell(self.arr_key(k)?, src),
                             None => arr.bind_cell(ArrKey::Int(arr.next), src),
                         }
                         *b = Value::Array(Rc::new(RefCell::new(arr)));
@@ -1892,7 +1936,7 @@ impl<'a> Interp<'a> {
                             .unwrap_or(false);
                         let mut arr = rc.borrow_mut();
                         match &key {
-                            Some(k) => arr.bind_cell(to_key(k), src.clone()),
+                            Some(k) => arr.bind_cell(self.arr_key(k)?, src.clone()),
                             None => {
                                 let k = ArrKey::Int(arr.next);
                                 arr.bind_cell(k, src.clone());
@@ -2328,7 +2372,7 @@ impl<'a> Interp<'a> {
             let (key, keyv) = match ke {
                 Some(ke) => {
                     let kv = self.eval(ke)?;
-                    (self.destructure_key(&kv)?, kv)
+                    (self.arr_key(&kv)?, kv)
                 }
                 None => (ArrKey::Int(i as i64), Value::Int(i as i64)),
             };
@@ -3112,9 +3156,11 @@ impl<'a> Interp<'a> {
                         // index; keys with no leading int are the
                         // TypeError (probe4d, bug19943).
                         if let Some(kc) = k.as_ref() {
-                            if let Value::Str(ks) = &*kc.borrow() {
-                                match Self::str_off_key(ks) {
+                            let kb = kc.borrow();
+                            match &*kb {
+                                Value::Str(ks) => match Self::str_off_key(ks) {
                                     StrOffKey::Bad => {
+                                        drop(kb);
                                         return self.fail(PhpError::uncaught(
                                             "TypeError",
                                             "Cannot access offset of type string on string",
@@ -3122,13 +3168,20 @@ impl<'a> Interp<'a> {
                                         ));
                                     }
                                     StrOffKey::Junk(_) => {
-                                        self.warn(&format!(
+                                        let m = format!(
                                             "Illegal string offset \"{}\"",
                                             crate::value::lossy(ks)
-                                        ))?;
+                                        );
+                                        drop(kb);
+                                        self.warn(&m)?;
                                     }
                                     StrOffKey::Int(_) => {}
+                                },
+                                Value::Bool(_) | Value::Float(_) => {
+                                    drop(kb);
+                                    self.warn_ns("String offset cast occurred")?;
                                 }
+                                _ => {}
                             }
                         }
                         // String offset write (final level only).
@@ -3307,7 +3360,10 @@ impl<'a> Interp<'a> {
                         {
                             (Step::Stop, None)
                         } else {
-                            let key = k.as_ref().map(|kc| to_key(&kc.borrow()));
+                            let key = match k.as_ref() {
+                                Some(kc) => Some(self.arr_key(&kc.borrow())?),
+                                None => None,
+                            };
                             match key {
                                 Some(ArrKey::Int(_)) | Some(ArrKey::Str(_)) => {
                                     let key = key.unwrap();
@@ -3331,9 +3387,11 @@ impl<'a> Interp<'a> {
                         } else {
                             (
                                 Step::Missing,
-                                k.as_ref()
-                                    .map(|kc| to_key(&kc.borrow()))
-                                    .filter(|k| !matches!(k, ArrKey::Tomb)),
+                                match k.as_ref() {
+                                    Some(kc) => Some(self.arr_key(&kc.borrow())?),
+                                    None => None,
+                                }
+                                .filter(|k| !matches!(k, ArrKey::Tomb)),
                             )
                         }
                     }
@@ -3352,10 +3410,19 @@ impl<'a> Interp<'a> {
                                 StrOffKey::Bad => (None, None),
                             },
                             Some(Value::Int(i)) => (Some(*i), None),
+                            Some(v @ (Value::Bool(_) | Value::Float(_))) => {
+                                // The compound op throws next — the
+                                // offset cast still warns first.
+                                (Some(v.to_int()), Some("".into()))
+                            }
                             _ => (None, None),
                         };
                         if let Some(jn) = junk {
-                            self.warn(&format!("Illegal string offset \"{}\"", jn))?;
+                            if jn.is_empty() {
+                                self.warn_ns("String offset cast occurred")?;
+                            } else {
+                                self.warn(&format!("Illegal string offset \"{}\"", jn))?;
+                            }
                         }
                         match (n + 1 == keys.len(), idx) {
                             (true, Some(i)) => {
@@ -3443,7 +3510,7 @@ impl<'a> Interp<'a> {
             Expr::Var(n) => match self.var_lookup(n) {
                 Some(c) => Ok(Some(c)),
                 None => {
-                    if self.silence == 0 {
+                    if !self.is_quiet() {
                         self.warn(&format!("Undefined variable ${}", n))?;
                     }
                     Ok(Some(cell(Value::Null)))
@@ -3455,7 +3522,7 @@ impl<'a> Interp<'a> {
                 match self.var_lookup(&name) {
                     Some(c) => Ok(Some(c)),
                     None => {
-                        if self.silence == 0 {
+                        if !self.is_quiet() {
                             self.warn(&format!("Undefined variable ${}", name))?;
                         }
                         Ok(Some(cell(Value::Null)))
@@ -3509,12 +3576,14 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    /// Keyed-destructure key validation — zend runs the same offset
-    /// checks as a dim read on the key expr's value: array/object keys
-    /// are a TypeError ('Cannot access offset of type K on array'),
-    /// float truncates with Deprecated, null is Deprecated, and a
-    /// resource warns and casts to its id int (m9 vs silent to_key).
-    pub(in crate::interp) fn destructure_key(&mut self, v: &Value) -> Result<ArrKey, PhpError> {
+    /// `$a[$k]` key coercion — zend runs the same offset cast at every
+    /// implicit array-key site (reads, writes, isset, unset, literals,
+    /// SPL dims): array/object keys are a TypeError ('Cannot access
+    /// offset of type K on array'), an in-range fractional float
+    /// truncates with Deprecated, an out-of-range float warns 'not
+    /// representable' (NaN emits both), null is Deprecated, and a
+    /// resource warns and casts to its id int.
+    pub(crate) fn arr_key(&mut self, v: &Value) -> Result<ArrKey, PhpError> {
         match v {
             Value::Array(_) | Value::Object(_) | Value::Callable(_) => {
                 let tn = Self::illegal_offset_ty(v).unwrap();
@@ -3525,21 +3594,44 @@ impl<'a> Interp<'a> {
                 ))
             }
             Value::Float(f) => {
-                self.deprecated(&format!(
-                    "Implicit conversion from float {} to int loses precision",
-                    Value::Float(*f).to_php_string()
-                ))?;
+                if !f.is_finite() || *f >= i64::MAX as f64 || *f < i64::MIN as f64 {
+                    let mut werr = None;
+                    let i = coerce_float(*f, |m| {
+                        if let Err(e) = self.warn_ns(m) {
+                            werr = Some(e);
+                        }
+                    });
+                    if let Some(e) = werr {
+                        return Err(e);
+                    }
+                    // NaN is the only non-finite zend also flags for
+                    // precision loss ('Implicit conversion from float
+                    // NAN to int loses precision').
+                    if f.is_nan() {
+                        self.deprecated_ns(&format!(
+                            "Implicit conversion from float {} to int loses precision",
+                            Value::Float(*f).to_php_string()
+                        ))?;
+                    }
+                    return Ok(ArrKey::Int(i));
+                }
+                if f.fract() != 0.0 {
+                    self.deprecated_ns(&format!(
+                        "Implicit conversion from float {} to int loses precision",
+                        Value::Float(*f).to_php_string()
+                    ))?;
+                }
                 Ok(to_key(v))
             }
             Value::Null => {
-                self.deprecated(
+                self.deprecated_ns(
                     "Using null as an array offset is deprecated, use an empty string instead",
                 )?;
                 Ok(to_key(v))
             }
             Value::Resource(r) => {
                 let id = r.borrow().id();
-                self.warn(&format!(
+                self.warn_ns(&format!(
                     "Resource ID#{} used as offset, casting to integer ({})",
                     id, id
                 ))?;
@@ -3573,7 +3665,7 @@ impl<'a> Interp<'a> {
                     Value::Null => {
                         let mut arr = PhpArray::new();
                         match key {
-                            Some(k) => arr.set(to_key(&k), v),
+                            Some(k) => arr.set(self.arr_key(&k)?, v),
                             None => arr.push(v),
                         }
                         *b = Value::Array(Rc::new(RefCell::new(arr)));
@@ -3596,7 +3688,7 @@ impl<'a> Interp<'a> {
                         drop(b);
                         let mut arr = rc.borrow_mut();
                         match key {
-                            Some(k) => arr.set(to_key(&k), v),
+                            Some(k) => arr.set(self.arr_key(&k)?, v),
                             None => arr.push(v),
                         }
                     }
@@ -3604,6 +3696,11 @@ impl<'a> Interp<'a> {
                         let mut bytes = s.to_vec();
                         match key {
                             Some(k) => {
+                                // zend warns once per non-int scalar
+                                // key cast on a string offset.
+                                if matches!(k, Value::Bool(_) | Value::Float(_)) {
+                                    self.warn_ns("String offset cast occurred")?;
+                                }
                                 // PHP 8: negative offsets index from the
                                 // end; beyond -len is illegal (bug22592).
                                 let orig = k.to_int();
@@ -3662,6 +3759,11 @@ impl<'a> Interp<'a> {
                             if let Value::Str(s) = &mut *b {
                                 let vs = self.conv_bytes(&v).unwrap_or_default();
                                 let mut bytes = s.to_vec();
+                                if let Some(k) = key.as_ref() {
+                                    if matches!(k, Value::Bool(_) | Value::Float(_)) {
+                                        self.warn_ns("String offset cast occurred")?;
+                                    }
+                                }
                                 let orig = key
                                     .as_ref()
                                     .map(|k| k.to_int())
@@ -3809,7 +3911,7 @@ impl<'a> Interp<'a> {
             };
             drop(b);
             let key = match key {
-                Some(k) => to_key(&k),
+                Some(k) => self.arr_key(&k)?,
                 None => {
                     let mut arr = rc.borrow_mut();
                     let k = ArrKey::Int(arr.next);
@@ -4005,7 +4107,7 @@ impl<'a> Interp<'a> {
         }
         match base {
             Value::Array(rc) => {
-                let k = to_key(&key);
+                let k = self.arr_key(&key)?;
                 let arr = rc.borrow();
                 match arr.get(&k) {
                     Some(v) => Ok(v),
@@ -4014,7 +4116,7 @@ impl<'a> Interp<'a> {
                             Value::Str(s) => format!("\"{}\"", crate::value::lossy(s)),
                             other => other.to_php_string(),
                         };
-                        if self.silence == 0 {
+                        if !self.is_quiet() {
                             self.warn(&format!("Undefined array key {}", shown))?;
                         }
                         Ok(Value::Null)
@@ -4050,7 +4152,14 @@ impl<'a> Interp<'a> {
                             ));
                         }
                     }
-                    _ => key.to_int(),
+                    k => {
+                        // bool/float keys on a string offset warn once
+                        // per cast (null is a silent offset 0).
+                        if matches!(k, Value::Bool(_) | Value::Float(_)) {
+                            self.warn_ns("String offset cast occurred")?;
+                        }
+                        k.to_int()
+                    }
                 };
                 let bytes: &[u8] = &s[..];
                 let idx = if idx < 0 {
@@ -4059,7 +4168,7 @@ impl<'a> Interp<'a> {
                     idx
                 };
                 if idx < 0 || idx as usize >= bytes.len() {
-                    if self.silence == 0 {
+                    if !self.is_quiet() {
                         self.warn(&format!("Uninitialized string offset {}", key.to_int()))?;
                     }
                     Ok(Value::Null)
@@ -4068,7 +4177,7 @@ impl<'a> Interp<'a> {
                 }
             }
             Value::Null => {
-                if self.silence == 0 {
+                if !self.is_quiet() {
                     // PHP 8.5 dropped "value of type" from this message
                     // (bug25922, passByReference_003).
                     self.warn("Trying to access array offset on null")?;
@@ -4097,7 +4206,7 @@ impl<'a> Interp<'a> {
                 ))
             }
             _ => {
-                if self.silence == 0 {
+                if !self.is_quiet() {
                     // PHP 8.5 names the scalar itself: int/float/null and
                     // the literal true|false (no "value of type").
                     let what = match &base {
@@ -4150,7 +4259,7 @@ impl<'a> Interp<'a> {
                 Expr::Var(name) => match self.var_cell_opt(name) {
                     Some(c) => Some(c),
                     None => {
-                        if self.silence == 0 {
+                        if !self.is_quiet() {
                             self.warn(&format!("Undefined variable ${}", name))?;
                         }
                         // missing var → whole unset no-ops (below)
@@ -4218,7 +4327,7 @@ impl<'a> Interp<'a> {
                         Some(ie) => self.eval(ie)?,
                         None => Value::Null,
                     };
-                    let next = match cur_arr.borrow().get_cell(&to_key(&kv)) {
+                    let next = match cur_arr.borrow().get_cell(&self.arr_key(&kv)?) {
                         Some(cc) => {
                             let mut b = cc.borrow_mut();
                             // The fetched array may alias other slots
@@ -4257,11 +4366,12 @@ impl<'a> Interp<'a> {
                         return self.fail(e);
                     }
                     if let Some(k) = &key {
-                        cur_arr.borrow_mut().unset(&to_key(k));
+                        let ak = self.arr_key(k)?;
+                        cur_arr.borrow_mut().unset(&ak);
                     }
                     return Ok(());
                 }
-                if self.silence == 0 {
+                if !self.is_quiet() {
                     let cn = o.borrow().class.name().to_string();
                     self.notice(&format!(
                         "Indirect modification of overloaded element of {} has no effect",
@@ -4307,18 +4417,18 @@ impl<'a> Interp<'a> {
                     _ => unreachable!(),
                 };
                 drop(b);
-                let found = rc.borrow().get_cell(&to_key(&key));
+                let found = rc.borrow().get_cell(&self.arr_key(&key)?);
                 Ok(found)
             }
             Value::Null => Ok(None),
             Value::Object(o) => {
                 if matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. })) {
                     let arr = self.ao_arr(&o);
-                    let found = arr.borrow().get_cell(&to_key(&key));
+                    let found = arr.borrow().get_cell(&self.arr_key(&key)?);
                     match found {
                         Some(cc) => Ok(Some(cc)),
                         None => {
-                            if self.silence == 0 {
+                            if !self.is_quiet() {
                                 let cn = o.borrow().class.name().to_string();
                                 self.notice(&format!(
                                     "Indirect modification of overloaded element of {} has no effect",
@@ -4333,7 +4443,7 @@ impl<'a> Interp<'a> {
                     // Non-lvalue offsetGet: zend notices the indirect
                     // modification is lost, then keeps descending into
                     // the temporary (later dims may still throw).
-                    if !self.is_ref_cell(&cc) && self.silence == 0 {
+                    if !self.is_ref_cell(&cc) && !self.is_quiet() {
                         let cn = o.borrow().class.name().to_string();
                         self.notice(&format!(
                             "Indirect modification of overloaded element of {} has no effect",
@@ -4384,8 +4494,8 @@ impl<'a> Interp<'a> {
                     // unsets on its own copy of getArguments()).
                     self.cow_split(&mut b);
                     if let (Value::Array(rc), Some(k)) = (&*b, &key) {
-                        let k = to_key(k);
-                        rc.borrow_mut().unset(&k);
+                        let ak = self.arr_key(k)?;
+                        rc.borrow_mut().unset(&ak);
                     }
                     return Ok(());
                 }
@@ -5467,6 +5577,29 @@ impl<'a> Interp<'a> {
                 if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
                     return Ok(Value::bytes(bitwise_str(op, a, b)));
                 }
+                // Zend's bitwise ops take the object-operator path when
+                // either operand is an object: the error names the
+                // OBJECT first and no scalar coercion/warning on the
+                // other operand ever runs ('1 & obj' → 'stdClass & int').
+                if matches!(l, Value::Object(_) | Value::Callable(_))
+                    || matches!(r, Value::Object(_) | Value::Callable(_))
+                {
+                    let (a, b) = if matches!(l, Value::Object(_) | Value::Callable(_)) {
+                        (&l, &r)
+                    } else {
+                        (&r, &l)
+                    };
+                    return self.fail(PhpError::uncaught(
+                        "TypeError",
+                        format!(
+                            "Unsupported operand types: {} {} {}",
+                            a.operand_type_name(),
+                            op,
+                            b.operand_type_name()
+                        ),
+                        0,
+                    ));
+                }
                 let li = match self.bit_operand(op, &l, &r, false) {
                     Ok(i) => i,
                     Err(e) => return self.fail(e),
@@ -5526,6 +5659,31 @@ impl<'a> Interp<'a> {
             }
         }
 
+        // `%` coerces each operand to int LEFT-to-RIGHT — the left's
+        // float deprecation fires before the right's type check
+        // ('1.5 % "x"' deprecates then 'float % string'), and a bad
+        // left operand short-circuits the right's conversion
+        // ('"x" % 1.5' throws 'string % float', no deprecation).
+        if op == "%" {
+            let a = match self.bit_operand(op, &l, &r, false) {
+                Ok(i) => i,
+                Err(e) => return self.fail(e),
+            };
+            let b = match self.bit_operand(op, &r, &l, true) {
+                Ok(i) => i,
+                Err(e) => return self.fail(e),
+            };
+            if b == 0 {
+                return self.fail(PhpError::uncaught(
+                    "DivisionByZeroError",
+                    "Modulo by zero",
+                    0,
+                ));
+            }
+            // i64::MIN % -1 is 0 in PHP (no overflow panic).
+            return Ok(Value::Int(a.wrapping_rem(b)));
+        }
+
         let (ln, warn_l) = self.num(&l);
         let (rn, warn_r) = self.num(&r);
         if warn_l {
@@ -5568,47 +5726,6 @@ impl<'a> Interp<'a> {
                     },
                     (a, b) => Value::Float(a.to_float() / b.to_float()),
                 }
-            }
-            "%" => {
-                let a = match ln {
-                    Num::I(i) => i,
-                    Num::F(f) => {
-                        let mut werr = None;
-                        let i = coerce_float(f, |m| {
-                            if let Err(e) = self.warn(m) {
-                                werr = Some(e);
-                            }
-                        });
-                        if let Some(e) = werr {
-                            return Err(e);
-                        }
-                        i
-                    }
-                };
-                let b = match rn {
-                    Num::I(i) => i,
-                    Num::F(f) => {
-                        let mut werr = None;
-                        let i = coerce_float(f, |m| {
-                            if let Err(e) = self.warn(m) {
-                                werr = Some(e);
-                            }
-                        });
-                        if let Some(e) = werr {
-                            return Err(e);
-                        }
-                        i
-                    }
-                };
-                if b == 0 {
-                    return self.fail(PhpError::uncaught(
-                        "DivisionByZeroError",
-                        "Modulo by zero",
-                        0,
-                    ));
-                }
-                // i64::MIN % -1 is 0 in PHP (no overflow panic).
-                Value::Int(a.wrapping_rem(b))
             }
             "**" => match (&ln, &rn) {
                 // int ** int (exp >= 0) stays int when it fits
@@ -5658,8 +5775,8 @@ impl<'a> Interp<'a> {
         other: &Value,
         swapped: bool,
     ) -> Result<i64, PhpError> {
-        // 'Unsupported operand types' always prints in source order —
-        // for the right-operand check the args arrive swapped.
+        // 'Unsupported operand types' prints in source order — for the
+        // right-operand check the args arrive swapped.
         let operand_err = |v: &Value, other: &Value| {
             let (a, b) = if swapped { (other, v) } else { (v, other) };
             PhpError::uncaught(

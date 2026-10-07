@@ -1550,7 +1550,7 @@ impl<'a> Interp<'a> {
                 Ok(Value::Null)
             }
             other => {
-                if self.silence == 0 {
+                if !self.is_quiet() {
                     // zend names scalar types by their zval name —
                     // 'on int', never 'on integer' (probe4j).
                     let t = self.zval_type_name(&other);
