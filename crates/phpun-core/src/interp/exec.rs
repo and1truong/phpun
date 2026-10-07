@@ -28,13 +28,21 @@ impl<'a> Interp<'a> {
             let limit = self.ini_bytes("memory_limit");
             if limit > 0 && self.mem_used as i64 > limit {
                 self.mem_exceeded = true;
-                return self.err_flow(PhpError::fatal(
+                // zend's bailout backtraces the allocating call —
+                // oom_at captured it inside mem_charge.
+                let (line, frames) = self
+                    .oom_at
+                    .clone()
+                    .unwrap_or((self.cur_line, self.fatal_frames()));
+                let mut e = PhpError::fatal(
                     format!(
                         "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
                         limit, self.mem_last
                     ),
-                    self.cur_line,
-                ));
+                    line,
+                );
+                e.trace = Some(frames);
+                return self.err_flow(e);
             }
             if let Some(d) = self.deadline {
                 if std::time::Instant::now() > d {

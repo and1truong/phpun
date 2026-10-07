@@ -102,6 +102,8 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
+                // zend: HashTable alloc + one bucket per element.
+                self.mem_charge(96 + 32 * items.len() as u64);
                 Ok(Value::Array(Rc::new(RefCell::new(arr))))
             }
             Expr::ByRef(e) => {
@@ -2882,6 +2884,8 @@ impl<'a> Interp<'a> {
                             None => arr.push(v),
                         }
                         *b = Value::Array(Rc::new(RefCell::new(arr)));
+                        // zend: new HashTable + first bucket.
+                        self.mem_charge(128);
                     }
                     Value::Array(_) => {
                         // CoW: shared arrays get replaced wholesale by callers
@@ -2897,6 +2901,8 @@ impl<'a> Interp<'a> {
                                 None => arr.push(v),
                             }
                         }
+                        // zend: bucket + amortized arData growth.
+                        self.mem_charge(32);
                     }
                     Value::Str(_) => {
                         let mut bytes = match &*b {

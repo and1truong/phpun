@@ -131,6 +131,7 @@ fn run_script(args: &[String]) -> ExitCode {
     let mut code: Option<String> = None;
     let mut ini: Vec<String> = Vec::new();
     let mut script_args: Vec<String> = Vec::new();
+    let mut no_ini = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].clone();
@@ -168,7 +169,10 @@ fn run_script(args: &[String]) -> ExitCode {
                     print_version();
                     return ExitCode::SUCCESS;
                 }
-                "no-php-ini" => i += 1,
+                "no-php-ini" => {
+                    no_ini = true;
+                    i += 1;
+                }
                 "php-ini" => match inline {
                     Some(_) => i += 1,
                     None if i + 1 < args.len() => i += 2,
@@ -184,10 +188,14 @@ fn run_script(args: &[String]) -> ExitCode {
             continue;
         }
         match a.as_str() {
-            // Flags zend accepts and ignores here (`-n` skips ini
-            // loading — we have none anyway; `-q`/`-e`/`-H` are
-            // CGI-era/debugger no-ops).
-            "-n" | "-q" | "-e" | "-H" => i += 1,
+            // `-n` skips ini loading — zend falls back to compiler
+            // defaults (log_errors=0); `-q`/`-e`/`-H` are
+            // CGI-era/debugger no-ops.
+            "-n" => {
+                no_ini = true;
+                i += 1;
+            }
+            "-q" | "-e" | "-H" => i += 1,
             "-h" => {
                 print!("{}", ZEND_USAGE);
                 return ExitCode::SUCCESS;
@@ -278,6 +286,11 @@ fn run_script(args: &[String]) -> ExitCode {
         _ => label.to_string(),
     };
     let mut it = Interp::new(&abs);
+    // `-n`/`--no-php-ini`: zend falls back to compiler ini defaults —
+    // log_errors off, so the 'PHP Fatal error' stderr copy vanishes.
+    if no_ini {
+        it.ini.insert("log_errors".into(), "0".into());
+    }
     // CLI PHP sets the script-path SERVER vars to the path AS INVOKED
     // (`php console.php` shows "console.php"), unlike __FILE__ which is
     // always canonical. `-r`/stdin code sets SCRIPT_FILENAME to "" and

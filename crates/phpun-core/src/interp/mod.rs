@@ -712,6 +712,10 @@ pub struct Interp<'a> {
     /// Raised once the memory_limit fatal fired — buffers are dropped
     /// at shutdown instead of flushed (bug45392).
     pub mem_exceeded: bool,
+    /// Call site (line + rendered backtrace) where mem_used first
+    /// crossed memory_limit — zend's OOM bailout reports the
+    /// allocating call, not the stmt boundary that raises the fatal.
+    oom_at: Option<(usize, Vec<String>)>,
     /// Execution deadline set by set_time_limit/hard_timeout (045).
     deadline: Option<std::time::Instant>,
     /// Seconds figure for the 'Maximum execution time' message.
@@ -1367,6 +1371,7 @@ impl<'a> Interp<'a> {
             mem_used: 0,
             mem_last: 0,
             mem_exceeded: false,
+            oom_at: None,
             deadline: None,
             deadline_secs: 0,
             ini: HashMap::from([
@@ -3101,13 +3106,30 @@ impl<'a> Interp<'a> {
         self.emit_bytes(s.as_bytes());
     }
 
+    /// Zend's emalloc charge: heap allocations (objects, array
+    /// buckets, output bytes) accrue into `mem_used` so memory_limit
+    /// fires at the next statement boundary (bug45392). `mem_last`
+    /// feeds the fatal's 'tried to allocate N bytes'.
+    pub fn mem_charge(&mut self, n: u64) {
+        self.mem_used += n;
+        self.mem_last = n;
+        // First crossing remembers the allocating call site — zend's
+        // OOM bailout backtraces from inside that call, while the
+        // fatal itself raises at the next statement boundary.
+        if self.oom_at.is_none() {
+            let limit = self.ini_bytes("memory_limit");
+            if limit > 0 && self.mem_used as i64 > limit {
+                self.oom_at = Some((self.cur_line, self.fatal_frames()));
+            }
+        }
+    }
+
     /// Byte-faithful emit — program output is bytes (echo of binary
     /// strings, file reads, preg results must not be UTF-8 validated).
     pub fn emit_bytes(&mut self, b: &[u8]) {
         // memory_limit>0 turns into a deferred fatal once accumulated
         // writes pass it (bug45392); checked at the next statement.
-        self.mem_used += b.len() as u64;
-        self.mem_last = b.len() as u64;
+        self.mem_charge(b.len() as u64);
         // Inside a generator run, output after a yield is deferred to
         // resume — `f(yield)` must not observe the call (nor its echo)
         // until the consumer advances past that yield.
