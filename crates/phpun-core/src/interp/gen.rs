@@ -1615,17 +1615,30 @@ impl<'a> Interp<'a> {
                         // delegate's own method instead of next().
                         let base = self.gen_collect_base.unwrap_or(0);
                         let outer_idx = base + out.len() - 1;
+                        // Injection methods exist only on Generator —
+                        // a plain Iterator delegate has no send()/throw():
+                        // zend falls back to next() for send(), and
+                        // surfaces a throw() at the outer's own
+                        // yield-from instead of calling the delegate.
+                        let delegate_is_gen = matches!(
+                            o.borrow().internal,
+                            Some(crate::value::ObjectInternal::Generator(_))
+                        );
                         let injected = if let Some(p) =
                             self.gen_sends.iter().position(|(i, _)| *i == outer_idx)
                         {
                             let (_, v) = self.gen_sends.remove(p).unwrap();
-                            let mut a = CallArgs::empty();
-                            a.cells.push(cell(v));
-                            match self.method_invoke(o.clone(), "send", a) {
-                                Ok(_) => true,
-                                Err(e) => {
-                                    death = Some(e);
-                                    break;
+                            if !delegate_is_gen {
+                                false
+                            } else {
+                                let mut a = CallArgs::empty();
+                                a.cells.push(cell(v));
+                                match self.method_invoke(o.clone(), "send", a) {
+                                    Ok(_) => true,
+                                    Err(e) => {
+                                        death = Some(e);
+                                        break;
+                                    }
                                 }
                             }
                         } else if let Some(p) =
@@ -1633,6 +1646,18 @@ impl<'a> Interp<'a> {
                         {
                             let (_, v) = self.gen_throws.remove(p).unwrap();
                             self.gen_throws_fired.push(outer_idx);
+                            if !delegate_is_gen {
+                                self.pending_exception = Some(v);
+                                death = Some(PhpError {
+                                    kind: crate::error::ErrorKind::Throw,
+                                    message: "gen".into(),
+                                    line: 0,
+                                    trace: None,
+                                    thrown_line: None,
+                                    display_msg: None,
+                                });
+                                break;
+                            }
                             let mut a = CallArgs::empty();
                             a.cells.push(cell(v));
                             match self.method_invoke(o.clone(), "throw", a) {
