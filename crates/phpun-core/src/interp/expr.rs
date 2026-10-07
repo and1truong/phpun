@@ -1895,6 +1895,11 @@ impl<'a> Interp<'a> {
                     PropName::Expr(i) => self.unfold_tail_site(i, subj_site).or(Some(*site)),
                     _ => Some(*site),
                 },
+                // A nested match compiles its arms as real ops — CG
+                // ends at the last arm's result, not the cond marker.
+                Expr::Match { .. } => Self::inner_end_line(e)
+                    .or_else(|| Self::marked_line(e))
+                    .or_else(|| Self::inner_end_line(inner)),
                 _ => Self::marked_line(e)
                     .or_else(|| Self::inner_end_line(e))
                     .or_else(|| Self::inner_end_line(inner)),

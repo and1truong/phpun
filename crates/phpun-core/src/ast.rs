@@ -637,6 +637,10 @@ pub fn end_line(e: &Expr) -> Option<usize> {
             .rev()
             .find_map(|i| i.as_ref())
             .and_then(end_line),
+        // A match expr's compiled end is its last arm's result — zend
+        // emits each arm's compare+result in source order, so the
+        // post-eval lineno is the last result's own end.
+        Expr::Match { arms, .. } => arms.last().and_then(|a| end_line(&a.result)),
         _ => None,
     }
 }
