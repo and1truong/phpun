@@ -2603,21 +2603,27 @@ impl<'a> Interp<'a> {
         // Destructure elements keep their `argline` mark — zend sites
         // each element's store op at the element's own line (a nested
         // list keeps the running line; its own elements re-site as
-        // they store).
-        let (mark, target) = match target {
-            Expr::Binary {
-                op: "argline",
-                l,
-                r,
-            } => {
-                let ml = match l.as_ref() {
-                    Expr::Int(n) => Some(*n as usize),
-                    _ => None,
-                };
-                (ml, r.as_ref())
-            }
-            _ => (None, target),
-        };
+        // they store). Marks can stack (`($x)` adds a paren mark over
+        // the element's): peel them all like `unmark_rhs`; the
+        // INNERMOST mark is the element's first-token line.
+        let mut mark = None;
+        let mut target = target;
+        loop {
+            target = match target {
+                Expr::Binary {
+                    op: "argline",
+                    l,
+                    r,
+                } => {
+                    if let Expr::Int(n) = l.as_ref() {
+                        mark = Some(*n as usize);
+                    }
+                    r.as_ref()
+                }
+                Expr::Paren(inner) => inner.as_ref(),
+                _ => break,
+            };
+        }
         if let Some(l) = mark {
             if !matches!(target, Expr::List(_)) {
                 self.cur_line = l;
@@ -2699,7 +2705,10 @@ impl<'a> Interp<'a> {
                 self.send_line = Some(self.cur_line);
                 self.store_prop(ov, &pn, v).map(|_| ())
             }
-            _ => self.fail(PhpError::fatal("Cannot assign to this expression", 0)),
+            _ => self.fail(PhpError::fatal(
+                "Cannot assign to this expression",
+                mark.unwrap_or(0),
+            )),
         }
     }
 
