@@ -2494,6 +2494,12 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null),
             ),
+            "getseverity" => Some(
+                ob.props
+                    .get("severity")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Int(1)),
+            ),
             "__tostring" => {
                 let msg = ob
                     .props
@@ -2536,24 +2542,128 @@ impl<'a> Interp<'a> {
                 )))
             }
             "__construct" => {
-                // Builtin ctor: props from args message/code/previous.
+                // Builtin throwable ctor: props from args. ErrorException's
+                // own signature is (message, code, severity, filename,
+                // line, previous) — zend declares it on ErrorException so
+                // the whole subtree inherits the 6-arg shape; every other
+                // throwable keeps (message, code, previous). Arg checks
+                // are zend's weak-mode ZPP coercions (non-coercible arg →
+                // TypeError naming it).
                 drop(ob);
                 let mut ob = obj.borrow_mut();
-                let msg = _args
-                    .first()
-                    .map(|c| c.borrow().to_php_string())
-                    .unwrap_or_default();
-                let code = _args.get(1).map(|c| c.borrow().to_int()).unwrap_or(0);
+                let ee = self.is_a(&ob.class.clone(), "errorexception");
+                // zend names the ctor's DECLARING scope — the ROOT
+                // builtin throwable ancestor whose internal __construct
+                // stub the method descends from (Exception for the
+                // Exception tree, Error for the Error tree,
+                // ErrorException for its subtree). A userland override
+                // in the middle of the chain does not relabel it.
+                let mut cls_name = ob.class.name().to_string();
+                {
+                    let mut cur = Some(ob.class.clone());
+                    while let Some(c) = cur {
+                        let internal = c.decl.methods.iter().any(|m| {
+                            m.decl.name.eq_ignore_ascii_case("__construct")
+                                && m.decl.body.is_empty()
+                                && m.decl.line == 0
+                        });
+                        if internal {
+                            cls_name = c.name().to_string();
+                        }
+                        cur = c
+                            .decl
+                            .parent
+                            .as_ref()
+                            .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                    }
+                    if ee {
+                        cls_name = "ErrorException".into();
+                    }
+                }
+                macro_rules! arg_err {
+                    ($n:expr, $pname:expr, $ty:expr, $v:expr) => {{
+                        let tn = self.zval_type_name($v);
+                        return Err(self.spl_throw(
+                            "TypeError",
+                            format!(
+                                "{}::__construct(): Argument #{} (${}) must be of type {}, {} given",
+                                cls_name, $n, $pname, $ty, tn
+                            ),
+                        ));
+                    }};
+                }
+                let getv = |i: usize| _args.get(i).map(|c| c.borrow().clone());
+                let msg = match getv(0) {
+                    Some(v @ Value::Array(_)) => arg_err!(1, "message", "string", &v),
+                    Some(v) => v.to_php_string(),
+                    None => String::new(),
+                };
+                let code = match getv(1) {
+                    Some(Value::Int(i)) => i,
+                    Some(v) => match weak_ty_coerce(&["int".into()], &v) {
+                        Some(Value::Int(i)) => i,
+                        _ => arg_err!(2, "code", "int", &v),
+                    },
+                    None => 0,
+                };
+                let (severity, filename, line, prev_arg) = if ee {
+                    let severity = match getv(2) {
+                        Some(Value::Int(i)) => i,
+                        Some(v) => match weak_ty_coerce(&["int".into()], &v) {
+                            Some(Value::Int(i)) => i,
+                            _ => arg_err!(3, "severity", "int", &v),
+                        },
+                        None => 1, // E_ERROR
+                    };
+                    let filename = match getv(3) {
+                        Some(Value::Null) | None => None,
+                        Some(v @ Value::Array(_)) => arg_err!(4, "filename", "?string", &v),
+                        Some(v) => Some(v.to_php_string()),
+                    };
+                    let line = match getv(4) {
+                        Some(Value::Null) | None => None,
+                        Some(Value::Int(i)) => Some(i),
+                        Some(v) => match weak_ty_coerce(&["int".into()], &v) {
+                            Some(Value::Int(i)) => Some(i),
+                            _ => arg_err!(5, "line", "?int", &v),
+                        },
+                    };
+                    (severity, filename, line, _args.get(5).cloned())
+                } else {
+                    (1, None, None, _args.get(2).cloned())
+                };
                 ob.props.insert("message".into(), cell(Value::str(msg)));
                 ob.props.insert("code".into(), cell(Value::Int(code)));
                 if !ob.prop_order.contains(&"message".into()) {
                     ob.prop_order.push("message".into());
                     ob.prop_order.push("code".into());
                 }
-                // zend's Throwable ctor takes ?Throwable $previous — a
-                // non-Throwable arg3 is a TypeError; a Throwable lands
-                // in the `previous` prop for getPrevious().
-                if let Some(c) = _args.get(2) {
+                if ee {
+                    ob.props.insert("severity".into(), cell(Value::Int(severity)));
+                    if !ob.prop_order.contains(&"severity".into()) {
+                        ob.prop_order.push("severity".into());
+                    }
+                    // zend lets the ctor override the throw site's
+                    // file/line — both the props and getFile()/getLine()
+                    // report them.
+                    if let Some(f) = &filename {
+                        ob.props.insert("file".into(), cell(Value::str(f)));
+                        if let Some(ObjectInternal::Exception { file, .. }) = &mut ob.internal {
+                            *file = f.clone();
+                        }
+                    }
+                    if let Some(l) = line {
+                        ob.props.insert("line".into(), cell(Value::Int(l)));
+                        if let Some(ObjectInternal::Exception { line: il, .. }) = &mut ob.internal
+                        {
+                            *il = l as u32;
+                        }
+                    }
+                }
+                // zend's ?Throwable check — arg #6 on ErrorException,
+                // #3 elsewhere. A Throwable lands in the `previous`
+                // prop for getPrevious().
+                if let Some(c) = prev_arg {
                     let pv = c.borrow().clone();
                     let ok = match &pv {
                         Value::Null => true,
@@ -2564,37 +2674,7 @@ impl<'a> Interp<'a> {
                         _ => false,
                     };
                     if !ok {
-                        // zend names the ctor's DECLARING scope — the
-                        // ROOT builtin throwable ancestor whose internal
-                        // __construct stub the method descends from
-                        // (Exception for the Exception tree, Error for
-                        // the Error tree). A userland override in the
-                        // middle of the chain does not relabel it.
-                        let mut cls_name = ob.class.name().to_string();
-                        let mut cur = Some(ob.class.clone());
-                        while let Some(c) = cur {
-                            let internal = c.decl.methods.iter().any(|m| {
-                                m.decl.name.eq_ignore_ascii_case("__construct")
-                                    && m.decl.body.is_empty()
-                                    && m.decl.line == 0
-                            });
-                            if internal {
-                                cls_name = c.name().to_string();
-                            }
-                            cur = c
-                                .decl
-                                .parent
-                                .as_ref()
-                                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
-                        }
-                        let tn = self.zval_type_name(&pv);
-                        return Err(self.spl_throw(
-                            "TypeError",
-                            format!(
-                                "{}::__construct(): Argument #3 ($previous) must be of type ?Throwable, {} given",
-                                cls_name, tn
-                            ),
-                        ));
+                        arg_err!(if ee { 6 } else { 3 }, "previous", "?Throwable", &pv);
                     }
                     if !matches!(pv, Value::Null) {
                         ob.props.insert("previous".into(), cell(pv));

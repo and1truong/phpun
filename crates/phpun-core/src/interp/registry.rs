@@ -2192,8 +2192,20 @@ impl<'a> Interp<'a> {
             },
             false,
         );
+        {
+            // ErrorException declares its own 6-arg __construct shape
+            // (severity/filename/line before previous), a `severity`
+            // prop and getSeverity() — the ctor stub reads the class
+            // family to pick the signature.
+            let mut d = throwable_class(
+                "ErrorException",
+                Some("Exception"),
+                &["message", "code", "file", "line", "severity"],
+            );
+            d.methods.push(method("getSeverity", &[]));
+            reg(d, false);
+        }
         for (name, parent) in [
-            ("ErrorException", "Exception"),
             ("RuntimeException", "Exception"),
             ("LogicException", "Exception"),
             ("InvalidArgumentException", "LogicException"),

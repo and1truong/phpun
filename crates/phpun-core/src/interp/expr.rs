@@ -2443,22 +2443,12 @@ impl<'a> Interp<'a> {
                     };
                     continue;
                 }
-                // Userland ArrayAccess can't alias its element — zend's
-                // indirect-modification notice, writes land on a
-                // throwaway cell.
-                let iv = self
-                    .method_invoke(
-                        o.clone(),
-                        "offsetGet",
-                        CallArgs::positional(vec![cell(k.clone().unwrap_or(Value::Null))]),
-                    )
-                    .unwrap_or(Value::Null);
-                let cn = o.borrow().class.name().to_string();
-                self.notice(&format!(
-                    "Indirect modification of overloaded element of {} has no effect",
-                    cn
-                ))?;
-                c = cell(iv);
+                // Userland ArrayAccess — the same write-context
+                // read_dimension zend runs: a `&offsetGet` hands the
+                // real storage cell back (writes through it reach the
+                // object); a value return yields a throwaway cell and
+                // notices only when it isn't an object.
+                c = self.index_cell_object(&c, k.clone())?;
                 continue;
             }
             match self.index_into_key(c.clone(), k.clone()) {
@@ -2637,28 +2627,34 @@ impl<'a> Interp<'a> {
     /// string offset as an array' mid-path or 'Cannot use assign-op
     /// operators with string offsets' at the final dim. The gate runs
     /// before `newv` arith; the leaf's key already validated during the
-    /// current-value read.
+    /// current-value read. The walk is READ-ONLY: probing an append or
+    /// missing key must not materialize cells — a fresh slot is never
+    /// a string, and a bound NULL bucket would push the real write
+    /// into the next slot (`$a[] .= 'x'` left a hole).
     fn str_offset_op_gate(&mut self, e: &Expr, keys: &[Option<Value>]) -> Result<(), PhpError> {
         let mut c = self.eval_cell(e)?;
         let last = keys.len() - 1;
         for (n, k) in keys.iter().enumerate() {
-            if matches!(*c.borrow(), Value::Str(_)) {
-                return self.fail(PhpError::uncaught(
-                    "Error",
-                    if n != last {
-                        "Cannot use string offset as an array"
-                    } else {
-                        "Cannot use assign-op operators with string offsets"
-                    },
-                    self.cur_line,
-                ));
-            }
-            if !matches!(*c.borrow(), Value::Array(_)) {
-                return Ok(());
-            }
-            match self.index_into_key(c.clone(), k.clone()) {
-                Ok(nc) => c = nc,
-                Err(_) => return Ok(()),
+            let rc = match &*c.borrow() {
+                Value::Str(_) => {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        if n != last {
+                            "Cannot use string offset as an array"
+                        } else {
+                            "Cannot use assign-op operators with string offsets"
+                        },
+                        self.cur_line,
+                    ));
+                }
+                Value::Array(rc) => rc.clone(),
+                _ => return Ok(()),
+            };
+            let Some(k) = k else { return Ok(()) };
+            let found = rc.borrow().get_cell(&to_key(k));
+            match found {
+                Some(nc) => c = nc,
+                None => return Ok(()),
             }
         }
         Ok(())
@@ -3016,11 +3012,11 @@ impl<'a> Interp<'a> {
                 arr.borrow_mut().bind_cell(to_key(k), src);
                 return Ok(());
             }
-            let cn = o.borrow().class.name().to_string();
-            self.notice(&format!(
-                "Indirect modification of overloaded element of {} has no effect",
-                cn
-            ))?;
+            // zend fetches the element (BP_VAR_W read_dimension — the
+            // `&offsetGet` / object-element notice rule applies) before
+            // the assign-by-ref Error, so offsetGet side effects and
+            // the notice both precede it.
+            let _ = self.index_cell_object(&c, key.clone())?;
             return self.fail(PhpError::uncaught(
                 "Error",
                 "Cannot assign by reference to an array dimension of an object",
@@ -3095,14 +3091,18 @@ impl<'a> Interp<'a> {
             }
             None => {
                 // offsetGet returned by value — the element can't be
-                // aliased, so writes through this fetch silently no-op
-                // (zend: "Indirect modification of overloaded element").
+                // aliased, so writes through this fetch silently
+                // no-op. zend notices the indirect modification only
+                // when the fetched value isn't itself an object
+                // (object-typed elements carry their own storage).
                 let v = rv?;
-                let cn = o.borrow().class.name().to_string();
-                self.notice(&format!(
-                    "Indirect modification of overloaded element of {} has no effect",
-                    cn
-                ))?;
+                if !matches!(v, Value::Object(_)) {
+                    let cn = o.borrow().class.name().to_string();
+                    self.notice(&format!(
+                        "Indirect modification of overloaded element of {} has no effect",
+                        cn
+                    ))?;
+                }
                 Ok(cell(v))
             }
         }
@@ -3464,17 +3464,11 @@ impl<'a> Interp<'a> {
                         }
                     }
                 } else if self.obj_is_a(&o, "ArrayAccess") {
+                    // index_cell_object owns the indirect-modification
+                    // notice now (non-ref, non-object fetched element —
+                    // zend's zend_fetch_dimension_address rule, which
+                    // unset shares).
                     let cc = self.index_cell_object(c, Some(key))?;
-                    // Non-lvalue offsetGet: zend notices the indirect
-                    // modification is lost, then keeps descending into
-                    // the temporary (later dims may still throw).
-                    if !self.is_ref_cell(&cc) && self.silence == 0 {
-                        let cn = o.borrow().class.name().to_string();
-                        self.notice(&format!(
-                            "Indirect modification of overloaded element of {} has no effect",
-                            cn
-                        ))?;
-                    }
                     Ok(Some(cc))
                 } else {
                     let cn = o.borrow().class.name().to_string();
