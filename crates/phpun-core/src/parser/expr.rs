@@ -2225,12 +2225,23 @@ impl<'a> Parser<'a> {
                         } else {
                             format!("{}{}", '\u{1}', resolved)
                         };
+                        // An unqualified name inside a namespace compiles
+                        // to a delayed ns-fallback op — zend can't bind
+                        // the callee at compile time, so the dedicated
+                        // ops never fire and bare-CV args fuse at the
+                        // arglist's FIRST-arg line like a dynamic call.
+                        // Frameless icalls still specialize (they carry
+                        // the ns delay inside the op) at the name line.
+                        let delayed_ns =
+                            resolved.starts_with('\u{1}') && !self.cur_ns.is_empty();
                         // Frameless builtins fuse every bare-CV arg's
                         // read into the call op at the name's line;
                         // dedicated ops (array_key_exists, const-fmt
                         // sprintf) fuse them at the last arg's end.
                         if Self::frameless_call(&resolved, &args) {
                             Self::frameless_arglines(&mut args, site);
+                        } else if delayed_ns {
+                            Self::dyn_arglines(&mut args);
                         } else if Self::dedicated_call(&resolved, &args) {
                             Self::dedicated_arglines(&mut args, self.arg_end);
                         }
