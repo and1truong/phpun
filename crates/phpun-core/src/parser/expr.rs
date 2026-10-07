@@ -691,16 +691,27 @@ impl<'a> Parser<'a> {
     }
 
     /// Deepest chain root under `x[..]`/`x->y`/`x->m()` links (parens
-    /// transparent) is writable grammar.
+    /// transparent) is writable grammar. A `new`-rooted chain is only
+    /// writable once a member CALL intervenes — zend's temporary
+    /// object: `(new F)->m()->p[]` and `(new F)->p->m()[]` assign,
+    //  `(new F)->p[]` alone is a temporary (oracle-probed).
     fn writeable_root(e: &Expr) -> bool {
         use crate::ast::Expr::*;
         let mut leaf = e;
+        let mut call_link = false;
         loop {
             leaf = match leaf {
-                Index { e: c, .. } | Prop { obj: c, .. } | MethodCall { obj: c, .. } => c.as_ref(),
+                Index { e: c, .. } | Prop { obj: c, .. } => c.as_ref(),
+                MethodCall { obj: c, .. } => {
+                    call_link = true;
+                    c.as_ref()
+                }
                 Paren(inner) => inner.as_ref(),
                 _ => break,
             };
+        }
+        if call_link && matches!(leaf, New { .. }) {
+            return true;
         }
         matches!(
             leaf,
@@ -714,6 +725,29 @@ impl<'a> Parser<'a> {
                 | Paren(_)
                 | StaticProp { .. }
         )
+    }
+
+    /// `clone (` — does the `(` (at `pos+1`) hold a top-level `,`?
+    /// Only then is it PHP 8.5's clone-with call form; without a
+    /// comma the parens group the unary operand (`clone ($o)->m` is
+    /// `clone(($o)->m)` in zend).
+    fn clone_paren_has_comma(&self) -> bool {
+        let mut depth = 0usize;
+        for lt in &self.toks[self.pos + 1..] {
+            match &lt.token {
+                Token::Op(o) if matches!(*o, "(" | "[" | "{") => depth += 1,
+                Token::Op(o) if matches!(*o, ")" | "]" | "}") => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return false;
+                    }
+                }
+                Token::Op(",") if depth == 1 => return true,
+                Token::Op(";") => return false,
+                _ => {}
+            }
+        }
+        false
     }
 
     /// A destructuring element must itself be a writable value:
@@ -1118,12 +1152,34 @@ impl<'a> Parser<'a> {
             // form parses as a normal call to the `clone` builtin;
             // bare `clone $o` stays the unary operator (R3 #13).
             if matches!(self.peek2(), Some(Token::Op("("))) {
-                self.pos += 2;
-                let args = self.args()?;
-                return Ok(Expr::Call {
-                    name: Box::new(Expr::Str("\u{1}clone".to_string())),
-                    args,
-                });
+                // Only a top-level `,` inside makes it the clone-with
+                // call form — otherwise the `(` groups the operand and
+                // postfix keeps growing into it: `clone (e)->m` is
+                // `clone((e)->m)` (oracle TypeError on `int given`),
+                // never a call result followed by `->m`.
+                if self.clone_paren_has_comma() {
+                    self.pos += 2;
+                    let args = self.args()?;
+                    // `clone($o, [...])->m` is a parse error in zend
+                    // ('unexpected token "->"'): the call-form parens
+                    // do not take postfix.
+                    if self.at_op("->") || self.at_op("?->") {
+                        return Err(PhpError::parse(
+                            format!(
+                                "syntax error, unexpected {}, expecting \")\"",
+                                self.describe()
+                            ),
+                            self.line(),
+                        ));
+                    }
+                    return Ok(Expr::Call {
+                        name: Box::new(Expr::Str("\u{1}clone".to_string())),
+                        args,
+                    });
+                }
+                self.pos += 1;
+                let e = self.unary()?;
+                return Ok(Expr::Clone(Box::new(e)));
             }
             self.pos += 1;
             let e = self.unary()?;

@@ -1735,8 +1735,7 @@ impl<'a> Interp<'a> {
                 // `??=`'s null-slot store is zend's plain assign —
                 // 'Cannot modify' — while compound/dim writes stay
                 // 'indirectly modify'.
-                let c =
-                    self.static_prop_named_ctx(&class, &pn, needs_read && op != "??=")?;
+                let c = self.static_prop_named_ctx(&class, &pn, needs_read && op != "??=")?;
                 // Static prop writes coerce to the declared type like
                 // instance props (typed_properties_023).
                 if let Ok((cls, _)) = self.member_class_of(&class) {
