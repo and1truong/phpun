@@ -631,9 +631,11 @@ impl<'a> Interp<'a> {
                             // table entry too.
                             if self.stack.is_empty() {
                                 if let Some(arr) = self.globals_arr.clone() {
-                                    if let Some(v) =
-                                        arr.borrow_mut().unset(&ArrKey::Str(Rc::from(n.as_str())))
-                                    {
+                                    // The borrow must end before the
+                                    // evicted payload's dtors run.
+                                    let evicted =
+                                        arr.borrow_mut().unset(&ArrKey::Str(Rc::from(n.as_str())));
+                                    if let Some(v) = evicted {
                                         if let Err(e) = self.destruct_dying_value(&v) {
                                             return self.err_flow(e);
                                         }

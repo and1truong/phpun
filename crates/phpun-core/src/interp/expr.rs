@@ -3150,7 +3150,11 @@ impl<'a> Interp<'a> {
                         return self.fail(e);
                     }
                     if let Some(k) = &key {
-                        if let Some(v) = cur_arr.borrow_mut().unset(&to_key(k)) {
+                        // The borrow must drop before the evicted
+                        // payload's dtors run — a __destruct reading
+                        // this same array would re-borrow it.
+                        let evicted = cur_arr.borrow_mut().unset(&to_key(k));
+                        if let Some(v) = evicted {
                             self.destruct_dying_value(&v)?;
                         }
                     }
@@ -3284,8 +3288,12 @@ impl<'a> Interp<'a> {
                         drop(b);
                         // The evicted payload's last ref dies with
                         // the cell — held objects/gens destruct now
-                        // (zend destroys the zval's contents).
-                        if let Some(v) = rc.borrow_mut().unset(&k) {
+                        // (zend destroys the zval's contents). The
+                        // borrow_mut must end before userland dtors
+                        // run: an element by-ref aliasing this array
+                        // reads it inside __destruct (bug65051).
+                        let evicted = rc.borrow_mut().unset(&k);
+                        if let Some(v) = evicted {
                             self.destruct_dying_value(&v)?;
                         }
                         return Ok(());
