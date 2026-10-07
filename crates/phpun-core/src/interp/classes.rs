@@ -3284,11 +3284,7 @@ impl<'a> Interp<'a> {
         target: Rc<RefCell<PhpObject>>,
     ) -> Result<Value, PhpError> {
         let target_id = target.borrow().id;
-        if let Some(existing) = self
-            .weakrefs
-            .get(&target_id)
-            .and_then(|w| w.upgrade())
-        {
+        if let Some(existing) = self.weakrefs.get(&target_id).and_then(|w| w.upgrade()) {
             return Ok(Value::Object(existing));
         }
         let cls = match self.classes.get("weakreference").cloned() {

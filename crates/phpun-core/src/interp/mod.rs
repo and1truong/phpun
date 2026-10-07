@@ -347,13 +347,11 @@ pub struct Interp<'a> {
     /// Live codec objects keyed (filter res id, read-chain flag) —
     /// an ALL-mode attach shares one res id across its two chain
     /// entries, so the direction disambiguates them.
-    pub codec_states:
-        std::collections::HashMap<(u64, bool), crate::builtins::fs::CodecState>,
+    pub codec_states: std::collections::HashMap<(u64, bool), crate::builtins::fs::CodecState>,
     /// Live WeakReference wrapper per target object id — zend keeps a
     /// per-handle weakref list so repeated create() calls on the same
     /// live object return the identical wrapper (`===` true).
-    pub weakrefs:
-        std::collections::HashMap<u64, std::rc::Weak<RefCell<crate::value::PhpObject>>>,
+    pub weakrefs: std::collections::HashMap<u64, std::rc::Weak<RefCell<crate::value::PhpObject>>>,
     /// Output buffer stack for ob_*().
     ob_stack: Vec<ObLevel>,
     /// While >0, warnings are suppressed (implements `??`, `isset`,

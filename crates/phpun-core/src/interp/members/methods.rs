@@ -2639,7 +2639,8 @@ impl<'a> Interp<'a> {
                     ob.prop_order.push("code".into());
                 }
                 if ee {
-                    ob.props.insert("severity".into(), cell(Value::Int(severity)));
+                    ob.props
+                        .insert("severity".into(), cell(Value::Int(severity)));
                     if !ob.prop_order.contains(&"severity".into()) {
                         ob.prop_order.push("severity".into());
                     }
@@ -2654,8 +2655,7 @@ impl<'a> Interp<'a> {
                     }
                     if let Some(l) = line {
                         ob.props.insert("line".into(), cell(Value::Int(l)));
-                        if let Some(ObjectInternal::Exception { line: il, .. }) = &mut ob.internal
-                        {
+                        if let Some(ObjectInternal::Exception { line: il, .. }) = &mut ob.internal {
                             *il = l as u32;
                         }
                     }
