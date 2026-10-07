@@ -4,6 +4,46 @@
 use super::util::*;
 use super::*;
 
+/// Newlines before the first token of a `${...}` interp snippet —
+/// whitespace and `//`, `#`, `/* */` comments don't produce tokens,
+/// so a folded name's CV-equivalent line is `base` plus this count.
+fn leading_src_lines(src: &str) -> usize {
+    let b = src.as_bytes();
+    let mut i = 0;
+    let mut lines = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\n' => {
+                lines += 1;
+                i += 1;
+            }
+            b' ' | b'\t' | b'\r' | 0x0b | 0x0c => i += 1,
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'#' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    if b[i] == b'\n' {
+                        lines += 1;
+                    }
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            }
+            _ => break,
+        }
+    }
+    lines
+}
+
 impl<'a> Interp<'a> {
     // ----- expressions -----
 
@@ -15,11 +55,18 @@ impl<'a> Interp<'a> {
     /// (cur_line already holds the right line).
     pub(in crate::interp) fn inner_end_line(e: &Expr) -> Option<usize> {
         match e {
-            Expr::Call { args, .. }
-            | Expr::MethodCall { args, .. }
-            | Expr::StaticCall { args, .. }
-            | Expr::StaticCallDyn { args, .. }
-            | Expr::New { args, .. } => Self::inner_end_line(args.last()?),
+            // zend's post-eval lineno for a call is its last arg's
+            // line (the DO_FCALL lineno override only touches the op,
+            // not CG) — a zero-arg call leaves it at the call site.
+            Expr::Call { args, site, .. }
+            | Expr::MethodCall { args, site, .. }
+            | Expr::StaticCall { args, site, .. }
+            | Expr::StaticCallDyn { args, site, .. }
+            | Expr::New { args, site, .. } => Self::inner_end_line(args.last()?).or(Some(*site)),
+            Expr::ArrayLit(items) => items
+                .iter()
+                .rev()
+                .find_map(|(_, v)| Self::inner_end_line(v)),
             Expr::Binary {
                 op: "argline",
                 l,
@@ -51,15 +98,11 @@ impl<'a> Interp<'a> {
             | Expr::YieldFrom(e)
             | Expr::Empty(e) => Self::inner_end_line(e),
             Expr::Unary { e, .. } | Expr::Cast { e, .. } => Self::inner_end_line(e),
-            // A folded varvar ends at its `}` line (the non-folded
-            // inner's own end otherwise).
-            Expr::VarVar(inner, end) => {
-                if is_compile_const(inner) {
-                    Some(*end)
-                } else {
-                    Self::inner_end_line(inner)
-                }
-            }
+            // A varvar's effective position is its inner's — for a
+            // folded varvar that's the inner's first-token line (CV
+            // semantics), for a dynamic one the inner's last
+            // evaluated line.
+            Expr::VarVar(inner, _) => Self::inner_end_line(inner),
             // Zend emits the ASSIGN op at the assignment node's own
             // line (the target's first token) — not the value's end.
             // A `list()`/`[]` destructure ends at its last element's
@@ -144,14 +187,14 @@ impl<'a> Interp<'a> {
                             let (expr, _) = parser::parse_expr_src(src, *base)
                                 .map_err(|e| PhpError::parse(e.message, e.line))?;
                             let nv = self.eval(&expr)?;
-                            // A folded name sites at the part's `}`
-                            // (base plus the snippet's own newlines);
-                            // otherwise the name-conversion + variable
-                            // read site at the inner expr's last
-                            // evaluated line (same re-site as
-                            // StringPart::Expr above).
+                            // A folded name reads like a CV: it sites at
+                            // the inner's first-token line (base plus the
+                            // snippet's leading newlines). Otherwise the
+                            // name-conversion + variable read site at
+                            // the inner expr's last evaluated line (same
+                            // re-site as the StringPart::Expr above).
                             if is_compile_const(&expr) {
-                                self.cur_line = *base + src.matches('\n').count();
+                                self.cur_line = *base + leading_src_lines(src);
                             } else if let Some(l) = Self::inner_end_line(&expr) {
                                 self.cur_line = l;
                             }
@@ -165,15 +208,19 @@ impl<'a> Interp<'a> {
                 Ok(Value::bytes(s))
             }
             Expr::Var(name) => self.var_get(name),
-            Expr::VarVar(inner, end) => {
+            Expr::VarVar(inner, _) => {
                 let n = self.eval(inner)?;
                 if is_compile_const(inner) {
-                    // A compile-folded name emits no zend ops — the
-                    // varname read sites at the `${...}`'s `}` line,
-                    // or at the enclosing `=`'s own line when the
-                    // varvar IS its direct value (zend's delayed
-                    // compile gives the RHS the ASSIGN's lineno).
-                    self.cur_line = self.vv_rhs_site.take().unwrap_or(*end);
+                    // A folded varvar reads exactly like a CV: the
+                    // name read sites at the inner's first-token line
+                    // (the inner's `argline` already sited cur_line
+                    // there during eval — keep it), except where an
+                    // enclosing op binds the CV's read: vv_rhs_site
+                    // carries that op's line (`=` RHS, delayed dim,
+                    // `->` member, binary op, match/switch compare).
+                    if let Some(l) = self.vv_rhs_site.take() {
+                        self.cur_line = l;
+                    }
                 } else if let Some(l) = Self::inner_end_line(inner) {
                     // The name-conversion + variable read site at the
                     // inner expr's last evaluated line (zend's
@@ -283,7 +330,9 @@ impl<'a> Interp<'a> {
             Expr::PostInc(t) => self.incdec(t, 1, true),
             Expr::PostDec(t) => self.incdec(t, -1, true),
             Expr::Isset(args) => {
-                self.silence += 1;
+                // No blanket silence: only the varname-path reads are
+                // quiet — inner exprs (dims, varvar names, calls)
+                // still warn, e.g. `isset($a[$b])` warns $b.
                 let mut ok = true;
                 for a in args {
                     match self.isset_val_mode(a, 0) {
@@ -293,18 +342,14 @@ impl<'a> Interp<'a> {
                             break;
                         }
                         Err(e) => {
-                            self.silence -= 1;
                             return Err(e);
                         }
                     }
                 }
-                self.silence -= 1;
                 Ok(Value::Bool(ok))
             }
             Expr::Empty(e) => {
-                self.silence += 1;
                 let v = self.isset_val_mode(e, 1);
-                self.silence -= 1;
                 match v {
                     Ok(Some(v)) => Ok(Value::Bool(!v.is_truthy())),
                     Ok(None) => Ok(Value::Bool(true)),
@@ -413,7 +458,40 @@ impl<'a> Interp<'a> {
                 }
             }
             Expr::Match { subject, arms } => {
-                let sv = self.eval(subject)?;
+                // zend: all-const int/str conds && ≥2 total → a single
+                // MATCH op reads the subject at the subject's own line.
+                // Otherwise a CV subject (bare or folded varvar) binds
+                // inside each compare op — its read sites at each
+                // cond's end line, warning once per evaluated compare.
+                // With no non-default conds the subject is never read.
+                let num_conds: usize = arms.iter().map(|a| a.conds.len()).sum();
+                let jumptable = num_conds >= 2
+                    && arms.iter().all(|a| {
+                        a.conds.iter().all(|c| {
+                            is_compile_const(Self::unmark_arg(c))
+                                && matches!(
+                                    self.eval_const(Self::unmark_arg(c)),
+                                    Ok(Value::Int(_) | Value::Str(_))
+                                )
+                        })
+                    });
+                let subj_u = Self::unmark_rhs(subject);
+                let cv_subject = Self::is_cv(subj_u);
+                // A jumptable MATCH op binds a CV subject at the CV's
+                // own site (a folded varvar's inner name line, a plain
+                // var's first-token line).
+                let cv_site = Self::cv_site_of(subject, subj_u).unwrap_or(self.cur_line);
+                let sv: Option<Value> = if jumptable {
+                    Some(if cv_subject {
+                        self.eval_cv_at(subj_u, cv_site)?
+                    } else {
+                        self.eval(subject)?
+                    })
+                } else if cv_subject {
+                    None
+                } else {
+                    Some(self.eval(subject)?)
+                };
                 let mut default: Option<&Expr> = None;
                 for arm in arms {
                     if arm.conds.is_empty() {
@@ -422,6 +500,16 @@ impl<'a> Interp<'a> {
                     }
                     for c in &arm.conds {
                         let cv = self.eval(c)?;
+                        // A deferred CV subject is read inside THIS
+                        // compare op — a fresh read each time (zend's
+                        // CV operand binds per op: warns per cond line).
+                        let svv = match &sv {
+                            Some(sv) => sv.clone(),
+                            None => {
+                                let cl = Self::inner_end_line(c).unwrap_or(self.cur_line);
+                                self.eval_cv_at(subj_u, cl)?
+                            }
+                        };
                         crate::value::clear_cmp_depth_err();
                         // ZEND_CASE_STRICT (TMP|VAR subjects) is
                         // noncommutative — subject stays left; CONST|CV
@@ -429,9 +517,9 @@ impl<'a> Interp<'a> {
                         // commutative-swaps when the arm ranks higher.
                         let r = compare_operand_rank(subject);
                         let (x, y) = if (r & 6) == 0 && r < compare_operand_rank(c) {
-                            (&cv, &sv)
+                            (&cv, &svv)
                         } else {
-                            (&sv, &cv)
+                            (&svv, &cv)
                         };
                         let hit = identical(x, y);
                         self.emit_cmp_notices()?;
@@ -450,9 +538,39 @@ impl<'a> Interp<'a> {
                 if let Some(d) = default {
                     self.eval(d)
                 } else {
+                    // MATCH_ERROR reads the subject silently — for a
+                    // deferred CV subject that's the var's value now
+                    // (a cond's side effects may have set it).
+                    let sv = match sv {
+                        Some(v) => v,
+                        None => {
+                            let n = match subj_u {
+                                Expr::Var(n) => Some(n.clone()),
+                                Expr::VarVar(inner, _) if is_compile_const(inner) => {
+                                    let v = self.eval(inner)?;
+                                    Some(self.conv_str(&v)?)
+                                }
+                                _ => None,
+                            };
+                            n.and_then(|n| self.var_cell_opt(&n))
+                                .map(|c| c.borrow().clone())
+                                .unwrap_or(Value::Null)
+                        }
+                    };
+                    // MATCH_ERROR sites at the subject's compiled end
+                    // line under the jumptable (the MATCH op's own
+                    // lineno); non-jumptable keeps the last compare's
+                    // line.
+                    if jumptable {
+                        let l = Self::inner_end_line(subj_u)
+                            .or_else(|| Self::marked_line(subject))
+                            .unwrap_or(cv_site);
+                        self.cur_line = l;
+                        self.send_line = Some(l);
+                    }
                     let e = self.exception(
                         "UnhandledMatchError",
-                        &format!("Unhandled match case {}", sv.to_php_string()),
+                        &format!("Unhandled match case {}", match_case_desc(&sv)),
                     );
                     self.pending_exception = Some(e);
                     Err(PhpError {
@@ -1020,14 +1138,46 @@ impl<'a> Interp<'a> {
                 },
                 None => None,
             }),
+            Expr::VarVar(inner, _) => {
+                // isset/empty suppress the varname's CV read too —
+                // `isset($$x)` is fully silent — but only a bare-CV
+                // name: `isset(${$y . 'z'})` warns $y. Under `??` and
+                // as an index/prop base the inner warns normally.
+                let n = if mode < 2 {
+                    match Self::unmark_rhs(inner) {
+                        Expr::Var(n2) => match self.var_cell_opt(n2) {
+                            Some(c) => c.borrow().clone(),
+                            // The name can't be formed — the var doesn't
+                            // exist; silent false.
+                            None => return Ok(None),
+                        },
+                        _ => self.eval(inner)?,
+                    }
+                } else {
+                    self.eval(inner)?
+                };
+                let name = self.conv_str(&n)?;
+                Ok(match self.var_cell_opt(&name) {
+                    Some(c) => match &*c.borrow() {
+                        Value::Null => None,
+                        v => Some(v.clone()),
+                    },
+                    None => None,
+                })
+            }
             Expr::Index { e, i } => {
                 // `isset($this->uninitTyped['k'])` and `$x ?? y` must not
                 // throw on uninitialized typed properties. The base
                 // chains through isset semantics — absent segments
                 // short-circuit without __get (bug71359).
-                self.silence += 1;
+                // zend emits the dims' operand exprs unconditionally —
+                // they eval (and warn) even when the base is absent:
+                // `isset($a[$b])` warns $b with undef $a.
                 let base = self.isset_val_mode(e, 2);
-                self.silence -= 1;
+                let key = match i {
+                    Some(k) => self.eval(k)?,
+                    None => return Ok(None),
+                };
                 let base = match base {
                     Ok(Some(b)) => b,
                     Ok(None) => return Ok(None),
@@ -1041,10 +1191,6 @@ impl<'a> Interp<'a> {
                         return Err(err);
                     }
                     Err(_) => return Ok(None),
-                };
-                let key = match i {
-                    Some(k) => self.eval(k)?,
-                    None => return Ok(None),
                 };
                 // ArrayAccess containers see any key type (offsetExists).
                 if !matches!(&base, Value::Object(o) if self.obj_is_a(o, "ArrayAccess")) {
@@ -1413,10 +1559,22 @@ impl<'a> Interp<'a> {
         })
     }
 
+    /// The CV-effective line of an operand node: a folded varvar's CV
+    /// binds at its inner name's line (like `Expr::Var` at its own);
+    /// any other node's line is its own first-token marker.
+    pub(in crate::interp) fn cv_site_of(marked: &Expr, unmarked: &Expr) -> Option<usize> {
+        match unmarked {
+            Expr::VarVar(inner, _) if is_compile_const(inner) => {
+                Self::marked_line(inner).or_else(|| Self::marked_line(marked))
+            }
+            _ => Self::marked_line(marked),
+        }
+    }
+
     /// Strip `argline` markers and parens from an assign's value to
     /// its root node — transparent wrappers don't break zend's
     /// direct-RHS folding rules.
-    fn unmark_rhs(mut e: &Expr) -> &Expr {
+    pub(in crate::interp) fn unmark_rhs(mut e: &Expr) -> &Expr {
         loop {
             e = match e {
                 Expr::Paren(inner) => inner,
@@ -1426,6 +1584,35 @@ impl<'a> Interp<'a> {
                 _ => return e,
             };
         }
+    }
+
+    /// A CV-shaped operand: bare `Expr::Var` or a folded varvar — zend
+    /// folds a compile-time-constant `${expr}` name to a plain CV read
+    /// with the inner's first-token line.
+    pub(in crate::interp) fn is_cv(e: &Expr) -> bool {
+        match e {
+            Expr::Var(_) => true,
+            Expr::VarVar(inner, _) => is_compile_const(inner),
+            _ => false,
+        }
+    }
+
+    /// Eval a CV-shaped expr binding its read to `site` — the enclosing
+    /// op's lineno. A bare Var reads at the ambient cur_line; a folded
+    /// varvar takes the site through `vv_rhs_site` (its inner's argline
+    /// would otherwise re-site the warn at the inner's own line).
+    pub(in crate::interp) fn eval_cv_at(
+        &mut self,
+        e: &Expr,
+        site: usize,
+    ) -> Result<Value, PhpError> {
+        let prev = self.vv_rhs_site;
+        self.vv_rhs_site = Some(site);
+        self.cur_line = site;
+        self.send_line = Some(site);
+        let r = self.eval(e);
+        self.vv_rhs_site = prev;
+        r
     }
 
     fn assign(
@@ -1823,12 +2010,14 @@ impl<'a> Interp<'a> {
                     *c.borrow_mut() = nv;
                 }
                 None => {
-                    // `list()`/`[]` destructure: zend's FETCH_LIST ops
-                    // emit at the list node's own line — this assign's
-                    // line (its `[`/`list(` first token).
+                    // `list()`/`[]` destructure: zend's first FETCH_LIST
+                    // op emits at the RHS's post-eval line (later
+                    // fetches interleave at each element's own line
+                    // — handled inside store()).
                     if matches!(target, Expr::List(_)) {
-                        self.cur_line = aline;
-                        self.send_line = Some(aline);
+                        let l = Self::inner_end_line(value).unwrap_or(aline);
+                        self.cur_line = l;
+                        self.send_line = Some(l);
                     }
                     self.store(target, newv.clone())?
                 }
@@ -3111,9 +3300,10 @@ impl<'a> Interp<'a> {
         );
         if delayed && dim_simple != Some(true) {
             // Complex dim: its ops run first (inner warnings at their
-            // own lines). A CV base binds inside the FETCH_DIM at the
-            // dim's line; varnode bases (varvar/prop/static-prop) emit
-            // their own op after the dim's at the container's own line.
+            // own lines). A CV base (bare or folded-varvar) binds
+            // inside the FETCH_DIM at the dim's line; varnode bases
+            // (dyn varvar/prop/static-prop) emit their own op after
+            // the dim's at the container's own line.
             let (base_line, base_send) = (self.cur_line, self.send_line);
             let key = match i {
                 Some(ie) => self.eval(ie)?,
@@ -3121,16 +3311,25 @@ impl<'a> Interp<'a> {
                     return self.fail(PhpError::fatal("[] used in read context", 0));
                 }
             };
-            if matches!(e, Expr::Var(_)) {
-                if let Some(l) = i.and_then(Self::marked_line) {
-                    self.cur_line = l;
-                    self.send_line = Some(l);
+            let prev_vv = self.vv_rhs_site;
+            match e {
+                Expr::Var(_) => {
+                    if let Some(l) = i.and_then(Self::marked_line) {
+                        self.cur_line = l;
+                        self.send_line = Some(l);
+                    }
                 }
-            } else {
-                self.cur_line = base_line;
-                self.send_line = base_send;
+                Expr::VarVar(inner, _) if is_compile_const(inner) => {
+                    self.vv_rhs_site = i.and_then(Self::marked_line).or(Some(base_line));
+                }
+                _ => {
+                    self.cur_line = base_line;
+                    self.send_line = base_send;
+                }
             }
-            let base = self.eval(e)?;
+            let base = self.eval(e);
+            self.vv_rhs_site = prev_vv;
+            let base = base?;
             // The FETCH's own diagnostics (offset warnings, key checks)
             // site at the dim's line.
             if let Some(l) = i.and_then(Self::marked_line) {
@@ -3140,15 +3339,25 @@ impl<'a> Interp<'a> {
             return self.index_read_base(base, key);
         }
         // Simple dim (CV/const binds inside the op): the FETCH_DIM sites
-        // a CV container's warning at the dim's line.
-        if matches!(e, Expr::Var(_)) {
-            if let Some(l) = i.and_then(Self::marked_line) {
-                self.cur_line = l;
-                self.send_line = Some(l);
+        // a CV container's warning at the dim's line — a folded varvar
+        // does the same through vv_rhs_site.
+        let prev_vv = self.vv_rhs_site;
+        match e {
+            Expr::Var(_) => {
+                if let Some(l) = i.and_then(Self::marked_line) {
+                    self.cur_line = l;
+                    self.send_line = Some(l);
+                }
             }
+            Expr::VarVar(inner, _) if is_compile_const(inner) => {
+                self.vv_rhs_site = i.and_then(Self::marked_line);
+            }
+            _ => {}
         }
         // Base evaluates before the index expr (left-to-right).
-        let base = self.eval(e)?;
+        let base = self.eval(e);
+        self.vv_rhs_site = prev_vv;
+        let base = base?;
         let key = match i {
             Some(ie) => self.eval(ie)?,
             None => {
@@ -4383,12 +4592,51 @@ impl<'a> Interp<'a> {
         // The operand line markers must not mask the plain-CV shape
         // (or the deferred read would warn at the var's own line
         // instead of the op's right-operand line).
-        if let Expr::Var(n) = Self::unmark_arg(l) {
-            let c = self.var_cell_opt(n);
+        let l_u = Self::unmark_arg(l);
+        // A folded varvar defers exactly like a CV: its name is
+        // compile-time-constant, so it can be computed before `r`
+        // runs (the const inner emits no ops — this early eval has
+        // no observable effect).
+        let name = match l_u {
+            Expr::Var(n) => Some(n.clone()),
+            Expr::VarVar(inner, _) if is_compile_const(inner) => {
+                let n = self.eval(inner)?;
+                Some(self.conv_str(&n)?)
+            }
+            _ => None,
+        };
+        if let Some(n) = name {
+            let c = self.var_cell_opt(&n);
+            // A CV right operand fuses into the same op too — zend
+            // reads op1 then op2 inside it, both at the op's line
+            // (the right operand's first-token line).
+            let r_name = match Self::unmark_arg(r) {
+                Expr::Var(n) => Some(n.clone()),
+                Expr::VarVar(inner, _) if is_compile_const(inner) => {
+                    let v = self.eval(inner)?;
+                    Some(self.conv_str(&v)?)
+                }
+                _ => None,
+            };
+            if let Some(rn) = r_name {
+                let r_u = Self::unmark_arg(r);
+                let op = Self::cv_site_of(r, r_u).unwrap_or(self.cur_line);
+                self.cur_line = op;
+                self.send_line = Some(op);
+                let lv = match c {
+                    Some(c) => c.borrow().clone(),
+                    None => self.var_get(&n)?,
+                };
+                let rv = match self.var_cell_opt(&rn) {
+                    Some(c) => c.borrow().clone(),
+                    None => self.var_get(&rn)?,
+                };
+                return Ok((lv, rv));
+            }
             let rv = self.eval(r)?;
             let lv = match c {
                 Some(c) => c.borrow().clone(),
-                None => self.eval(Self::unmark_arg(l))?,
+                None => self.var_get(&n)?,
             };
             return Ok((lv, rv));
         }

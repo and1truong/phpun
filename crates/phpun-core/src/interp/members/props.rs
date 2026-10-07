@@ -1345,16 +1345,30 @@ impl<'a> Interp<'a> {
         nullsafe: bool,
         site: usize,
     ) -> Result<Value, PhpError> {
-        let ov = self.eval(obj)?;
-        let pn = self.prop_name(name)?;
         // Zend sites the prop fetch at the member's end: the name
         // token's line for `->p`, the name expr's last line for
-        // `->{e}`.
-        self.cur_line = match name {
+        // `->{e}`. A CV obj (bare or folded varvar) binds inside the
+        // FETCH_OBJ op, so its own read sites there too — and its
+        // warn follows the name expr's diagnostics (`->m1` chain
+        // oracle: obj warn after `->{g()}`'s). `?->` keeps the obj's
+        // own line (the JMP_NULL operand is separate).
+        let member_end = match name {
             PropName::Expr(inner) => Self::inner_end_line(inner).unwrap_or(site),
             _ => site,
         };
-        self.send_line = Some(self.cur_line);
+        let obj_u = Self::unmark_rhs(obj);
+        let ov = if !nullsafe && Self::is_cv(obj_u) {
+            let pn = self.prop_name(name)?;
+            let ov = self.eval_cv_at(obj_u, member_end)?;
+            self.cur_line = member_end;
+            self.send_line = Some(member_end);
+            return self.prop_read_value(ov, &pn, nullsafe);
+        } else {
+            self.eval(obj)?
+        };
+        let pn = self.prop_name(name)?;
+        self.cur_line = member_end;
+        self.send_line = Some(member_end);
         self.prop_read_value(ov, &pn, nullsafe)
     }
 
@@ -1530,16 +1544,23 @@ impl<'a> Interp<'a> {
         _nullsafe: bool,
         site: usize,
     ) -> Result<Cell, PhpError> {
-        let pn = self.prop_name(name)?;
-        let ov = self.eval(obj)?;
         // Same member-end re-site as prop_read: write-path diags
         // (default-object creation, magic __get/__set) also site at
-        // the member name's end.
-        self.cur_line = match name {
+        // the member name's end — and a CV obj's own read fuses into
+        // the fetch op at that line.
+        let member_end = match name {
             PropName::Expr(inner) => Self::inner_end_line(inner).unwrap_or(site),
             _ => site,
         };
-        self.send_line = Some(self.cur_line);
+        let obj_u = Self::unmark_rhs(obj);
+        let pn = self.prop_name(name)?;
+        let ov = if Self::is_cv(obj_u) {
+            self.eval_cv_at(obj_u, member_end)?
+        } else {
+            self.eval(obj)?
+        };
+        self.cur_line = member_end;
+        self.send_line = Some(member_end);
         match ov {
             Value::Object(o) => {
                 // Hooks intercept the cell path entirely — `[]`, `&`,

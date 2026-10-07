@@ -1715,7 +1715,21 @@ impl<'a> Interp<'a> {
             self.send_line = Some(s);
         }
         let mn = Self::nul_trunc(&self.prop_name(name)?);
-        let ov = self.eval(obj)?;
+        // A CV obj (bare or folded varvar) binds inside the
+        // INIT_METHOD_CALL op at the member's end — the name token's
+        // line for `->m`, the name expr's last line for `->{e}()`.
+        // `?->` keeps the obj's own line.
+        let obj_u = Self::unmark_rhs(obj);
+        let ov = if !nullsafe && Self::is_cv(obj_u) {
+            let mline = match name {
+                PropName::Expr(inner) => Self::inner_end_line(inner).or(site),
+                _ => site,
+            }
+            .unwrap_or(self.cur_line);
+            self.eval_cv_at(obj_u, mline)?
+        } else {
+            self.eval(obj)?
+        };
         match ov {
             Value::Null if nullsafe => Ok(Value::Null),
             Value::Object(o) => {

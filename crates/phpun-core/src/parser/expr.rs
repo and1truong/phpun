@@ -2,6 +2,7 @@
 //! precedence chain down to `primary`, call args and array literals.
 
 use super::*;
+use crate::interp::util::is_compile_const;
 
 impl<'a> Parser<'a> {
     /// `function (&$a) use ($x, &$y) { }`, `static function () {}`,
@@ -1142,12 +1143,35 @@ impl<'a> Parser<'a> {
                 let mut args = self.args()?;
                 if !Self::literal_dyn_callee(&e) {
                     Self::dyn_arglines(&mut args);
+                } else {
+                    // `('max')()` / `"max"()` — a literal-name call via
+                    // a dyn callee still gets the frameless fold.
+                    let n = match Self::unmark_argline_r(&e) {
+                        Expr::Str(s) => Some(s.clone()),
+                        _ => Self::interp_lit(&e),
+                    };
+                    if let Some(n) = n {
+                        if Self::frameless_call(&n, &args) {
+                            Self::frameless_arglines(&mut args, callee_line);
+                        }
+                    }
                 }
+                // A folded-varvar callee's CV read sites at its inner
+                // name's first-token line (like any other position).
+                let callee = match Self::unmark_argline_r(&e) {
+                    Expr::VarVar(inner, _)
+                        if is_compile_const(inner)
+                            && matches!(inner.as_ref(), Expr::Binary { op: "argline", .. }) =>
+                    {
+                        Self::argline_of(inner).unwrap_or(callee_line)
+                    }
+                    _ => callee_line,
+                };
                 e = Self::fcc_wrap(Expr::Call {
                     name: Box::new(e),
                     args,
                     site: paren_line,
-                    callee: callee_line,
+                    callee,
                 })?;
             } else if self.at_op("->") || self.at_op("?->") {
                 let nullsafe = self.at_op("?->");
@@ -1544,18 +1568,49 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// A call arg whose send op is a bare CV — `f($x)` or `f(n: $x)`.
-    /// Zend compiles it to a plain send whose lineno is the call's
-    /// arg-head line for non-literal callees; any other arg shape
-    /// emits ops on its own lines first.
+    /// A call arg whose send op is a bare CV — `f($x)`, `f(n: $x)`, or
+    /// a folded varvar `f(${const})` (zend compiles the folded name to
+    /// a plain CV read). Any other arg shape emits ops on its own
+    /// lines first.
     fn bare_var_arg(e: &Expr) -> bool {
-        match Self::unmark_argline_r(e) {
-            Expr::Var(_) => true,
-            Expr::Binary { op: "named", r, .. } => {
-                matches!(Self::unmark_argline_r(r), Expr::Var(_))
+        fn cvish(e: &Expr) -> bool {
+            match e {
+                Expr::Var(_) => true,
+                Expr::VarVar(inner, _) => is_compile_const(inner),
+                _ => false,
             }
+        }
+        match Self::unmark_argline_r(e) {
+            e if cvish(e) => true,
+            Expr::Binary { op: "named", r, .. } => cvish(Self::unmark_argline_r(r)),
             _ => false,
         }
+    }
+
+    /// A folded varvar's CV-equivalent line lives in its inner's
+    /// `argline` marker — retarget that too when the enclosing op
+    /// binds the name read (dyn-callee first-arg fold, frameless
+    /// name-line fold).
+    fn retarget_varvar_line(e: &mut Expr, line: usize) {
+        match e {
+            Expr::Binary { op: "named", r, .. } => Self::retarget_varvar_line(r, line),
+            Expr::VarVar(inner, _)
+                if matches!(inner.as_ref(), Expr::Binary { op: "argline", .. }) =>
+            {
+                if let Expr::Binary { l, .. } = inner.as_mut() {
+                    *l.as_mut() = Expr::Int(line as i64);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Rewrite a bare-CV arg's marker (and a folded varvar's inner
+    /// marker) to `line`.
+    fn fold_var_arg(a: &mut Expr, line: usize) {
+        let mut un = Self::unmark_argline(std::mem::replace(a, Expr::Null));
+        Self::retarget_varvar_line(&mut un, line);
+        *a = Self::markline(un, line);
     }
 
     /// Non-literal callee (`$f()`, `$o->m()`, `new`, `parent::m()`,
@@ -1570,10 +1625,70 @@ impl<'a> Parser<'a> {
         };
         for a in args.iter_mut().skip(1) {
             if Self::bare_var_arg(a) {
-                *a = Self::markline(
-                    Self::unmark_argline(std::mem::replace(a, Expr::Null)),
-                    first,
-                );
+                Self::fold_var_arg(a, first);
+            }
+        }
+    }
+
+    /// zend's frameless icall builtins (the `@frameless-function`
+    /// stubs, arity-gated): the call compiles to a single FRAMELESS
+    /// op at the callee's lineno — every bare-CV arg's read fuses
+    /// into it at the function NAME's line. (name, min_args, max_args)
+    const FRAMELESS: &'static [(&'static str, usize, usize)] = &[
+        ("min", 2, 2),
+        ("max", 2, 2),
+        ("in_array", 2, 3),
+        ("trim", 1, 2),
+        ("implode", 1, 2),
+        ("dirname", 1, 2),
+        ("strstr", 2, 3),
+        ("strpos", 2, 3),
+        ("str_contains", 2, 2),
+        ("str_starts_with", 2, 2),
+        ("substr", 2, 3),
+        ("strtr", 2, 3),
+        ("str_replace", 3, 3),
+        ("dechex", 1, 1),
+        ("is_numeric", 1, 1),
+        ("property_exists", 2, 2),
+        ("class_exists", 1, 2),
+        ("preg_match", 2, 2),
+        ("preg_replace", 3, 3),
+    ];
+
+    /// Whether `name(args)` compiles to a frameless op: the function is
+    /// a known frameless builtin, arg count fits a handler's arity, and
+    /// the args are positional (zend_args_contain_unpack_or_named
+    /// disqualifies named/unpack).
+    fn frameless_call(name: &str, args: &[Expr]) -> bool {
+        let bare = name
+            .strip_prefix('\u{1}')
+            .or_else(|| name.strip_prefix('\\'))
+            .unwrap_or(name);
+        if bare.contains('\\') {
+            return false;
+        }
+        let bare = bare.to_lowercase();
+        let Some((_, lo, hi)) = Self::FRAMELESS.iter().find(|(n, ..)| *n == bare) else {
+            return false;
+        };
+        if !(*lo..=*hi).contains(&args.len()) {
+            return false;
+        }
+        args.iter().all(|a| {
+            !matches!(
+                Self::unmark_argline_r(a),
+                Expr::Unpack(_) | Expr::Binary { op: "named", .. }
+            )
+        })
+    }
+
+    /// Frameless dispatch: every bare-CV arg's send fuses to the
+    /// callee's own line.
+    fn frameless_arglines(args: &mut [Expr], line: usize) {
+        for a in args.iter_mut() {
+            if Self::bare_var_arg(a) {
+                Self::fold_var_arg(a, line);
             }
         }
     }
@@ -1997,7 +2112,7 @@ impl<'a> Parser<'a> {
                     let name = self.name_path().unwrap_or_default();
                     if self.at_op("(") {
                         self.pos += 1;
-                        let args = self.args()?;
+                        let mut args = self.args()?;
                         let resolved = self.ns_resolve(&name, NsKind::Func);
                         // Unqualified literal names carry a \u{1} marker:
                         // call_named then applies the ns\f -> f fallback.
@@ -2007,6 +2122,11 @@ impl<'a> Parser<'a> {
                         } else {
                             format!("{}{}", '\u{1}', resolved)
                         };
+                        // Frameless builtins fuse every bare-CV arg's
+                        // read into the call op at the name's line.
+                        if Self::frameless_call(&resolved, &args) {
+                            Self::frameless_arglines(&mut args, site);
+                        }
                         Self::fcc_wrap(Expr::Call {
                             name: Box::new(Expr::Str(resolved)),
                             args,
@@ -2042,7 +2162,10 @@ impl<'a> Parser<'a> {
                 }
                 if self.at_op("(") {
                     self.pos += 1;
-                    let args = self.args()?;
+                    let mut args = self.args()?;
+                    if Self::frameless_call(&name, &args) {
+                        Self::frameless_arglines(&mut args, site);
+                    }
                     Self::fcc_wrap(Expr::Call {
                         name: Box::new(Expr::Str(name)),
                         args,

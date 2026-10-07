@@ -215,9 +215,21 @@ impl<'a> Interp<'a> {
                 body,
             } => self.exec_foreach(arr, key, val, body),
             Stmt::Switch { cond, cases } => {
-                let cv = match self.eval(cond) {
-                    Ok(v) => v,
-                    Err(e) => return self.err_flow(e),
+                // zend: a CV subject (bare or folded varvar) binds
+                // inside each case's CASE op — its read sites at the
+                // case cond's end line and warns once per compare
+                // evaluated; the jumptable SWITCH op reads it
+                // silently. With no real cases the subject is never
+                // read.
+                let cond_u = Self::unmark_rhs(cond);
+                let cv_subject = Self::is_cv(cond_u);
+                let cv: Option<Value> = if cv_subject {
+                    None
+                } else {
+                    match self.eval(cond) {
+                        Ok(v) => Some(v),
+                        Err(e) => return self.err_flow(e),
+                    }
                 };
                 // Find first matching case (loose ==); default is fallback.
                 let mut start: Option<usize> = None;
@@ -228,6 +240,17 @@ impl<'a> Interp<'a> {
                             if start.is_none() {
                                 match self.eval(ce) {
                                     Ok(v) => {
+                                        let cvv = match &cv {
+                                            Some(cv) => cv.clone(),
+                                            None => {
+                                                let cl = Self::inner_end_line(ce)
+                                                    .unwrap_or(self.cur_line);
+                                                match self.eval_cv_at(cond_u, cl) {
+                                                    Ok(v) => v,
+                                                    Err(e) => return self.err_flow(e),
+                                                }
+                                            }
+                                        };
                                         // ZEND_CASE (TMP|VAR subjects) is
                                         // noncommutative — subject stays
                                         // left; CONST|CV subjects emit
@@ -237,9 +260,9 @@ impl<'a> Interp<'a> {
                                         let r = compare_operand_rank(cond);
                                         let (x, y) = if (r & 6) == 0 && r < compare_operand_rank(ce)
                                         {
-                                            (&v, &cv)
+                                            (&v, &cvv)
                                         } else {
-                                            (&cv, &v)
+                                            (&cvv, &v)
                                         };
                                         crate::value::clear_cmp_depth_err();
                                         if compare(x, y) == Ordering::Equal {

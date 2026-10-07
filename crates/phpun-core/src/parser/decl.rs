@@ -74,7 +74,10 @@ impl<'a> Parser<'a> {
                 }
                 let cl = self.line();
                 self.pos += 1;
-                let e = self.expr()?;
+                // argline-mark the case expr: zend's CASE op (and a
+                // CV subject bound inside it) sites at the cond's
+                // last-evaluated line.
+                let e = Self::markline(self.expr()?, cl);
                 if !self.eat_op(":") {
                     self.expect_op(";")?;
                     self.deprecations.push((
