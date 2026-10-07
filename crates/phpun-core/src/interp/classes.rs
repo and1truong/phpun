@@ -3306,6 +3306,11 @@ impl<'a> Interp<'a> {
 
     /// Wrap a PhpObject in Rc and assign its handle id.
     pub fn alloc_obj(&mut self, o: PhpObject) -> Rc<RefCell<PhpObject>> {
+        // Object shells count toward memory_limit — a flat cost per
+        // allocation so a runaway `new` loop trips the limit even
+        // when nothing is emitted (new_oom).
+        self.mem_used += 512;
+        self.mem_last = 512;
         let rc = Rc::new(RefCell::new(o));
         let id = self.next_obj_id(&rc);
         rc.borrow_mut().id = id;

@@ -39,6 +39,7 @@ fn main() -> ExitCode {
 fn run_script(args: &[String]) -> ExitCode {
     let mut file: Option<&str> = None;
     let mut ini: Vec<String> = Vec::new();
+    let mut no_php_ini = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -57,9 +58,14 @@ fn run_script(args: &[String]) -> ExitCode {
                 i += 2;
                 continue;
             }
-            "-f" | "-q" | "-n" | "--no-php-ini" => {
+            "-f" | "-q" => {
+                i += 1;
+                continue;
+            }
+            "-n" | "--no-php-ini" => {
                 // `-n`/`--no-php-ini`: reference php skips ini files —
-                // phpun never reads one, so the flag is a no-op.
+                // the compiled-in defaults differ (log_errors=0).
+                no_php_ini = true;
                 i += 1;
                 continue;
             }
@@ -91,6 +97,12 @@ fn run_script(args: &[String]) -> ExitCode {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| file.to_string());
     let mut it = Interp::new(&abs);
+    if no_php_ini {
+        // The binary's compiled-in default is log_errors=0 — the dist
+        // php.ini turns it on, so -n leaves the `PHP Fatal error:`
+        // stderr copy off entirely (new_oom's merged 2>&1 stream).
+        it.ini.insert("log_errors".to_string(), "0".to_string());
+    }
     // CLI PHP sets the script-path SERVER vars to the path AS INVOKED
     // (`php console.php` shows "console.php"), unlike __FILE__ which is
     // always canonical.

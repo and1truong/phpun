@@ -533,8 +533,10 @@ pub(crate) fn dispatch(
         "php_sapi_name" => Value::str("cli"),
         "phpversion" | "phpversion_strict" => Value::str("8.5.11-phpun"),
         "php_uname" => Value::str("Linux"),
-        "memory_get_usage" => Value::Int(2097152),
-        "memory_get_peak_usage" => Value::Int(2097152),
+        // 2M base (zend's post-boot floor) plus accounted use —
+        // emits and object shells both count toward it.
+        "memory_get_usage" => Value::Int(2097152 + it.mem_used as i64),
+        "memory_get_peak_usage" => Value::Int(2097152 + it.mem_used as i64),
         "memory_reset_peak_usage" => Value::Null,
         "zend_version" => Value::str("8.5.11-phpun"),
         "getmypid" => Value::Int(std::process::id() as i64),

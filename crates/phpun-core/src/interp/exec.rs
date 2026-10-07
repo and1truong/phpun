@@ -29,13 +29,18 @@ impl<'a> Interp<'a> {
             let limit = self.ini_bytes("memory_limit");
             if limit > 0 && self.mem_used as i64 > limit {
                 self.mem_exceeded = true;
-                return self.err_flow(PhpError::fatal(
+                // Zend's OOM fatal always prints a Stack trace:
+                // block (`#0 {main}` at top level) — a plain E_ERROR
+                // wouldn't.
+                let mut e = PhpError::fatal(
                     format!(
                         "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
                         limit, self.mem_last
                     ),
                     self.cur_line,
-                ));
+                );
+                e.trace = Some(self.fatal_frames());
+                return self.err_flow(e);
             }
             if let Some(d) = self.deadline {
                 if std::time::Instant::now() > d {
