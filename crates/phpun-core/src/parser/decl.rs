@@ -1590,6 +1590,7 @@ impl<'a> Parser<'a> {
                         p.name, params[ri].name
                     ),
                     line,
+                    self.pos,
                 ));
             }
         }

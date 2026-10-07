@@ -735,7 +735,9 @@ impl<'a> Interp<'a> {
                 }
                 Ok(())
             }
-            Expr::StaticCallDyn { class, name, args, .. } => {
+            Expr::StaticCallDyn {
+                class, name, args, ..
+            } => {
                 self.flow_expr(class, sc)?;
                 self.flow_expr(name, sc)?;
                 for a in args {

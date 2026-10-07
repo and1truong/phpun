@@ -137,7 +137,7 @@ pub fn parse_pure(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
 
 /// `eof_line` is Zend's scanner line at end-of-input (one past the
 /// last consumed newline) — where EOF-attributed errors are reported.
-fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> {
+fn parse_toks(toks: Vec<Lexed>, eof_line: usize, src: &str) -> Result<Vec<Stmt>, PhpError> {
     // Compile-time diagnostics ride the token stream; each records the
     // index it would occupy in the filtered stream — its binding
     // position for stmt attribution (Zend emits a diagnostic while
@@ -159,7 +159,7 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
         })
         .collect();
     let bracket_err = bracket_check(&toks, eof_line);
-    let mut p = Parser::new(&toks, eof_line);
+    let mut p = Parser::new(&toks, eof_line, src);
     let stmts = match p.program() {
         Ok(s) => s,
         Err(pe) => {
@@ -174,6 +174,7 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
                 let mut p2 = Parser::new(
                     &toks[..bpos],
                     toks.get(bpos).map(|t| t.line).unwrap_or(eof_line),
+                    src,
                 );
                 match p2.program() {
                     Err(pe2) if !pe2.message.starts_with("syntax error, unexpected end of") => {
@@ -228,7 +229,7 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
 }
 
 impl<'a> Parser<'a> {
-    fn new(toks: &'a [Lexed], eof_line: usize) -> Self {
+    fn new(toks: &'a [Lexed], eof_line: usize, src: &'a str) -> Self {
         Self {
             toks,
             src,

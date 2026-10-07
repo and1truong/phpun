@@ -193,7 +193,9 @@ impl<'a> Interp<'a> {
             Expr::StaticCall { class, args, .. } => {
                 Self::expr_yield_kind(class).or_else(|| args.iter().find_map(Self::expr_yield_kind))
             }
-            Expr::StaticCallDyn { class, name, args, .. } => Self::expr_yield_kind(class)
+            Expr::StaticCallDyn {
+                class, name, args, ..
+            } => Self::expr_yield_kind(class)
                 .or_else(|| Self::expr_yield_kind(name))
                 .or_else(|| args.iter().find_map(Self::expr_yield_kind)),
             Expr::Index { e, i } => Self::expr_yield_kind(e)
@@ -216,7 +218,7 @@ impl<'a> Interp<'a> {
                     .and_then(|k| Self::expr_yield_kind(k))
                     .or_else(|| Self::expr_yield_kind(v))
             }),
-            Expr::Match { subject, arms } => Self::expr_yield_kind(subject).or_else(|| {
+            Expr::Match { subject, arms, .. } => Self::expr_yield_kind(subject).or_else(|| {
                 arms.iter().find_map(|a| {
                     a.conds
                         .iter()
@@ -1077,6 +1079,8 @@ impl<'a> Interp<'a> {
                 args: args.to_vec(),
                 named_args: Vec::new(),
                 internal: false,
+                visible: true,
+                named_dispatch: false,
             });
         }
         let v = self.exception(class, msg);
