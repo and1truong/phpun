@@ -398,6 +398,12 @@ pub struct Interp<'a> {
     /// rebound or mutated the container, so the pending write lands on
     /// the stale slot: invisible and silent (assign_dim_014).
     detached_dim: bool,
+    /// `++`/`--` overflow context while the pending dim write stores:
+    /// a ref held by a typed-int prop reports `Cannot
+    /// increment/decrement a reference held by property ... past its
+    /// {maximal,minimal} value` instead of the assign TypeError
+    /// (typed_properties_064). `(direction, bound)`.
+    incdec_ref_ctx: Option<(&'static str, &'static str)>,
     /// Inside `unset()`: null dim keys convert to "" without the
     /// 'Using null as an array offset' deprecation (zend's UNSET_DIM
     /// maps IS_NULL silently — float/resource/illegal still diagnose).
@@ -941,6 +947,7 @@ impl<'a> Interp<'a> {
             script_args: Vec::new(),
             exception_handler: None,
             in_handler: false,
+            incdec_ref_ctx: None,
             detached_dim: false,
             unset_ctx: false,
             dim_key_conv: std::collections::HashMap::new(),

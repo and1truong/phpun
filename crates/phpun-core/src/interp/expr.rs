@@ -72,6 +72,7 @@ impl DimPre {
     }
 }
 
+#[derive(Clone)]
 struct DimDetach {
     name: String,
     pre: DimPre,
@@ -903,7 +904,7 @@ impl<'a> Interp<'a> {
                         }
                     };
                     if let Some(b) = &cur {
-                        cur = self.isset_dim_fetch(b.clone(), key, mode)?;
+                        cur = self.isset_dim_fetch(b.clone(), key, mode, idx == keys.len() - 1)?;
                     }
                 }
                 Ok(cur)
@@ -1390,7 +1391,7 @@ impl<'a> Interp<'a> {
         // A var-rooted dim write binds its container cell before the
         // key exprs run — a handler that rebinds the var detaches the
         // pending write onto the stale slot (assign_dim_014).
-        let mut dim_root: Option<(String, Cell)> = None;
+        let mut dim_root: Option<(DimDetach, Cell)> = None;
         // Dynamic-prop slots materialized below record themselves so
         // the read side can replay zend's 'Undefined property' warns.
         self.fresh_dyn_props.clear();
@@ -1426,6 +1427,14 @@ impl<'a> Interp<'a> {
                 // (engine_assignExecutionOrder_001 reads $name that way).
                 match self.eval_cell(e) {
                     Ok(c) => {
+                        // Same per-op cache reset as the plain Index arm —
+                        // a stale entry keyed by a CV's stable cell ptr
+                        // would reuse last op's converted key ($a->p[$k]
+                        // re-writing the first bound index).
+                        if !self.in_handler {
+                            self.dim_key_conv.clear();
+                            self.dim_cv_bound.clear();
+                        }
                         let key = match i.as_deref() {
                             Some(ie) => self.dim_key(ie)?,
                             None => None,
@@ -1464,7 +1473,15 @@ impl<'a> Interp<'a> {
                         _ => {
                             let c = self.eval_cell(base)?;
                             if let Expr::Var(n) = base {
-                                dim_root = Some((n.clone(), c.clone()));
+                                dim_root = Some((
+                                    DimDetach {
+                                        name: n.clone(),
+                                        pre: DimPre::of(&c.borrow()),
+                                        pre_cell: Rc::as_ptr(&c) as usize,
+                                        coalesce: false,
+                                    },
+                                    c.clone(),
+                                ));
                             }
                             c
                         }
@@ -1472,7 +1489,15 @@ impl<'a> Interp<'a> {
                 } else {
                     let c = self.eval_cell(base)?;
                     if let Expr::Var(n) = base {
-                        dim_root = Some((n.clone(), c.clone()));
+                        dim_root = Some((
+                            DimDetach {
+                                name: n.clone(),
+                                pre: DimPre::of(&c.borrow()),
+                                pre_cell: Rc::as_ptr(&c) as usize,
+                                coalesce: false,
+                            },
+                            c.clone(),
+                        ));
                     }
                     c
                 };
@@ -1643,11 +1668,9 @@ impl<'a> Interp<'a> {
         // stale slot (RHS-eval diags land inside `pre` — they can't
         // detach, the op hasn't started yet).
         let mut det: Option<DimDetach> = if op == "??=" {
-            dim_root.as_ref().map(|(n, c)| DimDetach {
-                name: n.clone(),
-                pre: DimPre::of(&c.borrow()),
-                pre_cell: Rc::as_ptr(c) as usize,
+            dim_root.as_ref().map(|(d, _)| DimDetach {
                 coalesce: true,
+                ..d.clone()
             })
         } else {
             None
@@ -1660,12 +1683,31 @@ impl<'a> Interp<'a> {
         }
         let rhs = self.eval(value)?;
         if det.is_none() {
-            det = dim_root.as_ref().map(|(n, c)| DimDetach {
-                name: n.clone(),
-                pre: DimPre::of(&c.borrow()),
-                pre_cell: Rc::as_ptr(c) as usize,
-                coalesce: false,
-            });
+            // zend's ASSIGN_DIM materializes an undef/null container
+            // slot to a fresh array AFTER the RHS but BEFORE the dim
+            // operands evaluate — the pending write's detach sentinel
+            // is that array's refcount: a handler rebind kills it.
+            det = match dim_root.as_ref() {
+                Some((d, c)) => {
+                    if matches!(&*c.borrow(), Value::Null) {
+                        // Typed slots gate array promotion —
+                        // `Cannot auto-initialize an array inside ...`
+                        // beats the pending write (typed_properties_083).
+                        self.auto_init_gate(c)?;
+                        if matches!(&*c.borrow(), Value::Null) {
+                            *c.borrow_mut() =
+                                Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+                        }
+                    }
+                    Some(DimDetach {
+                        name: d.name.clone(),
+                        pre: DimPre::of(&c.borrow()),
+                        pre_cell: d.pre_cell,
+                        coalesce: d.coalesce,
+                    })
+                }
+                None => None,
+            };
         }
         let dim_det = det.as_ref().is_some_and(|d| self.dim_detached(d));
         let cur = if needs_read {
@@ -1941,15 +1983,18 @@ impl<'a> Interp<'a> {
                 // A `??=` detached root re-resolves AFTER the RHS — the
                 // RHS may have created the var (`$a[0] ??= ($a = [5])`),
                 // else this finally materializes it for the write.
-                let base = match undef_root.take() {
-                    Some(n) => self.var_cell(&n),
-                    None => base.clone(),
-                };
                 // A handler-rebound container detaches the pending
                 // write (zend's refcount sentinel aborts mid-key). For
                 // `=`/`+=` the write lands on a scratch holding the
                 // op-entry value — invisible, conversions silenced.
+                // Checked BEFORE undef_root materializes the var: a
+                // still-undef root is bound, and materializing it would
+                // masquerade as a handler bind.
                 let detached = det.as_ref().is_some_and(|d| self.dim_detached(d));
+                let base = match undef_root.take() {
+                    Some(n) => self.var_cell(&n),
+                    None => base.clone(),
+                };
                 let mut det = det;
                 let (target, silence) = if detached {
                     let d = det.as_ref().unwrap();
@@ -1989,7 +2034,7 @@ impl<'a> Interp<'a> {
                                 // strings/scalars write a scratch.
                                 self.dim_cv_bound.clear();
                                 self.dim_key_conv.clear();
-                                det = Some(DimDetach {
+                                    det = Some(DimDetach {
                                     name: d.name.clone(),
                                     pre: DimPre::of(&cur),
                                     pre_cell: 0,
@@ -2655,12 +2700,7 @@ impl<'a> Interp<'a> {
                 dims.reverse();
                 let c = self.eval_cell(base)?;
                 let det = match base {
-                    Expr::Var(n) => self.var_cell_opt(n).map(|c| DimDetach {
-                        name: n.clone(),
-                        pre: DimPre::of(&c.borrow()),
-                        pre_cell: Rc::as_ptr(&c) as usize,
-                        coalesce: false,
-                    }),
+                    Expr::Var(n) => Some(self.dim_detach_var(n, false)),
                     _ => None,
                 };
                 if !self.in_handler {
@@ -3493,6 +3533,28 @@ impl<'a> Interp<'a> {
     /// container? zend's refcount sentinel: the captured zval's
     /// refcount hits zero → the pending write aborts (silent +
     /// invisible). A destroyed Weak counts as a rebind.
+    /// The detach sentinel for a `$var` root: `pre_cell = usize::MAX`
+    /// when the var was UNDEF at op entry — zend captured the IS_UNDEF
+    /// slot, so a handler that then binds it detaches the pending
+    /// write (invisible + conversion-silent, assign_dim_014); a var
+    /// still undef at write time stays bound (auto-viv path).
+    fn dim_detach_var(&mut self, n: &str, coalesce: bool) -> DimDetach {
+        match self.var_cell_opt(n) {
+            Some(c) => DimDetach {
+                name: n.to_string(),
+                pre: DimPre::of(&c.borrow()),
+                pre_cell: Rc::as_ptr(&c) as usize,
+                coalesce,
+            },
+            None => DimDetach {
+                name: n.to_string(),
+                pre: DimPre::Scalar(Value::Null),
+                pre_cell: usize::MAX,
+                coalesce,
+            },
+        }
+    }
+
     fn dim_detached(&mut self, det: &DimDetach) -> bool {
         if det.name == "GLOBALS" {
             // $GLOBALS resolves to a fresh wrapper cell per fetch over
@@ -3501,6 +3563,9 @@ impl<'a> Interp<'a> {
         }
         match self.var_cell_opt(&det.name) {
             Some(c) => {
+                if det.pre_cell == usize::MAX {
+                    return true;
+                }
                 // A non-refcounted op-start slot detaches only when the
                 // var cell itself was replaced — auto-viv (Null →
                 // Array) and in-place scalar writes mutate the same
@@ -3510,7 +3575,7 @@ impl<'a> Interp<'a> {
                 }
                 !Self::same_container(&det.pre, &c.borrow())
             }
-            None => true,
+            None => det.pre_cell != usize::MAX,
         }
     }
 
@@ -3571,6 +3636,7 @@ impl<'a> Interp<'a> {
         base: Value,
         key: Value,
         mode: u8,
+        last: bool,
     ) -> Result<Option<Value>, PhpError> {
         // ArrayAccess containers see any key type (offsetExists).
         if !matches!(&base, Value::Object(o) if self.obj_is_a(o, "ArrayAccess")) {
@@ -3623,10 +3689,11 @@ impl<'a> Interp<'a> {
                         "offsetExists",
                         CallArgs::positional(vec![cell(key.clone())]),
                     ) {
-                        // isset() consults offsetExists alone —
-                        // offsetGet is only chained by ??/empty
-                        // (bug31683).
-                        Ok(v) if v.is_truthy() && mode == 0 => Ok(Some(Value::Bool(true))),
+                        // isset() consults offsetExists alone on the
+                        // LAST level — intermediate levels still chain
+                        // offsetGet to descend (bug71731); ??/empty
+                        // chain offsetGet at every level (bug31683).
+                        Ok(v) if v.is_truthy() && mode == 0 && last => Ok(Some(Value::Bool(true))),
                         Ok(v) if v.is_truthy() => {
                             match self.method_invoke(
                                 o,
@@ -3698,31 +3765,32 @@ impl<'a> Interp<'a> {
         // zend binds the container at op entry — after eager key exprs,
         // before CV binds/conversions: the sentinel snapshot lives here.
         let det = match e {
-            Expr::Var(n) => self.var_cell_opt(n).map(|c| DimDetach {
-                name: n.clone(),
-                pre: DimPre::of(&c.borrow()),
-                pre_cell: Rc::as_ptr(&c) as usize,
-                coalesce: false,
-            }),
+            Expr::Var(n) => Some(self.dim_detach_var(n, false)),
             _ => None,
         };
         let mut key = key;
         if let Some(n) = &cv_key {
             if let Some(d) = &det {
                 let bad = {
-                    let b = self.var_cell(&d.name);
-                    let b = b.borrow();
-                    match &*b {
-                        Value::Null | Value::Array(_) | Value::Str(_) => None,
-                        Value::Object(o) if self.obj_is_a(o, "ArrayAccess") => None,
-                        Value::Object(o) => Some(format!(
+                    let bc = self.var_cell_opt(&d.name);
+                    let bb = bc.as_ref().map(|c| c.borrow());
+                    match bb.as_deref() {
+                        // An undef root reads as writable-Null
+                        // (auto-viv); it must NOT be created here —
+                        // the detach sentinel treats "now exists" as
+                        // "handler bound it mid-op".
+                        None | Some(Value::Null) | Some(Value::Array(_)) | Some(Value::Str(_)) => {
+                            None
+                        }
+                        Some(Value::Object(o)) if self.obj_is_a(o, "ArrayAccess") => None,
+                        Some(Value::Object(o)) => Some(format!(
                             "Cannot use object of type {} as array",
                             o.borrow().class.name()
                         )),
-                        Value::Callable(_) => {
+                        Some(Value::Callable(_)) => {
                             Some("Cannot use object of type Closure as array".to_string())
                         }
-                        _ => Some("Cannot use a scalar value as an array".to_string()),
+                        Some(_) => Some("Cannot use a scalar value as an array".to_string()),
                     }
                 };
                 if let Some(m) = bad {
@@ -3973,7 +4041,8 @@ impl<'a> Interp<'a> {
                 c = cell(iv);
                 continue;
             }
-            match self.index_into_key(c.clone(), k.clone()) {
+            let rr = self.index_into_key(c.clone(), k.clone());
+            match rr {
                 Ok(nc) => {
                     if n == last {
                         // `$ref[k] = v` where the element cell is bound to
@@ -5247,12 +5316,7 @@ impl<'a> Interp<'a> {
         // strings, 'Cannot unset offset in a non-array variable' for
         // anything else refcounted — even a rebound-TO-array).
         let det = match cur {
-            Expr::Var(n) => self.var_cell_opt(n).map(|c| DimDetach {
-                name: n.clone(),
-                pre: DimPre::of(&c.borrow()),
-                pre_cell: Rc::as_ptr(&c) as usize,
-                coalesce: false,
-            }),
+            Expr::Var(n) => Some(self.dim_detach_var(n, false)),
             _ => None,
         };
         // `unset()` key conversions never warn 'Using null as an array
@@ -5819,6 +5883,32 @@ impl<'a> Interp<'a> {
                     None => return Ok(v),
                 }
             };
+        // Overflowing ++/-- through a ref held by a typed-int prop:
+        // zend rejects on the inc/dec verb before the float coercion
+        // is even considered (typed_properties_064).
+        if let Some((dir, bound)) = self.incdec_ref_ctx {
+            if self.is_ref_ptr(ptr) {
+                if let Some((tys, cn, pn)) = owners.iter().find(|(tys, _, _)| {
+                    tys.iter().any(|m| m.eq_ignore_ascii_case("int"))
+                        && !tys.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                }) {
+                    let mut e = PhpError::uncaught(
+                        "TypeError",
+                        format!(
+                            "Cannot {} a reference held by property {}::${} of type {} past its {} value",
+                            dir,
+                            cn,
+                            pn,
+                            ty_disp(tys),
+                            bound
+                        ),
+                        0,
+                    );
+                    e.thrown_line = Some(self.cur_line);
+                    return self.fail(e);
+                }
+            }
+        }
         let mut results: Vec<Option<Value>> = Vec::with_capacity(owners.len());
         for (tys, _, _) in &owners {
             results.push(if strict {
@@ -6414,6 +6504,23 @@ impl<'a> Interp<'a> {
         }
         let old = self.compound_dim_read(arr_cell.clone(), &keys, false, Some(&det))?;
         let new = self.incdec_value(&old, delta)?;
+        // int-boundary overflow writes a float back — zend words the
+        // typed-ref rejection `Cannot increment/decrement a reference
+        // held by property ... past its {maximal,minimal} value`
+        // (typed_properties_064); slot_write picks the context up.
+        let oob = matches!(old, Value::Int(i) if i.checked_add(delta).is_none());
+        let saved_ctx = std::mem::replace(
+            &mut self.incdec_ref_ctx,
+            if oob {
+                Some(if delta > 0 {
+                    ("increment", "maximal")
+                } else {
+                    ("decrement", "minimal")
+                })
+            } else {
+                None
+            },
+        );
         let detached = self.dim_detached(&det);
         let target = if detached {
             cell(det.pre.value().unwrap_or(Value::Null))
@@ -6423,6 +6530,7 @@ impl<'a> Interp<'a> {
         let was = std::mem::replace(&mut self.detached_dim, detached);
         let r = self.assign_index_path(target, &keys, new.clone(), true, Some(&det));
         self.detached_dim = was;
+        self.incdec_ref_ctx = saved_ctx;
         r?;
         Ok(if post { old } else { new })
     }
