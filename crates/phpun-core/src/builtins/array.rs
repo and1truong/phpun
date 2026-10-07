@@ -1164,8 +1164,8 @@ pub(crate) fn dispatch(
             // recursion guard — catchable Error 'Recursion detected'.
             let mut out = PhpArray::new();
             let mut active = std::collections::HashSet::new();
-            for c in args {
-                compact_one(it, &c.borrow().clone(), &mut out, &mut active)?;
+            for (i, c) in args.iter().enumerate() {
+                compact_one(it, &c.borrow().clone(), &mut out, &mut active, i)?;
             }
             Value::Array(Rc::new(RefCell::new(out)))
         }
@@ -1678,6 +1678,7 @@ fn compact_one(
     v: &Value,
     out: &mut PhpArray,
     active: &mut std::collections::HashSet<usize>,
+    arg_idx: usize,
 ) -> Result<(), PhpError> {
     // Iterative expansion — a nested-array arg walks down arbitrarily
     // deep without native recursion. zend charges each level against
@@ -1736,7 +1737,15 @@ fn compact_one(
                         stack.push(Work::Val(e));
                     }
                 }
-                _ => {}
+                // Non-string, non-array elements warn with the
+                // containing TOP-LEVEL argument's index (probe m7).
+                v => {
+                    it.warn_pub(&format!(
+                        "compact(): Argument #{} must be string or array of strings, {} given",
+                        arg_idx + 1,
+                        it.zval_type_name(&v)
+                    ))?;
+                }
             },
         }
     }
