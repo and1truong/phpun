@@ -700,10 +700,26 @@ pub struct ObLevel {
     /// journal cursor they arrived at — the splice input for
     /// `ob_mirror_close`.
     pub caps: Vec<(usize, Vec<u8>)>,
+    /// Buf ranges holding consumer captures, as (tag, offset, len)
+    /// per entry — lets a content rebuild exclude cap bytes from the
+    /// direct-write head and re-insert them at cursor position
+    /// (`ob_level_content`, end-of-request patches).
+    pub cap_segs: Vec<(usize, usize, usize)>,
+    /// Buffer views the body materialized eagerly — (yield index,
+    /// head, per-tag segments) per read. Consumer captures that
+    /// arrive between the suspend and the read's resume belong
+    /// inside them (Zend runs the read lazily); the window's close
+    /// rewrites the stored values to the resolved content.
+    pub read_vals: Vec<ObReadVal>,
     /// The owning generator's state — stale-drop rewrites its
     /// deferred journal entries still holding the stale pop value.
     pub gen_state: Option<std::rc::Weak<RefCell<crate::value::GenState>>>,
 }
+
+/// A buffer view a gen body materialized eagerly: (yield index,
+/// direct-write head, per-tag journaled segments). Window close
+/// rewrites the stored value against the captures its resume saw.
+pub(in crate::interp) type ObReadVal = (usize, Vec<u8>, Vec<(usize, Vec<u8>)>);
 
 /// Result of a top-level program run.
 pub struct RunResult {
@@ -735,6 +751,45 @@ pub(in crate::interp) fn ob_splice(
         ci += 1;
     }
     v
+}
+
+/// Split a buffer view at the level's recorded drain offsets into a
+/// direct-write head and per-tag journaled segments — same layout
+/// `ob_splice` consumes.
+pub(in crate::interp) fn ob_split_view(
+    l: &ObLevel,
+    content: &[u8],
+) -> (Vec<u8>, Vec<(usize, Vec<u8>)>) {
+    let first = l
+        .drained_segs
+        .first()
+        .map(|(_, s, _)| (*s).min(content.len()))
+        .unwrap_or(content.len());
+    let head = content[..first].to_vec();
+    let mut segs: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut off = first;
+    for &(t, s, n) in &l.drained_segs {
+        let s = s.min(content.len());
+        let e = (s + n).min(content.len());
+        if s < off {
+            continue;
+        }
+        // Real writes between two journaled segs ride with the
+        // following one — they ran later.
+        if s > off {
+            if let Some(prev) = segs.last_mut() {
+                prev.1.extend_from_slice(&content[off..s]);
+            } else {
+                segs.push((t, content[off..s].to_vec()));
+            }
+        }
+        segs.push((t, content[s..e].to_vec()));
+        off = e;
+    }
+    if off < content.len() {
+        segs.push((usize::MAX, content[off..].to_vec()));
+    }
+    (head, segs)
 }
 
 impl<'a> Interp<'a> {
@@ -2835,6 +2890,7 @@ impl<'a> Interp<'a> {
                 // consumer writes — keep the bookkeeping in step.
                 let pos = l.gen_q.as_ref().map(|q| q.borrow().pos).unwrap_or(0);
                 l.caps.push((pos, b.to_vec()));
+                l.cap_segs.push((pos, l.buf.len(), b.len()));
             }
             l.buf.extend_from_slice(b);
             return;
@@ -2859,6 +2915,7 @@ impl<'a> Interp<'a> {
                 // teardown and mirror-close splices need it.
                 let pos = buf.gen_q.as_ref().map(|q| q.borrow().pos).unwrap_or(0);
                 buf.caps.push((pos, b.to_vec()));
+                buf.cap_segs.push((pos, buf.buf.len(), b.len()));
             }
             buf.buf.extend_from_slice(b);
         } else if self.live_io {
@@ -2894,11 +2951,18 @@ impl<'a> Interp<'a> {
                 segs.sort_by_key(|(_, off, _)| *off);
                 let mut v = Vec::with_capacity(l.buf.len());
                 let mut off = 0;
-                for (_, s, e) in segs {
+                for &(_, s, e) in &segs {
                     v.extend_from_slice(&l.buf[off..s.min(l.buf.len())]);
                     off = (s + e).min(l.buf.len());
                 }
                 v.extend_from_slice(&l.buf[off..]);
+                // Cap offsets ride on the same buf — shift each by
+                // the bytes the excision cut before it.
+                for c in l.cap_segs.iter_mut() {
+                    c.1 = segs.iter().fold(c.1, |o, (_, s, e)| {
+                        o.saturating_sub((*e).min(o.saturating_sub(*s)))
+                    });
+                }
                 l.buf = v;
                 l.gen_drained = 0;
             }
@@ -3035,11 +3099,13 @@ impl<'a> Interp<'a> {
                 let new_v = st.buf;
                 if let Some(gs) = &l.gen_state {
                     if let Some(st2) = gs.upgrade() {
-                        for (t, b, ..) in &mut st2.borrow_mut().pending_out {
+                        let mut st2 = st2.borrow_mut();
+                        for (t, b, ..) in &mut st2.pending_out {
                             if *t >= min_tag {
                                 Self::bytes_replace(b, &old_v, &new_v);
                             }
                         }
+                        Self::gen_patch_values(&mut st2, &old_v, &new_v);
                     }
                 }
                 if let Some(q) = &l.gen_q {
@@ -3072,8 +3138,34 @@ impl<'a> Interp<'a> {
                     gen_drained: 0,
                     pop_head: None,
                     pop_segs: Vec::new(),
-                    drained_segs: Vec::new(),
-                    caps: Vec::new(),
+                    // Keep the journaled segment and capture
+                    // positions so later consumer writes still
+                    // splice at cursor order.
+                    drained_segs: {
+                        let mut off = head.len();
+                        l.pop_segs
+                            .iter()
+                            .map(|(t, s)| {
+                                let e = (*t, off, s.len());
+                                off += s.len();
+                                e
+                            })
+                            .collect()
+                    },
+                    caps: l.caps.clone(),
+                    cap_segs: {
+                        let mut off = l.pop_head.as_ref().map(|h| h.len()).unwrap_or(0)
+                            + l.pop_segs.iter().map(|(_, s)| s.len()).sum::<usize>();
+                        l.caps
+                            .iter()
+                            .map(|(t, c)| {
+                                let e = (*t, off, c.len());
+                                off += c.len();
+                                e
+                            })
+                            .collect()
+                    },
+                    read_vals: l.read_vals.clone(),
                     gen_state: l.gen_state.clone(),
                 });
             }
@@ -3091,6 +3183,27 @@ impl<'a> Interp<'a> {
         // only deferred entries from that segment on can carry the
         // pop value.
         let min_tag = l.gen_close.unwrap_or(0).saturating_sub(1);
+        // Buffer views the body materialized eagerly — each read
+        // resolves against the captures that arrived while the
+        // cursor sat at tags below its resume.
+        if !l.read_vals.is_empty() {
+            if let Some(gs) = &l.gen_state {
+                if let Some(st) = gs.upgrade() {
+                    let mut st = st.borrow_mut();
+                    for (k, rhead, rsegs) in &l.read_vals {
+                        let caps: Vec<(usize, Vec<u8>)> =
+                            l.caps.iter().filter(|(t, _)| *t < *k).cloned().collect();
+                        let mut stale = rhead.clone();
+                        for (_, s) in rsegs {
+                            stale.extend_from_slice(s);
+                        }
+                        let mut v = rhead.clone();
+                        v.extend_from_slice(&ob_splice(&[], rsegs, &caps));
+                        Self::gen_patch_values(&mut st, &stale, &v);
+                    }
+                }
+            }
+        }
         if old_v.is_empty() {
             // The journaled pop value is the empty string — no anchor
             // to rewrite. Splice into the body's first deferred echo
@@ -3144,6 +3257,68 @@ impl<'a> Interp<'a> {
                     Self::bytes_replace(b, &old_v, &new_v);
                 }
             }
+        }
+        // Values the body already materialized from the window's
+        // stale content (ob_get_contents reads stored into CVs,
+        // yielded items, the return value) — Zend ran those reads at
+        // resume with the captures inside.
+        if let Some(gs) = &l.gen_state {
+            if let Some(st) = gs.upgrade() {
+                Self::gen_patch_values(&mut st.borrow_mut(), &old_v, &new_v);
+            }
+        }
+    }
+
+    /// Rewrite a gen's stored values that materialized a window's
+    /// stale content: string cells equal to `old` become `new`, and
+    /// an Int cell equal to `old`'s byte length inside a container
+    /// that held such a string becomes `new`'s (ob_get_length reads
+    /// pair with ob_get_contents ones).
+    fn gen_patch_values(st: &mut crate::value::GenState, old: &[u8], new: &[u8]) {
+        if old == new || old.is_empty() {
+            return;
+        }
+        let patch = |v: &mut Value| Self::value_replace(v, old, new);
+        patch(&mut st.return_val);
+        for (k, c) in &mut st.items {
+            patch(k);
+            patch(&mut c.borrow_mut());
+        }
+        let fin = st.fin_q.clone();
+        let mut f = fin.borrow_mut();
+        for (_, c) in &mut f.suspended {
+            patch(&mut c.borrow_mut());
+        }
+    }
+
+    /// Deep cell rewrite for `gen_patch_values` — returns the number
+    /// of string cells replaced so the enclosing array can also patch
+    /// sibling length reads.
+    fn value_replace(v: &mut Value, old: &[u8], new: &[u8]) -> usize {
+        match v {
+            Value::Str(s) if s.as_ref() == old => {
+                *v = Value::bytes(new.to_vec());
+                1
+            }
+            Value::Array(a) => {
+                let cells: Vec<crate::value::Cell> =
+                    a.borrow().iter().map(|(_, c)| c.clone()).collect();
+                let mut n = 0;
+                for c in &cells {
+                    n += Self::value_replace(&mut c.borrow_mut(), old, new);
+                }
+                if n > 0 {
+                    for c in &cells {
+                        if let Value::Int(i) = &mut *c.borrow_mut() {
+                            if *i == old.len() as i64 {
+                                *i = new.len() as i64;
+                            }
+                        }
+                    }
+                }
+                n
+            }
+            _ => 0,
         }
     }
 
@@ -3325,10 +3500,13 @@ impl<'a> Interp<'a> {
         r
     }
 
-    /// Rebuild a level's real buffer content: direct writes + the
-    /// journaled segments the consumer cursor already confirmed +
-    /// consumer captures. A killed gen's tail entries (`t + 1 >= pos`)
-    /// never ran in Zend's frame and drop out.
+    /// Rebuild a level's real buffer content in write order: the
+    /// direct-write head pieces stay inline, journaled segs emit
+    /// once the consumer cursor confirms them, and consumer captures
+    /// splice ahead of the first seg whose tag is >= their arrival
+    /// cursor — the shared stack's real ordering. A killed gen's
+    /// tail entries (`t + 1 >= pos`) never ran in Zend's frame and
+    /// drop out.
     fn ob_level_content(l: &ObLevel, pos: usize, killed: bool) -> Vec<u8> {
         if let Some(head) = &l.pop_head {
             // Pop mirror — the body's pop ran only in the eager
@@ -3341,24 +3519,42 @@ impl<'a> Interp<'a> {
             }
             return v;
         }
-        // Buffer contents = direct writes + segments the cursor
-        // already passed + consumer captures — journaled bytes
-        // tagged at/past the cursor never ran in Zend's frame.
+        // Walk the recorded seg/cap ranges in buf order: head slices
+        // copy through, cap bytes hold for their tag position, and
+        // each confirmed seg first emits every capture that arrived
+        // before its resume.
+        let mut events: Vec<(usize, usize, usize, bool)> = Vec::new();
+        for &(t, s, n) in &l.drained_segs {
+            events.push((s, t, n, false));
+        }
+        for &(t, s, n) in &l.cap_segs {
+            events.push((s, t, n, true));
+        }
+        events.sort_by_key(|(s, _, _, c)| (*s, *c));
         let mut v = Vec::new();
         let mut off = 0usize;
-        for &(t, s, n) in &l.drained_segs {
+        let mut ci = 0usize;
+        for (s, t, n, is_cap) in events {
             let s = s.min(l.buf.len());
             let e = (s + n).min(l.buf.len());
             if s < off {
                 continue;
             }
             v.extend_from_slice(&l.buf[off..s]);
-            if t + usize::from(killed) < pos {
+            if !is_cap && t + usize::from(killed) < pos {
+                while ci < l.caps.len() && l.caps[ci].0 <= t {
+                    v.extend_from_slice(&l.caps[ci].1);
+                    ci += 1;
+                }
                 v.extend_from_slice(&l.buf[s..e]);
             }
             off = e;
         }
         v.extend_from_slice(&l.buf[off..]);
+        while ci < l.caps.len() {
+            v.extend_from_slice(&l.caps[ci].1);
+            ci += 1;
+        }
         v
     }
 

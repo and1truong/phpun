@@ -47,6 +47,50 @@ impl<'a> Interp<'a> {
                     l.drained_segs.clear();
                     l.gen_drained = 0;
                 }
+                // A live gen window's buffer resolves at teardown:
+                // consumer captures splice into cursor position —
+                // the body's eager reads of the stale content
+                // (ob_get_contents & friends stored in CVs) rewrite
+                // to the resolved value, and the flush itself
+                // carries the spliced ordering.
+                if l.gen_q.is_some() && !l.caps.is_empty() {
+                    let caps = std::mem::take(&mut l.caps);
+                    let old_v = Self::ob_level_content(l, dead.0, dead.1);
+                    l.caps = caps;
+                    let new_v = Self::ob_level_content(l, dead.0, dead.1);
+                    if let Some(gs) = &l.gen_state {
+                        if let Some(st) = gs.upgrade() {
+                            Self::gen_patch_values(&mut st.borrow_mut(), &old_v, &new_v);
+                        }
+                    }
+                    l.buf = new_v;
+                    l.drained_segs.clear();
+                    l.cap_segs.clear();
+                    l.gen_drained = 0;
+                }
+                // Eager buffer reads the body stored (ob_get_contents
+                // & friends) resolve against the captures each read's
+                // resume had seen — the same close-time rewrite a
+                // pop mirror performs.
+                if l.gen_q.is_some() && !l.read_vals.is_empty() {
+                    let reads = std::mem::take(&mut l.read_vals);
+                    if let Some(gs) = &l.gen_state {
+                        if let Some(st) = gs.upgrade() {
+                            let mut st = st.borrow_mut();
+                            for (k, rhead, rsegs) in &reads {
+                                let caps: Vec<(usize, Vec<u8>)> =
+                                    l.caps.iter().filter(|(t, _)| *t < *k).cloned().collect();
+                                let mut stale = rhead.clone();
+                                for (_, s) in rsegs {
+                                    stale.extend_from_slice(s);
+                                }
+                                let mut v = rhead.clone();
+                                v.extend_from_slice(&crate::interp::ob_splice(&[], rsegs, &caps));
+                                Self::gen_patch_values(&mut st, &stale, &v);
+                            }
+                        }
+                    }
+                }
             }
 
             let r = self.ob_invoke(8);
@@ -244,6 +288,8 @@ impl<'a> Interp<'a> {
             pop_segs: Vec::new(),
             drained_segs: Vec::new(),
             caps: Vec::new(),
+            cap_segs: Vec::new(),
+            read_vals: Vec::new(),
             gen_state,
         });
     }
@@ -296,11 +342,13 @@ impl<'a> Interp<'a> {
             if !old_v.is_empty() {
                 if let Some(gs) = &l.gen_state {
                     if let Some(st2) = gs.upgrade() {
-                        for (t, b, ..) in &mut st2.borrow_mut().pending_out {
+                        let mut st2 = st2.borrow_mut();
+                        for (t, b, ..) in &mut st2.pending_out {
                             if *t >= min_tag {
                                 Self::bytes_replace(b, &old_v, &[]);
                             }
                         }
+                        Self::gen_patch_values(&mut st2, &old_v, &[]);
                     }
                 }
                 if let Some(q) = &l.gen_q {
@@ -337,36 +385,7 @@ impl<'a> Interp<'a> {
             // mid-buffer drains (consumer writes between segs) stay
             // positional.
             let split_parts = |content: &[u8]| -> (Vec<u8>, Vec<(usize, Vec<u8>)>) {
-                let first = l
-                    .drained_segs
-                    .first()
-                    .map(|(_, s, _)| (*s).min(content.len()))
-                    .unwrap_or(content.len());
-                let head = content[..first].to_vec();
-                let mut segs: Vec<(usize, Vec<u8>)> = Vec::new();
-                let mut off = first;
-                for &(t, s, n) in &l.drained_segs {
-                    let s = s.min(content.len());
-                    let e = (s + n).min(content.len());
-                    if s < off {
-                        continue;
-                    }
-                    // Real writes between two journaled segs ride
-                    // with the following one — they ran later.
-                    if s > off {
-                        if let Some(prev) = segs.last_mut() {
-                            prev.1.extend_from_slice(&content[off..s]);
-                        } else {
-                            segs.push((t, content[off..s].to_vec()));
-                        }
-                    }
-                    segs.push((t, content[s..e].to_vec()));
-                    off = e;
-                }
-                if off < content.len() {
-                    segs.push((usize::MAX, content[off..].to_vec()));
-                }
-                (head, segs)
+                crate::interp::ob_split_view(&l, content)
             };
             if let Some((_mhead, caps)) = existing {
                 // Replayed pop: the mirror already captured the
@@ -382,6 +401,15 @@ impl<'a> Interp<'a> {
                 // split into a head and per-tag segments so consumer
                 // captures splice in real write order at close.
                 let (head, mut segs) = split_parts(&content);
+                let mut read_vals = l.read_vals.clone();
+                if !content.is_empty() {
+                    let k = self
+                        .gen_sink
+                        .as_ref()
+                        .map(|s| s.borrow().len())
+                        .unwrap_or(0);
+                    read_vals.push((k, head.clone(), segs.clone()));
+                }
                 if let Some(prev) = segs.last_mut() {
                     if prev.0 == usize::MAX {
                         prev.0 = close.unwrap_or(0).saturating_sub(1);
@@ -401,6 +429,11 @@ impl<'a> Interp<'a> {
                     pop_segs: segs,
                     drained_segs: Vec::new(),
                     caps: Vec::new(),
+                    cap_segs: Vec::new(),
+                    // The pop's own returned content is itself a
+                    // stale view — consumer captures arriving before
+                    // the window closes belong inside it.
+                    read_vals,
                     gen_state,
                 });
             }
@@ -464,6 +497,22 @@ impl<'a> Interp<'a> {
     pub fn ob_top(&mut self) -> Option<&Vec<u8>> {
         self.ob_promote();
         self.ob_drain_pending();
+        if self.gen_run_state.is_some() {
+            if let Some(l) = self.ob_stack.last_mut() {
+                // A buffer view the body materializes eagerly —
+                // consumer captures landing between the suspend and
+                // this read's resume rewrite it at window close.
+                if l.gen_q.is_some() && !l.buf.is_empty() {
+                    let k = self
+                        .gen_sink
+                        .as_ref()
+                        .map(|s| s.borrow().len())
+                        .unwrap_or(0);
+                    let (head, segs) = crate::interp::ob_split_view(l, &l.buf.clone());
+                    l.read_vals.push((k, head, segs));
+                }
+            }
+        }
         self.ob_stack.last().map(|l| &l.buf)
     }
     pub fn ob_len(&mut self) -> usize {
