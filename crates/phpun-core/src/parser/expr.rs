@@ -732,7 +732,7 @@ impl<'a> Parser<'a> {
     /// assign end re-sites it for the next.
     fn list_assign_check(items: &[Option<Expr>], rhs: &Expr, rl: usize) -> Option<PhpError> {
         let mut cg = Self::list_rhs_line(items, rhs).unwrap_or(rl);
-        Self::list_assign_walk(items, &mut cg)
+        Self::list_assign_walk(items, rhs, &mut cg)
     }
 
     /// CG(zend_lineno) after the destructure's RHS compiled — the
@@ -755,12 +755,84 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn list_assign_walk(items: &[Option<Expr>], cg: &mut usize) -> Option<PhpError> {
+    /// A `&` element anywhere in this list level — nested lists
+    /// count: zend fires the non-referenceable fatal at the
+    //  containing level's first element (`[$v, [&$r]] = [[1],[2]]`
+    /// sites at `$v`'s line, before the nested list compiles).
+    fn list_any_byref(items: &[Option<Expr>]) -> bool {
+        items.iter().flatten().any(|e| {
+            let mut e = e;
+            loop {
+                e = match e {
+                    Expr::Binary {
+                        op: "argline" | "listkey",
+                        r,
+                        ..
+                    } => r,
+                    Expr::Paren(inner) => inner,
+                    _ => break,
+                };
+            }
+            match e {
+                Expr::ByRef(_) => true,
+                Expr::List(inner) => Self::list_any_byref(inner),
+                _ => false,
+            }
+        })
+    }
+
+    /// zend_is_variable_or_call: the destructure RHS is referenceable
+    /// when its access chain roots at a variable (CV, varvar, static
+    /// prop) or passes through a call — `f()->p`, `$a[0]`, `C::$a`
+    /// qualify; literals, `new`, casts and binary results do not.
+    fn rhs_var_or_call(rhs: &Expr) -> bool {
+        let mut e = rhs;
+        loop {
+            e = match e {
+                Expr::Index { e, .. } => e,
+                Expr::Prop { obj, .. } => obj,
+                Expr::Binary {
+                    op: "argline", r, ..
+                } => r,
+                Expr::Paren(inner) | Expr::ByRef(inner) => inner,
+                Expr::Call { .. }
+                | Expr::MethodCall { .. }
+                | Expr::StaticCall { .. }
+                | Expr::StaticCallDyn { .. }
+                | Expr::Var(_)
+                | Expr::VarVar(..)
+                | Expr::StaticProp { .. } => return true,
+                _ => return false,
+            };
+        }
+    }
+
+    fn list_assign_walk(items: &[Option<Expr>], rhs: &Expr, cg: &mut usize) -> Option<PhpError> {
         let keyed = items
             .iter()
             .flatten()
             .next()
             .is_some_and(|e| matches!(e, Expr::Binary { op: "listkey", .. }));
+        // zend fires 'Cannot assign reference to non referenceable
+        // value' when the level carries a `&` element and the RHS
+        // can't produce references — checked as the level's first
+        // element begins compiling, so it sites at the first
+        // element's line and beats sibling write-context fatals
+        // (`[f(), &$r] = [1,2]` reports the ref error).
+        // A nested level's RHS is `rhs[i]` — the chain root is the
+        // same expr, so the check is identical at every depth.
+        if Self::list_any_byref(items) && !Self::rhs_var_or_call(rhs) {
+            let site = items
+                .iter()
+                .flatten()
+                .next()
+                .and_then(crate::ast::start_line)
+                .unwrap_or(*cg);
+            return Some(PhpError::compile_fatal(
+                "Cannot assign reference to non referenceable value",
+                site,
+            ));
+        }
         let mut has_elems = false;
         for slot in items {
             let Some(elem) = slot else {
@@ -799,7 +871,7 @@ impl<'a> Parser<'a> {
                 // Nested destructure passes the verify; its elements
                 // continue with the same CG (the fetch op leaves it
                 // untouched).
-                if let Some(err) = Self::list_assign_walk(inner, cg) {
+                if let Some(err) = Self::list_assign_walk(inner, rhs, cg) {
                     return Some(err);
                 }
                 continue;
@@ -2442,7 +2514,14 @@ impl<'a> Parser<'a> {
                             continue;
                         }
                         let el = self.line();
-                        items.push(Some(Self::markline(self.expr()?, el)));
+                        let e = if self.eat_op("&") {
+                            // `list(&$r)` — zend's array_pair accepts
+                            // `&` elements exactly like `[&$r]`.
+                            Expr::ByRef(Box::new(Self::markline(self.expr()?, el)))
+                        } else {
+                            self.expr()?
+                        };
+                        items.push(Some(Self::markline(e, el)));
                         if !self.eat_op(",") {
                             break;
                         }

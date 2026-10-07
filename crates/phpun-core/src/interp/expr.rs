@@ -2141,12 +2141,60 @@ impl<'a> Interp<'a> {
         // re-site it; a folded varvar takes the site via vv_rhs_site.
         let rhs_u = Self::unmark_rhs(value);
         let pin_rhs = matches!(op, "=" | "??=") && Self::is_cv(rhs_u);
+        // A `&` destructure element write-fetches its slot inside the
+        // RHS container and aliases that live cell — bind the
+        // container to its cell once here (the same auto-vivifying
+        // fetch zend's FETCH_LIST emits), instead of a read clone
+        // whose slots would alias nothing. A call-family RHS stays a
+        // value (its temp can't hold refs; zend notices instead).
+        let list_byref = match target {
+            Expr::List(items) => Self::list_any_byref(items),
+            _ => false,
+        };
+        let mut rhs_cell: Option<Cell> = None;
         let rhs_r = if pin_rhs {
-            self.eval_cv_at(rhs_u, aline)
+            let r = self.eval_cv_at(rhs_u, aline);
+            if list_byref {
+                // The pinned CV is a bare Var/folded varvar — grab
+                // its live cell too so `&` elements write-fetch
+                // (auto-vivify) inside it (`[&$r] = $a` on null).
+                rhs_cell = self.eval_cell(rhs_u).ok();
+            }
+            r
+        } else if list_byref
+            && matches!(
+                rhs_u,
+                Expr::Var(_)
+                    | Expr::Index { .. }
+                    | Expr::Prop { .. }
+                    | Expr::StaticProp { .. }
+                    | Expr::VarVar(..)
+            )
+        {
+            match self.eval_cell(rhs_u) {
+                Ok(cc) => {
+                    let v = cc.borrow().clone();
+                    rhs_cell = Some(cc);
+                    Ok(v)
+                }
+                Err(e) => Err(e),
+            }
         } else {
             self.eval(value)
         };
         let rhs = rhs_r?;
+        // `&` elements on a call-family RHS: zend reports
+        // 'Attempting to set reference...' only when the callee did
+        // NOT declare `&` — a by-ref return binds plainly.
+        let rhs_nonref_call = list_byref
+            && matches!(
+                rhs_u,
+                Expr::Call { .. }
+                    | Expr::MethodCall { .. }
+                    | Expr::StaticCall { .. }
+                    | Expr::StaticCallDyn { .. }
+            )
+            && !self.last_call_by_ref;
         let cur = if needs_read {
             match &target_cell {
                 Some(c) => c.borrow().clone(),
@@ -2374,7 +2422,7 @@ impl<'a> Interp<'a> {
                         self.cur_line = l;
                         self.send_line = Some(l);
                     }
-                    self.store(target, newv.clone())?
+                    self.store_rhs(target, newv.clone(), rhs_cell, rhs_nonref_call)?
                 }
             },
         }
@@ -2457,6 +2505,12 @@ impl<'a> Interp<'a> {
         match target {
             Expr::Var(n) => {
                 self.cur().vars.insert(n.clone(), src);
+                Ok(())
+            }
+            Expr::VarVar(inner, _) => {
+                let n = self.eval(inner)?;
+                let name = self.conv_str(&n)?;
+                self.cur().vars.insert(name, src);
                 Ok(())
             }
             Expr::Index { e, i } => {
@@ -2654,16 +2708,123 @@ impl<'a> Interp<'a> {
                 }
                 Ok(())
             }
-            Expr::VarVar(..) => {
-                let c = self.eval_cell(target)?;
-                *c.borrow_mut() = src.borrow().clone();
-                Ok(())
-            }
             _ => self.fail(PhpError::fatal("Cannot create reference to expression", 0)),
         }
     }
 
+    /// A destructure whose elements include a `&` alias anywhere
+    /// (a nested list's `&` element counts — its slots fetch inside
+    /// the parent's write-fetch).
+    fn list_any_byref(items: &[Option<Expr>]) -> bool {
+        items.iter().flatten().any(|e| {
+            let mut e = e;
+            loop {
+                e = match e {
+                    Expr::Binary {
+                        op: "argline" | "listkey",
+                        r,
+                        ..
+                    } => r,
+                    Expr::Paren(inner) => inner,
+                    _ => break,
+                };
+            }
+            match e {
+                Expr::ByRef(_) => true,
+                Expr::List(inner) => Self::list_any_byref(inner),
+                _ => false,
+            }
+        })
+    }
+
+    /// The innermost `argline` mark on a destructure element — its
+    /// first-token line, where zend sites the element's fetch op.
+    fn elem_mark_line(t: &Expr) -> Option<usize> {
+        let mut e = t;
+        let mut mark = None;
+        loop {
+            e = match e {
+                Expr::Binary {
+                    op: "argline",
+                    l,
+                    r,
+                    ..
+                } => {
+                    if let Expr::Int(n) = l.as_ref() {
+                        mark = Some(*n as usize);
+                    }
+                    r
+                }
+                Expr::Paren(inner) => inner,
+                Expr::Binary {
+                    op: "listkey", r, ..
+                } => r,
+                _ => break,
+            };
+        }
+        mark
+    }
+
+    /// WRITE-mode slot fetch for a `&` element on a RHS that has no
+    /// container cell (eval'd temp) — array slots vivify missing
+    /// keys; strings/scalars/objects throw zend's write-fetch
+    /// errors. `arrk` sites the slot at the element's position.
+    fn list_ref_slot(&mut self, v: &Value, arrk: &ArrKey) -> Result<Cell, PhpError> {
+        match v {
+            Value::Array(a) => {
+                let mut arr = a.borrow_mut();
+                Ok(match arr.get_cell(arrk) {
+                    Some(c) => c,
+                    None => {
+                        let c = cell(Value::Null);
+                        arr.bind_cell(arrk.clone(), c.clone());
+                        c
+                    }
+                })
+            }
+            Value::Null => Ok(cell(Value::Null)),
+            Value::Str(_) => self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot create references to/from string offsets",
+                self.cur_line,
+            )),
+            Value::Object(o) => {
+                let cn = o.borrow().class.name().to_string();
+                self.fail(PhpError::uncaught(
+                    "Error",
+                    format!("Cannot use object of type {} as array", cn),
+                    self.cur_line,
+                ))
+            }
+            Value::Callable(_) => self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot use object of type Closure as array",
+                self.cur_line,
+            )),
+            _ => self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot use a scalar value as an array",
+                self.cur_line,
+            )),
+        }
+    }
+
     pub(in crate::interp) fn store(&mut self, target: &Expr, v: Value) -> Result<(), PhpError> {
+        self.store_rhs(target, v, None, false)
+    }
+
+    /// `store` carrying the eval'd RHS container's live cell (a `&`
+    /// destructure write-fetches slots inside it) and whether the
+    /// RHS was a call-family expr whose result isn't by-ref (zend
+    /// emits 'Attempting to set reference to non referenceable
+    /// value' per `&` element, then assigns the plain value).
+    fn store_rhs(
+        &mut self,
+        target: &Expr,
+        v: Value,
+        container: Option<Cell>,
+        rhs_nonref_call: bool,
+    ) -> Result<(), PhpError> {
         // Destructure elements keep their `argline` mark — zend sites
         // each element's store op at the element's own line (a nested
         // list keeps the running line; its own elements re-site as
@@ -2746,33 +2907,113 @@ impl<'a> Interp<'a> {
                         } => (Some(l.as_ref()), r.as_ref()),
                         _ => (None, t),
                     };
-                    let arrk = match key_e {
+                    let (arrk, key_val) = match key_e {
                         Some(ke) => {
                             let kv = self.eval(ke)?;
-                            crate::value::to_key(&kv)
+                            (crate::value::to_key(&kv), Some(kv))
                         }
-                        None => ArrKey::Int(i as i64),
+                        None => (ArrKey::Int(i as i64), Some(Value::Int(i as i64))),
                     };
-                    let vi = match &v {
-                        Value::Array(a) => match a.borrow().get(&arrk) {
-                            Some(v) => v,
-                            None => {
-                                let shown = match &arrk {
-                                    ArrKey::Int(i) => i.to_string(),
-                                    ArrKey::Str(s) => format!("\"{}\"", s),
-                                    ArrKey::Tomb => String::new(),
-                                };
-                                self.warn(&format!("Undefined array key {}", shown))?;
+                    // `&` element: the slot write-fetches inside the
+                    // container (auto-vivifies null/missing keys,
+                    // string/scalar/object throw zend's errors) and
+                    // the element aliases that live cell. A non-ref
+                    // call RHS has no cell to give — zend notices
+                    // and assigns the fetched value plainly.
+                    if let Expr::ByRef(inner) = Self::unmark_rhs(t) {
+                        if let Some(l) = Self::elem_mark_line(t) {
+                            self.cur_line = l;
+                            self.send_line = Some(l);
+                        }
+                        let inner_u = Self::unmark_rhs(inner);
+                        if rhs_nonref_call {
+                            self.notice("Attempting to set reference to non referenceable value")?;
+                            let vi = match &v {
+                                Value::Array(a) => match a.borrow().get(&arrk) {
+                                    Some(v) => v,
+                                    None => {
+                                        let shown = match &arrk {
+                                            ArrKey::Int(i) => i.to_string(),
+                                            ArrKey::Str(s) => format!("\"{}\"", s),
+                                            ArrKey::Tomb => String::new(),
+                                        };
+                                        self.warn(&format!("Undefined array key {}", shown))?;
+                                        Value::Null
+                                    }
+                                },
+                                Value::Null => Value::Null,
+                                other => {
+                                    self.warn(&format!(
+                                        "Cannot use {} as array",
+                                        other.debug_type()
+                                    ))?;
+                                    Value::Null
+                                }
+                            };
+                            self.store(inner, vi)?;
+                            continue;
+                        }
+                        let src = match &container {
+                            Some(cc) => {
+                                // zend's ref-fetch on a string is
+                                // 'Cannot create references to/from
+                                // string offsets' — the FETCH_DIM_REF
+                                // variant, not the plain write one.
+                                let was = std::mem::replace(&mut self.dim_by_ref, true);
+                                let r = self.index_into_key(cc.clone(), key_val);
+                                self.dim_by_ref = was;
+                                r?
+                            }
+                            None => self.list_ref_slot(&v, &arrk)?,
+                        };
+                        self.bind_cell(inner_u, src)?;
+                        continue;
+                    }
+                    // A nested list carrying `&` elements write-
+                    // fetches its own slot (auto-vivifying) so the
+                    // inner aliases land in real cells; on a non-ref
+                    // call temp that fetch is the same 'Attempting
+                    // to set reference' notice.
+                    let sub_container = match (&container, Self::unmark_rhs(t)) {
+                        (Some(cc), Expr::List(inner)) if Self::list_any_byref(inner) => {
+                            Some(self.index_into_key(cc.clone(), key_val.clone())?)
+                        }
+                        _ => None,
+                    };
+                    if rhs_nonref_call
+                        && matches!(
+                            Self::unmark_rhs(t),
+                            Expr::List(inner) if Self::list_any_byref(inner)
+                        )
+                    {
+                        self.notice("Attempting to set reference to non referenceable value")?;
+                    }
+                    // The write-fetch vivified the slot — the nested
+                    // list reads IT (a fresh auto-viv'd array), not a
+                    // read-mode fetch that would warn 'Undefined key'.
+                    let vi = match &sub_container {
+                        Some(cc) => cc.borrow().clone(),
+                        None => match &v {
+                            Value::Array(a) => match a.borrow().get(&arrk) {
+                                Some(v) => v,
+                                None => {
+                                    let shown = match &arrk {
+                                        ArrKey::Int(i) => i.to_string(),
+                                        ArrKey::Str(s) => format!("\"{}\"", s),
+                                        ArrKey::Tomb => String::new(),
+                                    };
+                                    self.warn(&format!("Undefined array key {}", shown))?;
+                                    Value::Null
+                                }
+                            },
+                            Value::Null => Value::Null,
+                            other => {
+                                self.warn(&format!("Cannot use {} as array", other.debug_type()))?;
                                 Value::Null
                             }
                         },
-                        Value::Null => Value::Null,
-                        other => {
-                            self.warn(&format!("Cannot use {} as array", other.debug_type()))?;
-                            Value::Null
-                        }
                     };
-                    self.store(t, vi)?;
+                    self.store_rhs(t, vi, sub_container, rhs_nonref_call)?;
                 }
                 Ok(())
             }
@@ -3742,9 +3983,22 @@ impl<'a> Interp<'a> {
                     Ok(c)
                 }
             }
-        } else if matches!(*b, Value::Object(_)) {
+        } else if matches!(*b, Value::Object(_) | Value::Callable(_)) {
+            let cn = match &*b {
+                Value::Object(o) => o.borrow().class.name().to_string(),
+                _ => "Closure".to_string(),
+            };
+            let is_ao = matches!(&*b, Value::Object(o) if self.obj_is_a(o, "ArrayAccess"));
             drop(b);
-            self.index_cell_object(&c, key)
+            if is_ao {
+                self.index_cell_object(&c, key)
+            } else {
+                self.fail(PhpError::uncaught(
+                    "Error",
+                    format!("Cannot use object of type {} as array", cn),
+                    self.cur_line,
+                ))
+            }
         } else {
             let is_str = matches!(*b, Value::Str(_));
             drop(b);
