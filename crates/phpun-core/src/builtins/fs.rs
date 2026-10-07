@@ -3731,16 +3731,15 @@ pub(in crate::builtins) fn stream_ops_label(res: &PhpResource) -> &'static str {
 /// ops->seek(position) + readpos=writepos=0, and the same
 /// discard+reseek a buffered write does first, streams.c:1194):
 /// the fd's kernel offset is lseek(2)'d back to the stream's logical
-/// position and pending read-buffer bytes are dropped. FOR_SELECT
-/// casts must NOT do this — they keep the read buffer.
+/// position — unconditionally, since a child holding a dup may have
+/// moved it while our read buffer was empty — and pending read-buffer
+/// bytes are dropped. FOR_SELECT casts must NOT do this — they keep
+/// the read buffer.
 pub(in crate::builtins) fn fd_resync(
     fd: std::os::unix::io::RawFd,
     pos: u64,
     srbuf: &mut std::collections::VecDeque<u8>,
 ) {
-    if srbuf.is_empty() {
-        return;
-    }
     unsafe {
         libc::lseek(fd, pos as libc::off_t, libc::SEEK_SET);
     }
