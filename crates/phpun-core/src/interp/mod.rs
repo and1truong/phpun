@@ -726,6 +726,8 @@ pub struct Interp<'a> {
     /// back into mem_used, so reclaimable churn never trips the limit
     /// while genuinely-growing structures do.
     mem_tracked: HashMap<usize, (u64, MemProbe)>,
+    /// High-water mark of mem_used — memory_get_peak_usage().
+    pub(crate) mem_peak: u64,
     /// Registry size that trips the next dead-entry sweep — bounds the
     /// tracker footprint for alloc-churn loops.
     mem_sweep_at: usize,
@@ -1386,6 +1388,7 @@ impl<'a> Interp<'a> {
             mem_exceeded: false,
             oom_at: None,
             mem_tracked: HashMap::new(),
+            mem_peak: 0,
             mem_sweep_at: 4096,
             deadline: None,
             deadline_secs: 0,
@@ -3128,6 +3131,9 @@ impl<'a> Interp<'a> {
     pub fn mem_charge(&mut self, n: u64) {
         self.mem_used += n;
         self.mem_last = n;
+        if self.mem_used > self.mem_peak {
+            self.mem_peak = self.mem_used;
+        }
         // efree half of emalloc/efree: dead tracked allocs release
         // their charge. Sweep when the registry grew past its bound,
         // or when the counter crosses the limit — the fatal below
@@ -3216,6 +3222,13 @@ impl<'a> Interp<'a> {
                 self.mem_used = self.mem_used.saturating_sub(sub);
             }
         }
+    }
+
+    /// Reconcile then report the live usage — memory_get_usage()
+    /// reads it straight, so sweep dead tracked allocs first.
+    pub(crate) fn mem_reconcile(&mut self) -> u64 {
+        self.mem_sweep();
+        self.mem_used
     }
 
     /// The memory_limit fatal as raised mid-call by an oversized alloc

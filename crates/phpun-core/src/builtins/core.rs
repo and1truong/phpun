@@ -542,9 +542,32 @@ pub(crate) fn dispatch(
         "php_sapi_name" => Value::str("cli"),
         "phpversion" | "phpversion_strict" => Value::str("8.5.11-phpun"),
         "php_uname" => Value::str("Linux"),
-        "memory_get_usage" => Value::Int(2097152),
-        "memory_get_peak_usage" => Value::Int(2097152),
-        "memory_reset_peak_usage" => Value::Null,
+        // zend's memory_get_usage reports the live emalloc usage —
+        // our mem_used models it (charges up, credits down on efree).
+        "memory_get_usage" => {
+            if arg(args, 0).is_truthy() {
+                // real_usage: heap segments zend never returns to the
+                // OS — model as peak usage rounded up to 2MB chunks.
+                let seg = 2097152u64;
+                Value::Int((it.mem_peak.div_ceil(seg) * seg).max(seg) as i64)
+            } else {
+                Value::Int(it.mem_reconcile() as i64)
+            }
+        }
+        "memory_get_peak_usage" => {
+            if arg(args, 0).is_truthy() {
+                let seg = 2097152u64;
+                Value::Int((it.mem_peak.div_ceil(seg) * seg).max(seg) as i64)
+            } else {
+                it.mem_reconcile();
+                Value::Int(it.mem_peak as i64)
+            }
+        }
+        "memory_reset_peak_usage" => {
+            it.mem_reconcile();
+            it.mem_peak = it.mem_used;
+            Value::Null
+        }
         "zend_version" => Value::str("8.5.11-phpun"),
         "getmypid" => Value::Int(std::process::id() as i64),
         "getmyuid" | "getmygid" | "getmyinode" => Value::Int(1000),
