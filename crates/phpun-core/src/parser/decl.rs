@@ -45,7 +45,8 @@ impl<'a> Parser<'a> {
     pub(in crate::parser) fn switch_stmt(&mut self) -> Result<Stmt, PhpError> {
         self.pos += 1; // switch
         self.expect_op("(")?;
-        let cond = self.expr()?;
+        let sl = self.line();
+        let cond = Self::markline(self.expr()?, sl);
         self.expect_op(")")?;
         let alt = self.eat_op(":");
         if !alt {
