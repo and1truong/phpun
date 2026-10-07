@@ -33,6 +33,61 @@ impl<'a> Interp<'a> {
         None
     }
 
+    /// Zend's visibility check for `Cls::$p` static access: a private
+    /// prop declared in an ancestor still resolves (for the error) even
+    /// though the subclass can't see it, and the message names the
+    /// ACCESSED class — 'Cannot access private property D::$s' for a
+    /// `private static $s` living in C.
+    fn static_prop_vis(&mut self, cls: &Rc<PhpClass>, name: &str) -> Result<(), PhpError> {
+        let mut cur = Some(cls.clone());
+        let mut found: Option<(crate::ast::PropDecl, Rc<PhpClass>)> = None;
+        while let Some(c) = cur {
+            if let Some(pd) = c.decl.props.iter().find(|p| p.name == name && p.is_static) {
+                found = Some((pd.clone(), c.clone()));
+                break;
+            }
+            cur = c
+                .decl
+                .parent
+                .as_ref()
+                .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+        }
+        let Some((pd, dcls)) = found else {
+            return Ok(());
+        };
+        let scope = self.stack.last().and_then(|f| {
+            f.decl_class
+                .as_ref()
+                .or(f.scope_class.as_ref())
+                .map(|s| s.decl.name.clone())
+        });
+        let ok = match pd.visibility {
+            crate::ast::Visibility::Public => true,
+            crate::ast::Visibility::Private => scope.as_deref() == Some(dcls.name()),
+            crate::ast::Visibility::Protected => match &scope {
+                Some(s) => self.is_a_str(s, dcls.name()) || self.is_a_str(dcls.name(), s),
+                None => false,
+            },
+        };
+        if ok {
+            return Ok(());
+        }
+        self.fail(PhpError::uncaught(
+            "Error",
+            format!(
+                "Cannot access {} property {}::${}",
+                match pd.visibility {
+                    crate::ast::Visibility::Private => "private",
+                    crate::ast::Visibility::Protected => "protected",
+                    crate::ast::Visibility::Public => "public",
+                },
+                cls.name(),
+                name
+            ),
+            0,
+        ))
+    }
+
     pub(in crate::interp) fn static_prop_read(
         &mut self,
         class: &Expr,
@@ -47,11 +102,23 @@ impl<'a> Interp<'a> {
             ))?;
         }
         self.statics_init(&cls)?;
+        self.static_prop_vis(&cls, &name)?;
         let v = cls.statics.borrow().get(&name).map(|c| c.borrow().clone());
         match v {
             Some(v) => Ok(v),
             None => {
                 if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &name) {
+                    // The shared slot lives on the DECLARING class —
+                    // materialized after this class's init it isn't in
+                    // its own table yet.
+                    if !Rc::ptr_eq(&dcls, &cls) {
+                        self.statics_init(&dcls)?;
+                        if let Some(v) =
+                            dcls.statics.borrow().get(&name).map(|c| c.borrow().clone())
+                        {
+                            return Ok(v);
+                        }
+                    }
                     if pd.ty.is_some() {
                         return self.fail(PhpError::uncaught(
                             "Error",
@@ -77,19 +144,48 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// zend's static assign-ops (`C::$a .= expr`, `&=`, `+=`, …) gate
+    /// the private(set)/protected(set) write BEFORE the RHS evaluates —
+    /// 'Cannot indirectly modify' fires without expr's side effects
+    /// (instance props evaluate first, gating at the store).
+    pub(in crate::interp) fn static_prop_indirect_gate(
+        &mut self,
+        class: &Expr,
+        name: &str,
+    ) -> Result<(), PhpError> {
+        let (cls, _tname) = self.member_class_of(class)?;
+        self.statics_init(&cls)?;
+        self.static_prop_vis(&cls, name)?;
+        if !self.in_unset {
+            if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
+                if let Some(sv) = pd.set_vis {
+                    if self.set_vis_scope_denied(&dcls, sv) {
+                        return self.set_visibility_indirect_error(&dcls, &pd.name, sv);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::interp) fn static_prop_cell(
         &mut self,
         class: &Expr,
         name: &PropName,
     ) -> Result<Cell, PhpError> {
         let name = self.prop_name(name)?;
-        self.static_prop_named(class, &name)
+        self.static_prop_named_ctx(class, &name, true)
     }
 
-    pub(in crate::interp) fn static_prop_named(
+    /// `indirect` picks the set-visibility message: the cell path IS
+    /// an indirect write (`[]`, `&`, compound, `++`, by-ref args) —
+    /// 'Cannot indirectly modify' — while `=` and `??=`'s null-slot
+    /// store are plain writes ('Cannot modify').
+    pub(in crate::interp) fn static_prop_named_ctx(
         &mut self,
         class: &Expr,
         name: &str,
+        indirect: bool,
     ) -> Result<Cell, PhpError> {
         let (cls, tname) = self.member_class_of(class)?;
         if let Some(t) = tname {
@@ -99,6 +195,23 @@ impl<'a> Interp<'a> {
             ))?;
         }
         self.statics_init(&cls)?;
+        self.static_prop_vis(&cls, name)?;
+        // private(set)/protected(set): gated by write kind — plain `=`
+        // is gated in store() with 'Cannot modify' first, and unsets
+        // carry their own 'Attempt to unset static property'.
+        if !self.in_unset {
+            if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
+                if let Some(sv) = pd.set_vis {
+                    if self.set_vis_scope_denied(&dcls, sv) {
+                        return if indirect {
+                            self.set_visibility_indirect_error(&dcls, &pd.name, sv)
+                        } else {
+                            self.set_visibility_error(&dcls, &pd.name, sv)
+                        };
+                    }
+                }
+            }
+        }
         let found = cls.statics.borrow().get(name).cloned();
         match found {
             Some(c) => {
@@ -124,10 +237,69 @@ impl<'a> Interp<'a> {
             }
             None => {
                 // Write/cell path materializes a declared static; an
-                // undeclared one is an Error.
+                // undeclared one is an Error. The slot lives on the
+                // DECLARING class's table — zend shares one storage
+                // slot with every subclass that doesn't redeclare.
                 if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
+                    if !Rc::ptr_eq(&dcls, &cls) {
+                        self.statics_init(&dcls)?;
+                        if let Some(c) = dcls.statics.borrow().get(name).cloned() {
+                            if let Some(tys) = &pd.ty {
+                                let p = Rc::as_ptr(&c) as usize;
+                                self.typed_slots.insert(
+                                    p,
+                                    (
+                                        c.clone(),
+                                        tys.clone(),
+                                        dcls.name().to_string(),
+                                        name.to_string(),
+                                    ),
+                                );
+                                self.slot_anchor.insert(
+                                    p,
+                                    SlotAnchor::Statics(dcls.name().to_string(), name.to_string()),
+                                );
+                            }
+                            return Ok(c);
+                        }
+                    }
+                    if pd.ty.is_some() && pd.default.is_none() {
+                        let nullable = pd
+                            .ty
+                            .as_ref()
+                            .map(|t| t.iter().any(|m| m.eq_ignore_ascii_case("null")))
+                            .unwrap_or(false);
+                        if !nullable && (self.dim_by_ref || self.foreach_by_ref) {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Cannot access uninitialized non-nullable property {}::${} by reference",
+                                    dcls.name(),
+                                    name
+                                ),
+                                0,
+                            ));
+                        }
+                        if nullable && self.foreach_by_ref {
+                            // `foreach (C::$p as &$v)` on an
+                            // uninitialized nullable slot names the
+                            // 'undeclared' Error — the `=&` bind alone
+                            // materializes NULL instead.
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Access to undeclared static property {}::${}",
+                                    cls.name(),
+                                    name
+                                ),
+                                0,
+                            ));
+                        }
+                    }
                     let c = cell(Value::Null);
-                    cls.statics.borrow_mut().insert(name.to_string(), c.clone());
+                    dcls.statics
+                        .borrow_mut()
+                        .insert(name.to_string(), c.clone());
                     if let Some(tys) = &pd.ty {
                         self.last_fresh_cell = Some(Rc::as_ptr(&c) as usize);
                         let p = Rc::as_ptr(&c) as usize;
@@ -166,9 +338,9 @@ impl<'a> Interp<'a> {
             return Ok(());
         }
         *cls.statics_init.borrow_mut() = true;
-        // Inherited statics: PHP snapshots the parent's static-prop
-        // values into the child's table at link time, so `static::$p`
-        // on the child resolves parent defaults.
+        // Inherited statics: a non-redeclared prop is ONE shared slot
+        // — zend links the child to the parent's storage cell, so
+        // `D::$a` and `C::$a` write through the same reference.
         if let Some(pname) = &cls.decl.parent {
             if let Some(p) = self.classes.get(&pname.to_lowercase()).cloned() {
                 self.statics_init(&p)?;
@@ -176,9 +348,24 @@ impl<'a> Interp<'a> {
                     cls.statics
                         .borrow_mut()
                         .entry(k.clone())
-                        .or_insert_with(|| cell(v.borrow().clone()));
+                        .or_insert_with(|| v.clone());
                 }
             }
+        }
+        // First-access class init resolves the constants table ahead of
+        // static defaults: `B::$s`/`new B` evaluate `const C = <expr>`
+        // decls first, so a failing const reports ITS decl line even on
+        // a static-prop access (p3j/p3n).
+        for cd in &cls.decl.consts {
+            if cd.enum_case {
+                continue;
+            }
+            let old = self.const_self.replace(cls.clone());
+            self.class_const_ctx += 1;
+            let r = self.eval_decl_const(&cd.value, &cls.decl.file, cd.line);
+            self.class_const_ctx -= 1;
+            self.const_self = old;
+            r?;
         }
         for p in &cls.decl.props {
             if !p.is_static {
@@ -188,7 +375,11 @@ impl<'a> Interp<'a> {
                 Some(d) => {
                     let old = self.const_self.replace(cls.clone());
                     self.class_const_ctx += 1;
-                    let v = self.eval_decl_const(d, &cls.decl.file);
+                    let v = self.eval_decl_const(
+                        d,
+                        &cls.decl.file,
+                        if p.dline > 0 { p.dline } else { p.line },
+                    );
                     self.class_const_ctx -= 1;
                     self.const_self = old;
                     // Gate/const errors are real fatals (e.g. a
@@ -298,7 +489,7 @@ impl<'a> Interp<'a> {
                                 "TypeError",
                                 &format!(
                                     "Closure::bind(): Argument #2 ($newThis) must be of type ?object, {} given",
-                                    v.gettype()
+                                    self.zval_type_name(v)
                                 ),
                             );
                             return Err(self.throw(e));
@@ -314,7 +505,7 @@ impl<'a> Interp<'a> {
                                 "TypeError",
                                 &format!(
                                     "Closure::bind(): Argument #3 ($newScope) must be of type object|string|null, {} given",
-                                    v.gettype()
+                                    self.zval_type_name(v)
                                 ),
                             );
                             return Err(self.throw(e));
@@ -619,8 +810,74 @@ impl<'a> Interp<'a> {
         out
     }
 
+    /// `self`/`static`/`parent` left as the literal keyword after scope
+    /// resolution — member-style access (`X::$p`, `new X`, `X::K`,
+    /// extends/catch) on an unresolved scope keyword throws the
+    /// catchable `Cannot access "X" when no class scope is active`;
+    /// `parent` inside a class without one is the catchable Error
+    /// 'Cannot access "parent" when current class scope has no parent'
+    /// (a `parent::` literal in a NON-trait/non-closure parentless
+    /// class still parse-fatals upstream; traits and closures reach
+    /// this runtime gate). `literal` gates all of it to operands that
+    /// were the literal keyword node — a runtime string 'parent' is an
+    /// ordinary unknown class ('Class "parent" not found').
+    pub(in crate::interp) fn scope_kw_err(
+        &mut self,
+        name: &str,
+        literal: bool,
+    ) -> Result<(), PhpError> {
+        if !literal {
+            return Ok(());
+        }
+        let lw = name.to_lowercase();
+        if !matches!(lw.as_str(), "self" | "static" | "parent") {
+            return Ok(());
+        }
+        let resolved = self.resolve_class_name(name);
+        if !resolved.eq_ignore_ascii_case(&lw) {
+            return Ok(());
+        }
+        if lw == "parent" && self.has_class_scope() {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot access \"parent\" when current class scope has no parent".to_string(),
+                0,
+            ));
+        }
+        self.fail(PhpError::uncaught(
+            "Error",
+            format!("Cannot access \"{}\" when no class scope is active", lw),
+            0,
+        ))
+    }
+
+    /// Whether `e` is a syntactic class reference — a bare identifier
+    /// (parens peeled): `Foo`, `self`, `static`, `parent`. Only those
+    /// get scope-keyword error semantics and `::class` name returns;
+    /// runtime strings look up literally.
+    pub(in crate::interp) fn is_lit_class_ref(e: &Expr) -> bool {
+        match e {
+            Expr::Paren(inner) => Self::is_lit_class_ref(inner),
+            Expr::Const(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether any class scope is live — an executing method frame or a
+    /// const-expression bound to a class.
+    fn has_class_scope(&self) -> bool {
+        (self.in_const_expr > 0 && self.const_self.is_some())
+            || self
+                .stack
+                .last()
+                .map(|f| f.scope_class.is_some())
+                .unwrap_or(false)
+    }
+
     pub(in crate::interp) fn class_of(&mut self, e: &Expr) -> Result<Rc<PhpClass>, PhpError> {
+        let lit = Self::is_lit_class_ref(e);
         let name = self.class_name_of(e)?;
+        self.scope_kw_err(&name, lit)?;
         if !self.classes.contains_key(&name.to_lowercase()) {
             self.run_autoload(&name)?;
         }
@@ -639,7 +896,57 @@ impl<'a> Interp<'a> {
         class: &Expr,
         name: &str,
     ) -> Result<Value, PhpError> {
+        let lit = Self::is_lit_class_ref(class);
+        if name == "class" && !lit {
+            // `::class` on a runtime operand: an object gives its
+            // class name (`$o::class`); a string is an Error (zend's
+            // 'Cannot use "::class" on string').
+            let v = self.eval(class)?;
+            return match v {
+                Value::Object(o) => Ok(Value::str(o.borrow().class.name().to_string())),
+                _ => self.fail(PhpError::uncaught(
+                    "Error",
+                    "Cannot use \"::class\" on string".to_string(),
+                    0,
+                )),
+            };
+        }
         let cname = self.class_name_of(class)?;
+        if name == "class" {
+            // `X::class` on an unresolved scope keyword carries its own
+            // messages: 'Cannot use "X" in the global scope'; in a class
+            // without parent, `parent::class` is the catchable no-parent
+            // Error (p15/t/m6 vs oracle).
+            match cname.to_lowercase().as_str() {
+                "parent" if self.has_class_scope() => {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        "Cannot use \"parent\" when current class scope has no parent".to_string(),
+                        0,
+                    ));
+                }
+                "self" | "static" | "parent" => {
+                    // A deferred const-slot eval (`const X = self::class`,
+                    // closure/param defaults) throws 'Cannot use "X" when
+                    // no class scope is active'; a plain runtime read
+                    // reports 'in the global scope' instead (oracle).
+                    let msg = if self.in_const_expr > 0 {
+                        format!(
+                            "Cannot use \"{}\" when no class scope is active",
+                            cname.to_lowercase()
+                        )
+                    } else {
+                        format!(
+                            "Cannot use \"{}\" in the global scope",
+                            cname.to_lowercase()
+                        )
+                    };
+                    return self.fail(PhpError::uncaught("Error", msg, 0));
+                }
+                _ => {}
+            }
+        }
+        self.scope_kw_err(&cname, lit)?;
         self.class_const_named(&cname, name)
     }
 
@@ -678,6 +985,7 @@ impl<'a> Interp<'a> {
             // Const on an interface (e.g. `FastRoute\Dispatcher::FOUND`):
             // walk it and its extended interfaces.
             let mut seen = std::collections::HashSet::new();
+            let iname = iface.name.clone();
             let mut stack = vec![iface];
             while let Some(c) = stack.pop() {
                 if !seen.insert(c.name.to_lowercase()) {
@@ -686,7 +994,7 @@ impl<'a> Interp<'a> {
                 for cd in &c.consts {
                     if cd.name == name {
                         self.class_const_ctx += 1;
-                        let r = self.eval_decl_const(&cd.value, &c.file);
+                        let r = self.eval_decl_const(&cd.value, &c.file, cd.line);
                         self.class_const_ctx -= 1;
                         return match r {
                             Ok(v) => self.const_apply_ty(cd, &c.name, v),
@@ -707,7 +1015,7 @@ impl<'a> Interp<'a> {
             }
             return self.fail(PhpError::uncaught(
                 "Error",
-                format!("Undefined constant {}::{}", cname, name),
+                format!("Undefined constant {}::{}", iname, name),
                 0,
             ));
         }
@@ -733,7 +1041,7 @@ impl<'a> Interp<'a> {
                     }
                     let old = self.const_self.replace(c.clone());
                     self.class_const_ctx += 1;
-                    let r = self.eval_decl_const(&cd.value, &c.decl.file);
+                    let r = self.eval_decl_const(&cd.value, &c.decl.file, cd.line);
                     self.class_const_ctx -= 1;
                     self.const_self = old;
                     return match r {
@@ -761,7 +1069,7 @@ impl<'a> Interp<'a> {
                         let old = self.const_self.replace(cls.clone());
                         self.class_const_ctx += 1;
                         let r = self
-                            .eval_decl_const(&cd.value, &c.file)
+                            .eval_decl_const(&cd.value, &c.file, cd.line)
                             .and_then(|v| self.const_apply_ty(cd, &c.name, v));
                         self.class_const_ctx -= 1;
                         self.const_self = old;
@@ -774,9 +1082,11 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        // Oracle names the RESOLVED class (canonical case) in the
+        // miss error, not the caller's spelling (`$a::N` → 'A::N').
         self.fail(PhpError::uncaught(
             "Error",
-            format!("Undefined constant {}::{}", cname, name),
+            format!("Undefined constant {}::{}", cls.decl.name, name),
             0,
         ))
     }

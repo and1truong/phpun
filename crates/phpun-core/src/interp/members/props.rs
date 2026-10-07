@@ -174,6 +174,27 @@ impl<'a> Interp<'a> {
         None
     }
 
+    /// Would creating dynamic prop `key`/`pn` on `o` emit the
+    /// E_DEPRECATED? True when no declared prop exists and the class
+    /// isn't exempt (stdClass / #[AllowDynamicProperties]).
+    pub(in crate::interp) fn dyn_prop_deprecated(
+        &mut self,
+        o: &Rc<RefCell<PhpObject>>,
+        pn: &str,
+        key: &str,
+    ) -> bool {
+        !o.borrow().props.contains_key(key)
+            && self.decl_prop(o, pn).is_none()
+            && !self.obj_is_a(o, "stdclass")
+            && !o.borrow().class.decl.attrs.iter().any(|a| {
+                a.name
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(&a.name)
+                    .eq_ignore_ascii_case("AllowDynamicProperties")
+            })
+    }
+
     /// Backedness of the *merged* runtime prop: any merged hook body
     /// referencing `$this->prop`, or any plain (unhooked) decl for it
     /// anywhere in the chain — a hooked redecl over a plain parent prop
@@ -366,10 +387,10 @@ impl<'a> Interp<'a> {
                 k.as_ref().is_some_and(|k| Self::expr_uses_this_prop(k, pn))
                     || Self::expr_uses_this_prop(v, pn)
             }),
-            Expr::List(items) => items
-                .iter()
-                .flatten()
-                .any(|e| Self::expr_uses_this_prop(e, pn)),
+            Expr::List(items) => items.iter().flatten().any(|(k, e)| {
+                k.as_ref().is_some_and(|k| Self::expr_uses_this_prop(k, pn))
+                    || Self::expr_uses_this_prop(e, pn)
+            }),
             Expr::Match { subject, arms } => {
                 Self::expr_uses_this_prop(subject, pn)
                     || arms.iter().any(|a| {
@@ -1281,6 +1302,58 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Whether the caller's scope violates set-visibility `sv` on a
+    /// prop declared in `dcls` — objectless counterpart of
+    /// hook_scope_allows for statics.
+    pub(in crate::interp) fn set_vis_scope_denied(
+        &mut self,
+        dcls: &Rc<PhpClass>,
+        sv: crate::ast::Visibility,
+    ) -> bool {
+        let scope = self.caller_scope_name();
+        match (sv, scope.as_deref()) {
+            (crate::ast::Visibility::Public, _) => false,
+            (crate::ast::Visibility::Private, s) => s != Some(dcls.name()),
+            (crate::ast::Visibility::Protected, Some(s)) => {
+                !(self.is_a_str(s, dcls.name()) || self.is_a_str(dcls.name(), s))
+            }
+            (crate::ast::Visibility::Protected, None) => true,
+        }
+    }
+
+    /// `private(set)`/`protected(set)` violation on INDIRECT writes
+    /// (`[]`, `&`, compound, `++`, by-ref args) — zend names it
+    /// 'Cannot indirectly modify ... (set)' instead of 'Cannot modify'.
+    pub(in crate::interp) fn set_visibility_indirect_error<T>(
+        &mut self,
+        dcls: &Rc<PhpClass>,
+        pname: &str,
+        sv: crate::ast::Visibility,
+    ) -> Result<T, PhpError> {
+        let visname = match sv {
+            crate::ast::Visibility::Private => "private",
+            crate::ast::Visibility::Protected => "protected",
+            crate::ast::Visibility::Public => "public",
+        };
+        let from = self
+            .stack
+            .last()
+            .and_then(|f| f.decl_class.as_ref().or(f.scope_class.as_ref()))
+            .map(|c| format!("scope {}", c.name()))
+            .unwrap_or_else(|| "global scope".to_string());
+        self.fail(PhpError::uncaught(
+            "Error",
+            format!(
+                "Cannot indirectly modify {}(set) property {}::${} from {}",
+                visname,
+                dcls.name(),
+                pname,
+                from
+            ),
+            0,
+        ))
+    }
+
     /// `private(set)`/`protected(set)` violation message — distinct from
     /// the read-side "Cannot access" (asymmetric_visibility).
     pub(in crate::interp) fn set_visibility_error<T>(
@@ -1477,12 +1550,11 @@ impl<'a> Interp<'a> {
                 Ok(Value::Null)
             }
             other => {
-                if self.silence == 0 {
-                    self.warn(&format!(
-                        "Attempt to read property \"{}\" on {}",
-                        pn,
-                        other.gettype()
-                    ))?;
+                if !self.is_quiet() {
+                    // zend names scalar types by their zval name —
+                    // 'on int', never 'on integer' (probe4j).
+                    let t = self.zval_type_name(&other);
+                    self.warn(&format!("Attempt to read property \"{}\" on {}", pn, t))?;
                 }
                 Ok(Value::Null)
             }
@@ -1495,8 +1567,14 @@ impl<'a> Interp<'a> {
         name: &PropName,
         _nullsafe: bool,
     ) -> Result<Cell, PhpError> {
+        self.last_prop_ov = None;
         let pn = self.prop_name(name)?;
-        let ov = self.eval(obj)?;
+        // Write-context chains evaluate every link as a write fetch —
+        // `$i->p->sub` dies with 'Attempt to modify property "p" on
+        // int' instead of the read warning (probe4j). A paren just
+        // wraps a link.
+        let ov = self.eval_lvalue_obj(obj)?;
+        self.last_prop_ov = Some(ov.clone());
         match ov {
             Value::Object(o) => {
                 // Hooks intercept the cell path entirely — `[]`, `&`,
@@ -1555,10 +1633,75 @@ impl<'a> Interp<'a> {
                 // is *inaccessible*: cell ops route to __get like a
                 // missing prop, and the write dies in the temp
                 // (bug37667 — appends to a protected prop).
+                let visible = self.prop_visible(&o.borrow().class.clone(), &pn);
                 let key = match key {
-                    Some(k) if self.prop_visible(&o.borrow().class.clone(), &pn) => Some(k),
+                    Some(k) if visible => Some(k),
                     _ => None,
                 };
+                // zend's write-fetch on a readonly prop is only legal
+                // when the slot already holds an object — the write
+                // then targets the object, never the slot. The engine
+                // hands out the object handle, so `&`-binds get a
+                // detached temp whose writes can't reach the slot.
+                // Any other content — missing, scalar, array — dies
+                // with the indirect-modify Error, ahead of the
+                // uninit-typed 'by reference' gate (R3 finding 3).
+                // Invisible props keep falling to __get/hidden-error.
+                if visible {
+                    if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
+                        if pd.readonly {
+                            let dk = if pd.visibility == crate::ast::Visibility::Private {
+                                format!("\0{}\0{}", dcls.name(), pd.name)
+                            } else {
+                                pd.name.clone()
+                            };
+                            let held = o.borrow().props.get(&dk).cloned();
+                            return match held {
+                                Some(c) if matches!(&*c.borrow(), Value::Object(_)) => {
+                                    Ok(cell(c.borrow().clone()))
+                                }
+                                _ => self.fail(PhpError::uncaught(
+                                    "Error",
+                                    format!(
+                                        "Cannot indirectly modify readonly property {}::${}",
+                                        dcls.name(),
+                                        pd.name
+                                    ),
+                                    0,
+                                )),
+                            };
+                        }
+                        // private(set)/protected(set): a cell fetch is
+                        // an indirect write — `[]`, `&`, `&arg`, `+=`,
+                        // `++`, foreach-by-ref all name it (a
+                        // whole-prop unset carries its own error).
+                        // Like readonly, a slot already holding an
+                        // OBJECT hands the object out instead — writes
+                        // then target it (`$foo->bar->baz = 42`), and
+                        // dim/compound ops on the slot itself hit the
+                        // object's own errors, not 'indirectly modify'.
+                        if !self.in_unset {
+                            if let Some(sv) = pd.set_vis {
+                                if !self.hook_scope_allows(&o, &dcls, &pn, sv) {
+                                    let dk = if pd.visibility == crate::ast::Visibility::Private {
+                                        format!("\0{}\0{}", dcls.name(), pd.name)
+                                    } else {
+                                        pd.name.clone()
+                                    };
+                                    let held = o.borrow().props.get(&dk).cloned();
+                                    return match held {
+                                        Some(c) if matches!(&*c.borrow(), Value::Object(_)) => {
+                                            Ok(cell(c.borrow().clone()))
+                                        }
+                                        _ => {
+                                            self.set_visibility_indirect_error(&dcls, &pd.name, sv)
+                                        }
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
                 if key.is_none() {
                     if let Some((tpd, tdcls)) = self.decl_prop(&o, &pn) {
                         if tpd.ty.is_some() && tpd.default.is_none() {
@@ -1567,7 +1710,7 @@ impl<'a> Interp<'a> {
                                 .as_ref()
                                 .map(|t| t.iter().any(|m| m.eq_ignore_ascii_case("null")))
                                 .unwrap_or(false);
-                            if !nullable {
+                            if !nullable && (self.dim_by_ref || self.foreach_by_ref) {
                                 // `=&` on an uninit typed prop routes to
                                 // `&__get` when it exists — the bound
                                 // ref sees __get's cell (073).
@@ -1672,27 +1815,27 @@ impl<'a> Interp<'a> {
                         return Ok(cell(Value::Null));
                     }
                 }
+                // Declared-but-invisible with no __get intercept dies
+                // with zend's access Error — it must not fall through
+                // to the dynamic-prop materialization below and shadow
+                // the declaration (finding 11).
+                if key.is_none() {
+                    if let Some(e) = self.hidden_decl_error(&o, &pn) {
+                        return self.fail(e);
+                    }
+                }
                 let key = key.unwrap_or_else(|| pn.clone());
                 // An RW fetch of an undeclared prop materializes a
                 // dynamic one — E_DEPRECATED on non-exempt classes
                 // (stdClass / #[AllowDynamicProperties]).
-                if !o.borrow().props.contains_key(&key)
-                    && self.decl_prop(&o, &pn).is_none()
-                    && !self.obj_is_a(&o, "stdclass")
-                    && !o.borrow().class.decl.attrs.iter().any(|a| {
-                        a.name
-                            .rsplit('\\')
-                            .next()
-                            .unwrap_or(&a.name)
-                            .eq_ignore_ascii_case("AllowDynamicProperties")
-                    })
-                {
+                if self.dyn_prop_deprecated(&o, &pn, &key) {
                     let cn = o.borrow().class.name().to_string();
                     self.deprecated(&format!(
                         "Creation of dynamic property {}::${} is deprecated",
                         cn, pn
                     ))?;
                 }
+                let undeclared = self.decl_prop(&o, &pn).is_none();
                 let mut ob = o.borrow_mut();
                 if !ob.props.contains_key(&key) {
                     if !ob.prop_order.contains(&key) {
@@ -1700,6 +1843,17 @@ impl<'a> Interp<'a> {
                     }
                     let nc = cell(Value::Null);
                     self.last_fresh_cell = Some(Rc::as_ptr(&nc) as usize);
+                    if undeclared {
+                        // The compound read warns 'Undefined property'
+                        // for a slot this write-fetch just created
+                        // (finding 13) — only for genuinely dynamic
+                        // props; declared-but-uninit slots stay silent.
+                        self.fresh_dyn_props.push((
+                            Rc::as_ptr(&nc) as usize,
+                            ob.class.name().to_string(),
+                            pn.clone(),
+                        ));
+                    }
                     ob.props.insert(key.clone(), nc);
                 }
                 let slot = ob.props.get(&key).unwrap().clone();
@@ -1722,9 +1876,16 @@ impl<'a> Interp<'a> {
                 }
                 Ok(slot)
             }
-            _ => self.fail(PhpError::fatal(
-                format!("Attempt to assign property \"{}\" on non-object", pn),
-                0,
+            // Cell fetches (`=&`, `[]`, `++`) on a prop of a non-object
+            // die with zend's modify-verb Error — catchable (probe4f).
+            other => self.fail(PhpError::uncaught(
+                "Error",
+                format!(
+                    "Attempt to modify property \"{}\" on {}",
+                    pn,
+                    self.zval_type_name(&other)
+                ),
+                self.cur_line,
             )),
         }
     }
@@ -1759,7 +1920,7 @@ impl<'a> Interp<'a> {
     pub(in crate::interp) fn unset_prop(&mut self, e: &Expr) -> Result<(), PhpError> {
         if let Expr::Prop { obj, name, .. } = e {
             let pn = self.prop_name(name)?;
-            let ov = self.eval(obj)?;
+            let ov = self.eval_lvalue_obj(obj)?;
             if let Value::Object(o) = ov {
                 if !self.in_own_hook(&o, &pn) {
                     if let Some((pd, hs)) = self.hooked_prop(&o, &pn) {
@@ -1776,7 +1937,87 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let cls = o.borrow().class.clone();
-                if let Some(k) = self.obj_prop_key(&o, &pn) {
+                // A declared prop the scope can't see is zend's access
+                // Error — `__unset` intercepts it like any overload
+                // first (finding 11: unset($a->protected)). Computed
+                // unconditionally: prop_visible() skips private decls,
+                // which would make an invisible private prop unset()
+                // silently no-op instead of 'Cannot access private
+                // property' (R3 finding 2).
+                let hidden = self.hidden_decl_error(&o, &pn);
+                // zend's unset on a declared prop runs its write-scope
+                // gates BEFORE the slot is touched (R3 finding 1): an
+                // initialized readonly prop can never be unset; an
+                // uninitialized one — or any asymmetric-visibility
+                // prop — needs the set-visibility scope
+                // (`public readonly` is implicitly protected(set)).
+                if hidden.is_none() {
+                    if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
+                        let dk = if pd.visibility == crate::ast::Visibility::Private {
+                            format!("\0{}\0{}", dcls.name(), pd.name)
+                        } else {
+                            pd.name.clone()
+                        };
+                        if pd.readonly && o.borrow().props.contains_key(&dk) {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                format!(
+                                    "Cannot unset readonly property {}::${}",
+                                    dcls.name(),
+                                    pd.name
+                                ),
+                                0,
+                            ));
+                        }
+                        let eff = pd.set_vis.unwrap_or(if pd.readonly {
+                            crate::ast::Visibility::Protected
+                        } else {
+                            pd.visibility
+                        });
+                        if eff != crate::ast::Visibility::Public {
+                            let scope = self.caller_scope_name();
+                            let dn = dcls.name().to_string();
+                            let ok = match eff {
+                                crate::ast::Visibility::Private => {
+                                    scope.as_deref() == Some(dn.as_str())
+                                }
+                                crate::ast::Visibility::Protected => scope
+                                    .as_deref()
+                                    .map(|s| self.is_a_str(s, &dn) || self.is_a_str(&dn, s))
+                                    .unwrap_or(false),
+                                crate::ast::Visibility::Public => true,
+                            };
+                            if !ok {
+                                let word = if eff == crate::ast::Visibility::Private {
+                                    "private(set)"
+                                } else {
+                                    "protected(set)"
+                                };
+                                // zend's wording tucks 'readonly' into
+                                // the protected(set) form only — the
+                                // private(set) message drops it.
+                                let rw = if pd.readonly && eff == crate::ast::Visibility::Protected
+                                {
+                                    " readonly"
+                                } else {
+                                    ""
+                                };
+                                let from = scope
+                                    .map(|s| format!("scope {}", s))
+                                    .unwrap_or_else(|| "global scope".to_string());
+                                return self.fail(PhpError::uncaught(
+                                    "Error",
+                                    format!(
+                                        "Cannot unset {}{} property {}::${} from {}",
+                                        word, rw, dn, pd.name, from
+                                    ),
+                                    0,
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(k) = self.obj_prop_key(&o, &pn).filter(|_| hidden.is_none()) {
                     let mut ob = o.borrow_mut();
                     let prune = if let Some(c) = ob.props.remove(&k) {
                         // unset() severs the typed slot: refs bound to it
@@ -1807,6 +2048,25 @@ impl<'a> Interp<'a> {
                         self.prune_typed_slot(ptr);
                         // efree the prop bucket — charged at insert.
                         self.mem_credit(&o, 32);
+                    }
+                } else if let Some(e) = hidden {
+                    // __unset overloads the invisible decl like a
+                    // missing prop; without it the access Error wins.
+                    if self.find_method_in(&cls, "__unset").is_some()
+                        && self
+                            .magic_guards
+                            .insert((Rc::as_ptr(&o) as usize, 3u8, pn.clone()))
+                    {
+                        let res = self.method_invoke(
+                            o.clone(),
+                            "__unset",
+                            CallArgs::positional(vec![cell(Value::str(pn.clone()))]),
+                        );
+                        self.magic_guards
+                            .remove(&(Rc::as_ptr(&o) as usize, 3u8, pn.clone()));
+                        res?;
+                    } else {
+                        return self.fail(e);
                     }
                 } else if let Some((pd, dcls)) = self.decl_prop(&o, &pn) {
                     // unset() on an uninitialized declared prop still
@@ -1943,9 +2203,18 @@ impl<'a> Interp<'a> {
         if allows {
             return None;
         }
+        // The message names the DECLARING class for private but the
+        // object's RUNTIME class for protected ('Cannot access
+        // protected property B::$x' on a B() even though A declares
+        // the prop).
+        let en = if pd.visibility == crate::ast::Visibility::Protected {
+            o.borrow().class.name().to_string()
+        } else {
+            dn
+        };
         Some(PhpError::uncaught(
             "Error",
-            format!("Cannot access {} property {}::${}", word, dn, pn),
+            format!("Cannot access {} property {}::${}", word, en, pn),
             0,
         ))
     }

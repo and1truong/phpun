@@ -663,10 +663,27 @@ fn print_r(_it: &mut Interp, v: &Value, indent: usize) -> String {
             s.push_str("(\n");
             for n in &ob.prop_order {
                 if let Some(c) = ob.props.get(n) {
-                    // Int-keyed buckets print their bare index.
+                    // Int-keyed buckets print their bare index;
+                    // other props annotate visibility like zend:
+                    // `[name:protected]` / `[name:Cls:private]`.
                     let disp = match crate::value::int_prop_index(n) {
                         Some(i) => i.to_string(),
-                        None => n.clone(),
+                        None => {
+                            let (vis, dcls) = _it.prop_visibility(&ob.class, n);
+                            let short = n
+                                .strip_prefix('\0')
+                                .and_then(|r| r.split('\0').nth(1))
+                                .unwrap_or(n.as_str());
+                            match vis {
+                                crate::ast::Visibility::Private => {
+                                    format!("{}:{}:private", short, dcls)
+                                }
+                                crate::ast::Visibility::Protected => {
+                                    format!("{}:protected", short)
+                                }
+                                crate::ast::Visibility::Public => short.to_string(),
+                            }
+                        }
                     };
                     s.push_str(&"    ".repeat(indent + 1));
                     s.push_str(&format!("[{}] => ", disp));
@@ -784,18 +801,27 @@ fn var_export_depth(it: &mut Interp, v: &Value, depth: usize) -> String {
             } else {
                 None
             };
+            // Entries indent by nesting: 3 spaces at depth 0, +2 per
+            // depth — zend's var_export prop table.
+            let epad = " ".repeat(3 + 2 * depth);
+            let vpad = "  ".repeat(depth + 1);
             let has_ao = ao_arr.is_some();
             if let Some(arr) = ao_arr {
                 for (k, c) in arr.borrow().iter() {
                     // Int keys print bare, strings quoted — zend's
                     // var_export key rule.
                     let ks = match k {
-                        ArrKey::Int(i) => format!("   {} => ", i),
-                        ArrKey::Str(st) => format!("   '{}' => ", st),
+                        ArrKey::Int(i) => format!("{}{} => ", epad, i),
+                        ArrKey::Str(st) => format!("{}'{}' => ", epad, st),
                         ArrKey::Tomb => continue,
                     };
                     s.push_str(&ks);
-                    s.push_str(&var_export_depth(it, &c.borrow(), depth + 1));
+                    let inner = c.borrow();
+                    if matches!(&*inner, Value::Array(_) | Value::Object(_)) {
+                        s.push('\n');
+                        s.push_str(&vpad);
+                    }
+                    s.push_str(&var_export_depth(it, &inner, depth + 1));
                     s.push_str(",\n");
                 }
             }
@@ -808,7 +834,11 @@ fn var_export_depth(it: &mut Interp, v: &Value, depth: usize) -> String {
                         continue;
                     }
                     if let Some(v) = o.borrow().props.get(&slot).map(|c| c.borrow().clone()) {
-                        s.push_str(&format!("   {} => ", i));
+                        s.push_str(&format!("{}{} => ", epad, i));
+                        if matches!(&v, Value::Array(_) | Value::Object(_)) {
+                            s.push('\n');
+                            s.push_str(&vpad);
+                        }
                         s.push_str(&var_export_depth(it, &v, depth + 1));
                         s.push_str(",\n");
                     }
@@ -819,11 +849,18 @@ fn var_export_depth(it: &mut Interp, v: &Value, depth: usize) -> String {
                     None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
                 };
                 if let Some(v) = v {
-                    s.push_str(&format!("   '{}' => ", out));
+                    s.push_str(&format!("{}'{}' => ", epad, out));
+                    // A nested array/object value renders on its own
+                    // line at value depth ('k' => \n  array (...)).
+                    if matches!(&v, Value::Array(_) | Value::Object(_)) {
+                        s.push('\n');
+                        s.push_str(&vpad);
+                    }
                     s.push_str(&var_export_depth(it, &v, depth + 1));
                     s.push_str(",\n");
                 }
             }
+            s.push_str(&"  ".repeat(depth));
             s.push_str("))");
             s
         }
@@ -1144,8 +1181,11 @@ pub(crate) fn php_unserialize(
             } else {
                 // zend turns the target slot into an IS_REFERENCE
                 // bucket — the shared cell must mark so var_dump
-                // prints `&` and a later serialize re-emits R:.
+                // prints `&` and a later serialize re-emits R:. A
+                // reference-bound array joins the GC universe the same
+                // as a `=&` bind (unserialize can create cycles).
                 it.mark_ref(&target);
+                it.reg_arr_ref(&target);
                 vhash.push(target.clone());
                 Ok(target)
             }
@@ -1332,6 +1372,20 @@ pub(crate) fn php_unserialize(
                 }
                 let v = php_unserialize(it, s, pos, err, vhash)?;
                 let mut ob = obj.borrow_mut();
+                // A Throwable's `previous` lives in the exception
+                // internal (getPrevious reads it, not the prop slot)
+                // — zend's C-field mirrors the serialized
+                // `\0Exception\0previous` member.
+                if let Some(crate::value::ObjectInternal::Exception { previous, .. }) =
+                    &mut ob.internal
+                {
+                    if plain == b"previous" {
+                        *previous = match &*v.borrow() {
+                            Value::Object(o) => Some(Value::Object(o.clone())),
+                            _ => None,
+                        };
+                    }
+                }
                 let key = crate::value::lossy(&ks).into_owned();
                 if !ob.prop_order.contains(&key) {
                     ob.prop_order.push(key.clone());

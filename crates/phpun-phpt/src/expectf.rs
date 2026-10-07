@@ -46,7 +46,10 @@ pub fn expectf_to_regex(wanted: &str) -> String {
                 b'i' => "[+-]?\\d+",
                 b'd' => "\\d+",
                 b'x' => "[0-9a-fA-F]+",
-                b'f' => "[+-]?(?:\\d+|(?=\\.\\d))(?:\\.\\d+)?(?:[Ee][+-]?\\d+)?",
+                // `regex` has no lookahead — spell the same float
+                // grammar without `(?=...)`: digits, or a leading-dot
+                // fraction, each with optional exponent.
+                b'f' => "[+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)(?:[Ee][+-]?\\d+)?",
                 b'c' => ".",
                 b'0' => "\\x00",
                 _ => "",

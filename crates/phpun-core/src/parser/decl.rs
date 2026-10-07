@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// `(key expr, target)` pairs of a destructuring list — `None` is a
+/// hole, `None` key is positional.
+type ListItems<T> = Vec<Option<(Option<Expr>, T)>>;
+
 impl<'a> Parser<'a> {
     pub(in crate::parser) fn expr_stmt(&mut self) -> Result<Stmt, PhpError> {
         let e = self.expr()?;
@@ -225,8 +229,8 @@ impl<'a> Parser<'a> {
             return Err(expecting(self));
         }
         if nullsafe {
-            return Err(PhpError::compile_fatal(
-                "Can't use nullsafe operator in write context",
+            self.write_ctx_errs.push((
+                "Can't use nullsafe operator in write context".to_string(),
                 self.line(),
             ));
         }
@@ -247,32 +251,31 @@ impl<'a> Parser<'a> {
                     | Expr::New { .. }
             );
             if !writable {
-                return Err(PhpError::compile_fatal(
-                    "Cannot use temporary expression in write context",
+                self.write_ctx_errs.push((
+                    "Cannot use temporary expression in write context".to_string(),
                     self.line(),
                 ));
             }
         }
         if has_append {
-            return Err(PhpError::compile_fatal(
-                "Cannot use [] for unsetting",
-                self.line(),
-            ));
+            self.write_ctx_errs
+                .push(("Cannot use [] for unsetting".to_string(), self.line()));
         }
         if leaf {
             match &e {
                 Expr::Var(n) if n == "this" => {
-                    return Err(PhpError::compile_fatal("Cannot unset $this", self.line()));
+                    self.write_ctx_errs
+                        .push(("Cannot unset $this".to_string(), self.line()));
                 }
                 Expr::Call { .. } => {
-                    return Err(PhpError::compile_fatal(
-                        "Can't use function return value in write context",
+                    self.write_ctx_errs.push((
+                        "Can't use function return value in write context".to_string(),
                         self.line(),
                     ));
                 }
                 Expr::MethodCall { .. } | Expr::StaticCall { .. } | Expr::StaticCallDyn { .. } => {
-                    return Err(PhpError::compile_fatal(
-                        "Can't use method return value in write context",
+                    self.write_ctx_errs.push((
+                        "Can't use method return value in write context".to_string(),
                         self.line(),
                     ));
                 }
@@ -283,7 +286,7 @@ impl<'a> Parser<'a> {
                         Expr::Call { .. } => "Can't use function return value in write context",
                         _ => "Can't use method return value in write context",
                     };
-                    return Err(PhpError::compile_fatal(msg, self.line()));
+                    self.write_ctx_errs.push((msg.to_string(), self.line()));
                 }
                 _ => {}
             }
@@ -324,67 +327,85 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn foreach_target(&mut self) -> Result<ForeachTarget, PhpError> {
+        self.foreach_target_in(false)
+    }
+
+    /// `in_list` marks destructuring elements (`as [$a, $b]` /
+    /// `as list($a, $b)`) — a `?->` chain there reports
+    /// 'Assignments can only happen to writable values' while the
+    /// direct target reports 'Can't use nullsafe operator in write
+    /// context' (p13 l6 vs fp2).
+    fn foreach_target_in(&mut self, in_list: bool) -> Result<ForeachTarget, PhpError> {
         if self.eat_op("&") {
-            let l = self.line();
-            return match self.next() {
-                Some(Token::Variable(n)) => Ok(ForeachTarget::ByRef(n)),
-                t => Err(PhpError::parse(
-                    format!(
-                        "syntax error, unexpected {}, expecting variable",
-                        desc_t(t.as_ref())
-                    ),
-                    l,
-                )),
-            };
+            // `&$v`, `&$o->p`, `&$a[i]` — a write-context `new_variable`
+            // chain (call roots and `?->` are compile fatals).
+            return Ok(ForeachTarget::ByRef(Box::new(self.ref_variable(true)?)));
         }
         if self.at_op("[") {
             self.pos += 1;
-            let mut items = Vec::new();
-            while !self.at_op("]") {
-                if self.eat_op(",") {
-                    items.push(None);
-                    continue;
-                }
-                items.push(Some(self.foreach_target()?));
-                if !self.eat_op(",") {
-                    break;
-                }
-            }
-            self.expect_op("]")?;
-            return Ok(ForeachTarget::List(items));
+            return Ok(ForeachTarget::List(self.foreach_list_items("]")?));
         }
         if self.ident_is("list") && matches!(self.peek2(), Some(Token::Op("("))) {
             self.pos += 1;
             self.expect_op("(")?;
-            let mut items = Vec::new();
-            while !self.at_op(")") {
-                if self.at_op(",") {
-                    items.push(None);
-                    self.pos += 1;
-                    continue;
-                }
-                items.push(Some(self.foreach_target()?));
-                if !self.eat_op(",") {
-                    break;
-                }
-            }
-            self.expect_op(")")?;
-            return Ok(ForeachTarget::List(items));
+            return Ok(ForeachTarget::List(self.foreach_list_items(")")?));
         }
         let l = self.line();
         match self.next() {
             Some(Token::Variable(n)) => {
-                // Lvalue targets: `$b[0]`, `$o->p`, ...
+                // Lvalue targets: `$b[0]`, `$o->p`, `$o?->p` — dim and
+                // prop links like zend's `variable` write context
+                // (`foreach($a as $o->p)` is legal; `?->` is the
+                // write-context compile fatal).
                 let mut e = Expr::Var(n);
-                while self.at_op("[") {
-                    self.pos += 1;
-                    let i = if self.at_op("]") {
-                        None
+                loop {
+                    if self.at_op("[") {
+                        self.pos += 1;
+                        let i = if self.at_op("]") {
+                            None
+                        } else {
+                            Some(Box::new(self.expr()?))
+                        };
+                        self.expect_op("]")?;
+                        e = Expr::Index { e: Box::new(e), i };
+                    } else if self.at_op("->") || self.at_op("?->") {
+                        let nullsafe = self.at_op("?->");
+                        self.pos += 1;
+                        let name = match self.next() {
+                            Some(Token::Ident(m)) => PropName::Name(m),
+                            Some(Token::Op("{")) => {
+                                let inner = self.expr()?;
+                                self.expect_op("}")?;
+                                PropName::Expr(Box::new(inner))
+                            }
+                            Some(Token::Variable(v)) => PropName::Name(v),
+                            t => {
+                                return Err(PhpError::parse(
+                                    format!("syntax error, unexpected {}", desc_t(t.as_ref())),
+                                    self.line(),
+                                ));
+                            }
+                        };
+                        e = Expr::Prop {
+                            obj: Box::new(e),
+                            name,
+                            nullsafe,
+                        };
                     } else {
-                        Some(Box::new(self.expr()?))
-                    };
-                    self.expect_op("]")?;
-                    e = Expr::Index { e: Box::new(e), i };
+                        break;
+                    }
+                }
+                if Self::has_nullsafe(&e) {
+                    if in_list {
+                        self.write_ctx_errs.push((
+                            "Assignments can only happen to writable values".to_string(),
+                            self.line(),
+                        ));
+                    }
+                    self.write_ctx_errs.push((
+                        "Can't use nullsafe operator in write context".to_string(),
+                        self.line(),
+                    ));
                 }
                 if let Expr::Var(_) = e {
                     Ok(ForeachTarget::Var(match e {
@@ -395,13 +416,118 @@ impl<'a> Parser<'a> {
                     Ok(ForeachTarget::Lvalue(Box::new(e)))
                 }
             }
-            t => Err(PhpError::parse(
-                format!(
-                    "syntax error, unexpected {}, expecting variable",
-                    desc_t(t.as_ref())
-                ),
-                l,
-            )),
+            t => {
+                // `as f()` parses — zend's write-context check then
+                // defers 'Can't use function return value in write
+                // context' past later syntax errors (like any other
+                // write-context violation). Bare idents still die
+                // 'expecting variable'.
+                if matches!(&t, Some(Token::Ident(_)))
+                    && matches!(self.peek(), Some(Token::Op("(")))
+                {
+                    self.pos -= 1;
+                    let e = self.expr()?;
+                    return self.expr_to_foreach_target(e);
+                }
+                Err(PhpError::parse(
+                    format!(
+                        "syntax error, unexpected {}, expecting variable",
+                        desc_t(t.as_ref())
+                    ),
+                    l,
+                ))
+            }
+        }
+    }
+
+    /// `[..]`/`list(..)` destructuring inside a foreach target —
+    /// positional elements, holes, and `expr => target` keyed pairs
+    /// (zend-legal `as ['a' => $a]` / `as list('a' => $a)`); keyed and
+    /// unkeyed entries can't mix.
+    fn foreach_list_items(&mut self, close: &str) -> Result<ListItems<ForeachTarget>, PhpError> {
+        let mut items = Vec::new();
+        let (mut keyed, mut unkeyed) = (false, false);
+        while !self.at_op(close) {
+            if self.eat_op(",") {
+                items.push(None);
+                continue;
+            }
+            if self.at_op("&") {
+                unkeyed = true;
+                items.push(Some((None, self.foreach_target_in(true)?)));
+            } else {
+                let e = self.expr()?;
+                if self.eat_op("=>") {
+                    keyed = true;
+                    items.push(Some((Some(e), self.foreach_target_in(true)?)));
+                } else {
+                    unkeyed = true;
+                    items.push(Some((None, self.expr_to_foreach_target(e)?)));
+                }
+            }
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op(close)?;
+        if keyed && unkeyed {
+            return Err(PhpError::compile_fatal(
+                "Cannot mix keyed and unkeyed array entries in assignments",
+                self.line(),
+            ));
+        }
+        Ok(items)
+    }
+
+    /// A foreach destructuring element parsed as an expression —
+    /// variables stay `Var`, nested array literals / `list()` calls
+    /// recurse as lists, `&` elements stay ByRef, other writable
+    /// chains are Lvalues; non-writable exprs die in list_writable.
+    fn expr_to_foreach_target(&mut self, e: Expr) -> Result<ForeachTarget, PhpError> {
+        match e {
+            Expr::Var(n) => Ok(ForeachTarget::Var(n)),
+            Expr::ByRef(inner) => Ok(ForeachTarget::ByRef(inner)),
+            Expr::ArrayLit(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                let (mut keyed, mut unkeyed) = (false, false);
+                for (k, v) in items {
+                    match (k, v) {
+                        (None, Expr::Null) => {
+                            unkeyed = true;
+                            out.push(None);
+                        }
+                        (k, other) => {
+                            if k.is_some() {
+                                keyed = true;
+                            } else {
+                                unkeyed = true;
+                            }
+                            out.push(Some((k, self.expr_to_foreach_target(other)?)));
+                        }
+                    }
+                }
+                if keyed && unkeyed {
+                    return Err(PhpError::compile_fatal(
+                        "Cannot mix keyed and unkeyed array entries in assignments",
+                        self.line(),
+                    ));
+                }
+                Ok(ForeachTarget::List(out))
+            }
+            Expr::List(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(match it {
+                        None => None,
+                        Some((k, e)) => Some((k, self.expr_to_foreach_target(e)?)),
+                    });
+                }
+                Ok(ForeachTarget::List(out))
+            }
+            _ => {
+                self.list_writable(&e)?;
+                Ok(ForeachTarget::Lvalue(Box::new(e)))
+            }
         }
     }
 
@@ -456,7 +582,7 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let name = self.ident().unwrap_or_default();
         self.expect_op("=")?;
-        let value = self.expr()?;
+        let value = self.const_expr()?;
         self.expect_op(")")?;
         let is_strict = name.eq_ignore_ascii_case("strict_types");
         // `declare(strict_types=1)` is legal only as the very first
@@ -781,16 +907,31 @@ impl<'a> Parser<'a> {
     /// declaration's line (first_class_callable_011,
     /// named_params/attributes_*).
     pub(in crate::parser) fn line_after_attr_group(&self) -> usize {
+        // The error surfaces mid-args — nested `]` from array literals
+        // inside the args would end a naive forward scan early. Walk
+        // back to the enclosing group's `#[` first so the forward scan
+        // starts outside any nested bracket (R6 #22).
         let mut i = self.pos;
+        let mut d = 0i32;
+        while i > 0 {
+            i -= 1;
+            match &self.toks[i].token {
+                Token::Op("]") => d += 1,
+                Token::Op("[") | Token::Op("#[") => d -= 1,
+                _ => {}
+            }
+            if d < 0 && matches!(self.toks[i].token, Token::Op("#[")) {
+                break;
+            }
+        }
+        // i now sits on the group's `#[` (or 0 if unbalanced). Scan
+        // forward past it: the first `]` at depth 0 ends the group —
+        // `[` literals inside args nest deeper, `(`/`)` don't matter.
+        i += 1;
         let mut d = 0i32;
         while i < self.toks.len() {
             match &self.toks[i].token {
-                Token::Op("(") | Token::Op("[") | Token::Op("#[") => d += 1,
-                Token::Op(")") => {
-                    if d > 0 {
-                        d -= 1;
-                    }
-                }
+                Token::Op("[") | Token::Op("#[") => d += 1,
                 Token::Op("]") => {
                     if d == 0 {
                         i += 1;
@@ -802,8 +943,33 @@ impl<'a> Parser<'a> {
             }
             i += 1;
         }
-        while self.toks.get(i).is_some_and(|t| t.token == Token::Op("]")) {
-            i += 1;
+        // Sibling `#[..]` groups follow — the attributed declaration's
+        // line sits past ALL of them (`#[A(bad)] #[B] class` reports
+        // the class line).
+        loop {
+            while self.toks.get(i).is_some_and(|t| t.token == Token::Op("]")) {
+                i += 1;
+            }
+            if self.toks.get(i).map(|t| &t.token) == Some(&Token::Op("#[")) {
+                i += 1;
+                let mut d = 0i32;
+                while i < self.toks.len() {
+                    match &self.toks[i].token {
+                        Token::Op("[") | Token::Op("#[") => d += 1,
+                        Token::Op("]") => {
+                            if d == 0 {
+                                i += 1;
+                                break;
+                            }
+                            d -= 1;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            break;
         }
         self.toks.get(i).map(|t| t.line).unwrap_or(0)
     }
@@ -839,7 +1005,10 @@ impl<'a> Parser<'a> {
                     }
                     self.pos -= 1;
                     self.expect_op("(")?;
-                    match self.args() {
+                    let saved_const = std::mem::replace(&mut self.const_ctx, ConstCtx::Slot);
+                    let args_r = self.args();
+                    self.const_ctx = saved_const;
+                    match args_r {
                         Ok(list) => {
                             // Duplicate named args are a compile-time
                             // fatal for attribute args (unlike calls,
@@ -940,8 +1109,10 @@ impl<'a> Parser<'a> {
             .insert(name.rsplit('\\').next().unwrap_or(&name).to_lowercase());
         self.cur_class = name.clone();
         // enum backing type `enum X: int`
+        let mut enum_backed = false;
         if self.eat_op(":") {
             self.skip_type()?;
+            enum_backed = kind == ClassKind::Enum;
         }
         let mut parent = None;
         let mut implements = Vec::new();
@@ -982,10 +1153,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op("{")?;
-        self.class_ctx.push((
-            parent.is_some() || !implements.is_empty(),
-            kind == ClassKind::Trait,
-        ));
+        // `implements I` alone does NOT give the class a `parent` —
+        // `parent::`/`new parent()`/`parent::$p` inside must still hit
+        // zend's whole-file compile fatal.
+        self.class_ctx
+            .push((parent.is_some(), kind == ClassKind::Trait));
         let mut methods = Vec::new();
         let mut props = Vec::new();
         let mut consts = Vec::new();
@@ -1100,7 +1272,24 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect_op("=")?;
-                    let cv = self.expr()?;
+                    // Value-expr start line — a lazy init Error
+                    // attributes to the expr's own line, not the
+                    // `const` keyword's (p3m multi-line defaults).
+                    let cline = self.line();
+                    let cv = self.const_expr()?;
+                    // A const name redeclared inside the same class body
+                    // is a compile fatal — the body compiles wherever the
+                    // decl sits (`if (0)`, a dead function), and Zend
+                    // reports the dup on its own line.
+                    if consts
+                        .iter()
+                        .any(|cd: &crate::ast::ConstDecl| cd.name == cname)
+                    {
+                        return Err(PhpError::compile_fatal(
+                            format!("Cannot redefine class constant {}::{}", name, cname),
+                            self.line(),
+                        ));
+                    }
                     consts.push(crate::ast::ConstDecl {
                         name: cname,
                         value: cv,
@@ -1110,6 +1299,7 @@ impl<'a> Parser<'a> {
                         attrs: member_attrs.clone(),
                         decl_in: None,
                         enum_case: false,
+                        line: cline,
                     });
                     if !self.eat_op(",") {
                         break;
@@ -1207,9 +1397,25 @@ impl<'a> Parser<'a> {
                 // enum cases
                 self.pos += 1;
                 let cname = self.ident().unwrap_or_default();
+                let cline = self.line();
                 let cv = if self.eat_op("=") {
-                    self.expr()?
+                    if !enum_backed {
+                        return Err(PhpError::compile_fatal(
+                            format!(
+                                "Case {} of non-backed enum {} must not have a value",
+                                cname, name
+                            ),
+                            cline,
+                        ));
+                    }
+                    self.const_expr()?
                 } else {
+                    if enum_backed {
+                        return Err(PhpError::compile_fatal(
+                            format!("Case {} of backed enum {} must have a value", cname, name),
+                            cline,
+                        ));
+                    }
                     Expr::Null
                 };
                 consts.push(crate::ast::ConstDecl {
@@ -1221,6 +1427,7 @@ impl<'a> Parser<'a> {
                     attrs: vec![],
                     decl_in: None,
                     enum_case: true,
+                    line: cline,
                 });
                 self.expect_op(";")?;
                 continue;
@@ -1254,11 +1461,17 @@ impl<'a> Parser<'a> {
                         ))
                     }
                 };
+                let mut dline = 0;
                 let default = if self.eat_op("=") {
-                    Some(self.expr()?)
+                    dline = self.line();
+                    Some(self.const_expr()?)
                 } else {
                     None
                 };
+                // 'Readonly property cannot have default value' runs in
+                // the per-prop decl pass (class register), after 'must
+                // have type' and before 'static cannot be readonly' —
+                // zend checks props in declaration order (m11b).
                 props.push(PropDecl {
                     name: pname,
                     default,
@@ -1273,6 +1486,7 @@ impl<'a> Parser<'a> {
                     hooks: None,
                     attrs: member_attrs.clone(),
                     line: pline,
+                    dline,
                 });
                 if !self.eat_op(",") {
                     break;
@@ -1329,13 +1543,16 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let prev_ret_by_ref = self.ret_by_ref;
+        self.ret_by_ref = by_ref;
         let (body, end_line) = if self.eat_op(";") {
             (Vec::new(), line)
         } else {
-            let b = self.body()?;
+            let b = self.runtime_body()?;
             let e = self.prev_line();
             (b, e)
         };
+        self.ret_by_ref = prev_ret_by_ref;
         self.hook_ctx = prev_hook;
         Ok(MethodDecl {
             decl: FunctionDecl {
@@ -1432,6 +1649,7 @@ impl<'a> Parser<'a> {
             let by_ref = self.eat_op("&");
             // Any identifier is consumed here — an unknown one is a
             // compile-fatal naming the class+prop (unknown_hook).
+            let hline = self.line();
             let hname = match self.next() {
                 Some(Token::Ident(n)) => n,
                 t => {
@@ -1469,7 +1687,10 @@ impl<'a> Parser<'a> {
             let line = self.line();
             let prev_hook = self.hook_ctx.replace((pname.to_string(), is_get));
             let body = if self.eat_op("=>") {
-                let e = self.expr()?;
+                let saved_const = std::mem::replace(&mut self.const_ctx, ConstCtx::Runtime);
+                let e = self.expr();
+                self.const_ctx = saved_const;
+                let e = e?;
                 self.expect_op(";")?;
                 if is_get {
                     Some(vec![Stmt::Line(line), Stmt::Return(Some(e))])
@@ -1489,7 +1710,7 @@ impl<'a> Parser<'a> {
                     ])
                 }
             } else if self.at_op("{") {
-                Some(self.body()?)
+                Some(self.runtime_body()?)
             } else if self.eat_op(";") {
                 None
             } else {
@@ -1511,6 +1732,7 @@ impl<'a> Parser<'a> {
                 by_ref,
                 is_final: hfinal,
                 visibility: hvis,
+                line: hline,
             });
         }
         self.expect_op("}")?;
@@ -1534,6 +1756,29 @@ impl<'a> Parser<'a> {
         } else {
             false
         }
+    }
+
+    /// Parse a compile-time-constant slot (param defaults, const/prop
+    /// inits, attribute args, enum cases): scope-keyword checks defer
+    /// to the slot's runtime eval — `self::`/`parent::`/`new self()`
+    /// become catchable `Cannot access "X" ...` Errors at call/init,
+    /// while `static` stays the compile fatal
+    /// '"static::" is not allowed in compile-time constants'.
+    pub(in crate::parser) fn const_expr(&mut self) -> Result<Expr, PhpError> {
+        let saved = std::mem::replace(&mut self.const_ctx, ConstCtx::Slot);
+        let r = self.expr();
+        self.const_ctx = saved;
+        r
+    }
+
+    /// Clear the const-slot flag around a runtime body (closure/method/
+    /// hook bodies nested inside a const slot): scope-keyword gates
+    /// apply to those bodies as ordinary runtime expressions.
+    pub(in crate::parser) fn runtime_body(&mut self) -> Result<Vec<Stmt>, PhpError> {
+        let saved = std::mem::replace(&mut self.const_ctx, ConstCtx::Runtime);
+        let r = self.body();
+        self.const_ctx = saved;
+        r
     }
 
     pub(in crate::parser) fn params(&mut self) -> Result<Vec<Param>, PhpError> {
@@ -1618,7 +1863,7 @@ impl<'a> Parser<'a> {
                 }
             };
             let default = if self.eat_op("=") {
-                Some(self.expr()?)
+                Some(self.const_expr()?)
             } else {
                 None
             };
@@ -1751,6 +1996,15 @@ impl<'a> Parser<'a> {
             )
         })?;
         let prev_hook = self.hook_ctx.take();
+        // A named function's signature+body has NO class scope even
+        // when its decl is nested in a method — `self::`/`new self()`/
+        // `parent::$p` inside it are zend's whole-file compile fatal
+        // 'Cannot use "X" when no class scope is active'. Clearing
+        // class_ctx/in_closure for the parse makes the `X::` gates see
+        // that scope; closures/arrow fns re-set in_closure themselves.
+        let saved_ctx = std::mem::take(&mut self.class_ctx);
+        let saved_closure = std::mem::replace(&mut self.in_closure, false);
+        let saved_named = std::mem::replace(&mut self.in_named_fn, true);
         let params = self.params()?;
         // Return type declarations (: int).
         let ret = if self.eat_op(":") {
@@ -1758,9 +2012,15 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let prev_ret_by_ref = self.ret_by_ref;
+        self.ret_by_ref = by_ref;
         let body = self.body()?;
         let end_line = self.prev_line();
+        self.ret_by_ref = prev_ret_by_ref;
         self.hook_ctx = prev_hook;
+        self.class_ctx = saved_ctx;
+        self.in_closure = saved_closure;
+        self.in_named_fn = saved_named;
         let name = self.ns_qualify(&name);
         Ok(Stmt::Function(FunctionDecl {
             name,

@@ -269,28 +269,34 @@ impl<'a> Interp<'a> {
             };
             if by_ref {
                 match expr {
-                    Expr::Var(_) | Expr::Index { .. } | Expr::Prop { .. } | Expr::VarVar(_)
+                    Expr::Var(_)
+                    | Expr::Index { .. }
+                    | Expr::Prop { .. }
+                    | Expr::VarVar(_)
                     | Expr::StaticProp { .. }
                         // zend's SEND_REF check rejects the $GLOBALS
                         // table itself (its elements are fine).
                         if !matches!(expr, Expr::Var(n) if n == "GLOBALS") =>
                     {
-                        match self.eval_cell(expr) {
-                            Ok(c) => {
-                                if let Some(n) = name {
-                                    out.named.push((n, c, true, false));
-                                    seen_named = true;
-                                } else {
-                                    out.cells.push(c);
-                                    pos += 1;
-                                }
-                            }
-                            Err(_) => {
-                                return self.fail(PhpError::fatal(
-                                    "Only variables should be passed by reference",
-                                    0,
-                                ))
-                            }
+                        // zend evaluates a by-ref arg dim as BP_VAR_RW
+                        // — string offsets fail with the catchable
+                        // 'Cannot create references to/from string
+                        // offsets' (and the str-key TypeError), not the
+                        // generic scalar-as-array fatal.
+                        let was = std::mem::replace(&mut self.dim_by_ref, true);
+                        let rc = self.eval_cell(expr);
+                        self.dim_by_ref = was;
+                        // Cell-access errors (readonly/private prop,
+                        // string offsets, undeclared static) are real
+                        // catchable throwables — propagate them, not
+                        // the bogus by-ref compile fatal.
+                        let c = rc?;
+                        if let Some(n) = name {
+                            out.named.push((n, c, true, false));
+                            seen_named = true;
+                        } else {
+                            out.cells.push(c);
+                            pos += 1;
                         }
                     }
                     Expr::Assign {
@@ -308,7 +314,10 @@ impl<'a> Interp<'a> {
                             pos += 1;
                         }
                     }
-                    Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. } => {
+                    Expr::Call { .. }
+                    | Expr::MethodCall { .. }
+                    | Expr::StaticCall { .. }
+                    | Expr::StaticCallDyn { .. } => {
                         // `f(g())`: binds only when g() returns by reference,
                         // otherwise a notice and pass by value (passByReference_004/007).
                         let (c, was_ref) = self.eval_call_cell(expr)?;
@@ -519,6 +528,17 @@ impl<'a> Interp<'a> {
                 self.arg_cells(args, &params, &format!("{}::{}()", cls.name(), mn), false)?;
             return self.static_invoke_vis(cls, mn, vals, None, false);
         }
+        // zend_forbid_dynamic_call: compact() rejects any call that did
+        // not come from a compile-time literal (the `\u{1}` marker or a
+        // `\`-qualified name) — `$f()`, `($this->cb)()`, reflection and
+        // call_user_func all hit 'Cannot call compact() dynamically'.
+        if lname == "compact" && !unqualified && !fname.starts_with('\\') {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot call compact() dynamically",
+                self.cur_line,
+            ));
+        }
         let mut decl = self.functions.get(&lname).cloned();
         // A namespaced user function outranks the global/builtin one for
         // unqualified calls (namespaces/ns_013).
@@ -709,6 +729,15 @@ impl<'a> Interp<'a> {
                     }
                     CallableKind::Named(n) => {
                         let n = n.trim_start_matches('\\');
+                        // zend_forbid_dynamic_call — every callable
+                        // dispatch is a dynamic call.
+                        if n.eq_ignore_ascii_case("compact") {
+                            return self.fail(PhpError::uncaught(
+                                "Error",
+                                "Cannot call compact() dynamically",
+                                self.cur_line,
+                            ));
+                        }
                         if let Some(v) = self.call_builtin(&n.to_lowercase(), &args)? {
                             return Ok(v);
                         }
@@ -1946,128 +1975,11 @@ impl<'a> Interp<'a> {
         // Callee `Stmt::Line` markers must not leak into the caller:
         // diagnostics after the call report the call-site line.
         let saved_line = self.cur_line;
-        // A callback invoked from inside a builtin's own machinery
-        // (internal_cb: ob handlers, sort callbacks) has call site
-        // `[internal function]`; engine callbacks like the error handler
-        // invoked mid-eval instead report the builtin's own call site
-        // (bug32828 vs bug28213). At shutdown the trace is empty — the
-        // engine itself is the caller, which is also `[internal
-        // function]` (registered shutdown fns, the dtor sweep).
-        let from_builtin =
-            self.internal_cb > 0 && self.call_trace.last().map(|f| f.internal).unwrap_or(true);
-        let (site_file, site_line) = if from_builtin {
-            ("[internal function]".to_string(), 0)
-        } else {
-            // Call-site file = the frame below the callee (the caller's
-            // executing file); top-level calls report the file currently
-            // being run.
-            let sf = self
-                .stack
-                .iter()
-                .rev()
-                .nth(1)
-                .map(|f| f.file.clone())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| self.cur_file.clone());
-            (sf, saved_line as u32)
-        };
-        // Trace args are the send list normalized through the last
-        // bound slot (unbound params render null; named args appear in
-        // declaration order — `test3(NULL, 'B')` in named_params/defaults).
-        // Named args collected by a variadic stay keyed
-        // (`test(1, 2, x: 3, y: 4)` in named_params/backtrace).
-        let mut targs_named: Vec<(String, Cell)> = Vec::new();
-        let targs: Vec<Cell> = if args.named.is_empty() {
-            args.cells.clone()
-        } else {
-            let mut last: i64 = -1;
-            for (i, p) in decl.params.iter().enumerate() {
-                if p.variadic {
-                    break;
-                }
-                if args.cells.get(i).is_some() || args.named.iter().any(|(n, ..)| *n == p.name) {
-                    last = i as i64;
-                }
-            }
-            let mut t: Vec<Cell> = Vec::new();
-            for (i, p) in decl.params.iter().enumerate() {
-                if p.variadic || i as i64 > last {
-                    break;
-                }
-                let c = args
-                    .cells
-                    .get(i)
-                    .cloned()
-                    .or_else(|| {
-                        args.named
-                            .iter()
-                            .find(|(n, ..)| *n == p.name)
-                            .map(|(_, c, ..)| c.clone())
-                    })
-                    .unwrap_or_else(|| cell(Value::Null));
-                t.push(c);
-            }
-            if decl.params.iter().any(|p| p.variadic) {
-                // Variadic: every sent positional shows up; named args
-                // that matched no declared param stay keyed.
-                for (i, c) in args.cells.iter().enumerate() {
-                    if i >= t.len() {
-                        t.push(c.clone());
-                    }
-                }
-                for (n, c, ..) in &args.named {
-                    if !decl.params.iter().any(|p| !p.variadic && p.name == *n) {
-                        targs_named.push((n.clone(), c.clone()));
-                    }
-                }
-            }
-            t
-        };
-        let fr = self
-            .stack
-            .last()
-            .map(|f| TraceFrame {
-                // fn_name is already the Zend scope name —
-                // `{closure:Foo::m():L}`/`{closure:FILE:L}` included.
-                function: f.fn_name.clone(),
-                // A closure bound to $this without a real scope runs
-                // on the "dummy scope" — traces show `Closure->`
-                // (closure_038).
-                class: f
-                    .scope_class
-                    .as_ref()
-                    .map(|c| c.name().to_string())
-                    .or_else(|| {
-                        if f.fn_name.starts_with("{closure:") && f.this_obj.is_some() {
-                            Some("Closure".to_string())
-                        } else {
-                            None
-                        }
-                    }),
-                ty: if f.this_obj.is_some() {
-                    "->"
-                } else if f.scope_class.is_some() {
-                    "::"
-                } else {
-                    ""
-                }
-                .to_string(),
-                file: site_file.clone(),
-                line: site_line,
-                args: targs.clone(),
-                named_args: targs_named.clone(),
-                internal: false,
-            })
-            .unwrap_or_else(|| TraceFrame {
-                function: decl.name.clone(),
-                class: None,
-                ty: String::new(),
-                file: site_file,
-                line: site_line,
-                args: targs,
-                named_args: targs_named,
-                internal: false,
-            });
+        // prop_cell's `=&`-source stash pins the receiver object — a
+        // callee's leftover must not keep that object alive after the
+        // call returns (typed_properties_094).
+        let saved_prop_ov = self.last_prop_ov.take();
+        let fr = self.call_site_frame(decl, &args);
         self.call_trace.push(fr);
         self.last_call_by_ref = decl.by_ref;
         let r = self.bind_and_run_inner(decl, args, unused);
@@ -2081,7 +1993,7 @@ impl<'a> Interp<'a> {
         // __destruct now (bug52361). A dtor error on a clean return
         // replaces the result and aborts; during unwind it chains —
         // destruct_frame_objs guards that itself.
-        if let Some(f) = self.last_popped_frame.take() {
+        let out = if let Some(f) = self.last_popped_frame.take() {
             // A generator body's frame pops as a suspension, not a
             // return — Zend keeps its CVs live in execute_data until
             // the gen closes or is destroyed, then decrefs them after
@@ -2163,15 +2075,156 @@ impl<'a> Interp<'a> {
                     }
                 }
                 fin.suspended = pairs;
-                return r;
+                r
+            } else {
+                let dtor_err = self.destruct_frame_objs(&f).err();
+                match (r, dtor_err) {
+                    (Ok(_), Some(e)) => Err(e),
+                    (r, _) => r,
+                }
             }
-            let dtor_err = self.destruct_frame_objs(&f).err();
-            match (r, dtor_err) {
-                (Ok(_), Some(e)) => return Err(e),
-                (r, _) => return r,
+        } else {
+            r
+        };
+        self.last_prop_ov = saved_prop_ov;
+        out
+    }
+
+    /// The callee's call-trace frame for a call about to be dispatched —
+    /// call-site file/line resolved like zend (internal callback drivers
+    /// render `[internal function]`, hidden trampolines like
+    /// call_user_func lend their own site) plus trace-format args.
+    /// Arity/binding failures reuse this so a callee that never ran a
+    /// body still appears in the exception's trace (probe11).
+    fn call_site_frame(&mut self, decl: &FunctionDecl, args: &CallArgs) -> TraceFrame {
+        // A callback invoked from inside a builtin's own machinery
+        // (internal_cb: ob handlers, sort callbacks) has call site
+        // `[internal function]`; engine callbacks like the error handler
+        // invoked mid-eval instead report the builtin's own call site
+        // (bug32828 vs bug28213). At shutdown the trace is empty — the
+        // engine itself is the caller, which is also `[internal
+        // function]` (registered shutdown fns, the dtor sweep).
+        let from_builtin =
+            self.internal_cb > 0 && self.call_trace.last().map(|f| f.internal).unwrap_or(true);
+        let (site_file, site_line) = if from_builtin {
+            match self.call_trace.last() {
+                // A hidden internal frame (call_user_func family) lends
+                // its own call site to the callee — zend renders
+                // `file(line): cb()` with the call_user_func call line,
+                // not `[internal function]` (probe9d vs oracle).
+                Some(f) if crate::value::trace_frame_hidden(f) => (f.file.clone(), f.line),
+                _ => ("[internal function]".to_string(), 0),
             }
-        }
-        r
+        } else {
+            // Call-site file = the frame below the callee (the caller's
+            // executing file); top-level calls report the file currently
+            // being run.
+            let sf = self
+                .stack
+                .iter()
+                .rev()
+                .nth(1)
+                .map(|f| f.file.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| self.cur_file.clone());
+            (sf, self.cur_line as u32)
+        };
+        // Trace args are the send list normalized through the last
+        // bound slot (unbound params render null; named args appear in
+        // declaration order — `test3(NULL, 'B')` in named_params/defaults).
+        // Named args collected by a variadic stay keyed
+        // (`test(1, 2, x: 3, y: 4)` in named_params/backtrace).
+        let mut targs_named: Vec<(String, Cell)> = Vec::new();
+        let targs: Vec<Cell> = if args.named.is_empty() {
+            args.cells.clone()
+        } else {
+            let mut last: i64 = -1;
+            for (i, p) in decl.params.iter().enumerate() {
+                if p.variadic {
+                    break;
+                }
+                if args.cells.get(i).is_some() || args.named.iter().any(|(n, ..)| *n == p.name) {
+                    last = i as i64;
+                }
+            }
+            let mut t: Vec<Cell> = Vec::new();
+            for (i, p) in decl.params.iter().enumerate() {
+                if p.variadic || i as i64 > last {
+                    break;
+                }
+                let c = args
+                    .cells
+                    .get(i)
+                    .cloned()
+                    .or_else(|| {
+                        args.named
+                            .iter()
+                            .find(|(n, ..)| *n == p.name)
+                            .map(|(_, c, ..)| c.clone())
+                    })
+                    .unwrap_or_else(|| cell(Value::Null));
+                t.push(c);
+            }
+            if decl.params.iter().any(|p| p.variadic) {
+                // Variadic: every sent positional shows up; named args
+                // that matched no declared param stay keyed.
+                for (i, c) in args.cells.iter().enumerate() {
+                    if i >= t.len() {
+                        t.push(c.clone());
+                    }
+                }
+                for (n, c, ..) in &args.named {
+                    if !decl.params.iter().any(|p| !p.variadic && p.name == *n) {
+                        targs_named.push((n.clone(), c.clone()));
+                    }
+                }
+            }
+            t
+        };
+        self.stack
+            .last()
+            .map(|f| TraceFrame {
+                // fn_name is already the Zend scope name —
+                // `{closure:Foo::m():L}`/`{closure:FILE:L}` included.
+                function: f.fn_name.clone(),
+                // A closure bound to $this without a real scope runs
+                // on the "dummy scope" — traces show `Closure->`
+                // (closure_038).
+                class: f
+                    .scope_class
+                    .as_ref()
+                    .map(|c| c.name().to_string())
+                    .or_else(|| {
+                        if f.fn_name.starts_with("{closure:") && f.this_obj.is_some() {
+                            Some("Closure".to_string())
+                        } else {
+                            None
+                        }
+                    }),
+                ty: if f.this_obj.is_some() {
+                    "->"
+                } else if f.scope_class.is_some() {
+                    "::"
+                } else {
+                    ""
+                }
+                .to_string(),
+                file: site_file.clone(),
+                line: site_line,
+                args: targs.clone(),
+                named_args: targs_named.clone(),
+                internal: false,
+            })
+            .unwrap_or_else(|| TraceFrame {
+                function: decl.name.clone(),
+                class: None,
+                ty: String::new(),
+                file: site_file,
+                line: site_line,
+                args: targs,
+                named_args: targs_named,
+                internal: false,
+            })
     }
 
     /// PHP's compile-time checks on typed params (tests/lang/type_hints_*):
@@ -3013,6 +3066,11 @@ impl<'a> Interp<'a> {
                     .as_deref()
                     .and_then(|p| self.classes.get(&p.to_lowercase()).cloned())
                 {
+                    // Callable validation (`is_callable`, cuf arginfo)
+                    // reports this as a not-callable detail — zend's
+                    // 'Cannot use "parent" ...' compile fatal is gated
+                    // to the `parent::` dispatch syntax (traits/
+                    // bug76773-deprecated).
                     None => Err(SiteErr::Msg(
                         "cannot access \"parent\" when current class scope has no parent"
                             .to_string(),
@@ -3550,6 +3608,11 @@ impl<'a> Interp<'a> {
                     vec!["Traversable".to_string(), "array".to_string()]
                 } else if let Some(pos) = m.find("@anonymous$") {
                     vec![format!("{}@anonymous", &m[..pos])]
+                } else if let Some(pos) = m.find('\0') {
+                    // `{base}@anonymous\0FILE:LINE$N` — the internal
+                    // decl-site suffix never leaks into TypeErrors
+                    // (union_types/anonymous_class).
+                    vec![m[..pos].to_string()]
                 } else if m.contains('&') && ty.len() > 1 {
                     // Intersection members parenthesize inside a union
                     // ((X&Y)|(W&Z) — dnf_2_intersection).
@@ -3592,7 +3655,7 @@ impl<'a> Interp<'a> {
         // is the positional-only form.
         if args.named.is_empty() && args.len() < required {
             self.stack.pop();
-            return self.fail(PhpError::uncaught(
+            let mut e = PhpError::uncaught(
                 "ArgumentCountError",
                 format!(
                     "Too few arguments to function {}(), {} passed{} and {} {} expected",
@@ -3607,7 +3670,9 @@ impl<'a> Interp<'a> {
                     required
                 ),
                 0,
-            ));
+            );
+            e.thrown_line = Some(decl.line);
+            return self.fail(e);
         }
         // Named arguments resolve against decl.params by name
         // (Zend/tests/named_params): unknown names land in a trailing
@@ -3762,7 +3827,16 @@ impl<'a> Interp<'a> {
                 // internal `Closure::__invoke` ( `$f->__invoke()` or
                 // `[$f,'__invoke']`) drops it (closure_059).
                 let call_alias = self.stack.last().and_then(|f| f.call_alias.clone());
-                let msg = if call_alias.is_some() {
+                // A callback dispatched from inside a builtin
+                // (array_walk, usort, ob handlers) traces from
+                // `[internal function]` — zend's message then drops the
+                // `called in ... and defined` tail too (bug24658).
+                let internal_site = self
+                    .call_trace
+                    .last()
+                    .map(|f| f.file == "[internal function]")
+                    .unwrap_or(false);
+                let msg = if call_alias.is_some() || internal_site {
                     format!(
                         "{}(): Argument #{} (${}) must be of type {}, {} given",
                         fname,
@@ -3783,7 +3857,11 @@ impl<'a> Interp<'a> {
                         self.cur_line
                     )
                 };
-                let display = format!("{} and defined", msg);
+                let display = if internal_site {
+                    msg.clone()
+                } else {
+                    format!("{} and defined", msg)
+                };
                 let argdesc = args
                     .iter()
                     .map(|a| trace_arg(&a.borrow()))
@@ -3802,13 +3880,22 @@ impl<'a> Interp<'a> {
                     "::"
                 };
                 let tname = fname.replacen("::", arrow, 1);
-                let frame = format!(
-                    "{}({}): {}({})",
-                    self.diag_file(),
-                    self.cur_line,
-                    tname,
-                    argdesc
-                );
+                let frame = if internal_site {
+                    // The callee's own pushed frame carries the
+                    // `[internal function]` site and the callback args.
+                    self.call_trace
+                        .last()
+                        .map(crate::value::trace_frame_str)
+                        .unwrap_or_default()
+                } else {
+                    format!(
+                        "{}({}): {}({})",
+                        self.diag_file(),
+                        self.cur_line,
+                        tname,
+                        argdesc
+                    )
+                };
                 let call_line = self.cur_line;
                 // Frames below the call site (include/require and
                 // outer calls) join the synthetic #0 — the callee's
@@ -3941,7 +4028,7 @@ impl<'a> Interp<'a> {
                     // blank the enclosing fn name the way class-init
                     // const eval does ({closure:M::m():L}).
                     let pb = self.param_bind_ctx.replace(self.class_const_ctx);
-                    let r = self.eval_decl_const(d, &decl.file);
+                    let r = self.eval_decl_const(d, &decl.file, decl.line);
                     self.param_bind_ctx = pb;
                     self.const_self = old;
                     self.cur_line = prev_line;
@@ -4027,11 +4114,13 @@ impl<'a> Interp<'a> {
                     // args (the positional count check runs earlier).
                     let fname = self.decl_fname(decl);
                     self.stack.pop();
-                    return self.fail(PhpError::uncaught(
+                    let mut e = PhpError::uncaught(
                         "ArgumentCountError",
                         format!("{}(): Argument #{} (${}) not passed", fname, i + 1, p.name),
                         0,
-                    ));
+                    );
+                    e.thrown_line = Some(decl.line);
+                    return self.fail(e);
                 }
             }
             let frame = self.stack.last_mut().unwrap();
@@ -4323,13 +4412,31 @@ impl<'a> Interp<'a> {
             .filter(|p| p.default.is_none() && !p.variadic)
             .count();
         if args.named.is_empty() && args.len() < required {
-            return self.fail(PhpError::uncaught(
+            // Zend verifies arity inside the callee's call frame — the
+            // thrown ArgumentCountError still lists the callee
+            // ([internal function] for builtin-driven callbacks) and
+            // attributes the throw to the declaration line
+            // (probe11/probe11c). A minimal exec frame gives
+            // call_site_frame the callee identity (C->m vs plain f()).
+            let mut frame = Frame::new(decl.name.clone());
+            frame.this_obj = this_obj.clone();
+            frame.scope_class = scope_class.clone();
+            frame.decl_class = self
+                .pending_decl_class
+                .clone()
+                .or_else(|| scope_class.clone());
+            self.stack.push(frame);
+            let fr = self.call_site_frame(decl, &args);
+            self.call_trace.push(fr);
+            let fname = self.decl_fname(decl);
+            self.stack.pop();
+            let mut e = PhpError::uncaught(
                 "ArgumentCountError",
                 format!(
                     "Too few arguments to function {}(), {} passed{} and {} {} expected",
-                    self.decl_fname(decl),
+                    fname,
                     args.len(),
-                    self.arg_err_in(0),
+                    self.arg_err_in(1),
                     if required == decl.params.len() {
                         "exactly"
                     } else {
@@ -4338,7 +4445,11 @@ impl<'a> Interp<'a> {
                     required
                 ),
                 0,
-            ));
+            );
+            e.thrown_line = Some(decl.line);
+            let r = self.fail(e);
+            self.call_trace.pop();
+            return r;
         }
         // A `yield`-bearing body makes the call a Generator factory:
         // the caller gets a Generator object immediately and the body
@@ -4416,8 +4527,8 @@ fn builtin_byref(name: &str) -> Option<&'static [bool]> {
     Some(match name {
         "array_pop" | "array_shift" | "array_walk" | "sort" | "rsort" | "asort" | "arsort"
         | "ksort" | "krsort" | "usort" | "uasort" | "uksort" | "natsort" | "natcasesort"
-        | "shuffle" | "reset" | "end" | "next" | "prev" | "current" | "pos" | "each"
-        | "array_push" | "array_unshift" | "array_splice" => &[true],
+        | "shuffle" | "reset" | "end" | "next" | "prev" | "array_push" | "array_unshift"
+        | "array_splice" => &[true],
         "preg_match" | "preg_match_all" => &[false, false, true],
         "preg_replace"
         | "preg_replace_callback"
