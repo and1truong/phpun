@@ -4426,6 +4426,7 @@ fn builtin_byref(name: &str) -> Option<&'static [bool]> {
         | "str_ireplace" => &[false, false, false, false, true],
         "preg_replace_callback_array" => &[false, false, false, true],
         "parse_str" => &[false, true],
+        "getopt" => &[false, false, true],
         "is_callable" => &[false, false, true],
         "sscanf" | "fscanf" => &[false, false],
         "exec" => &[false, true, true],

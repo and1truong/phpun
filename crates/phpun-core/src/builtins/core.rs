@@ -435,9 +435,11 @@ pub(crate) fn dispatch(
                 e.push(v);
             };
             let mut i = 0usize;
+            let mut dd = false;
             while i < argv.len() {
                 let a = &argv[i];
                 if a == "--" {
+                    dd = true;
                     break;
                 } else if let Some(body) = a.strip_prefix("--").filter(|b| !b.is_empty()) {
                     let (name, inline) = match body.find('=') {
@@ -464,9 +466,9 @@ pub(crate) fn dispatch(
                                     &mut vals,
                                     &mut order,
                                 );
-                            } else {
-                                put(name.to_string(), Value::Bool(false), &mut vals, &mut order);
                             }
+                            // A required-value option left valueless is
+                            // simply absent from zend's result.
                         }
                     }
                 } else if a.starts_with('-') && a.len() > 1 {
@@ -484,14 +486,18 @@ pub(crate) fn dispatch(
                                     let v: String = cs[j + 1..].iter().collect();
                                     let v = v.strip_prefix('=').unwrap_or(&v).to_string();
                                     put(cs[j].to_string(), Value::str(v), &mut vals, &mut order);
-                                } else if k == 1 && i + 1 < argv.len() {
-                                    i += 1;
-                                    put(
-                                        cs[j].to_string(),
-                                        Value::str(argv[i].clone()),
-                                        &mut vals,
-                                        &mut order,
-                                    );
+                                } else if k == 1 {
+                                    if i + 1 < argv.len() {
+                                        i += 1;
+                                        put(
+                                            cs[j].to_string(),
+                                            Value::str(argv[i].clone()),
+                                            &mut vals,
+                                            &mut order,
+                                        );
+                                    }
+                                    // Required value never arrived —
+                                    // zend omits the key entirely.
                                 } else {
                                     put(
                                         cs[j].to_string(),
@@ -510,7 +516,9 @@ pub(crate) fn dispatch(
                 i += 1;
             }
             if let Some(c) = args.get(2) {
-                *c.borrow_mut() = Value::Int(i as i64);
+                // zend's optind counts argv[0] (the script name) and
+                // skips a terminating `--` — our script_args has neither.
+                *c.borrow_mut() = Value::Int(i as i64 + 1 + dd as i64);
             }
             let mut out = PhpArray::new();
             for name in order {
@@ -525,7 +533,9 @@ pub(crate) fn dispatch(
                         Value::Array(Rc::new(RefCell::new(inner)))
                     }
                 };
-                out.set(ArrKey::Str(name.into()), v);
+                // Numeric option names normalize to int keys — zend's
+                // getopt result uses the array key rules (-1111 → [1]).
+                out.set(to_key(&Value::str(name)), v);
             }
             Value::Array(Rc::new(RefCell::new(out)))
         }
