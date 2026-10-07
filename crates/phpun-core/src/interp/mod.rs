@@ -1607,6 +1607,7 @@ impl<'a> Interp<'a> {
         }
         if let Err(e) = Self::const_closure_gate(stmts)
             .and_then(|_| self.flow_gate(stmts))
+            .and_then(|_| Self::yield_gate(stmts))
             .and_then(|_| self.hoist_funcs(stmts))
         {
             let flow = self.err_flow(e);
@@ -2176,6 +2177,7 @@ impl<'a> Interp<'a> {
                 self.begin_unit();
                 if let Err(e) = Self::const_closure_gate(&stmts)
                     .and_then(|_| self.flow_gate(&stmts))
+                    .and_then(|_| Self::yield_gate(&stmts))
                     .and_then(|_| self.hoist_funcs(&stmts))
                 {
                     let flow = self.err_flow(e);

@@ -10,81 +10,155 @@ impl<'a> Interp<'a> {
     /// Whether a function body yields — scanning skips nested closures
     /// and function decls (each is its own generator context).
     pub(in crate::interp) fn decl_contains_yield(stmts: &[Stmt]) -> bool {
-        stmts.iter().any(Self::stmt_contains_yield)
+        stmts.iter().any(|s| Self::stmt_yield_kind(s).is_some())
     }
 
-    fn stmt_contains_yield(s: &Stmt) -> bool {
+    /// The yield token kind (`"yield"` or `"yield from"`) a statement's
+    /// own expressions carry outside any nested generator context.
+    fn stmt_yield_kind(s: &Stmt) -> Option<&'static str> {
         match s {
-            Stmt::Expr(e) => Self::expr_contains_yield(e),
-            Stmt::Echo(es) => es.iter().any(Self::expr_contains_yield),
-            Stmt::Return(Some(e)) => Self::expr_contains_yield(e),
-            Stmt::Block(b) => Self::decl_contains_yield(b),
-            Stmt::If { cond, then, else_ } => {
-                Self::expr_contains_yield(cond)
-                    || Self::decl_contains_yield(then)
-                    || Self::decl_contains_yield(else_)
-            }
+            Stmt::Expr(e) => Self::expr_yield_kind(e),
+            Stmt::Echo(es) => es.iter().find_map(Self::expr_yield_kind),
+            Stmt::Return(Some(e)) => Self::expr_yield_kind(e),
+            Stmt::Block(b) => Self::block_yield_kind(b),
+            Stmt::If { cond, then, else_ } => Self::expr_yield_kind(cond)
+                .or_else(|| Self::block_yield_kind(then))
+                .or_else(|| Self::block_yield_kind(else_)),
             Stmt::While { cond, body } | Stmt::DoWhile { body, cond } => {
-                Self::expr_contains_yield(cond) || Self::decl_contains_yield(body)
+                Self::expr_yield_kind(cond).or_else(|| Self::block_yield_kind(body))
             }
             Stmt::For {
                 init,
                 cond,
                 inc,
                 body,
-            } => {
-                init.iter()
-                    .chain(cond.iter())
-                    .chain(inc.iter())
-                    .any(Self::expr_contains_yield)
-                    || Self::decl_contains_yield(body)
-            }
-            Stmt::Foreach { arr, val, body, .. } => {
-                Self::expr_contains_yield(arr)
-                    || matches!(val, ForeachTarget::Lvalue(e) if Self::expr_contains_yield(e))
-                    || Self::decl_contains_yield(body)
-            }
-            Stmt::Switch { cond, cases } => {
-                Self::expr_contains_yield(cond)
-                    || cases.iter().any(|(c, b)| {
-                        c.as_ref().is_some_and(Self::expr_contains_yield)
-                            || Self::decl_contains_yield(b)
-                    })
-            }
+            } => init
+                .iter()
+                .chain(cond.iter())
+                .chain(inc.iter())
+                .find_map(Self::expr_yield_kind)
+                .or_else(|| Self::block_yield_kind(body)),
+            Stmt::Foreach { arr, val, body, .. } => Self::expr_yield_kind(arr)
+                .or_else(|| match val {
+                    ForeachTarget::Lvalue(e) => Self::expr_yield_kind(e),
+                    _ => None,
+                })
+                .or_else(|| Self::block_yield_kind(body)),
+            Stmt::Switch { cond, cases } => Self::expr_yield_kind(cond).or_else(|| {
+                cases.iter().find_map(|(c, b)| {
+                    c.as_ref()
+                        .and_then(Self::expr_yield_kind)
+                        .or_else(|| Self::block_yield_kind(b))
+                })
+            }),
             Stmt::Try {
                 body,
                 catches,
                 finally,
-            } => {
-                Self::decl_contains_yield(body)
-                    || catches.iter().any(|c| Self::decl_contains_yield(&c.body))
-                    || finally
-                        .as_ref()
-                        .is_some_and(|b| Self::decl_contains_yield(b))
-            }
+            } => Self::block_yield_kind(body)
+                .or_else(|| catches.iter().find_map(|c| Self::block_yield_kind(&c.body)))
+                .or_else(|| finally.as_ref().and_then(|b| Self::block_yield_kind(b))),
             Stmt::Static { vars, .. } => vars
                 .iter()
-                .any(|(_, e, _)| e.as_ref().is_some_and(Self::expr_contains_yield)),
-            Stmt::Unset(v) | Stmt::Global(v) => v.iter().any(Self::expr_contains_yield),
-            Stmt::ConstDecl(v) => v.iter().any(|(_, e)| Self::expr_contains_yield(e)),
-            Stmt::Declare { value, .. } => Self::expr_contains_yield(value),
+                .find_map(|(_, e, _)| e.as_ref().and_then(Self::expr_yield_kind)),
+            Stmt::Unset(v) | Stmt::Global(v) => v.iter().find_map(Self::expr_yield_kind),
+            Stmt::ConstDecl(v) => v.iter().find_map(|(_, e)| Self::expr_yield_kind(e)),
+            Stmt::Declare { value, .. } => Self::expr_yield_kind(value),
             // A nested `function` decl is its own generator context
             // (its yields don't make the outer fn a generator).
-            Stmt::Function(_) | Stmt::Class(_) => false,
-            _ => false,
+            Stmt::Function(_) | Stmt::Class(_) => None,
+            _ => None,
         }
     }
 
-    fn expr_contains_yield(e: &Expr) -> bool {
+    fn block_yield_kind(stmts: &[Stmt]) -> Option<&'static str> {
+        stmts.iter().find_map(Self::stmt_yield_kind)
+    }
+
+    /// Compile gate: a separately compiled unit's top-level
+    /// `yield`/`yield from` is a fatal in Zend — include()/eval() units
+    /// compile with their own function context, so a top-level yield in
+    /// included code is invalid even when the includer is itself a
+    /// generator body (it must not feed the outer gen's stream).
+    pub(in crate::interp) fn yield_gate(stmts: &[Stmt]) -> Result<(), PhpError> {
+        let mut line = 0;
+        if let Some((l, kind)) = Self::yield_gate_scan(stmts, &mut line) {
+            return Err(PhpError::compile_fatal(
+                format!(
+                    "The \"{}\" expression can only be used inside a function",
+                    kind
+                ),
+                l,
+            ));
+        }
+        Ok(())
+    }
+
+    /// First offending top-level yield's (line, kind). Stmt::Line
+    /// markers track the scan position so a yield nested in a block
+    /// reports its own line rather than the enclosing statement's.
+    fn yield_gate_scan(stmts: &[Stmt], line: &mut usize) -> Option<(usize, &'static str)> {
+        for s in stmts {
+            match s {
+                Stmt::Line(n) => *line = *n,
+                // Declared functions/methods/closures are their own
+                // generator contexts — their yields stay legal.
+                Stmt::Function(_) | Stmt::Class(_) => continue,
+                _ => {
+                    let stmt_line = *line;
+                    // Descend statement-level blocks first so an inner
+                    // yield reports its own Line marker.
+                    let bodies: Vec<&[Stmt]> = match s {
+                        Stmt::Block(b) => vec![b.as_slice()],
+                        Stmt::If { then, else_, .. } => {
+                            vec![then.as_slice(), else_.as_slice()]
+                        }
+                        Stmt::While { body, .. }
+                        | Stmt::DoWhile { body, .. }
+                        | Stmt::For { body, .. }
+                        | Stmt::Foreach { body, .. } => vec![body.as_slice()],
+                        Stmt::Switch { cases, .. } => {
+                            cases.iter().map(|(_, b)| b.as_slice()).collect()
+                        }
+                        Stmt::Try {
+                            body,
+                            catches,
+                            finally,
+                        } => {
+                            let mut v: Vec<&[Stmt]> = vec![body.as_slice()];
+                            v.extend(catches.iter().map(|c| c.body.as_slice()));
+                            v.extend(finally.as_ref().map(|f| f.as_slice()));
+                            v
+                        }
+                        _ => Vec::new(),
+                    };
+                    for b in bodies {
+                        if let Some(hit) = Self::yield_gate_scan(b, line) {
+                            return Some(hit);
+                        }
+                    }
+                    if let Some(kind) = Self::stmt_yield_kind(s) {
+                        return Some((stmt_line, kind));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The yield token kind an expression carries outside any nested
+    /// generator context — `Some("yield")`/`Some("yield from")`.
+    fn expr_yield_kind(e: &Expr) -> Option<&'static str> {
         match e {
-            Expr::Yield { .. } | Expr::YieldFrom(_) => true,
+            Expr::Yield { .. } => Some("yield"),
+            Expr::YieldFrom(_) => Some("yield from"),
             // Nested closures/arrow fns are their own generator context.
-            Expr::Closure(_) | Expr::AnonClass(_) => false,
+            Expr::Closure(_) | Expr::AnonClass(_) => None,
             Expr::Assign { target, value, .. } => {
-                Self::expr_contains_yield(target) || Self::expr_contains_yield(value)
+                Self::expr_yield_kind(target).or_else(|| Self::expr_yield_kind(value))
             }
             Expr::Binary { l, r, .. } => {
-                Self::expr_contains_yield(l) || Self::expr_contains_yield(r)
+                Self::expr_yield_kind(l).or_else(|| Self::expr_yield_kind(r))
             }
             Expr::Unary { e, .. }
             | Expr::Clone(e)
@@ -101,63 +175,63 @@ impl<'a> Interp<'a> {
             | Expr::Unpack(e)
             | Expr::Cast { e, .. }
             | Expr::Throw(e)
-            | Expr::Include { e, .. } => Self::expr_contains_yield(e),
-            Expr::Ternary { c, t, f } => {
-                Self::expr_contains_yield(c)
-                    || t.as_ref().is_some_and(|t| Self::expr_contains_yield(t))
-                    || Self::expr_contains_yield(f)
-            }
+            | Expr::Include { e, .. } => Self::expr_yield_kind(e),
+            Expr::Ternary { c, t, f } => Self::expr_yield_kind(c)
+                .or_else(|| t.as_ref().and_then(|t| Self::expr_yield_kind(t)))
+                .or_else(|| Self::expr_yield_kind(f)),
             Expr::Call { name, args } => {
-                Self::expr_contains_yield(name) || args.iter().any(Self::expr_contains_yield)
+                Self::expr_yield_kind(name).or_else(|| args.iter().find_map(Self::expr_yield_kind))
             }
             Expr::MethodCall {
                 obj, name, args, ..
-            } => {
-                Self::expr_contains_yield(obj)
-                    || matches!(name, PropName::Expr(e) if Self::expr_contains_yield(e))
-                    || args.iter().any(Self::expr_contains_yield)
-            }
+            } => Self::expr_yield_kind(obj)
+                .or_else(|| match name {
+                    PropName::Expr(e) => Self::expr_yield_kind(e),
+                    _ => None,
+                })
+                .or_else(|| args.iter().find_map(Self::expr_yield_kind)),
             Expr::StaticCall { class, args, .. } => {
-                Self::expr_contains_yield(class) || args.iter().any(Self::expr_contains_yield)
+                Self::expr_yield_kind(class).or_else(|| args.iter().find_map(Self::expr_yield_kind))
             }
-            Expr::StaticCallDyn { class, name, args } => {
-                Self::expr_contains_yield(class)
-                    || Self::expr_contains_yield(name)
-                    || args.iter().any(Self::expr_contains_yield)
-            }
-            Expr::Index { e, i } => {
-                Self::expr_contains_yield(e)
-                    || i.as_ref().is_some_and(|i| Self::expr_contains_yield(i))
-            }
-            Expr::Prop { obj, name, .. } => {
-                Self::expr_contains_yield(obj)
-                    || matches!(name, PropName::Expr(e) if Self::expr_contains_yield(e))
-            }
-            Expr::StaticProp { class, name } => {
-                Self::expr_contains_yield(class)
-                    || matches!(name, PropName::Expr(e) if Self::expr_contains_yield(e))
-            }
-            Expr::Isset(v) => v.iter().any(Self::expr_contains_yield),
-            Expr::List(v) => v.iter().flatten().any(Self::expr_contains_yield),
-            Expr::Exit(Some(e)) => Self::expr_contains_yield(e),
-            Expr::ArrayLit(items) => items.iter().any(|(k, v)| {
-                k.as_ref().is_some_and(Self::expr_contains_yield) || Self::expr_contains_yield(v)
+            Expr::StaticCallDyn { class, name, args } => Self::expr_yield_kind(class)
+                .or_else(|| Self::expr_yield_kind(name))
+                .or_else(|| args.iter().find_map(Self::expr_yield_kind)),
+            Expr::Index { e, i } => Self::expr_yield_kind(e)
+                .or_else(|| i.as_ref().and_then(|i| Self::expr_yield_kind(i))),
+            Expr::Prop { obj, name, .. } => Self::expr_yield_kind(obj).or_else(|| match name {
+                PropName::Expr(e) => Self::expr_yield_kind(e),
+                _ => None,
             }),
-            Expr::Match { subject, arms } => {
-                Self::expr_contains_yield(subject)
-                    || arms.iter().any(|a| {
-                        a.conds.iter().any(Self::expr_contains_yield)
-                            || Self::expr_contains_yield(&a.result)
-                    })
+            Expr::StaticProp { class, name } => {
+                Self::expr_yield_kind(class).or_else(|| match name {
+                    PropName::Expr(e) => Self::expr_yield_kind(e.as_ref()),
+                    _ => None,
+                })
             }
+            Expr::Isset(v) => v.iter().find_map(Self::expr_yield_kind),
+            Expr::List(v) => v.iter().flatten().find_map(Self::expr_yield_kind),
+            Expr::Exit(Some(e)) => Self::expr_yield_kind(e),
+            Expr::ArrayLit(items) => items.iter().find_map(|(k, v)| {
+                k.as_ref()
+                    .and_then(|k| Self::expr_yield_kind(k))
+                    .or_else(|| Self::expr_yield_kind(v))
+            }),
+            Expr::Match { subject, arms } => Self::expr_yield_kind(subject).or_else(|| {
+                arms.iter().find_map(|a| {
+                    a.conds
+                        .iter()
+                        .find_map(Self::expr_yield_kind)
+                        .or_else(|| Self::expr_yield_kind(&a.result))
+                })
+            }),
             Expr::New { class, args } => {
-                Self::expr_contains_yield(class) || args.iter().any(Self::expr_contains_yield)
+                Self::expr_yield_kind(class).or_else(|| args.iter().find_map(Self::expr_yield_kind))
             }
-            Expr::ClassConst { class, .. } => Self::expr_contains_yield(class),
+            Expr::ClassConst { class, .. } => Self::expr_yield_kind(class),
             Expr::Instanceof { obj, class } => {
-                Self::expr_contains_yield(obj) || Self::expr_contains_yield(class)
+                Self::expr_yield_kind(obj).or_else(|| Self::expr_yield_kind(class))
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -198,6 +272,8 @@ impl<'a> Interp<'a> {
             deferred_err: None,
             dead: false,
             closed: false,
+            running: false,
+            live: None,
         }));
         // GC-time finally replay: the weak dies with the object —
         // unset()/overwrite then replays fin_q; unit end replays it
@@ -230,6 +306,7 @@ impl<'a> Interp<'a> {
                 return Ok(());
             }
             st.started = true;
+            st.running = true;
             let setup = match &st.setup {
                 GenSetup::Invoke {
                     decl,
@@ -268,6 +345,10 @@ impl<'a> Interp<'a> {
         };
         let items = Rc::new(RefCell::new(Vec::new()));
         let saved_sink = self.gen_sink.replace(items.clone());
+        // Expose the in-flight collection so consumer read ops
+        // reaching the object mid-run (valid/current/key) see the
+        // yields produced so far.
+        state.borrow_mut().live = Some(items.clone());
         let saved_sends = std::mem::replace(&mut self.gen_sends, sends.into_iter().collect());
         let saved_throws = std::mem::replace(&mut self.gen_throws, throws.into_iter().collect());
         let saved_auto = std::mem::replace(&mut self.gen_auto, 0);
@@ -326,6 +407,8 @@ impl<'a> Interp<'a> {
             st.fin_q.borrow_mut().total = collected.len();
             st.items = collected;
             st.finished = true;
+            st.running = false;
+            st.live = None;
         }
         match r {
             Ok(rv) => {
@@ -913,11 +996,22 @@ impl<'a> Interp<'a> {
                     self.gen_raise_deferred(&state, "rewind", &args.cells)?;
                     return Ok(Some(Value::Null));
                 }
-                let (pos, len, dead, closed) = {
+                let (pos, len, dead, closed, running) = {
                     let st = state.borrow();
-                    (st.pos, st.items.len(), st.dead, st.closed)
+                    (st.pos, st.items.len(), st.dead, st.closed, st.running)
                 };
                 let engine = self.iter_calls > 0 || self.gen_internal_resume > 0;
+                if running {
+                    // Zend cleared DO_INIT the moment the body ran —
+                    // rewind of a still-running gen reports 'already
+                    // run' whether it arrives as ->rewind() or as a
+                    // foreach re-init inside the body itself.
+                    return Err(self.gen_method_throw(
+                        "rewind",
+                        &args.cells,
+                        "Cannot rewind a generator that was already run",
+                    ));
+                }
                 if closed {
                     // Engine-driven consume reports the closed state;
                     // an explicit ->rewind() reports 'already run'.
@@ -984,28 +1078,52 @@ impl<'a> Interp<'a> {
                 self.gen_start(&state)?;
                 self.gen_raise_deferred(&state, "valid", &args.cells)?;
                 let st = state.borrow();
-                Ok(Some(Value::Bool(st.pos < st.items.len())))
+                // Mid-run probes see the live collection, not the
+                // (still empty) committed buffer.
+                let len = st
+                    .live
+                    .as_ref()
+                    .map(|l| l.borrow().len())
+                    .unwrap_or(st.items.len());
+                Ok(Some(Value::Bool(st.pos < len)))
             }
             "current" => {
                 self.gen_start(&state)?;
                 self.gen_raise_deferred(&state, "current", &args.cells)?;
                 let st = state.borrow();
-                Ok(Some(
-                    st.items
-                        .get(st.pos)
-                        .map(|(_, v)| v.borrow().clone())
-                        .unwrap_or(Value::Null),
-                ))
+                let v = st
+                    .live
+                    .as_ref()
+                    .and_then(|l| l.borrow().get(st.pos).map(|(_, v)| v.borrow().clone()))
+                    .or_else(|| {
+                        st.items
+                            .get(st.pos)
+                            .map(|(_, v)| v.borrow().clone())
+                    })
+                    .unwrap_or(Value::Null);
+                Ok(Some(v))
             }
             "key" => {
                 self.gen_start(&state)?;
                 self.gen_raise_deferred(&state, "key", &args.cells)?;
                 let st = state.borrow();
-                Ok(Some(
-                    st.items.get(st.pos).map(|(k, _)| k.clone()).unwrap_or(Value::Null),
-                ))
+                let k = st
+                    .live
+                    .as_ref()
+                    .and_then(|l| l.borrow().get(st.pos).map(|(k, _)| k.clone()))
+                    .or_else(|| st.items.get(st.pos).map(|(k, _)| k.clone()))
+                    .unwrap_or(Value::Null);
+                Ok(Some(k))
             }
             "next" => {
+                if state.borrow().running {
+                    return Err(self.gen_method_throw_kind(
+                        "Error",
+                        "next",
+                        &args.cells,
+                        "Cannot resume an already running generator",
+                    ));
+                }
                 self.gen_start(&state)?;
                 let pos = {
                     let mut st = state.borrow_mut();
@@ -1019,6 +1137,14 @@ impl<'a> Interp<'a> {
             }
             "send" => {
                 let v = args.cells.first().map(|c| c.borrow().clone()).unwrap_or(Value::Null);
+                if state.borrow().running {
+                    return Err(self.gen_method_throw_kind(
+                        "Error",
+                        "send",
+                        &args.cells,
+                        "Cannot resume an already running generator",
+                    ));
+                }
                 if state.borrow().closed {
                     // send() on a killed gen is a silent no-op.
                     return Ok(Some(Value::Null));
@@ -1101,14 +1227,29 @@ impl<'a> Interp<'a> {
                         ),
                     ));
                 }
+                if state.borrow().running {
+                    return Err(self.gen_method_throw_kind(
+                        "Error",
+                        "throw",
+                        &args.cells,
+                        "Cannot resume an already running generator",
+                    ));
+                }
                 // throw() into an unstarted gen resumes it to the
                 // first yield first — its body (and queued finally
                 // output) exists before the kill.
                 self.gen_start(&state)?;
-                if state.borrow().closed {
-                    // No suspended frame to receive the throwable —
-                    // Zend bounces it out of this call verbatim.
-                    return Err(self.throw(e));
+                {
+                    let st = state.borrow();
+                    // No suspended frame to receive the throwable — a
+                    // force-closed or cursor-exhausted gen (pos past
+                    // the last item = Zend's finished execute_data)
+                    // bounces it out of this call verbatim, leaving the
+                    // completed body and its return value intact.
+                    if st.closed || st.pos >= st.items.len() {
+                        drop(st);
+                        return Err(self.throw(e));
+                    }
                 }
                 // Re-run the body with the throwable queued at the
                 // suspended yield: that yield expression raises it,
@@ -1201,7 +1342,7 @@ impl<'a> Interp<'a> {
                 self.gen_flush_out(&state, pos);
                 self.gen_raise_deferred(&state, "getReturn", &args.cells)?;
                 let st = state.borrow();
-                if st.pos < st.items.len() || st.closed || st.dead {
+                if st.pos < st.items.len() || st.closed || st.dead || st.running {
                     let msg = "Cannot get return value of a generator that hasn't returned";
                     drop(st);
                     return Err(self.gen_method_throw("getReturn", &args.cells, msg));

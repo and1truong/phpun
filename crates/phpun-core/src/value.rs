@@ -1892,6 +1892,15 @@ pub struct GenState {
     /// consumer reads behave like an exhausted generator (`valid()`
     /// false, `current()`/`key()` null), like Zend's closed gen.
     pub closed: bool,
+    /// The body's eager run is in flight right now — resuming ops
+    /// (`next`/`send`/`throw`) on the object are guarded ('Cannot
+    /// resume an already running generator') so a body that reaches
+    /// its own handle cannot re-enter the cursor machinery mid-frame.
+    pub running: bool,
+    /// The sink filling up while `running` — consumer read ops
+    /// (`valid`/`current`/`key`) consult it so a mid-run probe sees
+    /// the yields already produced, like Zend's live execute_data.
+    pub live: Option<Rc<RefCell<Vec<GenItem>>>>,
 }
 
 impl GenState {
