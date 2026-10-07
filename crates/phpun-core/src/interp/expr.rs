@@ -2423,6 +2423,10 @@ impl<'a> Interp<'a> {
                     self.dim_key_conv.clear();
                     self.dim_cv_bound.clear();
                 }
+                // `=&` can join the bound array into a cycle — register
+                // it as a GC node (gc_021's `$a[0] =& $a`), the way the
+                // pre-dim-chain bind_cell did.
+                self.reg_arr_ref(&src);
                 let mut slot = self.eval_cell(base)?;
                 // Expression keys evaluate eagerly (zend evals dim
                 // exprs at op entry); CV keys bind inside their own
@@ -2577,6 +2581,26 @@ impl<'a> Interp<'a> {
                                 "Cannot use object of type Closure as array".to_string(),
                             ),
                             Value::Object(o) => {
+                                // spl ArrayObject storage binds `src`
+                                // into the named bucket; everything
+                                // else — userland ArrayAccess dims and
+                                // the unaddressable append form — gets
+                                // the offsetGet read + the
+                                // indirect-modification notice, then
+                                // the assign-by-ref catchable Error
+                                // (array_access_012).
+                                let spl_arr = if matches!(
+                                    o.borrow().internal,
+                                    Some(ObjectInternal::ArrayIter { .. })
+                                ) {
+                                    Some(self.ao_arr(o))
+                                } else {
+                                    None
+                                };
+                                if let (Some(arr), Some(k)) = (spl_arr, &key) {
+                                    let old = arr.borrow_mut().bind_cell(to_key(k), src);
+                                    return self.destruct_displaced(old);
+                                }
                                 if self.obj_is_a(o, "ArrayAccess") {
                                     let _ = self.method_invoke(
                                         o.clone(),
@@ -2590,7 +2614,11 @@ impl<'a> Interp<'a> {
                                         "Indirect modification of overloaded element of {} has no effect",
                                         cn
                                     ))?;
-                                    return Ok(());
+                                    return self.fail(PhpError::uncaught(
+                                        "Error",
+                                        "Cannot assign by reference to an array dimension of an object",
+                                        self.cur_line,
+                                    ));
                                 }
                                 (
                                     "Error",
