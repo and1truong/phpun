@@ -1017,6 +1017,11 @@ struct GcScan {
     /// Containers reached through at least one real zval edge — an
     /// `internal`-marked container with a real edge counts normally.
     plain: HashSet<usize>,
+    /// Cell ptr → engine-bookkeeping clone count. `typed_slots` pins a
+    /// clone of every typed prop's cell for write-gating — like
+    /// `dying`, those aren't zval holders, so they can't root the cell's
+    /// payload (gc_048's typed `$cycleRef` prop cell).
+    pins: HashMap<usize, usize>,
 }
 
 impl<'a> Interp<'a> {
@@ -4378,9 +4383,14 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        let mut pins: HashMap<usize, usize> = HashMap::new();
+        for (c, ..) in self.typed_slots.values() {
+            *pins.entry(Rc::as_ptr(c) as usize).or_insert(0) += 1;
+        }
         let mut scan = GcScan {
             universe: seen,
             dying: self.gc_dying.clone(),
+            pins,
             ..GcScan::default()
         };
         // Scan the universe once. `cell_edges[t]` is the set of cells
@@ -4614,7 +4624,8 @@ impl<'a> Interp<'a> {
                         // the dying container's member refcounts
                         // before the collector ran (gc_023).
                         let dying = scan.dying.get(*cp).copied().unwrap_or(0);
-                        Rc::strong_count(&scan.cells[*cp]) > scan.cell_slots[cp] + 1 + dying
+                        let pins = scan.pins.get(*cp).copied().unwrap_or(0);
+                        Rc::strong_count(&scan.cells[*cp]) > scan.cell_slots[cp] + 1 + dying + pins
                     })
                     .count();
                 (set.len(), ext)
