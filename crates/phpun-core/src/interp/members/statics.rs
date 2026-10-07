@@ -876,14 +876,22 @@ impl<'a> Interp<'a> {
                     ));
                 }
                 "self" | "static" | "parent" => {
-                    return self.fail(PhpError::uncaught(
-                        "Error",
+                    // A deferred const-slot eval (`const X = self::class`,
+                    // closure/param defaults) throws 'Cannot use "X" when
+                    // no class scope is active'; a plain runtime read
+                    // reports 'in the global scope' instead (oracle).
+                    let msg = if self.in_const_expr > 0 {
+                        format!(
+                            "Cannot use \"{}\" when no class scope is active",
+                            cname.to_lowercase()
+                        )
+                    } else {
                         format!(
                             "Cannot use \"{}\" in the global scope",
                             cname.to_lowercase()
-                        ),
-                        0,
-                    ));
+                        )
+                    };
+                    return self.fail(PhpError::uncaught("Error", msg, 0));
                 }
                 _ => {}
             }

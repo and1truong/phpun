@@ -1784,11 +1784,28 @@ impl<'a> Parser<'a> {
                         ));
                     }
                     if self.const_ctx == ConstCtx::Slot {
-                        // Compile-time constants: `static::` is the
-                        // const-expr compile fatal; `self::`/`parent::`
-                        // defer scope checks to the slot's runtime eval
-                        // (catchable `Cannot access "X" ...` at call/init).
-                        if n.eq_ignore_ascii_case("static") {
+                        // Compile-time constants: a `::` CALL or static
+                        // prop in the slot is zend's invalid-operations
+                        // fatal regardless of the class side
+                        // (`self::m()`, `C::m()`, `static::$p` all die
+                        // the same way vs oracle). `self::`/`parent::`
+                        // constants defer scope checks to the slot's
+                        // runtime eval (catchable at call/init).
+                        if matches!(self.peek(), Some(Token::Variable(_)) | Some(Token::Op("$")))
+                            || (matches!(self.peek(), Some(Token::Ident(_)))
+                                && matches!(self.peek2(), Some(Token::Op("("))))
+                        {
+                            return Err(PhpError::compile_fatal(
+                                "Constant expression contains invalid operations",
+                                self.line(),
+                            ));
+                        }
+                        if n.eq_ignore_ascii_case("static")
+                            && !matches!(self.peek(), Some(Token::Ident(m)) if m == "class")
+                        {
+                            // `static::class` falls through to the
+                            // class-name-resolution gate below; bare
+                            // `static::K` is the '"static::"' fatal.
                             return Err(PhpError::compile_fatal(
                                 "\"static::\" is not allowed in compile-time constants",
                                 self.line(),
@@ -1812,9 +1829,20 @@ impl<'a> Parser<'a> {
                                 self.line(),
                             ));
                         }
+                        // `parent::$p::get()/set()` hook syntax bypasses
+                        // the generic no-parent fatal — the hook-ctx
+                        // gate after the member decides (a missing
+                        // parent then defers to a thrown Error at hook
+                        // invocation).
                         if n.eq_ignore_ascii_case("parent")
                             && self.class_ctx.last().map(|c| !c.1 && !c.0).unwrap_or(false)
                             && !self.in_closure
+                            && !matches!(
+                                self.peek(),
+                                Some(Token::Variable(_))
+                                    | Some(Token::Op("$"))
+                                    | Some(Token::Op("{"))
+                            )
                         {
                             return Err(PhpError::compile_fatal(
                                 "Cannot use \"parent\" when current class scope has no parent",
@@ -1830,6 +1858,59 @@ impl<'a> Parser<'a> {
                 match self.next() {
                     Some(Token::Ident(n)) => {
                         if n == "class" {
+                            // `X::class` in a const slot is compile-time
+                            // class-name resolution, not a deferrable
+                            // constant: classless named-fn defaults die
+                            // 'Cannot use "X" when no class scope is
+                            // active'; `static::class` anywhere else in
+                            // the slot dies 'cannot be used for
+                            // compile-time class name resolution'; a
+                            // parentless class's `parent::class` is the
+                            // no-parent compile fatal (all oracle-probed;
+                            // closures and non-fn slots defer to runtime).
+                            if self.const_ctx == ConstCtx::Slot {
+                                if let Expr::Const(cn) = &e {
+                                    let kw = cn.to_ascii_lowercase();
+                                    let classless_named = self.in_named_fn
+                                        && self.class_ctx.is_empty()
+                                        && !self.in_closure;
+                                    match kw.as_str() {
+                                        "static" => {
+                                            return Err(PhpError::compile_fatal(
+                                                if classless_named {
+                                                    "Cannot use \"static\" when no class scope is active".to_string()
+                                                } else {
+                                                    "static::class cannot be used for compile-time class name resolution".to_string()
+                                                },
+                                                self.line(),
+                                            ));
+                                        }
+                                        "self" | "parent" if classless_named => {
+                                            return Err(PhpError::compile_fatal(
+                                                format!(
+                                                    "Cannot use \"{}\" when no class scope is active",
+                                                    kw
+                                                ),
+                                                self.line(),
+                                            ));
+                                        }
+                                        "parent"
+                                            if self
+                                                .class_ctx
+                                                .last()
+                                                .map(|c| !c.1 && !c.0)
+                                                .unwrap_or(false)
+                                                && !self.in_closure =>
+                                        {
+                                            return Err(PhpError::compile_fatal(
+                                                "Cannot use \"parent\" when current class scope has no parent",
+                                                self.line(),
+                                            ));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                             e = Expr::ClassConst {
                                 class: Box::new(e),
                                 name: "class".into(),
