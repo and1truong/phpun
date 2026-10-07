@@ -241,7 +241,7 @@ impl<'a> Interp<'a> {
                     // first-token line — look past it for the
                     // by-ref/spread shapes, but eval the marked expr so
                     // the marker still sets the line.
-                    let shape = Self::unmark_arg(v);
+                    let shape = Self::unmark_rhs(v);
                     // `&$x` elements bind the source cell, not a copy.
                     if let Expr::ByRef(e) = shape {
                         let c = self.eval_cell(e)?;
@@ -468,9 +468,9 @@ impl<'a> Interp<'a> {
                 let jumptable = num_conds >= 2
                     && arms.iter().all(|a| {
                         a.conds.iter().all(|c| {
-                            is_compile_const(Self::unmark_arg(c))
+                            is_compile_const(Self::unmark_rhs(c))
                                 && matches!(
-                                    self.eval_const(Self::unmark_arg(c)),
+                                    self.eval_const(Self::unmark_rhs(c)),
                                     Ok(Value::Int(_) | Value::Str(_))
                                 )
                         })
@@ -507,7 +507,7 @@ impl<'a> Interp<'a> {
                         // its compiled end line. MATCH_ERROR sites at
                         // the last compare op's lineno (zend_lineno
                         // stays there when MATCH_ERROR emits).
-                        let cu = Self::unmark_arg(c);
+                        let cu = Self::unmark_rhs(c);
                         let tc = matches!(cu, Expr::Null | Expr::Bool(_))
                             || matches!(cu, Expr::ArrayLit(..) if is_compile_const(cu));
                         let cl = if !tc {
@@ -1663,7 +1663,7 @@ impl<'a> Interp<'a> {
         if op == "=&" {
             // Shape checks on the source see through the arg's
             // line marker (`$a =& ($b)` is still a Var source).
-            let value_u = Self::unmark_arg(value);
+            let value_u = Self::unmark_rhs(value);
             // zend refuses the $GLOBALS table itself as a by-ref source
             // (compile error `Cannot acquire reference to $GLOBALS`) —
             // element access $GLOBALS['x'] is fine.
@@ -2074,6 +2074,9 @@ impl<'a> Interp<'a> {
                 }
                 self.eval_cell(r)
             }
+            // `(...)` parens are transparent for cell binding too —
+            // `return (C::$p)` binds the static prop's cell.
+            Expr::Paren(inner) => self.eval_cell(inner),
             Expr::Var(n) => Ok(self.var_cell(n)),
             Expr::Index { e, i } => self.index_cell(e, i.as_deref()),
             Expr::Prop {
@@ -3322,11 +3325,11 @@ impl<'a> Interp<'a> {
         // Non-delayable containers (calls, subscript results, literals)
         // are real ops that emit first — base then dim.
         let dim_simple = i.map(|i| {
-            let i = Self::unmark_arg(i);
+            let i = Self::unmark_rhs(i);
             matches!(i, Expr::Var(_)) || is_compile_const(i)
         });
         let delayed = matches!(
-            e,
+            Self::unmark_rhs(e),
             Expr::Var(_) | Expr::VarVar(..) | Expr::Prop { .. } | Expr::StaticProp { .. }
         );
         if delayed && dim_simple != Some(true) {
@@ -4623,7 +4626,7 @@ impl<'a> Interp<'a> {
         // The operand line markers must not mask the plain-CV shape
         // (or the deferred read would warn at the var's own line
         // instead of the op's right-operand line).
-        let l_u = Self::unmark_arg(l);
+        let l_u = Self::unmark_rhs(l);
         // A folded varvar defers exactly like a CV: its name is
         // compile-time-constant, so it can be computed before `r`
         // runs (the const inner emits no ops — this early eval has
@@ -4641,7 +4644,7 @@ impl<'a> Interp<'a> {
             // A CV right operand fuses into the same op too — zend
             // reads op1 then op2 inside it, both at the op's line
             // (the right operand's first-token line).
-            let r_name = match Self::unmark_arg(r) {
+            let r_name = match Self::unmark_rhs(r) {
                 Expr::Var(n) => Some(n.clone()),
                 Expr::VarVar(inner, _) if is_compile_const(inner) => {
                     let v = self.eval(inner)?;
@@ -4650,7 +4653,7 @@ impl<'a> Interp<'a> {
                 _ => None,
             };
             if let Some(rn) = r_name {
-                let r_u = Self::unmark_arg(r);
+                let r_u = Self::unmark_rhs(r);
                 let op = Self::cv_site_of(r, r_u).unwrap_or(self.cur_line);
                 self.cur_line = op;
                 self.send_line = Some(op);
@@ -4696,8 +4699,8 @@ impl<'a> Interp<'a> {
         // emit as IS_SMALLER(_OR_EQUAL) on the reversed nodes.
         let (a, b) = match op {
             "==" | "!=" | "===" | "!=="
-                if compare_operand_rank(Self::unmark_arg(l))
-                    < compare_operand_rank(Self::unmark_arg(r)) =>
+                if compare_operand_rank(Self::unmark_rhs(l))
+                    < compare_operand_rank(Self::unmark_rhs(r)) =>
             {
                 (b, a)
             }

@@ -366,11 +366,16 @@ impl<'a> Interp<'a> {
                     .unwrap_or_else(|| decl.iter().any(|p| p.variadic && p.by_ref)),
             };
             if by_ref {
-                match expr {
+                // `(expr)` parens stack `argline` markers — peel fully
+                // for the shape check; `expr` itself (still marked) is
+                // evaluated so inner diagnostics keep their own lines.
+                let expr_u = Self::unmark_rhs(expr);
+                match expr_u {
                     Expr::Var(_) | Expr::Index { .. } | Expr::Prop { .. } | Expr::VarVar(..)
+                        | Expr::StaticProp { .. }
                         // zend's SEND_REF check rejects the $GLOBALS
                         // table itself (its elements are fine).
-                        if !matches!(expr, Expr::Var(n) if n == "GLOBALS") =>
+                        if !matches!(expr_u, Expr::Var(n) if n == "GLOBALS") =>
                     {
                         match self.eval_cell(expr) {
                             Ok(c) => {

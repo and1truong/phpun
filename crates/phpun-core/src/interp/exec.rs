@@ -106,7 +106,7 @@ impl<'a> Interp<'a> {
                 }
                 Flow::Normal
             }
-            Stmt::Expr(e) => match e {
+            Stmt::Expr(e) => match Self::unmark_rhs(e) {
                 // A lone `$x;` compiles to a dead FREE op in Zend — no
                 // undefined-variable warning (first_class_callable_dynamic).
                 Expr::Var(n) if self.var_lookup(n).is_none() => Flow::Normal,
@@ -466,8 +466,11 @@ impl<'a> Interp<'a> {
                     if let Some(e) = e {
                         // `function &f() { return $x; }` — the returned cell is
                         // bound, not copied (returnByReference tests).
+                        // `(expr)` parens are transparent: `return ($a)`
+                        // binds $a's cell just like `return $a`.
+                        let e_u = Self::unmark_rhs(e);
                         let is_lval = matches!(
-                            e,
+                            e_u,
                             Expr::Var(_)
                                 | Expr::Index { .. }
                                 | Expr::Prop { .. }
@@ -483,7 +486,7 @@ impl<'a> Interp<'a> {
                             return Flow::Return(c.borrow().clone());
                         }
                         if matches!(
-                            e,
+                            e_u,
                             Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. }
                         ) {
                             // `return &f()` chains through when callee returns
