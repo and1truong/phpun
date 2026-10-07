@@ -290,6 +290,7 @@ impl<'a> Interp<'a> {
             caps: Vec::new(),
             cap_segs: Vec::new(),
             read_vals: Vec::new(),
+            suspend_base: 0,
             gen_state,
         });
     }
@@ -434,6 +435,7 @@ impl<'a> Interp<'a> {
                     // stale view — consumer captures arriving before
                     // the window closes belong inside it.
                     read_vals,
+                    suspend_base: 0,
                     gen_state,
                 });
             }

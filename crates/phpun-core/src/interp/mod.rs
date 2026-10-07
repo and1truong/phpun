@@ -711,6 +711,11 @@ pub struct ObLevel {
     /// inside them (Zend runs the read lazily); the window's close
     /// rewrites the stored values to the resolved content.
     pub read_vals: Vec<ObReadVal>,
+    /// Stack slot the level occupied when the body suspended —
+    /// consumer levels pushed during the suspension stay above it
+    /// in Zend's shared stack, so promotion re-inserts here rather
+    /// than at the top.
+    pub suspend_base: usize,
     /// The owning generator's state — stale-drop rewrites its
     /// deferred journal entries still holding the stale pop value.
     pub gen_state: Option<std::rc::Weak<RefCell<crate::value::GenState>>>,
@@ -3041,7 +3046,8 @@ impl<'a> Interp<'a> {
                 && (self.gen_run_state.is_none() || l.pop_head.is_none());
             if ready {
                 let l = self.suspended_obs.remove(i);
-                self.ob_stack.push(l);
+                let at = l.suspend_base.min(self.ob_stack.len());
+                self.ob_stack.insert(at, l);
             } else {
                 i += 1;
             }
@@ -3063,7 +3069,9 @@ impl<'a> Interp<'a> {
                     .as_ref()
                     .is_some_and(|q| std::rc::Rc::ptr_eq(q, fq));
             if owned {
-                moved.push(self.ob_stack.remove(i));
+                let mut l = self.ob_stack.remove(i);
+                l.suspend_base = i;
+                moved.push(l);
             }
         }
         moved.reverse();
@@ -3166,6 +3174,7 @@ impl<'a> Interp<'a> {
                             .collect()
                     },
                     read_vals: l.read_vals.clone(),
+                    suspend_base: l.suspend_base,
                     gen_state: l.gen_state.clone(),
                 });
             }
@@ -3581,38 +3590,55 @@ impl<'a> Interp<'a> {
         // journaled captures never ran in Zend's frame.
         fq.borrow_mut().kill_tree();
         let killed = true;
-        let mut bufs = Vec::new();
-        let take = |l: &ObLevel, bufs: &mut Vec<Vec<u8>>| {
-            let v = Self::ob_level_content(l, pos, killed);
-            if !v.is_empty() {
-                bufs.push(v);
+        // Zend destroys a level by flushing its contents into the
+        // level BELOW its stack slot (or real output at the bottom)
+        // — never into levels stacked above it. Suspended windows
+        // sat above the pre-existing consumer levels, so their
+        // parent is the window beneath them or the stack's bottom.
+        let sink = |interp: &mut Self, v: &[u8]| {
+            if interp.live_io {
+                use std::io::Write;
+                let mut so = std::io::stdout().lock();
+                let _ = so.write_all(v);
+                let _ = so.flush();
+            } else {
+                interp.out.extend_from_slice(v);
             }
         };
-        let mut i = 0;
-        while i < self.ob_stack.len() {
-            if owned(&self.ob_stack[i]) {
-                let mut l = self.ob_stack.remove(i);
+        let mut i = self.suspended_obs.len();
+        while i > 0 {
+            i -= 1;
+            if owned(&self.suspended_obs[i]) {
+                let mut l = self.suspended_obs.remove(i);
                 // Materialize the captures the cursor already passed —
                 // Zend ran those writes into the real buffer.
                 Self::ob_drain_level(&mut l, false);
-                take(&l, &mut bufs);
-            } else {
-                i += 1;
+                let v = Self::ob_level_content(&l, pos, killed);
+                if !v.is_empty() {
+                    if let Some(below) = self.suspended_obs.get_mut(i.wrapping_sub(1)) {
+                        below.buf.extend_from_slice(&v);
+                    } else if let Some(below) = self.ob_stack.first_mut() {
+                        below.buf.extend_from_slice(&v);
+                    } else {
+                        sink(self, &v);
+                    }
+                }
             }
         }
-        let mut i = 0;
-        while i < self.suspended_obs.len() {
-            if owned(&self.suspended_obs[i]) {
-                let mut l = self.suspended_obs.remove(i);
+        let mut i = self.ob_stack.len();
+        while i > 0 {
+            i -= 1;
+            if owned(&self.ob_stack[i]) {
+                let mut l = self.ob_stack.remove(i);
                 Self::ob_drain_level(&mut l, false);
-                take(&l, &mut bufs);
-            } else {
-                i += 1;
-            }
-        }
-        for b in bufs {
-            if !b.is_empty() {
-                self.emit_replay(&b, usize::MAX);
+                let v = Self::ob_level_content(&l, pos, killed);
+                if !v.is_empty() {
+                    if i > 0 {
+                        self.ob_stack[i - 1].buf.extend_from_slice(&v);
+                    } else {
+                        sink(self, &v);
+                    }
+                }
             }
         }
     }
