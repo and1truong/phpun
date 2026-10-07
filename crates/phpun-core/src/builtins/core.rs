@@ -622,7 +622,8 @@ pub(crate) fn dispatch(
                 .unwrap_or(0),
             std::process::id()
         )),
-        "gc_collect_cycles" | "gc_enable" | "gc_disable" | "gc_mem_caches" => Value::Int(0),
+        "gc_collect_cycles" => Value::Int(it.gc_cycle_collect()? as i64),
+        "gc_enable" | "gc_disable" | "gc_mem_caches" => Value::Int(0),
         "gc_status" => {
             let mut a = PhpArray::new();
             for (k, v) in [

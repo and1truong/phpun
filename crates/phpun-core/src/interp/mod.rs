@@ -3014,6 +3014,203 @@ impl<'a> Interp<'a> {
         terminal
     }
 
+    /// Zend's cycle collector, driven by `gc_collect_cycles()`: an
+    /// object reachable only through other objects — the classic
+    /// object-prop ↔ suspended-gen-frame cycle (`$a->g = $a->g()`
+    /// where the gen's `$this` is `$a`) — is freed at the call, so a
+    /// dead cycle's generator force-closes and replays its finally
+    /// journal mid-script rather than at shutdown.
+    ///
+    /// The pass marks every live object, seeds roots as objects with
+    /// more strong refs than the refs found inside the candidate
+    /// universe (props / gen frames' suspended cells, yielded items,
+    /// pending sends and throws, setup args/captures/$this), and
+    /// flood-fills through internal edges; what's left is a dead
+    /// cycle. Dead gens replay their journal, dead objects run
+    /// `__destruct`, then the dead set's held cells release so the
+    /// weak handles in `live_gens`/`obj_handles` go stale like Zend
+    /// freeing the zvals.
+    pub fn gc_cycle_collect(&mut self) -> Result<usize, PhpError> {
+        let objs: Vec<Rc<RefCell<PhpObject>>> = self
+            .obj_handles
+            .iter()
+            .filter_map(|h| match h {
+                ObjHandle::Obj(w) => w.upgrade(),
+                _ => None,
+            })
+            .collect();
+        // Refs to objects held inside the universe, per target.
+        let mut internal: HashMap<usize, usize> = HashMap::new();
+        let mut edges: HashMap<usize, Vec<usize>> = HashMap::new();
+        for o in &objs {
+            let mut out = Vec::new();
+            Self::gc_obj_out_refs(o, &mut out);
+            for t in &out {
+                *internal.entry(*t).or_insert(0) += 1;
+            }
+            edges.insert(Rc::as_ptr(o) as usize, out);
+        }
+        // Roots: a strong ref count above the internal tally + our
+        // own scan clone means an external holder (variable, frame,
+        // static) — the cycle can't die while that holder lives.
+        let mut reach: HashSet<usize> = objs
+            .iter()
+            .filter(|o| {
+                Rc::strong_count(o)
+                    > internal
+                        .get(&(Rc::as_ptr(o) as usize))
+                        .copied()
+                        .unwrap_or(0)
+                        + 1
+            })
+            .map(|o| Rc::as_ptr(o) as usize)
+            .collect();
+        let mut stack: Vec<usize> = reach.iter().copied().collect();
+        while let Some(p) = stack.pop() {
+            if let Some(out) = edges.get(&p) {
+                for t in out {
+                    if reach.insert(*t) {
+                        stack.push(*t);
+                    }
+                }
+            }
+        }
+        let dead: Vec<Rc<RefCell<PhpObject>>> = objs
+            .into_iter()
+            .filter(|o| !reach.contains(&(Rc::as_ptr(o) as usize)))
+            .collect();
+        if dead.is_empty() {
+            return Ok(0);
+        }
+        let mut first_err = None;
+        for o in &dead {
+            let gen_q = match &o.borrow().internal {
+                Some(crate::value::ObjectInternal::Generator(st)) => {
+                    Some(st.borrow().fin_q.clone())
+                }
+                _ => None,
+            };
+            if let Some(q) = gen_q {
+                if let Some(e) = self.gen_fin_replay(&q, false) {
+                    first_err = Some(e);
+                }
+            } else if self
+                .find_method_in(&o.borrow().class, "__destruct")
+                .is_some()
+                && self.mark_destructed(o)
+            {
+                if let Err(e) = self.method_invoke(o.clone(), "__destruct", CallArgs::empty()) {
+                    first_err = Some(e);
+                }
+            }
+        }
+        // Release the dead set's cells last — dropping them earlier
+        // would let a freed prop's value (a gen handle) run its own
+        // close ahead of the journal replay above.
+        for o in &dead {
+            o.borrow_mut().props.clear();
+            if let Some(crate::value::ObjectInternal::Generator(st)) = &o.borrow().internal {
+                let mut st = st.borrow_mut();
+                st.items.clear();
+                st.sends.clear();
+                st.throws.clear();
+                st.injected_throwable = None;
+                let GenSetup::Invoke {
+                    args,
+                    this_obj,
+                    captures,
+                    ..
+                } = &mut st.setup;
+                args.cells.clear();
+                *this_obj = None;
+                captures.clear();
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(dead.len()),
+        }
+    }
+
+    /// Every object reference held inside `o` — prop cells, and for a
+    /// generator the suspended frame's stashed CVs, buffered items,
+    /// queued sends/throws and the saved call setup. The cycle
+    /// collector treats these as the graph's internal edges.
+    fn gc_obj_out_refs(o: &Rc<RefCell<PhpObject>>, out: &mut Vec<usize>) {
+        fn walk(v: &Value, out: &mut Vec<usize>, depth: u8) {
+            if depth == 0 {
+                return;
+            }
+            match v {
+                Value::Object(o) => out.push(Rc::as_ptr(o) as usize),
+                Value::Callable(c) => {
+                    if let Some(o) = &c.this_obj {
+                        out.push(Rc::as_ptr(o) as usize);
+                    }
+                    for (_, cap, _) in &c.captures {
+                        walk(&cap.borrow(), out, depth - 1);
+                    }
+                }
+                Value::Array(a) => {
+                    for (_, c) in &a.borrow().entries {
+                        walk(&c.borrow(), out, depth - 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ob = o.borrow();
+        for c in ob.props.values() {
+            walk(&c.borrow(), out, 16);
+        }
+        let Some(crate::value::ObjectInternal::Generator(st)) = &ob.internal else {
+            return;
+        };
+        let st = st.borrow();
+        for (k, c) in &st.items {
+            walk(k, out, 16);
+            walk(&c.borrow(), out, 16);
+        }
+        for v in &st.sends {
+            walk(v, out, 16);
+        }
+        for (_, v) in &st.throws {
+            walk(v, out, 16);
+        }
+        if let Some(v) = &st.injected_throwable {
+            walk(v, out, 16);
+        }
+        let GenSetup::Invoke {
+            args,
+            this_obj,
+            captures,
+            ..
+        } = &st.setup;
+        for c in &args.cells {
+            walk(&c.borrow(), out, 16);
+        }
+        if let Some(t) = this_obj {
+            out.push(Rc::as_ptr(t) as usize);
+        }
+        for (_, c, _) in captures {
+            walk(&c.borrow(), out, 16);
+        }
+        // Suspended frame CVs — the journal outlives the state, and
+        // delegation snapshots carry their own inner frames' cells.
+        let mut journals = vec![st.fin_q.clone()];
+        while let Some(q) = journals.pop() {
+            let f = q.borrow();
+            for (_, c) in &f.suspended {
+                walk(&c.borrow(), out, 16);
+            }
+            for d in &f.delegates {
+                for (_, c) in &d.fin.suspended {
+                    walk(&c.borrow(), out, 16);
+                }
+            }
+        }
+    }
+
     /// Drain one gen's destruction journal: emit the suspended
     /// delegation chain's queued finally output (innermost level
     /// first) and return the level's own terminal raise — the
