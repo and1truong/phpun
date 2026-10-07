@@ -204,34 +204,28 @@ pub(crate) fn dispatch(
             Value::str(name)
         }
         "tmpfile" => {
-            // zend's php_stream_fopen_tmpfile → php_open_temporary_fd
-            // (mkstemp "<tmpdir>/phpXXXXXX"): a real, unique, LINKED
-            // file — mode r+b — that the stream removes on close
-            // (PhpResource::Drop honors unlink_on_close).
-            let mut tmpl = std::env::temp_dir()
-                .join("phpXXXXXX\0")
-                .to_string_lossy()
-                .into_owned()
-                .into_bytes();
-            let fd = unsafe { libc::mkstemp(tmpl.as_mut_ptr() as *mut libc::c_char) };
-            if fd < 0 {
-                Value::Bool(false)
-            } else {
-                use std::os::unix::io::FromRawFd;
-                let f = unsafe { std::fs::File::from_raw_fd(fd) };
-                let id = it.next_res_id();
-                let name = String::from_utf8_lossy(&tmpl[..tmpl.len() - 1]).into_owned();
-                Value::Resource(Rc::new(RefCell::new(PhpResource::File {
-                    id,
-                    file: f,
-                    read: true,
-                    write: true,
-                    pos: 0,
-                    eof: false,
-                    unlink_on_close: true,
-                    path: name,
-                    mode: "r+b".into(),
-                })))
+            // zend's php_stream_fopen_tmpfile → php_open_temporary_fd:
+            // a real, unique, LINKED file — mode r+b — that the stream
+            // removes on close (PhpResource::Drop honors
+            // unlink_on_close).
+            match php_open_temporary_fd() {
+                Some((fd, name)) => {
+                    use std::os::unix::io::FromRawFd;
+                    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+                    let id = it.next_res_id();
+                    Value::Resource(Rc::new(RefCell::new(PhpResource::File {
+                        id,
+                        file: f,
+                        read: true,
+                        write: true,
+                        pos: 0,
+                        eof: false,
+                        unlink_on_close: true,
+                        path: name,
+                        mode: "r+b".into(),
+                    })))
+                }
+                None => Value::Bool(false),
             }
         }
         "sys_get_temp_dir" => Value::str(std::env::temp_dir().display().to_string()),
@@ -3779,30 +3773,56 @@ fn select_throw_last(it: &mut Interp, chain: Vec<Value>) -> PhpError {
     }
 }
 
+/// zend's php_open_temporary_fd: mkstemp on "<tmpdir>/php" + 13
+/// chars of "0123456789abcdefghijklmnopqrstuv" + "XXXXXX" (the base32
+/// random prefix + 6 mkstemp bytes — a 19-char random tail, matching
+/// the 'uri' meta tmpfile() reports). Returns (fd, realized path);
+/// the file stays LINKED — fstat nlink 1 — until the owner's dtor
+/// removes it.
+fn php_open_temporary_fd() -> Option<(std::os::unix::io::RawFd, String)> {
+    const B32: &[u8] = b"0123456789abcdefghijklmnopqrstuv";
+    let mut r: u64 = 0;
+    if unsafe { libc::getrandom(&mut r as *mut u64 as *mut libc::c_void, 8, 0) } != 8 {
+        r = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+            .wrapping_add(std::process::id() as u64);
+    }
+    let mut pfx = b"php".to_vec();
+    for _ in 0..13 {
+        pfx.push(B32[(r % 32) as usize]);
+        r /= 32;
+    }
+    use std::os::unix::ffi::OsStringExt;
+    let mut tmpl = std::env::temp_dir().into_os_string().into_vec();
+    tmpl.push(b'/');
+    tmpl.extend_from_slice(&pfx);
+    tmpl.extend_from_slice(b"XXXXXX");
+    tmpl.push(0);
+    let fd = unsafe { libc::mkstemp(tmpl.as_mut_ptr() as *mut libc::c_char) };
+    if fd < 0 {
+        None
+    } else {
+        let name = String::from_utf8_lossy(&tmpl[..tmpl.len() - 1]).into_owned();
+        Some((fd, name))
+    }
+}
+
 /// php_stream_temp_cast: spill a php://temp buffer into a real
-/// filesystem temp file (zend's php_open_temporary_fd → mkstemp
-/// "<tmpdir>/phpXXXXXX", which stays LINKED — fstat reports nlink 1 —
-/// until the stream closes) positioned at the stream's offset. The
+/// filesystem temp file positioned at the stream's offset. The
 /// returned fd is the stream's claimable descriptor; its file is
 /// removed when the last owner closes (PhpResource::Drop). None on
 /// failure.
 pub(in crate::builtins) fn temp_spill_fd(buf: &[u8], pos: u64) -> Option<std::os::unix::io::RawFd> {
-    let mut tmpl = std::env::temp_dir()
-        .join("phpXXXXXX\0")
-        .to_string_lossy()
-        .into_owned()
-        .into_bytes();
+    let (fd, name) = php_open_temporary_fd()?;
     unsafe {
-        let fd = libc::mkstemp(tmpl.as_mut_ptr() as *mut libc::c_char);
-        if fd < 0 {
-            return None;
-        }
         let mut off = 0usize;
         while off < buf.len() {
             let n = libc::write(fd, buf.as_ptr().add(off) as *const _, buf.len() - off);
             if n <= 0 {
                 libc::close(fd);
-                let _ = std::fs::remove_file(&*String::from_utf8_lossy(&tmpl[..tmpl.len() - 1]));
+                let _ = std::fs::remove_file(&name);
                 return None;
             }
             off += n as usize;
