@@ -12,7 +12,31 @@ impl<'a> Interp<'a> {
     /// `exec_block` starting partway down the list — used when a
     /// `goto` lands on a label inside it (the label stmt itself is a
     /// no-op; control resumes at the stmt after it).
-    fn exec_block_from(&mut self, stmts: &[Stmt], mut i: usize) -> Flow {
+    fn exec_block_from(&mut self, stmts: &[Stmt], i: usize) -> Flow {
+        // The dim/prop write scratch is shared `Interp` state: a nested
+        // statement list — a callee, error-handler, eval/include, or
+        // destructor body — sees the enclosing op's caches, and its
+        // per-statement clears wipe them mid-op. The suspended outer
+        // write then re-reads live CVs (bug79793's handler flipping
+        // `$key` before the pending `[$key]++` write) and re-emits
+        // conversions the op already diagnosed. Park the outer scratch
+        // for this list's run; the in-list clears still drop each
+        // statement's own leftovers (gc_006).
+        let saved_key_conv = std::mem::take(&mut self.dim_key_conv);
+        let saved_cv_bound = std::mem::take(&mut self.dim_cv_bound);
+        let saved_undef = std::mem::take(&mut self.dim_undef_cells);
+        let saved_prop_ov = self.last_prop_ov.take();
+        let saved_dyn = std::mem::take(&mut self.fresh_dyn_props);
+        let out = self.exec_block_run(stmts, i);
+        self.dim_key_conv = saved_key_conv;
+        self.dim_cv_bound = saved_cv_bound;
+        self.dim_undef_cells = saved_undef;
+        self.last_prop_ov = saved_prop_ov;
+        self.fresh_dyn_props = saved_dyn;
+        out
+    }
+
+    fn exec_block_run(&mut self, stmts: &[Stmt], mut i: usize) -> Flow {
         // goto labels bind at the statement-list scope they appear in —
         // a goto bubbling up from nested control flow lands here.
         let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
