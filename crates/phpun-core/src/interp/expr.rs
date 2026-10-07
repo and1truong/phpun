@@ -254,6 +254,24 @@ impl<'a> Interp<'a> {
                         self.gen_collect_base = saved_cbase;
                         self.iter_calls -= 1;
                         let inner_len = items.len();
+                        // Record the delegation window: consumer
+                        // send()/throw() landing inside it routes into
+                        // the delegate's own queues (Zend's chain is
+                        // live), and the delegate's return value is
+                        // the yield-from expression's own value.
+                        let inner_ret = if let Value::Object(o) = &v {
+                            match &o.borrow().internal {
+                                Some(crate::value::ObjectInternal::Generator(ist)) => {
+                                    if let Some(run) = &self.gen_run_state {
+                                        run.borrow_mut().delegate_gens.push((base, inner_len));
+                                    }
+                                    ist.borrow().return_val.clone()
+                                }
+                                _ => Value::Null,
+                            }
+                        } else {
+                            Value::Null
+                        };
                         sink.borrow_mut().extend(items);
                         // A gen suspended inside `yield from` shares
                         // the OUTER gen's destruction: its destruction
@@ -278,7 +296,7 @@ impl<'a> Interp<'a> {
                         }
                         match death {
                             Some(e) => Err(e),
-                            None => Ok(Value::Null),
+                            None => Ok(inner_ret),
                         }
                     }
                     None => self.fail(PhpError::fatal(

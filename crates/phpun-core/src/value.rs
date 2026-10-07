@@ -1861,6 +1861,12 @@ pub struct GenState {
     /// (catch delivery, `return`-in-finally swallow, suspend at a
     /// yield inside `finally`).
     pub throws: Vec<(usize, Value)>,
+    /// `yield from` splice windows into this gen's item stream:
+    /// (first spliced index, item count). Consumer sends/throws
+    /// landing inside a window route into the delegate when it is
+    /// re-collected — injection arrives as the delegate's own
+    /// suspended-yield index (`outer - base`).
+    pub delegate_gens: Vec<(usize, usize)>,
     /// The throwable most recently queued by `Generator->throw()` —
     /// an uncaught injected throwable keeps its own trace (built at
     /// the `new` site) when it escapes, unlike a body-raised `throw`

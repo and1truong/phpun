@@ -266,6 +266,7 @@ impl<'a> Interp<'a> {
             auto_key: 0,
             sends: Vec::new(),
             throws: Vec::new(),
+            delegate_gens: Vec::new(),
             injected_throwable: None,
             pending_out: Vec::new(),
             fin_q,
@@ -1240,7 +1241,7 @@ impl<'a> Interp<'a> {
                     // suspended at (index pos) — the re-run replays
                     // every yield, so earlier yields must not eat it.
                     let pos = st.pos;
-                    st.sends.push((pos, v));
+                    st.sends.push((pos, v.clone()));
                     // A gen resumed past its end carries the body's
                     // death — Zend re-raises it at this call rather
                     // than re-running the body; a clean exhausted
@@ -1271,6 +1272,7 @@ impl<'a> Interp<'a> {
                         }
                         st.deferred_err = None;
                         st.dead = false;
+                        st.delegate_gens.clear();
                     }
                     // The re-run replays the prefix the consumer
                     // already echoed — suppress its bytes (Zend only
@@ -1366,6 +1368,7 @@ impl<'a> Interp<'a> {
                     }
                     st.deferred_err = None;
                     st.dead = false;
+                    st.delegate_gens.clear();
                     prev
                 };
                 self.gen_throws_fired.clear();
@@ -1375,7 +1378,15 @@ impl<'a> Interp<'a> {
                 let r = self.gen_start(&state);
                 self.gen_replay_horizon = None;
                 r?;
-                if !self.gen_throws_fired.contains(&prev) {
+                let fired_at_delegate = {
+                    let st = state.borrow();
+                    st.delegate_gens.iter().any(|(base, span)| {
+                        prev >= *base
+                            && prev < base + span
+                            && self.gen_throws_fired.contains(&(prev - base))
+                    })
+                };
+                if !self.gen_throws_fired.contains(&prev) && !fired_at_delegate {
                     // The injection couldn't land — the suspension
                     // point isn't a body-level yield (a `yield from`
                     // splice item) or the stream was exhausted: Zend
@@ -1549,9 +1560,50 @@ impl<'a> Interp<'a> {
                         }
                         .unwrap_or_else(|| cell(val));
                         out.push((k, c));
-                        if let Err(e) = self.method_invoke(o.clone(), "next", CallArgs::empty()) {
-                            death = Some(e);
-                            break;
+                        // A consumer injection queued for this splice
+                        // index delivers to the delegate's suspended
+                        // yield — Zend's chain is live: send()/throw()
+                        // on the outer lands inside the delegate, so
+                        // drive the step that crosses it with the
+                        // delegate's own method instead of next().
+                        let base = self.gen_collect_base.unwrap_or(0);
+                        let outer_idx = base + out.len() - 1;
+                        let injected = if let Some(p) =
+                            self.gen_sends.iter().position(|(i, _)| *i == outer_idx)
+                        {
+                            let (_, v) = self.gen_sends.remove(p).unwrap();
+                            let mut a = CallArgs::empty();
+                            a.cells.push(cell(v));
+                            match self.method_invoke(o.clone(), "send", a) {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    death = Some(e);
+                                    break;
+                                }
+                            }
+                        } else if let Some(p) =
+                            self.gen_throws.iter().position(|(i, _)| *i == outer_idx)
+                        {
+                            let (_, v) = self.gen_throws.remove(p).unwrap();
+                            self.gen_throws_fired.push(outer_idx);
+                            let mut a = CallArgs::empty();
+                            a.cells.push(cell(v));
+                            match self.method_invoke(o.clone(), "throw", a) {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    death = Some(e);
+                                    break;
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        if !injected {
+                            if let Err(e) = self.method_invoke(o.clone(), "next", CallArgs::empty())
+                            {
+                                death = Some(e);
+                                break;
+                            }
                         }
                     }
                     (out, death)

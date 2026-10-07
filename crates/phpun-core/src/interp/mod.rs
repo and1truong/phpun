@@ -3665,12 +3665,41 @@ impl<'a> Interp<'a> {
     fn rewrite_throwable_trace(&mut self, frames: &[String]) {
         if let Some(Value::Object(o)) = &self.pending_exception {
             let mut obj = o.borrow_mut();
-            if let Some(crate::value::ObjectInternal::Exception { trace, .. }) = &mut obj.internal {
+            if let Some(crate::value::ObjectInternal::Exception {
+                trace,
+                frames: cframes,
+                ..
+            }) = &mut obj.internal
+            {
+                // The throwable's own construction stack leads the
+                // render (Zend keeps the frames live at `new` time);
+                // frames the resume stack reports as `[internal
+                // function]: f()` are suspended gen bodies — the
+                // resume pseudo-frame already covers them.
+                let internals: Vec<String> = frames
+                    .iter()
+                    .filter_map(|f| {
+                        f.strip_prefix("[internal function]: ")
+                            .and_then(|s| s.split('(').next())
+                            .map(|n| n.to_string())
+                    })
+                    .collect();
+                let mut parts: Vec<String> = Vec::new();
+                for fr in cframes.clone().iter().rev() {
+                    if crate::value::trace_frame_hidden(fr) {
+                        continue;
+                    }
+                    if internals.contains(&fr.function) {
+                        continue;
+                    }
+                    parts.push(crate::value::trace_frame_str(fr));
+                }
+                parts.extend(frames.iter().cloned());
                 let mut t = String::new();
-                for (i, fr) in frames.iter().enumerate() {
+                for (i, fr) in parts.iter().enumerate() {
                     t.push_str(&format!("#{} {}\n", i, fr));
                 }
-                t.push_str(&format!("#{} {{main}}", frames.len()));
+                t.push_str(&format!("#{} {{main}}", parts.len()));
                 *trace = t;
             }
         }
