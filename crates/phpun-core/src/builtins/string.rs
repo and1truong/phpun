@@ -444,6 +444,37 @@ pub(crate) fn dispatch(
             Value::Array(Rc::new(RefCell::new(a)))
         }
         "implode" | "join" => {
+            // zend's legacy dual signature: implode($array) works, but
+            // implode($scalar) binds it to $separator — whose
+            // 'of type string' check passes after coercion — leaving
+            // $array null, which ZPP then rejects.
+            if args.len() == 1 && !matches!(&*args[0].borrow(), Value::Array(_)) {
+                return err(
+                    "TypeError",
+                    format!(
+                        "{}(): If argument #1 ($separator) is of type string, argument #2 ($array) must be of type array, null given",
+                        name
+                    ),
+                );
+            }
+            // `implode(null, $a)` — separator is `array|string`,
+            // so null deprecates rather than TypeErrors.
+            if args.len() > 1 && matches!(&*args[0].borrow(), Value::Null) {
+                it.deprecated_pub(&format!(
+                    "{}(): Passing null to parameter #1 ($separator) of type array|string is deprecated",
+                    name
+                ))?;
+            }
+            if args.len() > 1 && !matches!(&*args[1].borrow(), Value::Array(_) | Value::Null) {
+                return err(
+                    "TypeError",
+                    format!(
+                        "{}(): Argument #2 ($array) must be of type ?array, {} given",
+                        name,
+                        zval_word(&args[1].borrow())
+                    ),
+                );
+            }
             let (sep, arr) = if args.len() == 1 {
                 (Vec::new(), arg(args, 0))
             } else {

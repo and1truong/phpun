@@ -15,8 +15,8 @@ pub(crate) fn dispatch(
         },
         "intdiv" => {
             let (va, vb) = (arg(args, 0), arg(args, 1));
-            let a = it.coerce_int_pub(&va);
-            let b = it.coerce_int_pub(&vb);
+            let a = intdiv_int(it, &va, 1, "num1")?;
+            let b = intdiv_int(it, &vb, 2, "num2")?;
             if b == 0 {
                 return err("DivisionByZeroError", "Division by zero");
             }
@@ -258,4 +258,60 @@ fn base_conv(mut v: i128, to: u32) -> String {
         out.push('-');
     }
     out.iter().rev().collect()
+}
+
+/// intdiv()'s zpp 'l' arg coercion: bools and int strings coerce
+/// silently, in-range fractional floats deprecate, out-of-range floats
+/// and non-numeric types are the arginfo TypeError, null deprecates.
+fn intdiv_int(it: &mut Interp, v: &Value, n: usize, name: &str) -> Result<i64, PhpError> {
+    let te = |tn: &str| -> PhpError {
+        err::<i64>(
+            "TypeError",
+            format!(
+                "intdiv(): Argument #{} (${}) must be of type int, {} given",
+                n, name, tn
+            ),
+        )
+        .unwrap_err()
+    };
+    match v {
+        Value::Float(f) => {
+            if !f.is_finite() || *f >= i64::MAX as f64 || *f < i64::MIN as f64 {
+                return Err(te("float"));
+            }
+            if f.fract() != 0.0 {
+                it.deprecated_pub(&format!(
+                    "Implicit conversion from float {} to int loses precision",
+                    crate::value::format_float_repr(*f)
+                ))?;
+            }
+            Ok(*f as i64)
+        }
+        Value::Str(s) => match crate::value::numeric(s) {
+            crate::value::Numeric::Int(i) => Ok(i),
+            crate::value::Numeric::Float(f) => {
+                if !f.is_finite() || f >= i64::MAX as f64 || f < i64::MIN as f64 {
+                    return Err(te("string"));
+                }
+                if f.fract() != 0.0 {
+                    it.deprecated_pub(&format!(
+                        "Implicit conversion from float-string \"{}\" to int loses precision",
+                        String::from_utf8_lossy(s)
+                    ))?;
+                }
+                Ok(f as i64)
+            }
+            _ => Err(te("string")),
+        },
+        Value::Null => {
+            it.deprecated_pub(&format!(
+                "intdiv(): Passing null to parameter #{} (${}) of type int is deprecated",
+                n, name
+            ))?;
+            Ok(0)
+        }
+        Value::Int(i) => Ok(*i),
+        Value::Bool(b) => Ok(*b as i64),
+        other => Err(te(&other.operand_type_name())),
+    }
 }

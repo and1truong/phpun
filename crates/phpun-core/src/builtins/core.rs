@@ -688,8 +688,27 @@ pub(crate) fn dispatch(
                 line: 0,
             });
         }
-        "get_include_path" | "set_include_path" | "restore_include_path" => {
-            Value::str(".:/home/linuxbrew/.linuxbrew/share/pear")
+        "escapeshellarg" | "escapeshellcmd" => {
+            let s = arg_str(it, args, 0);
+            Value::str(format!("'{}'", s.replace('\'', "'\\''")))
+        }
+        "get_include_path" => Value::str(it.ini.get("include_path").cloned().unwrap_or_default()),
+        "set_include_path" => {
+            // Returns the OLD path; the new one stores into the ini
+            // table like ini_set (zend's set_include_path is ini_set).
+            let prev = it.ini.get("include_path").cloned().unwrap_or_default();
+            let v = arg_str(it, args, 0);
+            it.ini.insert("include_path".into(), v);
+            Value::str(prev)
+        }
+        "restore_include_path" => {
+            // zend restores the ini default registered at startup — the
+            // same compiled-in path Interp::new seeds.
+            it.ini.insert(
+                "include_path".into(),
+                ".:/home/linuxbrew/.linuxbrew/Cellar/php/8.5.11/share/php/pear".to_string(),
+            );
+            Value::Bool(false)
         }
         "token_get_all" | "token_name" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
         "highlight_string" => {
@@ -1001,7 +1020,40 @@ pub(crate) fn dispatch(
                 Value::Int(c)
             }
         }
-        "clone" => arg(args, 0),
+        "clone" => {
+            // PHP 8.5 `clone(object $object, array $withProperties = [])`.
+            if args.is_empty() {
+                return err(
+                    "ArgumentCountError",
+                    "clone() expects at least 1 argument, 0 given",
+                );
+            }
+            if args.len() > 2 {
+                return err(
+                    "ArgumentCountError",
+                    format!("clone() expects at most 2 arguments, {} given", args.len()),
+                );
+            }
+            let with = match args.get(1) {
+                Some(c) => {
+                    let w = c.borrow();
+                    match &*w {
+                        Value::Array(a) => Some(a.clone()),
+                        other => {
+                            return err(
+                                "TypeError",
+                                format!(
+                                    "clone(): Argument #2 ($withProperties) must be of type array, {} given",
+                                    other.debug_type()
+                                ),
+                            )
+                        }
+                    }
+                }
+                None => None,
+            };
+            it.builtin_clone(&arg(args, 0), with.as_ref())?
+        }
         "assert_options_now" => Value::Null,
         "zend_test_func" | "zend_test_array_return" => Value::Null,
         _ => return Ok(None),

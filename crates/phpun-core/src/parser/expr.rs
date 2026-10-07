@@ -86,18 +86,30 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let prev_ret_by_ref = self.ret_by_ref;
+        self.ret_by_ref = by_ref;
         let (body, end_line) = if arrow {
             self.expect_op("=>")?;
-            let e = self.expr()?;
+            // An arrow body inside a const slot is validated as part of
+            // the enclosing constant expression — scope keywords there
+            // are 'Constant expression contains invalid operations'.
+            let saved_const = self.const_ctx;
+            if self.const_ctx == ConstCtx::Slot {
+                self.const_ctx = ConstCtx::ArrowSlot;
+            }
+            let e = self.expr();
+            self.const_ctx = saved_const;
+            let e = e?;
             let el = self.prev_line();
             // A call inside the arrow expr needs a line marker — the
             // body has no statements to set cur_line (closure_064).
             (vec![Stmt::Line(line), Stmt::Return(Some(e))], el)
         } else {
-            let b = self.body()?;
+            let b = self.runtime_body()?;
             let el = self.prev_line();
             (b, el)
         };
+        self.ret_by_ref = prev_ret_by_ref;
         self.hook_ctx = prev_hook;
         Ok(Expr::Closure(ClosureExpr {
             decl: FunctionDecl {
@@ -150,8 +162,9 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_op("{")?;
-            self.class_ctx
-                .push((parent.is_some() || !implements.is_empty(), false));
+            // Only a real `extends` gives the anonymous class a
+            // `parent` (see class_decl).
+            self.class_ctx.push((parent.is_some(), false));
             let mut methods = Vec::new();
             let mut props = Vec::new();
             let mut consts = Vec::new();
@@ -216,6 +229,7 @@ impl<'a> Parser<'a> {
                 if self.ident_is("const") {
                     self.pos += 1;
                     loop {
+                        let cline = self.line();
                         let cname = self.ident().unwrap_or_default();
                         self.expect_op("=")?;
                         consts.push(crate::ast::ConstDecl {
@@ -227,6 +241,7 @@ impl<'a> Parser<'a> {
                             attrs: vec![],
                             decl_in: None,
                             enum_case: false,
+                            line: cline,
                         });
                         if !self.eat_op(",") {
                             break;
@@ -260,6 +275,7 @@ impl<'a> Parser<'a> {
                 }
                 if self.ident_is("case") {
                     self.pos += 1;
+                    let cline = self.line();
                     let cname = self.ident().unwrap_or_default();
                     let cv = if self.eat_op("=") {
                         self.expr()?
@@ -275,6 +291,7 @@ impl<'a> Parser<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: cline,
                     });
                     self.expect_op(";")?;
                     continue;
@@ -307,7 +324,9 @@ impl<'a> Parser<'a> {
                             ))
                         }
                     };
+                    let mut dline = 0;
                     let default = if self.eat_op("=") {
+                        dline = self.line();
                         Some(self.expr()?)
                     } else {
                         None
@@ -326,6 +345,7 @@ impl<'a> Parser<'a> {
                         hooks: None,
                         attrs: vec![],
                         line: pline,
+                        dline,
                     });
                     if !self.eat_op(",") {
                         break;
@@ -373,12 +393,14 @@ impl<'a> Parser<'a> {
         }
         // `new self` / `new static` / `new parent`
         if self.ident_is("self") || self.ident_is("static") || self.ident_is("parent") {
-            return Ok((Expr::Const(self.ident().unwrap()), Vec::new()));
+            let ce = Expr::Const(self.ident().unwrap());
+            return Ok((self.new_dcolon(ce)?, Vec::new()));
         }
         match self.peek().cloned() {
             Some(Token::Ident(_)) | Some(Token::Op("\\")) => {
                 let n = self.name_path().unwrap_or_default();
-                Ok((Expr::Const(self.ns_resolve(&n, NsKind::Class)), Vec::new()))
+                let ce = Expr::Const(self.ns_resolve(&n, NsKind::Class));
+                Ok((self.new_dcolon(ce)?, Vec::new()))
             }
             Some(Token::Variable(n)) => {
                 self.pos += 1;
@@ -436,6 +458,65 @@ impl<'a> Parser<'a> {
                 ),
                 self.line(),
             )),
+        }
+    }
+
+    /// `new X::...` — zend's new_expr only allows a class-name
+    /// variable after `::` (`new C::$v` instantiates the class named
+    /// by the static prop); `X::CONST`, `X::class` and `X::method()`
+    /// are parse errors `expecting variable or "$"` (p10v/y, probe10b).
+    fn new_dcolon(&mut self, ce: Expr) -> Result<Expr, PhpError> {
+        if !self.at_op("::") {
+            return Ok(ce);
+        }
+        self.pos += 1;
+        match self.next() {
+            Some(Token::Variable(n)) => Ok(Expr::StaticProp {
+                class: Box::new(ce),
+                name: PropName::Name(n),
+            }),
+            Some(Token::Op("$")) => {
+                // `X::$$v` / `X::${e}` — also a class-name variable.
+                let inner = if self.at_op("{") {
+                    self.pos += 1;
+                    let inner = self.expr()?;
+                    self.expect_op("}")?;
+                    inner
+                } else {
+                    match self.next() {
+                        Some(Token::Variable(n)) => Expr::Var(n),
+                        t => {
+                            return Err(PhpError::parse(
+                                format!(
+                                    "syntax error, unexpected {}, expecting variable or \"$\"",
+                                    desc_t(t.as_ref())
+                                ),
+                                self.line(),
+                            ))
+                        }
+                    }
+                };
+                Ok(Expr::StaticProp {
+                    class: Box::new(ce),
+                    name: PropName::Expr(Box::new(inner)),
+                })
+            }
+            t => {
+                let desc = match &t {
+                    Some(Token::Ident(n)) if crate::lexer::is_keyword(n) => {
+                        format!("token \"{}\"", n)
+                    }
+                    Some(Token::Ident(n)) => format!("identifier \"{}\"", n),
+                    other => desc_t(other.as_ref()),
+                };
+                Err(PhpError::parse(
+                    format!(
+                        "syntax error, unexpected {}, expecting variable or \"$\"",
+                        desc
+                    ),
+                    self.line(),
+                ))
+            }
         }
     }
 
@@ -500,10 +581,12 @@ impl<'a> Parser<'a> {
             let e = self.assign()?;
             return Ok(Expr::Throw(Box::new(e)));
         }
+        let lhs_start = self.pos;
         let e = self.ternary()?;
 
         if let Some(Token::Op(op)) = self.peek() {
             if ASSIGN_OPS.contains(op) {
+                let op_pos = self.pos;
                 let mut op: &'static str = op;
                 self.pos += 1;
                 if op == "=" && self.eat_op("&") {
@@ -511,6 +594,8 @@ impl<'a> Parser<'a> {
                 }
                 let rhs = self.assign()?;
                 let target = self.list_target(e)?;
+                self.check_list_ref_literal(op, &target, &rhs)?;
+                self.assign_target_gate(&target, op, lhs_start, op_pos)?;
                 return Ok(Expr::Assign {
                     target: Box::new(target),
                     op,
@@ -521,21 +606,256 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
+    /// `=`/`op=` LHS gate — zend's `variable` write context: a whole
+    /// parenthesized target and any other non-variable expression
+    /// parse-errors `unexpected token "{op}"`; call/method results are
+    /// `Can't use ... return value in write context` compile fatals;
+    /// nullsafe chains `Can't use nullsafe operator in write context`;
+    /// a deref-linked target whose chain root isn't writable is
+    /// `Cannot use temporary expression in write context` (probe13
+    /// family vs oracle). List elements check per-item instead.
+    fn assign_target_gate(
+        &mut self,
+        e: &Expr,
+        op: &str,
+        lhs_start: usize,
+        op_pos: usize,
+    ) -> Result<(), PhpError> {
+        use crate::ast::Expr::*;
+        if let List(items) = e {
+            for it in items.iter().flatten() {
+                self.list_writable(&it.1)?;
+            }
+            return Ok(());
+        }
+        let op = if op == "=&" { "=" } else { op };
+        if self.paren_wrapped_target(lhs_start, op_pos) || matches!(e, Paren(_)) {
+            return Err(PhpError::parse(
+                format!("syntax error, unexpected token \"{}\"", op),
+                self.line(),
+            ));
+        }
+        let callish = match e {
+            Call { .. } | Fcc(_) => Some("function"),
+            MethodCall { .. } | StaticCall { .. } | StaticCallDyn { .. } => Some("method"),
+            _ => None,
+        };
+        if let Some(k) = callish {
+            self.write_ctx_errs.push((
+                format!("Can't use {} return value in write context", k),
+                self.line(),
+            ));
+            return Ok(());
+        }
+        if Self::has_nullsafe(e) {
+            self.write_ctx_errs.push((
+                "Can't use nullsafe operator in write context".to_string(),
+                self.line(),
+            ));
+            return Ok(());
+        }
+        match e {
+            Var(_) | VarVar(_) | StaticProp { .. } => Ok(()),
+            // A deref-linked target writes iff its chain root is
+            // writable grammar — literal/const/`new` roots die as
+            // temporaries, not parse errors (nr/ns probes).
+            Index { .. } | Prop { .. } => {
+                if Self::writeable_root(e) {
+                    Ok(())
+                } else {
+                    // Deferred — zend's compile-time check fires only
+                    // after the whole file parses, so a later syntax
+                    // error wins over it (probe m8).
+                    self.write_ctx_errs.push((
+                        "Cannot use temporary expression in write context".to_string(),
+                        self.line(),
+                    ));
+                    Ok(())
+                }
+            }
+            _ => Err(PhpError::parse(
+                format!("syntax error, unexpected token \"{}\"", op),
+                self.line(),
+            )),
+        }
+    }
+
+    /// True when token `start` is `(` whose matching `)` sits
+    /// immediately before `op_pos` — the whole LHS is a parenthesized
+    /// expression (`($x) = 5`, `(f()) += v`), which zend refuses as an
+    /// assign target. `Paren` nodes only survive for static-prop refs,
+    /// so plain parens are recovered from the token stream.
+    fn paren_wrapped_target(&self, start: usize, op_pos: usize) -> bool {
+        if !matches!(self.toks.get(start).map(|l| &l.token), Some(Token::Op("("))) {
+            return false;
+        }
+        let mut depth = 0usize;
+        for (i, lt) in self.toks.iter().enumerate().skip(start) {
+            match &lt.token {
+                Token::Op("(") => depth += 1,
+                Token::Op(")") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i == op_pos - 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Deepest chain root under `x[..]`/`x->y`/`x->m()` links (parens
+    /// transparent) is writable grammar. A `new`-rooted chain is only
+    /// writable once a member CALL intervenes — zend's temporary
+    /// object: `(new F)->m()->p[]` and `(new F)->p->m()[]` assign,
+    //  `(new F)->p[]` alone is a temporary (oracle-probed).
+    fn writeable_root(e: &Expr) -> bool {
+        use crate::ast::Expr::*;
+        let mut leaf = e;
+        let mut call_link = false;
+        loop {
+            leaf = match leaf {
+                Index { e: c, .. } | Prop { obj: c, .. } => c.as_ref(),
+                MethodCall { obj: c, .. } => {
+                    call_link = true;
+                    c.as_ref()
+                }
+                Paren(inner) => inner.as_ref(),
+                _ => break,
+            };
+        }
+        if call_link && matches!(leaf, New { .. }) {
+            return true;
+        }
+        matches!(
+            leaf,
+            Var(_)
+                | VarVar(_)
+                | Call { .. }
+                | MethodCall { .. }
+                | StaticCall { .. }
+                | StaticCallDyn { .. }
+                | Fcc(_)
+                | Paren(_)
+                | StaticProp { .. }
+        )
+    }
+
+    /// `clone (` — does the `(` (at `pos+1`) hold a top-level `,`?
+    /// Only then is it PHP 8.5's clone-with call form; without a
+    /// comma the parens group the unary operand (`clone ($o)->m` is
+    /// `clone(($o)->m)` in zend).
+    fn clone_paren_has_comma(&self) -> bool {
+        let mut depth = 0usize;
+        for lt in &self.toks[self.pos + 1..] {
+            match &lt.token {
+                Token::Op(o) if matches!(*o, "(" | "[" | "{") => depth += 1,
+                Token::Op(o) if matches!(*o, ")" | "]" | "}") => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return false;
+                    }
+                }
+                Token::Op(",") if depth == 1 => return true,
+                Token::Op(";") => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// A destructuring element must itself be a writable value:
+    /// `($x)` unwraps, nested lists recurse, `&` elements recurse,
+    /// call/method results die with the return-value fatals, and
+    /// everything else (nullsafe chains included) is
+    /// `Assignments can only happen to writable values` (p13 l*).
+    pub(in crate::parser) fn list_writable(&mut self, e: &Expr) -> Result<(), PhpError> {
+        use crate::ast::Expr::*;
+        match e {
+            Var(_) | VarVar(_) | StaticProp { .. } => Ok(()),
+            Paren(inner) | ByRef(inner) => self.list_writable(inner),
+            List(items) => {
+                for it in items.iter().flatten() {
+                    self.list_writable(&it.1)?;
+                }
+                Ok(())
+            }
+            ArrayLit(items) => {
+                for (_, v) in items {
+                    if !matches!(v, Null) {
+                        self.list_writable(v)?;
+                    }
+                }
+                Ok(())
+            }
+            Call { .. } | Fcc(_) => {
+                self.write_ctx_errs.push((
+                    "Can't use function return value in write context".to_string(),
+                    self.line(),
+                ));
+                Ok(())
+            }
+            MethodCall { .. } | StaticCall { .. } | StaticCallDyn { .. } => {
+                self.write_ctx_errs.push((
+                    "Can't use method return value in write context".to_string(),
+                    self.line(),
+                ));
+                Ok(())
+            }
+            Index { .. } | Prop { .. } => {
+                if Self::has_nullsafe(e) || !Self::writeable_root(e) {
+                    self.write_ctx_errs.push((
+                        "Assignments can only happen to writable values".to_string(),
+                        self.line(),
+                    ));
+                }
+                Ok(())
+            }
+            _ => {
+                self.write_ctx_errs.push((
+                    "Assignments can only happen to writable values".to_string(),
+                    self.line(),
+                ));
+                Ok(())
+            }
+        }
+    }
+
     /// `[a, b]` / `list(a, b)` on the left of `=` is destructuring.
     pub(in crate::parser) fn list_target(&mut self, e: Expr) -> Result<Expr, PhpError> {
         match e {
-            Expr::ArrayLit(items) => Ok(Expr::List(
-                items
-                    .into_iter()
-                    .map(|(_, v)| match v {
-                        Expr::Null => None,
-                        other => Some(other),
-                    })
-                    .collect(),
-            )),
+            Expr::ArrayLit(items) => {
+                // Nested destructuring: `[[$a, $b], $c] = $src` — inner
+                // array literals (and `list()` calls) convert to List
+                // too, so runtime store() can recurse (lp4).
+                let mut out = Vec::with_capacity(items.len());
+                for (k, v) in items {
+                    out.push(match (k, v) {
+                        // `[,$a]`/`[$a, ,$c]` holes parse as `(None, Null)`.
+                        (None, Expr::Null) => None,
+                        (k, other) => Some((k, self.list_target(other)?)),
+                    });
+                }
+                self.list_mix_check(&out)?;
+                Ok(Expr::List(out))
+            }
             Expr::Call { name, args } => match *name {
                 Expr::Str(n) if n.eq_ignore_ascii_case("list") => {
-                    Ok(Expr::List(args.into_iter().map(Some).collect()))
+                    let mut out = Vec::with_capacity(args.len());
+                    for a in args {
+                        out.push(match a {
+                            Expr::Null => None,
+                            // `list('k' => $v)` — args_flags encodes the
+                            // keyed pair as a transient `=>` binary.
+                            Expr::Binary { op: "=>", l, r } => {
+                                Some((Some(*l), self.list_target(*r)?))
+                            }
+                            other => Some((None, self.list_target(other)?)),
+                        });
+                    }
+                    self.list_mix_check(&out)?;
+                    Ok(Expr::List(out))
                 }
                 other => Ok(Expr::Call {
                     name: Box::new(other),
@@ -829,35 +1149,18 @@ impl<'a> Parser<'a> {
             });
         }
         if self.eat_op("++") {
-            let e = self.unary()?;
-            if matches!(
-                e,
-                Expr::Call { .. }
-                    | Expr::MethodCall { .. }
-                    | Expr::StaticCall { .. }
-                    | Expr::StaticCallDyn { .. }
-            ) {
-                return Err(PhpError::compile_fatal(
-                    "Can't use method return value in write context",
-                    self.line(),
-                ));
-            }
+            // `++`'s operand is zend's `new_variable` — the same write
+            // context grammar as foreach `&` (`++1` → `unexpected
+            // integer`, `++(x)` → expecting `->`, `++f()`/`++$o->m()`
+            // → return-value fatal, `++"s"[0]`/`++new C()->x` →
+            // temporary-expression fatal, `++$x?->y` → nullsafe fatal).
+            let e = self.ref_variable(true)?;
+
             return Ok(Expr::PreInc(Box::new(e)));
         }
         if self.eat_op("--") {
-            let e = self.unary()?;
-            if matches!(
-                e,
-                Expr::Call { .. }
-                    | Expr::MethodCall { .. }
-                    | Expr::StaticCall { .. }
-                    | Expr::StaticCallDyn { .. }
-            ) {
-                return Err(PhpError::compile_fatal(
-                    "Can't use method return value in write context",
-                    self.line(),
-                ));
-            }
+            let e = self.ref_variable(true)?;
+
             return Ok(Expr::PreDec(Box::new(e)));
         }
         if self.eat_op("@") {
@@ -869,6 +1172,39 @@ impl<'a> Parser<'a> {
             });
         }
         if self.ident_is("clone") {
+            // `clone($o)` / `clone($o, [...])` — PHP 8.5's function
+            // form parses as a normal call to the `clone` builtin;
+            // bare `clone $o` stays the unary operator (R3 #13).
+            if matches!(self.peek2(), Some(Token::Op("("))) {
+                // Only a top-level `,` inside makes it the clone-with
+                // call form — otherwise the `(` groups the operand and
+                // postfix keeps growing into it: `clone (e)->m` is
+                // `clone((e)->m)` (oracle TypeError on `int given`),
+                // never a call result followed by `->m`.
+                if self.clone_paren_has_comma() {
+                    self.pos += 2;
+                    let args = self.args()?;
+                    // `clone($o, [...])->m` is a parse error in zend
+                    // ('unexpected token "->"'): the call-form parens
+                    // do not take postfix.
+                    if self.at_op("->") || self.at_op("?->") {
+                        return Err(PhpError::parse(
+                            format!(
+                                "syntax error, unexpected {}, expecting \")\"",
+                                self.describe()
+                            ),
+                            self.line(),
+                        ));
+                    }
+                    return Ok(Expr::Call {
+                        name: Box::new(Expr::Str("\u{1}clone".to_string())),
+                        args,
+                    });
+                }
+                self.pos += 1;
+                let e = self.unary()?;
+                return Ok(Expr::Clone(Box::new(e)));
+            }
             self.pos += 1;
             let e = self.unary()?;
             return Ok(Expr::Clone(Box::new(e)));
@@ -902,6 +1238,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        let lhs_start = self.pos;
         let mut e = self.postfix()?;
         // `instanceof` binds between unary and relational ops.
         while self.ident_is("instanceof") {
@@ -928,6 +1265,7 @@ impl<'a> Parser<'a> {
                         Some(Token::Op("&"))
                     ));
             if is_assign {
+                let op_pos = self.pos;
                 let mut op: &'static str = op;
                 self.pos += 1;
                 if op == "=" && self.eat_op("&") {
@@ -935,6 +1273,8 @@ impl<'a> Parser<'a> {
                 }
                 let rhs = self.assign()?;
                 let target = self.list_target(e)?;
+                self.check_list_ref_literal(op, &target, &rhs)?;
+                self.assign_target_gate(&target, op, lhs_start, op_pos)?;
                 return Ok(Expr::Assign {
                     target: Box::new(target),
                     op,
@@ -945,36 +1285,475 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
+    /// Zend rejects `['k' => $a, $b]`/`[$a, 'k' => $b]` — keyed and
+    /// unkeyed destructuring elements can't mix in one list.
+    fn list_mix_check(&self, items: &[Option<(Option<Expr>, Expr)>]) -> Result<(), PhpError> {
+        let mut keyed = false;
+        let mut unkeyed = false;
+        for it in items.iter().flatten() {
+            if it.0.is_some() {
+                keyed = true;
+            } else {
+                unkeyed = true;
+            }
+        }
+        if keyed && unkeyed {
+            return Err(PhpError::compile_fatal(
+                "Cannot mix keyed and unkeyed array entries in assignments",
+                self.line(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Any `&` element in the list — nested lists count too
+    /// (`list(list(&$x))` is a referenceable-value target).
+    fn list_has_ref(items: &[Option<(Option<Expr>, Expr)>]) -> bool {
+        items.iter().flatten().any(|(_, t)| match t {
+            Expr::ByRef(_) => true,
+            Expr::List(sub) => Self::list_has_ref(sub),
+            _ => false,
+        })
+    }
+
+    /// `[$a, &$b] = [..]` — a `&` element against a literal array RHS
+    /// is a zend compile fatal: temporaries can't be reference sources
+    /// (probe5j). `=` reaches the parser at both the statement and the
+    /// unary level, so both call sites check.
+    fn check_list_ref_literal(&self, op: &str, target: &Expr, rhs: &Expr) -> Result<(), PhpError> {
+        if op != "=" {
+            return Ok(());
+        }
+        let Expr::List(items) = target else {
+            return Ok(());
+        };
+        if !Self::list_has_ref(items) {
+            return Ok(());
+        }
+        let mut lit = rhs;
+        while let Expr::Paren(inner) = lit {
+            lit = inner;
+        }
+        if matches!(lit, Expr::ArrayLit(_) | Expr::List(_)) {
+            return Err(PhpError::compile_fatal(
+                "Cannot assign reference to non referenceable value",
+                self.line(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(in crate::parser) fn postfix(&mut self) -> Result<Expr, PhpError> {
-        let mut e = self.primary()?;
+        let start = self.pos;
+        let e = self.primary()?;
+        self.postfix_rest(e, start)
+    }
+
+    /// The RHS of `=&` / `foreach (.. as &..)` / `[&..]`: Zend's
+    /// `new_variable` grammar — a variable/call root followed by any
+    /// `->x`/`[x]`/`::x`/`(...)` links. Anything else is a parse error
+    /// (`unexpected integer`, `expecting "->"`, ...) and call roots in a
+    /// write context (foreach `&`) are a compile fatal.
+    pub(in crate::parser) fn ref_variable(&mut self, write_ctx: bool) -> Result<Expr, PhpError> {
+        use crate::ast::Expr::*;
+        const KW_REJECT: &[&str] = &[
+            "clone",
+            "function",
+            "fn",
+            "match",
+            "throw",
+            "print",
+            "echo",
+            "foreach",
+            "if",
+            "else",
+            "elseif",
+            "while",
+            "do",
+            "for",
+            "switch",
+            "return",
+            "global",
+            "unset",
+            "include",
+            "include_once",
+            "require",
+            "require_once",
+            "isset",
+            "empty",
+            "list",
+            "array",
+            "eval",
+            "exit",
+            "die",
+            "try",
+            "catch",
+            "finally",
+            "class",
+            "interface",
+            "trait",
+            "enum",
+            "extends",
+            "implements",
+            "use",
+            "namespace",
+            "declare",
+            "var",
+            "const",
+            "public",
+            "private",
+            "protected",
+            "abstract",
+            "final",
+            "readonly",
+            "instanceof",
+            "insteadof",
+            "or",
+            "and",
+            "xor",
+            "yield",
+            "goto",
+            "continue",
+            "break",
+        ];
+        let starter_ok = match self.peek() {
+            Some(Token::Variable(_))
+            | Some(Token::SimpleString(_))
+            | Some(Token::InterpString(_)) => true,
+            Some(Token::Op(o)) => matches!(*o, "$" | "$${" | "(" | "["),
+            Some(Token::Ident(n)) => !KW_REJECT.contains(&n.as_str()),
+            _ => false,
+        };
+        if !starter_ok {
+            let desc = match self.peek().cloned() {
+                Some(Token::Int(n)) => format!("integer \"{}\"", n),
+                Some(Token::Float(n)) => format!("floating-point number \"{}\"", n),
+                Some(Token::Ident(n)) => format!("token \"{}\"", n),
+                t => desc_t(t.as_ref()),
+            };
+            return Err(PhpError::parse(
+                format!("syntax error, unexpected {}", desc),
+                self.line(),
+            ));
+        }
+        // `new_variable` parens must be followed by a deref link —
+        // `=& ($x)` / `=& (f())` / `=& ($$v)` are parse errors while
+        // `(&$x)[0]` and `=& ($f)()` are legal (probe7 vs oracle).
+        if self.at_op("(") {
+            let mut depth = 0usize;
+            let mut i = self.pos;
+            while let Some(t) = self.toks.get(i).map(|l| &l.token) {
+                match t {
+                    Token::Op("(") => depth += 1,
+                    Token::Op(")") => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let next = self.toks.get(i + 1).map(|l| &l.token);
+            if !matches!(
+                next,
+                Some(Token::Op("["))
+                    | Some(Token::Op("->"))
+                    | Some(Token::Op("?->"))
+                    | Some(Token::Op("("))
+            ) {
+                return Err(PhpError::parse(
+                    format!(
+                        "syntax error, unexpected {}, expecting \"->\" or \"?->\" or \"[\"",
+                        desc_t(next)
+                    ),
+                    self.line(),
+                ));
+            }
+        }
+        // `& static` is only legal before `::` (`&static::$p` is a
+        // class-name reference). Before `function`/`fn` postfix would
+        // swallow it into a static closure — zend instead errors
+        // `unexpected token "function", expecting "::"` (probe15b).
+        if self.ident_is("static") && !matches!(self.peek2(), Some(Token::Op("::"))) {
+            let desc = match self.peek2().cloned() {
+                Some(Token::Int(n)) => format!("integer \"{}\"", n),
+                Some(Token::Float(n)) => format!("floating-point number \"{}\"", n),
+                Some(Token::Ident(n)) => format!("token \"{}\"", n),
+                t => desc_t(t.as_ref()),
+            };
+            return Err(PhpError::parse(
+                format!("syntax error, unexpected {}, expecting \"::\"", desc),
+                self.line(),
+            ));
+        }
+        let e = self.postfix()?;
+        // Deepest chain root: container of `x[...]`/`x->y`/`x->m()`.
+        // Parens are transparent for the ROOT search; a Call node is
+        // itself a legal root (`=& f()`, `=& ($f)()`), so call names
+        // are NOT unwrapped. `linked` = the OUTERMOST node is a real
+        // deref link — parens at the top level are NOT a
+        // `new_variable` (`=& ($x)`, `=& ($a[0])`, `=& (f())` all
+        // parse-error expecting "->"/"?->"/"[", while `(&$x)[0]` is
+        // legal because the link is outside).
+        let linked = matches!(&e, Index { .. } | Prop { .. } | MethodCall { .. });
+        let mut leaf: &Expr = &e;
+        loop {
+            leaf = match leaf {
+                Index { e: c, .. } | Prop { obj: c, .. } | MethodCall { obj: c, .. } => c.as_ref(),
+                Paren(inner) => inner.as_ref(),
+                _ => break,
+            };
+        }
+        let callish = |x: &Expr| -> Option<&'static str> {
+            match x {
+                MethodCall { .. } | StaticCall { .. } | StaticCallDyn { .. } => Some("method"),
+                Call { .. } | Fcc(_) => Some("function"),
+                _ => None,
+            }
+        };
+        if !linked {
+            // No deref link — zend's new_variable is a bare variable or
+            // a call, never a parenthesized expr (`=& ($x)` /
+            // `=& (f())` / `=& ($$v)` → parse error).
+            match &e {
+                Var(_) | VarVar(_) | StaticProp { .. } => {}
+                Call { .. }
+                | MethodCall { .. }
+                | StaticCall { .. }
+                | StaticCallDyn { .. }
+                | Fcc(_) => {
+                    if write_ctx {
+                        self.write_ctx_errs.push((
+                            format!(
+                                "Can't use {} return value in write context",
+                                callish(leaf).unwrap_or("function")
+                            ),
+                            self.line(),
+                        ));
+                    }
+                }
+                New { .. } => {
+                    // `new C` wants `(`, `new C()` wants a deref link.
+                    let had_parens = matches!(
+                        self.toks.get(self.pos.wrapping_sub(1)).map(|l| &l.token),
+                        Some(Token::Op(")"))
+                    );
+                    return Err(PhpError::parse(
+                        if had_parens {
+                            "syntax error, unexpected token \";\", expecting \"->\" or \"?->\" or \"[\""
+                        } else {
+                            "syntax error, unexpected token \";\", expecting \"(\""
+                        },
+                        self.line(),
+                    ));
+                }
+                _ => {
+                    // Unexpected token names the token following the
+                    // parsed root (`&self function` → 'function';
+                    // `&1` → ';', p15/n).
+                    let desc = match self.peek().cloned() {
+                        Some(Token::Int(n)) => format!("integer \"{}\"", n),
+                        Some(Token::Float(n)) => format!("floating-point number \"{}\"", n),
+                        Some(Token::Ident(n)) => format!("token \"{}\"", n),
+                        t => desc_t(t.as_ref()),
+                    };
+                    return Err(PhpError::parse(
+                        format!(
+                            "syntax error, unexpected {}, expecting \"->\" or \"?->\" or \"[\"",
+                            desc
+                        ),
+                        self.line(),
+                    ));
+                }
+            }
+        } else {
+            // A chain consumed at least one link — the ROOT must be a
+            // variable/call family; literal, string/interpolated-string
+            // and const-expr roots (`"abc"[0]`, `"a$v"[0]`, `true[0]`,
+            // `C::CONST[0]`, `new C()->x`) are a compile fatal —
+            // string literals are temporaries, not new_variables
+            // (probe6/6b vs oracle).
+            match leaf {
+                Var(_)
+                | VarVar(_)
+                | Call { .. }
+                | MethodCall { .. }
+                | StaticCall { .. }
+                | StaticCallDyn { .. }
+                | Fcc(_)
+                | Paren(_)
+                | StaticProp { .. } => {}
+                _ => {
+                    self.write_ctx_errs.push((
+                        "Cannot use temporary expression in write context".to_string(),
+                        self.line(),
+                    ));
+                }
+            }
+            // In write context (foreach `&`) a call-shaped OUTER node
+            // dies too — `&f()`, `&$o->m()`. A callish root under a
+            // deref (`&f()->x`) survives the leaf check but still dies.
+            let mut kind = callish(&e);
+            if kind.is_none() {
+                kind = callish(leaf);
+            }
+            if write_ctx {
+                if let Some(kind) = kind {
+                    self.write_ctx_errs.push((
+                        format!("Can't use {} return value in write context", kind),
+                        self.line(),
+                    ));
+                }
+            }
+        }
+        if Self::has_nullsafe(&e) {
+            if write_ctx {
+                self.write_ctx_errs.push((
+                    "Can't use nullsafe operator in write context".to_string(),
+                    self.line(),
+                ));
+            } else {
+                self.write_ctx_errs.push((
+                    "Cannot take reference of a nullsafe chain".to_string(),
+                    self.line(),
+                ));
+            }
+        }
+        Ok(e)
+    }
+
+    /// `e++`/`e--` operand gate — zend's `new_variable` write context:
+    /// a whole-parenthesized operand (`($x)++`, `(f())++`) and any
+    /// other non-variable expression parse-error `unexpected token
+    /// "++"`; call/method results are compile fatals (`Can't use
+    /// function/method return value in write context`); string,
+    /// literal and `new` chain roots are `Cannot use temporary
+    /// expression in write context`; nullsafe chains `Can't use
+    /// nullsafe operator in write context`.
+    fn incdec_operand(&mut self, e: Expr, op: &str, start: usize) -> Result<Expr, PhpError> {
+        use crate::ast::Expr::*;
+        // Whole operand wrapped in parens — the start `(` matches the
+        // token right before the operator (`self.pos - 1` is `++`/`--`
+        // itself at this point).
+        if matches!(self.toks.get(start).map(|l| &l.token), Some(Token::Op("("))) {
+            let mut depth = 0usize;
+            let mut matched = None;
+            for (i, t) in self.toks.iter().enumerate().skip(start) {
+                match &t.token {
+                    Token::Op("(") => depth += 1,
+                    Token::Op(")") => {
+                        depth -= 1;
+                        if depth == 0 {
+                            matched = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if matched == Some(self.pos - 2) {
+                return Err(PhpError::parse(
+                    format!("syntax error, unexpected token \"{}\"", op),
+                    self.line(),
+                ));
+            }
+        }
+        if Self::has_nullsafe(&e) {
+            self.write_ctx_errs.push((
+                "Can't use nullsafe operator in write context".to_string(),
+                self.line(),
+            ));
+        }
+        // `++$x++` / `++$o->m()++` — the operand is already a
+        // composite `expr`, so the trailing operator can't reduce:
+        // zend yacc errors `unexpected token "++"`.
+        if start > 0
+            && matches!(
+                self.toks.get(start - 1).map(|l| &l.token),
+                Some(Token::Op("++")) | Some(Token::Op("--"))
+            )
+        {
+            return Err(PhpError::parse(
+                format!("syntax error, unexpected token \"{}\"", op),
+                self.line(),
+            ));
+        }
+        let linked = matches!(&e, Index { .. } | Prop { .. } | MethodCall { .. });
+        // `$o->m()++` — the ++ targets a method result directly:
+        // zend's write-context check rejects it.
+        if matches!(&e, MethodCall { .. }) {
+            self.write_ctx_errs.push((
+                "Can't use method return value in write context".to_string(),
+                self.line(),
+            ));
+        }
+        if linked {
+            let mut leaf = &e;
+            loop {
+                leaf = match leaf {
+                    Index { e: c, .. } | Prop { obj: c, .. } | MethodCall { obj: c, .. } => {
+                        c.as_ref()
+                    }
+                    Paren(inner) => inner.as_ref(),
+                    _ => break,
+                };
+            }
+            match leaf {
+                Var(_)
+                | VarVar(_)
+                | Call { .. }
+                | MethodCall { .. }
+                | StaticCall { .. }
+                | StaticCallDyn { .. }
+                | Fcc(_)
+                | Paren(_)
+                | StaticProp { .. } => {}
+                _ => {
+                    self.write_ctx_errs.push((
+                        "Cannot use temporary expression in write context".to_string(),
+                        self.line(),
+                    ));
+                }
+            }
+        } else {
+            match &e {
+                Var(_) | VarVar(_) | StaticProp { .. } => {}
+                Call { .. } | Fcc(_) => self.write_ctx_errs.push((
+                    "Can't use function return value in write context".to_string(),
+                    self.line(),
+                )),
+                MethodCall { .. } | StaticCall { .. } | StaticCallDyn { .. } => {
+                    self.write_ctx_errs.push((
+                        "Can't use method return value in write context".to_string(),
+                        self.line(),
+                    ))
+                }
+                _ => {
+                    return Err(PhpError::parse(
+                        format!("syntax error, unexpected token \"{}\"", op),
+                        self.line(),
+                    ))
+                }
+            }
+        }
+        Ok(e)
+    }
+
+    pub(in crate::parser) fn postfix_rest(
+        &mut self,
+        mut e: Expr,
+        start: usize,
+    ) -> Result<Expr, PhpError> {
         loop {
             if self.eat_op("++") {
-                if matches!(
-                    e,
-                    Expr::Call { .. }
-                        | Expr::MethodCall { .. }
-                        | Expr::StaticCall { .. }
-                        | Expr::StaticCallDyn { .. }
-                ) {
-                    return Err(PhpError::compile_fatal(
-                        "Can't use method return value in write context",
-                        self.line(),
-                    ));
-                }
+                e = self.incdec_operand(e, "++", start)?;
+
                 e = Expr::PostInc(Box::new(e));
             } else if self.eat_op("--") {
-                if matches!(
-                    e,
-                    Expr::Call { .. }
-                        | Expr::MethodCall { .. }
-                        | Expr::StaticCall { .. }
-                        | Expr::StaticCallDyn { .. }
-                ) {
-                    return Err(PhpError::compile_fatal(
-                        "Can't use method return value in write context",
-                        self.line(),
-                    ));
-                }
+                e = self.incdec_operand(e, "--", start)?;
+
                 e = Expr::PostDec(Box::new(e));
             } else if self.eat_op("[") {
                 let i = if self.at_op("]") {
@@ -985,7 +1764,10 @@ impl<'a> Parser<'a> {
                 self.expect_op("]")?;
                 e = Expr::Index { e: Box::new(e), i };
             } else if self.eat_op("(") {
-                let args = self.args()?;
+                // `list($a, &$b)` is the one call site zend's grammar
+                // allows `&` elements in (destructuring builtin).
+                let is_list = matches!(&e, Expr::Str(n) if n.eq_ignore_ascii_case("list"));
+                let args = self.args_flags(is_list)?;
                 e = Self::fcc_wrap(Expr::Call {
                     name: Box::new(e),
                     args,
@@ -1011,6 +1793,99 @@ impl<'a> Parser<'a> {
                     };
                 }
             } else if self.eat_op("::") {
+                // `parent::` inside a non-trait class with no parent is
+                // zend's compile-time fatal — the whole file fails
+                // before executing (p15/t/ch vs oracle). Traits defer
+                // the check to the using class, and closures defer it
+                // to invocation (catchable Error).
+                if let Expr::Const(n) = &e {
+                    if self.const_ctx == ConstCtx::ArrowSlot
+                        && matches!(
+                            n.to_ascii_lowercase().as_str(),
+                            "self" | "static" | "parent"
+                        )
+                    {
+                        return Err(PhpError::compile_fatal(
+                            "Constant expression contains invalid operations",
+                            self.line(),
+                        ));
+                    }
+                    if self.const_ctx == ConstCtx::Slot {
+                        // Compile-time constants: a static PROP in the
+                        // slot is zend's invalid-operations fatal
+                        // regardless of the class side (`F::$p`,
+                        // `static::$p`, `self::$p` all die the same
+                        // way vs oracle). A `::` CALL defers like a
+                        // constant fetch — `F::m(...)` FCC inits
+                        // lazily (unknown class → 'Class "F" not
+                        // found' at eval), and `self::`/`parent::`
+                        // defer their scope checks to the slot's
+                        // runtime eval (catchable at call/init). Only
+                        // `static::` is the compile fatal, and the
+                        // wording splits on the member kind:
+                        // `static::m(...)`/`static::$p` get
+                        // '"static"', bare `static::K` gets
+                        // '"static::"'.
+                        if matches!(self.peek(), Some(Token::Variable(_)) | Some(Token::Op("$"))) {
+                            return Err(PhpError::compile_fatal(
+                                "Constant expression contains invalid operations",
+                                self.line(),
+                            ));
+                        }
+                        if n.eq_ignore_ascii_case("static")
+                            && !matches!(self.peek(), Some(Token::Ident(m)) if m == "class")
+                        {
+                            // `static::class` falls through to the
+                            // class-name-resolution gate below.
+                            let msg = if matches!(self.peek(), Some(Token::Ident(_)))
+                                && matches!(self.peek2(), Some(Token::Op("(")))
+                            {
+                                "\"static\" is not allowed in compile-time constants"
+                            } else {
+                                "\"static::\" is not allowed in compile-time constants"
+                            };
+                            return Err(PhpError::compile_fatal(msg, self.line()));
+                        }
+                    } else if self.const_ctx == ConstCtx::Runtime {
+                        // Inside a NAMED function there is no class scope at
+                        // all — `self::`/`static::`/`parent::` in any member
+                        // position is the 'Cannot use "X" when no class
+                        // scope is active' compile fatal (at top level the
+                        // same stays a runtime catchable Error).
+                        if matches!(
+                            n.to_ascii_lowercase().as_str(),
+                            "self" | "static" | "parent"
+                        ) && self.in_named_fn
+                            && self.class_ctx.is_empty()
+                            && !self.in_closure
+                        {
+                            return Err(PhpError::compile_fatal(
+                                format!("Cannot use \"{}\" when no class scope is active", n),
+                                self.line(),
+                            ));
+                        }
+                        // `parent::$p::get()/set()` hook syntax bypasses
+                        // the generic no-parent fatal — the hook-ctx
+                        // gate after the member decides (a missing
+                        // parent then defers to a thrown Error at hook
+                        // invocation).
+                        if n.eq_ignore_ascii_case("parent")
+                            && self.class_ctx.last().map(|c| !c.1 && !c.0).unwrap_or(false)
+                            && !self.in_closure
+                            && !matches!(
+                                self.peek(),
+                                Some(Token::Variable(_))
+                                    | Some(Token::Op("$"))
+                                    | Some(Token::Op("{"))
+                            )
+                        {
+                            return Err(PhpError::compile_fatal(
+                                "Cannot use \"parent\" when current class scope has no parent",
+                                self.line(),
+                            ));
+                        }
+                    }
+                }
                 if self.at_op("(") {
                     // `expr::(...)` first-class-callable-ish — unsupported
                     return Err(PhpError::parse("syntax error, unexpected (", self.line()));
@@ -1018,6 +1893,59 @@ impl<'a> Parser<'a> {
                 match self.next() {
                     Some(Token::Ident(n)) => {
                         if n == "class" {
+                            // `X::class` in a const slot is compile-time
+                            // class-name resolution, not a deferrable
+                            // constant: classless named-fn defaults die
+                            // 'Cannot use "X" when no class scope is
+                            // active'; `static::class` anywhere else in
+                            // the slot dies 'cannot be used for
+                            // compile-time class name resolution'; a
+                            // parentless class's `parent::class` is the
+                            // no-parent compile fatal (all oracle-probed;
+                            // closures and non-fn slots defer to runtime).
+                            if self.const_ctx == ConstCtx::Slot {
+                                if let Expr::Const(cn) = &e {
+                                    let kw = cn.to_ascii_lowercase();
+                                    let classless_named = self.in_named_fn
+                                        && self.class_ctx.is_empty()
+                                        && !self.in_closure;
+                                    match kw.as_str() {
+                                        "static" => {
+                                            return Err(PhpError::compile_fatal(
+                                                if classless_named {
+                                                    "Cannot use \"static\" when no class scope is active".to_string()
+                                                } else {
+                                                    "static::class cannot be used for compile-time class name resolution".to_string()
+                                                },
+                                                self.line(),
+                                            ));
+                                        }
+                                        "self" | "parent" if classless_named => {
+                                            return Err(PhpError::compile_fatal(
+                                                format!(
+                                                    "Cannot use \"{}\" when no class scope is active",
+                                                    kw
+                                                ),
+                                                self.line(),
+                                            ));
+                                        }
+                                        "parent"
+                                            if self
+                                                .class_ctx
+                                                .last()
+                                                .map(|c| !c.1 && !c.0)
+                                                .unwrap_or(false)
+                                                && !self.in_closure =>
+                                        {
+                                            return Err(PhpError::compile_fatal(
+                                                "Cannot use \"parent\" when current class scope has no parent",
+                                                self.line(),
+                                            ));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                             e = Expr::ClassConst {
                                 class: Box::new(e),
                                 name: "class".into(),
@@ -1190,6 +2118,24 @@ impl<'a> Parser<'a> {
                         ))
                     }
                 }
+            } else if self.at_op("=") && matches!(self.peek2(), Some(Token::Op("&"))) {
+                // `expr =& variable` — the `&` binds tighter than any
+                // op that can follow (`?`, `??`, binary ops keep going
+                // on the Assign node). The RHS is Zend's restricted
+                // `new_variable` grammar, not a full expression.
+                let eq_pos = self.pos;
+                self.pos += 2;
+                let rhs = self.ref_variable(false)?;
+                let target = self.list_target(e)?;
+                // Non-lvalue =& targets are zend's parse error at the
+                // `=` (`($c ? $a : $b) =& $x`, finding 16) — the gate
+                // normalizes '=&' to '=' for the message.
+                self.assign_target_gate(&target, "=&", start, eq_pos)?;
+                e = Expr::Assign {
+                    target: Box::new(target),
+                    op: "=&",
+                    value: Box::new(rhs),
+                };
             } else {
                 return Ok(e);
             }
@@ -1202,6 +2148,15 @@ impl<'a> Parser<'a> {
         match e {
             Expr::MethodCall { obj, nullsafe, .. } => *nullsafe || Self::has_nullsafe(obj),
             Expr::Prop { obj, nullsafe, .. } => *nullsafe || Self::has_nullsafe(obj),
+            // Chain positions only — arg lists are independent exprs.
+            Expr::Index { e, .. } => Self::has_nullsafe(e),
+            Expr::Paren(inner) => Self::has_nullsafe(inner),
+            Expr::Call { name, .. } => Self::has_nullsafe(name),
+            Expr::StaticCall { class, .. }
+            | Expr::StaticCallDyn { class, .. }
+            | Expr::StaticProp { class, .. }
+            | Expr::ClassConst { class, .. } => Self::has_nullsafe(class),
+            Expr::Fcc(inner) => Self::has_nullsafe(inner),
             _ => false,
         }
     }
@@ -1244,6 +2199,12 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn args(&mut self) -> Result<Vec<Expr>, PhpError> {
+        self.args_flags(false)
+    }
+
+    /// `list($a, &$b)` — zend's destructuring builtin accepts `&`
+    /// elements; every other call site rejects them at parse time.
+    pub(in crate::parser) fn args_flags(&mut self, allow_ref: bool) -> Result<Vec<Expr>, PhpError> {
         let mut args = Vec::new();
         let mut unpacked = false;
         let mut seen_named = false;
@@ -1293,7 +2254,30 @@ impl<'a> Parser<'a> {
                         self.line(),
                     ));
                 }
-                args.push(self.expr()?);
+                if allow_ref && self.at_op("&") {
+                    self.pos += 1;
+                    args.push(Expr::ByRef(Box::new(self.ref_variable(false)?)));
+                } else {
+                    let e = self.expr()?;
+                    // `list('k' => $v)` — keyed elements carry the key
+                    // expr on a transient `=>` binary; list_target
+                    // converts it to a keyed List element.
+                    if allow_ref && self.eat_op("=>") {
+                        let t = if self.at_op("&") {
+                            self.pos += 1;
+                            Expr::ByRef(Box::new(self.ref_variable(false)?))
+                        } else {
+                            self.expr()?
+                        };
+                        args.push(Expr::Binary {
+                            op: "=>",
+                            l: Box::new(e),
+                            r: Box::new(t),
+                        });
+                    } else {
+                        args.push(e);
+                    }
+                }
             }
             if !self.eat_op(",") {
                 break;
@@ -1528,10 +2512,82 @@ impl<'a> Parser<'a> {
                 } else if self.ident_is("new") {
                     self.pos += 1;
                     let (class, mut ctor_args) = self.new_class_expr()?;
+                    // `new parent()` in a parentless class — same
+                    // compile-time gate as `parent::` (p10new/ch3);
+                    // inside a closure it defers to the runtime Error.
+                    if let Expr::Const(n) = &class {
+                        if self.const_ctx == ConstCtx::ArrowSlot
+                            && matches!(
+                                n.to_ascii_lowercase().as_str(),
+                                "self" | "static" | "parent"
+                            )
+                        {
+                            return Err(PhpError::compile_fatal(
+                                "Constant expression contains invalid operations",
+                                self.line(),
+                            ));
+                        }
+                        if self.const_ctx == ConstCtx::Slot {
+                            // `new static` in a const slot — the
+                            // const-expr compile fatal (no `::`); `new
+                            // self()`/`new parent()` defer to runtime.
+                            if n.eq_ignore_ascii_case("static") {
+                                return Err(PhpError::compile_fatal(
+                                    "\"static\" is not allowed in compile-time constants",
+                                    self.line(),
+                                ));
+                            }
+                        } else if self.const_ctx == ConstCtx::Runtime {
+                            // `new self()`/`new static()`/`new parent()`
+                            // inside a named function — no class scope:
+                            // 'Cannot use "X" when no class scope is active'
+                            // (k12). Same gate as the `X::` postfix.
+                            if matches!(
+                                n.to_ascii_lowercase().as_str(),
+                                "self" | "static" | "parent"
+                            ) && self.in_named_fn
+                                && self.class_ctx.is_empty()
+                                && !self.in_closure
+                            {
+                                return Err(PhpError::compile_fatal(
+                                    format!("Cannot use \"{}\" when no class scope is active", n),
+                                    self.line(),
+                                ));
+                            }
+                            if n.eq_ignore_ascii_case("parent")
+                                && self.class_ctx.last().map(|c| !c.1 && !c.0).unwrap_or(false)
+                                && !self.in_closure
+                            {
+                                return Err(PhpError::compile_fatal(
+                                    "Cannot use \"parent\" when current class scope has no parent",
+                                    self.line(),
+                                ));
+                            }
+                        }
+                    }
+                    let mut ctor_parens = false;
                     if self.at_op("(") {
                         self.pos += 1;
                         ctor_args = self.args()?;
                         self.check_no_fcc_ctor(&ctor_args)?;
+                        ctor_parens = true;
+                    }
+                    // A bare `new A` (no ctor parens) can't chain member
+                    // access — zend parse-errors on the next op:
+                    // 'unexpected token "->"' (parens or `new A()` do
+                    // chain: `(new A)->x`, `new A()->x` — m15 vs oracle).
+                    // `new class{...}` is a completed value expr —
+                    // the anonymous-class body closes it, so
+                    // ->/?->/[ postfixes chain freely (probe m2).
+                    if !ctor_parens && !matches!(class, Expr::AnonClass(_)) {
+                        if let Some(Token::Op(o)) = self.peek() {
+                            if matches!(&**o, "->" | "?->" | "[") {
+                                return Err(PhpError::parse(
+                                    format!("syntax error, unexpected token \"{}\"", o),
+                                    self.line(),
+                                ));
+                            }
+                        }
                     }
                     Ok(Expr::New {
                         class: Box::new(class),
@@ -1549,12 +2605,35 @@ impl<'a> Parser<'a> {
                             self.pos += 1;
                             continue;
                         }
-                        items.push(Some(self.expr()?));
+                        // `list($a, &$b)` — zend's destructuring `&`
+                        // element (probe5b): binds the source cell.
+                        if self.at_op("&") {
+                            self.pos += 1;
+                            items.push(Some((
+                                None,
+                                Expr::ByRef(Box::new(self.ref_variable(false)?)),
+                            )));
+                        } else {
+                            let e = self.expr()?;
+                            if self.eat_op("=>") {
+                                // `list('k' => $v)` — a keyed element.
+                                let t = if self.at_op("&") {
+                                    self.pos += 1;
+                                    Expr::ByRef(Box::new(self.ref_variable(false)?))
+                                } else {
+                                    self.expr()?
+                                };
+                                items.push(Some((Some(e), t)));
+                            } else {
+                                items.push(Some((None, e)));
+                            }
+                        }
                         if !self.eat_op(",") {
                             break;
                         }
                     }
                     self.expect_op(")")?;
+                    self.list_mix_check(&items)?;
                     Ok(Expr::List(items))
                 } else if self.ident_is("include")
                     || self.ident_is("include_once")
@@ -1743,7 +2822,7 @@ impl<'a> Parser<'a> {
         if self.eat_op("...") {
             Ok(Expr::Unpack(Box::new(self.expr()?)))
         } else if self.eat_op("&") {
-            Ok(Expr::ByRef(Box::new(self.expr()?)))
+            Ok(Expr::ByRef(Box::new(self.ref_variable(false)?)))
         } else {
             self.expr()
         }

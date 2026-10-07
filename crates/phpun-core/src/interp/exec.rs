@@ -401,7 +401,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let mut d = d.clone();
-                d.file = self.cur_file.clone();
+                d.file = self.diag_file();
                 self.functions.insert(key, Rc::new(d));
                 Flow::Normal
             }
@@ -430,6 +430,9 @@ impl<'a> Interp<'a> {
                     return Flow::Normal;
                 }
                 if let Some((kind, file, line)) = self.existing_class_site(&key) {
+                    // The message names the EXISTING decl's kind
+                    // (`interface I {} class I {}` → 'Cannot redeclare
+                    // interface I').
                     let e = self.decl_fatal_ctx(PhpError::fatal(
                         Self::redeclare_class_msg(kind, &d.name, &file, line),
                         self.cur_line,
@@ -556,7 +559,10 @@ impl<'a> Interp<'a> {
                         }
                         if matches!(
                             e,
-                            Expr::Call { .. } | Expr::MethodCall { .. } | Expr::StaticCall { .. }
+                            Expr::Call { .. }
+                                | Expr::MethodCall { .. }
+                                | Expr::StaticCall { .. }
+                                | Expr::StaticCallDyn { .. }
                         ) {
                             // `return &f()` chains through when callee returns
                             // by reference (returnByReference.006/009).
@@ -643,8 +649,8 @@ impl<'a> Interp<'a> {
                                 if let Some(arr) = self.globals_arr.clone() {
                                     // The borrow must end before the
                                     // evicted payload's dtors run.
-                                    let evicted =
-                                        arr.borrow_mut().unset(&ArrKey::Str(Rc::from(n.as_str())));
+                                    let ak = ArrKey::Str(Rc::from(n.as_str()));
+                                    let evicted = arr.borrow_mut().unset(&ak);
                                     if let Some(v) = evicted {
                                         if let Err(e) = self.destruct_dying_value(&v) {
                                             return self.err_flow(e);
@@ -774,7 +780,13 @@ impl<'a> Interp<'a> {
                         e.trace = Some(self.compile_err_frames());
                         return self.err_flow(e);
                     }
-                    match self.eval_const(e) {
+                    // A top-level `const X = <expr>` decl evaluates its
+                    // initializer eagerly in {main} — zend only enters
+                    // the lazy const-expr context (its `[constant
+                    // expression]()` pseudo-frame) for class-init
+                    // exprs (prop/static/class-const), not here.
+                    let v = self.eval_const(e);
+                    match v {
                         Ok(v) => self.define_const(n, v),
                         Err(e) => return self.err_flow(e),
                     }
@@ -985,13 +997,45 @@ impl<'a> Interp<'a> {
             e.trace = Some(self.compile_err_frames());
             return self.err_flow(e);
         }
-        let src = match self.eval(arr) {
-            Ok(v) => v,
-            Err(e) => return self.err_flow(e),
+        // Diagnostics raised while destructuring an element attribute
+        // to the foreach statement itself — capture its line before
+        // `arr` evaluation drifts cur_line into arg positions.
+        let stmt_line = self.cur_line;
+        // A `&` target fetches the source as a writable cell — zend's
+        // 'Cannot indirectly modify readonly property' surfaces here
+        // (`foreach ($r->a as &$v)`, finding 8), and prop/index
+        // sources iterate their real cells.
+        let mut arr_e = arr;
+        while let Expr::Paren(inner) = arr_e {
+            arr_e = inner.as_ref();
+        }
+        let cell_src = Self::foreach_target_by_ref(val)
+            && matches!(
+                arr_e,
+                Expr::Prop { .. } | Expr::StaticProp { .. } | Expr::Index { .. } | Expr::VarVar(_)
+            );
+        let src = if cell_src {
+            // A `&` source is a by-ref bind — uninitialized typed props
+            // report the 'by reference'/'undeclared' catchable.
+            let was = std::mem::replace(&mut self.foreach_by_ref, true);
+            let c = self.eval_cell(arr);
+            self.foreach_by_ref = was;
+            match c {
+                Ok(c) => c.borrow().clone(),
+                Err(e) => return self.err_flow(e),
+            }
+        } else {
+            match self.eval(arr) {
+                Ok(v) => v,
+                Err(e) => return self.err_flow(e),
+            }
         };
         match src {
             Value::Array(rc) => {
-                let by_ref = matches!(val, ForeachTarget::ByRef(_));
+                // `foreach ($arr as [&$p, $q])` iterates by reference
+                // too — the `&` inside the list target binds the row's
+                // real element cells, so writes reach $arr.
+                let by_ref = Self::foreach_target_by_ref(val);
                 // `&$v` foreach iterates the live array — appends and
                 // removals during the loop are observed (foreachLoop.009).
                 let live = by_ref;
@@ -1054,24 +1098,38 @@ impl<'a> Interp<'a> {
                         }
                         match val {
                             ForeachTarget::Var(n) => {
-                                if let Err(e) = self.var_set(n, c.borrow().clone()) {
+                                // Hoist the clone: after `as &$v` the var
+                                // slot can alias this same cell — an inline
+                                // `c.borrow()` would outlive var_set and
+                                // panic (probe12b).
+                                let v = c.borrow().clone();
+                                if let Err(e) = self.var_set(n, v) {
                                     break self.err_flow(e);
                                 }
                             }
-                            ForeachTarget::ByRef(n) => {
+                            ForeachTarget::ByRef(e) => {
                                 if let Some(f) = self.readonly_ref_error(&c) {
                                     break f;
                                 }
                                 // zend leaves the element IS_REFERENCE
                                 // — post-loop copies re-bind it.
-                                self.mark_ref(&c);
-                                self.cur().vars.insert(n.clone(), c);
+                                match self.bind_cell(e, c) {
+                                    Ok(()) => {}
+                                    Err(e2) => break self.err_flow(e2),
+                                }
                             }
                             ForeachTarget::Lvalue(e) => {
-                                let _ = self.store(e, c.borrow().clone());
+                                let v = c.borrow().clone();
+                                match self.store(e, v) {
+                                    Ok(()) => {}
+                                    Err(e2) => break self.err_flow(e2),
+                                }
                             }
                             ForeachTarget::List(items) => {
-                                if self.foreach_list(items, &c.borrow().clone()).is_err() {}
+                                match self.foreach_list(items, &c, stmt_line) {
+                                    Ok(()) => {}
+                                    Err(e2) => break self.err_flow(e2),
+                                }
                             }
                         }
                         match self.exec_loop_body(body) {
@@ -1092,10 +1150,21 @@ impl<'a> Interp<'a> {
                     rc.borrow().iter().cloned().collect()
                 } else {
                     // .iter() skips tombstoned buckets — a value-foreach
-                    // never sees shifted/unset elements.
+                    // never sees shifted/unset elements. IS_REFERENCE
+                    // elements stay LIVE: zend reads the real bucket,
+                    // so writes through a held alias are observed and a
+                    // `&$v`-bound var writes back into the array
+                    // (probe12c/p12e vs oracle).
                     rc.borrow()
                         .iter()
-                        .map(|(k, c)| (k.clone(), cell(c.borrow().clone())))
+                        .map(|(k, c)| {
+                            let cc = if self.is_ref_cell(c) {
+                                c.clone()
+                            } else {
+                                cell(c.borrow().clone())
+                            };
+                            (k.clone(), cc)
+                        })
                         .collect()
                 };
                 for (idx, (k, c)) in snapshot.into_iter().enumerate() {
@@ -1107,21 +1176,36 @@ impl<'a> Interp<'a> {
                     }
                     match val {
                         ForeachTarget::Var(n) => {
-                            if let Err(e) = self.var_set(n, c.borrow().clone()) {
+                            // Hoist the clone: after `as &$v` the var
+                            // slot can alias this same cell — an inline
+                            // `c.borrow()` would outlive var_set and
+                            // panic (probe12b).
+                            let v = c.borrow().clone();
+                            if let Err(e) = self.var_set(n, v) {
                                 return self.err_flow(e);
                             }
                         }
-                        ForeachTarget::ByRef(n) => {
+                        ForeachTarget::ByRef(e) => {
                             if let Some(f) = self.readonly_ref_error(&c) {
                                 return f;
                             }
-                            self.cur().vars.insert(n.clone(), c);
+                            match self.bind_cell(e, c) {
+                                Ok(()) => {}
+                                Err(e2) => return self.err_flow(e2),
+                            }
                         }
                         ForeachTarget::Lvalue(e) => {
-                            let _ = self.store(e, c.borrow().clone());
+                            let v = c.borrow().clone();
+                            match self.store(e, v) {
+                                Ok(()) => {}
+                                Err(e2) => return self.err_flow(e2),
+                            }
                         }
                         ForeachTarget::List(items) => {
-                            if self.foreach_list(items, &c.borrow().clone()).is_err() {}
+                            match self.foreach_list(items, &c, stmt_line) {
+                                Ok(()) => {}
+                                Err(e2) => return self.err_flow(e2),
+                            }
                         }
                     }
                     match self.exec_loop_body(body) {
@@ -1153,7 +1237,7 @@ impl<'a> Interp<'a> {
                             }
                             // getIterator() must return a Traversable.
                             Value::Object(io) if self.obj_is_a(&io, "Iterator") => {
-                                return self.exec_foreach_iter(io, key, val, body);
+                                return self.exec_foreach_iter(io, key, val, body, stmt_line);
                             }
                             _ => {
                                 let cls_name = cur.borrow().class.name().to_string();
@@ -1187,7 +1271,7 @@ impl<'a> Interp<'a> {
                         let e = self.throw(v);
                         return self.err_flow(e);
                     }
-                    return self.exec_foreach_iter(o.clone(), key, val, body);
+                    return self.exec_foreach_iter(o.clone(), key, val, body, stmt_line);
                 }
                 // Plain object: iterate the property table in
                 // declaration order — backed slots plus *virtual* hooked
@@ -1374,19 +1458,50 @@ impl<'a> Interp<'a> {
                     }
                     match val {
                         ForeachTarget::Var(n) => {
-                            if let Err(e) = self.var_set(n, c.borrow().clone()) {
+                            // Hoist the clone: after `as &$v` the var
+                            // slot can alias this same cell — an inline
+                            // `c.borrow()` would outlive var_set and
+                            // panic (probe12b).
+                            let v = c.borrow().clone();
+                            if let Err(e) = self.var_set(n, v) {
                                 return self.err_flow(e);
                             }
                         }
-                        ForeachTarget::ByRef(n) => {
-                            self.mark_ref(&c);
-                            self.cur().vars.insert(n.clone(), c.clone());
+                        ForeachTarget::ByRef(e) => {
+                            // `foreach($o as &$v)` can't hand out a
+                            // reference to a readonly property —
+                            // 'Cannot acquire reference to readonly
+                            // property C::$p' (probe12a vs oracle).
+                            if let Some((pd, dcls)) = self.decl_prop(&o, &dname) {
+                                if pd.readonly {
+                                    let v = self.exception(
+                                        "Error",
+                                        &format!(
+                                            "Cannot acquire reference to readonly property {}::${}",
+                                            dcls.name(),
+                                            dname
+                                        ),
+                                    );
+                                    let e = self.throw(v);
+                                    return self.err_flow(e);
+                                }
+                            }
+                            match self.bind_cell(e, c.clone()) {
+                                Ok(()) => {}
+                                Err(e2) => return self.err_flow(e2),
+                            }
                         }
                         ForeachTarget::Lvalue(e) => {
-                            let _ = self.store(e, c.borrow().clone());
+                            let v = c.borrow().clone();
+                            match self.store(e, v) {
+                                Ok(()) => {}
+                                Err(e2) => return self.err_flow(e2),
+                            }
                         }
                         ForeachTarget::List(items) => {
-                            let _ = self.foreach_list(items, &c.borrow().clone());
+                            if let Err(e2) = self.foreach_list(items, &c, stmt_line) {
+                                return self.err_flow(e2);
+                            }
                         }
                     }
                     match self.exec_loop_body(body) {
@@ -1433,8 +1548,9 @@ impl<'a> Interp<'a> {
         key: &Option<ForeachKey>,
         val: &ForeachTarget,
         body: &[Stmt],
+        stmt_line: usize,
     ) -> Flow {
-        let f = self.exec_foreach_iter_loop(it.clone(), key, val, body);
+        let f = self.exec_foreach_iter_loop(it.clone(), key, val, body, stmt_line);
         // The iterator's temp dies with the foreach — a `new` captured
         // only by the iteration frees here, not at statement end
         // (typed_properties_115: its prop cells must unalias before a
@@ -1472,6 +1588,7 @@ impl<'a> Interp<'a> {
         key: &Option<ForeachKey>,
         val: &ForeachTarget,
         body: &[Stmt],
+        stmt_line: usize,
     ) -> Flow {
         if let Err(e) = self.iter_call(&it, "rewind") {
             return self.err_flow(e);
@@ -1531,14 +1648,20 @@ impl<'a> Interp<'a> {
                     if let Some(f) = self.readonly_ref_error(&c) {
                         return f;
                     }
-                    self.mark_ref(&c);
-                    self.cur().vars.insert(n.clone(), c);
+                    match self.bind_cell(n, c) {
+                        Ok(()) => {}
+                        Err(e2) => return self.err_flow(e2),
+                    }
                 }
                 ForeachTarget::Lvalue(e) => {
-                    let _ = self.store(e, v);
+                    if let Err(e2) = self.store(e, v) {
+                        return self.err_flow(e2);
+                    }
                 }
                 ForeachTarget::List(items) => {
-                    let _ = self.foreach_list(items, &v);
+                    if let Err(e2) = self.foreach_list(items, &cell(v), stmt_line) {
+                        return self.err_flow(e2);
+                    }
                 }
             }
             match self.exec_loop_body(body) {
@@ -1556,20 +1679,232 @@ impl<'a> Interp<'a> {
         Flow::Normal
     }
 
-    fn foreach_list(&mut self, items: &[Option<ForeachTarget>], v: &Value) -> Result<(), PhpError> {
-        if let Value::Array(a) = v {
-            let a = a.borrow();
-            for (i, t) in items.iter().enumerate() {
-                if let Some(t) = t {
-                    let iv = a.get(&ArrKey::Int(i as i64)).unwrap_or(Value::Null);
+    /// Whether a foreach value target binds by reference anywhere —
+    /// `&$v` itself or any `&` inside a list-destructure
+    /// (`foreach ($arr as [&$p, $q])` iterates the array by-ref).
+    fn foreach_target_by_ref(t: &ForeachTarget) -> bool {
+        match t {
+            ForeachTarget::ByRef(_) => true,
+            ForeachTarget::List(items) => items
+                .iter()
+                .flatten()
+                .any(|(_, t)| Self::foreach_target_by_ref(t)),
+            _ => false,
+        }
+    }
+
+    /// `Undefined array key` warn for a missing row element —
+    /// zend quotes string keys.
+    fn foreach_missing_key(&mut self, key: &ArrKey) -> Result<(), PhpError> {
+        match key {
+            ArrKey::Str(s) => self.warn(&format!("Undefined array key \"{}\"", s)),
+            ArrKey::Int(i) => self.warn(&format!("Undefined array key {}", i)),
+            ArrKey::Tomb => Ok(()),
+        }
+    }
+
+    /// Positional/keyed destructuring of a foreach row. `&` elements
+    /// bind the row's real element cell — a missing key auto-creates a
+    /// null reference silently — while plain elements read the value
+    /// and warn `Undefined array key N` on a miss (zend list-in-foreach
+    /// semantics). Non-array rows follow zend's matrix: objects (and
+    /// scalars/strings under a `&` element) raise catchable Errors, a
+    /// plain list on a scalar warns `Cannot use T as array`, and null
+    /// is silent — a `&` element auto-vivifies the null row to an
+    /// array first.
+    fn foreach_list(
+        &mut self,
+        items: &[Option<(Option<Expr>, ForeachTarget)>],
+        c: &Cell,
+        line: usize,
+    ) -> Result<(), PhpError> {
+        self.foreach_list_q(items, c, line, false)
+    }
+
+    /// `quiet` suppresses 'Undefined array key' — set for a nested
+    /// list's freshly auto-vivified intermediate (`[&$x]` on a
+    /// missing slot creates `[]` and inner plain reads stay silent,
+    /// matching zend's write-reference fetch).
+    fn foreach_list_q(
+        &mut self,
+        items: &[Option<(Option<Expr>, ForeachTarget)>],
+        c: &Cell,
+        line: usize,
+        quiet: bool,
+    ) -> Result<(), PhpError> {
+        // Zend attributes destructure diagnostics to the foreach stmt.
+        self.cur_line = line;
+        let needs_ref = items
+            .iter()
+            .flatten()
+            .any(|(_, t)| Self::foreach_target_by_ref(t));
+        enum Row {
+            Array(Rc<RefCell<PhpArray>>),
+            Skip,
+            Warn(String),
+            ScalarErr,
+            StrOffsetErr,
+            ObjectErr(String),
+            ArrayAccess(Rc<RefCell<PhpObject>>, String),
+        }
+        let row = {
+            let mut b = c.borrow_mut();
+            match &*b {
+                Value::Array(rc) => Row::Array(rc.clone()),
+                Value::Null if needs_ref => {
+                    *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+                    match &*b {
+                        Value::Array(rc) => Row::Array(rc.clone()),
+                        _ => unreachable!(),
+                    }
+                }
+                Value::Null => Row::Skip,
+                Value::Str(_) if needs_ref => Row::StrOffsetErr,
+                Value::Str(_) => Row::Warn("string".to_string()),
+                Value::Object(o) if self.obj_is_a(o, "ArrayAccess") => {
+                    let n = o.borrow().class.name().to_string();
+                    Row::ArrayAccess(o.clone(), n)
+                }
+                Value::Object(o) => Row::ObjectErr(o.borrow().class.name().to_string()),
+                Value::Callable(_) => Row::ObjectErr("Closure".to_string()),
+                _ if needs_ref => Row::ScalarErr,
+                other => Row::Warn(other.type_name().to_string()),
+            }
+        };
+        match row {
+            Row::Skip => {}
+            Row::Warn(t) => self.warn(&format!("Cannot use {} as array", t))?,
+            Row::ScalarErr => {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    "Cannot use a scalar value as an array",
+                    self.cur_line,
+                ));
+            }
+            Row::StrOffsetErr => {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    "Cannot create references to/from string offsets",
+                    self.cur_line,
+                ));
+            }
+            Row::ObjectErr(name) => {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    format!("Cannot use object of type {} as array", name),
+                    self.cur_line,
+                ));
+            }
+            Row::ArrayAccess(o, name) => {
+                // Destructures via offsetGet; a `&` element binds the
+                // returned temp after zend's 'Indirect modification of
+                // overloaded element' notice.
+                for (i, elem) in items.iter().enumerate() {
+                    let Some((ke, t)) = elem else { continue };
+                    let keyv = match ke {
+                        Some(ke) => self.eval(ke)?,
+                        None => Value::Int(i as i64),
+                    };
+                    let iv = self
+                        .method_invoke(
+                            o.clone(),
+                            "offsetGet",
+                            CallArgs::positional(vec![cell(keyv)]),
+                        )
+                        .unwrap_or(Value::Null);
                     match t {
                         ForeachTarget::Var(n) => self.var_set(n, iv)?,
                         ForeachTarget::Lvalue(e) => {
-                            let _ = self.store(e, iv);
+                            self.store(e, iv)?;
                         }
-                        ForeachTarget::ByRef(n) => self.var_set(n, iv)?,
+                        ForeachTarget::ByRef(e) => {
+                            self.notice(&format!(
+                                "Indirect modification of overloaded element of {} has no effect",
+                                name
+                            ))?;
+                            self.bind_cell(e, cell(iv))?;
+                        }
+
                         ForeachTarget::List(sub) => {
-                            self.foreach_list(sub, &iv)?;
+                            self.foreach_list(sub, &cell(iv), line)?;
+                        }
+                    }
+                }
+            }
+            Row::Array(a) => {
+                for (i, elem) in items.iter().enumerate() {
+                    let Some((ke, t)) = elem else { continue };
+                    let key = match ke {
+                        Some(ke) => {
+                            let kv = self.eval(ke)?;
+                            self.arr_key(&kv)?
+                        }
+                        None => ArrKey::Int(i as i64),
+                    };
+                    match t {
+                        ForeachTarget::Var(n) => match a.borrow().get(&key) {
+                            Some(iv) => self.var_set(n, iv)?,
+                            None => {
+                                if !quiet {
+                                    self.foreach_missing_key(&key)?;
+                                }
+                                self.var_set(n, Value::Null)?;
+                            }
+                        },
+                        ForeachTarget::Lvalue(e) => match a.borrow().get(&key) {
+                            Some(iv) => {
+                                self.store(e, iv)?;
+                            }
+                            None => {
+                                if !quiet {
+                                    self.foreach_missing_key(&key)?;
+                                }
+                                self.store(e, Value::Null)?;
+                            }
+                        },
+                        ForeachTarget::ByRef(e) => {
+                            let ec = {
+                                let mut arr = a.borrow_mut();
+                                match arr.get_cell(&key) {
+                                    Some(c) => c,
+                                    None => {
+                                        arr.set_cell(key.clone(), cell(Value::Null));
+                                        arr.get_cell(&key).unwrap()
+                                    }
+                                }
+                            };
+                            self.bind_cell(e, ec)?;
+                        }
+                        ForeachTarget::List(sub) => {
+                            // A nested list carrying `&` binds the
+                            // row's real cell: a missing key
+                            // auto-creates a null cell (auto-vivified
+                            // to [] inside), and the fresh array's
+                            // inner reads stay silent — zend's
+                            // write-reference fetch (kd_nested_ref).
+                            let sub_ref = sub
+                                .iter()
+                                .flatten()
+                                .any(|(_, t)| Self::foreach_target_by_ref(t));
+                            let ec = {
+                                let mut arr = a.borrow_mut();
+                                match arr.get_cell(&key) {
+                                    Some(c) => c,
+                                    None if sub_ref => {
+                                        let nc = cell(Value::Null);
+                                        arr.set_cell(key.clone(), nc.clone());
+                                        nc
+                                    }
+                                    None => {
+                                        if !quiet {
+                                            self.foreach_missing_key(&key)?;
+                                        }
+                                        cell(Value::Null)
+                                    }
+                                }
+                            };
+                            let fresh = sub_ref && matches!(&*ec.borrow(), Value::Null);
+                            self.foreach_list_q(sub, &ec, line, fresh)?;
                         }
                     }
                 }
