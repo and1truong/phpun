@@ -518,6 +518,11 @@ impl<'a> Interp<'a> {
                             c
                         }
                     };
+                    // The bound cell belongs to the function's statics
+                    // table — a suspended gen frame's release must not
+                    // null it out from under sibling calls/instances
+                    // (bug64979).
+                    self.mark_shared(&cellv);
                     self.cur().vars.insert(name.clone(), cellv);
                 }
                 Flow::Normal

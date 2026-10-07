@@ -553,6 +553,15 @@ pub struct Interp<'a> {
     pub ref_cells: std::collections::HashMap<usize, std::rc::Weak<RefCell<Value>>>,
     /// Next `mark_ref` inserts past this size first sweep dead marks.
     ref_cells_prune: usize,
+    /// Cells bound to storage owned outside the executing frame —
+    /// `static $s` aliases its function's statics table, so the cell
+    /// outlives every call. Like is_ref cells, a suspended gen frame's
+    /// release decrefs the binding but must not null the referent:
+    /// the table keeps it live for sibling calls/gen instances
+    /// (bug64979). Same Weak-pin ABA scheme as `ref_cells`.
+    pub shared_cells: std::collections::HashMap<usize, std::rc::Weak<RefCell<Value>>>,
+    /// Next `mark_shared` inserts past this size first sweep dead marks.
+    shared_cells_prune: usize,
     /// Zend's per-op magic-property guards, keyed
     /// (object-ptr, kind, prop-name): while `__get($o,$p)` runs, an
     /// access to `$o->$p` bypasses magic and hits real storage
@@ -1074,6 +1083,8 @@ impl<'a> Interp<'a> {
             slot_anchor: std::collections::HashMap::new(),
             ref_cells: std::collections::HashMap::new(),
             ref_cells_prune: 1024,
+            shared_cells: std::collections::HashMap::new(),
+            shared_cells_prune: 1024,
             magic_guards: std::collections::HashSet::new(),
             readonly_cells: std::collections::HashMap::new(),
             last_fresh_cell: None,
@@ -2364,6 +2375,26 @@ impl<'a> Interp<'a> {
             self.ref_cells.retain(|_, w| w.strong_count() > 0);
             self.ref_cells_prune = (self.ref_cells.len() * 2).max(1024);
         }
+    }
+
+    /// Mark `c` as bound to storage outside the frame (statics table).
+    pub(crate) fn mark_shared(&mut self, c: &Cell) {
+        self.shared_cells
+            .insert(Rc::as_ptr(c) as usize, Rc::downgrade(c));
+        if self.shared_cells.len() > self.shared_cells_prune {
+            self.shared_cells.retain(|_, w| w.strong_count() > 0);
+            self.shared_cells_prune = (self.shared_cells.len() * 2).max(1024);
+        }
+    }
+
+    /// Is `c` a live frame-external binding? Same Weak-pin proof as
+    /// `is_ref_cell`.
+    pub(crate) fn is_shared_cell(&self, c: &Cell) -> bool {
+        self.shared_cells
+            .get(&(Rc::as_ptr(c) as usize))
+            .and_then(|w| w.upgrade())
+            .map(|u| Rc::ptr_eq(&u, c))
+            .unwrap_or(false)
     }
 
     /// Is `c` a live IS_REFERENCE cell? The Weak pins the allocation,

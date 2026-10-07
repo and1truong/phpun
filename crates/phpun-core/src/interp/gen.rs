@@ -948,8 +948,10 @@ impl<'a> Interp<'a> {
             // An is_ref cell is a shared binding (by-ref yield): the
             // frame gives up its hold but the referent stays live —
             // Zend decrefs the CV's reference, it does not null the
-            // referent.
-            let v = if self.is_ref_cell(&c) {
+            // referent. Same for shared cells bound to outside storage
+            // (a `static` aliases the function's statics table —
+            // bug64979).
+            let v = if self.is_ref_cell(&c) || self.is_shared_cell(&c) {
                 c.borrow().clone()
             } else {
                 std::mem::replace(&mut *c.borrow_mut(), Value::Null)
