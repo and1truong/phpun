@@ -334,8 +334,32 @@ fn resource_child_fd(
     r: &mut PhpResource,
     index: i64,
 ) -> Result<Option<RawFd>, PhpError> {
+    // zend cast.c: a filtered stream fails EVERY non-STDIO cast —
+    // the descriptor-spec branch warns and proc_open falls back to
+    // `false` for the whole call.
+    if crate::builtins::fs::stream_is_filtered(it, r.id()) {
+        spec_err(it, "Cannot cast a filtered stream on this system")?;
+        return Ok(None);
+    }
     let fd = match r {
-        PhpResource::File { file, .. } => file.as_raw_fd(),
+        PhpResource::File {
+            file, pos, rbuf, ..
+        } => {
+            let fd = file.as_raw_fd();
+            if crate::builtins::fs::stdio_seekable(fd) {
+                // zend's non-FOR_SELECT cast resyncs EVERY seekable
+                // stream: flush + seek(fd, stream->position, SEEK_SET)
+                // + drop the read buffer — a previous cast's child may
+                // have advanced the kernel offset away from pos.
+                crate::builtins::fs::fd_resync(fd, *pos, rbuf);
+            } else if !rbuf.is_empty() {
+                it.warn_pub(&format!(
+                    "proc_open(): {} bytes of buffered data lost during stream conversion!",
+                    rbuf.len()
+                ))?;
+            }
+            fd
+        }
         PhpResource::Pipe { file, rbuf, .. } => {
             // zend's AS_FD cast skips the buffer sync on NO_SEEK
             // streams: the pending read-buffer bytes stay put and the

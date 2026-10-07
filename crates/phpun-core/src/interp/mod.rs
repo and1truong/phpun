@@ -295,6 +295,24 @@ pub struct Interp<'a> {
     /// resource id — the function returns the PREVIOUS size (zend
     /// default 8192).
     pub stream_chunk_sizes: std::collections::HashMap<u64, i64>,
+    /// Filters attached by stream_filter_append/prepend, keyed by the
+    /// STREAM resource id — zend's readfilters/writefilters chains.
+    /// A stream with any entry is 'filtered' and every non-STDIO cast
+    /// fails (cast.c:300).
+    pub stream_filters: std::collections::HashMap<u64, Vec<crate::value::StreamFilter>>,
+    /// Filter RESOURCE id → (stream resource id, filter name, the
+    /// resource itself) — stream_filter_remove() detaches the right
+    /// chain entry and fclose() invalidates still-held filter handles
+    /// when their stream dies (zend's stream dtor frees the chain,
+    /// leaving the zval 'of type (Unknown)').
+    pub stream_filter_bindings: std::collections::HashMap<
+        u64,
+        (
+            u64,
+            String,
+            std::rc::Rc<std::cell::RefCell<crate::value::PhpResource>>,
+        ),
+    >,
     /// Output buffer stack for ob_*().
     ob_stack: Vec<ObLevel>,
     /// While >0, warnings are suppressed (implements `??`, `isset`,
@@ -720,6 +738,9 @@ impl<'a> Interp<'a> {
         constants.insert("SEEK_SET".into(), Value::Int(0));
         constants.insert("SEEK_CUR".into(), Value::Int(1));
         constants.insert("SEEK_END".into(), Value::Int(2));
+        constants.insert("STREAM_FILTER_READ".into(), Value::Int(1));
+        constants.insert("STREAM_FILTER_WRITE".into(), Value::Int(2));
+        constants.insert("STREAM_FILTER_ALL".into(), Value::Int(3));
         constants.insert("PHP_OUTPUT_HANDLER_START".into(), Value::Int(1));
         constants.insert("PHP_OUTPUT_HANDLER_WRITE".into(), Value::Int(0));
         constants.insert("PHP_OUTPUT_HANDLER_CONT".into(), Value::Int(0));
@@ -903,6 +924,8 @@ impl<'a> Interp<'a> {
             php_input: std::rc::Rc::new(Vec::new()),
             uploads: Vec::new(),
             stream_chunk_sizes: std::collections::HashMap::new(),
+            stream_filters: std::collections::HashMap::new(),
+            stream_filter_bindings: std::collections::HashMap::new(),
             ob_stack: Vec::new(),
             silence: 0,
             statics: HashMap::new(),

@@ -1787,6 +1787,12 @@ pub enum PhpResource {
         /// Byte position used for reads (we do our own buffering for fgets).
         pos: u64,
         eof: bool,
+        /// Stream-level read buffer + capacity — zend buffers plain
+        /// file streams, so rbuf.len() is zend's writepos-readpos
+        /// (buffered-but-unread bytes) for cast resyncs and the
+        /// stream_select emulate shortcut.
+        rbuf: std::collections::VecDeque<u8>,
+        rcap: usize,
         /// tmpfile() only — zend removes the temp file when the stream
         /// closes (Drop unlinks `path`).
         unlink_on_close: bool,
@@ -1939,6 +1945,23 @@ impl PhpResource {
             _ => "stream",
         }
     }
+}
+
+/// A stream filter attached by stream_filter_append/prepend — zend's
+/// php_stream_filter on a stream's read/write chains. `read`/`write`
+/// say which chain it sits on (STREAM_FILTER_READ=1, WRITE=2, ALL=3).
+/// Byte-map filters (string.rot13/toupper/tolower) actually transform
+/// data; the other registered names only mark the stream filtered —
+/// their transforms are not implemented.
+#[derive(Debug, Clone)]
+pub struct StreamFilter {
+    pub name: String,
+    pub read: bool,
+    pub write: bool,
+    /// The filter resource's own id — stream_filter_remove() detaches
+    /// the chain entry by this, not by name (two same-name filters
+    /// stay distinct).
+    pub fid: u64,
 }
 
 /// A dropped process handle closes its pipes and gets one non-blocking
