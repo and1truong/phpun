@@ -283,6 +283,15 @@ pub(crate) fn dispatch(
                 } else {
                     n - off
                 };
+                // Element count the replacement contributes (zend's php_splice
+                // `pos` bookkeeping) — needed to move live foreach cursors.
+                let ins = match args.get(3).map(|r| r.borrow().clone()) {
+                    Some(Value::Array(r)) => r.borrow().len(),
+                    Some(Value::Object(o)) => o.borrow().prop_order.len(),
+                    Some(Value::Null) | None => 0,
+                    Some(_) => 1,
+                };
+                arr.foreach_spliced(off as usize, len as usize, ins);
                 let tail: Vec<(ArrKey, Cell)> = std::mem::take(&mut arr.entries);
                 arr.next = 0;
                 let (head, rest) = tail.split_at(off as usize);
@@ -392,6 +401,7 @@ pub(crate) fn dispatch(
                     Some(f) => {
                         let c = arr.entries[f].1.clone();
                         arr.entries[f].0 = ArrKey::Tomb;
+                        arr.foreach_shifted();
                         let mut ni = 0i64;
                         for (k, _) in arr.entries.iter_mut() {
                             if let ArrKey::Int(i) = k {
@@ -412,6 +422,7 @@ pub(crate) fn dispatch(
                 let mut arr = rc.borrow_mut();
                 // Renumber existing int keys up by arg count.
                 let add = args.len() - 1;
+                arr.foreach_unshifted(add);
                 for (k, _) in arr.entries.iter_mut() {
                     if let ArrKey::Int(i) = k {
                         *i += add as i64;

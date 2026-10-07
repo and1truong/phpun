@@ -1014,39 +1014,40 @@ impl<'a> Interp<'a> {
                     };
                     // The table never CoW-splits while the loop holds
                     // it by reference — restored on exit so later
-                    // copies separate normally again.
-                    let was_shared = rc.borrow().is_ref;
-                    rc.borrow_mut().is_ref = true;
-                    // PHP's live iterator tracks "the element after the
-                    // current one in logical order" — prepends (unshift) and
-                    // renumbering (shift) don't move it, tombstoned current
-                    // elements still anchor it (foreachLoop.013/.015).
-                    let mut last: Option<Cell> = None;
+                    // copies separate normally again. Register the loop's
+                    // slot cursor (zend's HashTableIterator): the raw index
+                    // of the next element to fetch. Tombstoned unsets keep
+                    // indices stable, so `unset($a[$k])` mid-loop leaves the
+                    // cursor pointing at the element after the removed one
+                    // (foreach_008, gh11244, gh13178).
+                    let (pos_i, was_shared) = {
+                        let mut a = rc.borrow_mut();
+                        let i = match a.foreach_pos.iter().position(|p| p.is_none()) {
+                            Some(i) => i,
+                            None => {
+                                a.foreach_pos.push(None);
+                                a.foreach_pos.len() - 1
+                            }
+                        };
+                        a.foreach_pos[i] = Some(0);
+                        let ws = a.is_ref;
+                        a.is_ref = true;
+                        (i, ws)
+                    };
                     let flow = loop {
                         let next = {
                             let a = rc.borrow();
-                            let live_at = |from: usize| -> Option<(ArrKey, Cell)> {
-                                a.entries[from..]
-                                    .iter()
-                                    .find(|(k, _)| !matches!(k, ArrKey::Tomb))
-                                    .cloned()
-                            };
-                            match &last {
-                                None => live_at(0),
-                                Some(lc) => {
-                                    match a.entries.iter().position(|(_, c)| Rc::ptr_eq(c, lc)) {
-                                        Some(i) => live_at(i + 1),
-                                        // Current element gone entirely —
-                                        // restart at the first live element.
-                                        None => live_at(0),
-                                    }
-                                }
-                            }
+                            let from = a.foreach_pos[pos_i].unwrap_or(0).min(a.entries.len());
+                            a.entries[from..]
+                                .iter()
+                                .enumerate()
+                                .find(|(_, (k, _))| !matches!(k, ArrKey::Tomb))
+                                .map(|(d, (k, c))| (from + d, k.clone(), c.clone()))
                         };
-                        let Some((k, c)) = next else {
+                        let Some((idx, k, c)) = next else {
                             break Flow::Normal;
                         };
-                        last = Some(c.clone());
+                        rc.borrow_mut().foreach_pos[pos_i] = Some(idx + 1);
                         if let Some(ForeachKey::Var(kn)) = key {
                             if let Err(e) = self.var_set(kn, key_value(&k)) {
                                 break self.err_flow(e);
@@ -1083,7 +1084,11 @@ impl<'a> Interp<'a> {
                             f => break f,
                         }
                     };
-                    rc.borrow_mut().is_ref = was_shared;
+                    {
+                        let mut a = rc.borrow_mut();
+                        a.foreach_pos[pos_i] = None;
+                        a.is_ref = was_shared;
+                    }
                     return flow;
                 }
                 // Snapshot (key, cell) pairs — PHP iterates a copy for

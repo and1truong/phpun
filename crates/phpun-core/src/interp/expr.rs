@@ -1648,6 +1648,7 @@ impl<'a> Interp<'a> {
                     next: a.next,
                     is_ref: false,
                     iter_pos: a.iter_pos,
+                    foreach_pos: Vec::new(),
                 })))
             }
             v => v,
@@ -3028,6 +3029,7 @@ impl<'a> Interp<'a> {
             next: a.next,
             is_ref: a.is_ref,
             iter_pos: a.iter_pos,
+            foreach_pos: Vec::new(),
         };
         for (k, c) in &a.entries {
             // zend unwraps a refcount-1 IS_REFERENCE bucket on copy;
