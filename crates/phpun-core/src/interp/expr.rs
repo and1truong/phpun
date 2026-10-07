@@ -5694,21 +5694,11 @@ impl<'a> Interp<'a> {
             cur = b;
         }
         idxs.reverse();
-        // UNSET_DIM snapshots the container at op entry — an array root
-        // the key-eval handler then rebinds unsets inside the STALE
-        // table (silent, invisible); a non-array root errors on the
-        // CURRENT type instead ('Cannot unset string offsets' on
-        // strings, 'Cannot unset offset in a non-array variable' for
-        // anything else refcounted — even a rebound-TO-array).
-        let det = match cur {
-            Expr::Var(n) => Some(self.dim_detach_var(n, false)),
-            _ => None,
-        };
         // `unset()` key conversions never warn 'Using null as an array
         // offset' — zend maps null offsets to "" without the
         // deprecation (float/resource/illegal still diagnose).
         let was_ctx = std::mem::replace(&mut self.unset_ctx, true);
-        let r = self.unset_index_inner(cur, &idxs, i, det.as_ref());
+        let r = self.unset_index_inner(cur, &idxs, i);
         self.unset_ctx = was_ctx;
         r
     }
@@ -5718,54 +5708,31 @@ impl<'a> Interp<'a> {
         cur: &Expr,
         idxs: &[Option<&Expr>],
         i: Option<&Expr>,
-        det: Option<&DimDetach>,
     ) -> Result<(), PhpError> {
+        // zend evaluates every dim key FIRST (source order — inner
+        // dims left to right, then the unset key), then resolves the
+        // container from the CURRENT value: a key-eval handler that
+        // rebinds the root redirects the unset onto the new array
+        // (unset($a[rb()]) unsets inside rb's result, not a stale
+        // snapshot). Eval errors surface as catchable throwables.
+        let mut keys = Vec::with_capacity(idxs.len());
+        for ix in idxs {
+            let kv = match ix {
+                Some(ie) => match self.eval(ie) {
+                    Ok(v) => v,
+                    Err(e) => return self.fail::<()>(e),
+                },
+                None => Value::Null,
+            };
+            keys.push(kv);
+        }
         let key = match i {
-            // eval errors surface as catchable throwables like zend's
-            // (an uncaught Error from the index expr is a `throw`).
             Some(ie) => match self.eval(ie) {
                 Ok(v) => Some(v),
                 Err(e) => return self.fail::<()>(e),
             },
             None => None,
         };
-        // The key eval's diagnostics ran — a handler that rebound the
-        // root detaches this unset: array roots silently walk the
-        // stale table, non-array roots take zend's error matrix on the
-        // CURRENT value.
-        let detached = det.is_some_and(|d| self.dim_detached(d));
-        if detached {
-            let d = det.unwrap();
-            if !matches!(
-                d.pre.value().as_ref(),
-                Some(Value::Array(_) | Value::Object(_))
-            ) {
-                let cur_v = self
-                    .var_cell_opt(&d.name)
-                    .map(|c| c.borrow().clone())
-                    .unwrap_or(Value::Null);
-                match &cur_v {
-                    // Objects take the normal dispatch below (offsetUnset
-                    // / 'Cannot use object as array' on CURRENT).
-                    Value::Object(_) => {}
-                    Value::Str(_) => {
-                        return self.fail(PhpError::uncaught(
-                            "Error",
-                            "Cannot unset string offsets",
-                            self.cur_line,
-                        ))
-                    }
-                    Value::Null | Value::Bool(false) => return Ok(()),
-                    _ => {
-                        return self.fail(PhpError::uncaught(
-                            "Error",
-                            "Cannot unset offset in a non-array variable",
-                            self.cur_line,
-                        ))
-                    }
-                }
-            }
-        }
         // Roots with real storage cells resolve once (prop_cell invokes
         // __get a single time for an overloaded prop); a missing plain
         // variable warns and no-ops (zend undefined-variable semantics).
@@ -5845,11 +5812,7 @@ impl<'a> Interp<'a> {
             if let Some((o, arr)) = ao {
                 let mut cur_arr = arr;
                 let mut ok = true;
-                for ix in idxs {
-                    let kv = match ix {
-                        Some(ie) => self.eval(ie)?,
-                        None => Value::Null,
-                    };
+                for kv in keys.iter().cloned() {
                     let next = match cur_arr.borrow().get_cell(&self.arr_key(&kv)?) {
                         Some(cc) => {
                             let mut b = cc.borrow_mut();
@@ -5915,40 +5878,15 @@ impl<'a> Interp<'a> {
         // autovivify on unset); non-array containers throw zend's
         // catchable unset Errors ("Cannot unset offset in a non-array
         // variable" &c).
-        // A detached array root unsets inside the stale table — the
-        // key conversions stay silent and the removal is invisible.
-        let mut c = if detached {
-            cell(det.unwrap().pre.value().unwrap_or(Value::Null))
-        } else {
-            root_cell
-        };
-        let prev_det = std::mem::replace(&mut self.detached_dim, detached);
-        for ix in idxs.iter() {
-            let kv = match ix {
-                Some(ie) => match self.eval(ie) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        self.detached_dim = prev_det;
-                        return Err(e);
-                    }
-                },
-                None => Value::Null,
-            };
+        let mut c = root_cell;
+        for kv in keys {
             match self.unset_dim_cell(&c, kv) {
                 Ok(Some(nc)) => c = nc,
-                Ok(None) => {
-                    self.detached_dim = prev_det;
-                    return Ok(());
-                }
-                Err(e) => {
-                    self.detached_dim = prev_det;
-                    return Err(e);
-                }
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(e),
             }
         }
-        let r = self.unset_in_cell(c, key);
-        self.detached_dim = prev_det;
-        r
+        self.unset_in_cell(c, key)
     }
 
     /// One intermediate dim down for `unset`: plain arrays yield the
@@ -6012,9 +5950,16 @@ impl<'a> Interp<'a> {
             }
             Value::Str(_) => self.fail(PhpError::uncaught(
                 "Error",
-                "Cannot use string offset as an array",
+                "Cannot unset string offsets",
                 self.cur_line,
             )),
+            // zend's unset emits the false->array conversion deprecation
+            // then no-ops (the var stays false) — unlike reads/writes it
+            // never actually vivifies.
+            Value::Bool(false) => {
+                self.deprecated_ns("Automatic conversion of false to array is deprecated")?;
+                Ok(None)
+            }
             Value::Callable(_) => self.fail(PhpError::uncaught(
                 "Error",
                 "Cannot use object of type Closure as array",
@@ -6091,6 +6036,9 @@ impl<'a> Interp<'a> {
                 "Cannot unset string offsets",
                 self.cur_line,
             )),
+            Value::Bool(false) => {
+                self.deprecated_ns("Automatic conversion of false to array is deprecated")
+            }
             Value::Callable(_) => self.fail(PhpError::uncaught(
                 "Error",
                 "Cannot use object of type Closure as array",
