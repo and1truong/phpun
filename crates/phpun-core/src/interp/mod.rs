@@ -4545,15 +4545,21 @@ impl<'a> Interp<'a> {
         }
         // Suspended frame CVs — the journal outlives the state, and
         // delegation snapshots carry their own inner frames' cells.
-        let mut journals = vec![st.fin_q.clone()];
-        while let Some(q) = journals.pop() {
-            let f = q.borrow();
-            for (_, c) in &f.suspended {
-                Self::gc_scan_cell(c, scan, out, depth - 1, visited);
-            }
-            for d in &f.delegates {
-                for (_, c) in &d.fin.suspended {
+        // A `yield from` chain nests FinDelegate.fin recursively, so walk
+        // the delegate tree, not just the first level (gc_with_yield_from:
+        // a ≥3-deep chain left the innermost global-holding snapshot
+        // unscanned → phantom root kept the whole cycle alive). The
+        // Rc-shared `delegate_fins` live journals are skipped — they're
+        // owned by their own gens' states and get scanned there.
+        {
+            let f = st.fin_q.borrow();
+            let mut fins: Vec<&crate::value::GenFinData> = vec![&*f];
+            while let Some(g) = fins.pop() {
+                for (_, c) in &g.suspended {
                     Self::gc_scan_cell(c, scan, out, depth - 1, visited);
+                }
+                for d in &g.delegates {
+                    fins.push(&d.fin);
                 }
             }
         }
