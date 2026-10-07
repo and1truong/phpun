@@ -368,10 +368,20 @@ pub(crate) fn dispatch(
 
         // ----- env/process -----
         "getenv" => {
-            let name = arg_str(it, args, 0);
-            match it.getenv_pub(&name) {
-                Some(v) => Value::str(v),
-                None => Value::Bool(false),
+            // ?string $name = null — an explicit null means the default:
+            // the full environment array, same as a 0-arg call.
+            if args.is_empty() || matches!(arg(args, 0), Value::Null) {
+                let mut a = PhpArray::new();
+                for (k, v) in it.getenv_all_pub() {
+                    a.set(ArrKey::Str(k.into()), Value::str(v));
+                }
+                Value::Array(Rc::new(RefCell::new(a)))
+            } else {
+                let name = arg_str(it, args, 0);
+                match it.getenv_pub(&name) {
+                    Some(v) => Value::str(v),
+                    None => Value::Bool(false),
+                }
             }
         }
         "putenv" => {
@@ -657,8 +667,6 @@ pub(crate) fn dispatch(
             }
             _ => Value::Bool(false),
         },
-        "proc_open" | "proc_close" | "proc_get_status" | "proc_terminate" => Value::Bool(false),
-        "shell_exec" | "exec" | "system" | "passthru" => Value::Null,
         // exit()/die() exist in zend's function table too — reachable
         // through 'exit'/'die' string callables (FCC, call_user_func).
         // Top-level exit() parses to Expr::Exit and never lands here.
@@ -679,10 +687,6 @@ pub(crate) fn dispatch(
                 message: format!("\u{1}exit:{}", code),
                 line: 0,
             });
-        }
-        "escapeshellarg" | "escapeshellcmd" => {
-            let s = arg_str(it, args, 0);
-            Value::str(format!("'{}'", s.replace('\'', "'\\''")))
         }
         "get_include_path" | "set_include_path" | "restore_include_path" => {
             Value::str(".:/home/linuxbrew/.linuxbrew/share/pear")

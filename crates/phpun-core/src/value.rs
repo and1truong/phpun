@@ -319,7 +319,7 @@ pub fn trace_arg(v: &Value) -> String {
         Value::Null => "NULL".into(),
         Value::Bool(b) => if *b { "true" } else { "false" }.into(),
         Value::Callable(_) => "Object(Closure)".into(),
-        Value::Resource(_) => "Resource id #1".into(),
+        Value::Resource(r) => format!("Resource id #{}", r.borrow().id()),
         Value::Float(f) => {
             if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e16 {
                 format!("{f:.1}")
@@ -1686,6 +1686,9 @@ pub enum ObjectInternal {
         /// (RecursiveDirectoryIterator::getSubPath).
         sub_path: String,
     },
+    /// WeakReference::create($obj) payload — a weak handle; get()
+    /// upgrades to the object or null once freed.
+    WeakRef(std::rc::Weak<RefCell<PhpObject>>),
     /// DateTime, closures-as-objects, etc. — opaque marker.
     None,
 }
@@ -1749,6 +1752,7 @@ impl std::fmt::Debug for ObjectInternal {
             ObjectInternal::DirIter { .. } => f.write_str("DirIter"),
             ObjectInternal::Sqlite { .. } => f.write_str("Sqlite"),
             ObjectInternal::SqliteStmt { .. } => f.write_str("SqliteStmt"),
+            ObjectInternal::WeakRef(_) => f.write_str("WeakRef"),
             ObjectInternal::None => f.write_str("None"),
         }
     }
@@ -1799,14 +1803,54 @@ pub enum PhpResource {
         /// Byte position used for reads (we do our own buffering for fgets).
         pos: u64,
         eof: bool,
+        /// Stream-level read buffer + capacity — zend buffers plain
+        /// file streams, so rbuf.len() is zend's writepos-readpos
+        /// (buffered-but-unread bytes) for cast resyncs and the
+        /// stream_select emulate shortcut.
+        rbuf: std::collections::VecDeque<u8>,
+        rcap: usize,
+        /// tmpfile() only — zend removes the temp file when the stream
+        /// closes (Drop unlinks `path`).
+        unlink_on_close: bool,
+        /// Path and mode as given to fopen() — stream_get_meta_data().
+        path: String,
+        mode: String,
     },
     /// STDIN/STDOUT/STDERR — php:// and the CLI-SAPI constants.
-    Stdio { id: u64, which: u8 },
+    /// `which` > 2 is php://output: a write-only stream whose ftell
+    /// counts bytes written (zend tracks them on the stream struct).
+    Stdio { id: u64, which: u8, pos: u64 },
     /// php://input — the request body, readable like a file.
     Input {
         id: u64,
         body: std::rc::Rc<Vec<u8>>,
         pos: u64,
+        eof: bool,
+        /// zend's stream->position = -1 marker after a failed seek:
+        /// ftell reports pos-1 (false) while IO resumes at pos=0.
+        pos_broken: bool,
+        /// The URI the stream was opened with ("php://input", "data:...")
+        /// — reported verbatim in stream_get_meta_data()'s 'uri' key.
+        uri: String,
+        /// The fopen() mode, verbatim — stream_get_meta_data() 'mode'.
+        mode: String,
+        /// fd claimed by a PHP_STREAM_AS_FD_FOR_SELECT cast (zend's
+        /// php_stream_temp_cast spills an RFC2397 buffer into a
+        /// tmpfile() the stream then KEEPS — later casts reuse it and
+        /// flock(2)/fstat(2) see it).
+        spilled_fd: Option<std::os::unix::io::RawFd>,
+        /// zend stream->readbuf — read(2) fills land here while
+        /// spilled, and FILTERED bytes land here once a read filter is
+        /// attached (zend's fill applies the chain before buffering).
+        srbuf: std::collections::VecDeque<u8>,
+        /// zend stream->readbuflen for srbuf — grows one chunk_size
+        /// whenever a fill finds less than a chunk of free space.
+        rcap: usize,
+        /// The raw store cursor (zend's inner-stream fpos): filtered
+        /// fills slice the body from here while pos stays the
+        /// delivered count. Unfiltered reads bypass the buffer, so
+        /// fraw tracks pos then.
+        fraw: u64,
     },
     /// php://memory / php://temp — an in-memory byte buffer that is
     /// always read/write, seekable (Composer's BufferIO).
@@ -1815,15 +1859,89 @@ pub enum PhpResource {
         buf: Vec<u8>,
         pos: u64,
         eof: bool,
+        /// zend's stream->position = -1 marker after a failed
+        /// CUR/END-below-zero seek: ftell reports pos-1 (false) while
+        /// IO resumes at pos=0; a successful seek clears it.
+        pos_broken: bool,
         /// fwrite honors the fopen mode ('r' → false); fprintf does not
         /// (zend php_stream_printf bypasses the check).
         write: bool,
+        /// zend's TEMP_STREAM_APPEND: an 'a'-mode buffer write lands at
+        /// end-of-buffer regardless of position. Lost once the stream
+        /// spills — the tmpfile is a plain r+b file (zend likewise).
+        append: bool,
+        /// The php:// URI the stream was opened with ("php://memory",
+        /// "php://temp", "php://temp/maxmemory:N") — reported verbatim
+        /// in stream_get_meta_data()'s 'uri' key.
+        uri: String,
+        /// zend's normalized open mode for meta ('rb', 'w+b', 'a+b').
+        mode: String,
+        /// php://temp* only: zend's ts->smax — the /maxmemory:N budget
+        /// (default PHP_STREAM_MAX_MEM = 2MB). A write reaching
+        /// stream->position+count >= smax spills the buffer to a
+        /// tmpfile BEFORE the inner stream's readonly check runs.
+        /// None on php://memory: never spills and not fd-castable.
+        temp_smax: Option<u64>,
+        /// fd claimed by a PHP_STREAM_AS_FD_FOR_SELECT cast or a write
+        /// that crossed temp_smax — zend's php_stream_temp_cast /
+        /// php_stream_temp_write spills a TEMP buffer into a tmpfile()
+        /// the stream then KEEPS (later casts reuse it and
+        /// flock(2)/fstat(2) see it). php://memory is not castable.
+        spilled_fd: Option<std::os::unix::io::RawFd>,
+        /// zend stream->readbuf — read(2) fills land here while
+        /// spilled, and FILTERED bytes land here once a read filter is
+        /// attached (zend's fill applies the chain before buffering).
+        srbuf: std::collections::VecDeque<u8>,
+        /// zend stream->readbuflen for srbuf — grows one chunk_size
+        /// whenever a fill finds less than a chunk of free space.
+        rcap: usize,
+        /// The raw store cursor (zend ms->fpos): filtered fills slice
+        /// the buffer from here while pos stays the delivered count.
+        /// Unfiltered reads bypass the buffer, so fraw tracks pos.
+        fraw: u64,
     },
     /// A resource closed via fclose()/fclose-aliased wrappers — Zend
     /// keeps the zval `resource (closed)` (gettype "resource (closed)",
     /// var_dump "of type (Unknown)", is_resource() false) and every
     /// stream function on it throws "must be an open stream resource".
     Closed { id: u64 },
+    /// A proc_open() pipe end (or socketpair/pty end) as seen by the
+    /// parent: a raw fd wrapped in File. `write` mirrors zend's
+    /// mode; reads always hit the real fd so EBADF reports like zend.
+    Pipe {
+        id: u64,
+        file: std::fs::File,
+        write: bool,
+        /// ["socket"] descriptor pair — bidirectional, different
+        /// stream_type in stream_get_meta_data().
+        socket: bool,
+        /// ["pty"] descriptor — the parent's end is the pty master,
+        /// opened 'r+' in zend's meta.
+        pty: bool,
+        /// stream_set_blocking($s, false) — reads return "" instead
+        /// of waiting (fcntl O_NONBLOCK on the fd).
+        nonblock: bool,
+        pos: u64,
+        eof: bool,
+        /// read-buffered but unconsumed bytes (zend's readbuf/writepos/
+        /// readpos): a php_stream_read() call drains this and performs
+        /// at most ONE underlying fill of stream_set_chunk_size() bytes.
+        rbuf: std::collections::VecDeque<u8>,
+    },
+    /// proc_open() process handle — type "process" in zend.
+    Proc {
+        id: u64,
+        pid: i32,
+        command: String,
+        /// Raw waitpid status cached after a WIFEXITED reap
+        /// (zend's waitpid_cached: only normal exits are cached).
+        cached_status: Option<i32>,
+        /// proc_close() already consumed this handle.
+        closed: bool,
+        /// The proc's pipe streams — zend's proc dtor zend_list_close()s
+        /// them, so proc_close()/GC turns every $pipes entry "Unknown".
+        pipes: Vec<std::rc::Rc<std::cell::RefCell<PhpResource>>>,
+    },
     /// curl/db handles etc. — opaque placeholder.
     Other { id: u64, kind: &'static str },
 }
@@ -1836,6 +1954,8 @@ impl PhpResource {
             PhpResource::Input { id, .. } => *id,
             PhpResource::Mem { id, .. } => *id,
             PhpResource::Closed { id, .. } => *id,
+            PhpResource::Pipe { id, .. } => *id,
+            PhpResource::Proc { id, .. } => *id,
             PhpResource::Other { id, .. } => *id,
         }
     }
@@ -1845,8 +1965,171 @@ impl PhpResource {
     pub fn type_name(&self) -> &'static str {
         match self {
             PhpResource::Closed { .. } => "Unknown",
+            PhpResource::Proc { .. } => "process",
             PhpResource::Other { kind, .. } => kind,
             _ => "stream",
+        }
+    }
+}
+
+/// A stream filter attached by stream_filter_append/prepend — zend's
+/// php_stream_filter on a stream's read/write chains. `read`/`write`
+/// say which chain it sits on (STREAM_FILTER_READ=1, WRITE=2, ALL=3 —
+/// ALL creates TWO entries, one per chain, with separate state).
+#[derive(Debug, Clone)]
+pub struct StreamFilter {
+    pub name: String,
+    pub read: bool,
+    pub write: bool,
+    /// The filter resource's own id — stream_filter_remove() detaches
+    /// the chain entry by this, not by name (two same-name filters
+    /// stay distinct).
+    pub fid: u64,
+    /// zend's filter->abstract — per-instance state.
+    pub state: FilterState,
+}
+
+/// Per-instance state for the stateful stream filters.
+#[derive(Debug, Clone)]
+pub enum FilterState {
+    /// Stateless transforms (string.rot13/toupper/tolower) and
+    /// recognized-but-unimplemented factories (zlib.*, bzip2.*).
+    Plain,
+    /// `consumed` — passes bytes through while counting them; on the
+    /// closing flush zend seeks the stream back to offset+consumed
+    /// (filters.c consumed_filter_filter).
+    Consumed {
+        count: u64,
+        /// stream->position captured on the first filter call.
+        offset: Option<u64>,
+    },
+    /// `dechunk` — the HTTP chunked-transfer decoder's state machine
+    /// (filters.c php_dechunk): bytes between calls.
+    Dechunk(Dechunk),
+    /// convert.iconv.FROM/TO — normalized encoding pair plus the
+    /// partial multibyte sequence carried between calls.
+    Iconv {
+        from: String,
+        to: String,
+        /// the original `from"=>"to` spec for the invalid-seq warn.
+        disp: String,
+        pending: Vec<u8>,
+        /// UTF-16/32's BOM already emitted (iconv emits it once).
+        bom_done: bool,
+        /// to-charset carried //IGNORE — unrepresentable cps drop.
+        ignore: bool,
+    },
+    /// convert.base64-encode / -decode — tail bytes carried between
+    /// calls (3-in/4-out groupings).
+    Base64 { decode: bool, tail: Vec<u8> },
+    /// convert.quoted-printable-encode / -decode. `col` is the
+    /// encoder's line-wrap column (75), `tail` the decoder's
+    /// partial-escape carry.
+    Qp {
+        encode: bool,
+        col: usize,
+        tail: Vec<u8>,
+    },
+    /// zlib.inflate/deflate, bzip2.compress/decompress — the codec
+    /// object lives in Interp::codec_states[fid] (compressors don't
+    /// clone).
+    Codec(CodecKind),
+    /// A php_user_filter subclass instance created at attach time.
+    User(std::rc::Rc<std::cell::RefCell<PhpObject>>),
+}
+
+/// Which streaming codec backs a FilterState::Codec entry — the
+/// compressor/decompressor lives in Interp::codec_states[fid].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecKind {
+    /// zlib.deflate — raw RFC1951 deflate stream.
+    ZlibDeflate,
+    /// zlib.inflate — raw RFC1951 inflate; bad data → 'zlib: data error'.
+    ZlibInflate,
+    /// bzip2.compress.
+    BzDeflate,
+    /// bzip2.decompress — bad data → 'bzip2 decompression failed'.
+    BzInflate,
+}
+
+/// The `dechunk` filter's persistent state machine — a byte-for-byte
+/// port of zend's php_chunked_filter_data (filters.c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DechunkState {
+    SizeStart,
+    Size,
+    SizeExt,
+    SizeCr,
+    SizeLf,
+    Body,
+    BodyCr,
+    BodyLf,
+    Trailer,
+    Error,
+}
+
+/// `dechunk` filter instance data (zend's php_chunked_filter_data).
+#[derive(Debug, Clone)]
+pub struct Dechunk {
+    pub chunk_size: u64,
+    pub state: DechunkState,
+}
+
+/// A dropped process handle closes its pipes and gets one non-blocking
+/// reap so exited children don't stay zombies (zend's proc dtor does
+/// the same — pipes first, then waitpid).
+impl Drop for PhpResource {
+    fn drop(&mut self) {
+        if let PhpResource::Proc {
+            pid,
+            cached_status,
+            closed,
+            pipes,
+            ..
+        } = self
+        {
+            for p in pipes {
+                let mut b = p.borrow_mut();
+                if let PhpResource::Pipe { id, .. } = &*b {
+                    *b = PhpResource::Closed { id: *id };
+                }
+            }
+            if !*closed && cached_status.is_none() {
+                unsafe {
+                    let mut st = 0;
+                    libc::waitpid(*pid, &mut st, libc::WNOHANG);
+                }
+            }
+        }
+        // tmpfile(): zend removes the temp file on stream close.
+        if let PhpResource::File {
+            unlink_on_close: true,
+            path,
+            ..
+        } = self
+        {
+            let _ = std::fs::remove_file(&*path);
+        }
+        let fd = match self {
+            PhpResource::Mem { spilled_fd, .. } | PhpResource::Input { spilled_fd, .. } => {
+                spilled_fd.take()
+            }
+            _ => None,
+        };
+        if let Some(fd) = fd {
+            unsafe {
+                // A spilled temp stream maps a real filesystem entry
+                // (zend php_stream_temp_cast unlinks it only when the
+                // stream closes): remove it via the procfs link target
+                // before dropping the last descriptor we own.
+                if let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{fd}")) {
+                    let t = target.to_string_lossy();
+                    if !t.ends_with(" (deleted)") {
+                        let _ = std::fs::remove_file(&*t);
+                    }
+                }
+                libc::close(fd);
+            }
         }
     }
 }

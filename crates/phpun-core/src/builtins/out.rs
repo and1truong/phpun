@@ -72,10 +72,16 @@ pub(crate) fn dispatch(
             let fmt = fmt_string(it, args, 1, "fprintf", 2)?;
             let s = php_formatted_print(it, &fmt, &args[2.min(args.len())..], 2, "fprintf")?;
             // Zend ignores php_stream_write's result — a failed write
-            // notices (plain wrapper) or discards (mem ro/input) and
-            // fprintf still returns the formatted length.
-            if let StreamWrite::Ebadf(errno, msg) = write_resource(it, args.first(), &s)? {
-                write_ebadf_notice(it, name, s.len(), errno, &msg)?;
+            // notices (plain wrapper), warns (RFC2397) or discards
+            // (mem ro/input) and fprintf still returns the length.
+            match write_resource(it, args.first(), &s)? {
+                StreamWrite::Ebadf(errno, msg) => {
+                    write_ebadf_notice(it, name, s.len(), errno, &msg)?;
+                }
+                StreamWrite::NotWritable => {
+                    it.notice_pub(&format!("{}(): Stream is not writable", name))?;
+                }
+                _ => {}
             }
             Value::Int(s.len() as i64)
         }
@@ -110,8 +116,14 @@ pub(crate) fn dispatch(
                 }
             };
             let s = php_formatted_print(it, &fmt, &list, -1, name)?;
-            if let StreamWrite::Ebadf(errno, msg) = write_resource(it, args.first(), &s)? {
-                write_ebadf_notice(it, name, s.len(), errno, &msg)?;
+            match write_resource(it, args.first(), &s)? {
+                StreamWrite::Ebadf(errno, msg) => {
+                    write_ebadf_notice(it, name, s.len(), errno, &msg)?;
+                }
+                StreamWrite::NotWritable => {
+                    it.notice_pub(&format!("{}(): Stream is not writable", name))?;
+                }
+                _ => {}
             }
             Value::Int(s.len() as i64)
         }

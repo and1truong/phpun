@@ -188,6 +188,15 @@ impl Frame {
     }
 }
 
+/// stream_filter_remove's binding record: (stream res id, filter name,
+/// the filter resource itself, the stream resource for ->stream props).
+pub(crate) type FilterBinding = (
+    u64,
+    String,
+    Rc<RefCell<PhpResource>>,
+    Rc<RefCell<PhpResource>>,
+);
+
 pub struct Interp<'a> {
     pub file: &'a str,
     globals: Frame,
@@ -297,6 +306,58 @@ pub struct Interp<'a> {
     /// Real upload tmp paths created this request — is_uploaded_file()
     /// and move_uploaded_file() check membership.
     pub uploads: Vec<std::path::PathBuf>,
+    /// Per-stream chunk size set by stream_set_chunk_size(), keyed by
+    /// resource id — the function returns the PREVIOUS size (zend
+    /// default 8192).
+    pub stream_chunk_sizes: std::collections::HashMap<u64, i64>,
+    /// Filters attached by stream_filter_append/prepend, keyed by the
+    /// STREAM resource id — zend's readfilters/writefilters chains.
+    /// A stream with any entry is 'filtered' and every non-STDIO cast
+    /// fails (cast.c:300).
+    pub stream_filters: std::collections::HashMap<u64, Vec<crate::value::StreamFilter>>,
+    /// Filter RESOURCE id → (stream resource id, filter name, the
+    /// filter resource, the STREAM resource) — stream_filter_remove()
+    /// detaches the right chain entry, fclose() invalidates held
+    /// filter handles when their stream dies, and the flush in
+    /// remove() hands filter() callbacks their ->stream prop (zend's
+    /// stream zval on the filter call).
+    pub stream_filter_bindings: std::collections::HashMap<u64, FilterBinding>,
+    /// stream_filter_register() — name → userland class name (zend's
+    /// BG(user_filter_map); the class is resolved lazily at attach).
+    /// Insertion-ordered so stream_get_filters() lists them in the
+    /// order they were registered.
+    pub user_filter_map: Vec<(String, String)>,
+    /// userfilter.bucket brigade resource id → the brigade's queue of
+    /// bucket payloads — populated while a php_user_filter::filter()
+    /// call is in flight.
+    pub stream_brigades: std::collections::HashMap<u64, std::collections::VecDeque<Vec<u8>>>,
+    /// userfilter.bucket resource id → the bucket's raw bytes — the
+    /// backing for StreamBucket::$bucket.
+    pub stream_buckets: std::collections::HashMap<u64, Vec<u8>>,
+    /// The stream resource id a php_user_filter::filter() call is
+    /// running on (zend's PHP_STREAM_FLAG_NO_FCLOSE): an fclose() on
+    /// it from inside the callback warns 'cannot close the provided
+    /// stream' and returns false.
+    pub filter_no_fclose: Option<u64>,
+    /// The builtin name zend's php_error_docref would use for warnings
+    /// raised inside filter() calls ('fread(): Unprocessed filter
+    /// buckets...'). fs::dispatch refreshes it per call.
+    pub filter_warn_ctx: String,
+    /// Stream resource ids whose php_user_filter::filter() call is in
+    /// flight — zend fails stream reads re-entered on the stream the
+    /// fill loop owns.
+    pub stream_filter_busy: std::collections::HashSet<u64>,
+    /// Streaming codec objects for FilterState::Codec entries, keyed
+    /// by filter id (compressors can't clone). Seeded at attach and
+    /// dropped with the chain entry.
+    /// Live codec objects keyed (filter res id, read-chain flag) —
+    /// an ALL-mode attach shares one res id across its two chain
+    /// entries, so the direction disambiguates them.
+    pub codec_states: std::collections::HashMap<(u64, bool), crate::builtins::fs::CodecState>,
+    /// Live WeakReference wrapper per target object id — zend keeps a
+    /// per-handle weakref list so repeated create() calls on the same
+    /// live object return the identical wrapper (`===` true).
+    pub weakrefs: std::collections::HashMap<u64, std::rc::Weak<RefCell<crate::value::PhpObject>>>,
     /// Output buffer stack for ob_*().
     ob_stack: Vec<ObLevel>,
     /// While >0, warnings are suppressed (implements `??`, `isset`,
@@ -356,8 +417,10 @@ pub struct Interp<'a> {
     exception_handler_stack: Vec<Value>,
     /// error_reporting() level mask (E_* bits).
     pub(crate) error_level: i64,
-    /// putenv() overrides read back by getenv() (no real process-env mutation).
-    env_overrides: HashMap<String, String>,
+    /// putenv() overrides read back by getenv() (no real process-env
+    /// mutation). `None` = tombstone from `putenv("KEY")` (unset),
+    /// which shadows a same-named var in the real environment.
+    env_overrides: HashMap<String, Option<String>>,
     /// Raw argv entries after the script path, for `getopt()`.
     pub script_args: Vec<String>,
     exception_handler: Option<Value>,
@@ -611,6 +674,7 @@ impl<'a> Interp<'a> {
                 Value::Resource(Rc::new(RefCell::new(crate::value::PhpResource::Stdio {
                     id: which as u64 + 1,
                     which,
+                    pos: 0,
                 }))),
             );
         }
@@ -686,6 +750,65 @@ impl<'a> Interp<'a> {
         constants.insert("E_USER_WARNING".into(), Value::Int(512));
         constants.insert("E_USER_NOTICE".into(), Value::Int(1024));
         constants.insert("E_USER_DEPRECATED".into(), Value::Int(16384));
+        for (name, n) in [
+            ("SIGHUP", 1),
+            ("SIGINT", 2),
+            ("SIGQUIT", 3),
+            ("SIGILL", 4),
+            ("SIGTRAP", 5),
+            ("SIGABRT", 6),
+            ("SIGIOT", 6),
+            ("SIGBUS", 7),
+            ("SIGFPE", 8),
+            ("SIGKILL", 9),
+            ("SIGUSR1", 10),
+            ("SIGSEGV", 11),
+            ("SIGUSR2", 12),
+            ("SIGPIPE", 13),
+            ("SIGALRM", 14),
+            ("SIGTERM", 15),
+            ("SIGSTKFLT", 16),
+            ("SIGCHLD", 17),
+            ("SIGCLD", 17),
+            ("SIGCONT", 18),
+            ("SIGSTOP", 19),
+            ("SIGTSTP", 20),
+            ("SIGTTIN", 21),
+            ("SIGTTOU", 22),
+            ("SIGURG", 23),
+            ("SIGXCPU", 24),
+            ("SIGXFSZ", 25),
+            ("SIGVTALRM", 26),
+            ("SIGPROF", 27),
+            ("SIGWINCH", 28),
+            ("SIGIO", 29),
+            ("SIGPOLL", 29),
+            ("SIGPWR", 30),
+            ("SIGSYS", 31),
+            ("SIG_BLOCK", 0),
+            ("SIG_UNBLOCK", 1),
+            ("SIG_SETMASK", 2),
+            ("SIG_DFL", 0),
+            ("SIG_IGN", 1),
+            ("SIG_ERR", -1),
+            ("SIGBABY", 31),
+            ("WNOHANG", 1),
+            ("WUNTRACED", 2),
+            ("WCONTINUED", 8),
+            ("PRIO_PROCESS", 0),
+        ] {
+            constants.insert(name.into(), Value::Int(n));
+        }
+        constants.insert("SEEK_SET".into(), Value::Int(0));
+        constants.insert("SEEK_CUR".into(), Value::Int(1));
+        constants.insert("SEEK_END".into(), Value::Int(2));
+        constants.insert("STREAM_FILTER_READ".into(), Value::Int(1));
+        constants.insert("STREAM_FILTER_WRITE".into(), Value::Int(2));
+        constants.insert("STREAM_FILTER_ALL".into(), Value::Int(3));
+        // php_stream_filter_status_t — php_user_filter::filter() returns.
+        constants.insert("PSFS_ERR_FATAL".into(), Value::Int(0));
+        constants.insert("PSFS_FEED_ME".into(), Value::Int(1));
+        constants.insert("PSFS_PASS_ON".into(), Value::Int(2));
         constants.insert("PHP_OUTPUT_HANDLER_START".into(), Value::Int(1));
         constants.insert("PHP_OUTPUT_HANDLER_WRITE".into(), Value::Int(0));
         constants.insert("PHP_OUTPUT_HANDLER_CONT".into(), Value::Int(0));
@@ -846,6 +969,27 @@ impl<'a> Interp<'a> {
             tentative: {
                 let mut t = HashSet::new();
                 t.insert(("datetimezone".into(), "listidentifiers".into()));
+                // php_user_filter's methods carry tentative return
+                // types — overrides without matching types warn
+                // (ReturnTypeWillChange suppresses).
+                for m in [
+                    "filter",
+                    "oncreate",
+                    "onclose",
+                    "onflush",
+                    "onread",
+                    "onwrite",
+                    "onappend",
+                    "onprepend",
+                    "onstart",
+                    "onstop",
+                    "onseek",
+                    "onskip",
+                    "oneof",
+                    "ondetach",
+                ] {
+                    t.insert(("php_user_filter".into(), m.into()));
+                }
                 t
             },
             interfaces: HashMap::new(),
@@ -868,6 +1012,17 @@ impl<'a> Interp<'a> {
             valid_utf8: std::collections::HashMap::new(),
             php_input: std::rc::Rc::new(Vec::new()),
             uploads: Vec::new(),
+            stream_chunk_sizes: std::collections::HashMap::new(),
+            stream_filters: std::collections::HashMap::new(),
+            stream_filter_bindings: std::collections::HashMap::new(),
+            user_filter_map: Vec::new(),
+            stream_brigades: std::collections::HashMap::new(),
+            stream_buckets: std::collections::HashMap::new(),
+            filter_no_fclose: None,
+            filter_warn_ctx: String::new(),
+            stream_filter_busy: std::collections::HashSet::new(),
+            codec_states: std::collections::HashMap::new(),
+            weakrefs: std::collections::HashMap::new(),
             ob_stack: Vec::new(),
             silence: 0,
             statics: HashMap::new(),
@@ -877,7 +1032,10 @@ impl<'a> Interp<'a> {
             included: HashSet::new(),
             pending_exception: None,
             call_trace: Vec::new(),
-            res_counter: 0,
+            // zend's regular_list already holds stdin/stdout/stderr
+            // plus the default stream context, so the first userland
+            // resource is id 5.
+            res_counter: 4,
             shutdown_fns: Vec::new(),
             error_handler: None,
             error_handler_stack: Vec::new(),
@@ -1650,6 +1808,33 @@ impl<'a> Interp<'a> {
                         _ => 255,
                     });
                     dtor_stop = true;
+                    break;
+                }
+            }
+        }
+        // zend's resource-list teardown rides the symbol-table free:
+        // each still-filtered stream flushes its write chain and runs
+        // the userfilter dtor with ->stream NULL (the stream zval is
+        // already dead). An error stops the sweep like a dtor failure.
+        if !dtor_stop {
+            let mut sres = Vec::new();
+            for c in self.globals.vars.values() {
+                if let Value::Resource(r) = &*c.borrow() {
+                    if self.stream_filters.contains_key(&r.borrow().id()) {
+                        sres.push(r.clone());
+                    }
+                }
+            }
+            for r in sres {
+                if let Err(e) = crate::builtins::fs::stream_dtor_flush(self, &r) {
+                    shutdown_code = Some(match self.err_flow(e) {
+                        Flow::Exit(c) => c,
+                        Flow::Throw(v) => {
+                            self.uncaught(&v);
+                            255
+                        }
+                        _ => 255,
+                    });
                     break;
                 }
             }
@@ -2450,23 +2635,50 @@ impl<'a> Interp<'a> {
         self.coerce_int(v)
     }
 
-    /// getenv(): putenv() overrides win over the process environment.
+    /// getenv(): putenv() overrides win over the process environment;
+    /// an unset tombstone makes the name read back as unset.
     pub fn getenv_pub(&self, name: &str) -> Option<String> {
-        self.env_overrides
-            .get(name)
-            .cloned()
-            .or_else(|| std::env::var(name).ok())
+        match self.env_overrides.get(name) {
+            Some(v) => v.clone(),
+            None => std::env::var(name).ok(),
+        }
     }
 
-    /// putenv("K=V") → true on success.
+    /// getenv() with no args: the whole environment as name → value,
+    /// minus tombstoned names.
+    pub fn getenv_all_pub(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = std::env::vars()
+            .filter(|(k, _)| !matches!(self.env_overrides.get(k), Some(None)))
+            .collect();
+        for (k, v) in &self.env_overrides {
+            let Some(v) = v else { continue };
+            match out.iter_mut().find(|(ek, _)| ek == k) {
+                Some(e) => e.1 = v.clone(),
+                None => out.push((k.clone(), v.clone())),
+            }
+        }
+        out
+    }
+
+    /// putenv("K=V") sets, putenv("K") unsets (zend's unsetenv form) —
+    /// both return true.
     pub fn putenv_pub(&mut self, s: &str) -> bool {
         match s.split_once('=') {
             Some((k, v)) => {
-                self.env_overrides.insert(k.to_string(), v.to_string());
-                true
+                self.env_overrides
+                    .insert(k.to_string(), Some(v.to_string()));
             }
-            None => false,
+            None => {
+                self.env_overrides.insert(s.to_string(), None);
+            }
         }
+        true
+    }
+
+    /// putenv() state for spawning children: set/overrides/unset pairs
+    /// applied on top of the inherited process environment.
+    pub fn env_overrides_pub(&self) -> &HashMap<String, Option<String>> {
+        &self.env_overrides
     }
 
     /// Build a throwable object (used for internal errors).
@@ -3365,7 +3577,7 @@ fn assert_arg_repr(v: &Value) -> String {
         Value::Array(_) => "Array".into(),
         Value::Object(o) => format!("Object({})", o.borrow().class.name()),
         Value::Callable(_) => "Object(Closure)".into(),
-        Value::Resource(_) => "Resource id #1".into(),
+        Value::Resource(r) => format!("Resource id #{}", r.borrow().id()),
     }
 }
 

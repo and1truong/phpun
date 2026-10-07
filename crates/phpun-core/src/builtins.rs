@@ -18,12 +18,13 @@ mod crypto;
 mod ctype;
 mod datetime;
 mod filter;
-mod fs;
+pub(crate) mod fs;
 mod json;
 mod math;
 mod mbstring;
 mod out;
 mod pcre;
+mod proc;
 mod spl;
 mod string;
 mod url;
@@ -31,7 +32,7 @@ pub(crate) mod var;
 
 pub(crate) use url::urldecode;
 
-fn cell(v: Value) -> Cell {
+pub(in crate::builtins) fn cell(v: Value) -> Cell {
     Rc::new(RefCell::new(v))
 }
 
@@ -134,6 +135,7 @@ const FAMILIES: &[Dispatch] = &[
     mbstring::dispatch,
     out::dispatch,
     pcre::dispatch,
+    proc::dispatch,
     spl::dispatch,
     string::dispatch,
     url::dispatch,
@@ -625,6 +627,7 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "pow"
             | "preg_filter"
             | "preg_grep"
+            | "preg_jit"
             | "preg_last_error"
             | "preg_last_error_msg"
             | "preg_match"
@@ -635,10 +638,12 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "preg_replace_callback_array"
             | "preg_split"
             | "prev"
+            | "print"
             | "print_r"
             | "printf"
             | "proc_close"
             | "proc_get_status"
+            | "proc_nice"
             | "proc_open"
             | "proc_terminate"
             | "property_exists"
@@ -725,6 +730,7 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "stream_get_meta_data"
             | "stream_get_wrappers"
             | "stream_isatty"
+            | "stream_select"
             | "stream_set_blocking"
             | "stream_set_chunk_size"
             | "stream_set_read_buffer"
@@ -1054,6 +1060,22 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         "microtime" => bp!(("as_float", Bool(false))),
         "usleep" => bp!(("microseconds", Req)),
         "sleep" => bp!(("seconds", Req)),
+        "proc_open" => bp!(
+            ("command", Req),
+            ("descriptor_spec", Req),
+            ("pipes", Req),
+            ("cwd", Null),
+            ("env_vars", Null),
+            ("options", Null)
+        ),
+        "proc_close" => bp!(("process", Req)),
+        "proc_get_status" => bp!(("process", Req)),
+        "proc_terminate" => bp!(("process", Req), ("signal", Int(15))),
+        "proc_nice" => bp!(("priority", Req)),
+        "exec" => bp!(("command", Req), ("output", Null), ("result_code", Null)),
+        "system" | "passthru" => bp!(("command", Req), ("result_code", Null)),
+        "shell_exec" => bp!(("command", Req)),
+        "escapeshellarg" | "escapeshellcmd" => bp!(("arg", Req)),
         "md5" | "sha1" => bp!(("string", Req), ("binary", Bool(false))),
         "file_get_contents" => bp!(
             ("filename", Req),
@@ -1072,6 +1094,15 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         }
         "var_export" => bp!(("value", Req), ("return", Bool(false))),
         "getenv" => bp!(("name", Null), ("local_only", Bool(false))),
+        "stream_select" => bp!(
+            ("read", Req),
+            ("write", Req),
+            ("except", Req),
+            ("seconds", Req),
+            ("microseconds", Null)
+        ),
+        // oracle takes exactly 2 args — zend's $mode has no default.
+        "stream_set_blocking" => bp!(("stream", Req), ("enable", Req)),
         "header" => bp!(
             ("header", Req),
             ("replace", Bool(true)),
