@@ -2,7 +2,7 @@ mod decl;
 mod expr;
 
 use crate::ast::*;
-use crate::error::PhpError;
+use crate::error::{ErrorKind, PhpError};
 use crate::lexer::{lex, lex_with, Lexed, Token};
 use std::rc::Rc;
 
@@ -111,6 +111,15 @@ pub fn parse_source(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> 
 /// eval()'d code, which in PHP is always tag-free source.
 pub fn parse_pure(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
     let toks = crate::lexer::lex_php_source(src, short_open)?;
+    parse_toks(toks, 1 + src.bytes().filter(|&b| b == b'\n').count())
+}
+
+/// eval()/`-r` code parse — tagless like [`parse_pure`], except the
+/// lexer never promotes a leading `<?php` into tag mode: `<?` lexes as
+/// operator tokens, surfacing Zend's `unexpected token "<"` error just
+/// like eval()'d code.
+pub fn parse_eval(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
+    let toks = crate::lexer::lex_php_eval(src, short_open)?;
     parse_toks(toks, 1 + src.bytes().filter(|&b| b == b'\n').count())
 }
 
@@ -549,10 +558,30 @@ impl<'a> Parser<'a> {
         let mut halted = false;
         while self.peek().is_some() {
             let stmt_line = self.line();
-            self.stmt_starts.push(self.pos);
+            let stmt_pos = self.pos;
+            self.stmt_starts.push(stmt_pos);
             stmts.push(Stmt::Line(stmt_line));
             self.first_stmt_slot = !saw_any;
-            let s = self.stmt()?;
+            let s = match self.stmt() {
+                Ok(s) => s,
+                Err(mut e) => {
+                    // Zend's top-level statement boundary is where the
+                    // program could just have ended: a token that can't
+                    // even start a statement gets the EOF expected-set
+                    // (`<?php` inside `-r` code, a stray binary op at
+                    // stmt start). Inside braces the expected set is the
+                    // enclosing `}`, so nested stmt() stays bare.
+                    if e.kind == ErrorKind::Parse && self.pos == stmt_pos {
+                        if let Some(Token::Op(o)) = self.peek() {
+                            e.message = format!(
+                                "syntax error, unexpected token \"{}\", expecting end of file",
+                                o
+                            );
+                        }
+                    }
+                    return Err(e);
+                }
+            };
             saw_any = true;
             let is_ns = matches!(&s, Stmt::Namespace(_))
                 || matches!(&s, Stmt::Block(v) if matches!(v.first(), Some(Stmt::Namespace(_))));

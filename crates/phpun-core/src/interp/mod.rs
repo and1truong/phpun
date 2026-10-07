@@ -2622,6 +2622,30 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `php -r <code>` mode: the source is tagless PHP parsed in-script
+    /// like eval()'d code — a `<?php`/`<?` sequence is a syntax error
+    /// (`unexpected token "<", expecting end of file`), never an open
+    /// tag; the pseudo-path "Command line code" stays the label.
+    pub fn run_code(&mut self, src: &str) -> RunResult {
+        if self.ini.contains_key("error_reporting") {
+            let lv = self.ini_error_level();
+            self.error_level = lv;
+        }
+        match parser::parse_eval(src, self.ini_on("short_open_tag")) {
+            Ok(stmts) => self.run(&stmts),
+            Err(e) => {
+                match e.kind {
+                    ErrorKind::Parse => self.print_parse(&e),
+                    _ => self.print_fatal(&e),
+                }
+                RunResult {
+                    exit_code: 255,
+                    fatal: Some(e),
+                }
+            }
+        }
+    }
+
     /// Like run_source but also returns the script's top-level `return`
     /// value — the boot phase of `phpun serve --worker` reads the app
     /// handler this way.

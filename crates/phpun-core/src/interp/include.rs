@@ -361,9 +361,9 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn eval_code(&mut self, code: &str) -> Result<Value, PhpError> {
-        // eval'd code has no <?php tag; strip a leading one defensively.
-        let src = code.strip_prefix("<?php").unwrap_or(code).to_string();
-        match parser::parse_pure(&src, self.ini_on("short_open_tag")) {
+        // eval'd code has no <?php tag at all — Zend lexes it strictly
+        // in-script, so `<?` is a syntax error, not an open tag.
+        match parser::parse_eval(code, self.ini_on("short_open_tag")) {
             Ok(stmts) => {
                 // Same cur_line clobber as include(): `f(eval(...))` must keep
                 // the call-site line for later calls in the statement.

@@ -32,124 +32,267 @@ fn main() -> ExitCode {
     }
 }
 
-/// `phpun [-d k=v]* [-n] [-c PATH] [-z EXT] [-q] [-f] <file.php> [args...]`
+/// Zend CLI usage text, printed on `-h`/`--help` and after a getopt
+/// error (both go to stdout; the error line itself goes to stderr).
+const ZEND_USAGE: &str = "\
+Usage: php [options] [-f] <file> [--] [args...]
+   php [options] -r <code> [--] [args...]
+   php [options] [-B <begin_code>] -R <code> [-E <end_code>] [--] [args...]
+   php [options] [-B <begin_code>] -F <file> [-E <end_code>] [--] [args...]
+   php [options] -S <addr>:<port> [-t docroot] [router]
+   php [options] -- [args...]
+   php [options] -a
+
+  -a               Run as interactive shell (requires readline extension)
+  -c <path>|<file> Look for php.ini file in this directory
+  -n               No configuration (ini) files will be used
+  -d foo[=bar]     Define INI entry foo with value 'bar'
+  -e               Generate extended information for debugger/profiler
+  -f <file>        Parse and execute <file>.
+  -h               This help
+  -i               PHP information
+  -l               Syntax check only (lint)
+  -m               Show compiled in modules
+  -r <code>        Run PHP <code> without using script tags <?..?>
+  -B <begin_code>  Run PHP <begin_code> before processing input lines
+  -R <code>        Run PHP <code> for every input line
+  -F <file>        Parse and execute <file> for every input line
+  -E <end_code>    Run PHP <end_code> after processing all input lines
+  -H               Hide any passed arguments from external tools.
+  -S <addr>:<port> Run with built-in web server.
+  -t <docroot>     Specify document root <docroot> for built-in web server.
+  -s               Output HTML syntax highlighted source.
+  -v               Version number
+  -w               Output source with stripped comments and whitespace.
+
+  args...          Arguments passed to script. Use -- args when first argument
+                   starts with - or script is read from stdin
+
+  --ini            Show configuration file names
+  --ini=diff       Show INI entries that differ from the built-in default
+
+  --rf <name>      Show information about function <name>.
+  --rc <name>      Show information about class <name>.
+  --re <name>      Show information about extension <name>.
+  --rz <name>      Show information about Zend extension <name>.
+  --ri <name>      Show configuration for extension <name>.
+
+  --repeat <count> Repeat script execution <count> times.
+                   For internal purposes only.
+
+";
+
+fn print_version() {
+    println!("phpun 0.0.1 (php compat target: 8.5)");
+}
+
+/// Zend getopt error: `Error in argument N, char C: <msg>` on stderr
+/// (N is the 0-based argv index counting argv[0]), usage on stdout.
+fn opt_err(arg_idx: usize, char_idx: usize, msg: String) -> ExitCode {
+    eprintln!("Error in argument {}, char {}: {}", arg_idx, char_idx, msg);
+    print!("{}", ZEND_USAGE);
+    ExitCode::FAILURE
+}
+
+/// A real php option phpun does not implement (-m, -i, -l, -s, -w,
+/// -a, -B/-R/-F/-E, -S/-t, --ini, --r*, --repeat). Refusing is more
+/// honest than silently ignoring them.
+fn opt_unimpl(a: &str) -> ExitCode {
+    eprintln!("phpun: option '{}' is not implemented", a);
+    ExitCode::FAILURE
+}
+
+/// The value of an arg-taking short option: inline when the arg is
+/// longer (`-rfoo` binds `foo`), else the next argv. Err = zend's
+/// `no argument for option X` getopt error.
+fn opt_arg(args: &[String], i: usize) -> Result<(String, usize), ()> {
+    let a = &args[i];
+    if a.len() > 2 {
+        Ok((a[2..].to_string(), 1))
+    } else if i + 1 < args.len() {
+        Ok((args[i + 1].clone(), 2))
+    } else {
+        Err(())
+    }
+}
+
+/// `phpun [-d k=v]* [-n] [-c PATH] [-q] [-f] <file.php> [args...]`
 /// `phpun [-d k=v]* [-n] -r <code> [args...]`
 ///
-/// `-d` ini flags, the ini-related switches (`-n`/`--no-php-ini`, `-c`,
-/// `-z`) and `-q`/`--` separators are accepted so the PHPT harness can
-/// invoke phpun with the same argv as reference php.
+/// Option parsing follows zend's cli getopt: a single left-to-right
+/// pass where `-r`/`-f`/`-d`/`-c` take their value inline or from the
+/// next argv, `-r`/`-f` are once-only (`-r` overrides an earlier `-f`;
+/// `-f` after `-r` is the "Either execute direct code..." error), and
+/// the first bare positional or `--` ends option parsing — everything
+/// after lands in $argv. With no file and no `-r` code php reads stdin
+/// (labelled "Standard input code", like `php -r`'s "Command line code").
 fn run_script(args: &[String]) -> ExitCode {
-    let mut file: Option<&str> = None;
+    let mut file: Option<String> = None;
     let mut code: Option<String> = None;
     let mut ini: Vec<String> = Vec::new();
+    let mut script_args: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
-        match a {
-            "--" => {
-                i += 1;
-                if i < args.len() {
-                    file = Some(&args[i]);
-                }
-                break;
-            }
-            "-d" => {
-                if i + 1 < args.len() {
-                    ini.push(args[i + 1].clone());
-                }
-                i += 2;
-                continue;
-            }
-            "-r" => {
-                if i + 1 < args.len() {
-                    code = Some(args[i + 1].clone());
-                }
-                i += 2;
-                break;
-            }
-            // php.ini switches zend accepts: `-n`/`--no-php-ini` skip ini
-            // loading (we have none anyway), `-c` points at an ini path
-            // and `-z` loads a zend extension — all ignored.
-            "-n" | "--no-php-ini" => {
-                i += 1;
-                continue;
-            }
-            "-c" | "--php-ini" | "-z" | "--zend-extension" => {
-                i += 2;
-                continue;
-            }
-            s if s.starts_with("-d") => {
-                ini.push(s[2..].to_string());
-                i += 1;
-                continue;
-            }
-            s if s.starts_with("-c")
-                || s.starts_with("--php-ini=")
-                || s.starts_with("--zend-extension=") =>
-            {
-                i += 1;
-                continue;
-            }
-            "-f" | "-q" => {
-                i += 1;
-                continue;
-            }
-            _ => {
+        let a = args[i].clone();
+        if a == "--" {
+            // End of options: the rest is $argv[1..] (stdin mode when
+            // no file/-r was picked).
+            i += 1;
+            script_args.extend(args[i..].iter().cloned());
+            break;
+        }
+        if !(a.len() > 1 && a.starts_with('-')) {
+            // First bare positional — the script file when neither
+            // -r nor -f picked a source, else a script arg. Options
+            // stop here either way.
+            if file.is_none() && code.is_none() {
                 file = Some(a);
-                break;
+            } else {
+                script_args.push(a);
+            }
+            i += 1;
+            script_args.extend(args[i..].iter().cloned());
+            break;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, inline) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            match name {
+                "help" => {
+                    print!("{}", ZEND_USAGE);
+                    return ExitCode::SUCCESS;
+                }
+                "version" => {
+                    print_version();
+                    return ExitCode::SUCCESS;
+                }
+                "no-php-ini" => i += 1,
+                "php-ini" => match inline {
+                    Some(_) => i += 1,
+                    None if i + 1 < args.len() => i += 2,
+                    None => {
+                        return opt_err(i + 1, 1, "no argument for option -".to_string());
+                    }
+                },
+                // Real php options phpun doesn't implement yet.
+                "modules" | "info" | "phpinfo" | "ini" | "rf" | "rc" | "re" | "rz" | "ri"
+                | "repeat" | "process-title" => return opt_unimpl(&a),
+                _ => return opt_err(i + 1, 1, "no argument for option -".to_string()),
+            }
+            continue;
+        }
+        match a.as_str() {
+            // Flags zend accepts and ignores here (`-n` skips ini
+            // loading — we have none anyway; `-q`/`-e`/`-H` are
+            // CGI-era/debugger no-ops).
+            "-n" | "-q" | "-e" | "-H" => i += 1,
+            "-h" => {
+                print!("{}", ZEND_USAGE);
+                return ExitCode::SUCCESS;
+            }
+            "-v" => {
+                print_version();
+                return ExitCode::SUCCESS;
+            }
+            // Real php options phpun doesn't implement yet.
+            "-m" | "-i" | "-l" | "-s" | "-w" | "-a" | "-B" | "-R" | "-F" | "-E" | "-S" | "-t" => {
+                return opt_unimpl(&a)
+            }
+            _ if a.starts_with("-r") => {
+                let v = match opt_arg(args, i) {
+                    Ok((v, n)) => {
+                        i += n;
+                        v
+                    }
+                    Err(()) => return opt_err(i + 1, 2, "no argument for option r".to_string()),
+                };
+                if code.is_some() {
+                    println!("You can use -r only once.");
+                    return ExitCode::FAILURE;
+                }
+                code = Some(v);
+            }
+            _ if a.starts_with("-f") => {
+                let v = match opt_arg(args, i) {
+                    Ok((v, n)) => {
+                        i += n;
+                        v
+                    }
+                    Err(()) => return opt_err(i + 1, 2, "no argument for option f".to_string()),
+                };
+                if code.is_some() {
+                    println!("Either execute direct code, process stdin or use a file.");
+                    return ExitCode::FAILURE;
+                }
+                if file.is_some() {
+                    println!("You can use -f only once.");
+                    return ExitCode::FAILURE;
+                }
+                file = Some(v);
+            }
+            _ if a.starts_with("-d") => match opt_arg(args, i) {
+                Ok((v, n)) => {
+                    ini.push(v);
+                    i += n;
+                }
+                Err(()) => {
+                    return opt_err(i + 1, 2, "no argument for option d".to_string());
+                }
+            },
+            // `-c`/`--php-ini` points at an ini path — ignored.
+            _ if a.starts_with("-c") => match opt_arg(args, i) {
+                Ok((_, n)) => i += n,
+                Err(()) => {
+                    return opt_err(i + 1, 2, "no argument for option c".to_string());
+                }
+            },
+            _ => {
+                return opt_err(i + 1, 2, format!("option not found {}", &a[1..2]));
             }
         }
     }
-    let (src, label): (String, &str) = match (&code, file) {
-        // `php -r` labels the source "Command line code" and argv[0] /
-        // PHP_SELF/SCRIPT_NAME "Standard input code".
+    // `-r` code wins over an earlier `-f` file; with neither, php
+    // reads stdin (pseudo-path "Standard input code").
+    let (src, label): (String, &str) = match (&code, &file) {
         (Some(code), _) => (code.clone(), "Command line code"),
-        (None, Some(file)) => {
-            let s = match std::fs::read_to_string(file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Could not open input file: {}", file);
-                    let _ = e;
-                    return ExitCode::FAILURE;
-                }
-            };
-            (s, file)
-        }
-        (None, None) => {
-            eprintln!("phpun: no input file");
-            return ExitCode::FAILURE;
-        }
+        (None, Some(file)) => match std::fs::read_to_string(file) {
+            Ok(s) => (s, file.as_str()),
+            Err(_) => {
+                eprintln!("Could not open input file: {}", file);
+                return ExitCode::FAILURE;
+            }
+        },
+        (None, None) => (
+            std::io::read_to_string(std::io::stdin()).unwrap_or_default(),
+            "Standard input code",
+        ),
     };
-    // __FILE__/__DIR__ are always absolute in PHP.
-    let abs = if code.is_some() {
-        label.to_string()
-    } else {
-        std::fs::canonicalize(label)
+    // __FILE__/__DIR__ are always absolute in PHP; the -r/stdin
+    // pseudo-paths stay literal.
+    let abs = match (&code, &file) {
+        (None, Some(file)) => std::fs::canonicalize(file)
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| label.to_string())
+            .unwrap_or_else(|_| file.clone()),
+        _ => label.to_string(),
     };
     let mut it = Interp::new(&abs);
     // CLI PHP sets the script-path SERVER vars to the path AS INVOKED
     // (`php console.php` shows "console.php"), unlike __FILE__ which is
-    // always canonical. `-r` code sets SCRIPT_FILENAME to "" and
+    // always canonical. `-r`/stdin code sets SCRIPT_FILENAME to "" and
     // PHP_SELF/SCRIPT_NAME to "Standard input code".
-    let (svar_file, svar_name) = if code.is_some() {
-        ("", "Standard input code")
-    } else {
+    let (svar_file, svar_name) = if code.is_none() && file.is_some() {
         (label, label)
+    } else {
+        ("", "Standard input code")
     };
     it.set_server_var("SCRIPT_FILENAME", svar_file);
     it.set_server_var("PHP_SELF", svar_name);
     it.set_server_var("SCRIPT_NAME", svar_name);
-    // Args after the script path (or after `-r <code>`) become $argv[1..]
-    // like reference php; argv[0] keeps the as-invoked path too.
-    let argv0 = if code.is_some() {
-        "Standard input code"
-    } else {
-        label
-    };
-    let rest = if code.is_some() { i } else { i + 1 };
-    it.set_script_args(argv0, &args[rest.min(args.len())..]);
+    // $argv[0] is the as-invoked path (or "Standard input code" for
+    // -r/stdin); everything collected after the file/code is $argv[1..].
+    it.set_script_args(svar_name, &script_args);
     for kv in ini {
         if let Some((k, v)) = kv.split_once('=') {
             it.ini.insert(k.trim().to_string(), v.trim().to_string());
@@ -160,7 +303,13 @@ fn run_script(args: &[String]) -> ExitCode {
     // Stream output to the real fds so stderr notices interleave with
     // stdout in PHP's order; `phpun test`/`serve` keep buffered capture.
     it.live_io = true;
-    let res = it.run_source(&src);
+    let res = if code.is_some() {
+        // `-r` code is tagless source parsed in-script like eval()'d
+        // code — a `<?php` is a syntax error, never an open tag.
+        it.run_code(&src)
+    } else {
+        it.run_source(&src)
+    };
     let _ = std::io::Write::write_all(&mut std::io::stdout(), &it.out);
     eprint!("{}", it.err_buf);
     ExitCode::from((res.exit_code & 0xff) as u8)

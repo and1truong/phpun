@@ -169,6 +169,21 @@ pub fn lex_php_source(src: &str, short_open: bool) -> Result<Vec<Lexed>, PhpErro
     Ok(out)
 }
 
+/// eval()/`-r` code mode: strict in-script lexing — `<?php`/`<?`/`<?=`
+/// never open a tag (they lex as operator tokens, surfacing Zend's
+/// `unexpected token "<"` parse error), while `?>` still ends PHP and
+/// drops to inline output, exactly like Zend's eval-mode scanner.
+pub fn lex_php_eval(src: &str, short_open: bool) -> Result<Vec<Lexed>, PhpError> {
+    let (body, shebang) = strip_shebang(src);
+    let mut out = Vec::new();
+    let mut line = if shebang { 2 } else { 1 };
+    let pos = lex_php(body, 0, &mut line, &mut out)?;
+    if pos < body.len() {
+        scan_html(body, pos, &mut line, &mut out, short_open)?;
+    }
+    Ok(out)
+}
+
 /// Inline-HTML scanning: everything outside `<?php`/`<?=`/`<?` is echoed.
 fn scan_html(
     src: &str,

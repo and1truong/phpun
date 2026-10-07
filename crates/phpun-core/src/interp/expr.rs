@@ -852,12 +852,22 @@ impl<'a> Interp<'a> {
         match m {
             MagicConst::Line => Value::Int(self.cur_line as i64),
             MagicConst::File => Value::str(decl_file.clone()),
-            MagicConst::Dir => Value::str(
-                std::path::Path::new(&decl_file)
+            MagicConst::Dir => Value::str({
+                let d = std::path::Path::new(&decl_file)
                     .parent()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
-            ),
+                    .unwrap_or_default();
+                // A pseudo-path with no dir part ("Command line code",
+                // "Standard input code", a top-level eval) resolves to
+                // the process cwd, like Zend's `php -r`.
+                if d.is_empty() {
+                    std::env::current_dir()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                } else {
+                    d
+                }
+            }),
             MagicConst::Function => Value::str(
                 self.stack
                     .last()
