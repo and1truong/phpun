@@ -873,10 +873,15 @@ pub(crate) fn dispatch(
                             .collect();
                         // onClose is user code — it may call back into
                         // stream builtins, so the stream borrow must
-                        // not be held across it.
+                        // not be held across it. A close-time filter()
+                        // throw marks the error for re-raise but zend
+                        // skips every onClose hook on the chain
+                        // (userfilter_dtor never runs).
                         drop(rb);
-                        for obj in onclose {
-                            let _ = it.method_invoke(obj, "onClose", CallArgs::empty());
+                        if close_err.is_none() {
+                            for obj in onclose {
+                                let _ = it.method_invoke(obj, "onClose", CallArgs::empty());
+                            }
                         }
                         rb = r.borrow_mut();
                     }
@@ -7474,9 +7479,13 @@ pub(crate) fn stream_dtor_flush(
             Err(e) => close_err = Some(e),
         }
     }
-    for f in &filters {
-        if let FilterState::User(obj) = &f.state {
-            let _ = it.method_invoke(obj.clone(), "onClose", CallArgs::empty());
+    // Same rule as explicit fclose: a close-time filter() throw skips
+    // every onClose hook on the chain.
+    if close_err.is_none() {
+        for f in &filters {
+            if let FilterState::User(obj) = &f.state {
+                let _ = it.method_invoke(obj.clone(), "onClose", CallArgs::empty());
+            }
         }
     }
     *r.borrow_mut() = PhpResource::Closed { id: sid };
