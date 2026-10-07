@@ -1716,6 +1716,12 @@ pub struct GenFinData {
     /// `GenState::finished`: eager collection marks that at run end,
     /// long before the consumer exhausts the items.)
     pub finished: bool,
+    /// The gen was force-closed (throw() bounce, injected throwable
+    /// uncaught, dead-weak/shutdown teardown) rather than consumed
+    /// to exhaustion — its post-yield journaled tail never ran in
+    /// Zend's frame, so journaled ob captures materialize only for
+    /// tags a subsequent real resume confirmed (`pos > t + 1`).
+    pub killed: bool,
     /// Total items collected by the eager run — the consumer-side
     /// "exhausted" condition is `pos >= total`, which is when the
     /// tail bytes (emitted after the last yield) may drain.
@@ -1740,6 +1746,22 @@ pub struct GenFinData {
     /// The owner died as a re-run artifact — the resumed incarnation
     /// displaced this frame — so its destruction replay stays silent.
     pub suppressed: bool,
+    /// Live journals of `yield from` delegates this gen collected —
+    /// killing this incarnation displaces them: their un-run tails
+    /// are kill-dropped too.
+    pub delegate_fins: Vec<FinQueue>,
+}
+
+impl GenFinData {
+    /// Mark this journal and every delegated journal beneath it
+    /// force-closed — a re-run's displaced incarnations and a
+    /// teardown's delegate chain alike leave eager tails un-run.
+    pub fn kill_tree(&mut self) {
+        self.killed = true;
+        for d in &self.delegate_fins {
+            d.borrow_mut().kill_tree();
+        }
+    }
 }
 
 /// A delegated `yield from` journal merged into the parent's — its
@@ -1917,6 +1939,12 @@ pub struct GenState {
     /// (`valid`/`current`/`key`) consult it so a mid-run probe sees
     /// the yields already produced, like Zend's live execute_data.
     pub live: Option<Rc<RefCell<Vec<GenItem>>>>,
+    /// This gen is being re-collected as a `yield from` delegate of a
+    /// gen whose own send()/throw() replay is in flight: its
+    /// pre-first-yield bytes were already echoed by the delegate run
+    /// the consumer saw, so emit suppression covers its `done==0`
+    /// prefix even though the active horizon targets the outer gen.
+    pub suppress_prefix: bool,
 }
 
 impl GenState {

@@ -275,6 +275,7 @@ impl<'a> Interp<'a> {
             closed: false,
             running: false,
             live: None,
+            suppress_prefix: false,
         }));
         // GC-time finally replay: the weak dies with the object —
         // unset()/overwrite then replays fin_q; unit end replays it
@@ -331,6 +332,7 @@ impl<'a> Interp<'a> {
             (setup, st.sends.clone())
         };
         let (decl, this_obj, scope_class, decl_class, called_class, captures, closure_rc) = setup;
+
         // Replay keeps the original arg cells (zend re-runs the same
         // frame): taking them once left the send()-triggered re-run
         // with an empty arg list and a fatals on required params.
@@ -405,7 +407,13 @@ impl<'a> Interp<'a> {
         let collected = std::mem::take(&mut *items.borrow_mut());
         {
             let mut st = state.borrow_mut();
-            st.fin_q.borrow_mut().total = collected.len();
+            {
+                let mut fin = st.fin_q.borrow_mut();
+                fin.total = collected.len();
+                // The body ran to its end — every echo it can ever
+                // produce is journaled; reads may confirm all of it.
+                fin.finished = true;
+            }
             st.items = collected;
             st.finished = true;
             st.running = false;
@@ -1316,11 +1324,20 @@ impl<'a> Interp<'a> {
                             fin.yields.clear();
                             fin.delegates.clear();
                             fin.fin_err = None;
+                            for d in fin.delegate_fins.drain(..) {
+                                // The re-run displaces this
+                                // delegate's incarnation — its eager
+                                // tail never ran.
+                                d.borrow_mut().kill_tree();
+                            }
                         }
                         st.deferred_err = None;
                         st.dead = false;
                         st.delegate_gens.clear();
                     }
+                    // The gen's ob windows journaled the old run's
+                    // post-yield tail — drop it before the re-run.
+                    self.ob_gen_restart(&state.borrow().fin_q.clone());
                     // The re-run replays the prefix the consumer
                     // already echoed — suppress its bytes (Zend only
                     // produces the resume segment).
@@ -1412,12 +1429,18 @@ impl<'a> Interp<'a> {
                         fin.yields.clear();
                         fin.delegates.clear();
                         fin.fin_err = None;
+                        for d in fin.delegate_fins.drain(..) {
+                            // The re-run displaces this delegate's
+                            // incarnation — its eager tail never ran.
+                            d.borrow_mut().kill_tree();
+                        }
                     }
                     st.deferred_err = None;
                     st.dead = false;
                     st.delegate_gens.clear();
                     prev
                 };
+                self.ob_gen_restart(&state.borrow().fin_q.clone());
                 self.gen_throws_fired.clear();
                 // The re-run replays the prefix the consumer already
                 // echoed — suppress its bytes like a send() re-run.
@@ -1443,7 +1466,11 @@ impl<'a> Interp<'a> {
                     let fq = state.borrow().fin_q.clone();
                     let mut fin = std::mem::take(&mut *fq.borrow_mut());
                     let pos = fin.pos;
-                    fq.borrow_mut().finished = true;
+                    {
+                        let mut f = fq.borrow_mut();
+                        f.finished = true;
+                        f.kill_tree();
+                    }
                     self.ob_dead_gen(&fq);
                     self.gen_fin_bytes(&fin, pos);
                     // The force-close frees the suspended frame's CVs
@@ -1467,6 +1494,9 @@ impl<'a> Interp<'a> {
                     // 'already run').
                     if st.dead {
                         st.closed = true;
+                        if st.injected_throwable.is_some() {
+                            st.fin_q.borrow_mut().kill_tree();
+                        }
                     }
                 }
                 self.gen_flush_out(&state, prev + 1);
@@ -1543,6 +1573,21 @@ impl<'a> Interp<'a> {
                 {
                     let mut out = Vec::new();
                     let mut death = None;
+                    // A delegate (re-)driven inside an outer's
+                    // send()/throw() replay: its pre-first-yield
+                    // bytes were already echoed by the run the
+                    // consumer saw — the outer's horizon can't tag
+                    // this state's emits, so mark the prefix stale.
+                    if let Some(crate::value::ObjectInternal::Generator(ist)) = &o.borrow().internal
+                    {
+                        if let Some((k, tgt)) = &self.gen_replay_horizon {
+                            let is_delegate = !std::rc::Rc::ptr_eq(tgt, ist)
+                                && self.gen_collect_base.is_some_and(|b| b <= *k);
+                            if is_delegate {
+                                ist.borrow_mut().suppress_prefix = true;
+                            }
+                        }
+                    }
                     if let Err(e) = self.method_invoke(o.clone(), "rewind", CallArgs::empty()) {
                         death = Some(e);
                     }
@@ -1631,6 +1676,14 @@ impl<'a> Interp<'a> {
                             if !delegate_is_gen {
                                 false
                             } else {
+                                // The delegate's injected re-run
+                                // replaces the tail it journaled into
+                                // the outer queue from its stale pass.
+                                if let Some(run) = &self.gen_run_state {
+                                    run.borrow_mut()
+                                        .pending_out
+                                        .retain(|(t, ..)| *t < outer_idx);
+                                }
                                 let mut a = CallArgs::empty();
                                 a.cells.push(cell(v));
                                 match self.method_invoke(o.clone(), "send", a) {
@@ -1657,6 +1710,14 @@ impl<'a> Interp<'a> {
                                     display_msg: None,
                                 });
                                 break;
+                            }
+                            // Same stale-tail drop as send() — the
+                            // delegate's re-run under the throwable
+                            // replaces what its earlier pass journaled.
+                            if let Some(run) = &self.gen_run_state {
+                                run.borrow_mut()
+                                    .pending_out
+                                    .retain(|(t, ..)| *t < outer_idx);
                             }
                             let mut a = CallArgs::empty();
                             a.cells.push(cell(v));

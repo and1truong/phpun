@@ -692,9 +692,10 @@ pub struct ObLevel {
     /// tag is >= pos, matching the global stack's write order.
     pub pop_segs: Vec<(usize, Vec<u8>)>,
     /// Segment boundaries of journaled bytes drained into `buf`, as
-    /// (tag, byte len) per entry — lets a later pop split `buf`'s
-    /// tail back into segments for `pop_segs`.
-    pub drained_segs: Vec<(usize, usize)>,
+    /// (tag, buf offset, byte len) per entry — lets a later pop split
+    /// `buf`'s drained regions back into segments for `pop_segs` and
+    /// lets teardown drop a killed gen's un-run tail in place.
+    pub drained_segs: Vec<(usize, usize, usize)>,
     /// Consumer writes this mirror captured, each tagged by the
     /// journal cursor they arrived at — the splice input for
     /// `ob_mirror_close`.
@@ -2747,10 +2748,25 @@ impl<'a> Interp<'a> {
                 .as_ref()
                 .map(|s| s.borrow().len())
                 .unwrap_or(0);
-            // send()'s re-run replays the prefix the consumer already
-            // observed — its output must not echo twice.
-            if self.gen_horizon_suppresses(done) {
-                return;
+            // send()/throw() re-runs replay the pre-first-yield prefix
+            // the consumer already echoed — silence only that live
+            // echo. Post-yield writes must still journal: the journal
+            // is what materializes them at the confirmed cursor, and
+            // the restart already dropped the stale run's entries.
+            if done == 0 {
+                if self.gen_horizon_suppresses(done) {
+                    return;
+                }
+                // A delegate re-collected under an outer's replay
+                // horizon: its pre-first-yield bytes were already
+                // echoed by the run the consumer saw.
+                let suppress = self
+                    .gen_run_state
+                    .as_ref()
+                    .is_some_and(|s| s.borrow().suppress_prefix);
+                if suppress {
+                    return;
+                }
             }
             if done > 0 {
                 // An ob opened inside this gen captures the deferred
@@ -2778,6 +2794,7 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
+
                 let is_fin = self.gen_fin_depth > 0;
                 self.gen_buf_out(done - 1, b, false, is_fin);
                 return;
@@ -2851,6 +2868,57 @@ impl<'a> Interp<'a> {
             let _ = so.flush();
         } else {
             self.out.extend_from_slice(b);
+        }
+    }
+
+    /// A send()/throw() restart replaces the body's earlier run: the
+    /// post-yield bytes that run journaled into its own ob windows
+    /// (`gen_pending`, plus any tail already drained into `buf`) are
+    /// stale — the re-run produces the window's real contents.
+    /// Consumer captures (`caps`) are real writes and stay.
+    pub(in crate::interp) fn ob_gen_restart(&mut self, fq: &crate::value::FinQueue) {
+        let owned = |l: &ObLevel| l.gen_q.as_ref().is_some_and(|q| std::rc::Rc::ptr_eq(q, fq));
+        let sweep = |l: &mut ObLevel| {
+            if l.pop_head.is_some() {
+                // A pop mirror is pure replay bookkeeping — the pop
+                // will re-run in the fresh body pass.
+                return true;
+            }
+            l.gen_pending.clear();
+            if l.gen_drained > 0 {
+                // Drop journaled bytes already merged into buf —
+                // the drained tail is the stale run's writes. They
+                // interleave with consumer captures, so cut each
+                // recorded seg range instead of truncating the tail.
+                let mut segs = std::mem::take(&mut l.drained_segs);
+                segs.sort_by_key(|(_, off, _)| *off);
+                let mut v = Vec::with_capacity(l.buf.len());
+                let mut off = 0;
+                for (_, s, e) in segs {
+                    v.extend_from_slice(&l.buf[off..s.min(l.buf.len())]);
+                    off = (s + e).min(l.buf.len());
+                }
+                v.extend_from_slice(&l.buf[off..]);
+                l.buf = v;
+                l.gen_drained = 0;
+            }
+            false
+        };
+        let mut i = 0;
+        while i < self.suspended_obs.len() {
+            if owned(&self.suspended_obs[i]) && sweep(&mut self.suspended_obs[i]) {
+                self.suspended_obs.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        let mut i = 0;
+        while i < self.ob_stack.len() {
+            if owned(&self.ob_stack[i]) && sweep(&mut self.ob_stack[i]) {
+                self.ob_stack.remove(i);
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -3107,22 +3175,43 @@ impl<'a> Interp<'a> {
         if level.gen_pending.is_empty() {
             return;
         }
-        let (pos, fin) = level
+        let (pos, fin, killed) = level
             .gen_q
             .as_ref()
             .map(|q| {
                 let f = q.borrow();
-                (f.pos, f.consumed())
+                // The whole journal is confirmed once the body ran
+                // to its end AND the consumer's cursor reached it —
+                // a mid-consumption gen's post-yield tails still wait
+                // on resume confirmation. Delegate snapshots freeze
+                // at pos=0 so this stays false for them.
+                (f.pos, f.finished && f.pos >= f.total, f.killed)
             })
-            .unwrap_or((usize::MAX, true));
+            .unwrap_or((usize::MAX, true, false));
+        // An orphaned journal (owning state displaced/freed) whose
+        // stream was never consumed is a kill — the un-run tail can
+        // never confirm. A consumed gen ran those writes; Zend
+        // emitted them.
+        let killed = killed
+            || (!fin
+                && level
+                    .gen_state
+                    .as_ref()
+                    .is_some_and(|w| w.upgrade().is_none()));
+        // A tail entry tagged `t` (written after yield index `t`)
+        // ran in Zend's frame only once a resume delivered item
+        // `t + 1` — a consumed-then-unclosed gen's whole journal is
+        // confirmed; a killed gen's cursor froze at the kill so its
+        // un-run tail never materializes.
         let take = level
             .gen_pending
             .iter()
-            .take_while(|(t, _)| all || fin || *t < pos)
+            .take_while(|(t, _)| all || (fin && !killed) || *t + 1 < pos)
             .count();
+
         for (t, b) in level.gen_pending.drain(..take) {
             level.gen_drained += b.len();
-            level.drained_segs.push((t, b.len()));
+            level.drained_segs.push((t, level.buf.len(), b.len()));
             level.buf.extend_from_slice(&b);
         }
     }
@@ -3222,7 +3311,7 @@ impl<'a> Interp<'a> {
     /// prefix — a nested gen's body (created inside the re-run, run
     /// by its own gen_start) emits and journals normally.
     pub(in crate::interp) fn gen_horizon_suppresses(&self, done: usize) -> bool {
-        match &self.gen_replay_horizon {
+        let r = match &self.gen_replay_horizon {
             Some((k, tgt)) => {
                 done <= *k
                     && self
@@ -3231,7 +3320,46 @@ impl<'a> Interp<'a> {
                         .is_some_and(|s| Rc::ptr_eq(s, tgt))
             }
             None => false,
+        };
+
+        r
+    }
+
+    /// Rebuild a level's real buffer content: direct writes + the
+    /// journaled segments the consumer cursor already confirmed +
+    /// consumer captures. A killed gen's tail entries (`t + 1 >= pos`)
+    /// never ran in Zend's frame and drop out.
+    fn ob_level_content(l: &ObLevel, pos: usize, killed: bool) -> Vec<u8> {
+        if let Some(head) = &l.pop_head {
+            // Pop mirror — the body's pop ran only in the eager
+            // re-run; at teardown the real buffer's content is
+            // its pre-window head plus whatever the consumer
+            // captured while suspended.
+            let mut v = head.clone();
+            for (_, c) in &l.caps {
+                v.extend_from_slice(c);
+            }
+            return v;
         }
+        // Buffer contents = direct writes + segments the cursor
+        // already passed + consumer captures — journaled bytes
+        // tagged at/past the cursor never ran in Zend's frame.
+        let mut v = Vec::new();
+        let mut off = 0usize;
+        for &(t, s, n) in &l.drained_segs {
+            let s = s.min(l.buf.len());
+            let e = (s + n).min(l.buf.len());
+            if s < off {
+                continue;
+            }
+            v.extend_from_slice(&l.buf[off..s]);
+            if t + usize::from(killed) < pos {
+                v.extend_from_slice(&l.buf[s..e]);
+            }
+            off = e;
+        }
+        v.extend_from_slice(&l.buf[off..]);
+        v
     }
 
     /// A dead gen's open output buffers tear down like Zend closing
@@ -3253,41 +3381,16 @@ impl<'a> Interp<'a> {
             // buffers force-flushed at teardown.
             return;
         }
+        // Mid-flight teardown — the eager tail's un-confirmed
+        // journaled captures never ran in Zend's frame.
+        fq.borrow_mut().kill_tree();
+        let killed = true;
         let mut bufs = Vec::new();
         let take = |l: &ObLevel, bufs: &mut Vec<Vec<u8>>| {
-            if let Some(head) = &l.pop_head {
-                // Pop mirror — the body's pop ran only in the eager
-                // re-run; at teardown the real buffer's content is
-                // its pre-window head plus whatever the consumer
-                // captured while suspended.
-                let mut v = head.clone();
-                for (_, c) in &l.caps {
-                    v.extend_from_slice(c);
-                }
-                if !v.is_empty() {
-                    bufs.push(v);
-                }
-                return;
+            let v = Self::ob_level_content(l, pos, killed);
+            if !v.is_empty() {
+                bufs.push(v);
             }
-            // Buffer contents = direct writes + segments the cursor
-            // already passed + consumer captures — journaled bytes
-            // tagged at/past the cursor never ran in Zend's frame.
-            // Consumer caps live inline in `buf` already (the capture
-            // path extends it), so the trailing tail covers them.
-            let split = l.buf.len() - l.gen_drained.min(l.buf.len());
-            let mut v = l.buf[..split].to_vec();
-            let mut off = split;
-            for (t, n) in &l.drained_segs {
-                let e = (off + n).min(l.buf.len());
-                if *t < pos {
-                    v.extend_from_slice(&l.buf[off..e]);
-                }
-                off = e;
-            }
-            if off < l.buf.len() {
-                v.extend_from_slice(&l.buf[off..]);
-            }
-            bufs.push(v);
         };
         let mut i = 0;
         while i < self.ob_stack.len() {
@@ -3614,6 +3717,21 @@ impl<'a> Interp<'a> {
         q: &crate::value::FinQueue,
         at_unit_end: bool,
     ) -> Option<PhpError> {
+        {
+            let mut f = q.borrow_mut();
+
+            // Every replay path is a destruction — a gen torn down
+            // mid-flight or displaced by a re-run leaves an un-run
+            // journaled tail; a fully-consumed gen's tail ran. A
+            // delegate torn down while suspended inside the outer's
+            // yield-from drain is likewise a kill: its pos mirror
+            // counts the collect drive's internal resumes, not real
+            // consumer resumes.
+            if f.pos < f.total || f.suppressed || (!at_unit_end && self.gen_collect_base.is_some())
+            {
+                f.kill_tree();
+            }
+        }
         if q.borrow().suppressed {
             // Re-run artifact — the displaced incarnation's close is
             // bookkeeping, not a real generator destruction.
@@ -3622,6 +3740,18 @@ impl<'a> Interp<'a> {
         self.ob_dead_gen(q);
         let mut fin = std::mem::take(&mut *q.borrow_mut());
         let pos = fin.pos;
+        // The take blanks the journal — parked ob windows still read
+        // this fin as their cursor mirror. Restore the bookkeeping
+        // fields they gate on.
+        {
+            let mut f = q.borrow_mut();
+            f.pos = fin.pos;
+            f.total = fin.total;
+            f.finished = fin.finished;
+            f.killed = fin.killed;
+            f.suppressed = fin.suppressed;
+            f.delegate_fins = fin.delegate_fins.clone();
+        }
         let terminal = self.gen_fin_emit(&fin, pos, at_unit_end);
         let dtor = self
             .gen_release_cells(std::mem::take(&mut fin.suspended))

@@ -23,6 +23,32 @@ impl<'a> Interp<'a> {
                     .is_some_and(|o| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos >= o))
         }));
         while !self.ob_stack.is_empty() {
+            // A killed gen's window: journaled tail bytes that merged
+            // into buf before the kill never ran in Zend's frame —
+            // rebuild the real content like the dead-gen teardown.
+            if let Some(l) = self.ob_stack.last_mut() {
+                let dead = l
+                    .gen_q
+                    .as_ref()
+                    .map(|q| {
+                        let f = q.borrow();
+                        (f.pos, f.killed, f.finished && f.pos >= f.total)
+                    })
+                    .unwrap_or((usize::MAX, false, true));
+                let dead = (
+                    dead.0,
+                    dead.1
+                        || (!dead.2 && l.gen_state.as_ref().is_some_and(|w| w.upgrade().is_none())),
+                );
+
+                if dead.1 && !l.drained_segs.is_empty() {
+                    let v = Self::ob_level_content(l, dead.0, true);
+                    l.buf = v;
+                    l.drained_segs.clear();
+                    l.gen_drained = 0;
+                }
+            }
+
             let r = self.ob_invoke(8);
             self.ob_stack.pop();
             if let Ok(Some(s)) = r {
@@ -153,7 +179,7 @@ impl<'a> Interp<'a> {
         // during the body run, detaches at suspend, and
         // rematerializes once the consumer's cursor reaches it
         // (ob_suspend/ob_promote).
-        let (gen_q, gen_open) = match &self.gen_run_state {
+        let (gen_q, gen_open, gen_state) = match &self.gen_run_state {
             Some(s) => {
                 let done = self
                     .gen_sink
@@ -177,6 +203,7 @@ impl<'a> Interp<'a> {
                             && m.pop_head.is_none()
                     }) {
                         let mut m = self.suspended_obs.remove(p);
+
                         // The re-run regenerates its journaled
                         // captures — stale ones would echo twice.
                         m.gen_pending.clear();
@@ -196,9 +223,13 @@ impl<'a> Interp<'a> {
                         return;
                     }
                 }
-                (Some(s.borrow().fin_q.clone()), Some(done))
+                (
+                    Some(s.borrow().fin_q.clone()),
+                    Some(done),
+                    Some(std::rc::Rc::downgrade(s)),
+                )
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         self.ob_stack.push(ObLevel {
             buf: Vec::new(),
@@ -213,7 +244,7 @@ impl<'a> Interp<'a> {
             pop_segs: Vec::new(),
             drained_segs: Vec::new(),
             caps: Vec::new(),
-            gen_state: None,
+            gen_state,
         });
     }
 
@@ -300,44 +331,61 @@ impl<'a> Interp<'a> {
                     .map(|m| (m.pop_head.clone(), m.caps.clone())),
                 _ => None,
             };
-            if let Some((_mhead, caps)) = existing {
-                // Replayed pop: the mirror already captured the
-                // consumer writes the shared Zend buffer also held —
-                // the returned value splices them into this pop's
-                // own segment stream in real write order.
-                let split = content.len() - l.gen_drained.min(content.len());
-                let mut segs = Vec::new();
-                let mut off = split;
-                for (t, n) in &l.drained_segs {
-                    let e = (off + n).min(content.len());
-                    segs.push((*t, content[off..e].to_vec()));
+            // Split `content` (a clone of the level's buf at pop)
+            // into the bytes before the drained stream and per-tag
+            // segments — drained_segs carry their recorded offsets so
+            // mid-buffer drains (consumer writes between segs) stay
+            // positional.
+            let split_parts = |content: &[u8]| -> (Vec<u8>, Vec<(usize, Vec<u8>)>) {
+                let first = l
+                    .drained_segs
+                    .first()
+                    .map(|(_, s, _)| (*s).min(content.len()))
+                    .unwrap_or(content.len());
+                let head = content[..first].to_vec();
+                let mut segs: Vec<(usize, Vec<u8>)> = Vec::new();
+                let mut off = first;
+                for &(t, s, n) in &l.drained_segs {
+                    let s = s.min(content.len());
+                    let e = (s + n).min(content.len());
+                    if s < off {
+                        continue;
+                    }
+                    // Real writes between two journaled segs ride
+                    // with the following one — they ran later.
+                    if s > off {
+                        if let Some(prev) = segs.last_mut() {
+                            prev.1.extend_from_slice(&content[off..s]);
+                        } else {
+                            segs.push((t, content[off..s].to_vec()));
+                        }
+                    }
+                    segs.push((t, content[s..e].to_vec()));
                     off = e;
                 }
                 if off < content.len() {
                     segs.push((usize::MAX, content[off..].to_vec()));
                 }
-                let mut v = content[..split].to_vec();
+                (head, segs)
+            };
+            if let Some((_mhead, caps)) = existing {
+                // Replayed pop: the mirror already captured the
+                // consumer writes the shared Zend buffer also held —
+                // the returned value splices them into this pop's
+                // own segment stream in real write order.
+                let (head, segs) = split_parts(&content);
+                let mut v = head;
                 v.extend_from_slice(&crate::interp::ob_splice(&[], &segs, &caps));
                 l.buf = v;
             } else {
                 // Register the window mirror: keep the pop value
                 // split into a head and per-tag segments so consumer
                 // captures splice in real write order at close.
-                let drained = l.gen_drained.min(content.len());
-                let split = content.len() - drained;
-                let head = content[..split].to_vec();
-                let mut segs = Vec::new();
-                let mut off = split;
-                for (t, n) in &l.drained_segs {
-                    let e = (off + n).min(content.len());
-                    segs.push((*t, content[off..e].to_vec()));
-                    off = e;
-                }
-                if off < content.len() {
-                    segs.push((
-                        close.unwrap_or(0).saturating_sub(1),
-                        content[off..].to_vec(),
-                    ));
+                let (head, mut segs) = split_parts(&content);
+                if let Some(prev) = segs.last_mut() {
+                    if prev.0 == usize::MAX {
+                        prev.0 = close.unwrap_or(0).saturating_sub(1);
+                    }
                 }
                 let gen_state = self.gen_run_state.as_ref().map(std::rc::Rc::downgrade);
                 self.suspended_obs.push(ObLevel {

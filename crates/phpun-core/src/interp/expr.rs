@@ -263,7 +263,15 @@ impl<'a> Interp<'a> {
                             match &o.borrow().internal {
                                 Some(crate::value::ObjectInternal::Generator(ist)) => {
                                     if let Some(run) = &self.gen_run_state {
-                                        run.borrow_mut().delegate_gens.push((base, inner_len));
+                                        let mut r = run.borrow_mut();
+                                        r.delegate_gens.push((base, inner_len));
+                                        // Live delegate journal —
+                                        // killing this incarnation
+                                        // displaces its delegates.
+                                        r.fin_q
+                                            .borrow_mut()
+                                            .delegate_fins
+                                            .push(ist.borrow().fin_q.clone());
                                     }
                                     ist.borrow().return_val.clone()
                                 }

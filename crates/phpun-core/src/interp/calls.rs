@@ -2149,7 +2149,13 @@ impl<'a> Interp<'a> {
                             if let Some(crate::value::ObjectInternal::Generator(gs)) =
                                 &o.borrow().internal
                             {
-                                gs.borrow().fin_q.borrow_mut().suppressed = true;
+                                let fq = gs.borrow().fin_q.clone();
+                                let mut f = fq.borrow_mut();
+                                f.suppressed = true;
+                                // The displaced incarnation's journaled
+                                // tail never ran — its orphaned ob
+                                // windows drop un-confirmed captures.
+                                f.kill_tree();
                             }
                         }
                     }
