@@ -248,10 +248,7 @@ impl<'a> Parser<'a> {
                     | Expr::New { .. }
             );
             if !writable {
-                return Err(PhpError::compile_fatal(
-                    "Cannot use temporary expression in write context",
-                    self.line(),
-                ));
+                self.write_ctx_errs.push(self.line());
             }
         }
         if has_append {

@@ -606,7 +606,7 @@ impl<'a> Parser<'a> {
     /// `Cannot use temporary expression in write context` (probe13
     /// family vs oracle). List elements check per-item instead.
     fn assign_target_gate(
-        &self,
+        &mut self,
         e: &Expr,
         op: &str,
         lhs_start: usize,
@@ -652,10 +652,11 @@ impl<'a> Parser<'a> {
                 if Self::writeable_root(e) {
                     Ok(())
                 } else {
-                    Err(PhpError::compile_fatal(
-                        "Cannot use temporary expression in write context",
-                        self.line(),
-                    ))
+                    // Deferred — zend's compile-time check fires only
+                    // after the whole file parses, so a later syntax
+                    // error wins over it (probe m8).
+                    self.write_ctx_errs.push(self.line());
+                    Ok(())
                 }
             }
             _ => Err(PhpError::parse(
@@ -1562,10 +1563,7 @@ impl<'a> Parser<'a> {
                 | Paren(_)
                 | StaticProp { .. } => {}
                 _ => {
-                    return Err(PhpError::compile_fatal(
-                        "Cannot use temporary expression in write context",
-                        self.line(),
-                    ));
+                    self.write_ctx_errs.push(self.line());
                 }
             }
             // In write context (foreach `&`) a call-shaped OUTER node
@@ -1605,7 +1603,7 @@ impl<'a> Parser<'a> {
     /// literal and `new` chain roots are `Cannot use temporary
     /// expression in write context`; nullsafe chains `Can't use
     /// nullsafe operator in write context`.
-    fn incdec_operand(&self, e: Expr, op: &str, start: usize) -> Result<Expr, PhpError> {
+    fn incdec_operand(&mut self, e: Expr, op: &str, start: usize) -> Result<Expr, PhpError> {
         use crate::ast::Expr::*;
         // Whole operand wrapped in parens — the start `(` matches the
         // token right before the operator (`self.pos - 1` is `++`/`--`
@@ -1684,10 +1682,7 @@ impl<'a> Parser<'a> {
                 | Paren(_)
                 | StaticProp { .. } => {}
                 _ => {
-                    return Err(PhpError::compile_fatal(
-                        "Cannot use temporary expression in write context",
-                        self.line(),
-                    ))
+                    self.write_ctx_errs.push(self.line());
                 }
             }
         } else {
@@ -2532,7 +2527,10 @@ impl<'a> Parser<'a> {
                     // access — zend parse-errors on the next op:
                     // 'unexpected token "->"' (parens or `new A()` do
                     // chain: `(new A)->x`, `new A()->x` — m15 vs oracle).
-                    if !ctor_parens {
+                    // `new class{...}` is a completed value expr —
+                    // the anonymous-class body closes it, so
+                    // ->/?->/[ postfixes chain freely (probe m2).
+                    if !ctor_parens && !matches!(class, Expr::AnonClass(_)) {
                         if let Some(Token::Op(o)) = self.peek() {
                             if matches!(&**o, "->" | "?->" | "[") {
                                 return Err(PhpError::parse(

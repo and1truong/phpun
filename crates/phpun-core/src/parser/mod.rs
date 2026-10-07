@@ -93,6 +93,11 @@ pub struct Parser<'a> {
     /// `return $o?->p` inside is the "Cannot take reference of a
     /// nullsafe chain" compile fatal.
     ret_by_ref: bool,
+    /// Lines of 'Cannot use temporary expression in write context'
+    /// violations seen while parsing — zend detects them in
+    /// zend_compile AFTER the whole file parses, so a later syntax
+    /// error wins over them; they emit only once the file parses clean.
+    write_ctx_errs: Vec<usize>,
 }
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
@@ -177,6 +182,15 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
     if let Some((be, _)) = bracket_err {
         return Err(be);
     }
+    // Zend's write-context check runs in zend_compile — AFTER the
+    // whole file parses — so a later syntax error always wins over
+    // 'Cannot use temporary expression in write context' (probe m8).
+    if let Some(&line) = p.write_ctx_errs.first() {
+        return Err(PhpError::compile_fatal(
+            "Cannot use temporary expression in write context",
+            line,
+        ));
+    }
     let mut diags: Vec<(String, &'static str, usize)> = lex_diags;
     diags.extend(
         std::mem::take(&mut p.deprecations)
@@ -219,6 +233,7 @@ impl<'a> Parser<'a> {
             in_named_fn: false,
             const_ctx: ConstCtx::Runtime,
             ret_by_ref: false,
+            write_ctx_errs: Vec::new(),
         }
     }
 }
@@ -319,6 +334,7 @@ pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
         in_named_fn: false,
         const_ctx: ConstCtx::Runtime,
         ret_by_ref: false,
+        write_ctx_errs: Vec::new(),
     };
     let e = p.expr()?;
     Ok((e, diags))
