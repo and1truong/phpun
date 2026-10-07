@@ -717,6 +717,10 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "strchr"
             | "strcmp"
             | "strcspn"
+            | "stream_bucket_append"
+            | "stream_bucket_make_writeable"
+            | "stream_bucket_new"
+            | "stream_bucket_prepend"
             | "stream_context_create"
             | "stream_context_get_default"
             | "stream_context_get_options"
@@ -725,6 +729,7 @@ pub(crate) fn is_builtin(n: &str) -> bool {
             | "stream_filter_append"
             | "stream_filter_prepend"
             | "stream_filter_register"
+            | "stream_filter_remove"
             | "stream_get_contents"
             | "stream_get_filters"
             | "stream_get_meta_data"
@@ -1240,6 +1245,12 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
             ("mode", Int(0)),
             ("params", Unk)
         ),
+        "stream_filter_remove" => bp!(("stream_filter", Req)),
+        "stream_bucket_new" => bp!(("stream", Req), ("buffer", Req)),
+        "stream_bucket_append" | "stream_bucket_prepend" => {
+            bp!(("brigade", Req), ("bucket", Req))
+        }
+        "stream_bucket_make_writeable" => bp!(("brigade", Req)),
         "headers_sent" => bp!(("filename", Null), ("line", Null)),
         // Oracle arginfo for internal functions whose reflection
         // signature was previously unknown (reported via the (0,0)
