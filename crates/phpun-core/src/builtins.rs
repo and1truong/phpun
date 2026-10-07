@@ -1292,7 +1292,12 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         "extract" => bp!(("array", Req), ("flags", Int(0)), ("prefix", Str(""))),
         "func_get_arg" => bp!(("position", Req)),
         "function_exists" => bp!(("function", Req)),
-        "get_class" | "get_class_methods" | "get_object_vars" => bp!(("object", Req)),
+        // get_class's $object is optional (the no-arg form reads the
+        // calling scope, deprecated since 8.0); get_class_methods takes
+        // object|string as $object_or_class.
+        "get_class" => bp!(("object", Null)),
+        "get_class_methods" => bp!(("object_or_class", Req)),
+        "get_object_vars" => bp!(("object", Req)),
         "get_class_vars" => bp!(("class", Req)),
         "get_debug_type" | "gettype" | "is_array" | "is_bool" | "is_countable" | "is_double"
         | "is_float" | "is_int" | "is_integer" | "is_iterable" | "is_long" | "is_null"

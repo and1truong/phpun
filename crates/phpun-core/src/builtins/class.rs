@@ -76,9 +76,37 @@ pub(crate) fn dispatch(
             }
             _ => Value::Bool(false),
         },
-        "get_class" => match arg(args, 0) {
-            Value::Object(o) => Value::str(o.borrow().class.name().to_string()),
-            _ => Value::Bool(false),
+        "get_class" => match args.first() {
+            // No-arg get_class() reads the calling scope's class —
+            // deprecated since 8.0, and outside class scope it throws
+            // (the deprecation only fires on the success path).
+            None => match it.caller_scope_name() {
+                Some(cn) => {
+                    it.deprecated_pub("Calling get_class() without arguments is deprecated")?;
+                    Value::str(cn)
+                }
+                None => {
+                    return Err(PhpError::uncaught(
+                        "Error",
+                        "get_class() without arguments must be called from within a class"
+                            .to_string(),
+                        it.cur_line,
+                    ))
+                }
+            },
+            Some(c) => match &*c.borrow() {
+                Value::Object(o) => Value::str(o.borrow().class.name().to_string()),
+                v => {
+                    return Err(PhpError::uncaught(
+                        "TypeError",
+                        format!(
+                            "get_class(): Argument #1 ($object) must be of type object, {} given",
+                            v.debug_type()
+                        ),
+                        it.cur_line,
+                    ))
+                }
+            },
         },
         "get_parent_class" => match arg(args, 0) {
             Value::Object(o) => match &o.borrow().class.decl.parent {
