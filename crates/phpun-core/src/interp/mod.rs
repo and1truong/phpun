@@ -2799,21 +2799,26 @@ impl<'a> Interp<'a> {
                 // fail() captures call_trace — pop AFTER it so the
                 // builtin's own frame shows in the backtrace
                 // (`array_multisort(: 1)` in call_user_func_array_variadic).
+                // Named-arg resolution errors raised while the
+                // callee's param array is still being built
+                // mean the frame never existed in Zend — the
+                // trace shows `{main}` only (`substr('x',
+                // bogus: 3)`, `sprintf('%s', format:)`). Pop it
+                // here once and skip the shared pop below.
+                let mut frame_popped = false;
                 let r = match r {
                     Ok(v) => Ok(v),
                     Err(e) => {
-                        // Named-arg resolution errors raised while the
-                        // callee's param array is still being built
-                        // mean the frame never existed in Zend — the
-                        // trace shows `{main}` only (`substr('x',
-                        // bogus: 3)`, `sprintf('%s', format:)`).
                         if Self::named_init_err(&e) {
                             self.call_trace.pop();
+                            frame_popped = true;
                         }
                         self.fail(e)
                     }
                 };
-                self.call_trace.pop();
+                if !frame_popped {
+                    self.call_trace.pop();
+                }
                 let n = self.emit_cmp_notices();
                 if !visible {
                     self.cur_line = save_l;
