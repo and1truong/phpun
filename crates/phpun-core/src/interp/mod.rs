@@ -3891,37 +3891,56 @@ impl<'a> Interp<'a> {
         // and its handler fires at the final flush like any orphaned
         // level. Promote each owned level to a real consumer level at
         // the slot it occupied (suspend_base for parked windows).
-        for l in self
-            .suspended_obs
-            .iter_mut()
-            .chain(self.ob_stack.iter_mut())
-            .filter(|l| owned(l))
-        {
-            Self::ob_drain_level(l, false);
-            l.buf = Self::ob_level_content(l, pos, killed);
-            l.drained_segs.clear();
-            l.cap_segs.clear();
-            l.caps.clear();
-            l.gen_pending.clear();
-            l.read_vals.clear();
-            l.gen_drained = 0;
-            l.gen_q = None;
-            l.gen_open = None;
-            l.gen_close = None;
-        }
+        // An owned pop mirror is a window the body's pop consumed —
+        // consumer-side that pop hasn't run, so its real content
+        // (pre-pop head + consumer captures) materializes into an
+        // ordinary poppable level; a mirror whose window never
+        // opened consumer-side dies silently.
         let mut promote: Vec<(usize, ObLevel)> = Vec::new();
         let mut i = self.suspended_obs.len();
         while i > 0 {
             i -= 1;
-            if self.suspended_obs[i].gen_q.is_none() {
-                let l = self.suspended_obs.remove(i);
-                promote.push((l.suspend_base, l));
+            if !owned(&self.suspended_obs[i]) {
+                continue;
             }
+            let mut l = self.suspended_obs.remove(i);
+            let never_opened = l.pop_head.is_some()
+                && l.gen_open
+                    .is_some_and(|o| l.gen_q.as_ref().is_some_and(|q| q.borrow().vis_pos < o));
+            if never_opened {
+                continue;
+            }
+            Self::ob_dead_level(&mut l, pos, killed);
+            promote.push((l.suspend_base, l));
+        }
+        for l in self.ob_stack.iter_mut().filter(|l| owned(l)) {
+            Self::ob_dead_level(l, pos, killed);
         }
         promote.sort_by_key(|(b, _)| *b);
         for (base, l) in promote {
             self.ob_stack.insert(base.min(self.ob_stack.len()), l);
         }
+    }
+
+    /// Materialize a dead gen's level into an ordinary consumer
+    /// level: real content at the confirmed cursor, all gen/mirror
+    /// bookkeeping cleared — a pop mirror becomes a normal poppable
+    /// level instead of a phantom that flushes raw and can't be
+    /// popped.
+    fn ob_dead_level(l: &mut ObLevel, pos: usize, killed: bool) {
+        Self::ob_drain_level(l, false);
+        l.buf = Self::ob_level_content(l, pos, killed);
+        l.drained_segs.clear();
+        l.cap_segs.clear();
+        l.caps.clear();
+        l.gen_pending.clear();
+        l.read_vals.clear();
+        l.gen_drained = 0;
+        l.gen_q = None;
+        l.gen_open = None;
+        l.gen_close = None;
+        l.pop_head = None;
+        l.pop_segs.clear();
     }
 
     /// Zend destroys a suspended generator by running the finally
