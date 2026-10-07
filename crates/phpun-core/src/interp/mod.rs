@@ -369,8 +369,9 @@ pub struct Interp<'a> {
     /// Active generator body's yield collector — `Expr::Yield` pushes
     /// (key, value) here while a generator function's body runs.
     gen_sink: Option<Rc<RefCell<Vec<crate::value::GenItem>>>>,
-    /// send() queue feeding `yield`-expr results in the running body.
-    gen_sends: std::collections::VecDeque<Value>,
+    /// send() queue feeding `yield`-expr results in the running body
+    /// — (yield index, value) entries.
+    gen_sends: std::collections::VecDeque<(usize, Value)>,
     /// throw() queue for the running body — (yield index, throwable)
     /// entries the `yield` expression raises as its result when the
     /// replay reaches them, so the body's own try/catch/finally does
@@ -660,12 +661,24 @@ pub struct ObLevel {
     /// body-pop value (buf[..len-drained] is pre-pop writes, the rest
     /// is the resume segment it captured).
     pub gen_drained: usize,
-    /// A body-popped window mirror: the pop value's head and tail —
-    /// consumer writes captured in [gen_open, gen_close) splice
-    /// between them when the journaled pop echo is rewritten at
-    /// window close.
+    /// A body-popped window mirror: the pop value's head — the
+    /// direct (pre-first-yield) writes that precede every tagged
+    /// segment. Consumer captures splice into the segment stream
+    /// when the journaled pop echo is rewritten at window close.
     pub pop_head: Option<Vec<u8>>,
-    pub pop_tail: Option<Vec<u8>>,
+    /// The pop value's per-tag segments (bytes the body's resumes
+    /// appended, keyed by the item index each followed) — a consumer
+    /// write at cursor `pos` splices ahead of every segment whose
+    /// tag is >= pos, matching the global stack's write order.
+    pub pop_segs: Vec<(usize, Vec<u8>)>,
+    /// Segment boundaries of journaled bytes drained into `buf`, as
+    /// (tag, byte len) per entry — lets a later pop split `buf`'s
+    /// tail back into segments for `pop_segs`.
+    pub drained_segs: Vec<(usize, usize)>,
+    /// Consumer writes this mirror captured, each tagged by the
+    /// journal cursor they arrived at — the splice input for
+    /// `ob_mirror_close`.
+    pub caps: Vec<(usize, Vec<u8>)>,
     /// The owning generator's state — stale-drop rewrites its
     /// deferred journal entries still holding the stale pop value.
     pub gen_state: Option<std::rc::Weak<RefCell<crate::value::GenState>>>,
@@ -676,6 +689,31 @@ pub struct RunResult {
     pub exit_code: i32,
     /// Set when a fatal error terminated execution.
     pub fatal: Option<PhpError>,
+}
+
+/// Rebuild the bytes one shared output buffer held: the body's
+/// per-tag segments in tag order, with each consumer capture
+/// spliced ahead of the segment whose tag is >= its arrival cursor
+/// — the global stack's real write order across suspends.
+pub(in crate::interp) fn ob_splice(
+    head: &[u8],
+    segs: &[(usize, Vec<u8>)],
+    caps: &[(usize, Vec<u8>)],
+) -> Vec<u8> {
+    let mut v = head.to_vec();
+    let mut ci = 0;
+    for (t, s) in segs {
+        while ci < caps.len() && caps[ci].0 <= *t {
+            v.extend_from_slice(&caps[ci].1);
+            ci += 1;
+        }
+        v.extend_from_slice(s);
+    }
+    while ci < caps.len() {
+        v.extend_from_slice(&caps[ci].1);
+        ci += 1;
+    }
+    v
 }
 
 impl<'a> Interp<'a> {
@@ -2630,8 +2668,13 @@ impl<'a> Interp<'a> {
                         _ => false,
                     };
                     if owns {
-                        l.gen_pending.push((done - 1, b.to_vec()));
-                        return;
+                        // finally-region output belongs to the
+                        // destruction journal — a gen-owned capture
+                        // window dies before it could replay them.
+                        if self.gen_fin_depth == 0 {
+                            l.gen_pending.push((done - 1, b.to_vec()));
+                            return;
+                        }
                     }
                 }
                 let is_fin = self.gen_fin_depth > 0;
@@ -2640,9 +2683,65 @@ impl<'a> Interp<'a> {
             }
         }
         self.ob_promote();
+        self.emit_routed(b);
+    }
+
+    /// Emit journaled/replayed bytes at their materialization point:
+    /// inside another gen's run they join its deferred journal (an
+    /// inner's death bytes attribute to the outer's cursor window);
+    /// consumer-side they go through emit_passthrough.
+    fn emit_replay(&mut self, b: &[u8], tag: usize) {
+        if self.gen_run_state.is_some() {
+            self.emit_bytes(b);
+        } else {
+            self.emit_passthrough(b, tag);
+        }
+    }
+
+    /// Emit already-journaled bytes bound for real output. Replayed
+    /// entries capture into the topmost level that was open at the
+    /// entry's logical write time (a live consumer `ob_start`, or a
+    /// gen window whose open tag the entry reaches) — Zend's shared
+    /// stack routes the resume echo the same way. Gen windows the
+    /// entry predates never see it: those bytes were journaled into
+    /// the level's own `gen_pending`, not `pending_out`.
+    fn emit_passthrough(&mut self, b: &[u8], tag: usize) {
+        if let Some(l) = self
+            .ob_stack
+            .iter_mut()
+            .rev()
+            .find(|l| l.gen_q.is_none() || l.gen_open.is_some_and(|o| tag >= o))
+        {
+            if l.gen_q.is_some() {
+                // A gen window's journaled captures splice by tag like
+                // consumer writes — keep the bookkeeping in step.
+                let pos = l.gen_q.as_ref().map(|q| q.borrow().pos).unwrap_or(0);
+                l.caps.push((pos, b.to_vec()));
+            }
+            l.buf.extend_from_slice(b);
+            return;
+        }
+        if self.live_io {
+            use std::io::Write;
+            let mut so = std::io::stdout().lock();
+            let _ = so.write_all(b);
+            let _ = so.flush();
+        } else {
+            self.out.extend_from_slice(b);
+        }
+    }
+
+    fn emit_routed(&mut self, b: &[u8]) {
         if let Some(buf) = self.ob_stack.last_mut() {
             // Cursor-past journaled captures precede this write.
             Self::ob_drain_level(buf, false);
+            if buf.gen_q.is_some() {
+                // A gen-owned level (live window or pop mirror):
+                // tag the write by the cursor it arrived at — kill
+                // teardown and mirror-close splices need it.
+                let pos = buf.gen_q.as_ref().map(|q| q.borrow().pos).unwrap_or(0);
+                buf.caps.push((pos, b.to_vec()));
+            }
             buf.buf.extend_from_slice(b);
         } else if self.live_io {
             use std::io::Write;
@@ -2702,7 +2801,11 @@ impl<'a> Interp<'a> {
                 .gen_open
                 .is_some_and(|t| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos >= t))
                 && l.gen_close
-                    .is_none_or(|c| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos < c));
+                    .is_none_or(|c| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos < c))
+                // Pop mirrors are consumer-side bookkeeping, not real
+                // stack levels — during the body's own run they stay
+                // parked so a body pop reaches the level it pushed.
+                && (self.gen_run_state.is_none() || l.pop_head.is_none());
             if ready {
                 let l = self.suspended_obs.remove(i);
                 self.ob_stack.push(l);
@@ -2743,19 +2846,120 @@ impl<'a> Interp<'a> {
         let Some(head) = &l.pop_head else {
             return;
         };
-        if l.buf.is_empty() {
+        // Body-pop retarget: the body's pop popped whatever sat on
+        // top of Zend's global stack at resume time. A consumer level
+        // still on the stack at window close means the pop took IT —
+        // its content replaces the journaled pop value and the level
+        // is consumed.
+        let stolen = self
+            .ob_stack
+            .iter()
+            .rposition(|x| x.gen_q.is_none() && x.pop_head.is_none())
+            .map(|i| self.ob_stack.remove(i));
+        if let Some(st) = stolen {
+            let mut old_v = head.clone();
+            for (_, s) in &l.pop_segs {
+                old_v.extend_from_slice(s);
+            }
+            let min_tag = l.gen_close.unwrap_or(0).saturating_sub(1);
+            if !old_v.is_empty() {
+                let new_v = st.buf;
+                if let Some(gs) = &l.gen_state {
+                    if let Some(st2) = gs.upgrade() {
+                        for (t, b, ..) in &mut st2.borrow_mut().pending_out {
+                            if *t >= min_tag {
+                                Self::bytes_replace(b, &old_v, &new_v);
+                            }
+                        }
+                    }
+                }
+                if let Some(q) = &l.gen_q {
+                    for (t, b, _) in &mut q.borrow_mut().bytes {
+                        if *t >= min_tag {
+                            Self::bytes_replace(b, &old_v, &new_v);
+                        }
+                    }
+                }
+            }
+            // The body's pop took the consumer level — the gen's own
+            // buffer was never popped: it stays open on the shared
+            // stack and keeps capturing (request-end flush).
+            if let Some(head) = &l.pop_head {
+                let mut buf = head.clone();
+                for (_, s) in &l.pop_segs {
+                    buf.extend_from_slice(s);
+                }
+                for (_, c) in &l.caps {
+                    buf.extend_from_slice(c);
+                }
+                self.ob_stack.push(ObLevel {
+                    buf,
+                    handler: l.handler.clone(),
+                    started: l.started,
+                    gen_q: l.gen_q.clone(),
+                    gen_open: l.gen_open,
+                    gen_close: None,
+                    gen_pending: Vec::new(),
+                    gen_drained: 0,
+                    pop_head: None,
+                    pop_segs: Vec::new(),
+                    drained_segs: Vec::new(),
+                    caps: Vec::new(),
+                    gen_state: l.gen_state.clone(),
+                });
+            }
             return;
         }
-        let tail = l.pop_tail.clone().unwrap_or_default();
+        if l.caps.is_empty() {
+            return;
+        }
+        let merged = ob_splice(&[], &l.pop_segs, &l.caps);
         let mut old_v = head.clone();
-        old_v.extend_from_slice(&tail);
-        let mut new_v = head.clone();
-        new_v.extend_from_slice(&l.buf);
-        new_v.extend_from_slice(&tail);
+        for (_, s) in &l.pop_segs {
+            old_v.extend_from_slice(s);
+        }
         // The pop ran inside the resume that produced item close-1 —
         // only deferred entries from that segment on can carry the
         // pop value.
         let min_tag = l.gen_close.unwrap_or(0).saturating_sub(1);
+        if old_v.is_empty() {
+            // The journaled pop value is the empty string — no anchor
+            // to rewrite. Splice into the body's first deferred echo
+            // after the pop: that is where the popped value's print
+            // lands (typical `echo "...$c\n"` shape).
+            let mut done = false;
+            if let Some(gs) = &l.gen_state {
+                if let Some(st) = gs.upgrade() {
+                    for (t, b, ..) in &mut st.borrow_mut().pending_out {
+                        if !done && *t >= min_tag {
+                            if let Some(p) = b.iter().rposition(|c| *c == b'\n') {
+                                b.splice(p..p, merged.iter().copied());
+                            } else {
+                                b.extend_from_slice(&merged);
+                            }
+                            done = true;
+                        }
+                    }
+                }
+            }
+            if !done {
+                if let Some(q) = &l.gen_q {
+                    for (t, b, _) in &mut q.borrow_mut().bytes {
+                        if !done && *t >= min_tag {
+                            if let Some(p) = b.iter().rposition(|c| *c == b'\n') {
+                                b.splice(p..p, merged.iter().copied());
+                            } else {
+                                b.extend_from_slice(&merged);
+                            }
+                            done = true;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        let mut new_v = head.clone();
+        new_v.extend_from_slice(&merged);
         if let Some(gs) = &l.gen_state {
             if let Some(st) = gs.upgrade() {
                 for (t, b, ..) in &mut st.borrow_mut().pending_out {
@@ -2815,8 +3019,9 @@ impl<'a> Interp<'a> {
             .iter()
             .take_while(|(t, _)| all || fin || *t < pos)
             .count();
-        for (_, b) in level.gen_pending.drain(..take) {
+        for (t, b) in level.gen_pending.drain(..take) {
             level.gen_drained += b.len();
+            level.drained_segs.push((t, b.len()));
             level.buf.extend_from_slice(&b);
         }
     }
@@ -2882,7 +3087,7 @@ impl<'a> Interp<'a> {
             if is_err {
                 self.diag_stderr(&String::from_utf8_lossy(&b));
             } else {
-                self.emit_bytes(&b);
+                self.emit_replay(&b, t);
             }
         }
         // Entries just shown are no longer part of the suspended
@@ -2925,6 +3130,90 @@ impl<'a> Interp<'a> {
                         .is_some_and(|s| Rc::ptr_eq(s, tgt))
             }
             None => false,
+        }
+    }
+
+    /// A dead gen's open output buffers tear down like Zend closing
+    /// the frame's levels: their real contents flush to the parent
+    /// level (or stdout), while journaled-but-unflushed captures
+    /// — the suspended body's writes the frame never ran — drop
+    /// with the window. Pop mirrors die silently: their captures
+    /// belonged to a window the body already consumed.
+    fn ob_dead_gen(&mut self, fq: &crate::value::FinQueue) {
+        let owned = |l: &ObLevel| l.gen_q.as_ref().is_some_and(|q| std::rc::Rc::ptr_eq(q, fq));
+        let (pos, total) = {
+            let q = fq.borrow();
+            (q.pos, q.total)
+        };
+        if pos >= total {
+            // The gen ran to its end — Zend leaves its output buffers
+            // on the global stack; they flush at request end like any
+            // orphaned level. Only a gen destroyed mid-flight has its
+            // buffers force-flushed at teardown.
+            return;
+        }
+        let mut bufs = Vec::new();
+        let take = |l: &ObLevel, bufs: &mut Vec<Vec<u8>>| {
+            if let Some(head) = &l.pop_head {
+                // Pop mirror — the body's pop ran only in the eager
+                // re-run; at teardown the real buffer's content is
+                // its pre-window head plus whatever the consumer
+                // captured while suspended.
+                let mut v = head.clone();
+                for (_, c) in &l.caps {
+                    v.extend_from_slice(c);
+                }
+                if !v.is_empty() {
+                    bufs.push(v);
+                }
+                return;
+            }
+            // Buffer contents = direct writes + segments the cursor
+            // already passed + consumer captures — journaled bytes
+            // tagged at/past the cursor never ran in Zend's frame.
+            // Consumer caps live inline in `buf` already (the capture
+            // path extends it), so the trailing tail covers them.
+            let split = l.buf.len() - l.gen_drained.min(l.buf.len());
+            let mut v = l.buf[..split].to_vec();
+            let mut off = split;
+            for (t, n) in &l.drained_segs {
+                let e = (off + n).min(l.buf.len());
+                if *t < pos {
+                    v.extend_from_slice(&l.buf[off..e]);
+                }
+                off = e;
+            }
+            if off < l.buf.len() {
+                v.extend_from_slice(&l.buf[off..]);
+            }
+            bufs.push(v);
+        };
+        let mut i = 0;
+        while i < self.ob_stack.len() {
+            if owned(&self.ob_stack[i]) {
+                let mut l = self.ob_stack.remove(i);
+                // Materialize the captures the cursor already passed —
+                // Zend ran those writes into the real buffer.
+                Self::ob_drain_level(&mut l, false);
+                take(&l, &mut bufs);
+            } else {
+                i += 1;
+            }
+        }
+        let mut i = 0;
+        while i < self.suspended_obs.len() {
+            if owned(&self.suspended_obs[i]) {
+                let mut l = self.suspended_obs.remove(i);
+                Self::ob_drain_level(&mut l, false);
+                take(&l, &mut bufs);
+            } else {
+                i += 1;
+            }
+        }
+        for b in bufs {
+            if !b.is_empty() {
+                self.emit_replay(&b, usize::MAX);
+            }
         }
     }
 
@@ -3171,7 +3460,7 @@ impl<'a> Interp<'a> {
             walk(k, out, 16);
             walk(&c.borrow(), out, 16);
         }
-        for v in &st.sends {
+        for (_, v) in &st.sends {
             walk(v, out, 16);
         }
         for (_, v) in &st.throws {
@@ -3229,6 +3518,7 @@ impl<'a> Interp<'a> {
             // bookkeeping, not a real generator destruction.
             return None;
         }
+        self.ob_dead_gen(q);
         let mut fin = std::mem::take(&mut *q.borrow_mut());
         let pos = fin.pos;
         let terminal = self.gen_fin_emit(&fin, pos, at_unit_end);
@@ -3296,7 +3586,7 @@ impl<'a> Interp<'a> {
             if *is_err {
                 self.diag_stderr(&String::from_utf8_lossy(b));
             } else {
-                self.emit_bytes(b);
+                self.emit_replay(b, *t);
             }
         }
     }

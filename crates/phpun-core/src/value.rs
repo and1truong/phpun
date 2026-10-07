@@ -1850,9 +1850,10 @@ pub struct GenState {
     pub by_ref: bool,
     /// Auto keys for keyless `yield $v` (0, 1, 2…).
     pub auto_key: i64,
-    /// Every send() value ever passed, in call order — the k-th send
-    /// feeds the k-th yield expression when the body (re)runs.
-    pub sends: Vec<Value>,
+    /// Every send() value ever passed, as (yield index, value) —
+    /// send() delivers to the yield the gen is suspended at, so a
+    /// re-run must not hand an early send to a preceding yield.
+    pub sends: Vec<(usize, Value)>,
     /// Every `Generator->throw()` injection, as (yield index,
     /// throwable) — the body re-runs on each resume, so the queued
     /// throwable is raised as the result of that yield expression and

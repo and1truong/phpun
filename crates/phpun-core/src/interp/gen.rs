@@ -1236,7 +1236,11 @@ impl<'a> Interp<'a> {
                 }
                 let (prev_pos, restart) = {
                     let mut st = state.borrow_mut();
-                    st.sends.push(v);
+                    // send() delivers to the yield the gen is
+                    // suspended at (index pos) — the re-run replays
+                    // every yield, so earlier yields must not eat it.
+                    let pos = st.pos;
+                    st.sends.push((pos, v));
                     // A gen resumed past its end carries the body's
                     // death — Zend re-raises it at this call rather
                     // than re-running the body; a clean exhausted
@@ -1382,6 +1386,7 @@ impl<'a> Interp<'a> {
                     let mut fin = std::mem::take(&mut *fq.borrow_mut());
                     let pos = fin.pos;
                     fq.borrow_mut().finished = true;
+                    self.ob_dead_gen(&fq);
                     self.gen_fin_bytes(&fin, pos);
                     // The force-close frees the suspended frame's CVs
                     // right after the finally chain (locals' __destruct

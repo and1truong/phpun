@@ -215,7 +215,14 @@ impl<'a> Interp<'a> {
                             self.gen_throws_fired.push(idx);
                             return Err(self.throw(v));
                         }
-                        Ok(self.gen_sends.pop_front().unwrap_or(Value::Null))
+                        // Queued send()s are keyed by yield index —
+                        // replayed yields before the suspended one
+                        // take NULL, not the incoming send.
+                        Ok(if self.gen_sends.front().is_some_and(|(i, _)| *i == idx) {
+                            self.gen_sends.pop_front().unwrap().1
+                        } else {
+                            Value::Null
+                        })
                     }
                     None => self.fail(PhpError::fatal(
                         "The \"yield\" expression can only be used inside a function",

@@ -160,14 +160,43 @@ impl<'a> Interp<'a> {
                     .as_ref()
                     .map(|k| k.borrow().len())
                     .unwrap_or(0);
-                // send()'s prefix re-run replays pushes that
-                // already exist — never materialize the dup.
-                let open = if self.gen_horizon_suppresses(done) {
-                    usize::MAX
-                } else {
-                    done
-                };
-                (Some(s.borrow().fin_q.clone()), Some(open))
+                // A send()/throw() prefix re-run replays this push —
+                // the level the first run parked is the same buffer
+                // (Zend's stack persists): reactivate it so the
+                // replay's writes capture there. A replayed push
+                // whose level was already popped falls through to a
+                // live level — the replayed pop folds it back.
+                if self.gen_horizon_suppresses(done) {
+                    let fq = s.borrow().fin_q.clone();
+                    if let Some(p) = self.suspended_obs.iter().position(|m| {
+                        m.gen_q
+                            .as_ref()
+                            .is_some_and(|mq| std::rc::Rc::ptr_eq(mq, &fq))
+                            && m.gen_open == Some(done)
+                            && m.gen_close.is_none()
+                            && m.pop_head.is_none()
+                    }) {
+                        let mut m = self.suspended_obs.remove(p);
+                        // The re-run regenerates its journaled
+                        // captures — stale ones would echo twice.
+                        m.gen_pending.clear();
+                        m.gen_drained = 0;
+                        m.drained_segs.clear();
+                        self.ob_stack.push(m);
+                        return;
+                    }
+                    let live = self.ob_stack.iter().any(|m| {
+                        m.gen_q
+                            .as_ref()
+                            .is_some_and(|mq| std::rc::Rc::ptr_eq(mq, &fq))
+                            && m.gen_open == Some(done)
+                            && m.pop_head.is_none()
+                    });
+                    if live {
+                        return;
+                    }
+                }
+                (Some(s.borrow().fin_q.clone()), Some(done))
             }
             None => (None, None),
         };
@@ -181,7 +210,9 @@ impl<'a> Interp<'a> {
             gen_pending: Vec::new(),
             gen_drained: 0,
             pop_head: None,
-            pop_tail: None,
+            pop_segs: Vec::new(),
+            drained_segs: Vec::new(),
+            caps: Vec::new(),
             gen_state: None,
         });
     }
@@ -194,7 +225,65 @@ impl<'a> Interp<'a> {
     /// into the returned value instead of registering a second
     /// window.
     fn ob_pop(&mut self) -> Option<ObLevel> {
-        let mut l = self.ob_stack.pop()?;
+        self.ob_pop_snap(None)
+    }
+
+    /// `snap` supplies the buffer contents for the mirror split when
+    /// the caller already consumed `buf` (ob_end_flush's handler
+    /// invoke empties it before the pop).
+    fn ob_pop_snap(&mut self, snap: Option<Vec<u8>>) -> Option<ObLevel> {
+        // Pop mirrors are bookkeeping for a buffer the body already
+        // consumed — Zend's stack has no such level, so every pop
+        // (body or consumer) lands on the topmost real level.
+        let i = self
+            .ob_stack
+            .iter()
+            .rposition(|l| l.pop_head.is_none())
+            .or_else(|| {
+                // Consumer-side pops reach into a suspended gen
+                // window — at the consumer's cursor the body's pop
+                // hasn't logically run, so the mirror IS the real
+                // buffer for them.
+                if self.gen_run_state.is_none() {
+                    self.ob_stack.iter().rposition(|l| l.gen_q.is_some())
+                } else {
+                    None
+                }
+            })?;
+        let mut l = self.ob_stack.remove(i);
+        if l.pop_head.is_some() {
+            // The consumer stole the window: return its real-time
+            // content; the body's pop Zend-wise now sees whatever
+            // remains (here: nothing) — clear the journaled value.
+            let mut v = l.pop_head.clone().unwrap_or_default();
+            for (_, s) in &l.pop_segs {
+                v.extend_from_slice(s);
+            }
+            v.extend_from_slice(&crate::interp::ob_splice(&[], &[], &l.caps));
+            let old_v = v.clone();
+            let min_tag = l.gen_close.unwrap_or(0).saturating_sub(1);
+            if !old_v.is_empty() {
+                if let Some(gs) = &l.gen_state {
+                    if let Some(st2) = gs.upgrade() {
+                        for (t, b, ..) in &mut st2.borrow_mut().pending_out {
+                            if *t >= min_tag {
+                                Self::bytes_replace(b, &old_v, &[]);
+                            }
+                        }
+                    }
+                }
+                if let Some(q) = &l.gen_q {
+                    for (t, b, _) in &mut q.borrow_mut().bytes {
+                        if *t >= min_tag {
+                            Self::bytes_replace(b, &old_v, &[]);
+                        }
+                    }
+                }
+            }
+            l.buf = v;
+            return Some(l);
+        }
+        let content = snap.unwrap_or_else(|| l.buf.clone());
         if l.gen_open.is_some() && self.gen_run_state.is_some() && l.gen_close.is_none() {
             let close = self.gen_sink.as_ref().map(|s| s.borrow().len());
             let existing = match (&l.gen_q, close) {
@@ -208,25 +297,48 @@ impl<'a> Interp<'a> {
                             .is_some_and(|mq| std::rc::Rc::ptr_eq(mq, q))
                             && m.gen_close == Some(c)
                     })
-                    .map(|m| (m.pop_head.clone(), m.buf.clone())),
+                    .map(|m| (m.pop_head.clone(), m.caps.clone())),
                 _ => None,
             };
-            if let Some((head, caps)) = existing {
+            if let Some((_mhead, caps)) = existing {
                 // Replayed pop: the mirror already captured the
-                // consumer writes the shared Zend buffer also held
-                // — the returned value is head+captures+this pop.
-                let mut nv = head.unwrap_or_default();
-                nv.extend_from_slice(&caps);
-                nv.extend_from_slice(&l.buf);
-                l.buf = nv;
+                // consumer writes the shared Zend buffer also held —
+                // the returned value splices them into this pop's
+                // own segment stream in real write order.
+                let split = content.len() - l.gen_drained.min(content.len());
+                let mut segs = Vec::new();
+                let mut off = split;
+                for (t, n) in &l.drained_segs {
+                    let e = (off + n).min(content.len());
+                    segs.push((*t, content[off..e].to_vec()));
+                    off = e;
+                }
+                if off < content.len() {
+                    segs.push((usize::MAX, content[off..].to_vec()));
+                }
+                let mut v = content[..split].to_vec();
+                v.extend_from_slice(&crate::interp::ob_splice(&[], &segs, &caps));
+                l.buf = v;
             } else {
-                // Register the window mirror: keep the pop value's
-                // head/tail split so consumer captures splice
-                // between them at window close.
-                let drained = l.gen_drained.min(l.buf.len());
-                let split = l.buf.len() - drained;
-                let head = l.buf[..split].to_vec();
-                let tail = l.buf[split..].to_vec();
+                // Register the window mirror: keep the pop value
+                // split into a head and per-tag segments so consumer
+                // captures splice in real write order at close.
+                let drained = l.gen_drained.min(content.len());
+                let split = content.len() - drained;
+                let head = content[..split].to_vec();
+                let mut segs = Vec::new();
+                let mut off = split;
+                for (t, n) in &l.drained_segs {
+                    let e = (off + n).min(content.len());
+                    segs.push((*t, content[off..e].to_vec()));
+                    off = e;
+                }
+                if off < content.len() {
+                    segs.push((
+                        close.unwrap_or(0).saturating_sub(1),
+                        content[off..].to_vec(),
+                    ));
+                }
                 let gen_state = self.gen_run_state.as_ref().map(std::rc::Rc::downgrade);
                 self.suspended_obs.push(ObLevel {
                     buf: Vec::new(),
@@ -238,7 +350,9 @@ impl<'a> Interp<'a> {
                     gen_pending: Vec::new(),
                     gen_drained: 0,
                     pop_head: Some(head),
-                    pop_tail: Some(tail),
+                    pop_segs: segs,
+                    drained_segs: Vec::new(),
+                    caps: Vec::new(),
                     gen_state,
                 });
             }
@@ -253,8 +367,10 @@ impl<'a> Interp<'a> {
     }
     /// ob_end_flush: handler(mode=FINAL) result emitted to parent, pop.
     pub fn ob_end_flush(&mut self) -> Result<(), PhpError> {
+        self.ob_drain_pending();
+        let raw = self.ob_stack.last().map(|l| l.buf.clone());
         let r = self.ob_invoke(8)?;
-        self.ob_pop();
+        self.ob_pop_snap(raw);
         if let Some(s) = r {
             self.emit_bytes(&s);
         }
@@ -291,7 +407,7 @@ impl<'a> Interp<'a> {
         self.ob_drain_pending();
         let raw = self.ob_stack.last().map(|l| l.buf.clone());
         let r = self.ob_invoke(8)?;
-        self.ob_pop();
+        self.ob_pop_snap(raw.clone());
         if let Some(s) = r {
             self.emit_bytes(&s);
         }
