@@ -978,16 +978,38 @@ impl<'a> Interp<'a> {
                                             .insert("\0rp\0default".into(), cell(v));
                                     }
                                     Err(pe) => {
-                                        let cls = match &pe.kind {
-                                            crate::error::ErrorKind::Uncaught { class } => *class,
-                                            _ => "Error",
+                                        // A Throw-kind error carries the
+                                        // real throwable in
+                                        // pending_exception ('Undefined
+                                        // constant X' etc.) — its class
+                                        // and message are what
+                                        // getDefaultValue() rethrows.
+                                        let thrown = self.pending_exception.take();
+                                        let (cls, msg) = match &thrown {
+                                            Some(Value::Object(o)) => {
+                                                let b = o.borrow();
+                                                let m = b
+                                                    .props
+                                                    .get("message")
+                                                    .map(|c| c.borrow().to_php_string())
+                                                    .unwrap_or_else(|| pe.message.clone());
+                                                (b.class.name().to_string(), m.to_string())
+                                            }
+                                            _ => {
+                                                let cls = match &pe.kind {
+                                                    crate::error::ErrorKind::Uncaught { class } => {
+                                                        *class
+                                                    }
+                                                    _ => "Error",
+                                                };
+                                                (cls.to_string(), pe.message.clone())
+                                            }
                                         };
                                         let mut ob = o.borrow_mut();
-                                        ob.props.insert(
-                                            "\0rp\0dmsg".into(),
-                                            cell(Value::str(&pe.message)),
-                                        );
-                                        ob.props.insert("\0rp\0dcls".into(), cell(Value::str(cls)));
+                                        ob.props
+                                            .insert("\0rp\0dmsg".into(), cell(Value::str(&msg)));
+                                        ob.props
+                                            .insert("\0rp\0dcls".into(), cell(Value::str(&cls)));
                                         drop(ob);
                                     }
                                 }
@@ -1029,11 +1051,12 @@ impl<'a> Interp<'a> {
                 if let Some(v) = got {
                     Ok(Some(v))
                 } else if let Some(m) = dmsg {
-                    Err(PhpError::uncaught(
-                        Box::leak(dcls.unwrap_or_else(|| "Error".into()).into_boxed_str()),
-                        m.to_string(),
-                        0,
-                    ))
+                    // The deferred default-eval error rethrows as a
+                    // catchable throwable of its recorded class —
+                    // try/catch around getDefaultValue() works.
+                    let cls = dcls.unwrap_or_else(|| "Error".into());
+                    let e = self.exception(&cls, &m.to_string());
+                    Err(self.throw_value(e))
                 } else {
                     Err(PhpError::uncaught(
                         "ReflectionException",
