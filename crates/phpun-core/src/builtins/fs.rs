@@ -6572,8 +6572,10 @@ fn filter_apply_one(
                 }
             }
             // A partial multibyte sequence still pending when the
-            // chain closes is an invalid sequence too (zend EILSEQ).
-            if !invalid && closing && !pending.is_empty() {
+            // chain drains is an invalid sequence too (zend EILSEQ) —
+            // any flush op trips it: fclose (closing) plus the
+            // incremental brigade drains fflush() and rewind() send.
+            if !invalid && (closing || inc) && !pending.is_empty() {
                 invalid = true;
             }
             if invalid {
