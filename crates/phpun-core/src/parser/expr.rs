@@ -520,10 +520,66 @@ impl<'a> Parser<'a> {
     pub fn expr(&mut self) -> Result<Expr, PhpError> {
         if self.ident_is("throw") {
             self.pos += 1;
-            let e = self.assign()?;
+            // `throw`'s operand is a full expr in zend — it reaches
+            // below even `or` (`throw $e or die` throws the `or`'s
+            // bool result, not $e).
+            let e = self.logical_or_low()?;
             return Ok(Expr::Throw(Box::new(e)));
         }
-        self.assign()
+        self.logical_or_low()
+    }
+
+    /// `or`/`xor`/`and` — zend's three lowest precedence levels, all
+    /// BELOW `=` (`$x = $v or die` parses `($x = $v) or die`) and
+    /// below print/yield. `or` is lowest, `and` highest of the three.
+    /// The word forms compile to the same BOOL ops as `||`/`xor`/`&&`
+    /// (but the result never feeds the assign's RHS).
+    pub(in crate::parser) fn logical_or_low(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
+        let mut e = self.logical_xor_low()?;
+        while self.ident_is("or") {
+            self.pos += 1;
+            let rline = self.line();
+            let r = self.logical_xor_low()?;
+            e = Expr::Binary {
+                op: "||",
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
+            };
+        }
+        Ok(e)
+    }
+
+    fn logical_xor_low(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
+        let mut e = self.logical_and_low()?;
+        while self.ident_is("xor") {
+            self.pos += 1;
+            let rline = self.line();
+            let r = self.logical_and_low()?;
+            e = Expr::Binary {
+                op: "xor",
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
+            };
+        }
+        Ok(e)
+    }
+
+    fn logical_and_low(&mut self) -> Result<Expr, PhpError> {
+        let lline = self.line();
+        let mut e = self.assign()?;
+        while self.ident_is("and") {
+            self.pos += 1;
+            let rline = self.line();
+            let r = self.assign()?;
+            e = Expr::Binary {
+                op: "&&",
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
+            };
+        }
+        Ok(e)
     }
 
     pub(in crate::parser) fn assign(&mut self) -> Result<Expr, PhpError> {
@@ -532,7 +588,7 @@ impl<'a> Parser<'a> {
         if self.ident_is("throw") {
             self.pos += 1;
             let tl = self.line();
-            let e = self.assign()?;
+            let e = self.logical_or_low()?;
             return Ok(Expr::Throw(Box::new(Self::markline(e, tl))));
         }
         let tl = self.line();
@@ -963,64 +1019,31 @@ impl<'a> Parser<'a> {
     pub(in crate::parser) fn logical_or(&mut self) -> Result<Expr, PhpError> {
         let lline = self.line();
         let mut e = self.logical_and()?;
-        loop {
-            if self.eat_op("||") {
-                let rline = self.line();
-                let r = self.logical_and()?;
-                e = Expr::Binary {
-                    op: "||",
-                    l: Box::new(Self::markline(e, lline)),
-                    r: Box::new(Self::markline(r, rline)),
-                };
-            } else if self.ident_is("or") {
-                self.pos += 1;
-                let rline = self.line();
-                let r = self.logical_and()?;
-                e = Expr::Binary {
-                    op: "||",
-                    l: Box::new(Self::markline(e, lline)),
-                    r: Box::new(Self::markline(r, rline)),
-                };
-            } else if self.ident_is("xor") {
-                self.pos += 1;
-                let rline = self.line();
-                let r = self.logical_and()?;
-                e = Expr::Binary {
-                    op: "xor",
-                    l: Box::new(Self::markline(e, lline)),
-                    r: Box::new(Self::markline(r, rline)),
-                };
-            } else {
-                return Ok(e);
-            }
+        while self.eat_op("||") {
+            let rline = self.line();
+            let r = self.logical_and()?;
+            e = Expr::Binary {
+                op: "||",
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
+            };
         }
+        Ok(e)
     }
 
     pub(in crate::parser) fn logical_and(&mut self) -> Result<Expr, PhpError> {
         let lline = self.line();
         let mut e = self.equality()?;
-        loop {
-            if self.eat_op("&&") {
-                let rline = self.line();
-                let r = self.equality()?;
-                e = Expr::Binary {
-                    op: "&&",
-                    l: Box::new(Self::markline(e, lline)),
-                    r: Box::new(Self::markline(r, rline)),
-                };
-            } else if self.ident_is("and") {
-                self.pos += 1;
-                let rline = self.line();
-                let r = self.equality()?;
-                e = Expr::Binary {
-                    op: "&&",
-                    l: Box::new(Self::markline(e, lline)),
-                    r: Box::new(Self::markline(r, rline)),
-                };
-            } else {
-                return Ok(e);
-            }
+        while self.eat_op("&&") {
+            let rline = self.line();
+            let r = self.equality()?;
+            e = Expr::Binary {
+                op: "&&",
+                l: Box::new(Self::markline(e, lline)),
+                r: Box::new(Self::markline(r, rline)),
+            };
         }
+        Ok(e)
     }
 
     pub(in crate::parser) fn equality(&mut self) -> Result<Expr, PhpError> {
@@ -2348,7 +2371,10 @@ impl<'a> Parser<'a> {
                 } else if self.ident_is("print") {
                     self.pos += 1;
                     let el = self.line();
-                    let e = self.expr()?;
+                    // print's operand binds above `=` but below zend's
+                    // `and`/`xor`/`or`: `print $x = 5` prints 5, while
+                    // `print $a or die` is `(print $a) or die`.
+                    let e = self.assign()?;
                     Ok(Expr::Print(Box::new(Self::markline(e, el))))
                 } else if self.ident_is("exit") || self.ident_is("die") {
                     self.pos += 1;
