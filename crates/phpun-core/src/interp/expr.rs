@@ -3237,12 +3237,15 @@ impl<'a> Interp<'a> {
     /// no borrow alive across the diagnostic dispatch (B1).
     fn dim_arr_key(&mut self, kc: &Cell) -> Result<ArrKey, PhpError> {
         let p = Rc::as_ptr(kc) as usize;
-        if let Some(ak) = self.dim_key_conv.get(&p) {
+        if let Some((_, ak)) = self.dim_key_conv.get(&p) {
             return Ok(ak.clone());
         }
         let v = kc.borrow().clone();
         let ak = self.arr_key(&v)?;
-        self.dim_key_conv.insert(p, ak.clone());
+        // Keep the cell Rc alive in the cache — a dropped cell's
+        // address would be reused and mis-key a later operand's
+        // conversion (method_call_variation_001).
+        self.dim_key_conv.insert(p, (kc.clone(), ak.clone()));
         Ok(ak)
     }
 

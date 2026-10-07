@@ -406,7 +406,10 @@ pub struct Interp<'a> {
     /// casts each dim operand once: the compound read, the write gate
     /// and the write itself reuse it without re-warning (`.=`/`|=`
     /// probe: oracle prints the null-offset deprecation exactly once).
-    dim_key_conv: std::collections::HashMap<usize, ArrKey>,
+    /// Per-dim-op cache of each operand cell's offset conversion —
+    /// `(cell, ArrKey)` keeps the Rc alive so a dropped cell's address
+    /// can't be reused and mis-key a later conversion (ABA).
+    dim_key_conv: std::collections::HashMap<usize, (Cell, ArrKey)>,
     /// Current line estimate for error messages (best-effort).
     pub cur_line: usize,
     /// Active generator body's yield collector — `Expr::Yield` pushes
