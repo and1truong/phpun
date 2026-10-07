@@ -57,7 +57,9 @@ fn run_script(args: &[String]) -> ExitCode {
                 i += 2;
                 continue;
             }
-            "-f" | "-q" => {
+            "-f" | "-q" | "-n" | "--no-php-ini" => {
+                // `-n`/`--no-php-ini`: reference php skips ini files —
+                // phpun never reads one, so the flag is a no-op.
                 i += 1;
                 continue;
             }
