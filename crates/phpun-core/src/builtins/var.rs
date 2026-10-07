@@ -1014,7 +1014,23 @@ fn ser_value(it: &mut Interp, v: &Value, ctx: &mut SerCtx) -> Result<String, Php
                 // their key as `i:N;` like an array's int member.
                 match crate::value::int_prop_index(&name) {
                     Some(i) => body.push_str(&format!("i:{};", i)),
-                    None => body.push_str(&format!("s:{}:\"{}\";", name.len(), name)),
+                    None => {
+                        // zend mangles member names in the stream:
+                        // `\0*\0name` protected, `\0Cls\0name` private
+                        // (private slots already store mangled — emit
+                        // them verbatim).
+                        let emit = if name.starts_with('\0') {
+                            name.clone()
+                        } else {
+                            match it.prop_visibility(&o.borrow().class, &name).0 {
+                                crate::ast::Visibility::Protected => {
+                                    format!("\0*\0{}", name)
+                                }
+                                _ => name.clone(),
+                            }
+                        };
+                        body.push_str(&format!("s:{}:\"{}\";", emit.len(), emit));
+                    }
                 }
                 body.push_str(&ser_cell(it, &c, ctx)?);
                 n += 1;
@@ -1369,7 +1385,49 @@ pub(crate) fn php_unserialize(
                 }
                 let v = php_unserialize(it, s, pos, err, vhash)?;
                 let mut ob = obj.borrow_mut();
-                let key = crate::value::lossy(&ks).into_owned();
+                // zend's `\0*\0name` member resolves to the declared
+                // protected prop's plain slot (ctor storage uses the
+                // plain name); an undeclared mangle — like a `\0Cls\0`
+                // private — keeps its mangled hash key verbatim.
+                let key = {
+                    let ksb: &[u8] = ks.as_ref();
+                    let pn = crate::value::lossy(&plain);
+                    if ksb.starts_with(&[0u8, b'*', 0u8][..])
+                        && it.prop_visibility(&ob.class, &pn).0
+                            == crate::ast::Visibility::Protected
+                    {
+                        pn.into_owned()
+                    } else {
+                        crate::value::lossy(&ks).into_owned()
+                    }
+                };
+                // Exception members mirror the engine's internal
+                // slots: previous feeds getPrevious(), file/line feed
+                // getFile()/getLine(), string the formatted trace —
+                // a prop-table-only write loses the roundtrip.
+                if let Some(crate::value::ObjectInternal::Exception {
+                    previous,
+                    file,
+                    line,
+                    trace,
+                    ..
+                }) = &mut ob.internal
+                {
+                    let vb = v.borrow();
+                    match plain {
+                        b"previous" => {
+                            *previous = if matches!(&*vb, Value::Object(_)) {
+                                Some(vb.clone())
+                            } else {
+                                None
+                            };
+                        }
+                        b"file" => *file = vb.to_php_string(),
+                        b"line" => *line = vb.to_int().max(0) as u32,
+                        b"string" => *trace = vb.to_php_string(),
+                        _ => {}
+                    }
+                }
                 if !ob.prop_order.contains(&key) {
                     ob.prop_order.push(key.clone());
                 }
