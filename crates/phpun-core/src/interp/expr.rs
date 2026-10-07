@@ -1522,15 +1522,7 @@ impl<'a> Interp<'a> {
                 // by-ref fetches resolve it to null silently instead
                 // (r($undef->p)).
                 if needs_read && op != "??=" {
-                    let mut b: &Expr = obj;
-                    while let Expr::Paren(inner) = b {
-                        b = inner.as_ref();
-                    }
-                    if let Expr::Var(n) = b {
-                        if self.var_lookup(n).is_none() {
-                            self.warn(&format!("Undefined variable ${}", n))?;
-                        }
-                    }
+                    self.warn_undef_lvalue_obj(obj)?;
                 }
                 // zend fetches the object operand in write context —
                 // an intermediate readonly prop holding a non-object
@@ -1624,9 +1616,9 @@ impl<'a> Interp<'a> {
                     // the slot — even over a handler's mid-warn
                     // rebind. `=`/`??=` keep silent fetch semantics.
                     if needs_read {
+                        self.warn_undef_lvalue_obj(base)?;
                         if let Expr::Var(n) = base {
                             if self.var_lookup(n).is_none() {
-                                self.warn(&format!("Undefined variable ${}", n))?;
                                 let c = self.var_cell(n);
                                 *c.borrow_mut() =
                                     Value::Array(Rc::new(RefCell::new(PhpArray::new())));
@@ -6577,6 +6569,28 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Warn 'Undefined variable' once for the innermost CV of an
+    /// lvalue chain under zend's RW fetch — nested prop/dim links
+    /// evaluate in the same write context, so `$u->a->a += 1` and
+    /// `$u->p[k] += 1` warn $u (bug78531).
+    fn warn_undef_lvalue_obj(&mut self, obj: &Expr) -> Result<(), PhpError> {
+        let mut b: &Expr = obj;
+        loop {
+            match b {
+                Expr::Paren(i) => b = i.as_ref(),
+                Expr::Prop { obj: o, .. } => b = o.as_ref(),
+                Expr::Index { e, .. } => b = e.as_ref(),
+                _ => break,
+            }
+        }
+        if let Expr::Var(n) = b {
+            if self.var_lookup(n).is_none() {
+                self.warn(&format!("Undefined variable ${}", n))?;
+            }
+        }
+        Ok(())
+    }
+
     fn incdec(&mut self, target: &Expr, delta: i64, post: bool) -> Result<Value, PhpError> {
         // PHP warns on undefined vars/props/keys during ++/-- (bug25547).
         let mut ro_target: Option<(Rc<RefCell<PhpObject>>, String)> = None;
@@ -6632,6 +6646,11 @@ impl<'a> Interp<'a> {
             // ++/-- reads through __get first — its exceptions
             // propagate (the __set is never reached, bug38624).
             Expr::Prop { obj, name, .. } => {
+                // The RW prop fetch warns 'Undefined variable' on an
+                // undef CV container like a compound assign
+                // (bug78531) — eval_lvalue_obj stays silent for the
+                // _W callers (plain `=`, by-ref reads).
+                self.warn_undef_lvalue_obj(obj)?;
                 // `++`/`--` on a prop of a non-object dies with the
                 // incdec verb before the loose-read warn (probe4i).
                 let ov = self.eval_lvalue_obj(obj)?;
