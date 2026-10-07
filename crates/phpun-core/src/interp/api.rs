@@ -310,6 +310,16 @@ impl<'a> Interp<'a> {
         self.warn(msg)
     }
 
+    /// Run `f` with diagnostics suppressed — zend's inner stream opens
+    /// (the php://filter wrapper's resource= target) fail silently; the
+    /// wrapper reports the generic failure itself.
+    pub fn silenced_pub<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.silence += 1;
+        let r = f(self);
+        self.silence -= 1;
+        r
+    }
+
     /// Backtrace frames (innermost first) for an E_ERROR raised inside a
     /// builtin — Zend attaches the call stack to runtime fatals.
     pub fn fatal_frames(&self) -> Vec<String> {

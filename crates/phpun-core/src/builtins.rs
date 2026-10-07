@@ -18,7 +18,7 @@ mod crypto;
 mod ctype;
 mod datetime;
 mod filter;
-mod fs;
+pub(crate) mod fs;
 mod json;
 mod math;
 mod mbstring;

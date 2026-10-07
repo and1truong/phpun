@@ -314,7 +314,7 @@ pub fn trace_arg(v: &Value) -> String {
         Value::Null => "NULL".into(),
         Value::Bool(b) => if *b { "true" } else { "false" }.into(),
         Value::Callable(_) => "Object(Closure)".into(),
-        Value::Resource(_) => "Resource id #1".into(),
+        Value::Resource(r) => format!("Resource id #{}", r.borrow().id()),
         Value::Float(f) => {
             if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e16 {
                 format!("{f:.1}")
@@ -1995,7 +1995,13 @@ pub enum FilterState {
     Iconv {
         from: String,
         to: String,
+        /// the original `from"=>"to` spec for the invalid-seq warn.
+        disp: String,
         pending: Vec<u8>,
+        /// UTF-16/32's BOM already emitted (iconv emits it once).
+        bom_done: bool,
+        /// to-charset carried //IGNORE — unrepresentable cps drop.
+        ignore: bool,
     },
     /// convert.base64-encode / -decode — tail bytes carried between
     /// calls (3-in/4-out groupings).
@@ -2008,12 +2014,26 @@ pub enum FilterState {
         col: usize,
         tail: Vec<u8>,
     },
-    /// zlib.inflate/deflate, bzip2.compress/decompress — recognized
-    /// factories whose codecs this build doesn't carry; the bytes
-    /// pass through (documented divergence vs zend's real zlib/bz2).
-    CodecStub,
+    /// zlib.inflate/deflate, bzip2.compress/decompress — the codec
+    /// object lives in Interp::codec_states[fid] (compressors don't
+    /// clone).
+    Codec(CodecKind),
     /// A php_user_filter subclass instance created at attach time.
     User(std::rc::Rc<std::cell::RefCell<PhpObject>>),
+}
+
+/// Which streaming codec backs a FilterState::Codec entry — the
+/// compressor/decompressor lives in Interp::codec_states[fid].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecKind {
+    /// zlib.deflate — raw RFC1951 deflate stream.
+    ZlibDeflate,
+    /// zlib.inflate — raw RFC1951 inflate; bad data → 'zlib: data error'.
+    ZlibInflate,
+    /// bzip2.compress.
+    BzDeflate,
+    /// bzip2.decompress — bad data → 'bzip2 decompression failed'.
+    BzInflate,
 }
 
 /// The `dechunk` filter's persistent state machine — a byte-for-byte

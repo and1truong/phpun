@@ -330,12 +330,25 @@ pub struct Interp<'a> {
     pub stream_buckets: std::collections::HashMap<u64, Vec<u8>>,
     /// The stream resource id a php_user_filter::filter() call is
     /// running on (zend's PHP_STREAM_FLAG_NO_FCLOSE): an fclose() on
-    /// it from inside the callback is a silent no-op.
+    /// it from inside the callback warns 'cannot close the provided
+    /// stream' and returns false.
     pub filter_no_fclose: Option<u64>,
     /// The builtin name zend's php_error_docref would use for warnings
     /// raised inside filter() calls ('fread(): Unprocessed filter
     /// buckets...'). fs::dispatch refreshes it per call.
     pub filter_warn_ctx: String,
+    /// Stream resource ids whose php_user_filter::filter() call is in
+    /// flight — zend fails stream reads re-entered on the stream the
+    /// fill loop owns.
+    pub stream_filter_busy: std::collections::HashSet<u64>,
+    /// Streaming codec objects for FilterState::Codec entries, keyed
+    /// by filter id (compressors can't clone). Seeded at attach and
+    /// dropped with the chain entry.
+    /// Live codec objects keyed (filter res id, read-chain flag) —
+    /// an ALL-mode attach shares one res id across its two chain
+    /// entries, so the direction disambiguates them.
+    pub codec_states:
+        std::collections::HashMap<(u64, bool), crate::builtins::fs::CodecState>,
     /// Output buffer stack for ob_*().
     ob_stack: Vec<ObLevel>,
     /// While >0, warnings are suppressed (implements `??`, `isset`,
@@ -979,6 +992,8 @@ impl<'a> Interp<'a> {
             stream_buckets: std::collections::HashMap::new(),
             filter_no_fclose: None,
             filter_warn_ctx: String::new(),
+            stream_filter_busy: std::collections::HashSet::new(),
+            codec_states: std::collections::HashMap::new(),
             ob_stack: Vec::new(),
             silence: 0,
             statics: HashMap::new(),
@@ -988,7 +1003,10 @@ impl<'a> Interp<'a> {
             included: HashSet::new(),
             pending_exception: None,
             call_trace: Vec::new(),
-            res_counter: 0,
+            // zend's regular_list already holds stdin/stdout/stderr
+            // plus the default stream context, so the first userland
+            // resource is id 5.
+            res_counter: 4,
             shutdown_fns: Vec::new(),
             error_handler: None,
             error_handler_stack: Vec::new(),
@@ -1756,6 +1774,33 @@ impl<'a> Interp<'a> {
                         _ => 255,
                     });
                     dtor_stop = true;
+                    break;
+                }
+            }
+        }
+        // zend's resource-list teardown rides the symbol-table free:
+        // each still-filtered stream flushes its write chain and runs
+        // the userfilter dtor with ->stream NULL (the stream zval is
+        // already dead). An error stops the sweep like a dtor failure.
+        if !dtor_stop {
+            let mut sres = Vec::new();
+            for c in self.globals.vars.values() {
+                if let Value::Resource(r) = &*c.borrow() {
+                    if self.stream_filters.contains_key(&r.borrow().id()) {
+                        sres.push(r.clone());
+                    }
+                }
+            }
+            for r in sres {
+                if let Err(e) = crate::builtins::fs::stream_dtor_flush(self, &r) {
+                    shutdown_code = Some(match self.err_flow(e) {
+                        Flow::Exit(c) => c,
+                        Flow::Throw(v) => {
+                            self.uncaught(&v);
+                            255
+                        }
+                        _ => 255,
+                    });
                     break;
                 }
             }
@@ -3199,7 +3244,7 @@ fn assert_arg_repr(v: &Value) -> String {
         Value::Array(_) => "Array".into(),
         Value::Object(o) => format!("Object({})", o.borrow().class.name()),
         Value::Callable(_) => "Object(Closure)".into(),
-        Value::Resource(_) => "Resource id #1".into(),
+        Value::Resource(r) => format!("Resource id #{}", r.borrow().id()),
     }
 }
 
