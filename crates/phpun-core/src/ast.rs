@@ -205,8 +205,7 @@ pub struct PropDecl {
     /// `#[Attr]` groups preceding the declaration (compile-checked
     /// builtins like ReturnTypeWillChange).
     pub attrs: Vec<AttrDecl>,
-    /// Source line of the declaration (Zend reports hook/prop
-    /// incompatibilities on the prop's own line).
+    /// Source line of the declaration.
     pub line: usize,
 }
 
@@ -230,6 +229,9 @@ pub struct PropHook {
     pub is_final: bool,
     /// Hook's own visibility when written explicitly (`private get`).
     pub visibility: Option<Visibility>,
+    /// Source line of the `get`/`set` keyword (hook-signature
+    /// incompatibilities report on it, not the prop's line).
+    pub line: usize,
 }
 
 #[derive(Debug, Clone)]

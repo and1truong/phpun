@@ -1575,6 +1575,7 @@ impl<'a> Parser<'a> {
             let by_ref = self.eat_op("&");
             // Any identifier is consumed here — an unknown one is a
             // compile-fatal naming the class+prop (unknown_hook).
+            let hline = self.line();
             let hname = match self.next() {
                 Some(Token::Ident(n)) => n,
                 t => {
@@ -1657,6 +1658,7 @@ impl<'a> Parser<'a> {
                 by_ref,
                 is_final: hfinal,
                 visibility: hvis,
+                line: hline,
             });
         }
         self.expect_op("}")?;

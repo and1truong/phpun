@@ -2073,7 +2073,7 @@ impl<'a> Interp<'a> {
                                         "Declaration of {}::${}::get() must be compatible with & {}::${}::get()",
                                         d.name, cp.name, pc.decl.name, cp.name
                                     ),
-                                    cp.line,
+                                    ch.line,
                                 ));
                             }
                             let (cty, aty) = (fmt(&cp.ty), fmt(&ap.ty));
@@ -2085,7 +2085,7 @@ impl<'a> Interp<'a> {
                                         "Declaration of {}::${}::get(): {} must be compatible with {}::${}::get(): {}",
                                         d.name, cp.name, cty, pc.decl.name, cp.name, aty
                                     ),
-                                    cp.line,
+                                    ch.line,
                                 ));
                             }
                         } else {
@@ -2115,7 +2115,7 @@ impl<'a> Interp<'a> {
                                         d.name, cp.name, cm.join("|"), cn,
                                         pc.decl.name, cp.name, am.join("|"), an
                                     ),
-                                    cp.line,
+                                    ch.line,
                                 ));
                             }
                         }
@@ -2399,12 +2399,28 @@ impl<'a> Interp<'a> {
                         (Some(_), None) => false,
                     };
                     if !compat {
+                        // Zend reports this on the hook's own line, except
+                        // when a type name wasn't resolvable at check
+                        // time (later-declared class-likes): then the
+                        // verdict lands on the class-decl line
+                        // (set_value_parameter_type_variance_003).
+                        let mut involved =
+                            p.ty.iter()
+                                .flatten()
+                                .chain(sp.ty.iter().flatten())
+                                .flat_map(|t| t.split(['|', '&']).map(str::trim))
+                                .filter(|t| !t.is_empty());
+                        let line = if involved.any(|t| !self.ty_member_registered(t)) {
+                            d.line
+                        } else {
+                            set.line
+                        };
                         return Err(PhpError::fatal(
                             format!(
                                 "Type of parameter ${} of hook {}::${}::set must be compatible with property type",
                                 sp.name, d.name, p.name
                             ),
-                            0,
+                            line,
                         ));
                     }
                 }
@@ -2457,6 +2473,96 @@ impl<'a> Interp<'a> {
     fn ty_sup(&mut self, sup: &[String], sub: &[String]) -> bool {
         sub.iter()
             .all(|t| sup.iter().any(|s| self.ty_member_is_a(t, s)))
+    }
+
+    /// Whether every type name a decl's members mention is already
+    /// resolvable — zend prevents early binding when prop/method/const
+    /// signature types can't be checked at compile time, deferring the
+    /// link (and its variance verdicts) to exec
+    /// (property_types_early_bind, enum_forward_compat).
+    pub(in crate::interp) fn decl_types_resolvable(&self, d: &ClassDecl) -> bool {
+        let mut tys = Vec::new();
+        for p in &d.props {
+            if let Some(t) = &p.ty {
+                tys.extend(t.iter().cloned());
+            }
+            if let Some(hs) = &p.hooks {
+                for h in hs {
+                    for sp in &h.params {
+                        if let Some(t) = &sp.ty {
+                            tys.extend(t.iter().cloned());
+                        }
+                    }
+                }
+            }
+        }
+        for m in &d.methods {
+            for sp in &m.decl.params {
+                if let Some(t) = &sp.ty {
+                    tys.extend(t.iter().cloned());
+                }
+            }
+            if let Some(t) = &m.decl.ret {
+                tys.extend(t.iter().cloned());
+            }
+        }
+        for cd in &d.consts {
+            if let Some(t) = &cd.ty {
+                tys.extend(t.iter().cloned());
+            }
+        }
+        tys.iter()
+            .flat_map(|t| t.split('&'))
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .all(|t| {
+                t.trim_start_matches('\\').eq_ignore_ascii_case(&d.name)
+                    || self.ty_member_registered(t)
+            })
+    }
+
+    /// Whether a type member already names a registered class-like —
+    /// the compile-vs-link distinction Zend's prop-type hook check
+    /// uses to pick its error line (no autoload, just a lookup).
+    fn ty_member_registered(&self, t: &str) -> bool {
+        let tl = t.trim_start_matches('\\').to_lowercase();
+        const BUILTIN: &[&str] = &[
+            "int",
+            "float",
+            "string",
+            "bool",
+            "array",
+            "object",
+            "callable",
+            "iterable",
+            "mixed",
+            "void",
+            "never",
+            "false",
+            "true",
+            "null",
+            "numeric",
+            "resource",
+            "self",
+            "static",
+            "parent",
+            "closure",
+            "traversable",
+            "iterator",
+            "generator",
+        ];
+        BUILTIN.contains(&tl.as_str())
+            || self.classes.contains_key(&tl)
+            || self.interfaces.contains_key(&tl)
+            || self.traits.contains_key(&tl)
+            || self
+                .declaring
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(&tl))
+            || self
+                .linking
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&tl))
     }
 
     /// Whether a single type conjunct resolves to a registered (or

@@ -1480,9 +1480,33 @@ impl<'a> Interp<'a> {
                 // class win early binding so the ENUM's exec site is
                 // where the redeclare fatal lands.
                 Stmt::Class(d)
-                    if d.implements.is_empty()
-                        && d.traits.is_empty()
+                    if d.traits.is_empty()
                         && d.kind != crate::ast::ClassKind::Enum
+                        && (d.implements.is_empty()
+                            // `interface Y extends X` also early-binds
+                            // once every parent interface is known —
+                            // delaying it to exec leaves Y unregistered
+                            // for the compile-pass compat checks of
+                            // early-bound classes that follow
+                            // (set_value_parameter_type_variance_006/007).
+                            || (d.kind == crate::ast::ClassKind::Interface
+                                && d.implements.iter().all(|i| {
+                                    let il = i.to_lowercase();
+                                    self.classes.contains_key(&il)
+                                        || self.interfaces.contains_key(&il)
+                                        || self.traits.contains_key(&il)
+                                        || self
+                                            .linking
+                                            .iter()
+                                            .any(|c| c.name.eq_ignore_ascii_case(&il))
+                                })))
+                        // And every type the decl's own signatures
+                        // mention must be checkable — zend refuses
+                        // early binding when prop/method/const types
+                        // reference unresolved names so their variance
+                        // verdicts run at exec-link instead
+                        // (property_types_early_bind).
+                        && self.decl_types_resolvable(d)
                         && match &d.parent {
                             // zend_try_early_binding: a class with no
                             // dependencies always binds; an extends-only
