@@ -503,13 +503,9 @@ impl<'a> Interp<'a> {
                     cv_site
                 } else {
                     match subj_u {
-                        // TYPE_CHECK sites on a non-CV subject: const-
-                        // folded binaries site one past their end.
-                        Expr::Binary { .. } if is_compile_const(subj_u) => {
-                            Self::inner_end_line(subject)
-                                .map(|l| l + 1)
-                                .unwrap_or(self.cur_line)
-                        }
+                        // TYPE_CHECK sites on a non-CV subject: binary
+                        // ops (folded or not) site at their end line —
+                        // the const-fold stamp never shifts one past.
                         Expr::Binary { .. } => {
                             Self::inner_end_line(subject).unwrap_or(self.cur_line)
                         }
