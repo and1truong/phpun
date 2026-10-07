@@ -3243,6 +3243,7 @@ impl<'a> Interp<'a> {
         // (namespace_004: call2's $c reuses call1's $d handle, then
         // $d reuses call1's $c — not the other way around).
         let n = self.obj_handles.len();
+        self.spawn_seq += 1;
         for i in (0..n).rev() {
             if !self.obj_handles[i].alive() {
                 if let ObjHandle::Callable(_, Some(name)) = &self.obj_handles[i] {
@@ -3252,10 +3253,12 @@ impl<'a> Interp<'a> {
                     self.statics.remove(&format!("{}\u{0}c{}", name, i + 1));
                 }
                 self.obj_handles[i] = w;
+                self.obj_born[i] = self.spawn_seq;
                 return (i + 1) as u64;
             }
         }
         self.obj_handles.push(w);
+        self.obj_born.push(self.spawn_seq);
         self.obj_handles.len() as u64
     }
 
@@ -3531,8 +3534,19 @@ impl<'a> Interp<'a> {
             }
         }
         let internal = if self.is_throwable_name(&cls.decl.name) {
+            // A throwable's file/line attribute to the executing code
+            // unit — inside a call frame that's the frame's own file
+            // (an error handler declared in the caller's file reports
+            // there even when invoked for an eval'd unit's diag); only
+            // outside frames does the ambient diag file apply.
+            let exec_file = self
+                .stack
+                .last()
+                .map(|f| f.file.clone())
+                .filter(|f| !f.is_empty())
+                .unwrap_or_else(|| self.diag_file());
             Some(ObjectInternal::Exception {
-                file: self.diag_file(),
+                file: exec_file,
                 line: self.cur_line as u32,
                 trace: String::new(),
                 thrown: self.cur_line as u32,

@@ -56,7 +56,10 @@ pub(crate) fn dispatch(
                 Value::Array(a) => a.borrow().iter().map(|(_, c)| c.clone()).collect(),
                 _ => Vec::new(),
             };
-            let items = it.yield_from_collect(&iter)?;
+            let (items, death) = it.yield_from_collect_internal(&iter);
+            if let Some(e) = death {
+                return Err(e);
+            }
             let mut count = 0i64;
             for (_, _) in items {
                 let r = it.call_value(&cb, crate::interp::CallArgs::positional(cb_args.clone()))?;
@@ -81,7 +84,10 @@ pub(crate) fn dispatch(
                 Value::Object(o) => {
                     // Materialize via the Iterator protocol (Generator,
                     // IteratorAggregate, plain Iterator).
-                    let items = it.yield_from_collect(&Value::Object(o))?;
+                    let (items, death) = it.yield_from_collect_internal(&Value::Object(o));
+                    if let Some(e) = death {
+                        return Err(e);
+                    }
                     if name_l == "iterator_count" {
                         return Ok(Some(Value::Int(items.len() as i64)));
                     }
