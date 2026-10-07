@@ -202,7 +202,7 @@ impl<'a> Interp<'a> {
                         ));
                     }
                 }
-                Stmt::Static { vars, line: sl } => {
+                Stmt::Static { vars, line: sl, .. } => {
                     for (name, _) in vars {
                         if sc.statics.insert(name.clone(), *sl).is_some() {
                             return Err(PhpError::compile_fatal(

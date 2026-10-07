@@ -467,7 +467,7 @@ impl<'a> Interp<'a> {
                 }
                 Flow::Normal
             }
-            Stmt::Static { vars, .. } => {
+            Stmt::Static { vars, site, .. } => {
                 let mut key = self.fn_statics_key();
                 // Static storage keys on the op_array the decl was
                 // compiled into: a function body's own table (bare key),
@@ -489,10 +489,15 @@ impl<'a> Interp<'a> {
                 // (static_basic_002) — while re-executing the same
                 // statement (loops) or redeclaring in a different unit
                 // — a separate include/eval/run, which Zend compiles to
-                // a fresh op_array — is not. The serial (not the file
-                // string) keys the unit: a re-parsed unit may recycle
-                // the freed Vec's stmt ptr and must still count as new.
-                let site = (self.cur_unit_id, vars.as_ptr() as usize);
+                // a fresh op_array — is not. The unit serial (not the
+                // file string) keys the unit; the site key is the
+                // `static` keyword's token index —
+                // stable across the per-call FunctionDecl clones method
+                // dispatch makes (vars.as_ptr() ABA-flakes: a reallocated
+                // clone's address can alias a freed decl's, falsely
+                // deduping, or differ from itself across calls, falsely
+                // reporting 'Duplicate declaration').
+                let site = (self.cur_unit_id, *site);
                 for (name, default) in vars {
                     // Every site is kept: a decl in a different unit is
                     // legal AND must not erase the same-unit record a

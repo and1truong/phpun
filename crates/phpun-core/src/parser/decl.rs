@@ -13,6 +13,7 @@ impl<'a> Parser<'a> {
     /// `static $a = 1, $b;` — persistent function-local vars.
     pub(in crate::parser) fn static_stmt(&mut self) -> Result<Stmt, PhpError> {
         let line = self.line();
+        let site = self.pos;
         self.pos += 1; // static
         let mut vars = Vec::new();
         loop {
@@ -39,7 +40,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op(";")?;
-        Ok(Stmt::Static { vars, line })
+        Ok(Stmt::Static { vars, line, site })
     }
 
     pub(in crate::parser) fn switch_stmt(&mut self) -> Result<Stmt, PhpError> {
