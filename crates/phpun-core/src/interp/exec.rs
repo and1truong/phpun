@@ -766,9 +766,17 @@ impl<'a> Interp<'a> {
                     f => f,
                 };
                 if let Some(fb) = finally {
-                    match self.exec_block(fb) {
-                        Flow::Normal => out,
-                        f => f,
+                    if matches!(out, Flow::Exit(_)) {
+                        // zend's bailout (exit(), a compile fatal's
+                        // unwinding) skips finally blocks entirely —
+                        // only throwables and ordinary control flow
+                        // run them.
+                        out
+                    } else {
+                        match self.exec_block(fb) {
+                            Flow::Normal => out,
+                            f => f,
+                        }
                     }
                 } else {
                     out
