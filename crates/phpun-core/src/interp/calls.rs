@@ -2260,7 +2260,17 @@ impl<'a> Interp<'a> {
                     ""
                 }
                 .to_string(),
-                file: site_file.clone(),
+                // A generator body resumed by a `Generator->{m}()`
+                // call isn't a userland call — Zend stamps its trace
+                // frame at the internal site (`[internal function]:
+                // fn(args)`). Under an engine resume (foreach /
+                // iterator_*) the body frame instead shows the
+                // consumer's resume site (`FILE(line): fn(args)`).
+                file: if f.gen_body && self.iter_calls == 0 && self.gen_internal_resume == 0 {
+                    "[internal function]".to_string()
+                } else {
+                    site_file.clone()
+                },
                 line: site_line,
                 args: targs.clone(),
                 named_args: targs_named.clone(),
@@ -4615,6 +4625,8 @@ impl<'a> Interp<'a> {
             decl.file.clone()
         };
         let pending_caps = std::mem::take(&mut self.pending_gen_captures);
+        frame.gen_body = self.pending_gen_body;
+        self.pending_gen_body = false;
         self.stack.push(frame);
         if let Some(top) = self.stack.last_mut() {
             for (n, c, by_ref) in pending_caps {

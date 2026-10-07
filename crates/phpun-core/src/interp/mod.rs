@@ -163,6 +163,10 @@ pub struct Frame {
     /// op_array (and fresh static_variables) per eval/include call.
     /// None = the frame's own op_array, whose statics persist.
     statics_unit: Option<u64>,
+    /// This frame is a generator body invoked by the engine's resume —
+    /// Zend renders it `[internal function]: fn(args)` in backtraces
+    /// (the resume call, not a userland call, carries the visible frame).
+    gen_body: bool,
 }
 
 impl Frame {
@@ -184,6 +188,7 @@ impl Frame {
             closure_rc: None,
             call_alias: None,
             statics_unit: None,
+            gen_body: false,
         }
     }
 }
@@ -730,6 +735,10 @@ pub struct Interp<'a> {
     /// yield-bearing closure's `use` vars bind when its generator body
     /// finally starts (iterable_003).
     pending_gen_captures: Vec<(String, Cell, bool)>,
+    /// Set by gen_start so invoke_fn_run marks the gen-body frame —
+    /// its TraceFrame sites `[internal function]` (Zend's resume
+    /// isn't a userland call).
+    pending_gen_body: bool,
     /// Bytes emitted so far — memory_limit bookkeeping.
     pub mem_used: u64,
     /// Size of the last emit — the 'tried to allocate' figure.
@@ -1329,6 +1338,7 @@ impl<'a> Interp<'a> {
             send_line: None,
             gen_sink: None,
             pending_gen_captures: Vec::new(),
+            pending_gen_body: false,
             gen_sends: std::collections::VecDeque::new(),
             gen_throws: std::collections::VecDeque::new(),
             gen_throws_fired: Vec::new(),
@@ -4753,19 +4763,23 @@ impl<'a> Interp<'a> {
                 // `FILE(line): f()` frame (foreach-resume), and an
                 // engine error raised while in-body calls were live
                 // re-reports those calls in raise_frames.
-                let mut names: Vec<String> = frames
-                    .iter()
-                    .filter_map(|f| {
-                        f.strip_prefix("[internal function]: ")
-                            .and_then(|s| s.split('(').next())
-                            .map(|n| n.to_string())
-                    })
-                    .collect();
+                // Dedup is by call, not by callee name: two frames
+                // may share a callee (`Generator->send` at the body's
+                // re-entrant resume vs the consumer's outer resume)
+                // and only same-site entries are the same call.
+                let mut internal_names: Vec<String> = Vec::new();
+                let mut site_names: Vec<String> = Vec::new();
+                let mut site_keys: Vec<(String, String)> = Vec::new();
                 for f in frames {
-                    if let Some(pos) = f.find("): ") {
+                    if let Some(rest) = f.strip_prefix("[internal function]: ") {
+                        if let Some(end) = rest.find('(') {
+                            internal_names.push(rest[..end].to_string());
+                        }
+                    } else if let Some(pos) = f.find("): ") {
                         let call = &f[pos + 3..];
                         if let Some(end) = call.find('(') {
-                            names.push(call[..end].to_string());
+                            site_names.push(call[..end].to_string());
+                            site_keys.push((call[..end].to_string(), f[..pos + 1].to_string()));
                         }
                     }
                 }
@@ -4779,7 +4793,22 @@ impl<'a> Interp<'a> {
                         .as_ref()
                         .map(|c| format!("{}{}{}", c, fr.ty, fr.function))
                         .unwrap_or_else(|| fr.function.clone());
-                    if names.contains(&fr.function) || names.contains(&callee) {
+                    let dup = if fr.file == "[internal function]" {
+                        // Engine-resumed frames (gen bodies, builtin
+                        // callbacks) have no call site of their own —
+                        // match by callee name against either render
+                        // shape the resume stack can carry.
+                        internal_names
+                            .iter()
+                            .chain(site_names.iter())
+                            .any(|n| *n == fr.function || *n == callee)
+                    } else {
+                        let site = format!("{}({})", fr.file, fr.line);
+                        site_keys
+                            .iter()
+                            .any(|(n, s)| (*n == fr.function || *n == callee) && *s == site)
+                    };
+                    if dup {
                         continue;
                     }
                     parts.push(crate::value::trace_frame_str(fr));
