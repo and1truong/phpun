@@ -14,10 +14,6 @@ pub enum Stmt {
         msg: String,
         line: usize,
     },
-    Deprecated {
-        msg: String,
-        line: usize,
-    },
     Inline(String),
     Echo(Vec<Expr>),
     Expr(Expr),
@@ -53,9 +49,10 @@ pub enum Stmt {
     /// resolves the global name dynamically (tests/lang/bug24396).
     Global(Vec<Expr>),
     /// `static $a = 1, $b;` — function-local persistent vars. `line` is the
-    /// `static` keyword line (redeclaration detection).
+    /// `static` keyword line; each var carries its own declarator line
+    /// (redeclaration diagnostics name the redeclared var's line).
     Static {
-        vars: Vec<(String, Option<Expr>)>,
+        vars: Vec<(String, Option<Expr>, usize)>,
         line: usize,
         /// Token index of the `static` keyword — the decl site's stable
         /// identity within its parse unit (survives FunctionDecl clones,

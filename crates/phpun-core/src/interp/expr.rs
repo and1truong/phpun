@@ -208,6 +208,7 @@ impl<'a> Interp<'a> {
                     if let Expr::ByRef(e) = shape {
                         let c = self.eval_cell(e)?;
                         self.mark_ref(&c);
+                        self.reg_arr_ref(&c);
                         match k {
                             Some(ke) => {
                                 let kv = self.eval(ke)?;
@@ -351,7 +352,33 @@ impl<'a> Interp<'a> {
                 match &self.gen_sink {
                     Some(sink) => {
                         sink.borrow_mut().push((k, vc));
-                        Ok(self.gen_sends.pop_front().unwrap_or(Value::Null))
+                        let idx = sink.borrow().len() - 1;
+                        // A yield inside a `finally` region marks the
+                        // force-close fatal — destruction replay
+                        // raises 'Cannot yield from finally in a
+                        // force-closed generator' here.
+                        if self.gen_fin_depth > 0 {
+                            if let Some(q) = &self.gen_fin_q {
+                                q.borrow_mut().yields.push((idx, self.cur_line));
+                            }
+                        }
+                        // A `Generator->throw()` queued for this yield
+                        // raises the throwable as the expression's
+                        // result — the body's own try/catch/finally
+                        // performs the unwind.
+                        if self.gen_throws.front().is_some_and(|(i, _)| *i == idx) {
+                            let (_, v) = self.gen_throws.pop_front().unwrap();
+                            self.gen_throws_fired.push(idx);
+                            return Err(self.throw(v));
+                        }
+                        // Queued send()s are keyed by yield index —
+                        // replayed yields before the suspended one
+                        // take NULL, not the incoming send.
+                        Ok(if self.gen_sends.front().is_some_and(|(i, _)| *i == idx) {
+                            self.gen_sends.pop_front().unwrap().1
+                        } else {
+                            Value::Null
+                        })
                     }
                     None => self.fail(PhpError::fatal(
                         "The \"yield\" expression can only be used inside a function",
@@ -366,10 +393,88 @@ impl<'a> Interp<'a> {
                     Some(sink) => {
                         // `yield from` splices the inner keys verbatim —
                         // duplicates and all — and doesn't touch the
-                        // keyless auto counter.
-                        let items = self.yield_from_collect(&v)?;
+                        // keyless auto counter. The materialization
+                        // drives inner iterators under the foreach
+                        // marking so an inner-gen death keeps its own
+                        // trace; items gathered before it still reach
+                        // the sink, and the death becomes this body's
+                        // own (deferred-raising) death.
+                        self.iter_calls += 1;
+                        let base = sink.borrow().len();
+                        // The inner drain's flushed stream bytes retag
+                        // into THIS gen's deferred queue at `base` —
+                        // a live emit would echo inner output before
+                        // the consumer reached it (yield-from order).
+                        let saved_cbase = self.gen_collect_base.replace(base);
+                        let saved_seen = std::mem::take(&mut self.gen_collect_seen);
+                        let saved_crun = self
+                            .gen_collect_run
+                            .replace(self.gen_run_state.clone().unwrap());
+                        let (items, death) = self.yield_from_collect(&v);
+                        self.gen_collect_base = saved_cbase;
+                        self.gen_collect_seen = saved_seen;
+                        self.gen_collect_run = saved_crun;
+                        self.iter_calls -= 1;
+                        let inner_len = items.len();
+                        // Record the delegation window: consumer
+                        // send()/throw() landing inside it routes into
+                        // the delegate's own queues (Zend's chain is
+                        // live), and the delegate's return value is
+                        // the yield-from expression's own value.
+                        let inner_ret = if let Value::Object(o) = &v {
+                            match &o.borrow().internal {
+                                Some(crate::value::ObjectInternal::Generator(ist)) => {
+                                    if let Some(run) = &self.gen_run_state {
+                                        let mut r = run.borrow_mut();
+                                        r.delegate_gens.push((base, inner_len));
+                                        // Live delegate journal —
+                                        // killing this incarnation
+                                        // displaces its delegates.
+                                        r.fin_q
+                                            .borrow_mut()
+                                            .delegate_fins
+                                            .push((base, ist.borrow().fin_q.clone()));
+                                        // The eager drain above drove
+                                        // the delegate's own cursor to
+                                        // its production count — the
+                                        // consumer-facing position is
+                                        // zero until the outer's
+                                        // cursor reaches `base`.
+                                        ist.borrow().fin_q.borrow_mut().set_vis_tree(0);
+                                    }
+                                    ist.borrow().return_val.clone()
+                                }
+                                _ => Value::Null,
+                            }
+                        } else {
+                            Value::Null
+                        };
                         sink.borrow_mut().extend(items);
-                        Ok(Value::Null)
+                        // A gen suspended inside `yield from` shares
+                        // the OUTER gen's destruction: its destruction
+                        // journal (snapshotted at its start, before
+                        // the drain pruned it) merges into the
+                        // parent's — tags retagged into the parent's
+                        // item space and the splice range recorded, so
+                        // the replay fires only while the consumer's
+                        // cursor is inside the delegate's stream (Zend
+                        // force-closes just the actually-suspended
+                        // delegation chain — a delegate never reached
+                        // replays nothing).
+                        if let Some(mut inner_fin) = self.gen_yield_from_fin.take() {
+                            if let Some(q) = &self.gen_fin_q {
+                                inner_fin.retag(base);
+                                q.borrow_mut().delegates.push(crate::value::FinDelegate {
+                                    entry: base,
+                                    span: inner_len,
+                                    fin: inner_fin,
+                                });
+                            }
+                        }
+                        match death {
+                            Some(e) => Err(e),
+                            None => Ok(inner_ret),
+                        }
                     }
                     None => self.fail(PhpError::fatal(
                         "The \"yield from\" expression can only be used inside a function",
@@ -2411,7 +2516,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let nv = self.typed_slot_store(&c, newv.clone())?;
-                *c.borrow_mut() = nv;
+                self.cell_store(&c, nv)?;
             }
             Late::Keyed { e, keys } => {
                 newv = self.assign_index_path(&e, &keys, newv, op != "=" && op != "??=")?;
@@ -2419,7 +2524,7 @@ impl<'a> Interp<'a> {
             Late::None => match target_cell {
                 Some(c) => {
                     let nv = self.typed_slot_store(&c, newv.clone())?;
-                    *c.borrow_mut() = nv;
+                    self.cell_store(&c, nv)?;
                 }
                 None => {
                     // `list()`/`[]` destructure: zend's first FETCH_LIST
@@ -2514,14 +2619,38 @@ impl<'a> Interp<'a> {
     }
 
     /// `$target =& $cell`
+    /// A `=&` bind displaced this slot's previous cell: Zend decrefs
+    /// it only after the new binding is visible, so its __destruct
+    /// reads and writes the shared cell (gh10168). A displaced cell
+    /// that still has live owners (another prop/static alias) keeps
+    /// its zval — Zend frees the zval only with the cell itself, so
+    /// `Test::$test =& $box->value` + `$box->value =& $tmp` leaves the
+    /// old shared cell alive under the static (assign_prop_ref_with_
+    /// prop_ref).
+    fn destruct_displaced(&mut self, old: Option<Cell>) -> Result<(), PhpError> {
+        if let Some(old) = old {
+            // Release dead bookkeeping refs first, then require the
+            // cell be truly orphaned — otherwise its zval stays alive.
+            self.prune_typed_slot(Rc::as_ptr(&old) as usize);
+
+            if Rc::strong_count(&old) != 1 {
+                return Ok(());
+            }
+            let v = old.borrow().clone();
+            drop(old);
+            self.destruct_dying_value(&v)?;
+        }
+        Ok(())
+    }
+
     fn bind_cell(&mut self, target: &Expr, src: Cell) -> Result<(), PhpError> {
         // `=&` creates Zend's IS_REFERENCE — writes through it say
         // "a reference held by property", not "property" (034/078).
         self.mark_ref(&src);
         match target {
             Expr::Var(n) => {
-                self.cur().vars.insert(n.clone(), src);
-                Ok(())
+                let old = self.cur().vars.insert(n.clone(), src);
+                self.destruct_displaced(old)
             }
             Expr::VarVar(inner, _) => {
                 let n = self.eval(inner)?;
@@ -2542,6 +2671,7 @@ impl<'a> Interp<'a> {
                     | Expr::Prop { .. }
                     | Expr::VarVar(..)
                     | Expr::StaticProp { .. } => {
+                        self.reg_arr_ref(&src);
                         let c = self.eval_cell(e)?;
                         self.bind_into_key(c, key, src)
                     }
@@ -2644,8 +2774,10 @@ impl<'a> Interp<'a> {
                         if !ob.prop_order.contains(&key) {
                             ob.prop_order.push(key.clone());
                         }
-                        ob.props.insert(key.clone(), src.clone());
+
+                        let old = ob.props.insert(key.clone(), src.clone());
                         drop(ob);
+                        self.destruct_displaced(old)?;
                         if let (Some(m), Some((_, dcls))) = (merged, self.decl_prop(o, &pn)) {
                             let sptr = Rc::as_ptr(&src) as usize;
                             // The FIRST owner is the ref's holder for
@@ -2696,7 +2828,10 @@ impl<'a> Interp<'a> {
                         merged = Some(self.bind_typed_check(&pd, &dcls, &src)?);
                     }
                 }
-                cls.statics.borrow_mut().insert(pn.clone(), src.clone());
+                let old = cls.statics.borrow_mut().insert(pn.clone(), src.clone());
+
+                self.destruct_displaced(old)?;
+
                 if let (Some(m), Some((pd, dcls))) = (merged, self.find_static_prop_decl(&cls, &pn))
                 {
                     let sptr = Rc::as_ptr(&src) as usize;
@@ -2877,13 +3012,13 @@ impl<'a> Interp<'a> {
                 if name == "this" {
                     return self.fail(PhpError::fatal("Cannot re-assign $this", 0));
                 }
-                self.var_set(name, v);
+                self.var_set(name, v)?;
                 Ok(())
             }
             Expr::VarVar(inner, _) => {
                 let n = self.eval(inner)?;
                 let name = self.conv_str(&n)?;
-                self.var_set(&name, v);
+                self.var_set(&name, v)?;
                 Ok(())
             }
             Expr::Index { e, i } => self.set_index(e, i.as_deref(), v),
@@ -2897,10 +3032,10 @@ impl<'a> Interp<'a> {
                 if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, &pname) {
                     let v2 = self.prop_typed_write_check(&pd, &dcls, v)?;
                     let nv = self.typed_slot_store(&c, v2)?;
-                    *c.borrow_mut() = nv;
+                    self.cell_store(&c, nv)?;
                 } else {
                     let nv = self.typed_slot_store(&c, v)?;
-                    *c.borrow_mut() = nv;
+                    self.cell_store(&c, nv)?;
                 }
                 Ok(())
             }
@@ -3253,7 +3388,7 @@ impl<'a> Interp<'a> {
                         // prop via `=&` — that prop's type still gates
                         // the write (typed_properties_062).
                         let nv = self.typed_slot_store(&existing, v)?;
-                        *existing.borrow_mut() = nv.clone();
+                        self.cell_store(&existing, nv.clone())?;
                         v = nv;
                     } else {
                         // A declared prop that was unset() is
@@ -4070,8 +4205,8 @@ impl<'a> Interp<'a> {
                 None
             };
             if let (Some(arr), Some(k)) = (spl_arr, &key) {
-                arr.borrow_mut().bind_cell(to_key(k), src);
-                return Ok(());
+                let old = arr.borrow_mut().bind_cell(to_key(k), src);
+                return self.destruct_displaced(old);
             }
             // zend fetches the element (BP_VAR_W read_dimension — the
             // `&offsetGet` / object-element notice rule applies) before
@@ -4107,15 +4242,18 @@ impl<'a> Interp<'a> {
                 _ => unreachable!(),
             };
             drop(b);
-            let mut arr = rc.borrow_mut();
-            match key {
-                Some(k) => arr.bind_cell(to_key(&k), src),
-                None => {
-                    let k = ArrKey::Int(arr.next);
-                    arr.bind_cell(k, src);
-                }
+            let old;
+            {
+                let mut arr = rc.borrow_mut();
+                old = match key {
+                    Some(k) => arr.bind_cell(to_key(&k), src),
+                    None => {
+                        let k = ArrKey::Int(arr.next);
+                        arr.bind_cell(k, src)
+                    }
+                };
             }
-            Ok(())
+            self.destruct_displaced(old)
         } else {
             drop(b);
             self.fail(PhpError::uncaught(
@@ -4540,7 +4678,13 @@ impl<'a> Interp<'a> {
                         return self.fail(e);
                     }
                     if let Some(k) = &key {
-                        cur_arr.borrow_mut().unset(&to_key(k));
+                        // The borrow must drop before the evicted
+                        // payload's dtors run — a __destruct reading
+                        // this same array would re-borrow it.
+                        let evicted = cur_arr.borrow_mut().unset(&to_key(k));
+                        if let Some(v) = evicted {
+                            self.destruct_dying_value(&v)?;
+                        }
                     }
                     return Ok(());
                 }
@@ -4662,7 +4806,19 @@ impl<'a> Interp<'a> {
                     self.cow_split(&mut b);
                     if let (Value::Array(rc), Some(k)) = (&*b, &key) {
                         let k = to_key(k);
-                        rc.borrow_mut().unset(&k);
+                        let rc = rc.clone();
+                        drop(b);
+                        // The evicted payload's last ref dies with
+                        // the cell — held objects/gens destruct now
+                        // (zend destroys the zval's contents). The
+                        // borrow_mut must end before userland dtors
+                        // run: an element by-ref aliasing this array
+                        // reads it inside __destruct (bug65051).
+                        let evicted = rc.borrow_mut().unset(&k);
+                        if let Some(v) = evicted {
+                            self.destruct_dying_value(&v)?;
+                        }
+                        return Ok(());
                     }
                     return Ok(());
                 }
@@ -6137,10 +6293,10 @@ fn closure_static_vars(stmts: &[Stmt], out: &mut Vec<(String, Option<Expr>, usiz
     use crate::ast::Stmt;
     for st in stmts {
         match st {
-            Stmt::Static { vars, line, .. } => {
-                for (n, d) in vars {
+            Stmt::Static { vars, .. } => {
+                for (n, d, vl) in vars {
                     if !out.iter().any(|(x, ..)| x == n) {
-                        out.push((n.clone(), d.clone(), *line));
+                        out.push((n.clone(), d.clone(), *vl));
                     }
                 }
             }

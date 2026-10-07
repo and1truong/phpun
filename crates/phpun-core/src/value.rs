@@ -107,28 +107,35 @@ impl PhpArray {
     }
 
     /// Bind an element slot to a specific cell (`$a[k] =& $x`).
-    pub fn bind_cell(&mut self, k: ArrKey, c: Cell) {
+    /// Returns the displaced slot cell — an object it held dies only
+    /// after the new binding is visible (its __destruct writes land
+    /// on the shared cell, gh10168).
+    pub fn bind_cell(&mut self, k: ArrKey, c: Cell) -> Option<Cell> {
         if let ArrKey::Int(i) = k {
             if i >= self.next {
                 self.next = i + 1;
             }
         }
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
-            slot.1 = c;
+            Some(std::mem::replace(&mut slot.1, c))
         } else {
             self.entries.push((k, c));
+            None
         }
     }
 
     /// Remove a key (unset). The bucket is tombstoned — position kept,
-    /// value gone (see ArrKey::Tomb). Returns whether it existed.
-    pub fn unset(&mut self, k: &ArrKey) -> bool {
+    /// value released (see ArrKey::Tomb). Returns the evicted payload
+    /// when the table owned the cell outright — an aliased (by-ref)
+    /// slot keeps sharing its value with the other holders.
+    pub fn unset(&mut self, k: &ArrKey) -> Option<Value> {
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| ek == k) {
             slot.0 = ArrKey::Tomb;
-            true
-        } else {
-            false
+            if Rc::strong_count(&slot.1) == 1 {
+                return Some(std::mem::replace(&mut *slot.1.borrow_mut(), Value::Null));
+            }
         }
+        None
     }
 
     /// First live (non-tombstone) index at or after `i`.
@@ -1699,6 +1706,199 @@ pub type GenItem = (Value, Cell);
 
 /// Generator internal state (object internal behind the `Generator`
 /// class, which implements `Iterator`).
+/// A generator's suspended-finally journal — shared between the gen
+/// state and the interpreter's `live_gens` GC registry, so a dead
+/// weak can still replay it after the object is gone. Beyond the
+/// buffered finally bytes it carries the destruction-time markers
+/// the object can no longer answer once dropped: yields recorded
+/// inside `finally` regions (a force-close unwinding into one dies
+/// 'Cannot yield from finally in a force-closed generator'), the
+/// body's error when it died inside `finally` (replayed as a raise),
+/// a `$gen->throw()` parked at a finally-yield, and a mirror of the
+/// consumer cursor plus the body's identity for the
+/// destruction-site trace.
+#[derive(Default, Clone)]
+pub struct GenFinData {
+    /// (yield-tag, bytes, is_err) — finally-region output buffered
+    /// for destruction replay; entries drop as normal flushes cover
+    /// them.
+    pub bytes: Vec<(usize, Vec<u8>, bool)>,
+    /// (item idx, line) of each `yield` emitted while a `finally`
+    /// region ran.
+    pub yields: Vec<(usize, usize)>,
+    /// The body's terminal error when it died inside a `finally`
+    /// region — (err, throwable), mirrors `GenState::deferred_err`'s
+    /// finally component so a dead weak still surfaces it.
+    pub fin_err: Option<(crate::error::PhpError, Option<Value>)>,
+    /// Mirrored `GenState::pos` — the object is gone when a dead
+    /// weak's entry replays.
+    pub pos: usize,
+    /// Consumer-visible cursor: `pos` counts the body's own resumes
+    /// (a `yield from` drain drives them eagerly), while this mirrors
+    /// what the outermost consumer has reached — the value ob
+    /// windows, drains, and journal gates actually check.
+    pub vis_pos: usize,
+    /// The body closed or died — its deferred-output journal is
+    /// complete, so every buffered byte it tagged is materialized
+    /// for reads from then on. (Not mirrored from
+    /// `GenState::finished`: eager collection marks that at run end,
+    /// long before the consumer exhausts the items.)
+    pub finished: bool,
+    /// The gen was force-closed (throw() bounce, injected throwable
+    /// uncaught, dead-weak/shutdown teardown) rather than consumed
+    /// to exhaustion — its post-yield journaled tail never ran in
+    /// Zend's frame, so journaled ob captures materialize only for
+    /// tags a subsequent real resume confirmed (`pos > t + 1`).
+    pub killed: bool,
+    /// Total items collected by the eager run — the consumer-side
+    /// "exhausted" condition is `pos >= total`, which is when the
+    /// tail bytes (emitted after the last yield) may drain.
+    pub total: usize,
+    /// The body's function name and file — destruction-site frames
+    /// attribute the raise (`FILE(n): g()` at an unset/overwrite
+    /// point, `[internal function]: g()` at request shutdown).
+    pub fn_name: String,
+    pub file: String,
+    /// Journals of `yield from` delegates that merged into this
+    /// stream — a delegate replays only while the consumer's cursor
+    /// sits inside its spliced range (`entry <= pos < entry + span`),
+    /// since Zend force-closes just the actually-suspended
+    /// delegation chain.
+    pub delegates: Vec<FinDelegate>,
+    /// (name, cell) pairs of the body's suspended frame in CV order —
+    /// Zend keeps a suspended generator's CVs live in execute_data
+    /// until the frame is freed (force-close, exhaustion,
+    /// destruction), then decrefs them after the finally journal.
+    /// Stashed on the journal because it outlives the dead-weak state.
+    pub suspended: Vec<(String, Cell)>,
+    /// The owner died as a re-run artifact — the resumed incarnation
+    /// displaced this frame — so its destruction replay stays silent.
+    pub suppressed: bool,
+    /// Live journals of `yield from` delegates this gen collected —
+    /// (parent item index where the delegate's stream begins, its
+    /// journal). Killing this incarnation displaces them: their
+    /// un-run tails are kill-dropped too.
+    pub delegate_fins: Vec<(usize, FinQueue)>,
+}
+
+impl GenFinData {
+    /// Mark this journal and every delegated journal beneath it
+    /// force-closed — a re-run's displaced incarnations and a
+    /// teardown's delegate chain alike leave eager tails un-run.
+    pub fn kill_tree(&mut self) {
+        self.killed = true;
+        for (_, d) in &self.delegate_fins {
+            d.borrow_mut().kill_tree();
+        }
+    }
+}
+
+/// A delegated `yield from` journal merged into the parent's — its
+/// item-space tags are already retagged into the parent's space.
+#[derive(Clone)]
+pub struct FinDelegate {
+    /// Parent item index where this delegate's stream begins, and
+    /// how many items it spliced there.
+    pub entry: usize,
+    pub span: usize,
+    /// The delegate's own destruction journal.
+    pub fin: GenFinData,
+}
+
+impl GenFinData {
+    /// Whether the consumer has consumed everything the body could
+    /// emit — dead/closed, or the cursor passed the last item.
+    pub fn consumed(&self) -> bool {
+        self.finished || self.pos >= self.total
+    }
+
+    /// Shift every item-space index in this journal by `base` —
+    /// applied when it merges into a `yield from` parent's item
+    /// space.
+    pub fn retag(&mut self, base: usize) {
+        for (t, ..) in &mut self.bytes {
+            *t += base;
+        }
+        for (i, _) in &mut self.yields {
+            *i += base;
+        }
+        for d in &mut self.delegates {
+            d.entry += base;
+            d.fin.retag(base);
+        }
+    }
+
+    /// Mirror the consumer cursor down the suspended delegation
+    /// chain — a delegate's own journal positions (open/close tags on
+    /// buffers the delegate opened) live in its own item space, offset
+    /// from the parent's by `entry`.
+    pub fn set_pos_tree(&mut self, pos: usize) {
+        self.pos = pos;
+        for d in &mut self.delegates {
+            d.fin.set_pos_tree(pos.saturating_sub(d.entry));
+        }
+        self.set_vis_tree(pos);
+    }
+
+    /// Mirror only the consumer-visible cursor down the chain — a
+    /// delegate's own `pos` (its production cursor) stays at
+    /// whatever its eager drain left behind. Item `pos` of this
+    /// gen's stream is item `pos - entry` inside a delegate's.
+    pub fn set_vis_tree(&mut self, pos: usize) {
+        self.vis_pos = pos;
+        for d in &mut self.delegates {
+            d.fin.set_vis_tree(pos.saturating_sub(d.entry));
+        }
+        for (entry, q) in &self.delegate_fins {
+            q.borrow_mut().set_vis_tree(pos.saturating_sub(*entry));
+        }
+    }
+
+    /// The delegates whose spliced range holds consumer cursor `pos`
+    /// — the suspended delegation chain, innermost first.
+    pub fn active_delegates_at(&self, pos: usize) -> Vec<&FinDelegate> {
+        let mut out: Vec<&FinDelegate> = self
+            .delegates
+            .iter()
+            .filter(|d| d.entry <= pos && pos < d.entry + d.span)
+            .collect();
+        // Innermost suspended level unwinds first.
+        out.sort_by_key(|d| std::cmp::Reverse(d.entry));
+        out
+    }
+
+    /// The first `yield`-inside-`finally` index ahead of `pos` along
+    /// the suspended delegation chain — where a `throw()`-driven
+    /// unwind parks next.
+    pub fn next_fin_yield(&self, pos: usize) -> Option<usize> {
+        let mut best = self
+            .yields
+            .iter()
+            .filter(|(i, _)| *i > pos)
+            .map(|(i, _)| *i)
+            .min();
+        for d in self.active_delegates_at(pos) {
+            if let Some(i) = d.fin.next_fin_yield(pos) {
+                best = Some(best.map_or(i, |b| b.min(i)));
+            }
+        }
+        best
+    }
+
+    /// Whether `pos` itself is a `yield` inside `finally` on the
+    /// suspended chain — a `throw()` injects at the suspended yield
+    /// and surfaces immediately.
+    pub fn at_fin_yield(&self, pos: usize) -> bool {
+        self.yields.iter().any(|(i, _)| *i == pos)
+            || self
+                .active_delegates_at(pos)
+                .iter()
+                .any(|d| d.fin.at_fin_yield(pos))
+    }
+}
+
+pub type FinQueue = Rc<RefCell<GenFinData>>;
+
 pub struct GenState {
     /// Everything needed to re-enter the function frame later.
     pub setup: GenSetup,
@@ -1716,13 +1916,98 @@ pub struct GenState {
     pub by_ref: bool,
     /// Auto keys for keyless `yield $v` (0, 1, 2…).
     pub auto_key: i64,
-    /// Every send() value ever passed, in call order — the k-th send
-    /// feeds the k-th yield expression when the body (re)runs.
-    pub sends: Vec<Value>,
+    /// Every send() value ever passed, as (yield index, value) —
+    /// send() delivers to the yield the gen is suspended at, so a
+    /// re-run must not hand an early send to a preceding yield.
+    pub sends: Vec<(usize, Value)>,
+    /// Every `Generator->throw()` injection, as (yield index,
+    /// throwable) — the body re-runs on each resume, so the queued
+    /// throwable is raised as the result of that yield expression and
+    /// the body's own try/catch/finally performs the real unwind
+    /// (catch delivery, `return`-in-finally swallow, suspend at a
+    /// yield inside `finally`).
+    pub throws: Vec<(usize, Value)>,
+    /// `yield from` splice windows into this gen's item stream:
+    /// (first spliced index, item count). Consumer sends/throws
+    /// landing inside a window route into the delegate when it is
+    /// re-collected — injection arrives as the delegate's own
+    /// suspended-yield index (`outer - base`).
+    pub delegate_gens: Vec<(usize, usize)>,
+    /// The throwable most recently queued by `Generator->throw()` —
+    /// an uncaught injected throwable keeps its own trace (built at
+    /// the `new` site) when it escapes, unlike a body-raised `throw`
+    /// whose uncaught render is the resume stack.
+    pub injected_throwable: Option<Value>,
     /// Output produced after a yield suspends mid-expression — Zend
     /// defers it to resume; buffered per yield index and emitted when
-    /// the consumer advances `pos` past it (closure_call_leak).
-    pub pending_out: Vec<(usize, Vec<u8>)>,
+    /// the consumer advances `pos` past it (closure_call_leak). The
+    /// first bool marks stderr-diag bytes so `PHP Fatal error:`/`PHP
+    /// Warning:` lines defer in the same emission order as stdout's;
+    /// the second marks bytes produced inside a `finally` region —
+    /// Zend runs the finally chains enclosing the suspension point
+    /// when a suspended generator is destroyed (Generator->throw(),
+    /// unset()/GC, request shutdown), so they also accumulate in
+    /// fin_q keyed the same way.
+    pub pending_out: Vec<(usize, Vec<u8>, bool, bool)>,
+    /// Buffered finally-region output of a suspended body — survives
+    /// the GenState itself (shared with the interpreter's live_gens
+    /// registry) so a GC'd generator's finally still replays.
+    /// (yield-tag, bytes, is_err); entries are dropped as normal
+    /// flushes cover them.
+    pub fin_q: FinQueue,
+    /// The body's terminal error, held until the consumer's next
+    /// resume past the last collected item — Zend's lazy body dies
+    /// inside `Generator->next()`/friends, after the bytes the
+    /// consumer already echoed between yields. Carries the throwable
+    /// itself for Throw deaths (the ambient pending_exception slot is
+    /// transient — consumer calls between death and resume clobber
+    /// it) and the call-trace frames suspended between the throw site
+    /// and the gen body (eval()/include() pseudo-frames, userland
+    /// calls) so the resume render can prepend them. The last flag
+    /// marks a death that originated inside a `finally` region — a
+    /// force-close then surfaces it at destruction instead.
+    pub deferred_err: Option<(crate::error::PhpError, Option<Value>, Vec<TraceFrame>, bool)>,
+    /// The body died by error — getReturn() reports 'hasn't returned'
+    /// even after the deferred error was consumed.
+    pub dead: bool,
+    /// Killed by `Generator->throw()` — buffered items are dropped and
+    /// consumer reads behave like an exhausted generator (`valid()`
+    /// false, `current()`/`key()` null), like Zend's closed gen.
+    pub closed: bool,
+    /// The body's eager run is in flight right now — resuming ops
+    /// (`next`/`send`/`throw`) on the object are guarded ('Cannot
+    /// resume an already running generator') so a body that reaches
+    /// its own handle cannot re-enter the cursor machinery mid-frame.
+    pub running: bool,
+    /// The sink filling up while `running` — consumer read ops
+    /// (`valid`/`current`/`key`) consult it so a mid-run probe sees
+    /// the yields already produced, like Zend's live execute_data.
+    pub live: Option<Rc<RefCell<Vec<GenItem>>>>,
+    /// This gen is being re-collected as a `yield from` delegate of a
+    /// gen whose own send()/throw() replay is in flight: its
+    /// pre-first-yield bytes were already echoed by the delegate run
+    /// the consumer saw, so emit suppression covers its `done==0`
+    /// prefix even though the active horizon targets the outer gen.
+    pub suppress_prefix: bool,
+}
+
+impl GenState {
+    /// Advance the consumer cursor, mirroring it into the shared
+    /// finally journal so a dead weak's destruction check can still
+    /// gate on the suspension point.
+    pub fn set_pos(&mut self, pos: usize) {
+        self.pos = pos;
+        self.fin_q.borrow_mut().set_pos_tree(pos);
+    }
+
+    /// Whether `decl` is this generator's own body — the popped
+    /// frame for that decl is a suspension (its CVs stay live in
+    /// execute_data) rather than a call return.
+    pub fn owns_frame(&self, decl: &crate::ast::FunctionDecl) -> bool {
+        match &self.setup {
+            GenSetup::Invoke { decl: d, .. } => std::ptr::eq(d.as_ref(), decl),
+        }
+    }
 }
 
 pub enum GenSetup {

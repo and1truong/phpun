@@ -7,6 +7,13 @@ use super::*;
 
 impl<'a> Interp<'a> {
     pub fn exec_block(&mut self, stmts: &[Stmt]) -> Flow {
+        self.exec_block_from(stmts, 0)
+    }
+
+    /// `exec_block` starting partway down the list — used when a
+    /// `goto` lands on a label inside it (the label stmt itself is a
+    /// no-op; control resumes at the stmt after it).
+    fn exec_block_from(&mut self, stmts: &[Stmt], mut i: usize) -> Flow {
         // goto labels bind at the statement-list scope they appear in —
         // a goto bubbling up from nested control flow lands here.
         let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
@@ -15,7 +22,6 @@ impl<'a> Interp<'a> {
                 labels.entry(n.as_str()).or_insert(i);
             }
         }
-        let mut i = 0;
         while i < stmts.len() {
             let s = &stmts[i];
             i += 1;
@@ -45,15 +51,103 @@ impl<'a> Interp<'a> {
                 }
             }
             match self.exec(s) {
-                Flow::Normal => {}
-                Flow::Goto(l) => match labels.get(l.as_str()) {
-                    Some(&t) => i = t + 1,
-                    None => return Flow::Goto(l),
+                Flow::Normal => {
+                    // Generators that died at this statement (unset(),
+                    // overwrite, foreach abandon) replay their
+                    // suspended finally chains here — Zend destroys
+                    // them at last-ref drop. A destruction-time raise
+                    // (force-closed finally yield, parked throwable,
+                    // finally-region death) becomes this statement's
+                    // error.
+                    if !self.live_gens.is_empty() {
+                        if let Err(e) = self.gen_gc_sweep(false) {
+                            return self.err_flow(e);
+                        }
+                    }
+                }
+                Flow::Goto(mut l) => loop {
+                    if let Some(&t) = labels.get(l.as_str()) {
+                        i = t + 1;
+                        break;
+                    }
+                    match self.exec_label_in(stmts, &l) {
+                        // The landing ran to this list's end, or ended
+                        // in another goto — the latter loops so it
+                        // resolves against this scope's labels too.
+                        Some(Flow::Goto(l2)) => l = l2,
+                        Some(out) => return out,
+                        None => return Flow::Goto(l),
+                    }
                 },
                 f => return f,
             }
         }
         Flow::Normal
+    }
+
+    /// A `goto` landing inside this list's nested structure — Zend
+    /// binds labels to the whole function op-array, so a label under a
+    /// bare block, an `if`/`else` arm, or a try/catch/finally body is
+    /// a legal target: control enters that list at the label and runs
+    /// to its end, then resumes after the enclosing statement. The
+    /// flow gate already rejected landings into loops and switches,
+    /// so those bodies are not searched.
+    fn exec_label_in(&mut self, stmts: &[Stmt], name: &str) -> Option<Flow> {
+        for (idx, s) in stmts.iter().enumerate() {
+            if let Stmt::Label(n) = s {
+                if n == name {
+                    return Some(self.exec_block_from(stmts, idx + 1));
+                }
+                continue;
+            }
+            let inner = match s {
+                Stmt::Block(b) => self.exec_label_in(b, name),
+                Stmt::If { then, else_, .. } => self
+                    .exec_label_in(then, name)
+                    .or_else(|| self.exec_label_in(else_, name)),
+                Stmt::Try {
+                    body,
+                    catches,
+                    finally,
+                } => {
+                    if let Some(flow) = self.exec_label_in(body, name) {
+                        // A landing inside the try arms its catches —
+                        // Zend's catch op-ranges cover the target too.
+                        let out = self.try_dispatch(flow, catches);
+                        Some(self.try_finally(out, finally))
+                    } else {
+                        let mut hit = None;
+                        for c in catches {
+                            if let f @ Some(_) = self.exec_label_in(&c.body, name) {
+                                hit = f;
+                                break;
+                            }
+                        }
+                        if hit.is_some() {
+                            // A catch body runs unguarded; the finally
+                            // region still runs after it.
+                            hit.map(|out| self.try_finally(out, finally))
+                        } else if let Some(fb) = finally {
+                            // Landing inside the finally region itself:
+                            // its tail only — the region does not re-run.
+                            self.exec_label_in(fb, name)
+                        } else {
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            if let Some(f) = inner {
+                // The nested landing consumed control through the
+                // ancestor's end; resume this list after it.
+                return match f {
+                    Flow::Normal => Some(self.exec_block_from(stmts, idx + 1)),
+                    other => Some(other),
+                };
+            }
+        }
+        None
     }
 
     /// A loop/switch body: one enclosing context for `break`/`continue`
@@ -72,24 +166,13 @@ impl<'a> Interp<'a> {
                 self.send_line = None;
                 Flow::Normal
             }
-            Stmt::Diag { level, msg, line } => {
+            // Compile-time diagnostics park before their source stmt;
+            // the flow gate already emitted each at its position (they
+            // are properties of the compiled unit, not the executed
+            // path — `if(0){ echo "${a}"; }` still deprecates).
+            Stmt::Diag { line, .. } => {
                 self.cur_line = *line;
-                let r = match *level {
-                    "Warning" => self.warn(msg),
-                    "Notice" => self.notice(msg),
-                    _ => self.deprecated(msg),
-                };
-                match r {
-                    Ok(()) => Flow::Normal,
-                    Err(e) => self.err_flow(e),
-                }
-            }
-            Stmt::Deprecated { msg, line } => {
-                self.cur_line = *line;
-                match self.deprecated(msg) {
-                    Ok(()) => Flow::Normal,
-                    Err(e) => self.err_flow(e),
-                }
+                Flow::Normal
             }
             Stmt::Inline(t) => {
                 self.emit(t);
@@ -125,9 +208,13 @@ impl<'a> Interp<'a> {
                             // refcount 0 here — Zend runs its
                             // __destruct immediately (methods_003
                             // `new bar;`). strong_count 2 = the
-                            // statement value + its expr_temps slot.
+                            // statement value + its expr_temps slot —
+                            // and the temps slot must actually pin it,
+                            // else a `=&`/`=` result aliased to a live
+                            // cell would falsely count 2 (gh10168).
                             if let Value::Object(o) = &v {
                                 if Rc::strong_count(o) == 2
+                                    && self.expr_temps.iter().any(|t| Rc::ptr_eq(t, o))
                                     && self
                                         .find_method_in(&o.borrow().class, "__destruct")
                                         .is_some()
@@ -141,6 +228,7 @@ impl<'a> Interp<'a> {
                                         self.expr_temps.truncate(base);
                                         return self.err_flow(e);
                                     }
+                                    self.mark_obj_died(o);
                                 }
                             }
                             // Statement end frees expression
@@ -443,10 +531,13 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let key = d.name.to_lowercase();
-                // The same decl site early-bound at compile time is a
+                // The same decl site early-bound for THIS unit is a
                 // no-op; a DIFFERENT decl claiming an occupied name is
-                // the 'Cannot redeclare' fatal.
-                if self.early_bound_classes.get(&key) == Some(&(Rc::as_ptr(d) as usize)) {
+                // the 'Cannot redeclare' fatal. The unit key guards a
+                // freed AST allocation recycled by a later unit's decl.
+                if self.early_bound_classes.get(&key)
+                    == Some(&(self.cur_unit_id, Rc::as_ptr(d) as usize))
+                {
                     return Flow::Normal;
                 }
                 if let Some((kind, file, line)) = self.existing_class_site(&key) {
@@ -498,7 +589,7 @@ impl<'a> Interp<'a> {
                 // deduping, or differ from itself across calls, falsely
                 // reporting 'Duplicate declaration').
                 let site = (self.cur_unit_id, *site);
-                for (name, default) in vars {
+                for (name, default, var_line) in vars {
                     // Every site is kept: a decl in a different unit is
                     // legal AND must not erase the same-unit record a
                     // later duplicate checks against.
@@ -515,7 +606,7 @@ impl<'a> Interp<'a> {
                         // context backtrace (include chain minus context).
                         let mut e = PhpError::compile_fatal(
                             format!("Duplicate declaration of static variable ${}", name),
-                            self.cur_line,
+                            *var_line,
                         );
                         e.trace = Some(self.compile_err_frames());
                         return self.err_flow(e);
@@ -548,6 +639,11 @@ impl<'a> Interp<'a> {
                             c
                         }
                     };
+                    // The bound cell belongs to the function's statics
+                    // table — a suspended gen frame's release must not
+                    // null it out from under sibling calls/instances
+                    // (bug64979).
+                    self.mark_shared(&cellv);
                     self.cur().vars.insert(name.clone(), cellv);
                 }
                 Flow::Normal
@@ -664,7 +760,15 @@ impl<'a> Interp<'a> {
                             // table entry too.
                             if self.stack.is_empty() {
                                 if let Some(arr) = self.globals_arr.clone() {
-                                    arr.borrow_mut().unset(&ArrKey::Str(Rc::from(n.as_str())));
+                                    // The borrow must end before the
+                                    // evicted payload's dtors run.
+                                    let evicted =
+                                        arr.borrow_mut().unset(&ArrKey::Str(Rc::from(n.as_str())));
+                                    if let Some(v) = evicted {
+                                        if let Err(e) = self.destruct_dying_value(&v) {
+                                            return self.err_flow(e);
+                                        }
+                                    }
                                 }
                                 self.globals_synced.remove(n);
                             }
@@ -731,7 +835,12 @@ impl<'a> Interp<'a> {
                         _ => {}
                     }
                 }
-                Flow::Normal
+                // A released generator replays its suspended
+                // finally chains now — unset() is its GC moment.
+                match self.gen_gc_sweep(false) {
+                    Err(e) => self.err_flow(e),
+                    Ok(()) => Flow::Normal,
+                }
             }
             Stmt::Try {
                 body,
@@ -739,53 +848,8 @@ impl<'a> Interp<'a> {
                 finally,
             } => {
                 let flow = self.exec_block(body);
-                let out = match flow {
-                    Flow::Throw(v) => {
-                        let mut result = Flow::Throw(v.clone());
-                        for c in catches {
-                            if self.catch_matches(&v, &c.types) {
-                                // The throwable's raise-site stamp is
-                                // consumed here — a later engine error
-                                // must not inherit its file
-                                // (a caught include-time throwable
-                                // would otherwise poison attribution).
-                                self.last_err_file.clear();
-                                if let Some(var) = &c.var {
-                                    // Binding the catch var is a normal
-                                    // assign — a `&`-bound typed ref
-                                    // gates it and the TypeError
-                                    // propagates out of the try
-                                    // (typed_properties_108).
-                                    match self.var_set_gated(var, v.clone(), true) {
-                                        Ok(_) => result = self.exec_block(&c.body),
-                                        Err(e) => result = self.err_flow(e),
-                                    }
-                                } else {
-                                    result = self.exec_block(&c.body);
-                                }
-                                break;
-                            }
-                        }
-                        result
-                    }
-                    f => f,
-                };
-                if let Some(fb) = finally {
-                    if matches!(out, Flow::Exit(_)) {
-                        // zend's bailout (exit(), a compile fatal's
-                        // unwinding) skips finally blocks entirely —
-                        // only throwables and ordinary control flow
-                        // run them.
-                        out
-                    } else {
-                        match self.exec_block(fb) {
-                            Flow::Normal => out,
-                            f => f,
-                        }
-                    }
-                } else {
-                    out
-                }
+                let out = self.try_dispatch(flow, catches);
+                self.try_finally(out, finally)
             }
             Stmt::Namespace(n) => {
                 // Top-level scope follows `namespace` declarations —
@@ -844,6 +908,83 @@ impl<'a> Interp<'a> {
                 }
                 Flow::Normal
             }
+        }
+    }
+
+    /// The Throw half of `Stmt::Try` exec — dispatch to the first
+    /// matching catch and run its body. Shared with the `goto`
+    /// landing path: control jumping into the middle of a try body is
+    /// still covered by its catch op-ranges.
+    fn try_dispatch(&mut self, flow: Flow, catches: &[Catch]) -> Flow {
+        match flow {
+            Flow::Throw(v) => {
+                let mut result = Flow::Throw(v.clone());
+                for c in catches {
+                    if self.catch_matches(&v, &c.types) {
+                        // The throwable's raise-site stamp is consumed
+                        // here — a later engine error must not inherit
+                        // its file (a caught include-time throwable
+                        // would otherwise poison attribution).
+                        self.last_err_file.clear();
+                        if let Some(var) = &c.var {
+                            // Binding the catch var is a normal
+                            // assign — a `&`-bound typed ref gates it
+                            // and the TypeError propagates out of the
+                            // try (typed_properties_108).
+                            match self.var_set_gated(var, v.clone(), true) {
+                                Ok(_) => result = self.exec_block(&c.body),
+                                Err(e) => result = self.err_flow(e),
+                            }
+                        } else {
+                            result = self.exec_block(&c.body);
+                        }
+                        break;
+                    }
+                }
+                result
+            }
+            f => f,
+        }
+    }
+
+    /// The finally half of `Stmt::Try` exec — the region runs after
+    /// the body/catches flow and supersedes it unless that flow was
+    /// Normal.
+    fn try_finally(&mut self, out: Flow, finally: &Option<Vec<Stmt>>) -> Flow {
+        match finally {
+            Some(_) if matches!(out, Flow::Exit(_)) => {
+                // zend's bailout (exit(), a compile fatal's
+                // unwinding) skips finally blocks entirely —
+                // only throwables and ordinary control flow
+                // run them.
+                out
+            }
+            Some(fb) => {
+                // Output of a finally region inside a generator body
+                // is death-time output (Zend replays it when the
+                // suspended gen is destroyed) — tag it for fin_q.
+                let fin = self.gen_run_state.is_some();
+                if fin {
+                    self.gen_fin_depth += 1;
+                }
+                let fr = self.exec_block(fb);
+                if fin {
+                    self.gen_fin_depth -= 1;
+                    // A body error raised inside the region is the
+                    // force-close terminal error — destruction
+                    // replays it (fin_err) rather than the deferred
+                    // resume. (Return/Break inside finally are not
+                    // deaths.)
+                    if matches!(fr, Flow::Throw(_) | Flow::Exit(_)) && self.gen_fin_depth == 0 {
+                        self.gen_fin_err = true;
+                    }
+                }
+                match fr {
+                    Flow::Normal => out,
+                    f => f,
+                }
+            }
+            None => out,
         }
     }
 
@@ -1039,10 +1180,16 @@ impl<'a> Interp<'a> {
                         };
                         last = Some(c.clone());
                         if let Some(ForeachKey::Var(kn)) = key {
-                            self.var_set(kn, key_value(&k));
+                            if let Err(e) = self.var_set(kn, key_value(&k)) {
+                                break self.err_flow(e);
+                            }
                         }
                         match val {
-                            ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                            ForeachTarget::Var(n) => {
+                                if let Err(e) = self.var_set(n, c.borrow().clone()) {
+                                    break self.err_flow(e);
+                                }
+                            }
                             ForeachTarget::ByRef(n) => {
                                 if let Some(f) = self.readonly_ref_error(&c) {
                                     break f;
@@ -1086,10 +1233,16 @@ impl<'a> Interp<'a> {
                 for (idx, (k, c)) in snapshot.into_iter().enumerate() {
                     self.cur_line = idx;
                     if let Some(ForeachKey::Var(kn)) = key {
-                        self.var_set(kn, key_value(&k));
+                        if let Err(e) = self.var_set(kn, key_value(&k)) {
+                            return self.err_flow(e);
+                        }
                     }
                     match val {
-                        ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                        ForeachTarget::Var(n) => {
+                            if let Err(e) = self.var_set(n, c.borrow().clone()) {
+                                return self.err_flow(e);
+                            }
+                        }
                         ForeachTarget::ByRef(n) => {
                             if let Some(f) = self.readonly_ref_error(&c) {
                                 return f;
@@ -1347,10 +1500,16 @@ impl<'a> Interp<'a> {
                             Some(i) => Value::Int(i),
                             None => Value::str(n.clone()),
                         };
-                        self.var_set(kn, kv);
+                        if let Err(e) = self.var_set(kn, kv) {
+                            return self.err_flow(e);
+                        }
                     }
                     match val {
-                        ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                        ForeachTarget::Var(n) => {
+                            if let Err(e) = self.var_set(n, c.borrow().clone()) {
+                                return self.err_flow(e);
+                            }
+                        }
                         ForeachTarget::ByRef(n) => {
                             self.mark_ref(&c);
                             self.cur().vars.insert(n.clone(), c.clone());
@@ -1415,7 +1574,7 @@ impl<'a> Interp<'a> {
         if Rc::strong_count(&it) == 2 && self.expr_temps.iter().any(|o| Rc::ptr_eq(o, &it)) {
             self.expr_temps.retain(|o| !Rc::ptr_eq(o, &it));
             let key = Rc::as_ptr(&it) as usize;
-            if !self.destructed.contains_key(&key)
+            if !self.was_destructed(key)
                 && self
                     .find_method_in(&it.borrow().class, "__destruct")
                     .is_some()
@@ -1429,6 +1588,16 @@ impl<'a> Interp<'a> {
         f
     }
 
+    /// An iterator-method call driven by foreach itself — marked so
+    /// diagnostics raised inside attribute the gen body's original
+    /// call frame, not a userland `Generator->next()` resume stack.
+    fn iter_call(&mut self, it: &Rc<RefCell<PhpObject>>, name: &str) -> Result<Value, PhpError> {
+        self.iter_calls += 1;
+        let r = self.method_invoke(it.clone(), name, CallArgs::empty());
+        self.iter_calls -= 1;
+        r
+    }
+
     fn exec_foreach_iter_loop(
         &mut self,
         it: Rc<RefCell<PhpObject>>,
@@ -1436,29 +1605,37 @@ impl<'a> Interp<'a> {
         val: &ForeachTarget,
         body: &[Stmt],
     ) -> Flow {
-        if let Err(e) = self.method_invoke(it.clone(), "rewind", CallArgs::empty()) {
+        if let Err(e) = self.iter_call(&it, "rewind") {
             return self.err_flow(e);
         }
         loop {
-            let ok = self
-                .method_invoke(it.clone(), "valid", CallArgs::empty())
-                .map(|v| v.is_truthy())
-                .unwrap_or(false);
+            let ok = match self.iter_call(&it, "valid") {
+                Ok(v) => v.is_truthy(),
+                Err(e) => return self.err_flow(e),
+            };
             if !ok {
                 break;
             }
             // PHP calls current() before key() on each iteration.
-            let v = self
-                .method_invoke(it.clone(), "current", CallArgs::empty())
-                .unwrap_or(Value::Null);
+            let v = match self.iter_call(&it, "current") {
+                Ok(v) => v,
+                Err(e) => return self.err_flow(e),
+            };
             if let Some(ForeachKey::Var(kn)) = key {
-                let k = self
-                    .method_invoke(it.clone(), "key", CallArgs::empty())
-                    .unwrap_or(Value::Null);
-                self.var_set(kn, k);
+                let k = match self.iter_call(&it, "key") {
+                    Ok(k) => k,
+                    Err(e) => return self.err_flow(e),
+                };
+                if let Err(e) = self.var_set(kn, k) {
+                    return self.err_flow(e);
+                }
             }
             match val {
-                ForeachTarget::Var(n) => self.var_set(n, v),
+                ForeachTarget::Var(n) => {
+                    if let Err(e) = self.var_set(n, v) {
+                        return self.err_flow(e);
+                    }
+                }
                 ForeachTarget::ByRef(n) => {
                     // A by-ref generator's current() is the yielded
                     // cell itself — bind to it directly. An
@@ -1504,7 +1681,7 @@ impl<'a> Interp<'a> {
                 Flow::Normal => {}
                 f => return f,
             }
-            if let Err(e) = self.method_invoke(it.clone(), "next", CallArgs::empty()) {
+            if let Err(e) = self.iter_call(&it, "next") {
                 return self.err_flow(e);
             }
         }
@@ -1518,11 +1695,11 @@ impl<'a> Interp<'a> {
                 if let Some(t) = t {
                     let iv = a.get(&ArrKey::Int(i as i64)).unwrap_or(Value::Null);
                     match t {
-                        ForeachTarget::Var(n) => self.var_set(n, iv),
+                        ForeachTarget::Var(n) => self.var_set(n, iv)?,
                         ForeachTarget::Lvalue(e) => {
                             let _ = self.store(e, iv);
                         }
-                        ForeachTarget::ByRef(n) => self.var_set(n, iv),
+                        ForeachTarget::ByRef(n) => self.var_set(n, iv)?,
                         ForeachTarget::List(sub) => {
                             self.foreach_list(sub, &iv)?;
                         }

@@ -10,7 +10,89 @@ impl<'a> Interp<'a> {
     /// Flush all output buffers at script end, innermost first so each
     /// level's handler output lands in its parent's buffer (bug24951).
     pub(in crate::interp) fn flush_ob_all(&mut self) {
+        // Still-open buffers a suspended gen opened are real Zend
+        // stack levels — restore the ones the consumer's cursor
+        // actually reached (in stack order) so the end-of-request
+        // flush covers them; dead capture mirrors (already popped by
+        // the body) and windows whose open tag was never passed are
+        // dropped — Zend never ran those resumes.
+        let sus = std::mem::take(&mut self.suspended_obs);
+        self.ob_stack.extend(sus.into_iter().filter(|l| {
+            l.gen_close.is_none()
+                && l.gen_open
+                    .is_some_and(|o| l.gen_q.as_ref().is_some_and(|q| q.borrow().vis_pos >= o))
+        }));
         while !self.ob_stack.is_empty() {
+            // A killed gen's window: journaled tail bytes that merged
+            // into buf before the kill never ran in Zend's frame —
+            // rebuild the real content like the dead-gen teardown.
+            if let Some(l) = self.ob_stack.last_mut() {
+                let dead = l
+                    .gen_q
+                    .as_ref()
+                    .map(|q| {
+                        let f = q.borrow();
+                        (f.vis_pos, f.killed, f.finished && f.vis_pos >= f.total)
+                    })
+                    .unwrap_or((usize::MAX, false, true));
+                let dead = (
+                    dead.0,
+                    dead.1
+                        || (!dead.2 && l.gen_state.as_ref().is_some_and(|w| w.upgrade().is_none())),
+                );
+
+                if dead.1 && !l.drained_segs.is_empty() {
+                    let v = Self::ob_level_content(l, dead.0, true);
+                    l.buf = v;
+                    l.drained_segs.clear();
+                    l.gen_drained = 0;
+                }
+                // A live gen window's buffer resolves at teardown:
+                // consumer captures splice into cursor position —
+                // the body's eager reads of the stale content
+                // (ob_get_contents & friends stored in CVs) rewrite
+                // to the resolved value, and the flush itself
+                // carries the spliced ordering.
+                if l.gen_q.is_some() && !l.caps.is_empty() {
+                    let caps = std::mem::take(&mut l.caps);
+                    let old_v = Self::ob_level_content(l, dead.0, dead.1);
+                    l.caps = caps;
+                    let new_v = Self::ob_level_content(l, dead.0, dead.1);
+                    if let Some(gs) = &l.gen_state {
+                        if let Some(st) = gs.upgrade() {
+                            Self::gen_patch_values(&mut st.borrow_mut(), &old_v, &new_v);
+                        }
+                    }
+                    l.buf = new_v;
+                    l.drained_segs.clear();
+                    l.cap_segs.clear();
+                    l.gen_drained = 0;
+                }
+                // Eager buffer reads the body stored (ob_get_contents
+                // & friends) resolve against the captures each read's
+                // resume had seen — the same close-time rewrite a
+                // pop mirror performs.
+                if l.gen_q.is_some() && !l.read_vals.is_empty() {
+                    let reads = std::mem::take(&mut l.read_vals);
+                    if let Some(gs) = &l.gen_state {
+                        if let Some(st) = gs.upgrade() {
+                            let mut st = st.borrow_mut();
+                            for (k, rhead, rsegs) in &reads {
+                                let caps: Vec<(usize, Vec<u8>)> =
+                                    l.caps.iter().filter(|(t, _)| *t < *k).cloned().collect();
+                                let mut stale = rhead.clone();
+                                for (_, s) in rsegs {
+                                    stale.extend_from_slice(s);
+                                }
+                                let mut v = rhead.clone();
+                                v.extend_from_slice(&crate::interp::ob_splice(&[], rsegs, &caps));
+                                Self::gen_patch_values(&mut st, &stale, &v);
+                            }
+                        }
+                    }
+                }
+            }
+
             let r = self.ob_invoke(8);
             self.ob_stack.pop();
             if let Ok(Some(s)) = r {
@@ -24,6 +106,8 @@ impl<'a> Interp<'a> {
     /// START=1, CLEAN=2, FLUSH=4, FINAL=8). Returns the handler's output
     /// — or the raw buffer when there is no handler.
     fn ob_invoke(&mut self, mode: i64) -> Result<Option<Vec<u8>>, PhpError> {
+        // Cursor-past journaled gen captures join the buffer first.
+        self.ob_drain_pending();
         let (handler, buf, already) = match self.ob_stack.last_mut() {
             Some(l) => {
                 let buf = std::mem::take(&mut l.buf);
@@ -132,22 +216,244 @@ impl<'a> Interp<'a> {
     }
     // public helpers for builtins
     pub fn ob_push(&mut self, handler: Option<Value>) {
+        // A buffer opened inside a generator body is a real global
+        // buffer in Zend — it survives the body's suspends and
+        // captures consumer writes too. Tag the level with the
+        // cursor position its ob_start ran at: it stays on the stack
+        // during the body run, detaches at suspend, and
+        // rematerializes once the consumer's cursor reaches it
+        // (ob_suspend/ob_promote).
+        let (gen_q, gen_open, gen_state) = match &self.gen_run_state {
+            Some(s) => {
+                let done = self
+                    .gen_sink
+                    .as_ref()
+                    .map(|k| k.borrow().len())
+                    .unwrap_or(0);
+                // A send()/throw() prefix re-run replays this push —
+                // the level the first run parked is the same buffer
+                // (Zend's stack persists): reactivate it so the
+                // replay's writes capture there. A replayed push
+                // whose level was already popped falls through to a
+                // live level — the replayed pop folds it back.
+                if self.gen_horizon_suppresses(done) {
+                    let fq = s.borrow().fin_q.clone();
+                    if let Some(p) = self.suspended_obs.iter().position(|m| {
+                        m.gen_q
+                            .as_ref()
+                            .is_some_and(|mq| std::rc::Rc::ptr_eq(mq, &fq))
+                            && m.gen_open == Some(done)
+                            && m.gen_close.is_none()
+                            && m.pop_head.is_none()
+                    }) {
+                        let mut m = self.suspended_obs.remove(p);
+
+                        // The re-run regenerates its journaled
+                        // captures — stale ones would echo twice.
+                        m.gen_pending.clear();
+                        m.gen_drained = 0;
+                        m.drained_segs.clear();
+                        self.ob_stack.push(m);
+                        return;
+                    }
+                    let live = self.ob_stack.iter().any(|m| {
+                        m.gen_q
+                            .as_ref()
+                            .is_some_and(|mq| std::rc::Rc::ptr_eq(mq, &fq))
+                            && m.gen_open == Some(done)
+                            && m.pop_head.is_none()
+                    });
+                    if live {
+                        return;
+                    }
+                }
+                (
+                    Some(s.borrow().fin_q.clone()),
+                    Some(done),
+                    Some(std::rc::Rc::downgrade(s)),
+                )
+            }
+            None => (None, None, None),
+        };
         self.ob_stack.push(ObLevel {
             buf: Vec::new(),
             handler,
             started: false,
+            gen_q,
+            gen_open,
+            gen_close: None,
+            gen_pending: Vec::new(),
+            gen_drained: 0,
+            pop_head: None,
+            pop_segs: Vec::new(),
+            drained_segs: Vec::new(),
+            caps: Vec::new(),
+            cap_segs: Vec::new(),
+            read_vals: Vec::new(),
+            suspend_base: 0,
+            gen_state,
         });
+    }
+
+    /// Pop the top buffer — a gen-opened one popped by the body
+    /// keeps a suspended capture window until the consumer's cursor
+    /// passes its close tag (Zend's global buffer still exists
+    /// between the body's yield and its pop). A body re-run that
+    /// replays the pop folds the live mirror's consumer captures
+    /// into the returned value instead of registering a second
+    /// window.
+    fn ob_pop(&mut self) -> Option<ObLevel> {
+        self.ob_pop_snap(None)
+    }
+
+    /// `snap` supplies the buffer contents for the mirror split when
+    /// the caller already consumed `buf` (ob_end_flush's handler
+    /// invoke empties it before the pop).
+    fn ob_pop_snap(&mut self, snap: Option<Vec<u8>>) -> Option<ObLevel> {
+        // Pop mirrors are bookkeeping for a buffer the body already
+        // consumed — Zend's stack has no such level, so every pop
+        // (body or consumer) lands on the topmost real level.
+        let i = self
+            .ob_stack
+            .iter()
+            .rposition(|l| l.pop_head.is_none())
+            .or_else(|| {
+                // Consumer-side pops reach into a suspended gen
+                // window — at the consumer's cursor the body's pop
+                // hasn't logically run, so the mirror IS the real
+                // buffer for them.
+                if self.gen_run_state.is_none() {
+                    self.ob_stack.iter().rposition(|l| l.gen_q.is_some())
+                } else {
+                    None
+                }
+            })?;
+        let mut l = self.ob_stack.remove(i);
+        if l.pop_head.is_some() {
+            // The consumer stole the window: return its real-time
+            // content; the body's pop Zend-wise now sees whatever
+            // remains (here: nothing) — clear the journaled value.
+            let mut v = l.pop_head.clone().unwrap_or_default();
+            for (_, s) in &l.pop_segs {
+                v.extend_from_slice(s);
+            }
+            v.extend_from_slice(&crate::interp::ob_splice(&[], &[], &l.caps));
+            let old_v = v.clone();
+            let min_tag = l.gen_close.unwrap_or(0).saturating_sub(1);
+            if !old_v.is_empty() {
+                if let Some(gs) = &l.gen_state {
+                    if let Some(st2) = gs.upgrade() {
+                        let mut st2 = st2.borrow_mut();
+                        for (t, b, ..) in &mut st2.pending_out {
+                            if *t >= min_tag {
+                                Self::bytes_replace(b, &old_v, &[]);
+                            }
+                        }
+                        Self::gen_patch_values(&mut st2, &old_v, &[]);
+                    }
+                }
+                if let Some(q) = &l.gen_q {
+                    for (t, b, _) in &mut q.borrow_mut().bytes {
+                        if *t >= min_tag {
+                            Self::bytes_replace(b, &old_v, &[]);
+                        }
+                    }
+                }
+            }
+            l.buf = v;
+            return Some(l);
+        }
+        let content = snap.unwrap_or_else(|| l.buf.clone());
+        if l.gen_open.is_some() && self.gen_run_state.is_some() && l.gen_close.is_none() {
+            let close = self.gen_sink.as_ref().map(|s| s.borrow().len());
+            let existing = match (&l.gen_q, close) {
+                (Some(q), Some(c)) => self
+                    .ob_stack
+                    .iter()
+                    .chain(self.suspended_obs.iter())
+                    .find(|m| {
+                        m.gen_q
+                            .as_ref()
+                            .is_some_and(|mq| std::rc::Rc::ptr_eq(mq, q))
+                            && m.gen_close == Some(c)
+                    })
+                    .map(|m| (m.pop_head.clone(), m.caps.clone())),
+                _ => None,
+            };
+            // Split `content` (a clone of the level's buf at pop)
+            // into the bytes before the drained stream and per-tag
+            // segments — drained_segs carry their recorded offsets so
+            // mid-buffer drains (consumer writes between segs) stay
+            // positional.
+            let split_parts = |content: &[u8]| -> (Vec<u8>, Vec<(usize, Vec<u8>)>) {
+                crate::interp::ob_split_view(&l, content)
+            };
+            if let Some((_mhead, caps)) = existing {
+                // Replayed pop: the mirror already captured the
+                // consumer writes the shared Zend buffer also held —
+                // the returned value splices them into this pop's
+                // own segment stream in real write order.
+                let (head, segs) = split_parts(&content);
+                let mut v = head;
+                v.extend_from_slice(&crate::interp::ob_splice(&[], &segs, &caps));
+                l.buf = v;
+            } else {
+                // Register the window mirror: keep the pop value
+                // split into a head and per-tag segments so consumer
+                // captures splice in real write order at close.
+                let (head, mut segs) = split_parts(&content);
+                let mut read_vals = l.read_vals.clone();
+                if !content.is_empty() {
+                    let k = self
+                        .gen_sink
+                        .as_ref()
+                        .map(|s| s.borrow().len())
+                        .unwrap_or(0);
+                    read_vals.push((k, head.clone(), segs.clone()));
+                }
+                if let Some(prev) = segs.last_mut() {
+                    if prev.0 == usize::MAX {
+                        prev.0 = close.unwrap_or(0).saturating_sub(1);
+                    }
+                }
+                let gen_state = self.gen_run_state.as_ref().map(std::rc::Rc::downgrade);
+                self.suspended_obs.push(ObLevel {
+                    buf: Vec::new(),
+                    handler: None,
+                    started: true,
+                    gen_q: l.gen_q.clone(),
+                    gen_open: l.gen_open,
+                    gen_close: close,
+                    gen_pending: Vec::new(),
+                    gen_drained: 0,
+                    pop_head: Some(head),
+                    pop_segs: segs,
+                    drained_segs: Vec::new(),
+                    caps: Vec::new(),
+                    cap_segs: Vec::new(),
+                    // The pop's own returned content is itself a
+                    // stale view — consumer captures arriving before
+                    // the window closes belong inside it.
+                    read_vals,
+                    suspend_base: 0,
+                    gen_state,
+                });
+            }
+        }
+        Some(l)
     }
     /// ob_end_clean: handler(mode=CLEAN|FINAL) result discarded, pop.
     pub fn ob_end_clean(&mut self) -> Result<(), PhpError> {
         self.ob_invoke(10)?;
-        self.ob_stack.pop();
+        self.ob_pop();
         Ok(())
     }
     /// ob_end_flush: handler(mode=FINAL) result emitted to parent, pop.
     pub fn ob_end_flush(&mut self) -> Result<(), PhpError> {
+        self.ob_drain_pending();
+        let raw = self.ob_stack.last().map(|l| l.buf.clone());
         let r = self.ob_invoke(8)?;
-        self.ob_stack.pop();
+        self.ob_pop_snap(raw);
         if let Some(s) = r {
             self.emit_bytes(&s);
         }
@@ -173,27 +479,49 @@ impl<'a> Interp<'a> {
     }
     /// ob_get_clean: raw buffer, NO handler invocation, pop.
     pub fn ob_get_clean(&mut self) -> Value {
-        self.ob_stack
-            .pop()
+        self.ob_drain_pending();
+        self.ob_pop()
             .map(|l| Value::bytes(l.buf))
             .unwrap_or(Value::Bool(false))
     }
     /// ob_get_flush: handler(mode=FINAL) result emitted, RAW buffer
     /// returned, level popped.
     pub fn ob_get_flush(&mut self) -> Result<Value, PhpError> {
+        self.ob_drain_pending();
         let raw = self.ob_stack.last().map(|l| l.buf.clone());
         let r = self.ob_invoke(8)?;
-        self.ob_stack.pop();
+        self.ob_pop_snap(raw.clone());
         if let Some(s) = r {
             self.emit_bytes(&s);
         }
         Ok(raw.map(Value::bytes).unwrap_or(Value::Bool(false)))
     }
-    pub fn ob_top(&self) -> Option<&Vec<u8>> {
+    pub fn ob_top(&mut self) -> Option<&Vec<u8>> {
+        self.ob_promote();
+        self.ob_drain_pending();
+        if self.gen_run_state.is_some() {
+            if let Some(l) = self.ob_stack.last_mut() {
+                // A buffer view the body materializes eagerly —
+                // consumer captures landing between the suspend and
+                // this read's resume rewrite it at window close.
+                if l.gen_q.is_some() && !l.buf.is_empty() {
+                    let k = self
+                        .gen_sink
+                        .as_ref()
+                        .map(|s| s.borrow().len())
+                        .unwrap_or(0);
+                    let (head, segs) = crate::interp::ob_split_view(l, &l.buf.clone());
+                    l.read_vals.push((k, head, segs));
+                }
+            }
+        }
         self.ob_stack.last().map(|l| &l.buf)
     }
-    pub fn ob_len(&self) -> usize {
-        self.ob_stack.len()
+    pub fn ob_len(&mut self) -> usize {
+        self.ob_promote();
+        // Suspended gen-owned buffers stay on Zend's shared stack
+        // until their window closes — count the live ones too.
+        self.ob_stack.len() + self.ob_suspended_visible()
     }
     pub fn register_shutdown(&mut self, f: Value, args: Vec<Cell>) {
         self.shutdown_fns.push((f, args));
@@ -303,8 +631,8 @@ impl<'a> Interp<'a> {
     ) -> Result<Value, PhpError> {
         self.call_value(&Value::Callable(c.clone()), CallArgs::positional(args))
     }
-    pub fn var_name_set(&mut self, name: &str, v: Value) {
-        self.var_set(name, v);
+    pub fn var_name_set(&mut self, name: &str, v: Value) -> Result<(), PhpError> {
+        self.var_set(name, v)
     }
     pub fn warn_pub(&mut self, msg: &str) -> Result<(), PhpError> {
         self.warn(msg)

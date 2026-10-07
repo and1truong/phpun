@@ -1018,7 +1018,7 @@ pub(crate) fn dispatch(
                 for (k, c) in a.borrow().iter() {
                     if let ArrKey::Str(s) = k {
                         if is_varname(s) {
-                            it.var_name_set(s, c.borrow().clone());
+                            it.var_name_set(s, c.borrow().clone())?;
                         }
                     }
                 }

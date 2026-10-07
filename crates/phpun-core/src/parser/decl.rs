@@ -17,6 +17,7 @@ impl<'a> Parser<'a> {
         self.pos += 1; // static
         let mut vars = Vec::new();
         loop {
+            let var_line = self.line();
             let name = match self.next() {
                 Some(Token::Variable(n)) => n,
                 t => {
@@ -25,7 +26,7 @@ impl<'a> Parser<'a> {
                             "syntax error, unexpected {}, expecting variable",
                             desc_t(t.as_ref())
                         ),
-                        self.line(),
+                        var_line,
                     ))
                 }
             };
@@ -34,12 +35,12 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            vars.push((name, default));
+            vars.push((name, default, var_line));
             if !self.eat_op(",") {
                 break;
             }
         }
-        self.expect_op(";")?;
+        self.expect_op_list_end()?;
         Ok(Stmt::Static { vars, line, site })
     }
 
@@ -48,7 +49,7 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let sl = self.line();
         let cond = Self::markline(self.expr()?, sl);
-        self.expect_op(")")?;
+        self.expect_group(")")?;
         let alt = self.eat_op(":");
         if !alt {
             self.expect_op("{")?;
@@ -85,6 +86,7 @@ impl<'a> Parser<'a> {
                     self.deprecations.push((
                         "Case statements followed by a semicolon (;) are deprecated, use a colon (:) instead".into(),
                         cl,
+                        self.pos,
                     ));
                 }
                 cases.push((Some(e), Vec::new()));
@@ -100,6 +102,7 @@ impl<'a> Parser<'a> {
                     self.deprecations.push((
                         "Case statements followed by a semicolon (;) are deprecated, use a colon (:) instead".into(),
                         cl,
+                        self.pos,
                     ));
                 }
                 cases.push((None, Vec::new()));
@@ -327,6 +330,7 @@ impl<'a> Parser<'a> {
 
     pub(in crate::parser) fn foreach_target(&mut self) -> Result<ForeachTarget, PhpError> {
         if self.eat_op("&") {
+            let l = self.line();
             return match self.next() {
                 Some(Token::Variable(n)) => Ok(ForeachTarget::ByRef(n)),
                 t => Err(PhpError::parse(
@@ -334,7 +338,7 @@ impl<'a> Parser<'a> {
                         "syntax error, unexpected {}, expecting variable",
                         desc_t(t.as_ref())
                     ),
-                    self.line(),
+                    l,
                 )),
             };
         }
@@ -372,6 +376,7 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             return Ok(ForeachTarget::List(items));
         }
+        let l = self.line();
         match self.next() {
             Some(Token::Variable(n)) => {
                 // Lvalue targets: `$b[0]`, `$o->p`, ...
@@ -401,7 +406,7 @@ impl<'a> Parser<'a> {
                     "syntax error, unexpected {}, expecting variable",
                     desc_t(t.as_ref())
                 ),
-                self.line(),
+                l,
             )),
         }
     }
@@ -464,7 +469,7 @@ impl<'a> Parser<'a> {
         // top-level statement — nowhere nested, nothing before it
         // (scalar_strict_declaration_placement_*, strict_nested).
         if is_strict && !self.strict_slot {
-            return Err(PhpError::fatal(
+            return Err(PhpError::compile_fatal(
                 "strict_types declaration must be the very first statement in the script",
                 self.line(),
             ));
@@ -476,7 +481,7 @@ impl<'a> Parser<'a> {
             // `declare(...) { }` / `declare(...):` block forms —
             // strict_types forbids block mode entirely (placement_008).
             if is_strict {
-                return Err(PhpError::fatal(
+                return Err(PhpError::compile_fatal(
                     "strict_types declaration must not use block mode",
                     self.line(),
                 ));
@@ -586,7 +591,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        self.expect_op(";")?;
+        self.expect_op_list_end()?;
         Ok(Stmt::Use(names))
     }
 
@@ -600,17 +605,22 @@ impl<'a> Parser<'a> {
         alias: &str,
         fq: &str,
     ) -> Result<(), PhpError> {
-        // Re-importing the same alias to the same target is a no-op
-        // (namespaces/ns_078).
-        if kind == NsKind::Class && self.use_map.get(&alias.to_lowercase()) == Some(&fq.to_string())
-        {
-            return Ok(());
-        }
-        if kind == NsKind::Class && self.declared_types.contains(&alias.to_lowercase()) {
-            return Err(PhpError::fatal(
+        // Any alias already claimed in the same import table is a
+        // compile fatal — even re-importing the same target (Zend's
+        // zend_resolve_non_class_name check, use_collision_*).
+        let (hit, tag) = match kind {
+            NsKind::Class => (self.use_map.contains_key(&alias.to_lowercase()), ""),
+            NsKind::Func => (
+                self.use_fn_map.contains_key(&alias.to_lowercase()),
+                "function ",
+            ),
+            NsKind::Const => (self.use_const_map.contains_key(alias), "const "),
+        };
+        if hit || (kind == NsKind::Class && self.declared_types.contains(&alias.to_lowercase())) {
+            return Err(PhpError::compile_fatal(
                 format!(
-                    "Cannot use {} as {} because the name is already in use",
-                    fq, alias
+                    "Cannot use {}{} as {} because the name is already in use",
+                    tag, fq, alias
                 ),
                 self.line(),
             ));
@@ -936,7 +946,7 @@ impl<'a> Parser<'a> {
             .use_map
             .contains_key(&name.rsplit('\\').next().unwrap_or(&name).to_lowercase())
         {
-            return Err(PhpError::fatal(
+            return Err(PhpError::compile_fatal(
                 format!(
                     "Cannot redeclare class {} (previously declared as local import)",
                     name
@@ -1249,6 +1259,7 @@ impl<'a> Parser<'a> {
             };
             self.check_prop_ty(&pty, pline)?;
             loop {
+                let pl = self.line();
                 let pname = match self.next() {
                     Some(Token::Variable(n)) => n,
                     t => {
@@ -1257,7 +1268,7 @@ impl<'a> Parser<'a> {
                                 "syntax error, unexpected {}, expecting variable",
                                 desc_t(t.as_ref())
                             ),
-                            self.line(),
+                            pl,
                         ))
                     }
                 };
@@ -1408,7 +1419,7 @@ impl<'a> Parser<'a> {
     ) -> Result<Option<Vec<PropHook>>, PhpError> {
         self.expect_op("{")?;
         if self.at_op("}") {
-            return Err(PhpError::fatal(
+            return Err(PhpError::compile_fatal(
                 "Property hook list must not be empty",
                 self.line(),
             ));
@@ -1438,7 +1449,7 @@ impl<'a> Parser<'a> {
                     hfinal = true;
                     self.pos += 1;
                 } else if self.ident_is("static") {
-                    return Err(PhpError::fatal(
+                    return Err(PhpError::compile_fatal(
                         "Cannot use the static modifier on a property hook",
                         self.line(),
                     ));
@@ -1462,7 +1473,7 @@ impl<'a> Parser<'a> {
                 }
             };
             if hname != "get" && hname != "set" {
-                return Err(PhpError::fatal(
+                return Err(PhpError::compile_fatal(
                     format!(
                         "Unknown hook \"{}\" for property {}::${}, expected \"get\" or \"set\"",
                         hname, self.cur_class, pname
@@ -1472,7 +1483,7 @@ impl<'a> Parser<'a> {
             }
             let is_get = hname == "get";
             if hs.iter().any(|h| h.is_get == is_get) {
-                return Err(PhpError::fatal(
+                return Err(PhpError::compile_fatal(
                     format!("Cannot redeclare property hook \"{}\"", hname),
                     self.line(),
                 ));
@@ -1632,7 +1643,7 @@ impl<'a> Parser<'a> {
             // `static` is never a legal param modifier/type
             // (static_type_param).
             if self.ident_is("static") {
-                return Err(PhpError::fatal(
+                return Err(PhpError::compile_fatal(
                     "Cannot use the static modifier on a parameter",
                     self.line(),
                 ));
@@ -1652,6 +1663,7 @@ impl<'a> Parser<'a> {
             };
             let by_ref = self.eat_op("&");
             let variadic = self.eat_op("...");
+            let pl = self.line();
             let pname = match self.next() {
                 Some(Token::Variable(n)) => n,
                 t => {
@@ -1660,7 +1672,7 @@ impl<'a> Parser<'a> {
                             "syntax error, unexpected {}, expecting variable",
                             desc_t(t.as_ref())
                         ),
-                        self.line(),
+                        pl,
                     ))
                 }
             };
@@ -1703,7 +1715,7 @@ impl<'a> Parser<'a> {
         self.pos += 1; // if
         self.expect_op("(")?;
         let cond = self.expr()?;
-        self.expect_op(")")?;
+        self.expect_group(")")?;
         let alt = self.at_op(":");
         let arm_body = |p: &mut Self, stops: &[&str]| -> Result<Vec<Stmt>, PhpError> {
             if alt {
@@ -1726,7 +1738,7 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 self.expect_op("(")?;
                 let c = self.expr()?;
-                self.expect_op(")")?;
+                self.expect_group(")")?;
                 let b = arm_body(self, &["elseif", "else", "endif"])?;
                 arms.push((c, b));
                 continue;
@@ -1764,12 +1776,14 @@ impl<'a> Parser<'a> {
         if !self.at_op(";") {
             init = self.expr_list()?;
         }
-        self.expect_op(";")?;
+        // Zend reports the single-token expected set at the for-header
+        // separators (`unexpected "{", expecting ";"`).
+        self.expect_op_full(";")?;
         let mut cond = Vec::new();
         if !self.at_op(";") {
             cond = self.expr_list()?;
         }
-        self.expect_op(";")?;
+        self.expect_op_full(";")?;
         let mut inc = Vec::new();
         if !self.at_op(")") {
             inc = self.expr_list()?;
@@ -2028,7 +2042,7 @@ impl<'a> Parser<'a> {
                                         _ => None,
                                     };
                                     if let Some(m) = w {
-                                        self.compile_warnings.push((m, self.line()));
+                                        self.compile_warnings.push((m, self.line(), self.pos));
                                     }
                                 }
                                 // `self`/`static`/`parent` need an
