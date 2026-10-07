@@ -936,6 +936,13 @@ struct GcScan {
     /// In-flight slot decrefs (`gc_note_dying` walks) — a snapshot of
     /// `Interp::gc_dying` taken at pass start.
     dying: HashMap<usize, usize>,
+    /// Containers reached through internal-machinery prop cells only
+    /// (`\0Cls\0prop` on GC_PROPLESS_CLASSES): engine-modeled storage,
+    /// not zvals — dead ones don't count toward the collect total.
+    internal: HashSet<usize>,
+    /// Containers reached through at least one real zval edge — an
+    /// `internal`-marked container with a real edge counts normally.
+    plain: HashSet<usize>,
 }
 
 impl<'a> Interp<'a> {
@@ -4195,7 +4202,7 @@ impl<'a> Interp<'a> {
             if visited.insert(t) {
                 let mut out = Vec::new();
                 for (_, c) in &a.borrow().entries {
-                    Self::gc_scan_cell(c, &mut scan, &mut out, 16, &mut visited);
+                    Self::gc_scan_cell(c, &mut scan, &mut out, 16, &mut visited, false);
                 }
                 scan.edges.insert(t, out);
             }
@@ -4301,8 +4308,21 @@ impl<'a> Interp<'a> {
             dead_nodes.retain(|t| freed.contains(t));
         }
         // Zend counts every dead root — dead universe nodes plus the
-        // dead non-node containers that die with them.
-        let dead_roots = dead.len() + dead_arrs.len() + dead_nodes.len();
+        // dead non-node containers that die with them. Containers reached
+        // only through internal-machinery props (SplObjectStorage's
+        // `$objs`/`$data`, SplFixedArray's `$data`) aren't zvals in Zend —
+        // its storage is C-level — so they don't count (bug69534); their
+        // slot contents are still scanned and do.
+        let counted = |t: &usize| !scan.internal.contains(t) || scan.plain.contains(t);
+        let dead_roots = dead
+            .iter()
+            .filter(|o| counted(&(Rc::as_ptr(o) as usize)))
+            .count()
+            + dead_arrs
+                .iter()
+                .filter(|a| counted(&(Rc::as_ptr(a) as usize)))
+                .count()
+            + dead_nodes.iter().filter(|t| counted(t)).count();
         drop(scan);
         let mut first_err = None;
         for o in &dead {
@@ -4408,6 +4428,7 @@ impl<'a> Interp<'a> {
         out: &mut Vec<usize>,
         depth: u8,
         visited: &mut HashSet<usize>,
+        internal: bool,
     ) {
         if depth == 0 {
             return;
@@ -4415,7 +4436,7 @@ impl<'a> Interp<'a> {
         let cp = Rc::as_ptr(c) as usize;
         *scan.cell_slots.entry(cp).or_insert(0) += 1;
         scan.cells.entry(cp).or_insert_with(|| c.clone());
-        Self::gc_scan_held(&c.borrow(), Some(cp), scan, out, depth, visited);
+        Self::gc_scan_held(&c.borrow(), Some(cp), scan, out, depth, visited, internal);
     }
 
     /// The refcounted target a held `v` points at. A cell-held clone
@@ -4429,6 +4450,7 @@ impl<'a> Interp<'a> {
         out: &mut Vec<usize>,
         depth: u8,
         visited: &mut HashSet<usize>,
+        internal: bool,
     ) {
         if depth == 0 {
             return;
@@ -4438,6 +4460,11 @@ impl<'a> Interp<'a> {
             return;
         }
         out.push(t);
+        if internal {
+            scan.internal.insert(t);
+        } else {
+            scan.plain.insert(t);
+        }
         match holder {
             Some(cp) => {
                 scan.cell_edges.entry(t).or_default().insert(cp);
@@ -4458,23 +4485,23 @@ impl<'a> Interp<'a> {
         match v {
             Value::Array(a) => {
                 for (_, c) in &a.borrow().entries {
-                    Self::gc_scan_cell(c, scan, &mut inner, depth - 1, visited);
+                    Self::gc_scan_cell(c, scan, &mut inner, depth - 1, visited, false);
                 }
             }
             Value::Callable(c) => {
                 for (_, cap, _) in &c.captures {
-                    Self::gc_scan_cell(cap, scan, &mut inner, depth - 1, visited);
+                    Self::gc_scan_cell(cap, scan, &mut inner, depth - 1, visited, false);
                 }
                 // The bound `$this` / method-callable target object is a
                 // bare clone — count it as a raw edge so the cycle
                 // object ↔ closure closes correctly.
                 if let Some(o) = &c.this_obj {
                     let v = Value::Object(o.clone());
-                    Self::gc_scan_held(&v, None, scan, &mut inner, depth - 1, visited);
+                    Self::gc_scan_held(&v, None, scan, &mut inner, depth - 1, visited, false);
                 }
                 if let crate::value::CallableKind::Method { obj: Some(o), .. } = &c.kind {
                     let v = Value::Object(o.clone());
-                    Self::gc_scan_held(&v, None, scan, &mut inner, depth - 1, visited);
+                    Self::gc_scan_held(&v, None, scan, &mut inner, depth - 1, visited, false);
                 }
             }
             Value::Object(o) => {
@@ -4483,6 +4510,32 @@ impl<'a> Interp<'a> {
             _ => {}
         }
         scan.edges.insert(t, inner);
+    }
+
+    /// `\0Cls\0prop` private-prop keys whose owning class keeps storage
+    /// in pure-C structures rather than zval slots in Zend — phpun models
+    /// them as ordinary prop cells, so containers sitting inside count as
+    /// dead member containers while Zend counts none (bug69534 expects
+    /// int(2): SplObjectStorage's `$objs`/`$data` arrays aren't real).
+    /// Element contents still scan: attached objects are zvals in Zend
+    /// too. Only classes whose storage is NOT a zend HashTable/array
+    /// qualify — IteratorIterator's `$inner`, RII's `$stack`, CBFI's
+    /// `$callback` etc. are real zvals and stay counted.
+    const GC_PROPLESS_CLASSES: &'static [&'static str] = &["splobjectstorage", "splfixedarray"];
+
+    /// Whether `name` is a `\0Cls\0prop` private-prop key on a
+    /// GC_PROPLESS_CLASSES member (engine-modeled storage, not a zval).
+    fn gc_internal_prop(name: &str) -> bool {
+        if !name.starts_with('\0') {
+            return false;
+        }
+        let rest = &name[1..];
+        let Some(owner) = rest.split('\0').next() else {
+            return false;
+        };
+        Self::GC_PROPLESS_CLASSES
+            .iter()
+            .any(|c| owner.eq_ignore_ascii_case(c))
     }
 
     /// An object's in-graph edges: prop cells, and for a generator
@@ -4502,25 +4555,36 @@ impl<'a> Interp<'a> {
             return;
         }
         let ob = o.borrow();
-        for c in ob.props.values() {
-            Self::gc_scan_cell(c, scan, out, depth - 1, visited);
+        for (pname, c) in ob.props.iter() {
+            // Private props on classes whose Zend counterpart keeps its
+            // storage in pure-C structures (no zval slots): the container
+            // in that cell is engine modeling, counted out of the dead
+            // set — its contents still scan as real member zvals.
+            Self::gc_scan_cell(
+                c,
+                scan,
+                out,
+                depth - 1,
+                visited,
+                Self::gc_internal_prop(pname),
+            );
         }
         let Some(crate::value::ObjectInternal::Generator(st)) = &ob.internal else {
             return;
         };
         let st = st.borrow();
         for (k, c) in &st.items {
-            Self::gc_scan_held(k, None, scan, out, depth - 1, visited);
-            Self::gc_scan_cell(c, scan, out, depth - 1, visited);
+            Self::gc_scan_held(k, None, scan, out, depth - 1, visited, false);
+            Self::gc_scan_cell(c, scan, out, depth - 1, visited, false);
         }
         for (_, v) in &st.sends {
-            Self::gc_scan_held(v, None, scan, out, depth - 1, visited);
+            Self::gc_scan_held(v, None, scan, out, depth - 1, visited, false);
         }
         for (_, v) in &st.throws {
-            Self::gc_scan_held(v, None, scan, out, depth - 1, visited);
+            Self::gc_scan_held(v, None, scan, out, depth - 1, visited, false);
         }
         if let Some(v) = &st.injected_throwable {
-            Self::gc_scan_held(v, None, scan, out, depth - 1, visited);
+            Self::gc_scan_held(v, None, scan, out, depth - 1, visited, false);
         }
         let GenSetup::Invoke {
             args,
@@ -4530,18 +4594,18 @@ impl<'a> Interp<'a> {
             ..
         } = &st.setup;
         for c in &args.cells {
-            Self::gc_scan_cell(c, scan, out, depth - 1, visited);
+            Self::gc_scan_cell(c, scan, out, depth - 1, visited, false);
         }
         for (_, c, _) in captures {
-            Self::gc_scan_cell(c, scan, out, depth - 1, visited);
+            Self::gc_scan_cell(c, scan, out, depth - 1, visited, false);
         }
         if let Some(t) = this_obj {
             let v = Value::Object(t.clone());
-            Self::gc_scan_held(&v, None, scan, out, depth - 1, visited);
+            Self::gc_scan_held(&v, None, scan, out, depth - 1, visited, false);
         }
         if let Some(rc) = closure_rc {
             let v = Value::Callable(rc.clone());
-            Self::gc_scan_held(&v, None, scan, out, depth - 1, visited);
+            Self::gc_scan_held(&v, None, scan, out, depth - 1, visited, false);
         }
         // Suspended frame CVs — the journal outlives the state, and
         // delegation snapshots carry their own inner frames' cells.
@@ -4556,7 +4620,7 @@ impl<'a> Interp<'a> {
             let mut fins: Vec<&crate::value::GenFinData> = vec![&*f];
             while let Some(g) = fins.pop() {
                 for (_, c) in &g.suspended {
-                    Self::gc_scan_cell(c, scan, out, depth - 1, visited);
+                    Self::gc_scan_cell(c, scan, out, depth - 1, visited, false);
                 }
                 for d in &g.delegates {
                     fins.push(&d.fin);
