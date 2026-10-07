@@ -2331,6 +2331,39 @@ impl<'a> Interp<'a> {
                 &["message", "code", "file", "line", "severity"],
             );
             d.methods.push(method("getSeverity", &[]));
+            // zend gives ErrorException its own ctor arginfo:
+            // (message, code, severity, filename, line, previous).
+            for m in d.methods.iter_mut() {
+                if m.decl.name == "__construct" {
+                    let mut decl = m.decl.clone();
+                    decl.params = [
+                        "message", "code", "severity", "filename", "line", "previous",
+                    ]
+                    .iter()
+                    .map(|n| Param {
+                        name: (*n).into(),
+                        default: Some(Expr::Null),
+                        by_ref: false,
+                        variadic: false,
+                        ty: None,
+                        promoted: false,
+                        vis: None,
+                        readonly: false,
+                        is_final: false,
+                        set_vis: None,
+                        hooks: None,
+                    })
+                    .collect();
+                    *m = Rc::new(MethodDecl {
+                        decl,
+                        is_static: m.is_static,
+                        is_abstract: m.is_abstract,
+                        is_final: m.is_final,
+                        visibility: m.visibility,
+                        trait_alias_of: None,
+                    });
+                }
+            }
             reg(d, false);
         }
         for (name, parent) in [
@@ -2365,41 +2398,6 @@ impl<'a> Interp<'a> {
             d.methods.retain(|m| {
                 !m.decl.name.eq_ignore_ascii_case("__construct") || name == "ErrorException"
             });
-            if name == "ErrorException" {
-                // zend gives ErrorException its own ctor arginfo:
-                // (message, code, severity, filename, line, previous).
-                for m in d.methods.iter_mut() {
-                    if m.decl.name == "__construct" {
-                        let mut decl = m.decl.clone();
-                        decl.params = [
-                            "message", "code", "severity", "filename", "line", "previous",
-                        ]
-                        .iter()
-                        .map(|n| Param {
-                            name: (*n).into(),
-                            default: Some(Expr::Null),
-                            by_ref: false,
-                            variadic: false,
-                            ty: None,
-                            promoted: false,
-                            vis: None,
-                            readonly: false,
-                            is_final: false,
-                            set_vis: None,
-                            hooks: None,
-                        })
-                        .collect();
-                        *m = Rc::new(MethodDecl {
-                            decl,
-                            is_static: m.is_static,
-                            is_abstract: m.is_abstract,
-                            is_final: m.is_final,
-                            visibility: m.visibility,
-                            trait_alias_of: None,
-                        });
-                    }
-                }
-            }
             reg(d, false);
         }
     }
