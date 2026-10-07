@@ -1891,6 +1891,13 @@ pub(crate) fn dispatch(
                     "stream_filter_register(): Argument #2 ($class) must be a non-empty string",
                 );
             }
+            // zend: user-map collision OR an exact builtin factory of
+            // the same name (register_factory_volatile) → false.
+            if it.user_filter_map.iter().any(|(n, _)| *n == fname)
+                || builtin_factory(&fname).is_some()
+            {
+                return Ok(Some(Value::Bool(false)));
+            }
             it.user_filter_map.push((fname, cls));
             Value::Bool(true)
         }
@@ -4654,6 +4661,19 @@ const FILTER_READ: bool = true;
 /// is tried first, then it is shortened a dotted segment at a time —
 /// `a.b.c` → `a.b.*` → `a.*`. Every level is checked against the
 /// builtin factory keys AND the user_filter_map.
+/// True when `name` is an exact builtin factory name (zend:
+/// php_stream_filter_register_factory_volatile collision — user
+/// wildcards don't count). Reuses filter_resolve's factory arms
+/// minus the user-map lookup.
+fn builtin_factory(name: &str) -> Option<()> {
+    // zend's factories hash keys — exact-match collision only.
+    match name {
+        "zlib.*" | "bzip2.*" | "convert.iconv.*" | "string.rot13" | "string.toupper"
+        | "string.tolower" | "convert.*" | "consumed" | "dechunk" => Some(()),
+        _ => None,
+    }
+}
+
 fn filter_resolve(it: &Interp, name: &str) -> Option<FactoryHit> {
     let mut probe = name.to_string();
     loop {
