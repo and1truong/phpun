@@ -541,6 +541,14 @@ impl<'a> Parser<'a> {
                 let rl = self.line();
                 let rhs = self.assign()?;
                 let target = self.list_target(e)?;
+                if let Expr::List(items) = &target {
+                    // zend_compile_list_assign's writability verify is
+                    // a COMPILE error — it aborts the whole file
+                    // before anything runs.
+                    if let Some(err) = Self::list_assign_check(items, &rhs, rl) {
+                        return Err(err);
+                    }
+                }
                 return Ok(Expr::Assign {
                     target: Box::new(target),
                     op,
@@ -560,7 +568,7 @@ impl<'a> Parser<'a> {
             Expr::ArrayLit(items) => Ok(Expr::List(
                 items
                     .into_iter()
-                    .map(|(_, v)| Self::list_elem(v))
+                    .map(|(k, v)| Self::list_elem_kv(k, v))
                     .collect::<Result<_, _>>()?,
             )),
             Expr::Call {
@@ -614,7 +622,7 @@ impl<'a> Parser<'a> {
             Expr::ArrayLit(items) => Ok(Some(Expr::List(
                 items
                     .into_iter()
-                    .map(|(_, v)| Self::list_elem(v))
+                    .map(|(k, v)| Self::list_elem_kv(k, v))
                     .collect::<Result<_, _>>()?,
             ))),
             Expr::Call {
@@ -637,6 +645,237 @@ impl<'a> Parser<'a> {
             },
             e => Ok(Some(e)),
         }
+    }
+
+    /// `k => v` in a destructure keeps its declared key wrapped
+    /// around the element as a `listkey` marker: zend's keyed
+    /// array_pair reads `rhs[k]` — dropping the key reads the
+    /// positional index instead (silent wrong values).
+    fn list_elem_kv(k: Option<Expr>, v: Expr) -> Result<Option<Expr>, PhpError> {
+        Ok(match (k, Self::list_elem(v)?) {
+            (Some(key), Some(e)) => Some(Expr::Binary {
+                op: "listkey",
+                l: Box::new(key),
+                r: Box::new(e),
+            }),
+            (_, e) => e,
+        })
+    }
+
+    /// zend's `zend_compile_list_assign` writability walk — a
+    /// COMPILE error fired at the first bad element before anything
+    /// in the file runs. `cg` mirrors CG(zend_lineno): the compiled
+    /// RHS leaves it at its end; each element's key then its own
+    /// assign end re-sites it for the next.
+    fn list_assign_check(items: &[Option<Expr>], rhs: &Expr, rl: usize) -> Option<PhpError> {
+        let mut cg = Self::list_rhs_line(items, rhs).unwrap_or(rl);
+        Self::list_assign_walk(items, &mut cg)
+    }
+
+    /// CG(zend_lineno) after the destructure's RHS compiled — the
+    /// site of an element-0 writability failure. A CV RHS emits its
+    /// QM_ASSIGN at the assign node's own line (the list's first
+    /// element's); a compile-const array folds without descending
+    /// (CG = the array's lineno — its first element's); anything
+    /// else ends at its last compiled leaf.
+    fn list_rhs_line(items: &[Option<Expr>], rhs: &Expr) -> Option<usize> {
+        match Self::unmark_lval(rhs) {
+            Expr::Var(_) | Expr::VarVar(..) => items
+                .iter()
+                .flatten()
+                .next()
+                .and_then(crate::ast::start_line),
+            u @ Expr::ArrayLit(elems) if is_compile_const(u) => {
+                elems.first().and_then(|(_, v)| crate::ast::start_line(v))
+            }
+            _ => crate::ast::end_line(rhs),
+        }
+    }
+
+    fn list_assign_walk(items: &[Option<Expr>], cg: &mut usize) -> Option<PhpError> {
+        let keyed = items
+            .iter()
+            .flatten()
+            .next()
+            .is_some_and(|e| matches!(e, Expr::Binary { op: "listkey", .. }));
+        let mut has_elems = false;
+        for slot in items {
+            let Some(elem) = slot else {
+                if keyed {
+                    return Some(PhpError::compile_fatal(
+                        "Cannot use empty array entries in keyed array assignment",
+                        *cg,
+                    ));
+                }
+                continue;
+            };
+            has_elems = true;
+            let (key, elem) = match elem {
+                Expr::Binary {
+                    op: "listkey",
+                    l,
+                    r,
+                } => (Some(l.as_ref()), r.as_ref()),
+                _ => (None, elem),
+            };
+            if keyed != key.is_some() {
+                return Some(PhpError::compile_fatal(
+                    "Cannot mix keyed and unkeyed array entries in assignments",
+                    *cg,
+                ));
+            }
+            // zend compiles a keyed entry's key BEFORE verifying its
+            // value — the value's failure sites at the key's end.
+            if let Some(k) = key {
+                if let Some(l) = crate::ast::end_line(k) {
+                    *cg = l;
+                }
+            }
+            let var = Self::unmark_lval(elem);
+            if let Expr::List(inner) = var {
+                // Nested destructure passes the verify; its elements
+                // continue with the same CG (the fetch op leaves it
+                // untouched).
+                if let Some(err) = Self::list_assign_walk(inner, cg) {
+                    return Some(err);
+                }
+                continue;
+            }
+            if let Expr::Unpack(_) = var {
+                return Some(PhpError::compile_fatal(
+                    "Spread operator is not supported in assignments",
+                    *cg,
+                ));
+            }
+            let base = Self::writable_base(var);
+            if Self::short_circuited(base) {
+                return Some(PhpError::compile_fatal(
+                    "Assignments can only happen to writable values",
+                    *cg,
+                ));
+            }
+            match base {
+                Expr::Call { .. } => {
+                    return Some(PhpError::compile_fatal(
+                        "Can't use function return value in write context",
+                        Self::call_err_line(var, elem),
+                    ));
+                }
+                Expr::MethodCall { .. } | Expr::StaticCall { .. } | Expr::StaticCallDyn { .. } => {
+                    return Some(PhpError::compile_fatal(
+                        "Can't use method return value in write context",
+                        Self::call_err_line(var, elem),
+                    ));
+                }
+                Expr::Var(_) | Expr::VarVar(..) | Expr::StaticProp { .. } => {
+                    // Writable. A CV target's assign ends at the var's
+                    // own line (zend's PAREN node keeps the inner
+                    // var's lineno); delayed dim/prop targets leave
+                    // CG where it stood.
+                    if matches!(var, Expr::Var(_) | Expr::VarVar(..)) {
+                        if let Some(l) = Self::elem_cv_line(elem) {
+                            *cg = l;
+                        }
+                    }
+                }
+                _ => {
+                    return Some(PhpError::compile_fatal(
+                        "Assignments can only happen to writable values",
+                        *cg,
+                    ));
+                }
+            }
+        }
+        if !has_elems {
+            return Some(PhpError::compile_fatal("Cannot use empty list", *cg));
+        }
+        None
+    }
+
+    /// Transparent marks around a destructure element's target —
+    /// `argline` marks, parens and by-ref wrappers don't change the
+    /// lvalue kind zend's writability check sees.
+    fn unmark_lval(e: &Expr) -> &Expr {
+        let mut e = e;
+        loop {
+            e = match e {
+                Expr::Binary {
+                    op: "argline", r, ..
+                } => r,
+                Expr::Paren(inner) | Expr::ByRef(inner) => inner,
+                _ => return e,
+            };
+        }
+    }
+
+    /// zend_can_write_to_variable's DIM/PROP unwrap: walks index and
+    /// non-nullsafe prop chains (and marks) to the container that
+    /// decides writability.
+    fn writable_base(e: &Expr) -> &Expr {
+        let mut e = e;
+        loop {
+            e = match e {
+                Expr::Index { e, .. } => e,
+                Expr::Prop {
+                    obj,
+                    nullsafe: false,
+                    ..
+                } => obj,
+                Expr::Binary {
+                    op: "argline", r, ..
+                } => r,
+                Expr::Paren(inner) | Expr::ByRef(inner) => inner,
+                _ => return e,
+            };
+        }
+    }
+
+    /// zend_ast_is_short_circuited: a nullsafe hop anywhere in the
+    /// access chain makes the whole target non-writable.
+    fn short_circuited(e: &Expr) -> bool {
+        match e {
+            Expr::Prop { obj, nullsafe, .. } | Expr::MethodCall { obj, nullsafe, .. } => {
+                *nullsafe || Self::short_circuited(obj)
+            }
+            Expr::Index { e, .. }
+            | Expr::StaticProp { class: e, .. }
+            | Expr::StaticCall { class: e, .. }
+            | Expr::StaticCallDyn { class: e, .. } => Self::short_circuited(e),
+            Expr::Paren(inner) | Expr::ByRef(inner) => Self::short_circuited(inner),
+            Expr::Binary {
+                op: "argline", r, ..
+            } => Self::short_circuited(r),
+            _ => false,
+        }
+    }
+
+    /// A CV destructure element's zend lineno — the var's own line.
+    /// `($a)` marks the inner var at its own line inside the
+    /// element's outer element-mark, so peel one mark layer and take
+    /// the line of what remains.
+    fn elem_cv_line(elem: &Expr) -> Option<usize> {
+        let inner = match elem {
+            Expr::Binary {
+                op: "argline", r, ..
+            } => r.as_ref(),
+            e => e,
+        };
+        crate::ast::start_line(inner).or_else(|| crate::ast::start_line(elem))
+    }
+
+    /// Line for a call-family element's write-context fatal: a bare
+    /// call element sites at its own first token (the synthetic
+    /// ASSIGN's lineno); one buried under dims/props sites at the
+    /// element's compiled end.
+    fn call_err_line(var: &Expr, elem: &Expr) -> usize {
+        match var {
+            Expr::Call { .. }
+            | Expr::MethodCall { .. }
+            | Expr::StaticCall { .. }
+            | Expr::StaticCallDyn { .. } => crate::ast::start_line(elem),
+            _ => crate::ast::end_line(var),
+        }
+        .unwrap_or(0)
     }
 
     /// Wrap a sub-expression in an `argline` marker: diagnostics
@@ -1077,8 +1316,17 @@ impl<'a> Parser<'a> {
                 if op == "=" && self.eat_op("&") {
                     op = "=&";
                 }
+                let rl = self.line();
                 let rhs = self.assign()?;
                 let target = self.list_target(e)?;
+                if let Expr::List(items) = &target {
+                    // zend_compile_list_assign's writability verify is
+                    // a COMPILE error — it aborts the whole file
+                    // before anything runs.
+                    if let Some(err) = Self::list_assign_check(items, &rhs, rl) {
+                        return Err(err);
+                    }
+                }
                 return Ok(Expr::Assign {
                     target: Box::new(target),
                     op,
@@ -2261,8 +2509,7 @@ impl<'a> Parser<'a> {
                                 .or_else(|| resolved.strip_prefix('\\'))
                                 .unwrap_or(&resolved);
                             let bare_l = bare.to_lowercase();
-                            (!bare_l.contains('\\')
-                                && crate::builtins::is_builtin(&bare_l))
+                            (!bare_l.contains('\\') && crate::builtins::is_builtin(&bare_l))
                                 || self.declared_funcs.contains(&bare_l)
                         };
                         // Frameless builtins fuse every bare-CV arg's

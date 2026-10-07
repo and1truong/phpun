@@ -79,70 +79,7 @@ impl<'a> Interp<'a> {
     /// source operand's end. `None` when `e` has no recorded end
     /// (cur_line already holds the right line).
     pub(in crate::interp) fn inner_end_line(e: &Expr) -> Option<usize> {
-        match e {
-            // zend's post-eval lineno for a call is its last arg's
-            // line (the DO_FCALL lineno override only touches the op,
-            // not CG) — a zero-arg call leaves it at the call site.
-            Expr::Call { args, site, .. }
-            | Expr::MethodCall { args, site, .. }
-            | Expr::StaticCall { args, site, .. }
-            | Expr::StaticCallDyn { args, site, .. }
-            | Expr::New { args, site, .. } => Self::inner_end_line(args.last()?).or(Some(*site)),
-            Expr::ArrayLit(items) => items
-                .iter()
-                .rev()
-                .find_map(|(_, v)| Self::inner_end_line(v)),
-            Expr::Binary {
-                op: "argline",
-                l,
-                r,
-            } => Self::inner_end_line(r).or_else(|| match l.as_ref() {
-                Expr::Int(n) => Some(*n as usize),
-                _ => None,
-            }),
-            Expr::Binary { r, .. } => Self::inner_end_line(r),
-            Expr::Ternary { f, .. } => Self::inner_end_line(f),
-            Expr::Prop { name, site, .. } => match name {
-                PropName::Expr(inner) => Self::inner_end_line(inner).or(Some(*site)),
-                _ => Some(*site),
-            },
-            Expr::Index { e, i } => i
-                .as_deref()
-                .and_then(Self::inner_end_line)
-                .or_else(|| Self::inner_end_line(e)),
-            Expr::Paren(e)
-            | Expr::PreInc(e)
-            | Expr::PreDec(e)
-            | Expr::PostInc(e)
-            | Expr::PostDec(e)
-            | Expr::Print(e)
-            | Expr::Clone(e)
-            | Expr::Unpack(e)
-            | Expr::Fcc(e)
-            | Expr::Throw(e)
-            | Expr::YieldFrom(e)
-            | Expr::Empty(e) => Self::inner_end_line(e),
-            Expr::Unary { e, .. } | Expr::Cast { e, .. } => Self::inner_end_line(e),
-            // A varvar's effective position is its inner's — for a
-            // folded varvar that's the inner's first-token line (CV
-            // semantics), for a dynamic one the inner's last
-            // evaluated line.
-            Expr::VarVar(inner, _) => Self::inner_end_line(inner),
-            // Zend emits the ASSIGN op at the assignment node's own
-            // line (the target's first token) — not the value's end.
-            // A `list()`/`[]` destructure ends at its last element's
-            // own store line instead (zend's post-eval lineno).
-            Expr::Assign { target, line, .. } => match target.as_ref() {
-                Expr::List(_) => Self::inner_end_line(target).or(Some(*line)),
-                _ => Some(*line),
-            },
-            Expr::List(items) => items
-                .iter()
-                .rev()
-                .find_map(|i| i.as_ref())
-                .and_then(Self::inner_end_line),
-            _ => None,
-        }
+        crate::ast::end_line(e)
     }
 
     /// Runs a call-producing expression with send_line scoped to that
@@ -2745,19 +2682,41 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
             Expr::List(items) => {
-                // Zend interleaves FETCH_LIST[i] + element ASSIGN per
-                // slot: the fetch reads [i] positionally (a missing key
-                // warns "Undefined array key i", a non-array warns
-                // "Cannot use T as array" — engine_assignExecutionOrder_002)
-                // at the running op line, then the element's own store
-                // re-sites it via the element's mark.
+                // Zend interleaves FETCH_LIST[dim] + element ASSIGN
+                // per slot: an unkeyed element reads [i] positionally
+                // (a missing key warns "Undefined array key i", a
+                // non-array warns "Cannot use T as array" —
+                // engine_assignExecutionOrder_002) at the running op
+                // line, then the element's own store re-sites it via
+                // the element's mark. A `k => elem` keyed entry reads
+                // its declared key instead of the position.
                 for (i, slot) in items.iter().enumerate() {
                     let Some(t) = slot else { continue };
+                    let (key_e, t) = match t {
+                        Expr::Binary {
+                            op: "listkey",
+                            l,
+                            r,
+                        } => (Some(l.as_ref()), r.as_ref()),
+                        _ => (None, t),
+                    };
+                    let arrk = match key_e {
+                        Some(ke) => {
+                            let kv = self.eval(ke)?;
+                            crate::value::to_key(&kv)
+                        }
+                        None => ArrKey::Int(i as i64),
+                    };
                     let vi = match &v {
-                        Value::Array(a) => match a.borrow().get(&ArrKey::Int(i as i64)) {
+                        Value::Array(a) => match a.borrow().get(&arrk) {
                             Some(v) => v,
                             None => {
-                                self.warn(&format!("Undefined array key {}", i))?;
+                                let shown = match &arrk {
+                                    ArrKey::Int(i) => i.to_string(),
+                                    ArrKey::Str(s) => format!("\"{}\"", s),
+                                    ArrKey::Tomb => String::new(),
+                                };
+                                self.warn(&format!("Undefined array key {}", shown))?;
                                 Value::Null
                             }
                         },
