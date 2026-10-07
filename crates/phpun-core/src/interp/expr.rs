@@ -4,6 +4,37 @@
 use super::util::*;
 use super::*;
 
+/// A dim-write operand for `assign_index_path`: `[]` appends; `Key`
+/// carries an eagerly-bound key cell (literals and expression keys —
+/// zend evaluates them with the lvalue chain before the RHS); `Cv`
+/// defers a plain-`$var` key to its own dim op, so an intermediate
+/// FETCH_DIM_W failure preempts the var's read (`$b['x'][$u] = v` on
+/// a scalar `$b['x']` fatals without warning `$u`).
+#[derive(Clone)]
+enum DimArg {
+    Append,
+    Key(Cell),
+    Cv(String),
+}
+
+impl From<Option<Cell>> for DimArg {
+    fn from(k: Option<Cell>) -> Self {
+        match k {
+            Some(c) => DimArg::Key(c),
+            None => DimArg::Append,
+        }
+    }
+}
+
+/// The container binding a var-rooted dim write detached from:
+/// `name`'s pre-key cell plus a snapshot of its pre-key value — the
+/// stale graph the invisible write lands on.
+struct DimDetach {
+    name: String,
+    pre: Cell,
+    stale: Value,
+}
+
 impl<'a> Interp<'a> {
     // ----- expressions -----
 
@@ -760,7 +791,15 @@ impl<'a> Interp<'a> {
                     Err(_) => return Ok(None),
                 };
                 let key = match i {
-                    Some(k) => self.eval(k)?,
+                    Some(k) => {
+                        // The key operand reads normally — only the
+                        // element access is suppressed (isset($b[$u])
+                        // still warns 'Undefined variable $u').
+                        let q = std::mem::replace(&mut self.isset_quiet, 0);
+                        let k = self.eval(k);
+                        self.isset_quiet = q;
+                        k?
+                    }
                     None => return Ok(None),
                 };
                 // ArrayAccess containers see any key type (offsetExists).
@@ -1312,7 +1351,13 @@ impl<'a> Interp<'a> {
             },
             Keyed {
                 base: Cell,
-                keys: Vec<Option<Cell>>,
+                keys: Vec<DimArg>,
+                /// `??=` re-reads each dim operand for the write pass
+                /// (zend's coalesce assigns evaluate the key twice).
+                key_exprs: Option<Vec<Option<Expr>>>,
+                /// Pre-key-eval container value — the scratch a
+                /// detached write lands on.
+                stale: Value,
             },
             None,
         }
@@ -1404,7 +1449,13 @@ impl<'a> Interp<'a> {
                             undef_root = Some(n.clone());
                             cell(Value::Null)
                         }
-                        _ => self.eval_cell(base)?,
+                        _ => {
+                            let c = self.eval_cell(base)?;
+                            if let Expr::Var(n) = base {
+                                dim_root = Some((n.clone(), c.clone()));
+                            }
+                            c
+                        }
                     }
                 } else {
                     let c = self.eval_cell(base)?;
@@ -1413,16 +1464,42 @@ impl<'a> Interp<'a> {
                     }
                     c
                 };
+                // Only a handler write during the KEY eval detaches —
+                // container-eval and earlier-statement writes don't.
+                self.handler_writes.clear();
+                self.handler_reads.clear();
+                self.dim_key_conv.clear();
+                let stale = self.stale_snap(&c);
                 let mut keys = Vec::with_capacity(dims.len());
+                let mut key_exprs = Vec::with_capacity(dims.len());
                 for d in dims {
+                    key_exprs.push(d.cloned());
                     match d {
                         // A throwing key expr propagates — swallowing
                         // it as `None` would silently append (finding 7).
-                        Some(ie) => keys.push(self.dim_key(ie)?),
-                        None => keys.push(None),
+                        Some(ie) => {
+                            // For `=` a plain-$var key binds at its own
+                            // dim op (zend's ASSIGN_DIM fetches the
+                            // container level first — `$b['x'][$u]` on
+                            // scalar $b['x'] dies before reading $u).
+                            let mut ve = ie;
+                            while let Expr::Paren(inner) = ve {
+                                ve = inner.as_ref();
+                            }
+                            match (op == "=", ve) {
+                                (true, Expr::Var(n)) => keys.push(DimArg::Cv(n.clone())),
+                                _ => keys.push(DimArg::from(self.dim_key(ie)?)),
+                            }
+                        }
+                        None => keys.push(DimArg::Append),
                     }
                 }
-                late = Late::Keyed { base: c, keys };
+                late = Late::Keyed {
+                    base: c,
+                    keys,
+                    key_exprs: (op == "??=").then_some(key_exprs),
+                    stale,
+                };
                 // Detachment decided by the bound slot vs a
                 // handler-touched rebind — checked again at the write
                 // so RHS-time rebinds count too.
@@ -1476,11 +1553,11 @@ impl<'a> Interp<'a> {
                             }
                         }
                         match &late {
-                            Late::Keyed { base, keys } => {
+                            Late::Keyed { base, keys, .. } => {
                                 self.compound_dim_read(base.clone(), keys, $quiet)?
                             }
                             Late::Index { base, key, .. } => {
-                                let keys = [key.clone()];
+                                let keys = [DimArg::from(key.clone())];
                                 self.compound_dim_read(base.clone(), &keys, $quiet)?
                             }
                             // Prop targets read through the CACHED object
@@ -1604,24 +1681,32 @@ impl<'a> Interp<'a> {
                     }
                     self.compound_dim_gate(base, key)?
                 }
-                Late::Keyed { base, keys } => {
+                Late::Keyed { base, keys, .. } => {
                     let mut c = base.clone();
                     for k in keys {
-                        if k.is_none() && matches!(&*c.borrow(), Value::Str(_)) {
+                        let kc = match k {
+                            DimArg::Append => None,
+                            DimArg::Key(c) => Some(c.clone()),
+                            DimArg::Cv(n) => Some(self.dim_var_key(n)?),
+                        };
+                        if kc.is_none() && matches!(&*c.borrow(), Value::Str(_)) {
                             return self.fail(PhpError::uncaught(
                                 "Error",
                                 "[] operator not supported for strings",
                                 self.cur_line,
                             ));
                         }
-                        self.compound_dim_gate(&c, k)?;
+                        self.compound_dim_gate(&c, &kc)?;
                         let nxt = {
                             let b = c.borrow();
                             match &*b {
-                                Value::Array(rc) => k
-                                    .as_ref()
-                                    .map(|kc| self.arr_key(&kc.borrow()).unwrap_or(ArrKey::Tomb))
-                                    .and_then(|ak| rc.borrow().get_cell(&ak)),
+                                Value::Array(rc) => {
+                                    let rc = rc.clone();
+                                    drop(b);
+                                    kc.as_ref()
+                                        .map(|kc| self.dim_arr_key(kc).unwrap_or(ArrKey::Tomb))
+                                        .and_then(|ak| rc.borrow().get_cell(&ak))
+                                }
                                 _ => None,
                             }
                         };
@@ -1755,12 +1840,20 @@ impl<'a> Interp<'a> {
                             Value::Array(rc) => rc.clone(),
                             _ => unreachable!(),
                         };
+                        drop(b);
+                        // Convert before borrowing the array — the
+                        // conversion deprecation's error handler could
+                        // not re-borrow it otherwise (B1).
+                        let ak = match key.as_ref() {
+                            Some(k) => Some(self.dim_arr_key(k)?),
+                            None => None,
+                        };
                         let mut arr = rc.borrow_mut();
                         if append {
                             arr.push(newv.clone());
                         } else {
-                            let key = match key.as_ref() {
-                                Some(k) => self.arr_key(&k.borrow())?,
+                            let key = match ak {
+                                Some(k) => k,
                                 None => to_key(&newv),
                             };
                             arr.set(key, newv.clone());
@@ -1799,7 +1892,12 @@ impl<'a> Interp<'a> {
                 let nv = self.typed_slot_store(&c, newv.clone())?;
                 *c.borrow_mut() = nv;
             }
-            Late::Keyed { base, keys } => {
+            Late::Keyed {
+                base,
+                keys,
+                key_exprs,
+                stale,
+            } => {
                 // A `??=` detached root re-resolves AFTER the RHS — the
                 // RHS may have created the var (`$a[0] ??= ($a = [5])`),
                 // else this finally materializes it for the write.
@@ -1807,6 +1905,22 @@ impl<'a> Interp<'a> {
                     Some(n) => self.var_cell(&n),
                     None => base.clone(),
                 };
+                // `??=`'s write pass re-reads the dim operands — the
+                // undef-var warn and the offset conversion fire again
+                // (a fresh eval pass, so the conversion cache resets —
+                // the dropped key cells' addresses can legitimately be
+                // reused by the new ones).
+                let mut keys = keys;
+                if let Some(es) = key_exprs {
+                    self.dim_key_conv.clear();
+                    keys = Vec::with_capacity(es.len());
+                    for ie in es {
+                        match &ie {
+                            Some(ie) => keys.push(DimArg::from(self.dim_key(ie)?)),
+                            None => keys.push(DimArg::Append),
+                        }
+                    }
+                }
                 // A handler-rebound container writes into the stale
                 // pre-bound slot — silently, and invisibly: a scratch
                 // cell stands in so a write-through rebind (the var is
@@ -1816,7 +1930,7 @@ impl<'a> Interp<'a> {
                     Some((n, pc)) if self.dim_detached(&Some(pc.clone()), n) => {
                         detached = true;
                         self.detached_dim = true;
-                        cell(base.borrow().clone())
+                        cell(stale.clone())
                     }
                     _ => base,
                 };
@@ -1831,7 +1945,12 @@ impl<'a> Interp<'a> {
                     self.detached_dim = false;
                     return Ok(newv);
                 }
-                let r = self.assign_index_path(target, &keys, newv, needs_read);
+                let det = dim_root.as_ref().map(|(n, pc)| DimDetach {
+                    name: n.clone(),
+                    pre: pc.clone(),
+                    stale,
+                });
+                let r = self.assign_index_path(target, &keys, newv, needs_read, det.as_ref());
                 self.detached_dim = false;
                 newv = r?;
             }
@@ -3099,6 +3218,49 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// The value the pending write detaches onto when the container
+    /// was rebound mid-key-eval: the slot's pre-key contents, deep
+    /// enough that a write-through stays invisible (a shallow clone
+    /// would share the live array's Rc).
+    fn stale_snap(&self, c: &Cell) -> Value {
+        match &*c.borrow() {
+            Value::Array(rc) => Value::Array(Rc::new(RefCell::new(self.dup_array(&rc.borrow())))),
+            v => v.clone(),
+        }
+    }
+
+    /// `arr_key` through the op's conversion cache — a dim operand's
+    /// cast diagnostics (null-offset deprecation, float truncation,
+    /// resource-id warn) emit once per assign op even though the
+    /// compound read, the write gate and the write itself all convert
+    /// it (zend casts the operand once per op). The clone also keeps
+    /// no borrow alive across the diagnostic dispatch (B1).
+    fn dim_arr_key(&mut self, kc: &Cell) -> Result<ArrKey, PhpError> {
+        let p = Rc::as_ptr(kc) as usize;
+        if let Some(ak) = self.dim_key_conv.get(&p) {
+            return Ok(ak.clone());
+        }
+        let v = kc.borrow().clone();
+        let ak = self.arr_key(&v)?;
+        self.dim_key_conv.insert(p, ak.clone());
+        Ok(ak)
+    }
+
+    /// dim_key's Var arm — a plain-`$var` key binds to its live cell
+    /// (post-eval mutations stay visible at write), warning once when
+    /// undefined. Pulled out so `DimArg::Cv` binds at its own dim op.
+    fn dim_var_key(&mut self, n: &str) -> Result<Cell, PhpError> {
+        match self.var_lookup(n) {
+            Some(c) => Ok(c),
+            None => {
+                if !self.is_quiet() {
+                    self.warn(&format!("Undefined variable ${}", n))?;
+                }
+                Ok(cell(Value::Null))
+            }
+        }
+    }
+
     /// `$arr[$k] = v` / `$arr[] = v`.
     fn set_index(&mut self, e: &Expr, i: Option<&Expr>, v: Value) -> Result<(), PhpError> {
         // zend binds the dim container's slot before the key evaluates;
@@ -3109,10 +3271,14 @@ impl<'a> Interp<'a> {
         // after them — so only entries from the key eval count.
         self.handler_writes.clear();
         self.handler_reads.clear();
+        self.dim_key_conv.clear();
         let pre_cell = match e {
             Expr::Var(n) => self.var_cell_opt(n),
             _ => None,
         };
+        // Snapshot BEFORE the key runs: a rebound container detaches
+        // onto this stale graph, not the rebound value (m3 family).
+        let stale = pre_cell.as_ref().map(|c| self.stale_snap(c));
         let key = match i {
             Some(ie) => Some(self.eval(ie)?),
             None => None,
@@ -3120,7 +3286,7 @@ impl<'a> Interp<'a> {
         if let Expr::Var(n) = e {
             if let Some(kv) = &key {
                 if self.dim_detached(&pre_cell, n) {
-                    let scratch = cell(pre_cell.map(|c| c.borrow().clone()).unwrap_or(Value::Null));
+                    let scratch = cell(stale.clone().unwrap_or(Value::Null));
                     self.detached_dim = true;
                     let r = self.set_index_var(&scratch, key, None, v);
                     self.detached_dim = false;
@@ -3140,7 +3306,7 @@ impl<'a> Interp<'a> {
                     None
                 };
                 if self.dim_detached(&pre_cell, n) {
-                    let scratch = cell(pre_cell.map(|c| c.borrow().clone()).unwrap_or(Value::Null));
+                    let scratch = cell(stale.clone().unwrap_or(Value::Null));
                     self.detached_dim = true;
                     let r = self.set_index_var(&scratch, key, ak, v);
                     self.detached_dim = false;
@@ -3170,12 +3336,54 @@ impl<'a> Interp<'a> {
     fn assign_index_path(
         &mut self,
         mut c: Cell,
-        keys: &[Option<Cell>],
+        keys: &[DimArg],
         v: Value,
         compound: bool,
+        det: Option<&DimDetach>,
     ) -> Result<Value, PhpError> {
         let last = keys.len() - 1;
-        for (n, k) in keys.iter().enumerate() {
+        for (n, ka) in keys.iter().enumerate() {
+            // A deferred plain-$var key binds at ITS dim op: the
+            // container's write check runs first (zend's FETCH_DIM_W
+            // on a scalar dies before the CV is read), then the bind —
+            // whose diagnostics can rebind the root and detach the
+            // rest of the write.
+            let k: Option<Cell> = match ka {
+                DimArg::Append => None,
+                DimArg::Key(kc) => Some(kc.clone()),
+                DimArg::Cv(name) => {
+                    if !self.detached_dim {
+                        let bad = {
+                            let b = c.borrow();
+                            match &*b {
+                                Value::Null | Value::Array(_) | Value::Str(_) => None,
+                                Value::Object(o) if self.obj_is_a(o, "ArrayAccess") => None,
+                                Value::Object(o) => Some(format!(
+                                    "Cannot use object of type {} as array",
+                                    o.borrow().class.name()
+                                )),
+                                Value::Callable(_) => {
+                                    Some("Cannot use object of type Closure as array".to_string())
+                                }
+                                _ => Some("Cannot use a scalar value as an array".to_string()),
+                            }
+                        };
+                        if let Some(m) = bad {
+                            return self.fail(PhpError::uncaught("Error", m, self.cur_line));
+                        }
+                    }
+                    let kc = self.dim_var_key(name)?;
+                    if let Some(d) = det {
+                        if self.dim_detached(&Some(d.pre.clone()), &d.name) {
+                            self.detached_dim = true;
+                            if n == 0 {
+                                c = cell(d.stale.clone());
+                            }
+                        }
+                    }
+                    Some(kc)
+                }
+            };
             // Auto-init gate: writing through a typed slot that is
             // null (or a just-materialized uninit slot) must produce
             // `Cannot auto-initialize an array inside property ...`
@@ -3196,7 +3404,7 @@ impl<'a> Interp<'a> {
             if compound && !self.detached_dim {
                 // Container/key checks fire BEFORE the dim write in a
                 // compound assign — zend throws at whatever level fails.
-                self.compound_dim_gate(&c, k)?;
+                self.compound_dim_gate(&c, &k)?;
             }
             // ArrayAccess object offset path: `$o[k]` dispatches to
             // offsetSet/offsetGet instead of writing through a cell.
@@ -3211,8 +3419,8 @@ impl<'a> Interp<'a> {
             // fallback — the key Error propagates
             // (closure_array_offset_error). ArrayAccess containers see
             // any key type — offsetSet receives it raw.
-            if let Some(kv) = k {
-                if as_obj.is_none() {
+            if let Some(kv) = &k {
+                if as_obj.is_none() && !self.detached_dim {
                     self.check_offset_key(&kv.borrow())?;
                 }
             }
@@ -3237,14 +3445,19 @@ impl<'a> Interp<'a> {
                 c = cell(iv);
                 continue;
             }
-            match self.index_into_key(c.clone(), k.as_ref().map(|kc| kc.borrow().clone())) {
+            match self.index_into_key(c.clone(), k.clone()) {
                 Ok(nc) => {
                     if n == last {
                         self.touch_write(&nc);
                         // `$ref[k] = v` where the element cell is bound to
                         // a typed prop stays type-gated (064).
                         let nv = self.typed_slot_store(&nc, v.clone())?;
-                        *nc.borrow_mut() = nv;
+                        // Never panic on a re-entrant borrow — a live
+                        // upstream borrow (a handler's write reaching
+                        // this slot) drops the write invisibly (B1).
+                        if let Ok(mut nb) = nc.try_borrow_mut() {
+                            *nb = nv;
+                        }
                         return Ok(v);
                     }
                     c = nc;
@@ -3302,7 +3515,10 @@ impl<'a> Interp<'a> {
                             }
                         }
                         // String offset write (final level only).
-                        let mut b = c.borrow_mut();
+                        let mut b = match c.try_borrow_mut() {
+                            Ok(b) => b,
+                            Err(_) => return Ok(v),
+                        };
                         let mut bytes = match &*b {
                             Value::Str(s) => s.to_vec(),
                             _ => Vec::new(),
@@ -3340,7 +3556,10 @@ impl<'a> Interp<'a> {
                                 self.warn(
                                     "Only the first byte will be assigned to the string offset",
                                 )?;
-                                b = c.borrow_mut();
+                                b = match c.try_borrow_mut() {
+                                    Ok(b) => b,
+                                    Err(_) => return Ok(v),
+                                };
                             }
                             if let Value::Str(s) = &mut *b {
                                 *s = bytes.clone().into();
@@ -3448,10 +3667,10 @@ impl<'a> Interp<'a> {
     fn compound_dim_read(
         &mut self,
         mut c: Cell,
-        keys: &[Option<Cell>],
+        keys: &[DimArg],
         quiet: bool,
     ) -> Result<Value, PhpError> {
-        for (n, k) in keys.iter().enumerate() {
+        for (n, ka) in keys.iter().enumerate() {
             enum Step {
                 Cell(Cell),
                 Missing,
@@ -3466,6 +3685,11 @@ impl<'a> Interp<'a> {
                 self.auto_init_gate(&c)?;
                 *c.borrow_mut() = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
             }
+            let k: Option<Cell> = match ka {
+                DimArg::Append => None,
+                DimArg::Key(kc) => Some(kc.clone()),
+                DimArg::Cv(name) => Some(self.dim_var_key(name)?),
+            };
             let (step, key_v) = {
                 let b = c.borrow();
                 match &*b {
@@ -3477,8 +3701,14 @@ impl<'a> Interp<'a> {
                         {
                             (Step::Stop, None)
                         } else {
+                            let rc = rc.clone();
+                            // Conversion diagnostics dispatch the user
+                            // error handler — never hold c's borrow
+                            // across them: a handler writing this cell
+                            // would panic the re-borrow (B1).
+                            drop(b);
                             let key = match k.as_ref() {
-                                Some(kc) => Some(self.arr_key(&kc.borrow())?),
+                                Some(kc) => Some(self.dim_arr_key(kc)?),
                                 None => None,
                             };
                             match key {
@@ -3502,10 +3732,11 @@ impl<'a> Interp<'a> {
                             // illegal-offset TypeError — no read.
                             (Step::Stop, None)
                         } else {
+                            drop(b);
                             (
                                 Step::Missing,
                                 match k.as_ref() {
-                                    Some(kc) => Some(self.arr_key(&kc.borrow())?),
+                                    Some(kc) => Some(self.dim_arr_key(kc)?),
                                     None => None,
                                 }
                                 .filter(|k| !matches!(k, ArrKey::Tomb)),
@@ -3519,6 +3750,7 @@ impl<'a> Interp<'a> {
                         // gate then throws, or `??=`'s isset check sees
                         // the byte and skips the write (bug19943, p12j).
                         let s = s.clone();
+                        drop(b);
                         let kv = k.as_ref().map(|kc| kc.borrow().clone());
                         let (idx, junk) = match &kv {
                             Some(Value::Str(ks)) => match Self::str_off_key(ks) {
@@ -3562,6 +3794,7 @@ impl<'a> Interp<'a> {
                             .as_ref()
                             .map(|kc| kc.borrow().clone())
                             .unwrap_or(Value::Null);
+
                         if quiet {
                             // `??=` is isset()-based: offsetExists gates
                             // — a hit fetches via offsetGet, a miss is a
@@ -3774,55 +4007,71 @@ impl<'a> Interp<'a> {
         ak: Option<ArrKey>,
         v: Value,
     ) -> Result<(), PhpError> {
-        let mut b = arr_cell.borrow_mut();
-        match &mut *b {
-            Value::Null => {
-                let mut arr = PhpArray::new();
-                match ak {
-                    Some(ak) => arr.set(ak, v),
-                    None => match key {
-                        Some(k) => arr.set(self.arr_key(&k)?, v),
+        // Null/Array slots: convert the key BEFORE taking the write
+        // borrow — the conversion's diagnostics dispatch the user
+        // handler and a handler re-entering this slot could not
+        // re-borrow it (B1).
+        if matches!(&*arr_cell.borrow(), Value::Null | Value::Array(_)) {
+            let ak: Option<ArrKey> = match ak {
+                Some(ak) => Some(ak),
+                None => match &key {
+                    Some(k) => Some(self.arr_key(k)?),
+                    None => None,
+                },
+            };
+            let mut b = match arr_cell.try_borrow_mut() {
+                Ok(b) => b,
+                // A live upstream borrow (a handler's nested write
+                // reached this slot) drops the write invisibly — never
+                // panic on a re-entrant borrow.
+                Err(_) => return Ok(()),
+            };
+            match &mut *b {
+                Value::Null => {
+                    let mut arr = PhpArray::new();
+                    match ak {
+                        Some(ak) => arr.set(ak, v),
                         None => arr.push(v),
-                    },
+                    }
+                    *b = Value::Array(Rc::new(RefCell::new(arr)));
                 }
-                *b = Value::Array(Rc::new(RefCell::new(arr)));
-            }
-            Value::Array(_) => {
-                // CoW: shared arrays get replaced wholesale by callers
-                // through the cell, so mutate in place via borrow_mut —
-                // PHP semantics: write through to all aliases... PHP
-                // separates unreferenced copies; our Rc aliases share.
-                // For `$a = $b; $a[0]=1` PHP copies. Handle via split.
-                self.cow_split(&mut b);
-                let rc = match &*b {
-                    Value::Array(rc) => rc.clone(),
-                    _ => unreachable!(),
-                };
-                // Drop the container borrow before mutating: an
-                // element cell can alias this very cell
-                // ($a = [&$a]) and the write-through needs it
-                // unborrowed.
-                drop(b);
-                let ak = match ak {
-                    Some(ak) => Some(ak),
-                    None => match &key {
-                        Some(k) => Some(self.arr_key(k)?),
-                        None => None,
-                    },
-                };
-                if self.in_handler {
-                    if let Some(ak) = &ak {
-                        if let Some(ec) = rc.borrow().get_cell(ak) {
-                            self.touch_write(&ec);
+                Value::Array(_) => {
+                    // CoW: shared arrays get replaced wholesale by
+                    // callers through the cell, so mutate in place via
+                    // borrow_mut — PHP separates unreferenced copies;
+                    // our Rc aliases share.
+                    self.cow_split(&mut b);
+                    let rc = match &*b {
+                        Value::Array(rc) => rc.clone(),
+                        _ => unreachable!(),
+                    };
+                    // Drop the container borrow before mutating: an
+                    // element cell can alias this very cell
+                    // ($a = [&$a]) and the write-through needs it
+                    // unborrowed.
+                    drop(b);
+                    if self.in_handler {
+                        if let Some(ak) = &ak {
+                            if let Some(ec) = rc.borrow().get_cell(ak) {
+                                self.touch_write(&ec);
+                            }
                         }
                     }
+                    let mut arr = rc.borrow_mut();
+                    match ak {
+                        Some(ak) => arr.set(ak, v),
+                        None => arr.push(v),
+                    }
                 }
-                let mut arr = rc.borrow_mut();
-                match ak {
-                    Some(ak) => arr.set(ak, v),
-                    None => arr.push(v),
-                }
+                _ => {}
             }
+            return Ok(());
+        }
+        let mut b = match arr_cell.try_borrow_mut() {
+            Ok(b) => b,
+            Err(_) => return Ok(()),
+        };
+        match &mut *b {
             Value::Str(s) => {
                 let mut bytes = s.to_vec();
                 match key {
@@ -3907,7 +4156,9 @@ impl<'a> Interp<'a> {
             Expr::Index { .. } | Expr::Prop { .. } | Expr::StaticProp { .. } | Expr::VarVar(..) => {
                 match self.index_cell_key(e, key.clone()) {
                     Ok(c) => {
-                        *c.borrow_mut() = v;
+                        if let Ok(mut cb) = c.try_borrow_mut() {
+                            *cb = v;
+                        }
                         Ok(())
                     }
                     // String offsets can't be cells — splice the byte in place.
@@ -4045,19 +4296,28 @@ impl<'a> Interp<'a> {
     }
 
     /// Index into `c`'s array value, taking a cell for `key`/`[]`.
-    fn index_into_key(&mut self, c: Cell, key: Option<Value>) -> Result<Cell, PhpError> {
-        if let Some(k) = &key {
+    fn index_into_key(&mut self, c: Cell, key: Option<Cell>) -> Result<Cell, PhpError> {
+        if let Some(kc) = &key {
             // Objects route to index_cell_object (ArrayAccess accepts
             // any key); only true arrays reject object keys.
-            if !matches!(&*c.borrow(), Value::Object(_)) {
-                self.check_offset_key(k)?;
+            if !matches!(&*c.borrow(), Value::Object(_)) && !self.detached_dim {
+                self.check_offset_key(&kc.borrow())?;
             }
         }
-        let mut b = c.borrow_mut();
+        let mut b = match c.try_borrow_mut() {
+            Ok(b) => b,
+            // A live upstream borrow (a handler's nested write reached
+            // this cell mid-read) never panics — the pending write
+            // lands on a dead scratch cell instead (B1).
+            Err(_) => return Ok(cell(Value::Null)),
+        };
         if matches!(*b, Value::Null) {
             *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
         }
         if let Value::Array(_) = &mut *b {
+            // A handler's dim write through this slot detaches outer
+            // pending writes bound to the same cell.
+            self.touch_write(&c);
             // Deliberately-shared arrays ($GLOBALS, &-bound storage)
             // keep their bound cells through the split (ref_cells);
             // an ordinary shared zend_array still separates on write
@@ -4069,7 +4329,7 @@ impl<'a> Interp<'a> {
             };
             drop(b);
             let key = match key {
-                Some(k) => self.arr_key(&k)?,
+                Some(kc) => self.dim_arr_key(&kc)?,
                 None => {
                     let mut arr = rc.borrow_mut();
                     let k = ArrKey::Int(arr.next);
@@ -4097,6 +4357,7 @@ impl<'a> Interp<'a> {
             // offsets stay a marker error for the byte-write path, but
             // under a by-ref fetch (`=&`, `&offsetGet`) split into
             // append / str-key / int-key (probe4 vs oracle).
+            let key = key.as_ref().map(|kc| kc.borrow().clone());
             match &*c.borrow() {
                 Value::Str(_) if self.dim_by_ref => {
                     let (class, msg) = match &key {
@@ -4153,7 +4414,7 @@ impl<'a> Interp<'a> {
     /// by-ref, so `&offsetGet` hands back the storage cell through
     /// last_ret_cell. A value-returning offsetGet yields a throwaway
     /// cell — plain `=` writes route through offsetSet elsewhere.
-    fn index_cell_object(&mut self, c: &Cell, key: Option<Value>) -> Result<Cell, PhpError> {
+    fn index_cell_object(&mut self, c: &Cell, key: Option<Cell>) -> Result<Cell, PhpError> {
         let Value::Object(o) = c.borrow().clone() else {
             unreachable!()
         };
@@ -4177,7 +4438,7 @@ impl<'a> Interp<'a> {
         let rv = self.method_invoke(
             o,
             "offsetGet",
-            CallArgs::positional(vec![cell(key.unwrap_or(Value::Null))]),
+            CallArgs::positional(vec![key.unwrap_or_else(|| cell(Value::Null))]),
         );
         self.dim_by_ref = was;
         match self.last_ret_cell.take() {
@@ -4199,6 +4460,7 @@ impl<'a> Interp<'a> {
 
     /// `index_cell` with an already-evaluated key.
     fn index_cell_key(&mut self, e: &Expr, key: Option<Value>) -> Result<Cell, PhpError> {
+        let key = key.map(cell);
         match e {
             Expr::Var(name) => {
                 let c = self.var_cell(name);
@@ -4229,7 +4491,7 @@ impl<'a> Interp<'a> {
             _ => {
                 // e.g. function call result index — read-only path.
                 let v = match key {
-                    Some(k) => self.index_read_val(e, Some(k))?,
+                    Some(k) => self.index_read_val(e, Some(k.borrow().clone()))?,
                     None => self.index_read(e, None)?,
                 };
                 Ok(cell(v))
@@ -4597,7 +4859,7 @@ impl<'a> Interp<'a> {
                         }
                     }
                 } else if self.obj_is_a(&o, "ArrayAccess") {
-                    let cc = self.index_cell_object(c, Some(key))?;
+                    let cc = self.index_cell_object(c, Some(cell(key)))?;
                     // Non-lvalue offsetGet: zend notices the indirect
                     // modification is lost, then keeps descending into
                     // the temporary (later dims may still throw).

@@ -715,7 +715,14 @@ impl<'a> Interp<'a> {
                         e.trace = Some(self.compile_err_frames());
                         return self.err_flow(e);
                     }
-                    match self.eval_const(e) {
+                    // A `const X = <expr>` initializer is zend's
+                    // constant expression — Errors raised inside it
+                    // get the `[constant expression]()` pseudo-frame
+                    // and eval'd-code caller attribution (probe m9).
+                    self.class_const_ctx += 1;
+                    let v = self.eval_const(e);
+                    self.class_const_ctx -= 1;
+                    match v {
                         Ok(v) => self.define_const(n, v),
                         Err(e) => return self.err_flow(e),
                     }

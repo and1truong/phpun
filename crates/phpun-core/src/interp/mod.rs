@@ -402,6 +402,11 @@ pub struct Interp<'a> {
     /// The current dim write is detached (see `handler_writes`) —
     /// offset-key conversions stay silent.
     detached_dim: bool,
+    /// Dim-key conversions already emitted for this assign op — zend
+    /// casts each dim operand once: the compound read, the write gate
+    /// and the write itself reuse it without re-warning (`.=`/`|=`
+    /// probe: oracle prints the null-offset deprecation exactly once).
+    dim_key_conv: std::collections::HashMap<usize, ArrKey>,
     /// Current line estimate for error messages (best-effort).
     pub cur_line: usize,
     /// Active generator body's yield collector — `Expr::Yield` pushes
@@ -925,6 +930,7 @@ impl<'a> Interp<'a> {
             handler_writes: std::collections::HashMap::new(),
             handler_reads: std::collections::HashMap::new(),
             detached_dim: false,
+            dim_key_conv: std::collections::HashMap::new(),
             cur_line: 1,
             gen_sink: None,
             pending_gen_captures: Vec::new(),
@@ -2143,6 +2149,7 @@ impl<'a> Interp<'a> {
         self.handler_writes.clear();
         self.handler_reads.clear();
         self.detached_dim = false;
+        self.dim_key_conv.clear();
         self.pending_exception = None;
         self.call_trace.clear();
         self.deadline = None;
@@ -3123,31 +3130,34 @@ impl<'a> Interp<'a> {
         self.last_err_file = self.diag_file();
         if let ErrorKind::Uncaught { class } = e.kind {
             // Errors raised mid-const-expr get a pseudo-frame for the
-            // constant expression itself (property_initializer_scope_002:
+            // constant expression itself, innermost on the real stack
+            // (property_initializer_scope_002:
             // `#0 %s(%d): [constant expression]()`).
-            let e = if self.class_const_ctx > 0 {
-                let fr = format!(
-                    "{}({}): [constant expression]()",
-                    self.diag_file(),
-                    self.cur_line
-                );
-                let mut frames = e.trace.clone().unwrap_or_default();
-                frames.insert(0, fr);
-                PhpError {
-                    trace: Some(frames),
-                    ..e
-                }
-            } else {
-                e
-            };
+            let const_frame = self.class_const_ctx > 0;
+            if const_frame {
+                self.call_trace.push(TraceFrame {
+                    function: "[constant expression]".to_string(),
+                    class: None,
+                    ty: String::new(),
+                    file: self.diag_file(),
+                    line: self.cur_line as u32,
+                    args: Vec::new(),
+                    named_args: Vec::new(),
+                    internal: true,
+                });
+            }
             // Internal errors raised as exceptions become real throwables so
             // userland `catch` blocks can intercept them.
             let v = self.exception(class, &e.message);
+            if const_frame {
+                self.call_trace.pop();
+            }
             if let Value::Object(o) = &v {
                 if let Some(ObjectInternal::Exception {
+                    file,
+                    line,
                     trace,
                     thrown,
-                    line,
                     full_msg,
                     ..
                 }) = &mut o.borrow_mut().internal
@@ -3166,6 +3176,21 @@ impl<'a> Interp<'a> {
                     }
                     if let Some(m) = &e.display_msg {
                         *full_msg = m.clone();
+                    }
+                    // A const-expr Error inside eval'd code attributes
+                    // to the CALLER file + the eval string's own line —
+                    // the `FILE(N) : eval()'d code` composite only
+                    // shows in trace frames (probe m9).
+                    if self.class_const_ctx > 0 && self.cur_file.contains("eval()'d code") {
+                        let caller = self
+                            .cur_file
+                            .strip_suffix(" : eval()'d code")
+                            .and_then(|s| s.rsplit_once('('))
+                            .map(|(f, _)| f.to_string())
+                            .unwrap_or_else(|| self.cur_file.clone());
+                        *file = caller;
+                        *line = self.cur_line as u32;
+                        *thrown = self.cur_line as u32;
                     }
                 }
             }
