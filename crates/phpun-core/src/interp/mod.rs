@@ -472,6 +472,12 @@ pub struct Interp<'a> {
     /// Live object handles for PHP's var_dump `#N` id: the lowest freed
     /// slot is reused, matching Zend's object store recycling.
     obj_handles: Vec<ObjHandle>,
+    /// Birth order stamp per handle slot (parallel to `obj_handles`):
+    /// the shutdown destruct sweep visits objects in creation order
+    /// like Zend — a recycled low slot must not let a newborn object
+    /// jump ahead of older live ones (bug74053).
+    obj_born: Vec<u64>,
+    spawn_seq: u64,
     /// Per-callsite unqualified fn resolution cache — Zend resolves
     /// `ns\f -> f` once per call site (constexpr/namespace_004).
     fcc_fn_cache: HashMap<(String, String, String), Option<String>>,
@@ -1068,6 +1074,8 @@ impl<'a> Interp<'a> {
             engine_consts,
             autoload_fns: Vec::new(),
             obj_handles: Vec::new(),
+            obj_born: Vec::new(),
+            spawn_seq: 0,
             fcc_fn_cache: HashMap::new(),
             destructed: HashMap::new(),
             destructed_prune: 1024,
@@ -1776,6 +1784,53 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Live objects in the store (strong pins) — used to catch drops
+    /// inside a shutdown-time dtor.
+    fn live_obj_pins(&self) -> Vec<Rc<RefCell<PhpObject>>> {
+        self.obj_handles
+            .iter()
+            .filter_map(|h| match h {
+                ObjHandle::Obj(w) => w.upgrade(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Invoke a shutdown-time `__destruct`, then fire the dtors of
+    /// objects whose last real ref was dropped inside it. Zend decrefs
+    /// a zval's contents the moment it is overwritten — `self::$b =
+    /// new b` inside a dtor runs the old object's __destruct
+    /// immediately, at any depth (bug74053). Pinning the store around
+    /// the call keeps such drops reclaimable (a dead Weak could never
+    /// be destructed); the drain recurses since a dropped object's own
+    /// dtor can drop further objects.
+    fn shutdown_dtor_invoke(&mut self, o: Rc<RefCell<PhpObject>>) -> Result<(), PhpError> {
+        let mut pins = self.live_obj_pins();
+        // Drops fire oldest-first — same creation order as the sweep.
+        pins.sort_by_key(|p| {
+            self.obj_born
+                .get(p.borrow().id.saturating_sub(1) as usize)
+                .copied()
+                .unwrap_or(0)
+        });
+        self.method_invoke(o, "__destruct", CallArgs::empty())?;
+        for p in pins {
+            // count==1: only `pins` still holds it — every real ref
+            // died during the dtor that just ran.
+            if Rc::strong_count(&p) != 1
+                || self.was_destructed(Rc::as_ptr(&p) as usize)
+                || self
+                    .find_method_in(&p.borrow().class, "__destruct")
+                    .is_none()
+                || !self.mark_destructed(&p)
+            {
+                continue;
+            }
+            self.shutdown_dtor_invoke(p)?;
+        }
+        Ok(())
+    }
+
     /// Run registered shutdown functions then the deferred __destruct
     /// sweep. A shutdown function that exits or dies stops the rest,
     /// but destructors still run (Zend); the produced exit code —
@@ -1857,7 +1912,7 @@ impl<'a> Interp<'a> {
                 .is_some()
                 && self.mark_destructed(&o)
             {
-                if let Err(e) = self.method_invoke(o.clone(), "__destruct", CallArgs::empty()) {
+                if let Err(e) = self.shutdown_dtor_invoke(o.clone()) {
                     shutdown_code = Some(match self.err_flow(e) {
                         Flow::Exit(c) => c,
                         Flow::Throw(v) => {
@@ -1893,18 +1948,28 @@ impl<'a> Interp<'a> {
         // (bug51822/bug74053).
         if !dtor_stop {
             'sweep: loop {
+                // Zend destructs objects in creation order; handle
+                // slots recycle mid-dtor, so slot order must not
+                // decide which spawned object runs next (bug74053).
+                let mut todo: Vec<(u64, Rc<RefCell<PhpObject>>)> = self
+                    .obj_handles
+                    .iter()
+                    .filter_map(|h| match h {
+                        ObjHandle::Obj(w) => w.upgrade(),
+                        _ => None,
+                    })
+                    .map(|o| {
+                        let born = self
+                            .obj_born
+                            .get(o.borrow().id.saturating_sub(1) as usize)
+                            .copied()
+                            .unwrap_or(0);
+                        (born, o)
+                    })
+                    .collect();
+                todo.sort_by_key(|(b, _)| *b);
                 let mut progressed = false;
-                let mut i = 0;
-                while i < self.obj_handles.len() {
-                    let w = match &self.obj_handles[i] {
-                        ObjHandle::Obj(w) => w.clone(),
-                        _ => {
-                            i += 1;
-                            continue;
-                        }
-                    };
-                    i += 1;
-                    let Some(o) = w.upgrade() else { continue };
+                for (_, o) in todo {
                     let key = Rc::as_ptr(&o) as usize;
                     if self.was_destructed(key) {
                         continue;
@@ -1915,9 +1980,7 @@ impl<'a> Interp<'a> {
                     {
                         self.mark_destructed(&o);
                         progressed = true;
-                        if let Err(e) =
-                            self.method_invoke(o.clone(), "__destruct", CallArgs::empty())
-                        {
+                        if let Err(e) = self.shutdown_dtor_invoke(o.clone()) {
                             shutdown_code = Some(match self.err_flow(e) {
                                 Flow::Exit(c) => c,
                                 Flow::Throw(v) => {
@@ -2318,6 +2381,7 @@ impl<'a> Interp<'a> {
     /// phase so per-request shutdown only sweeps request objects.
     pub fn seal_boot_objects(&mut self) {
         self.obj_handles.clear();
+        self.obj_born.clear();
     }
 
     /// Worker-mode request end: registered shutdown functions and
