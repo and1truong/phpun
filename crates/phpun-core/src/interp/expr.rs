@@ -2590,9 +2590,11 @@ impl<'a> Interp<'a> {
                 Ok(nc) => {
                     if n == last {
                         // `$ref[k] = v` where the element cell is bound to
-                        // a typed prop stays type-gated (064).
+                        // a typed prop stays type-gated (064). The store
+                        // goes through cell_store so the displaced zval's
+                        // destructor runs (a shared cell can alias vars).
                         let nv = self.typed_slot_store(&nc, v.clone())?;
-                        *nc.borrow_mut() = nv;
+                        self.cell_store(&nc, nv)?;
                         return Ok(v);
                     }
                     c = nc;
