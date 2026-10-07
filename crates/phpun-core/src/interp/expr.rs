@@ -250,8 +250,14 @@ impl<'a> Interp<'a> {
                         // a live emit would echo inner output before
                         // the consumer reached it (yield-from order).
                         let saved_cbase = self.gen_collect_base.replace(base);
+                        let saved_seen = std::mem::take(&mut self.gen_collect_seen);
+                        let saved_crun = self
+                            .gen_collect_run
+                            .replace(self.gen_run_state.clone().unwrap());
                         let (items, death) = self.yield_from_collect(&v);
                         self.gen_collect_base = saved_cbase;
+                        self.gen_collect_seen = saved_seen;
+                        self.gen_collect_run = saved_crun;
                         self.iter_calls -= 1;
                         let inner_len = items.len();
                         // Record the delegation window: consumer
@@ -271,7 +277,14 @@ impl<'a> Interp<'a> {
                                         r.fin_q
                                             .borrow_mut()
                                             .delegate_fins
-                                            .push(ist.borrow().fin_q.clone());
+                                            .push((base, ist.borrow().fin_q.clone()));
+                                        // The eager drain above drove
+                                        // the delegate's own cursor to
+                                        // its production count — the
+                                        // consumer-facing position is
+                                        // zero until the outer's
+                                        // cursor reaches `base`.
+                                        ist.borrow().fin_q.borrow_mut().set_vis_tree(0);
                                     }
                                     ist.borrow().return_val.clone()
                                 }

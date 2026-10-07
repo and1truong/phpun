@@ -1324,7 +1324,7 @@ impl<'a> Interp<'a> {
                             fin.yields.clear();
                             fin.delegates.clear();
                             fin.fin_err = None;
-                            for d in fin.delegate_fins.drain(..) {
+                            for (_, d) in fin.delegate_fins.drain(..) {
                                 // The re-run displaces this
                                 // delegate's incarnation — its eager
                                 // tail never ran.
@@ -1429,7 +1429,7 @@ impl<'a> Interp<'a> {
                         fin.yields.clear();
                         fin.delegates.clear();
                         fin.fin_err = None;
-                        for d in fin.delegate_fins.drain(..) {
+                        for (_, d) in fin.delegate_fins.drain(..) {
                             // The re-run displaces this delegate's
                             // incarnation — its eager tail never ran.
                             d.borrow_mut().kill_tree();
@@ -1652,6 +1652,7 @@ impl<'a> Interp<'a> {
                         }
                         .unwrap_or_else(|| cell(val));
                         out.push((k, c));
+                        self.gen_collect_seen += 1;
                         // A consumer injection queued for this splice
                         // index delivers to the delegate's suspended
                         // yield — Zend's chain is live: send()/throw()

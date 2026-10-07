@@ -20,7 +20,7 @@ impl<'a> Interp<'a> {
         self.ob_stack.extend(sus.into_iter().filter(|l| {
             l.gen_close.is_none()
                 && l.gen_open
-                    .is_some_and(|o| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos >= o))
+                    .is_some_and(|o| l.gen_q.as_ref().is_some_and(|q| q.borrow().vis_pos >= o))
         }));
         while !self.ob_stack.is_empty() {
             // A killed gen's window: journaled tail bytes that merged
@@ -32,7 +32,7 @@ impl<'a> Interp<'a> {
                     .as_ref()
                     .map(|q| {
                         let f = q.borrow();
-                        (f.pos, f.killed, f.finished && f.pos >= f.total)
+                        (f.vis_pos, f.killed, f.finished && f.vis_pos >= f.total)
                     })
                     .unwrap_or((usize::MAX, false, true));
                 let dead = (

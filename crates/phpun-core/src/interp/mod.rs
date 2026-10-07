@@ -512,6 +512,15 @@ pub struct Interp<'a> {
     /// queue at `base + inner_tag` — a live emit would echo inner
     /// output before the consumer reached it.
     gen_collect_base: Option<usize>,
+    /// Items the in-flight `yield from` collection has produced so
+    /// far — a plain delegate's side-effect output (its next()
+    /// echoing, etc.) journals at `base + seen - 1`, matching Zend
+    /// driving the delegate's next() lazily on each resume.
+    gen_collect_seen: usize,
+    /// The gen whose `yield from` collection is in flight — the
+    /// seen count belongs to that gen's sink; a delegate's own run
+    /// must not fold it into its `done`.
+    gen_collect_run: Option<Rc<RefCell<crate::value::GenState>>>,
     /// The running gen's fin_q (mirrors its GenState.fin_q; a stack-
     /// style save/restore like gen_sink).
     gen_fin_q: Option<crate::value::FinQueue>,
@@ -1281,6 +1290,8 @@ impl<'a> Interp<'a> {
             gen_replay_horizon: None,
             gen_yield_from_fin: None,
             gen_collect_base: None,
+            gen_collect_seen: 0,
+            gen_collect_run: None,
             gen_fin_q: None,
             live_gens: Vec::new(),
             pending_decl_class: None,
@@ -2992,16 +3003,26 @@ impl<'a> Interp<'a> {
                 .gen_sink
                 .as_ref()
                 .map(|s| s.borrow().len())
-                .unwrap_or(0);
-            // send()/throw() re-runs replay the pre-first-yield prefix
-            // the consumer already echoed — silence only that live
-            // echo. Post-yield writes must still journal: the journal
-            // is what materializes them at the confirmed cursor, and
-            // the restart already dropped the stale run's entries.
+                .unwrap_or(0)
+                + if self
+                    .gen_collect_run
+                    .as_ref()
+                    .zip(self.gen_run_state.as_ref())
+                    .is_some_and(|(a, b)| Rc::ptr_eq(a, b))
+                {
+                    self.gen_collect_seen
+                } else {
+                    0
+                };
+            // send()/throw() re-runs replay the prefix the consumer
+            // already echoed — suppress live echo AND re-journal for
+            // the covered span: the prior run journaled (and mostly
+            // emitted) those bytes, and the restart dropped only the
+            // stale run's un-emitted tail.
+            if self.gen_horizon_suppresses(done) {
+                return;
+            }
             if done == 0 {
-                if self.gen_horizon_suppresses(done) {
-                    return;
-                }
                 // A delegate re-collected under an outer's replay
                 // horizon: its pre-first-yield bytes were already
                 // echoed by the run the consumer saw.
@@ -3078,7 +3099,7 @@ impl<'a> Interp<'a> {
             if l.gen_q.is_some() {
                 // A gen window's journaled captures splice by tag like
                 // consumer writes — keep the bookkeeping in step.
-                let pos = l.gen_q.as_ref().map(|q| q.borrow().pos).unwrap_or(0);
+                let pos = l.gen_q.as_ref().map(|q| q.borrow().vis_pos).unwrap_or(0);
                 l.caps.push((pos, b.to_vec()));
                 l.cap_segs.push((pos, l.buf.len(), b.len()));
             }
@@ -3103,7 +3124,7 @@ impl<'a> Interp<'a> {
                 // A gen-owned level (live window or pop mirror):
                 // tag the write by the cursor it arrived at — kill
                 // teardown and mirror-close splices need it.
-                let pos = buf.gen_q.as_ref().map(|q| q.borrow().pos).unwrap_or(0);
+                let pos = buf.gen_q.as_ref().map(|q| q.borrow().vis_pos).unwrap_or(0);
                 buf.caps.push((pos, b.to_vec()));
                 buf.cap_segs.push((pos, buf.buf.len(), b.len()));
             }
@@ -3190,7 +3211,7 @@ impl<'a> Interp<'a> {
                 self.ob_stack[i]
                     .gen_q
                     .as_ref()
-                    .is_some_and(|q| q.borrow().pos >= c)
+                    .is_some_and(|q| q.borrow().vis_pos >= c)
             });
             if stale {
                 let l = self.ob_stack.remove(i);
@@ -3208,7 +3229,7 @@ impl<'a> Interp<'a> {
                 self.suspended_obs[i]
                     .gen_q
                     .as_ref()
-                    .is_some_and(|q| q.borrow().pos >= c)
+                    .is_some_and(|q| q.borrow().vis_pos >= c)
             });
             if dead {
                 let l = self.suspended_obs.remove(i);
@@ -3222,9 +3243,9 @@ impl<'a> Interp<'a> {
             let l = &self.suspended_obs[i];
             let ready = l
                 .gen_open
-                .is_some_and(|t| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos >= t))
+                .is_some_and(|t| l.gen_q.as_ref().is_some_and(|q| q.borrow().vis_pos >= t))
                 && l.gen_close
-                    .is_none_or(|c| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos < c))
+                    .is_none_or(|c| l.gen_q.as_ref().is_some_and(|q| q.borrow().vis_pos < c))
                 // Pop mirrors are consumer-side bookkeeping, not real
                 // stack levels — during the body's own run they stay
                 // parked so a body pop reaches the level it pushed.
@@ -3554,7 +3575,7 @@ impl<'a> Interp<'a> {
                 // a mid-consumption gen's post-yield tails still wait
                 // on resume confirmation. Delegate snapshots freeze
                 // at pos=0 so this stays false for them.
-                (f.pos, f.finished && f.pos >= f.total, f.killed)
+                (f.vis_pos, f.finished && f.vis_pos >= f.total, f.killed)
             })
             .unwrap_or((usize::MAX, true, false));
         // An orphaned journal (owning state displaced/freed) whose
@@ -3575,7 +3596,7 @@ impl<'a> Interp<'a> {
         let take = level
             .gen_pending
             .iter()
-            .take_while(|(t, _)| all || (fin && !killed) || *t + 1 < pos)
+            .take_while(|(t, _)| all || (fin && !killed) || *t < pos)
             .count();
 
         for (t, b) in level.gen_pending.drain(..take) {
@@ -3607,9 +3628,9 @@ impl<'a> Interp<'a> {
             .iter()
             .filter(|l| {
                 l.gen_open
-                    .is_some_and(|t| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos > t))
+                    .is_some_and(|t| l.gen_q.as_ref().is_some_and(|q| q.borrow().vis_pos > t))
                     && l.gen_close
-                        .is_none_or(|c| l.gen_q.as_ref().is_some_and(|q| q.borrow().pos <= c))
+                        .is_none_or(|c| l.gen_q.as_ref().is_some_and(|q| q.borrow().vis_pos <= c))
             })
             .count()
     }
@@ -4153,6 +4174,7 @@ impl<'a> Interp<'a> {
         {
             let mut f = q.borrow_mut();
             f.pos = fin.pos;
+            f.vis_pos = fin.vis_pos;
             f.total = fin.total;
             f.finished = fin.finished;
             f.killed = fin.killed;
