@@ -2246,8 +2246,7 @@ impl<'a> Parser<'a> {
                         // arglist's FIRST-arg line like a dynamic call.
                         // Frameless icalls still specialize (they carry
                         // the ns delay inside the op) at the name line.
-                        let delayed_ns =
-                            resolved.starts_with('\u{1}') && !self.cur_ns.is_empty();
+                        let delayed_ns = resolved.starts_with('\u{1}') && !self.cur_ns.is_empty();
                         // Frameless builtins fuse every bare-CV arg's
                         // read into the call op at the name's line;
                         // dedicated ops (array_key_exists, const-fmt

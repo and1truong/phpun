@@ -1910,9 +1910,7 @@ impl<'a> Interp<'a> {
     ) -> Option<usize> {
         match self.cond_fold(e) {
             CondFold::Folded(_) => Some(subj_site),
-            CondFold::Literal(le, _) => {
-                Self::marked_line(le).or_else(|| Self::inner_end_line(le))
-            }
+            CondFold::Literal(le, _) => Self::marked_line(le).or_else(|| Self::inner_end_line(le)),
             CondFold::Unfolded(inner) => match Self::unmark_rhs(inner) {
                 Expr::Binary { r, .. } => self.unfold_tail_site(r, subj_site),
                 Expr::Ternary { f, .. } => self.unfold_tail_site(f, subj_site),
@@ -1961,9 +1959,7 @@ impl<'a> Interp<'a> {
                             .and_then(|k| self.unfold_tail_site(k, subj_site))
                     }),
                 Expr::Prop { name, site, .. } => match name {
-                    PropName::Expr(i) => {
-                        self.unfold_tail_site(i, subj_site).or(Some(*site))
-                    }
+                    PropName::Expr(i) => self.unfold_tail_site(i, subj_site).or(Some(*site)),
                     _ => Some(*site),
                 },
                 _ => Self::marked_line(e)

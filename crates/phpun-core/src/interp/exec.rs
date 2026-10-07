@@ -326,9 +326,8 @@ impl<'a> Interp<'a> {
                                     self.scan_stamp = Some(subj_site);
                                 }
                                 let pair = if cv.is_none() && Self::is_cv(cu) {
-                                    self.eval_cv_at(cond_u, cl).and_then(|cvv| {
-                                        self.eval(operand).map(|v| (v, cvv))
-                                    })
+                                    self.eval_cv_at(cond_u, cl)
+                                        .and_then(|cvv| self.eval(operand).map(|v| (v, cvv)))
                                 } else {
                                     self.eval(operand).and_then(|v| {
                                         let cvv = match &cv {
