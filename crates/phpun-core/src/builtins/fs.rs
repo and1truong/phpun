@@ -6431,16 +6431,24 @@ fn run_filter_chain(
     inc: bool,
     seek: &mut Option<FillSeek<'_>>,
 ) -> Result<(Vec<u8>, i64), PhpError> {
-    let n = it.stream_filters.get(&sid).map(|v| v.len()).unwrap_or(0);
     let mut data = raw;
-    for i in 0..n {
-        let applies = it
-            .stream_filters
-            .get(&sid)
-            .and_then(|v| v.get(i))
-            .map(|f| if read_dir { f.read } else { f.write })
-            .unwrap_or(false);
+    // zend walks the LIVE chain (php_stream_filter_flush iterates
+    // current->next): a user filter's filter() callback that attaches
+    // another filter mid-pass has the appended entry drain the
+    // remaining buckets, while a prepended one lands behind the
+    // cursor and is never visited. Relocate our cursor by filter id
+    // after each call so inserts/removes stay ordered like the
+    // linked list — a removed entry continues at whatever shifted
+    // into its slot.
+    let mut i = 0usize;
+    while let Some((fid, applies)) = it
+        .stream_filters
+        .get(&sid)
+        .and_then(|v| v.get(i))
+        .map(|f| (f.fid, if read_dir { f.read } else { f.write }))
+    {
         if !applies {
+            i += 1;
             continue;
         }
         let (out, status) = filter_apply_one(it, sid, i, stream_val, data, closing, inc, seek)?;
@@ -6448,6 +6456,15 @@ fn run_filter_chain(
             return Ok((Vec::new(), status));
         }
         data = out;
+        i = it
+            .stream_filters
+            .get(&sid)
+            .and_then(|v| {
+                v.iter()
+                    .position(|f| f.fid == fid && (if read_dir { f.read } else { f.write }))
+            })
+            .map(|p| p + 1)
+            .unwrap_or(i);
     }
     Ok((data, 2))
 }
