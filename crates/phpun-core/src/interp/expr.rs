@@ -4482,14 +4482,18 @@ impl<'a> Interp<'a> {
     /// cell — static rebinds (082), unsets, or a dead object (094).
     fn slot_anchor_alive(&self, ptr: usize, anc: &SlotAnchor) -> bool {
         match anc {
+            // A destructed object is pinned in `self.destructed` — its
+            // prop table still holds the cell but no longer anchors it
+            // (tp094's post-unset write must not gate).
             SlotAnchor::Obj(w, key) => w
                 .upgrade()
                 .map(|o| {
-                    o.borrow()
-                        .props
-                        .get(key)
-                        .map(|c| Rc::as_ptr(c) as usize == ptr)
-                        .unwrap_or(false)
+                    !self.destructed.contains_key(&(Rc::as_ptr(&o) as usize))
+                        && o.borrow()
+                            .props
+                            .get(key)
+                            .map(|c| Rc::as_ptr(c) as usize == ptr)
+                            .unwrap_or(false)
                 })
                 .unwrap_or(false),
             SlotAnchor::Statics(cn, pn) => self

@@ -1974,6 +1974,10 @@ impl<'a> Interp<'a> {
         // Callee `Stmt::Line` markers must not leak into the caller:
         // diagnostics after the call report the call-site line.
         let saved_line = self.cur_line;
+        // prop_cell's `=&`-source stash pins the receiver object — a
+        // callee's leftover must not keep that object alive after the
+        // call returns (typed_properties_094).
+        let saved_prop_ov = self.last_prop_ov.take();
         let fr = self.call_site_frame(decl, &args);
         self.call_trace.push(fr);
         self.last_call_by_ref = decl.by_ref;
@@ -1988,14 +1992,17 @@ impl<'a> Interp<'a> {
         // __destruct now (bug52361). A dtor error on a clean return
         // replaces the result and aborts; during unwind it chains —
         // destruct_frame_objs guards that itself.
-        if let Some(f) = self.last_popped_frame.take() {
+        let out = if let Some(f) = self.last_popped_frame.take() {
             let dtor_err = self.destruct_frame_objs(&f).err();
             match (r, dtor_err) {
-                (Ok(_), Some(e)) => return Err(e),
-                (r, _) => return r,
+                (Ok(_), Some(e)) => Err(e),
+                (r, _) => r,
             }
-        }
-        r
+        } else {
+            r
+        };
+        self.last_prop_ov = saved_prop_ov;
+        out
     }
 
     /// The callee's call-trace frame for a call about to be dispatched —
@@ -3534,6 +3541,11 @@ impl<'a> Interp<'a> {
                     vec!["Traversable".to_string(), "array".to_string()]
                 } else if let Some(pos) = m.find("@anonymous$") {
                     vec![format!("{}@anonymous", &m[..pos])]
+                } else if let Some(pos) = m.find('\0') {
+                    // `{base}@anonymous\0FILE:LINE$N` — the internal
+                    // decl-site suffix never leaks into TypeErrors
+                    // (union_types/anonymous_class).
+                    vec![m[..pos].to_string()]
                 } else if m.contains('&') && ty.len() > 1 {
                     // Intersection members parenthesize inside a union
                     // ((X&Y)|(W&Z) — dnf_2_intersection).

@@ -1859,6 +1859,7 @@ impl<'a> Interp<'a> {
         }
         for (_, (n, o)) in held {
             // `o` contributes one ref from `held` itself; `v` holds n.
+
             if Rc::strong_count(&o) != n + 1 {
                 continue;
             }
