@@ -493,22 +493,51 @@ impl<'a> Interp<'a> {
                     Some(self.eval(subject)?)
                 };
                 let mut default: Option<&Expr> = None;
+                let mut last_cmp = self.cur_line;
                 for arm in arms {
                     if arm.conds.is_empty() {
                         default = Some(&arm.result);
                         continue;
                     }
                     for c in &arm.conds {
+                        // TYPE_CHECK conds (null/bool/const array) bind
+                        // the CV at the subject's own line; other
+                        // conds' compare ops bind it at the cond's end
+                        // line. A non-CV subject's TYPE_CHECK line is
+                        // its compiled end line. MATCH_ERROR sites at
+                        // the last compare op's lineno (zend_lineno
+                        // stays there when MATCH_ERROR emits).
+                        let cu = Self::unmark_arg(c);
+                        let tc = matches!(cu, Expr::Null | Expr::Bool(_))
+                            || matches!(cu, Expr::ArrayLit(..) if is_compile_const(cu));
+                        let cl = if !tc {
+                            Self::inner_end_line(c).unwrap_or(self.cur_line)
+                        } else if cv_subject {
+                            cv_site
+                        } else {
+                            // TYPE_CHECK on a non-CV subject sites at
+                            // the subject's first token — const-folded
+                            // binaries site one past their end.
+                            match subj_u {
+                                Expr::Binary { .. } if is_compile_const(subj_u) => {
+                                    Self::inner_end_line(subject)
+                                        .map(|l| l + 1)
+                                        .unwrap_or(self.cur_line)
+                                }
+                                Expr::Binary { .. } => {
+                                    Self::inner_end_line(subject).unwrap_or(self.cur_line)
+                                }
+                                _ => Self::marked_line(subject).unwrap_or(self.cur_line),
+                            }
+                        };
+                        last_cmp = cl;
                         let cv = self.eval(c)?;
                         // A deferred CV subject is read inside THIS
                         // compare op — a fresh read each time (zend's
                         // CV operand binds per op: warns per cond line).
                         let svv = match &sv {
                             Some(sv) => sv.clone(),
-                            None => {
-                                let cl = Self::inner_end_line(c).unwrap_or(self.cur_line);
-                                self.eval_cv_at(subj_u, cl)?
-                            }
+                            None => self.eval_cv_at(subj_u, cl)?,
                         };
                         crate::value::clear_cmp_depth_err();
                         // ZEND_CASE_STRICT (TMP|VAR subjects) is
@@ -561,13 +590,15 @@ impl<'a> Interp<'a> {
                     // line under the jumptable (the MATCH op's own
                     // lineno); non-jumptable keeps the last compare's
                     // line.
-                    if jumptable {
-                        let l = Self::inner_end_line(subj_u)
+                    let l = if jumptable {
+                        Self::inner_end_line(subj_u)
                             .or_else(|| Self::marked_line(subject))
-                            .unwrap_or(cv_site);
-                        self.cur_line = l;
-                        self.send_line = Some(l);
-                    }
+                            .unwrap_or(cv_site)
+                    } else {
+                        last_cmp
+                    };
+                    self.cur_line = l;
+                    self.send_line = Some(l);
                     let e = self.exception(
                         "UnhandledMatchError",
                         &format!("Unhandled match case {}", match_case_desc(&sv)),
@@ -1266,10 +1297,10 @@ impl<'a> Interp<'a> {
                     None => return Ok(None),
                 };
                 if let Value::Callable(_) = &ov {
-                    // Props on a Closure warn like undeclared members
-                    // of the real Closure class (closure_031).
+                    // isset/empty/?? on a Closure prop are silent —
+                    // the 'Undefined property: Closure::$x' warn only
+                    // fires on a real read (bug50146).
                     self.check_prop_name(&pn)?;
-                    self.warn(&format!("Undefined property: Closure::${}", pn))?;
                     return Ok(None);
                 }
                 if let Value::Object(o) = &ov {
