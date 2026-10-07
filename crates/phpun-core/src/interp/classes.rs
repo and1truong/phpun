@@ -3321,7 +3321,12 @@ impl<'a> Interp<'a> {
             _ => {
                 let v = self.eval(e)?;
                 match v {
-                    Value::Object(o) => Ok(o.borrow().class.name().to_string()),
+                    // The object's INTERNAL class name — `name()` is
+                    // the display truncation (`class@anonymous`), which
+                    // doesn't key the class table (anon-class `::`
+                    // postfixes like `(new class)::K` need the mangled
+                    // `class@anonymous\0FILE:LINE$SEQ`).
+                    Value::Object(o) => Ok(o.borrow().class.decl.name.clone()),
                     other => Ok(other.to_php_string().trim_start_matches('\\').to_string()),
                 }
             }
