@@ -2121,21 +2121,20 @@ impl<'a> Interp<'a> {
             Expr::List(_) => None,
             _ => self.eval_cell(target).ok(),
         };
-        // A folded `${expr}` that IS the plain `=` value reads at the
-        // assign node's own line — zend's delayed-compile RHS takes
-        // the ASSIGN op's lineno. Only the direct (paren/marker-stripped)
-        // root counts; operands, compound ops and nested exprs site at
-        // the varvar's own `}` line instead.
-        let prev_vv = self.vv_rhs_site;
-        self.vv_rhs_site = if op == "="
-            && matches!(Self::unmark_rhs(value), Expr::VarVar(inner, _) if is_compile_const(inner))
-        {
-            Some(aline)
+        // zend's delayed-compile RHS binds the DIRECT (paren/marker-
+        // stripped) RHS-root CV inside the ASSIGN op at the ASSIGN's
+        // own line — `$x = (\n$u\n)` warns at `=`'s line, not the var's
+        // inner line. `=` and `??=` qualify; compound ops (.=, +=) read
+        // the CV as an operand at its own line instead. A bare Var
+        // evals the stripped root so an inner `argline` mark can't
+        // re-site it; a folded varvar takes the site via vv_rhs_site.
+        let rhs_u = Self::unmark_rhs(value);
+        let pin_rhs = matches!(op, "=" | "??=") && Self::is_cv(rhs_u);
+        let rhs_r = if pin_rhs {
+            self.eval_cv_at(rhs_u, aline)
         } else {
-            None
+            self.eval(value)
         };
-        let rhs_r = self.eval(value);
-        self.vv_rhs_site = prev_vv;
         let rhs = rhs_r?;
         let cur = if needs_read {
             match &target_cell {
@@ -2302,7 +2301,14 @@ impl<'a> Interp<'a> {
                     // fetches interleave at each element's own line
                     // — handled inside store()).
                     if matches!(target, Expr::List(_)) {
-                        let l = Self::inner_end_line(value).unwrap_or(aline);
+                        // A pinned CV RHS left CG(zend_lineno) at the
+                        // ASSIGN's own line — inner_end_line would
+                        // re-read the dropped `argline` mark instead.
+                        let l = if pin_rhs {
+                            aline
+                        } else {
+                            Self::inner_end_line(value).unwrap_or(aline)
+                        };
                         self.cur_line = l;
                         self.send_line = Some(l);
                     }
