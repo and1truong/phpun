@@ -1153,6 +1153,8 @@ impl<'a> Parser<'a> {
                     if let Some(n) = n {
                         if Self::frameless_call(&n, &args) {
                             Self::frameless_arglines(&mut args, callee_line);
+                        } else if Self::dedicated_call(&n, &args) {
+                            Self::dedicated_arglines(&mut args, self.arg_end);
                         }
                     }
                 }
@@ -1519,6 +1521,9 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        // zend_lineno after the last arg compiled — the dedicated-op
+        // fold sites every CV arg there (the emitted op's lineno).
+        self.arg_end = self.toks[self.pos.saturating_sub(1)].line;
         self.expect_op(")")?;
         // Every arg carries its own line — the interpreter sites
         // arg-eval diagnostics there (zend's per-op lines).
@@ -1686,6 +1691,104 @@ impl<'a> Parser<'a> {
     /// Frameless dispatch: every bare-CV arg's send fuses to the
     /// callee's own line.
     fn frameless_arglines(args: &mut [Expr], line: usize) {
+        for a in args.iter_mut() {
+            if Self::bare_var_arg(a) {
+                Self::fold_var_arg(a, line);
+            }
+        }
+    }
+
+    /// zend_try_compile_special_func's multi-operand dedicated ops —
+    /// `array_key_exists` and the const-format `sprintf` fast path:
+    /// zend compiles every arg first, then emits the single op that
+    /// binds them all, so each bare-CV arg's read fuses into the op
+    /// at CG(zend_lineno) — the last arg's compiled end line.
+    /// (The other special ops — strlen, is_*, count, ord/chr, the
+    /// typecast builtins, defined, gettype, func_get_args — take one
+    /// arg or bind none of them; in_array's 3-arg shape is in the
+    /// FRAMELESS table already.)
+    fn dedicated_call(name: &str, args: &[Expr]) -> bool {
+        let bare = name
+            .strip_prefix('\u{1}')
+            .or_else(|| name.strip_prefix('\\'))
+            .unwrap_or(name);
+        if bare.contains('\\') {
+            return false;
+        }
+        // zend_args_contain_unpack_or_named disqualifies named/unpack.
+        if !args.iter().all(|a| {
+            !matches!(
+                Self::unmark_argline_r(a),
+                Expr::Unpack(_) | Expr::Binary { op: "named", .. }
+            )
+        }) {
+            return false;
+        }
+        match bare.to_lowercase().as_str() {
+            // zend_compile_func_array_key_exists: exactly two args.
+            "array_key_exists" => args.len() == 2,
+            "sprintf" => Self::sprintf_dedicated(args),
+            _ => false,
+        }
+    }
+
+    /// zend_compile_func_sprintf's dedicated path only fires for a
+    /// constant format under 256 bytes whose placeholders are all
+    /// %s/%d/%% and number exactly the args after it — otherwise the
+    /// call is an ordinary per-arg send.
+    fn sprintf_dedicated(args: &[Expr]) -> bool {
+        let Some(fmt) = args
+            .first()
+            .and_then(|a| Self::const_str(Self::unmark_argline_r(a)))
+        else {
+            return false;
+        };
+        if fmt.len() >= 256 {
+            return false;
+        }
+        let mut n = 0usize;
+        let mut i = 0;
+        while i < fmt.len() {
+            if fmt[i] == b'%' {
+                i += 1;
+                match fmt.get(i) {
+                    Some(b's') | Some(b'd') => n += 1,
+                    Some(b'%') => {}
+                    _ => return false,
+                }
+            }
+            i += 1;
+        }
+        n + 1 == args.len()
+    }
+
+    /// A compile-constant string node — `zend_eval_const_expr`
+    /// reduces a literal-only concat to a zval too.
+    fn const_str(e: &Expr) -> Option<Vec<u8>> {
+        match e {
+            Expr::Str(s) => Some(s.as_bytes().to_vec()),
+            Expr::Interp(parts) => {
+                let mut out = Vec::new();
+                for p in parts {
+                    match p {
+                        StringPart::Lit(s) => out.extend_from_slice(s),
+                        _ => return None,
+                    }
+                }
+                Some(out)
+            }
+            Expr::Binary { op: ".", l, r } => {
+                let mut out = Self::const_str(Self::unmark_argline_r(l))?;
+                out.extend_from_slice(&Self::const_str(Self::unmark_argline_r(r))?);
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// The dedicated-op fold: every bare-CV arg's send fuses into the
+    /// single op at the last arg's compiled end line.
+    fn dedicated_arglines(args: &mut [Expr], line: usize) {
         for a in args.iter_mut() {
             if Self::bare_var_arg(a) {
                 Self::fold_var_arg(a, line);
@@ -2123,9 +2226,13 @@ impl<'a> Parser<'a> {
                             format!("{}{}", '\u{1}', resolved)
                         };
                         // Frameless builtins fuse every bare-CV arg's
-                        // read into the call op at the name's line.
+                        // read into the call op at the name's line;
+                        // dedicated ops (array_key_exists, const-fmt
+                        // sprintf) fuse them at the last arg's end.
                         if Self::frameless_call(&resolved, &args) {
                             Self::frameless_arglines(&mut args, site);
+                        } else if Self::dedicated_call(&resolved, &args) {
+                            Self::dedicated_arglines(&mut args, self.arg_end);
                         }
                         Self::fcc_wrap(Expr::Call {
                             name: Box::new(Expr::Str(resolved)),
@@ -2165,6 +2272,8 @@ impl<'a> Parser<'a> {
                     let mut args = self.args()?;
                     if Self::frameless_call(&name, &args) {
                         Self::frameless_arglines(&mut args, site);
+                    } else if Self::dedicated_call(&name, &args) {
+                        Self::dedicated_arglines(&mut args, self.arg_end);
                     }
                     Self::fcc_wrap(Expr::Call {
                         name: Box::new(Expr::Str(name)),

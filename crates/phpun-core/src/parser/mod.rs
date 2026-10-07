@@ -55,6 +55,10 @@ pub struct Parser<'a> {
     /// 0 none, 1 unbraced, 2 braced (mixing is a compile fatal,
     /// namespaces/ns_081/ns_084).
     ns_style: u8,
+    /// The last parsed call's last arg end line — `args()` records it
+    /// for the dedicated-op fold, where every CV arg binds at the
+    /// line zend_lineno held after compiling the final argument.
+    arg_end: usize,
     /// Enclosing class-like declarations as (has_parent, is_trait) —
     /// `self`/`static`/`parent` type members are compile errors
     /// outside class scope (static_type_outside_class).
@@ -193,6 +197,7 @@ impl<'a> Parser<'a> {
             declared_types: std::collections::HashSet::new(),
             in_braced_ns: false,
             ns_style: 0,
+            arg_end: 0,
             class_ctx: Vec::new(),
             first_stmt_slot: false,
             strict_slot: false,
@@ -317,6 +322,7 @@ pub fn parse_expr_src(src: &str, base: usize) -> Result<(Expr, SrcDiags), PhpErr
         declared_types: std::collections::HashSet::new(),
         in_braced_ns: false,
         ns_style: 0,
+        arg_end: 0,
         class_ctx: Vec::new(),
         first_stmt_slot: false,
         strict_slot: false,
