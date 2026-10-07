@@ -2434,6 +2434,16 @@ impl<'a> Interp<'a> {
         name: &str,
         args: &CallArgs,
     ) -> Result<Option<Value>, PhpError> {
+        // zend resolves internal-function named args in the CALLER's
+        // frame — 'Unknown named parameter' and 'overwrites previous
+        // argument' errors surface without the ->__construct() frame
+        // that the arity check and ZPP type errors raised afterwards
+        // carry.
+        let ctor_bound = if name.eq_ignore_ascii_case("__construct") {
+            Some(self.throwable_ctor_bind(obj, args)?)
+        } else {
+            None
+        };
         // Zend renders a builtin's named args positionally in traces
         // (`Exception->__construct(Array, '9')`) — fold them into the
         // frame's arg list rather than `name: val` pairs.
@@ -2449,9 +2459,51 @@ impl<'a> Interp<'a> {
             named_args: vec![],
             internal: true,
         });
-        let r = self.throwable_method_inner(obj, name, args);
+        let r = self.throwable_method_inner(obj, name, args, ctor_bound);
         self.call_trace.pop();
         r
+    }
+
+    /// zend's "|SlO!" / "|SllS!l!O!" named-arg binding for builtin
+    /// throwable ctors: positional slots fill first, then named args
+    /// resolve against the declared names (unknown name / overwrite of
+    /// a filled slot errors). Run pre-frame in throwable_method so
+    /// binding errors carry no ctor trace frame. Returns the bound
+    /// slots plus whether the class descends from ErrorException.
+    fn throwable_ctor_bind(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        args: &CallArgs,
+    ) -> Result<(Vec<Option<Cell>>, bool), PhpError> {
+        let ee = self.is_a(&obj.borrow().class.clone(), "errorexception");
+        let pnames: &[&str] = if ee {
+            &[
+                "message", "code", "severity", "filename", "line", "previous",
+            ]
+        } else {
+            &["message", "code", "previous"]
+        };
+        let mut bound: Vec<Option<Cell>> = vec![None; pnames.len()];
+        for (i, c) in args.iter().enumerate().take(pnames.len()) {
+            bound[i] = Some(c.clone());
+        }
+        for (n, c, ..) in &args.named {
+            match pnames.iter().position(|p| *p == n.as_str()) {
+                Some(i) => {
+                    if bound[i].is_some() {
+                        return Err(self.spl_throw(
+                            "Error",
+                            format!("Named parameter ${} overwrites previous argument", n),
+                        ));
+                    }
+                    bound[i] = Some(c.clone());
+                }
+                None => {
+                    return Err(self.spl_throw("Error", format!("Unknown named parameter ${}", n)));
+                }
+            }
+        }
+        Ok((bound, ee))
     }
 
     fn throwable_method_inner(
@@ -2459,6 +2511,7 @@ impl<'a> Interp<'a> {
         obj: &Rc<RefCell<PhpObject>>,
         name: &str,
         args: &CallArgs,
+        ctor_bound: Option<(Vec<Option<Cell>>, bool)>,
     ) -> Result<Option<Value>, PhpError> {
         let ob = obj.borrow();
         let lname = name.to_lowercase();
@@ -2592,7 +2645,11 @@ impl<'a> Interp<'a> {
                 // TypeError naming it).
                 drop(ob);
                 let mut ob = obj.borrow_mut();
-                let ee = self.is_a(&ob.class.clone(), "errorexception");
+                // Named args already bound pre-frame by
+                // throwable_method (zend reports unknown-name and
+                // overwrite errors in the caller's frame — no ctor
+                // frame — while the arity/type errors below carry it).
+                let (bound, ee) = ctor_bound.expect("throwable_method binds __construct pre-frame");
                 // zend names the ctor's DECLARING scope — the ROOT
                 // builtin throwable ancestor whose internal __construct
                 // stub the method descends from (Exception for the
@@ -2634,46 +2691,15 @@ impl<'a> Interp<'a> {
                     }};
                 }
                 // zend parses the ctor with "|SlO!" (throwables) or
-                // "|SllS!l!O!" (ErrorException) — bind named args into
-                // the declared slots first: an unknown name or a named
-                // overwrite of a positional slot errors before the
-                // max-arity check (zend_parse_parameters order).
-                let pnames: &[&str] = if ee {
-                    &[
-                        "message", "code", "severity", "filename", "line", "previous",
-                    ]
-                } else {
-                    &["message", "code", "previous"]
-                };
-                let mut bound: Vec<Option<Cell>> = vec![None; pnames.len()];
-                for (i, c) in args.iter().enumerate().take(pnames.len()) {
-                    bound[i] = Some(c.clone());
-                }
-                for (n, c, ..) in &args.named {
-                    match pnames.iter().position(|p| *p == n.as_str()) {
-                        Some(i) => {
-                            if bound[i].is_some() {
-                                return Err(self.spl_throw(
-                                    "Error",
-                                    format!("Named parameter ${} overwrites previous argument", n),
-                                ));
-                            }
-                            bound[i] = Some(c.clone());
-                        }
-                        None => {
-                            return Err(
-                                self.spl_throw("Error", format!("Unknown named parameter ${}", n))
-                            );
-                        }
-                    }
-                }
-                if args.len() > pnames.len() {
+                // "|SllS!l!O!" (ErrorException); named args were bound
+                // pre-frame — only the max-arity check remains here.
+                if args.len() > bound.len() {
                     return Err(self.spl_throw(
                         "ArgumentCountError",
                         format!(
                             "{}::__construct() expects at most {} arguments, {} given",
                             cls_name,
-                            pnames.len(),
+                            bound.len(),
                             args.len()
                         ),
                     ));
