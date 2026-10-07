@@ -2424,12 +2424,41 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Native implementations of Throwable methods.
+    /// Native implementations of Throwable methods. Internal calls
+    /// carry a backtrace frame — zend renders
+    /// `Exception->__construct(Array, '9')` in uncaught TypeError
+    /// traces (arg repr truncates via trace_arg).
     pub(in crate::interp) fn throwable_method(
         &mut self,
         obj: &Rc<RefCell<PhpObject>>,
         name: &str,
-        _args: &[Cell],
+        args: &CallArgs,
+    ) -> Result<Option<Value>, PhpError> {
+        // Zend renders a builtin's named args positionally in traces
+        // (`Exception->__construct(Array, '9')`) — fold them into the
+        // frame's arg list rather than `name: val` pairs.
+        let mut fargs = args.cells.clone();
+        fargs.extend(args.named.iter().map(|(_, c, ..)| c.clone()));
+        self.call_trace.push(TraceFrame {
+            file: self.diag_file(),
+            line: self.cur_line as u32,
+            function: name.to_string(),
+            class: Some(obj.borrow().class.name().to_string()),
+            ty: "->".into(),
+            args: fargs,
+            named_args: vec![],
+            internal: true,
+        });
+        let r = self.throwable_method_inner(obj, name, args);
+        self.call_trace.pop();
+        r
+    }
+
+    fn throwable_method_inner(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        name: &str,
+        args: &CallArgs,
     ) -> Result<Option<Value>, PhpError> {
         let ob = obj.borrow();
         let lname = name.to_lowercase();
@@ -2604,14 +2633,76 @@ impl<'a> Interp<'a> {
                         ));
                     }};
                 }
-                let getv = |i: usize| _args.get(i).map(|c| c.borrow().clone());
+                // zend parses the ctor with "|SlO!" (throwables) or
+                // "|SllS!l!O!" (ErrorException) — bind named args into
+                // the declared slots first: an unknown name or a named
+                // overwrite of a positional slot errors before the
+                // max-arity check (zend_parse_parameters order).
+                let pnames: &[&str] = if ee {
+                    &[
+                        "message", "code", "severity", "filename", "line", "previous",
+                    ]
+                } else {
+                    &["message", "code", "previous"]
+                };
+                let mut bound: Vec<Option<Cell>> = vec![None; pnames.len()];
+                for (i, c) in args.iter().enumerate().take(pnames.len()) {
+                    bound[i] = Some(c.clone());
+                }
+                for (n, c, ..) in &args.named {
+                    match pnames.iter().position(|p| *p == n.as_str()) {
+                        Some(i) => {
+                            if bound[i].is_some() {
+                                return Err(self.spl_throw(
+                                    "Error",
+                                    format!("Named parameter ${} overwrites previous argument", n),
+                                ));
+                            }
+                            bound[i] = Some(c.clone());
+                        }
+                        None => {
+                            return Err(
+                                self.spl_throw("Error", format!("Unknown named parameter ${}", n))
+                            );
+                        }
+                    }
+                }
+                if args.len() > pnames.len() {
+                    return Err(self.spl_throw(
+                        "ArgumentCountError",
+                        format!(
+                            "{}::__construct() expects at most {} arguments, {} given",
+                            cls_name,
+                            pnames.len(),
+                            args.len()
+                        ),
+                    ));
+                }
+                let getv = |i: usize| {
+                    bound
+                        .get(i)
+                        .and_then(|o| o.as_ref())
+                        .map(|c| c.borrow().clone())
+                };
                 let msg = match getv(0) {
                     Some(v @ Value::Array(_)) => arg_err!(1, "message", "string", &v),
+                    Some(Value::Null) => {
+                        self.deprecated(&format!(
+                            "{cls_name}::__construct(): Passing null to parameter #1 ($message) of type string is deprecated"
+                        ))?;
+                        String::new()
+                    }
                     Some(v) => v.to_php_string(),
                     None => String::new(),
                 };
                 let code = match getv(1) {
                     Some(Value::Int(i)) => i,
+                    Some(Value::Null) => {
+                        self.deprecated(&format!(
+                            "{cls_name}::__construct(): Passing null to parameter #2 ($code) of type int is deprecated"
+                        ))?;
+                        0
+                    }
                     Some(v) => match weak_ty_coerce(&["int".into()], &v) {
                         Some(Value::Int(i)) => i,
                         _ => arg_err!(2, "code", "int", &v),
@@ -2621,6 +2712,12 @@ impl<'a> Interp<'a> {
                 let (severity, filename, line, prev_arg) = if ee {
                     let severity = match getv(2) {
                         Some(Value::Int(i)) => i,
+                        Some(Value::Null) => {
+                            self.deprecated(&format!(
+                                "{cls_name}::__construct(): Passing null to parameter #3 ($severity) of type int is deprecated"
+                            ))?;
+                            0
+                        }
                         Some(v) => match weak_ty_coerce(&["int".into()], &v) {
                             Some(Value::Int(i)) => i,
                             _ => arg_err!(3, "severity", "int", &v),
@@ -2640,9 +2737,9 @@ impl<'a> Interp<'a> {
                             _ => arg_err!(5, "line", "?int", &v),
                         },
                     };
-                    (severity, filename, line, _args.get(5).cloned())
+                    (severity, filename, line, bound[5].clone())
                 } else {
-                    (1, None, None, _args.get(2).cloned())
+                    (1, None, None, bound[2].clone())
                 };
                 ob.props.insert("message".into(), cell(Value::str(msg)));
                 ob.props.insert("code".into(), cell(Value::Int(code)));
@@ -2658,14 +2755,17 @@ impl<'a> Interp<'a> {
                     }
                     // zend lets the ctor override the throw site's
                     // file/line — both the props and getFile()/getLine()
-                    // report them.
+                    // report them. A filename override with a null or
+                    // omitted line forces line=0 (the `else if
+                    // (filename)` branch in zend_exceptions.c), while
+                    // no filename leaves the throw-site line alone.
                     if let Some(f) = &filename {
                         ob.props.insert("file".into(), cell(Value::str(f)));
                         if let Some(ObjectInternal::Exception { file, .. }) = &mut ob.internal {
                             *file = f.clone();
                         }
                     }
-                    if let Some(l) = line {
+                    if let Some(l) = line.or(filename.is_some().then_some(0)) {
                         ob.props.insert("line".into(), cell(Value::Int(l)));
                         if let Some(ObjectInternal::Exception { line: il, .. }) = &mut ob.internal {
                             *il = l as u32;

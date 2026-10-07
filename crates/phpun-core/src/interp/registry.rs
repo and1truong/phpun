@@ -7,6 +7,49 @@ impl<'a> Interp<'a> {
     /// Builtin exception classes + interfaces needed by try/catch.
     pub(in crate::interp) fn register_builtin_classes(&mut self) {
         fn throwable_class(name: &str, parent: Option<&str>, props: &[&str]) -> ClassDecl {
+            // zend stub: `__construct(string $message = "", int $code = 0, ?Throwable $previous = null)`
+            let mut ctor = (*method("__construct", &[])).clone();
+            ctor.decl.params = vec![
+                Param {
+                    name: "message".into(),
+                    default: Some(Expr::Str("".into())),
+                    by_ref: false,
+                    variadic: false,
+                    ty: Some(vec!["string".into()]),
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                },
+                Param {
+                    name: "code".into(),
+                    default: Some(Expr::Int(0)),
+                    by_ref: false,
+                    variadic: false,
+                    ty: Some(vec!["int".into()]),
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                },
+                Param {
+                    name: "previous".into(),
+                    default: Some(Expr::Null),
+                    by_ref: false,
+                    variadic: false,
+                    ty: Some(vec!["Throwable".into(), "null".into()]),
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                },
+            ];
             ClassDecl {
                 name: name.into(),
                 kind: ClassKind::Class,
@@ -19,7 +62,7 @@ impl<'a> Interp<'a> {
                 traits: vec![],
                 adaptations: vec![],
                 methods: vec![
-                    method("__construct", &["message", "code", "previous"]),
+                    Rc::new(ctor),
                     method("getMessage", &[]),
                     method("getCode", &[]),
                     method("getFile", &[]),
@@ -2256,6 +2299,91 @@ impl<'a> Interp<'a> {
                 Some("Exception"),
                 &["message", "code", "file", "line", "severity"],
             );
+            // zend stub: `__construct(string $message = "", int $code = 0,
+            // int $severity = E_ERROR, ?string $filename = null, ?int $line = null,
+            // ?Throwable $previous = null)`
+            let mut c = (*d.methods[0]).clone();
+            c.decl.params = vec![
+                Param {
+                    name: "message".into(),
+                    default: Some(Expr::Str("".into())),
+                    by_ref: false,
+                    variadic: false,
+                    ty: Some(vec!["string".into()]),
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                },
+                Param {
+                    name: "code".into(),
+                    default: Some(Expr::Int(0)),
+                    by_ref: false,
+                    variadic: false,
+                    ty: Some(vec!["int".into()]),
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                },
+                Param {
+                    name: "severity".into(),
+                    default: Some(Expr::Const("E_ERROR".into())),
+                    by_ref: false,
+                    variadic: false,
+                    ty: Some(vec!["int".into()]),
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                },
+                Param {
+                    name: "filename".into(),
+                    default: Some(Expr::Null),
+                    by_ref: false,
+                    variadic: false,
+                    ty: Some(vec!["string".into(), "null".into()]),
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                },
+                Param {
+                    name: "line".into(),
+                    default: Some(Expr::Null),
+                    by_ref: false,
+                    variadic: false,
+                    ty: Some(vec!["int".into(), "null".into()]),
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                },
+                Param {
+                    name: "previous".into(),
+                    default: Some(Expr::Null),
+                    by_ref: false,
+                    variadic: false,
+                    ty: Some(vec!["Throwable".into(), "null".into()]),
+                    promoted: false,
+                    vis: None,
+                    readonly: false,
+                    is_final: false,
+                    set_vis: None,
+                    hooks: None,
+                },
+            ];
+            d.methods[0] = Rc::new(c);
             d.methods.push(method("getSeverity", &[]));
             reg(d, false);
         }
