@@ -1939,6 +1939,65 @@ impl<'a> Interp<'a> {
                         self.cur_line,
                     ));
                 }
+                // zend's prop-redeclare order after final: static-ness,
+                // readonly, then visibility; type invariance last.
+                if ap.is_static != cp.is_static {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Cannot redeclare {} {}::${} as {} {}::${}",
+                            if ap.is_static { "static" } else { "non static" },
+                            pc.decl.name,
+                            cp.name,
+                            if cp.is_static { "static" } else { "non static" },
+                            d.name,
+                            cp.name
+                        ),
+                        self.cur_line,
+                    ));
+                }
+                if ap.readonly != cp.readonly {
+                    return Err(PhpError::fatal(
+                        format!(
+                            "Cannot redeclare {} property {}::${} as {} {}::${}",
+                            if ap.readonly {
+                                "readonly"
+                            } else {
+                                "non-readonly"
+                            },
+                            pc.decl.name,
+                            cp.name,
+                            if cp.readonly {
+                                "readonly"
+                            } else {
+                                "non-readonly"
+                            },
+                            d.name,
+                            cp.name
+                        ),
+                        self.cur_line,
+                    ));
+                }
+                let vis_rank = |v: &crate::ast::Visibility| match v {
+                    crate::ast::Visibility::Private => 0,
+                    crate::ast::Visibility::Protected => 1,
+                    crate::ast::Visibility::Public => 2,
+                };
+                if vis_rank(&cp.visibility) < vis_rank(&ap.visibility) {
+                    // ap is never private (filtered above): public →
+                    // 'must be public'; protected → 'or weaker'.
+                    let msg = if ap.visibility == crate::ast::Visibility::Protected {
+                        format!(
+                            "Access level to {}::${} must be protected (as in class {}) or weaker",
+                            d.name, cp.name, pc.decl.name
+                        )
+                    } else {
+                        format!(
+                            "Access level to {}::${} must be public (as in class {})",
+                            d.name, cp.name, pc.decl.name
+                        )
+                    };
+                    return Err(PhpError::fatal(msg, self.cur_line));
+                }
                 // Property types are invariant across inheritance
                 // only for *backed* props — a virtual hook pair
                 // follows per-kind signature variance instead
