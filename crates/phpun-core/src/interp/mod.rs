@@ -222,6 +222,11 @@ pub struct Interp<'a> {
     /// itself runs does not spawn a nested pass (error9 ordering — the
     /// autoloaded class's own code runs before the recheck resumes).
     in_variance_pass: bool,
+    /// Registration is running inside `hoist_funcs` — Zend's
+    /// early-binding compile phase — so its link errors carry the
+    /// compile-context trace (innermost include/eval frame dropped),
+    /// not the live call chain.
+    in_hoist: bool,
     /// Fatal raised inside an autoload a signature probe triggered —
     /// the probe reports it to the checking context instead of
     /// degrading to "could not check" (cascading variance failures
@@ -283,6 +288,11 @@ pub struct Interp<'a> {
     /// (prop/const/param defaults, attr args): __FILE__/__DIR__ bind to
     /// the declaring file, not the accessing file.
     decl_file_ctx: Option<String>,
+    /// (file, line) of the lazy class-const/prop/static decl currently
+    /// evaluating — an uncaught Error from inside it attributes to the
+    /// declaration site (zend reports the decl's own file+line, with
+    /// the [constant expression] pseudo-frame pointing at resolution).
+    const_decl_ctx: Option<(String, u32)>,
     /// Headers queued by header()/setcookie() — `phpun serve` emits them
     /// into the HTTP response; CLI ignores them (like php-cli).
     pub out_headers: Vec<String>,
@@ -365,8 +375,22 @@ pub struct Interp<'a> {
     /// While >0, warnings are suppressed (implements `??`, `isset`,
     /// `empty`, `@`).
     silence: u32,
+    /// isset/empty/?? quiet reads — zend suppresses only the
+    /// undefined-family diagnostics there while OFFSET-KEY casts
+    /// still surface deprecations/warnings; `_ns` emitters bypass
+    /// this counter, `@`'s `silence` suppresses them all.
+    isset_quiet: u32,
     /// Cell returned by the last `&fn()` call (returnByReference tests).
     last_ret_cell: Option<Cell>,
+    /// The object a write-context prop_cell resolved (lets `=&` reuse
+    /// it for the typed-prop decl lookup without re-evaluating the
+    /// receiver expr — `$x =& $o->m()->p` must call m() once).
+    last_prop_ov: Option<Value>,
+    /// Dynamic prop slots materialized by the CURRENT lvalue chain's
+    /// write-fetch — (cell ptr, class, name). The compound read then
+    /// emits zend's per-level 'Undefined property: C::$p' warning
+    /// (finding 13); cleared at the start of each assign target.
+    fresh_dyn_props: Vec<(usize, String, String)>,
     /// The last invoked function was declared `&name()` (returns by ref).
     last_call_by_ref: bool,
     /// Set just before invoking `[$closure,'__invoke']` so the callee
@@ -384,6 +408,15 @@ pub struct Interp<'a> {
     /// zend's read_dimension(BP_VAR_RW) silently creates missing
     /// buckets instead of warning.
     dim_by_ref: bool,
+    /// `foreach ($x as &$v)` source fetch — zend treats it as a
+    /// write-reference bind (uninit non-nullable typed props error
+    /// 'by reference'; uninit *nullable* statics report 'undeclared').
+    foreach_by_ref: bool,
+    /// Inside a whole-target `unset($x)` root fetch — set-visibility
+    /// checks stand down so unset's own errors ('Cannot unset
+    /// private(set) property', 'Attempt to unset static property')
+    /// win over 'Cannot indirectly modify'.
+    in_unset: bool,
     /// Autoload/lookup error swallowed by the last `is_callable_value`
     /// probe — re-raised when a `callable` param type rejects the arg.
     callable_probe_err: Option<(Value, PhpError)>,
@@ -409,6 +442,11 @@ pub struct Interp<'a> {
     included: HashSet<std::path::PathBuf>,
     /// Pending exception carried across an Err(Throw) return.
     pending_exception: Option<Value>,
+    /// zend's `class@anonymous` name table: decl-site (Rc ptr) →
+    /// mangled `base@anonymous\0FILE:LINE$SEQ` name.
+    anon_class_names: HashMap<usize, String>,
+    /// Process-wide anonymous-class sequence (`$0`, `$1`, ...).
+    anon_class_seq: u64,
     /// Live call stack (user + builtin) for getTrace() snapshots.
     call_trace: Vec<TraceFrame>,
     /// Pending fatal error message for exceptions raised as PhpError.
@@ -427,6 +465,38 @@ pub struct Interp<'a> {
     pub script_args: Vec<String>,
     exception_handler: Option<Value>,
     in_handler: bool,
+    /// The current dim write is detached — a handler mid-key-eval
+    /// rebound or mutated the container, so the pending write lands on
+    /// the stale slot: invisible and silent (assign_dim_014).
+    detached_dim: bool,
+    /// `++`/`--` overflow context while the pending dim write stores:
+    /// a ref held by a typed-int prop reports `Cannot
+    /// increment/decrement a reference held by property ... past its
+    /// {maximal,minimal} value` instead of the assign TypeError
+    /// (typed_properties_064). `(direction, bound)`.
+    incdec_ref_ctx: Option<(&'static str, &'static str)>,
+    /// Inside `unset()`: null dim keys convert to "" without the
+    /// 'Using null as an array offset' deprecation (zend's UNSET_DIM
+    /// maps IS_NULL silently — float/resource/illegal still diagnose).
+    unset_ctx: bool,
+    /// Dim-key conversions already emitted for this assign op — zend
+    /// casts each dim operand once: the compound read, the write gate
+    /// and the write itself reuse it without re-warning (`.=`/`|=`
+    /// probe: oracle prints the null-offset deprecation exactly once).
+    /// Per-dim-op cache of each operand cell's offset conversion —
+    /// `(cell, ArrKey)` keeps the Rc alive so a dropped cell's address
+    /// can't be reused and mis-key a later conversion (ABA).
+    dim_key_conv: std::collections::HashMap<usize, (Cell, ArrKey)>,
+    /// Per-dim-op CV-key bindings — zend reads each CV operand once
+    /// per op, so `$a[$u] += v` warns 'Undefined variable' once even
+    /// though the bound cell feeds both the read and the write
+    /// (`??=` is two ops: its assign pass re-reads the CV).
+    dim_cv_bound: HashMap<String, Cell>,
+    /// Dim operand cells bound to a fresh Null by an UNDEFINED var —
+    /// zend keeps them IS_UNDEF so a later fetch's CV re-read warns
+    /// again (`??=`'s ASSIGN_DIM is a second fetch). Reset with the
+    /// other dim-op caches.
+    dim_undef_cells: std::collections::HashSet<usize>,
     /// Current line estimate for error messages (best-effort).
     pub cur_line: usize,
     /// Active generator body's yield collector — `Expr::Yield` pushes
@@ -690,6 +760,10 @@ pub struct Interp<'a> {
     /// acquiring a `&` on one is "Cannot acquire reference to readonly
     /// property C::$p" (typed_properties_115). Value = (class, prop).
     pub readonly_cells: std::collections::HashMap<usize, (String, String)>,
+    /// Inside `clone($o, [...])` with-property writes: PHP 8.5 lets the
+    /// clone overwrite an already-initialized readonly prop — only the
+    /// set-visibility scope gate still applies (R3 finding 13).
+    pub clone_write: bool,
     /// Ptr of a typed prop slot eval_cell materialized to `null` just
     /// now — a rejected array auto-init must leave the prop
     /// uninitialized again (typed_properties_083).
@@ -1249,12 +1323,18 @@ impl<'a> Interp<'a> {
             file,
             globals: Frame::new(String::new()),
             last_ret_cell: None,
+            last_prop_ov: None,
+            fresh_dyn_props: Vec::new(),
             last_call_by_ref: false,
             pending_call_alias: None,
             globals_order: Vec::new(),
             globals_arr: None,
             globals_synced: std::collections::HashSet::new(),
             dim_by_ref: false,
+            foreach_by_ref: false,
+            in_unset: false,
+            anon_class_names: HashMap::new(),
+            anon_class_seq: 0,
             callable_probe_err: None,
             stack: Vec::new(),
             functions: HashMap::new(),
@@ -1265,6 +1345,7 @@ impl<'a> Interp<'a> {
             autoloading: std::collections::HashSet::new(),
             variance_obligations: Vec::new(),
             in_variance_pass: false,
+            in_hoist: false,
             sig_fatal: None,
             declaring: Vec::new(),
             tentative: {
@@ -1306,6 +1387,7 @@ impl<'a> Interp<'a> {
             err_buf: String::new(),
             live_io: false,
             decl_file_ctx: None,
+            const_decl_ctx: None,
             out_headers: Vec::new(),
             resp_code: 200,
             last_json_error: 0,
@@ -1327,6 +1409,7 @@ impl<'a> Interp<'a> {
             ob_stack: Vec::new(),
             suspended_obs: Vec::new(),
             silence: 0,
+            isset_quiet: 0,
             statics: HashMap::new(),
             static_decls: HashMap::new(),
             cur_unit_id: 0,
@@ -1347,6 +1430,12 @@ impl<'a> Interp<'a> {
             script_args: Vec::new(),
             exception_handler: None,
             in_handler: false,
+            incdec_ref_ctx: None,
+            detached_dim: false,
+            unset_ctx: false,
+            dim_key_conv: std::collections::HashMap::new(),
+            dim_undef_cells: std::collections::HashSet::new(),
+            dim_cv_bound: HashMap::new(),
             cur_line: 1,
             gen_sink: None,
             pending_gen_captures: Vec::new(),
@@ -1413,6 +1502,7 @@ impl<'a> Interp<'a> {
             shared_cells_prune: 1024,
             magic_guards: std::collections::HashSet::new(),
             readonly_cells: std::collections::HashMap::new(),
+            clone_write: false,
             last_fresh_cell: None,
             builtin_ifaces: std::collections::HashSet::new(),
             dep_seen: std::collections::HashSet::new(),
@@ -1429,6 +1519,13 @@ impl<'a> Interp<'a> {
                 // Zend's compiled-in default (hardcoded in main/php.ini).
                 ("memory_limit".to_string(), "128M".to_string()),
                 ("zend.enable_gc".to_string(), "1".to_string()),
+                // Oracle PHP's compiled-in include_path (brew build) —
+                // `get_include_path` and the Failed-opening diagnostics
+                // print it verbatim.
+                (
+                    "include_path".to_string(),
+                    ".:/home/linuxbrew/.linuxbrew/Cellar/php/8.5.11/share/php/pear".to_string(),
+                ),
             ]),
         };
         // Auto-globals. PHP's $_SERVER carries env + script metadata;
@@ -1522,13 +1619,27 @@ impl<'a> Interp<'a> {
 
     /// eval_const for a decl-attached expr (prop/const/param default):
     /// __FILE__/__DIR__ inside resolve to the declaring file.
-    fn eval_decl_const(&mut self, e: &Expr, decl_file: &str) -> Result<Value, PhpError> {
+    fn eval_decl_const(
+        &mut self,
+        e: &Expr,
+        decl_file: &str,
+        decl_line: usize,
+    ) -> Result<Value, PhpError> {
         if decl_file.is_empty() {
             return self.eval_const(e);
         }
         let old = self.decl_file_ctx.replace(decl_file.to_string());
+        let old_ctx = if decl_line > 0 {
+            self.const_decl_ctx
+                .replace((decl_file.to_string(), decl_line as u32))
+        } else {
+            None
+        };
         let r = self.eval_const(e);
         self.decl_file_ctx = old;
+        if decl_line > 0 {
+            self.const_decl_ctx = old_ctx;
+        }
         r
     }
 
@@ -1637,9 +1748,14 @@ impl<'a> Interp<'a> {
 
     fn gate_foreach_target(t: &ForeachTarget) -> Result<(), PhpError> {
         match t {
-            ForeachTarget::Lvalue(e) => Self::gate_expr(e, &GateMode::Runtime),
+            ForeachTarget::ByRef(e) | ForeachTarget::Lvalue(e) => {
+                Self::gate_expr(e, &GateMode::Runtime)
+            }
             ForeachTarget::List(ts) => {
-                for t in ts.iter().flatten() {
+                for (k, t) in ts.iter().flatten() {
+                    if let Some(k) = k {
+                        Self::gate_expr(k, &GateMode::Runtime)?;
+                    }
                     Self::gate_foreach_target(t)?;
                 }
                 Ok(())
@@ -1790,7 +1906,10 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
             Expr::List(v) => {
-                for x in v.iter().flatten() {
+                for (k, x) in v.iter().flatten() {
+                    if let Some(k) = k {
+                        Self::gate_expr(k, m)?;
+                    }
                     Self::gate_expr(x, m)?;
                 }
                 Ok(())
@@ -1923,6 +2042,17 @@ impl<'a> Interp<'a> {
     }
 
     fn hoist_funcs(&mut self, stmts: &[Stmt]) -> Result<(), PhpError> {
+        // Registration inside this pass is Zend's early-binding
+        // compile phase — its link errors carry the compile-context
+        // trace (compile_err_frames), while decls registering at exec
+        // keep the live call chain.
+        let saved_hoist = std::mem::replace(&mut self.in_hoist, true);
+        let r = self.hoist_funcs_pass(stmts);
+        self.in_hoist = saved_hoist;
+        r
+    }
+
+    fn hoist_funcs_pass(&mut self, stmts: &[Stmt]) -> Result<(), PhpError> {
         for s in stmts {
             match s {
                 // `namespace X { stmts }` parses as
@@ -1935,22 +2065,71 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                // Early binding: unconditional top-level classes with no
-                // parent/interfaces/traits register before execution
-                // (namespaces/ns_060).
+                // Early binding: unconditional top-level non-enum
+                // classes with no parent/interfaces/traits register
+                // before execution (namespaces/ns_060). Enums are
+                // exec-bound in Zend — `enum A {} class A {}` lets the
+                // class win early binding so the ENUM's exec site is
+                // where the redeclare fatal lands.
                 Stmt::Class(d)
-                    if d.parent.is_none() && d.implements.is_empty() && d.traits.is_empty() =>
+                    if d.traits.is_empty()
+                        && d.kind != crate::ast::ClassKind::Enum
+                        && (d.implements.is_empty()
+                            // `interface Y extends X` also early-binds
+                            // once every parent interface is known —
+                            // delaying it to exec leaves Y unregistered
+                            // for the compile-pass compat checks of
+                            // early-bound classes that follow
+                            // (set_value_parameter_type_variance_006/007).
+                            || (d.kind == crate::ast::ClassKind::Interface
+                                && d.implements.iter().all(|i| {
+                                    let il = i.to_lowercase();
+                                    self.classes.contains_key(&il)
+                                        || self.interfaces.contains_key(&il)
+                                        || self.traits.contains_key(&il)
+                                        || self
+                                            .linking
+                                            .iter()
+                                            .any(|c| c.name.eq_ignore_ascii_case(&il))
+                                })))
+                        // And every type the decl's own signatures
+                        // mention must be checkable — zend refuses
+                        // early binding when prop/method/const types
+                        // reference unresolved names so their variance
+                        // verdicts run at exec-link instead
+                        // (property_types_early_bind).
+                        && self.decl_types_resolvable(d)
+                        && match &d.parent {
+                            // zend_try_early_binding: a class with no
+                            // dependencies always binds; an extends-only
+                            // class binds when its parent is already
+                            // registered (no autoload at compile).
+                            // Classes with interfaces/traits bind at
+                            // exec — their link errors carry the live
+                            // trace ('Class B contains N abstract
+                            // method' for an interface method keeps the
+                            // eval()/include() frame).
+                            None => true,
+                            Some(p) => {
+                                let pl = p.to_lowercase();
+                                self.classes.contains_key(&pl)
+                                    || self.traits.contains_key(&pl)
+                                    || self.interfaces.contains_key(&pl)
+                                    || self
+                                        .linking
+                                        .iter()
+                                        .any(|c| c.name.eq_ignore_ascii_case(&pl))
+                            }
+                        } =>
                 {
                     let key = d.name.to_lowercase();
+                    // Class-kind redeclares are EXEC-phase fatals in
+                    // Zend (unlike function redeclares, which die inside
+                    // the unit's compile): an occupied name just leaves
+                    // the decl exec-bound so the dup hits the existing
+                    // 'Cannot redeclare' check in stmt order — an
+                    // earlier exec-bound decl's link error wins first.
                     if self.existing_class_site(&key).is_some() {
-                        // A second decl claiming an occupied name is
-                        // Zend's 'Cannot redeclare' fatal — but it fires
-                        // at the decl's EXEC position with the live
-                        // trace (`class A{} class A{}` still runs
-                        // earlier stmts first, and inside an include
-                        // the trace shows the include() frame), so
-                        // leave the decl for the exec arm's runtime
-                        // check instead of fataling here.
                         continue;
                     }
                     let site = Rc::as_ptr(d) as usize;
@@ -1960,10 +2139,18 @@ impl<'a> Interp<'a> {
                         mm.decl.file = self.cur_file.clone();
                         *m = Rc::new(mm);
                     }
-                    if self.register_class(Rc::new(d)).is_ok() {
-                        self.early_bound_classes
-                            .insert(key, (self.cur_unit_id, site));
-                    }
+                    // Link errors of an early-bound class are compile
+                    // errors of this unit — propagate (Zend fails the
+                    // whole compile; the decl site still no-ops at
+                    // exec via early_bound_classes). Zend reports the
+                    // class-decl line for them.
+                    let saved_line = self.cur_line;
+                    self.cur_line = d.line;
+                    let r = self.register_class(Rc::new(d));
+                    self.cur_line = saved_line;
+                    r?;
+                    self.early_bound_classes
+                        .insert(key, (self.cur_unit_id, site));
                 }
                 _ => {}
             }
@@ -2741,6 +2928,10 @@ impl<'a> Interp<'a> {
         self.ob_stack.clear();
         self.suspended_obs.clear();
         self.silence = 0;
+        self.isset_quiet = 0;
+        self.detached_dim = false;
+        self.dim_key_conv.clear();
+        self.dim_undef_cells.clear();
         self.pending_exception = None;
         self.call_trace.clear();
         self.deadline = None;
@@ -2916,17 +3107,19 @@ impl<'a> Interp<'a> {
 
     /// Does the variable name resolve to an existing cell?
     fn var_lookup(&mut self, name: &str) -> Option<Cell> {
-        if self.stack.is_empty() {
+        let r = if self.stack.is_empty() {
             if let Some(c) = self.global_var_cell(name) {
                 return Some(c);
             }
-            return self.superglobal_cell(name);
-        }
-        self.cur()
-            .vars
-            .get(name)
-            .cloned()
-            .or_else(|| self.superglobal_cell(name))
+            self.superglobal_cell(name)
+        } else {
+            self.cur()
+                .vars
+                .get(name)
+                .cloned()
+                .or_else(|| self.superglobal_cell(name))
+        };
+        r
     }
 
     fn var_get(&mut self, name: &str) -> Result<Value, PhpError> {
@@ -2950,12 +3143,13 @@ impl<'a> Interp<'a> {
             if let Some(c) = self.superglobal_cell(name) {
                 return Ok(c.borrow().clone());
             }
-            if self.silence == 0 {
+            if !self.is_quiet() {
                 self.warn(&format!("Undefined variable ${}", name))?;
             }
             return Ok(Value::Null);
         }
-        match self.cur().vars.get(name) {
+        let found = self.cur().vars.get(name).cloned();
+        match found {
             Some(c) => Ok(c.borrow().clone()),
             None => match self.superglobal_cell(name) {
                 Some(c) => Ok(c.borrow().clone()),
@@ -2970,7 +3164,7 @@ impl<'a> Interp<'a> {
                             0,
                         ));
                     }
-                    if self.silence == 0 {
+                    if !self.is_quiet() {
                         self.warn(&format!("Undefined variable ${}", name))?;
                     }
                     Ok(Value::Null)
@@ -3033,7 +3227,19 @@ impl<'a> Interp<'a> {
             for n in names {
                 if let Some(c) = self.globals.vars.get(&n).cloned() {
                     self.mark_ref(&c);
-                    a.set_cell(ArrKey::Str(n.clone().into()), c);
+                    let key = ArrKey::Str(n.clone().into());
+                    // The var's cell may have been rebound (`$x =& $y`)
+                    // — the table slot follows it rather than having
+                    // the new value written into the stale slot cell
+                    // (030's aliasing must survive a sync).
+                    if a.get_cell(&key)
+                        .map(|s| !Rc::ptr_eq(&s, &c))
+                        .unwrap_or(false)
+                    {
+                        a.bind_cell(key, c);
+                    } else {
+                        a.set_cell(key, c);
+                    }
                     self.globals_synced.insert(n);
                 }
             }
@@ -5150,6 +5356,7 @@ impl<'a> Interp<'a> {
                 full_msg: String::new(),
                 eval_ctx: 0,
                 frames: Rc::new(self.call_trace.clone()),
+                previous: None,
             });
             if !o.prop_order.contains(&"message".into()) {
                 o.prop_order.push("message".into());
@@ -5610,38 +5817,50 @@ impl<'a> Interp<'a> {
         Ok(out)
     }
 
+    #[track_caller]
     fn fail<T>(&mut self, e: PhpError) -> Result<T, PhpError> {
+        if std::env::var("PHPUN_DBG_FAIL").is_ok() {
+            eprintln!(
+                "FAIL@{}: {:?} {:?}",
+                std::panic::Location::caller(),
+                e.kind,
+                e.message
+            );
+        }
         if self.gen_run_state.is_some() {
             self.gen_raise_ctx = self.call_trace.clone();
         }
         self.last_err_file = self.diag_file();
         if let ErrorKind::Uncaught { class } = e.kind {
             // Errors raised mid-const-expr get a pseudo-frame for the
-            // constant expression itself (property_initializer_scope_002:
+            // constant expression itself, innermost on the real stack
+            // (property_initializer_scope_002:
             // `#0 %s(%d): [constant expression]()`).
-            let e = if self.class_const_ctx > 0 {
-                let fr = format!(
-                    "{}({}): [constant expression]()",
-                    self.diag_file(),
-                    self.cur_line
-                );
-                let mut frames = e.trace.clone().unwrap_or_default();
-                frames.insert(0, fr);
-                PhpError {
-                    trace: Some(frames),
-                    ..e
-                }
-            } else {
-                e
-            };
+            let const_frame = self.class_const_ctx > 0;
+            if const_frame {
+                self.call_trace.push(TraceFrame {
+                    function: "[constant expression]".to_string(),
+                    class: None,
+                    ty: String::new(),
+                    file: self.diag_file(),
+                    line: self.cur_line as u32,
+                    args: Vec::new(),
+                    named_args: Vec::new(),
+                    internal: true,
+                });
+            }
             // Internal errors raised as exceptions become real throwables so
             // userland `catch` blocks can intercept them.
             let v = self.exception(class, &e.message);
+            if const_frame {
+                self.call_trace.pop();
+            }
             if let Value::Object(o) = &v {
                 if let Some(ObjectInternal::Exception {
+                    file,
+                    line,
                     trace,
                     thrown,
-                    line,
                     full_msg,
                     ..
                 }) = &mut o.borrow_mut().internal
@@ -5660,6 +5879,18 @@ impl<'a> Interp<'a> {
                     }
                     if let Some(m) = &e.display_msg {
                         *full_msg = m.clone();
+                    }
+                    // A lazy class-const/prop/static init Error
+                    // attributes to the DECL site (zend reports the
+                    // decl's own file+line — the `FILE(N) : eval()'d
+                    // code` composite included — while the pseudo-frame
+                    // keeps the resolution site).
+                    if self.class_const_ctx > 0 {
+                        if let Some((df, dl)) = &self.const_decl_ctx {
+                            *file = df.clone();
+                            *line = *dl;
+                            *thrown = *dl;
+                        }
                     }
                 }
             }

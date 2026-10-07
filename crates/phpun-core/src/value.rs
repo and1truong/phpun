@@ -101,7 +101,16 @@ impl PhpArray {
             if Rc::ptr_eq(&slot.1, &c) {
                 return;
             }
-            *slot.1.borrow_mut() = c.borrow().clone();
+            // A self-referential array ($a = [&$a]) can alias the very cell
+            // an ancestor frame is borrowing — never panic on the reentrant
+            // borrow: write through when possible, else rebind the entry.
+            let new_v = c.try_borrow().map(|b| b.clone());
+            let writable = slot.1.try_borrow_mut().is_ok();
+            match (new_v, writable) {
+                (Ok(v), true) => *slot.1.borrow_mut() = v,
+                (Ok(v), false) => slot.1 = Rc::new(RefCell::new(v)),
+                (Err(_), _) => slot.1 = c,
+            }
             return;
         }
         if let ArrKey::Int(i) = k {
@@ -390,11 +399,23 @@ pub fn format_trace(frames: &[TraceFrame]) -> String {
 pub fn format_backtrace_frames(frames: &[TraceFrame]) -> String {
     let mut t = String::new();
     let mut i = 0;
-    for fr in frames.iter() {
+    // Only the innermost surviving include frame renders bare
+    // (`require()`); once a call frame sits above it, the executing
+    // include renders like any call — `require('/path/trunc...')`
+    // (probe9, d9).
+    let bare_incl = frames
+        .iter()
+        .position(|f| !trace_frame_hidden(f))
+        .filter(|&pos| include_frame(&frames[pos]));
+    for (pos, fr) in frames.iter().enumerate() {
         if trace_frame_hidden(fr) {
             continue;
         }
-        t.push_str(&format!("#{} {}\n", i, trace_frame_str_at(fr, i)));
+        t.push_str(&format!(
+            "#{} {}\n",
+            i,
+            trace_frame_str_at(fr, Some(pos) == bare_incl)
+        ));
         i += 1;
     }
     t
@@ -485,13 +506,13 @@ fn trace_frame_str_noargs(fr: &TraceFrame) -> String {
     trace_frame_str(&f)
 }
 
-/// Frame body for the `idx`-th frame of an innermost-first live
-/// backtrace. The innermost include/require pseudo-frame renders bare
-/// (`require()` — the include op_array's own executing context carries
-/// no call args in Zend); deeper include frames keep their path
-/// argument (`require('/tmp/x/inc....')`).
-pub fn trace_frame_str_at(fr: &TraceFrame, idx: usize) -> String {
-    if idx == 0 && include_frame(fr) {
+/// Frame body for an innermost-first live backtrace. The innermost
+/// include/require pseudo-frame renders bare (`require()` — the
+/// include op_array's own executing context carries no call args in
+/// Zend) at WHATEVER depth it sits (bug28213); deeper include frames
+/// keep their path argument (`require('/tmp/x/inc....')`).
+pub fn trace_frame_str_at(fr: &TraceFrame, bare_incl: bool) -> String {
+    if bare_incl && include_frame(fr) {
         trace_frame_str_noargs(fr)
     } else {
         trace_frame_str(fr)
@@ -570,6 +591,21 @@ impl Value {
             Value::Object(o) => format!("Object id #{}", o.borrow().id).into_bytes(),
             Value::Callable(_) => b"Closure".to_vec(),
             Value::Resource(r) => format!("Resource id #{}", r.borrow().id()).into_bytes(),
+        }
+    }
+
+    /// zend's operand type word for 'Unsupported operand types' —
+    /// objects report their CLASS name (anon-class names truncate at
+    /// the \0 file:line$N suffix), scalars report zend_type_name.
+    pub fn operand_type_name(&self) -> String {
+        match self {
+            Value::Object(o) => {
+                let n = o.borrow().class.name().to_string();
+                n.split('\0').next().unwrap_or(&n).to_string()
+            }
+            Value::Callable(_) => "Closure".into(),
+            Value::Null => "null".into(),
+            _ => self.type_name().into(),
         }
     }
 
@@ -1646,12 +1682,14 @@ pub struct PhpClass {
 
 impl PhpClass {
     pub fn name(&self) -> &str {
-        // Anonymous classes carry a `$LINE` uniquifier internally;
-        // Zend's public name is `{Base}@anonymous`.
-        if let Some(pos) = self.decl.name.find("@anonymous$") {
-            &self.decl.name[..pos + "@anonymous".len()]
+        // Anonymous classes carry a `\0FILE:LINE$SEQ` mangled suffix
+        // (or the older `$LINE` uniquifier) internally; the public
+        // display name truncates at the marker.
+        let n = self.decl.name.split('\0').next().unwrap_or(&self.decl.name);
+        if let Some(pos) = n.find("@anonymous$") {
+            &n[..pos + "@anonymous".len()]
         } else {
-            &self.decl.name
+            n
         }
     }
 
@@ -1734,6 +1772,11 @@ pub enum ObjectInternal {
         eval_ctx: u32,
         /// Call stack snapshot at construction → getTrace() (tests/lang/038).
         frames: Rc<Vec<TraceFrame>>,
+        /// Chained exception from the ctor's `previous` arg (or the
+        /// engine's own chains — e.g. the incdec TypeError attached
+        /// under a readonly-modify Error). Uncaught display renders
+        /// the deepest first as `Uncaught`, each enclosing as `Next`.
+        previous: Option<Value>,
     },
     /// SPL ArrayIterator state: shared storage slot + iteration cursor.
     ArrayIter {

@@ -27,18 +27,24 @@ impl<'a> Interp<'a> {
             ));
         }
         // include()/require() appear in backtraces as internal-function
-        // frames — even for a failed open (bug28213).
+        // frames — even for a failed open (bug28213). The frame keeps
+        // Zend's literal callee name for the kind (include_once()/
+        // require_once()) and carries no arg until the path resolves:
+        // an open still in progress renders bare `include()` even with
+        // frames above it (the error-handler trace of a failed open).
         self.call_trace.push(TraceFrame {
             function: match kind {
-                IncludeKind::Include | IncludeKind::IncludeOnce => "include",
-                _ => "require",
+                IncludeKind::Include => "include",
+                IncludeKind::IncludeOnce => "include_once",
+                IncludeKind::Require => "require",
+                _ => "require_once",
             }
             .to_string(),
             class: None,
             ty: String::new(),
             file: self.diag_file(),
             line: self.cur_line as u32,
-            args: vec![cell(pathv.clone())],
+            args: Vec::new(),
             named_args: Vec::new(),
             internal: true,
         });
@@ -92,7 +98,7 @@ impl<'a> Interp<'a> {
                     IncludeKind::Require => "require",
                     _ => "require_once",
                 };
-                let ip = ".:/home/linuxbrew/.linuxbrew/share/pear";
+                let ip = self.ini.get("include_path").cloned().unwrap_or_default();
                 let r = self
                     .warn(&format!(
                         "{}({}): Failed to open stream: No such file or directory",
@@ -136,9 +142,9 @@ impl<'a> Interp<'a> {
         let canon = path.canonicalize().unwrap_or(path);
         // Zend's include/require backtrace entries carry the RESOLVED
         // canonical path as their arg (trace_arg truncates it to 15
-        // chars at render).
+        // chars at render) — set only once the open succeeded.
         if let Some(f) = self.call_trace.last_mut() {
-            f.args[0] = cell(Value::str(canon.display().to_string()));
+            f.args = vec![cell(Value::str(canon.display().to_string()))];
         }
         if matches!(kind, IncludeKind::IncludeOnce | IncludeKind::RequireOnce) {
             if self.included.contains(&canon) {
@@ -199,9 +205,13 @@ impl<'a> Interp<'a> {
                         });
                     }
                     // Non-parse fatals raised while compiling the included
-                    // file still attribute to the included file.
+                    // file still attribute to the included file — with the
+                    // compile-context backtrace (the live stack minus this
+                    // include's own pseudo-frame) like the post-parse gates.
                     _ => {
                         self.last_err_file = fname.clone();
+                        let mut e = e;
+                        e.trace = Some(self.compile_err_frames());
                         self.print_fatal(&e);
                     }
                 }
@@ -274,9 +284,14 @@ impl<'a> Interp<'a> {
                 // here), mirroring the eval()'d-code branch. Zend attaches
                 // the compile-context backtrace — the live stack minus
                 // this include's own pseudo-frame — and prints the block
-                // even when it is just `{main}`.
+                // even when it is just `{main}`. A decl/link error that
+                // already carries the live trace (class-kind 'Cannot
+                // redeclare' binds at exec phase, inside the include
+                // frame) keeps it.
                 self.last_err_file = self.cur_file.clone();
-                e.trace = Some(self.compile_err_frames());
+                if e.trace.as_ref().is_none_or(|t| t.is_empty()) {
+                    e.trace = Some(self.compile_err_frames());
+                }
                 inc_pop(self);
                 inc_frame_popped = true;
                 self.err_flow(e)
@@ -361,6 +376,11 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn eval_code(&mut self, code: &str) -> Result<Value, PhpError> {
+        // eval('') returns false in zend (empty string only — a
+        // whitespace/comment-only string still compiles to NULL).
+        if code.is_empty() {
+            return Ok(Value::Bool(false));
+        }
         // eval'd code has no <?php tag; strip a leading one defensively.
         let src = code.strip_prefix("<?php").unwrap_or(code).to_string();
         match parser::parse_pure(&src, self.ini_on("short_open_tag")) {
@@ -371,8 +391,13 @@ impl<'a> Interp<'a> {
                 // Zend compiles eval'd code as its own unit attributed to
                 // the call site — `FILE(N) : eval()'d code` — which
                 // __FILE__, decl files and every diagnostic read via
-                // cur_file (a nested eval composes the context).
-                let eval_ctx = format!("{}({}) : eval()'d code", self.cur_file, self.cur_line);
+                // cur_file (a nested eval composes the context). FILE is
+                // the executing frame's decl file, not the file currently
+                // being included: `eval()` inside a function declared in
+                // the main script attributes to the main file even when
+                // the call runs inside an included unit.
+                let site_file = self.diag_file();
+                let eval_ctx = format!("{}({}) : eval()'d code", site_file, self.cur_line);
                 let saved_file = std::mem::replace(&mut self.cur_file, eval_ctx);
                 // eval'd top-level stmts execute in the caller's frame —
                 // attribution (throwable file, __FILE__) reads the frame's
@@ -400,7 +425,11 @@ impl<'a> Interp<'a> {
                     function: "eval".to_string(),
                     class: None,
                     ty: String::new(),
-                    file: saved_file.clone(),
+                    // The frame's FILE is the call site — the executing
+                    // frame's decl file (diag_file), so eval() inside a
+                    // function still points at the function's own file
+                    // even while an include is in progress.
+                    file: site_file,
                     line: saved_line as u32,
                     args: Vec::new(),
                     named_args: Vec::new(),
@@ -424,9 +453,16 @@ impl<'a> Interp<'a> {
                         // Gate errors are compile fatals of the eval'd
                         // unit — attribute to the eval()'d-code context
                         // and carry the live backtrace (Zend compiles
-                        // eval'd code at the call site).
+                        // eval'd code at the call site). A decl/link
+                        // error that already carries the live trace
+                        // (class-kind 'Cannot redeclare' binds at exec
+                        // phase in Zend, inside the eval() frame) keeps
+                        // it — only compile-phase errors get the
+                        // compile-context frames.
                         self.last_err_file = self.cur_file.clone();
-                        e.trace = Some(self.compile_err_frames());
+                        if e.trace.as_ref().is_none_or(|t| t.is_empty()) {
+                            e.trace = Some(self.compile_err_frames());
+                        }
                         self.err_flow(e)
                     }
                     Ok(()) => self.exec_block(&stmts),
@@ -499,6 +535,27 @@ impl<'a> Interp<'a> {
                 }
             }
             Err(e) => {
+                // E_COMPILE_ERROR-class fatals inside eval'd code are
+                // uncatchable in Zend (`try{eval(...)}catch(ParseError)`
+                // does not see them) — only real syntax errors surface
+                // as ParseError.
+                if e.kind != ErrorKind::Parse {
+                    self.last_err_file =
+                        format!("{}({}) : eval()'d code", self.diag_file(), self.cur_line);
+                    let mut e = e;
+                    if e.trace.as_ref().is_none_or(|t| t.is_empty()) {
+                        e.trace = Some(self.compile_err_frames());
+                    }
+                    self.print_fatal(&e);
+                    return Err(PhpError {
+                        trace: None,
+                        thrown_line: None,
+                        display_msg: None,
+                        kind: ErrorKind::Fatal,
+                        message: "\u{1}exit:255".into(),
+                        line: 0,
+                    });
+                }
                 let msg = e.message.clone();
                 let v = self.exception("ParseError", &msg);
                 if let Value::Object(o) = &v {
@@ -515,7 +572,7 @@ impl<'a> Interp<'a> {
                         // the error's own line inside the eval
                         // string. eval_ctx stays >0 as the marker the
                         // uncaught render keys on.
-                        *file = format!("{}({}) : eval()'d code", self.cur_file, self.cur_line);
+                        *file = format!("{}({}) : eval()'d code", self.diag_file(), self.cur_line);
                         *line = e.line as u32;
                         *thrown = e.line as u32;
                         *eval_ctx = e.line as u32;

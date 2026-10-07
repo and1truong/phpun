@@ -999,7 +999,20 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                     return Ok(Value::Bool(false));
                 }
             };
+            // `array $array` is ZPP-checked — non-array arg2 is a
+            // TypeError (zend_argument_type_error).
             let mut out = PhpArray::new();
+            if let Some(c) = args.get(1) {
+                if !matches!(&*c.borrow(), Value::Array(_)) {
+                    return err(
+                        "TypeError",
+                        format!(
+                            "preg_grep(): Argument #2 ($array) must be of type array, {} given",
+                            zval_word(&c.borrow())
+                        ),
+                    );
+                }
+            }
             if let Value::Array(a) = arg(args, 1) {
                 for (k, c) in a.borrow().iter() {
                     let v = c.borrow().clone();
