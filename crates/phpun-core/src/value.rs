@@ -1601,6 +1601,12 @@ pub struct TraceFrame {
     /// traces (overriding the cufa transparency filter) and the
     /// callee's call site attributes to `[internal function]`.
     pub named_dispatch: bool,
+    /// Frame pushed by `Generator->{m}()` for the resume itself.
+    /// A throwable constructed inside the running body snapshots it
+    /// into its construction stack, but Zend's deferred raise renders
+    /// the CURRENT resume — a stale resumer frame drops out of the
+    /// rewritten trace (the live resume stack supplies the real one).
+    pub gen_resume: bool,
 }
 
 /// Shared storage slot for spl array-objects — zend's `intern->array`

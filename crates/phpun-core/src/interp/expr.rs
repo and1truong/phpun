@@ -410,7 +410,12 @@ impl<'a> Interp<'a> {
                         let saved_crun = self
                             .gen_collect_run
                             .replace(self.gen_run_state.clone().unwrap());
+                        // The drain's drives aren't foreach iter_calls
+                        // — the delegate's suspended frame cites the
+                        // yield-from's own line, not the loop header.
+                        let saved_isite = self.gen_iter_site.take();
                         let (items, death) = self.yield_from_collect(&v);
+                        self.gen_iter_site = saved_isite;
                         self.gen_collect_base = saved_cbase;
                         self.gen_collect_seen = saved_seen;
                         self.gen_collect_run = saved_crun;

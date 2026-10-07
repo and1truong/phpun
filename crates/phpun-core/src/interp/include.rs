@@ -43,6 +43,7 @@ impl<'a> Interp<'a> {
             internal: true,
             visible: true,
             named_dispatch: false,
+            gen_resume: false,
         });
         let inc_pop = |it: &mut Interp| {
             it.call_trace.pop();
@@ -415,6 +416,7 @@ impl<'a> Interp<'a> {
                     internal: true,
                     visible: true,
                     named_dispatch: false,
+                    gen_resume: false,
                 });
                 // A compile diagnostic's handler runs at THIS eval()'s callsite.
                 let saved_callsite = self
@@ -528,6 +530,7 @@ impl<'a> Interp<'a> {
                         internal: true,
                         visible: true,
                         named_dispatch: false,
+                        gen_resume: false,
                     });
                     self.last_err_file =
                         format!("{}({}) : eval()'d code", self.cur_file, self.cur_line);

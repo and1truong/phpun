@@ -2277,6 +2277,7 @@ impl<'a> Interp<'a> {
                 internal: false,
                 visible: true,
                 named_dispatch: false,
+                gen_resume: false,
             })
             .unwrap_or_else(|| TraceFrame {
                 function: decl.name.clone(),
@@ -2289,6 +2290,7 @@ impl<'a> Interp<'a> {
                 internal: false,
                 visible: true,
                 named_dispatch: false,
+                gen_resume: false,
             });
         self.call_trace.push(fr);
         self.last_call_by_ref = decl.by_ref;

@@ -862,7 +862,9 @@ impl<'a> Interp<'a> {
             frames.push(format!(
                 "{}({}): {}({})",
                 self.diag_file(),
-                self.cur_line,
+                // Zend's FE ops carry the foreach header's line —
+                // cur_line has already drifted into the loop body.
+                self.gen_iter_site.unwrap_or(self.cur_line),
                 fn_name,
                 call_args
             ));
@@ -1113,6 +1115,7 @@ impl<'a> Interp<'a> {
                 internal: true,
                 visible: true,
                 named_dispatch: false,
+                gen_resume: true,
             });
         }
         let saved_site = self.gen_resume_site;

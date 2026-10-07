@@ -499,6 +499,11 @@ pub struct Interp<'a> {
     /// call, so destructors it runs cite the resume's line (the
     /// `->next()` call / foreach header), not the body's last line.
     gen_resume_site: Option<usize>,
+    /// The `foreach` statement's own line while `exec_foreach_iter`
+    /// drives an iterator — a deferred body death cites it for the
+    /// gen's suspended frame (Zend's FE ops carry the header line,
+    /// not the loop-body line `cur_line` has drifted to).
+    gen_iter_site: Option<usize>,
     /// A fatal surfaced by err_flow while a generator body runs —
     /// stored instead of printed so the deferred death restamps the
     /// resume-stack trace and prints once at the consumer's resume.
@@ -1347,6 +1352,7 @@ impl<'a> Interp<'a> {
             iter_calls: 0,
             gen_internal_resume: 0,
             gen_resume_site: None,
+            gen_iter_site: None,
             gen_pending_fatal: None,
             gen_raise_ctx: Vec::new(),
             compile_callsite: None,
@@ -4788,6 +4794,15 @@ impl<'a> Interp<'a> {
                     if crate::value::trace_frame_hidden(fr) {
                         continue;
                     }
+                    // A `Generator->{m}()` frame snapshotted into the
+                    // construction stack is the resume that RAN the
+                    // body — Zend's deferred render shows the resume
+                    // live at the raise, already in `frames`. Dropping
+                    // it here is what keeps a stale first-resume frame
+                    // from leading the rewritten trace.
+                    if fr.gen_resume {
+                        continue;
+                    }
                     let callee = fr
                         .class
                         .as_ref()
@@ -4992,6 +5007,7 @@ impl<'a> Interp<'a> {
             // are ordinary internal functions, not trampolines.
             named_dispatch: !args.named.is_empty()
                 && matches!(name, "call_user_func" | "call_user_func_array"),
+            gen_resume: false,
         });
         if name == "assert" {
             // AssertionError message = `assert(<args>)` as written.

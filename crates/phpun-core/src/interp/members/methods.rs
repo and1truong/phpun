@@ -36,6 +36,7 @@ impl<'a> Interp<'a> {
             internal: true,
             visible: true,
             named_dispatch: false,
+            gen_resume: false,
         });
         let r = self.array_iter_body(obj, name, args);
         self.call_trace.pop();
@@ -705,6 +706,7 @@ impl<'a> Interp<'a> {
                     internal: true,
                     visible: true,
                     named_dispatch: false,
+                    gen_resume: false,
                 });
                 self.internal_cb += 1;
                 let (sorted, deep, conv_err) = crate::builtins::array::zend_sort_flags(
@@ -772,6 +774,7 @@ impl<'a> Interp<'a> {
                     internal: true,
                     visible: true,
                     named_dispatch: false,
+                    gen_resume: false,
                 });
                 self.internal_cb += 1;
                 let (sorted, cb_err) = crate::builtins::array::zend_sort_user(
@@ -2287,6 +2290,7 @@ impl<'a> Interp<'a> {
                     internal: false,
                     visible: true,
                     named_dispatch: false,
+                    gen_resume: false,
                 });
                 let r = self.reflection_method(&obj, name, &args);
                 self.call_trace.pop();
@@ -2528,6 +2532,7 @@ impl<'a> Interp<'a> {
             internal: false,
             visible: true,
             named_dispatch: false,
+            gen_resume: false,
         });
         let bound = self.ctor_zpp_bind(&dc, &m, args, &defaults)?;
         self.call_trace.pop();

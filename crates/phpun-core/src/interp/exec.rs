@@ -1117,6 +1117,10 @@ impl<'a> Interp<'a> {
             e.trace = Some(self.compile_err_frames());
             return self.err_flow(e);
         }
+        // The foreach's own line — Zend's FE ops carry the header's
+        // line, so a deferred gen-body death cites it for the
+        // suspended frame (cur_line drifts into the loop body).
+        let iter_site = self.cur_line;
         let src = match self.eval(arr) {
             Ok(v) => v,
             Err(e) => return self.err_flow(e),
@@ -1285,7 +1289,7 @@ impl<'a> Interp<'a> {
                             }
                             // getIterator() must return a Traversable.
                             Value::Object(io) if self.obj_is_a(&io, "Iterator") => {
-                                return self.exec_foreach_iter(io, key, val, body);
+                                return self.exec_foreach_iter(io, key, val, body, iter_site);
                             }
                             _ => {
                                 let cls_name = cur.borrow().class.name().to_string();
@@ -1319,7 +1323,7 @@ impl<'a> Interp<'a> {
                         let e = self.throw(v);
                         return self.err_flow(e);
                     }
-                    return self.exec_foreach_iter(o.clone(), key, val, body);
+                    return self.exec_foreach_iter(o.clone(), key, val, body, iter_site);
                 }
                 // Plain object: iterate the property table in
                 // declaration order — backed slots plus *virtual* hooked
@@ -1559,14 +1563,20 @@ impl<'a> Interp<'a> {
     }
 
     /// foreach over an Iterator: rewind → valid → current/key → next.
+    /// `iter_site` is the foreach statement's own line — a deferred
+    /// gen-body death cites it for the suspended frame (Zend's FE ops
+    /// carry the header line).
     fn exec_foreach_iter(
         &mut self,
         it: Rc<RefCell<PhpObject>>,
         key: &Option<ForeachKey>,
         val: &ForeachTarget,
         body: &[Stmt],
+        iter_site: usize,
     ) -> Flow {
+        let saved_isite = self.gen_iter_site.replace(iter_site);
         let f = self.exec_foreach_iter_loop(it.clone(), key, val, body);
+        self.gen_iter_site = saved_isite;
         // The iterator's temp dies with the foreach — a `new` captured
         // only by the iteration frees here, not at statement end
         // (typed_properties_115: its prop cells must unalias before a
