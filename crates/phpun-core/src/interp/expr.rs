@@ -2152,8 +2152,24 @@ impl<'a> Interp<'a> {
             _ => false,
         };
         let mut rhs_cell: Option<Cell> = None;
+        // zend binds the ASSIGN_LIST op's delayed CV read at the FIRST
+        // element's line — a multi-line `[\n$a,\n$b\n] = $v` warns at
+        // element 0's line, not the `=` node's.
+        let rhs_site = if pin_rhs {
+            match target {
+                Expr::List(items) => items
+                    .iter()
+                    .flatten()
+                    .next()
+                    .and_then(crate::ast::start_line)
+                    .unwrap_or(aline),
+                _ => aline,
+            }
+        } else {
+            aline
+        };
         let rhs_r = if pin_rhs {
-            let r = self.eval_cv_at(rhs_u, aline);
+            let r = self.eval_cv_at(rhs_u, rhs_site);
             if list_byref {
                 // The pinned CV is a bare Var/folded varvar — grab
                 // its live cell too so `&` elements write-fetch
