@@ -1327,6 +1327,14 @@ pub(crate) fn php_unserialize(
                 }
                 return Ok(this);
             }
+            // The `previous` mirror key: whichever base throwable class
+            // declared it on this object — `\0Error\0previous` on
+            // Errors, `\0Exception\0previous` elsewhere.
+            let prev_key: &[u8] = if it.obj_implements(&obj, "error") {
+                b"\0Error\0previous"
+            } else {
+                b"\0Exception\0previous"
+            };
             for _ in 0..n {
                 let k = php_unserialize_key(s, pos)?;
                 // `i:` prop keys land as plain string-name props —
@@ -1374,12 +1382,15 @@ pub(crate) fn php_unserialize(
                 let mut ob = obj.borrow_mut();
                 // A Throwable's `previous` lives in the exception
                 // internal (getPrevious reads it, not the prop slot)
-                // — zend's C-field mirrors the serialized
-                // `\0Exception\0previous` member.
+                // — zend's C-field mirrors the serialized member the
+                // base class declared. Match the raw key: a demangled
+                // compare would let a subclass-private, protected, or
+                // plain `previous` prop clobber the real chain (and
+                // order-dependently null it out).
                 if let Some(crate::value::ObjectInternal::Exception { previous, .. }) =
                     &mut ob.internal
                 {
-                    if plain == b"previous" {
+                    if ks.as_ref() == prev_key {
                         *previous = match &*v.borrow() {
                             Value::Object(o) => Some(Value::Object(o.clone())),
                             _ => None,
