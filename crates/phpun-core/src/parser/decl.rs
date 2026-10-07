@@ -1344,12 +1344,6 @@ impl<'a> Parser<'a> {
         let params = self.params()?;
         // Anonymous-class methods report just `class@anonymous` in this
         // notice; named classes report `Cls::m`.
-        let owner = if self.cur_class == "class@anonymous" {
-            "class@anonymous".to_string()
-        } else {
-            format!("{}::{}", self.cur_class, name)
-        };
-        self.opt_before_required(&params, &owner, line);
         let ret = if self.eat_op(":") {
             self.take_type()?
         } else {
@@ -1563,36 +1557,6 @@ impl<'a> Parser<'a> {
             true
         } else {
             false
-        }
-    }
-
-    /// Zend compile-time Deprecated for an optional param declared
-    /// before a required one: one notice per offending param, naming
-    /// the last required param (`opt2($a=1, $b=2, $c)` flags both $a
-    /// and $b, each "before required parameter $c").
-    pub(in crate::parser) fn opt_before_required(
-        &mut self,
-        params: &[Param],
-        owner: &str,
-        line: usize,
-    ) {
-        let Some(ri) = params
-            .iter()
-            .rposition(|p| p.default.is_none() && !p.variadic)
-        else {
-            return;
-        };
-        for p in &params[..ri] {
-            if p.default.is_some() {
-                self.deprecations.push((
-                    format!(
-                        "{owner}(): Optional parameter ${} declared before required parameter ${} is implicitly treated as a required parameter",
-                        p.name, params[ri].name
-                    ),
-                    line,
-                    self.pos,
-                ));
-            }
         }
     }
 
@@ -1820,7 +1784,6 @@ impl<'a> Parser<'a> {
         if self.fn_nest == 0 {
             self.declared_funcs.insert(name.to_lowercase());
         }
-        self.opt_before_required(&params, &name, line);
         // Return type declarations (: int).
         let ret = if self.eat_op(":") {
             self.take_type()?

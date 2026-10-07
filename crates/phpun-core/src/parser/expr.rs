@@ -45,7 +45,6 @@ impl<'a> Parser<'a> {
             Some(parent) => format!("{{closure:{}():{}}}", parent, line),
             None => format!("{{closure:{}:{}}}", '\u{1}', line),
         };
-        self.opt_before_required(&params, &clo_name, line);
         if !arrow && self.ident_is("use") {
             self.pos += 1;
             self.expect_op("(")?;
