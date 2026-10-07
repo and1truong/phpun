@@ -547,7 +547,8 @@ impl<'a> Interp<'a> {
                             }
                             CondFold::Unfolded(u) => {
                                 sites.push((
-                                    Self::inner_end_line(u)
+                                    self.unfold_tail_site(u, subj_site)
+                                        .or_else(|| Self::inner_end_line(u))
                                         .or_else(|| Self::marked_line(u))
                                         .or_else(|| Self::inner_end_line(c))
                                         .or_else(|| Self::marked_line(c))
@@ -584,6 +585,7 @@ impl<'a> Interp<'a> {
                         // compiled end (their stamped zval); unfolded
                         // conds at their own end line. MATCH_ERROR
                         // sites at the last compare op's lineno.
+                        let scanned = sites.get(ci).is_some();
                         let (cl, operand) = sites.get(ci).copied().unwrap_or_else(|| {
                             (
                                 Self::inner_end_line(c)
@@ -601,22 +603,31 @@ impl<'a> Interp<'a> {
                         // the subject's. Any other cond emits its own
                         // ops first — its warnings precede the bind.
                         let cu = Self::unmark_rhs(operand);
-                        let (cv, svv) = if sv.is_none() && Self::is_cv(cu) {
-                            let svv = self.eval_cv_at(subj_u, cl)?;
-                            let cv = self.eval(operand)?;
-                            (cv, svv)
+                        // The const scan ran on this cond: its folded
+                        // leaves carry the subject-end stamp, so ops
+                        // inside the operand site by the tail rule.
+                        let prev_stamp = self.scan_stamp.take();
+                        if scanned {
+                            self.scan_stamp = Some(subj_site);
+                        }
+                        let pair = if sv.is_none() && Self::is_cv(cu) {
+                            self.eval_cv_at(subj_u, cl)
+                                .and_then(|svv| self.eval(operand).map(|cv| (cv, svv)))
                         } else {
-                            let cv = self.eval(operand)?;
-                            // A deferred CV subject is read inside THIS
-                            // compare op — a fresh read each time
-                            // (zend's CV operand binds per op: warns
-                            // per cond line).
-                            let svv = match &sv {
-                                Some(sv) => sv.clone(),
-                                None => self.eval_cv_at(subj_u, cl)?,
-                            };
-                            (cv, svv)
+                            self.eval(operand).and_then(|cv| {
+                                // A deferred CV subject is read inside
+                                // THIS compare op — a fresh read each
+                                // time (zend's CV operand binds per op:
+                                // warns per cond line).
+                                let svv = match &sv {
+                                    Some(sv) => Ok(sv.clone()),
+                                    None => self.eval_cv_at(subj_u, cl),
+                                };
+                                svv.map(|svv| (cv, svv))
+                            })
                         };
+                        self.scan_stamp = prev_stamp;
+                        let (cv, svv) = pair?;
                         crate::value::clear_cmp_depth_err();
                         // ZEND_CASE_STRICT (TMP|VAR subjects) is
                         // noncommutative — subject stays left; CONST|CV
@@ -1881,6 +1892,84 @@ impl<'a> Interp<'a> {
         match self.eval_const(e) {
             Ok(v) => CondFold::Folded(v),
             Err(_) => CondFold::Unfolded(e),
+        }
+    }
+
+    /// Where CG(zend_lineno) stands after zend finishes compiling an
+    /// UNFOLDED match/switch cond: each `zend_compile_expr` stamps it
+    /// to the node's own line, so the last visited node wins — the
+    /// rightmost leaf in zend's compile order. A leaf the const scan
+    /// folded to a zval carries the subject-end stamp (`subj_site`);
+    /// a literal or runtime leaf keeps its own line. `X ?? null` and
+    /// `$a + null` end on the folded `null` (the stamp), `(1+2) + $a`
+    /// ends on `$a` (a runtime read at its own line).
+    pub(in crate::interp) fn unfold_tail_site(
+        &mut self,
+        e: &Expr,
+        subj_site: usize,
+    ) -> Option<usize> {
+        match self.cond_fold(e) {
+            CondFold::Folded(_) => Some(subj_site),
+            CondFold::Literal(le, _) => {
+                Self::marked_line(le).or_else(|| Self::inner_end_line(le))
+            }
+            CondFold::Unfolded(inner) => match Self::unmark_rhs(inner) {
+                Expr::Binary { r, .. } => self.unfold_tail_site(r, subj_site),
+                Expr::Ternary { f, .. } => self.unfold_tail_site(f, subj_site),
+                Expr::Assign { value, .. } => self.unfold_tail_site(value, subj_site),
+                Expr::Paren(i)
+                | Expr::PreInc(i)
+                | Expr::PreDec(i)
+                | Expr::PostInc(i)
+                | Expr::PostDec(i)
+                | Expr::Print(i)
+                | Expr::Clone(i)
+                | Expr::Unpack(i)
+                | Expr::Fcc(i)
+                | Expr::Throw(i)
+                | Expr::YieldFrom(i)
+                | Expr::Empty(i)
+                | Expr::ByRef(i)
+                | Expr::Unary { e: i, .. }
+                | Expr::Cast { e: i, .. } => self.unfold_tail_site(i, subj_site),
+                Expr::Call { args, site, .. }
+                | Expr::MethodCall { args, site, .. }
+                | Expr::StaticCall { args, site, .. }
+                | Expr::StaticCallDyn { args, site, .. }
+                | Expr::New { args, site, .. } => match args.last() {
+                    Some(a) => self.unfold_tail_site(a, subj_site).or(Some(*site)),
+                    None => Some(*site),
+                },
+                // FETCH_DIM emits after the dim's ops (a delayed CV
+                // container binds inside it) — the dim is the tail.
+                Expr::Index { e: arr, i } => i
+                    .as_deref()
+                    .and_then(|d| self.unfold_tail_site(d, subj_site))
+                    .or_else(|| self.unfold_tail_site(arr, subj_site)),
+                Expr::ArrayLit(items) => items
+                    .iter()
+                    .rev()
+                    .find_map(|(_, v)| self.unfold_tail_site(v, subj_site)),
+                Expr::Isset(args) => args
+                    .last()
+                    .and_then(|a| self.unfold_tail_site(a, subj_site)),
+                Expr::Yield { key, val } => val
+                    .as_deref()
+                    .and_then(|v| self.unfold_tail_site(v, subj_site))
+                    .or_else(|| {
+                        key.as_deref()
+                            .and_then(|k| self.unfold_tail_site(k, subj_site))
+                    }),
+                Expr::Prop { name, site, .. } => match name {
+                    PropName::Expr(i) => {
+                        self.unfold_tail_site(i, subj_site).or(Some(*site))
+                    }
+                    _ => Some(*site),
+                },
+                _ => Self::marked_line(e)
+                    .or_else(|| Self::inner_end_line(e))
+                    .or_else(|| Self::inner_end_line(inner)),
+            },
         }
     }
 
@@ -4901,7 +4990,13 @@ impl<'a> Interp<'a> {
             };
             if let Some(rn) = r_name {
                 let r_u = Self::unmark_rhs(r);
-                let op = Self::cv_site_of(r, r_u).unwrap_or(self.cur_line);
+                let op = match self.scan_stamp {
+                    Some(stamp) => self
+                        .unfold_tail_site(r, stamp)
+                        .or_else(|| Self::cv_site_of(r, r_u))
+                        .unwrap_or(self.cur_line),
+                    None => Self::cv_site_of(r, r_u).unwrap_or(self.cur_line),
+                };
                 self.cur_line = op;
                 self.send_line = Some(op);
                 let lv = match c {
@@ -4915,6 +5010,15 @@ impl<'a> Interp<'a> {
                 return Ok((lv, rv));
             }
             let rv = self.eval(r)?;
+            if let Some(stamp) = self.scan_stamp {
+                // A scanned match/switch cond: the op stamps at
+                // CG(zend_lineno) after the right operand's compile —
+                // a folded leaf there carries the subject-end stamp.
+                if let Some(l2) = self.unfold_tail_site(r, stamp) {
+                    self.cur_line = l2;
+                    self.send_line = Some(l2);
+                }
+            }
             let lv = match c {
                 Some(c) => c.borrow().clone(),
                 None => self.var_get(&n)?,

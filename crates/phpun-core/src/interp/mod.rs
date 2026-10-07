@@ -370,6 +370,12 @@ pub struct Interp<'a> {
     /// marker-stripped value root is a folded VarVar; consumed by the
     /// VarVar eval arm.
     pub(in crate::interp) vv_rhs_site: Option<usize>,
+    /// The match/switch subject's compiled-end line while a scanned
+    /// (unfolded) cond evaluates — zend stamped every const-scan
+    /// folded leaf with it, so each op in the cond takes its line
+    /// from its rightmost leaf (`unfold_tail_site` instead of the
+    /// operand's own first-token line). `None` outside the scan.
+    pub(in crate::interp) scan_stamp: Option<usize>,
     /// Source line of the innermost call currently dispatching — Zend
     /// sites a pushed frame at the call's own line (the DO_FCALL op
     /// line: callee-name/`(` token for `f(...)`, member-name for
@@ -883,6 +889,7 @@ impl<'a> Interp<'a> {
             in_handler: false,
             cur_line: 1,
             vv_rhs_site: None,
+            scan_stamp: None,
             send_line: None,
             gen_sink: None,
             pending_gen_captures: Vec::new(),

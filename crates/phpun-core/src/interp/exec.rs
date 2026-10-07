@@ -272,7 +272,8 @@ impl<'a> Interp<'a> {
                         }
                         CondFold::Unfolded(u) => {
                             sites.push((
-                                Self::inner_end_line(u)
+                                self.unfold_tail_site(u, subj_site)
+                                    .or_else(|| Self::inner_end_line(u))
                                     .or_else(|| Self::marked_line(u))
                                     .or_else(|| Self::inner_end_line(ce))
                                     .or_else(|| Self::marked_line(ce))
@@ -298,6 +299,7 @@ impl<'a> Interp<'a> {
                 for (i, (c, _)) in cases.iter().enumerate() {
                     match c {
                         Some(ce) => {
+                            let scanned = sites.get(ci).is_some();
                             let (cl, operand) = sites.get(ci).copied().unwrap_or_else(|| {
                                 (
                                     Self::inner_end_line(ce)
@@ -315,28 +317,31 @@ impl<'a> Interp<'a> {
                                 // its warn follows the subject's bind.
                                 // Other cases emit their ops first.
                                 let cu = Self::unmark_rhs(operand);
-                                let (v, cvv) = if cv.is_none() && Self::is_cv(cu) {
-                                    let cvv = match self.eval_cv_at(cond_u, cl) {
-                                        Ok(v) => v,
-                                        Err(e) => return self.err_flow(e),
-                                    };
-                                    match self.eval(operand) {
-                                        Ok(v) => (v, cvv),
-                                        Err(e) => return self.err_flow(e),
-                                    }
+                                // The const scan ran on this case: its
+                                // folded leaves carry the subject-end
+                                // stamp, so ops inside the operand site
+                                // by the tail rule.
+                                let prev_stamp = self.scan_stamp.take();
+                                if scanned {
+                                    self.scan_stamp = Some(subj_site);
+                                }
+                                let pair = if cv.is_none() && Self::is_cv(cu) {
+                                    self.eval_cv_at(cond_u, cl).and_then(|cvv| {
+                                        self.eval(operand).map(|v| (v, cvv))
+                                    })
                                 } else {
-                                    let v = match self.eval(operand) {
-                                        Ok(v) => v,
-                                        Err(e) => return self.err_flow(e),
-                                    };
-                                    let cvv = match &cv {
-                                        Some(cv) => cv.clone(),
-                                        None => match self.eval_cv_at(cond_u, cl) {
-                                            Ok(v) => v,
-                                            Err(e) => return self.err_flow(e),
-                                        },
-                                    };
-                                    (v, cvv)
+                                    self.eval(operand).and_then(|v| {
+                                        let cvv = match &cv {
+                                            Some(cv) => Ok(cv.clone()),
+                                            None => self.eval_cv_at(cond_u, cl),
+                                        };
+                                        cvv.map(|cvv| (v, cvv))
+                                    })
+                                };
+                                self.scan_stamp = prev_stamp;
+                                let (v, cvv) = match pair {
+                                    Ok(p) => p,
+                                    Err(e) => return self.err_flow(e),
                                 };
                                 // ZEND_CASE (TMP|VAR subjects) is
                                 // noncommutative — subject stays
