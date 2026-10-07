@@ -467,11 +467,15 @@ impl<'a> Parser<'a> {
         self.expect_op(")")?;
         self.expect_op("{")?;
         let mut arms = Vec::new();
+        // The last arm-result's final token line — zend stamps an
+        // empty `[]` result's INIT_ARRAY there.
+        let mut tail = 0usize;
         while !self.at_op("}") {
             if self.eat_ident("default") {
                 self.expect_op("=>")?;
                 let rl = self.line();
                 let r = self.expr()?;
+                tail = self.prev_line();
                 arms.push(MatchArm {
                     conds: Vec::new(),
                     result: Self::markline(r, rl),
@@ -488,6 +492,7 @@ impl<'a> Parser<'a> {
                 self.expect_op("=>")?;
                 let rl = self.line();
                 let r = self.expr()?;
+                tail = self.prev_line();
                 arms.push(MatchArm {
                     conds,
                     result: Self::markline(r, rl),
@@ -495,10 +500,12 @@ impl<'a> Parser<'a> {
             }
             self.eat_op(",");
         }
+        let close = self.line();
         self.expect_op("}")?;
         Ok(Expr::Match {
             subject: Box::new(Self::markline(subject, sl)),
             arms,
+            end: if tail == 0 { close } else { tail },
         })
     }
 
@@ -1069,11 +1076,18 @@ impl<'a> Parser<'a> {
         while self.eat_op(".") {
             let rline = self.line();
             let r = self.bit_or()?;
+            // The reduce lookahead — zend_ast_create_concat_op stamps
+            // a parse-time-folded concat's zval at the token following
+            // the last operand.
+            let tail = self.line();
             e = Expr::Binary {
                 op: ".",
                 l: Box::new(Self::markline(e, lline)),
                 r: Box::new(Self::markline(r, rline)),
             };
+            if crate::ast::zval_lit(&e) {
+                e = Self::markline(e, tail);
+            }
         }
         Ok(e)
     }

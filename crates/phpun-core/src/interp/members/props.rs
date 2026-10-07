@@ -372,7 +372,7 @@ impl<'a> Interp<'a> {
                 .iter()
                 .flatten()
                 .any(|e| Self::expr_uses_this_prop(e, pn)),
-            Expr::Match { subject, arms } => {
+            Expr::Match { subject, arms, .. } => {
                 Self::expr_uses_this_prop(subject, pn)
                     || arms.iter().any(|a| {
                         a.conds.iter().any(|c| Self::expr_uses_this_prop(c, pn))

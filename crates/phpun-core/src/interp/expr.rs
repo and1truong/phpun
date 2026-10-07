@@ -419,7 +419,7 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
-            Expr::Match { subject, arms } => {
+            Expr::Match { subject, arms, .. } => {
                 // zend compiles the subject once, then const-scans the
                 // conds L→R (`can_match_use_jumptable` — the same scan
                 // that picks the MATCH jumptable): each foldable cond

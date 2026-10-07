@@ -494,7 +494,7 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
 
-            Expr::Match { subject, arms } => {
+            Expr::Match { subject, arms, .. } => {
                 Self::flow_expr(subject, sc)?;
                 for a in arms {
                     for c in &a.conds {

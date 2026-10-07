@@ -435,6 +435,9 @@ pub enum Expr {
     Match {
         subject: Box<Expr>,
         arms: Vec<MatchArm>,
+        /// Line of the last arm-result's final token — zend stamps an
+        /// empty `[]` result's lone INIT_ARRAY at its `]`.
+        end: usize,
     },
     /// `function (params) use ($a, &$b) { body }` / `fn() => expr`.
     Closure(ClosureExpr),
@@ -595,10 +598,22 @@ pub fn end_line(e: &Expr) -> Option<usize> {
             op: "argline",
             l,
             r,
-        } => end_line(r).or_else(|| match l.as_ref() {
-            Expr::Int(n) => Some(*n as usize),
-            _ => None,
-        }),
+        } => match r.as_ref() {
+            // A parse-time-folded concat's zval stamps at the reduce
+            // lookahead — the mark records that token's line.
+            Expr::Binary {
+                op: ".",
+                l: cl,
+                r: cr,
+            } if zval_lit(cl) && zval_lit(cr) => match l.as_ref() {
+                Expr::Int(n) => Some(*n as usize),
+                _ => end_line(r),
+            },
+            _ => end_line(r).or_else(|| match l.as_ref() {
+                Expr::Int(n) => Some(*n as usize),
+                _ => None,
+            }),
+        },
         Expr::Binary { r, .. } => end_line(r),
         Expr::Ternary { f, .. } => end_line(f),
         Expr::Prop { name, site, .. } => match name {
@@ -637,11 +652,42 @@ pub fn end_line(e: &Expr) -> Option<usize> {
             .rev()
             .find_map(|i| i.as_ref())
             .and_then(end_line),
-        // A match expr's compiled end is its last arm's result — zend
-        // emits each arm's compare+result in source order, so the
-        // post-eval lineno is the last result's own end.
-        Expr::Match { arms, .. } => arms.last().and_then(|a| end_line(&a.result)),
+        // A match expr's compiled end is its last arm's result. A
+        // parse-time-folded concat already carries its following-token
+        // stamp on its argline mark; `[]`'s lone INIT_ARRAY stamps at
+        // the `]` token instead of an element line.
+        Expr::Match { arms, end, .. } => match arms.last() {
+            Some(arm) if matches!(unmarked(&arm.result), Expr::ArrayLit(items) if items.is_empty()) => {
+                Some(*end)
+            }
+            _ => arms.last().and_then(|a| end_line(&a.result)),
+        },
         _ => None,
+    }
+}
+
+/// Marks transparent to a node's shape — `argline`, parens and by-ref
+/// wrappers — so a folded literal under them is still seen.
+fn unmarked(mut e: &Expr) -> &Expr {
+    loop {
+        e = match e {
+            Expr::Paren(inner) | Expr::ByRef(inner) => inner,
+            Expr::Binary {
+                op: "argline", r, ..
+            } => r,
+            _ => return e,
+        };
+    }
+}
+
+/// A literal-string-shaped concat operand — zend's parse-time
+/// `zend_ast_create_concat_op` folds these into one zval.
+pub(crate) fn zval_lit(e: &Expr) -> bool {
+    match unmarked(e) {
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) => true,
+        Expr::Interp(parts) => parts.iter().all(|p| matches!(p, StringPart::Lit(_))),
+        Expr::Binary { op: ".", l, r } => zval_lit(l) && zval_lit(r),
+        _ => false,
     }
 }
 

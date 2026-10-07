@@ -145,7 +145,7 @@ impl<'a> Interp<'a> {
             Expr::ArrayLit(items) => items.iter().any(|(k, v)| {
                 k.as_ref().is_some_and(Self::expr_contains_yield) || Self::expr_contains_yield(v)
             }),
-            Expr::Match { subject, arms } => {
+            Expr::Match { subject, arms, .. } => {
                 Self::expr_contains_yield(subject)
                     || arms.iter().any(|a| {
                         a.conds.iter().any(Self::expr_contains_yield)
