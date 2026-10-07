@@ -4991,29 +4991,45 @@ impl<'a> Interp<'a> {
                         && !o.borrow().props.contains_key(&pn)
                         && self.find_method_in(&cls, "__get").is_none()
                     {
-                        // A DECLARED prop the scope can't see is
-                        // `Cannot access private/protected property`,
-                        // not a dynamic-prop materialization
-                        // (closure_038/closure_039).
-                        if let Some(e) = self.hidden_decl_error(o, &pn) {
-                            return self.fail(e);
+                        // ARRAY_AS_PROPS: an undeclared prop reads the
+                        // storage hash — a missing bucket warns
+                        // 'Undefined array key' like spl's
+                        // read_property (gh18304).
+                        if self.aap_active(o) {
+                            let arr = self.ao_state(o).0;
+                            let v = arr.borrow().get(&ArrKey::Str(Rc::from(pn.as_str())));
+                            match v {
+                                Some(v) => v,
+                                None => {
+                                    self.warn(&format!("Undefined array key \"{}\"", pn))?;
+                                    Value::Null
+                                }
+                            }
+                        } else {
+                            // A DECLARED prop the scope can't see is
+                            // `Cannot access private/protected property`,
+                            // not a dynamic-prop materialization
+                            // (closure_038/closure_039).
+                            if let Some(e) = self.hidden_decl_error(o, &pn) {
+                                return self.fail(e);
+                            }
+                            let cn = o.borrow().class.name().to_string();
+                            if self.dyn_prop_deprecated(o, &pn, &pn) {
+                                self.deprecated(&format!(
+                                    "Creation of dynamic property {}::${} is deprecated",
+                                    cn, pn
+                                ))?;
+                            }
+                            self.warn(&format!("Undefined property: {}::${}", cn, pn))?;
+                            let mut ob = o.borrow_mut();
+                            if !ob.prop_order.contains(&pn) {
+                                ob.prop_order.push(pn.clone());
+                            }
+                            ob.props
+                                .entry(pn.clone())
+                                .or_insert_with(|| cell(Value::Null));
+                            Value::Null
                         }
-                        let cn = o.borrow().class.name().to_string();
-                        if self.dyn_prop_deprecated(o, &pn, &pn) {
-                            self.deprecated(&format!(
-                                "Creation of dynamic property {}::${} is deprecated",
-                                cn, pn
-                            ))?;
-                        }
-                        self.warn(&format!("Undefined property: {}::${}", cn, pn))?;
-                        let mut ob = o.borrow_mut();
-                        if !ob.prop_order.contains(&pn) {
-                            ob.prop_order.push(pn.clone());
-                        }
-                        ob.props
-                            .entry(pn.clone())
-                            .or_insert_with(|| cell(Value::Null));
-                        Value::Null
                     } else {
                         self.prop_read_loose(target)?
                     }
