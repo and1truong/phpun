@@ -2071,6 +2071,11 @@ impl<'a> Interp<'a> {
                     };
                     let kv = key.as_ref().map(|c| c.borrow().clone());
                     let off = self.str_offset_key(kv.as_ref())?;
+                    if self.detached_dim {
+                        // Dead string — zend bails before the
+                        // assign-op refusal and the byte splice.
+                        return Ok(Value::Null);
+                    }
                     // `??=` writes like `=` once the offset shows
                     // unset — only real compound ops are refused.
                     if op != "=" && op != "??=" {
@@ -4228,6 +4233,13 @@ impl<'a> Interp<'a> {
                         self.cur_line,
                     ));
                 }
+                if self.detached_dim {
+                    // assign_to_string_offset's GC_DELREF bail: the
+                    // separated string died inside the offset's
+                    // diagnostics — value checks and the write never
+                    // run (str_offset_006's rebound-container NULL).
+                    return Ok(Value::Null);
+                }
                 let mut bytes = {
                     let b = c.borrow();
                     match &*b {
@@ -4999,9 +5011,14 @@ impl<'a> Interp<'a> {
                 // bad keys throw 'on string' TypeErrors or the []
                 // Error before the byte splice runs.
                 let off = self.str_offset_key(key.as_ref())?;
-                if let OffWrite::Stored(_) = self.str_offset_write(&mut bytes, off, &v)? {
-                    *arr_cell.borrow_mut() =
-                        Value::str(String::from_utf8_lossy(&bytes).into_owned());
+                // Dead separated string — bail after the key
+                // diagnostics like zend's GC_DELREF check.
+                if !self.detached_dim {
+                    if let OffWrite::Stored(_) = self.str_offset_write(&mut bytes, off, &v)?
+                    {
+                        *arr_cell.borrow_mut() =
+                            Value::str(String::from_utf8_lossy(&bytes).into_owned());
+                    }
                 }
             }
             _ => {
@@ -5260,12 +5277,14 @@ impl<'a> Interp<'a> {
                                 _ => Vec::new(),
                             };
                             let off = self.str_offset_key(key.as_ref())?;
-                            if let OffWrite::Stored(_) =
-                                self.str_offset_write(&mut bytes, off, &v)?
-                            {
-                                let mut b = bc.borrow_mut();
-                                if let Value::Str(s) = &mut *b {
-                                    *s = bytes.into();
+                            if !self.detached_dim {
+                                if let OffWrite::Stored(_) =
+                                    self.str_offset_write(&mut bytes, off, &v)?
+                                {
+                                    let mut b = bc.borrow_mut();
+                                    if let Value::Str(s) = &mut *b {
+                                        *s = bytes.into();
+                                    }
                                 }
                             }
                             Ok(())

@@ -24,17 +24,24 @@ impl<'a> Interp<'a> {
         while i < stmts.len() {
             let s = &stmts[i];
             i += 1;
-            // memory_limit fires between statements (bug45392).
+            // memory_limit fires between statements (bug45392); zend
+            // counts heap growth (bucket/object emallocs) alongside
+            // emitted bytes, and attaches the live call stack like a
+            // runtime E_ERROR.
             let limit = self.ini_bytes("memory_limit");
-            if limit > 0 && self.mem_used as i64 > limit {
+            let used = self.mem_used + crate::value::alloc_bytes();
+            if limit > 0 && used as i64 > limit {
                 self.mem_exceeded = true;
-                return self.err_flow(PhpError::fatal(
+                let tried = crate::value::alloc_last().max(self.mem_last).max(1);
+                let mut e = PhpError::fatal(
                     format!(
                         "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
-                        limit, self.mem_last
+                        limit, tried
                     ),
                     self.cur_line,
-                ));
+                );
+                e.trace = Some(self.fatal_frames());
+                return self.err_flow(e);
             }
             if let Some(d) = self.deadline {
                 if std::time::Instant::now() > d {

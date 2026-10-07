@@ -3524,6 +3524,7 @@ impl<'a> Interp<'a> {
 
     /// Wrap a PhpObject in Rc and assign its handle id.
     pub fn alloc_obj(&mut self, o: PhpObject) -> Rc<RefCell<PhpObject>> {
+        crate::value::charge_alloc(crate::value::OBJ_ALLOC);
         let rc = Rc::new(RefCell::new(o));
         let id = self.next_obj_id(&rc);
         rc.borrow_mut().id = id;

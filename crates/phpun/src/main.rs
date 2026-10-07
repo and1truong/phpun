@@ -61,6 +61,14 @@ fn run_script(args: &[String]) -> ExitCode {
                 i += 1;
                 continue;
             }
+            // `-n`/`--no-php-ini`: phpun never reads a php.ini, so the
+            // flag only selects ini defaults — zend's built-in
+            // log_errors is off (CLI SAPI logs nothing to stderr).
+            "-n" | "--no-php-ini" => {
+                ini.push("log_errors=0".to_string());
+                i += 1;
+                continue;
+            }
             s if s.starts_with("-d") => {
                 ini.push(s[2..].to_string());
                 i += 1;

@@ -319,13 +319,14 @@ pub(crate) fn dispatch(
             if k == "memory_limit" {
                 it.ini.insert(k.clone(), v);
                 let lim = it.ini_bytes(&k);
-                if lim > 0 && (it.mem_used as i64) > lim {
+                let used = it.mem_used + crate::value::alloc_bytes();
+                if lim > 0 && (used as i64) > lim {
                     let _ = it
                         .ini
                         .insert(k.clone(), prev.clone().unwrap_or_else(|| "-1".into()));
                     it.warn_pub(&format!(
                         "Failed to set memory limit to {} bytes (Current memory usage is {} bytes)",
-                        lim, it.mem_used
+                        lim, used
                     ))?;
                     return Ok(Some(match prev {
                         Some(p) => Value::str(p),

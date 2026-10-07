@@ -2,6 +2,32 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+/// zend counts every emalloc against memory_limit — not just output.
+/// Heap growth (array buckets, object handles) charges this process
+/// counter; the between-statements check adds it to emitted bytes.
+static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static ALLOC_LAST: AtomicU64 = AtomicU64::new(0);
+
+/// Approximate bytes zend would have emalloc'd for one array bucket
+/// (bucket + zval + cell) or one object (zend_object + handle +
+/// properties table).
+pub const ARR_ELEM_ALLOC: u64 = 48;
+pub const OBJ_ALLOC: u64 = 256;
+
+pub fn charge_alloc(n: u64) {
+    ALLOC_LAST.store(n, AtomicOrdering::Relaxed);
+    ALLOC_BYTES.fetch_add(n, AtomicOrdering::Relaxed);
+}
+
+pub fn alloc_bytes() -> u64 {
+    ALLOC_BYTES.load(AtomicOrdering::Relaxed)
+}
+
+pub fn alloc_last() -> u64 {
+    ALLOC_LAST.load(AtomicOrdering::Relaxed)
+}
 
 /// PHP arrays are insertion-ordered maps. Keys normalize per PHP rules:
 /// `"8"` → 8, `"08"` stays string, `8.5` → 8, `true` → 1, `null` → "".
@@ -72,12 +98,14 @@ impl PhpArray {
         self.entries
             .push((ArrKey::Int(self.next), Rc::new(RefCell::new(v))));
         self.next += 1;
+        charge_alloc(ARR_ELEM_ALLOC);
     }
 
     /// Append an existing cell (by-ref variadics alias their args).
     pub fn push_cell(&mut self, c: Cell) {
         self.entries.push((ArrKey::Int(self.next), c));
         self.next += 1;
+        charge_alloc(ARR_ELEM_ALLOC);
     }
 
     /// Insert or update; returns the displaced slot (in-place writes
@@ -118,6 +146,7 @@ impl PhpArray {
         } else {
             self.entries.push((k, c));
         }
+        charge_alloc(ARR_ELEM_ALLOC);
         None
     }
 
@@ -135,6 +164,7 @@ impl PhpArray {
             Some(std::mem::replace(&mut slot.1, c))
         } else {
             self.entries.push((k, c));
+            charge_alloc(ARR_ELEM_ALLOC);
             None
         }
     }
