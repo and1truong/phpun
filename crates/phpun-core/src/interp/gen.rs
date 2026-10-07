@@ -892,6 +892,87 @@ impl<'a> Interp<'a> {
         Err(e)
     }
 
+    /// Release the gen's suspended frame when the consumer's cursor
+    /// proved the body done (`pos >= items`): Zend frees execute_data
+    /// inside the resume that exhausts the stream, so the CVs' decref
+    /// — locals' `__destruct`, held gens' own teardown — lands in
+    /// this call's output window.
+    fn gen_release_exhausted(&mut self, state: &Rc<RefCell<GenState>>) -> Result<(), PhpError> {
+        let done = {
+            let st = state.borrow();
+            st.pos >= st.items.len()
+        };
+        if !done {
+            return Ok(());
+        }
+        let cells = {
+            let st = state.borrow();
+            let mut fin = st.fin_q.borrow_mut();
+            std::mem::take(&mut fin.suspended)
+        };
+        self.gen_release_cells(cells)
+    }
+
+    /// Decref the suspended frame's CVs the way Zend's execute_data
+    /// teardown does — in CV order, each cell's value dies when the
+    /// frame's last ref to it drops: a `__destruct` runs, and a gen
+    /// internal releases into its own destruction replay at its own
+    /// slot (interleaved with the plain locals' destructors).
+    pub(in crate::interp) fn gen_release_cells(
+        &mut self,
+        cells: Vec<(String, Cell)>,
+    ) -> Result<(), PhpError> {
+        if cells.is_empty() {
+            return Ok(());
+        }
+        // Per-object count of the released cells — a value dies when
+        // the frame's LAST cell holding it decrefs.
+        let mut remaining: HashMap<usize, usize> = HashMap::new();
+        for (_, c) in &cells {
+            if let Value::Object(o) = &*c.borrow() {
+                *remaining.entry(Rc::as_ptr(o) as usize).or_insert(0) += 1;
+            }
+        }
+        let mut terminal = None;
+        for (_, c) in cells {
+            let obj = match &*c.borrow() {
+                Value::Object(o) => Some(o.clone()),
+                _ => None,
+            };
+            drop(c);
+            let Some(o) = obj else { continue };
+            let key = Rc::as_ptr(&o) as usize;
+            let Some(r) = remaining.get_mut(&key) else {
+                continue;
+            };
+            *r -= 1;
+            if *r != 0 {
+                continue;
+            }
+            remaining.remove(&key);
+            // `o` is the accounting clone — dies with the frame iff
+            // nothing outside it still holds the value.
+            if Rc::strong_count(&o) != 1 {
+                continue;
+            }
+            let fq = match &o.borrow().internal {
+                Some(ObjectInternal::Generator(st)) => Some(st.borrow().fin_q.clone()),
+                _ => None,
+            };
+            let e = match fq {
+                Some(q) => self.gen_fin_replay(&q, false),
+                None => self.destruct_dying_value(&Value::Object(o)).err(),
+            };
+            if terminal.is_none() {
+                terminal = e;
+            }
+        }
+        match terminal {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// The resume-stack frames for a deferred body death: the gen fn
     /// ran as an internal call (`[internal function]: g()`), invoked
     /// from `Generator->{method}()` at the consumer's call site,
@@ -1132,6 +1213,10 @@ impl<'a> Interp<'a> {
                     p
                 };
                 self.gen_flush_out(&state, pos);
+                // Crossing the body's end frees its suspended frame —
+                // Zend frees execute_data inside the resume that
+                // exhausts the gen.
+                self.gen_release_exhausted(&state)?;
                 self.gen_raise_deferred(&state, "next", &args.cells)?;
                 Ok(Some(Value::Null))
             }
@@ -1186,7 +1271,7 @@ impl<'a> Interp<'a> {
                     // The re-run replays the prefix the consumer
                     // already echoed — suppress its bytes (Zend only
                     // produces the resume segment).
-                    self.gen_replay_horizon = Some(prev_pos);
+                    self.gen_replay_horizon = Some((prev_pos, state.clone()));
                     let r = self.gen_start(&state);
                     self.gen_replay_horizon = None;
                     r?;
@@ -1203,6 +1288,7 @@ impl<'a> Interp<'a> {
                 }
                 let pos = state.borrow().pos;
                 self.gen_flush_out(&state, pos);
+                self.gen_release_exhausted(&state)?;
                 self.gen_raise_deferred(&state, "send", &args.cells)?;
                 let st = state.borrow();
                 Ok(Some(
@@ -1281,7 +1367,7 @@ impl<'a> Interp<'a> {
                 self.gen_throws_fired.clear();
                 // The re-run replays the prefix the consumer already
                 // echoed — suppress its bytes like a send() re-run.
-                self.gen_replay_horizon = Some(prev);
+                self.gen_replay_horizon = Some((prev, state.clone()));
                 let r = self.gen_start(&state);
                 self.gen_replay_horizon = None;
                 r?;
@@ -1293,10 +1379,14 @@ impl<'a> Interp<'a> {
                     // finally output, then bounce the throwable out
                     // of this call.
                     let fq = state.borrow().fin_q.clone();
-                    let fin = std::mem::take(&mut *fq.borrow_mut());
+                    let mut fin = std::mem::take(&mut *fq.borrow_mut());
                     let pos = fin.pos;
                     fq.borrow_mut().finished = true;
                     self.gen_fin_bytes(&fin, pos);
+                    // The force-close frees the suspended frame's CVs
+                    // right after the finally chain (locals' __destruct
+                    // runs, held gens release into their own teardown).
+                    self.gen_release_cells(std::mem::take(&mut fin.suspended))?;
                     let mut st = state.borrow_mut();
                     st.finished = true;
                     st.closed = true;
@@ -1317,6 +1407,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 self.gen_flush_out(&state, prev + 1);
+                self.gen_release_exhausted(&state)?;
                 self.gen_raise_deferred(&state, "throw", &args.cells)?;
                 Ok(Some(
                     state

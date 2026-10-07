@@ -425,11 +425,13 @@ pub struct Interp<'a> {
     /// a force-close surfaces it at destruction (not the resume).
     /// Saved/restored at gen_start like the other gen-run slots.
     gen_fin_err: bool,
-    /// send()'s re-run horizon: the body replays with the new send
-    /// queued, and output belonging to yields the consumer already
-    /// observed (tag < horizon) is suppressed — Zend's lazy resume
-    /// produces only post-resume bytes.
-    gen_replay_horizon: Option<usize>,
+    /// send()'s/throw()'s re-run horizon: the body replays with the
+    /// new send/throw queued, and output belonging to yields the
+    /// consumer already observed (tag < horizon) is suppressed —
+    /// Zend's lazy resume produces only post-resume bytes. Scoped to
+    /// the re-running gen's own frames — a nested gen's run shares
+    /// the interpreter, not the horizon.
+    gen_replay_horizon: Option<(usize, Rc<RefCell<crate::value::GenState>>)>,
     /// A `yield from` snapshots the inner gen's destruction journal
     /// right after its start (before the drain prunes it) so the
     /// splice can merge it into the OUTER gen's journal — inner+outer
@@ -1993,24 +1995,25 @@ impl<'a> Interp<'a> {
     /// to drop runs its __destruct now — Zend's behavior at function
     /// exit and exception unwind (bug52361).
     fn destruct_frame_objs(&mut self, f: &Frame) -> Result<(), PhpError> {
+        let mut cells: Vec<Cell> = f.vars.values().cloned().collect();
+        cells.extend(f.args.iter().cloned());
+        if let Some(o) = &f.this_obj {
+            cells.push(cell(Value::Object(o.clone())));
+        }
+        self.destruct_cells(&cells)
+    }
+
+    /// `destruct_frame_objs` over a bare cell list — the suspended
+    /// generator frame's stashed CVs decref the same way when its
+    /// execute_data is freed.
+    pub(in crate::interp) fn destruct_cells(&mut self, cells: &[Cell]) -> Result<(), PhpError> {
         let mut held: HashMap<usize, (usize, Rc<RefCell<PhpObject>>)> = HashMap::new();
-        let mut tally = |c: &Cell| {
+        for c in cells {
             if let Value::Object(o) = &*c.borrow() {
                 held.entry(Rc::as_ptr(o) as usize)
                     .or_insert_with(|| (0, o.clone()))
                     .0 += 1;
             }
-        };
-        for c in f.vars.values() {
-            tally(c);
-        }
-        for c in f.args.iter() {
-            tally(c);
-        }
-        if let Some(o) = &f.this_obj {
-            held.entry(Rc::as_ptr(o) as usize)
-                .or_insert_with(|| (0, o.clone()))
-                .0 += 1;
         }
         for (_, (n, o)) in held {
             // +1 for the `o` clone sitting in `held` itself.
@@ -2607,7 +2610,7 @@ impl<'a> Interp<'a> {
                 .unwrap_or(0);
             // send()'s re-run replays the prefix the consumer already
             // observed — its output must not echo twice.
-            if self.gen_replay_horizon.is_some_and(|k| done <= k) {
+            if self.gen_horizon_suppresses(done) {
                 return;
             }
             if done > 0 {
@@ -2908,6 +2911,23 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Whether a re-run's prefix suppression covers the current emit:
+    /// only the re-running gen's own frames replay the consumer-seen
+    /// prefix — a nested gen's body (created inside the re-run, run
+    /// by its own gen_start) emits and journals normally.
+    pub(in crate::interp) fn gen_horizon_suppresses(&self, done: usize) -> bool {
+        match &self.gen_replay_horizon {
+            Some((k, tgt)) => {
+                done <= *k
+                    && self
+                        .gen_run_state
+                        .as_ref()
+                        .is_some_and(|s| Rc::ptr_eq(s, tgt))
+            }
+            None => false,
+        }
+    }
+
     /// Zend destroys a suspended generator by running the finally
     /// chains of the try-regions enclosing its suspension point. The
     /// eager body already buffered those bytes plus the markers a
@@ -2998,15 +3018,27 @@ impl<'a> Interp<'a> {
     /// delegation chain's queued finally output (innermost level
     /// first) and return the level's own terminal raise — the
     /// `yield`-inside-`finally` fatal or the body's `finally`-region
-    /// death.
+    /// death. The suspended frame's CVs decref last — Zend frees
+    /// execute_data after the finally chain, so locals' `__destruct`
+    /// and held gens' own teardown land here, not in the body's
+    /// (already-past) output window.
     pub(in crate::interp) fn gen_fin_replay(
         &mut self,
         q: &crate::value::FinQueue,
         at_unit_end: bool,
     ) -> Option<PhpError> {
-        let fin = std::mem::take(&mut *q.borrow_mut());
+        if q.borrow().suppressed {
+            // Re-run artifact — the displaced incarnation's close is
+            // bookkeeping, not a real generator destruction.
+            return None;
+        }
+        let mut fin = std::mem::take(&mut *q.borrow_mut());
         let pos = fin.pos;
-        self.gen_fin_emit(&fin, pos, at_unit_end)
+        let terminal = self.gen_fin_emit(&fin, pos, at_unit_end);
+        let dtor = self
+            .gen_release_cells(std::mem::take(&mut fin.suspended))
+            .err();
+        terminal.or(dtor)
     }
 
     /// Emit a journal's queued bytes for the suspended chain the

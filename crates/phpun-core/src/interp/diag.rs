@@ -118,7 +118,7 @@ impl<'a> Interp<'a> {
                 .as_ref()
                 .map(|s| s.borrow().len())
                 .unwrap_or(0);
-            if self.gen_replay_horizon.is_some_and(|k| done <= k) {
+            if self.gen_horizon_suppresses(done) {
                 return;
             }
             if done > 0 {

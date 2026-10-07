@@ -1731,6 +1731,15 @@ pub struct GenFinData {
     /// since Zend force-closes just the actually-suspended
     /// delegation chain.
     pub delegates: Vec<FinDelegate>,
+    /// (name, cell) pairs of the body's suspended frame in CV order —
+    /// Zend keeps a suspended generator's CVs live in execute_data
+    /// until the frame is freed (force-close, exhaustion,
+    /// destruction), then decrefs them after the finally journal.
+    /// Stashed on the journal because it outlives the dead-weak state.
+    pub suspended: Vec<(String, Cell)>,
+    /// The owner died as a re-run artifact — the resumed incarnation
+    /// displaced this frame — so its destruction replay stays silent.
+    pub suppressed: bool,
 }
 
 /// A delegated `yield from` journal merged into the parent's — its
@@ -1910,6 +1919,15 @@ impl GenState {
     pub fn set_pos(&mut self, pos: usize) {
         self.pos = pos;
         self.fin_q.borrow_mut().set_pos_tree(pos);
+    }
+
+    /// Whether `decl` is this generator's own body — the popped
+    /// frame for that decl is a suspension (its CVs stay live in
+    /// execute_data) rather than a call return.
+    pub fn owns_frame(&self, decl: &crate::ast::FunctionDecl) -> bool {
+        match &self.setup {
+            GenSetup::Invoke { decl: d, .. } => std::ptr::eq(d.as_ref(), decl),
+        }
     }
 }
 

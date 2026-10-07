@@ -162,7 +162,7 @@ impl<'a> Interp<'a> {
                     .unwrap_or(0);
                 // send()'s prefix re-run replays pushes that
                 // already exist — never materialize the dup.
-                let open = if self.gen_replay_horizon.is_some_and(|k| done <= k) {
+                let open = if self.gen_horizon_suppresses(done) {
                     usize::MAX
                 } else {
                     done
