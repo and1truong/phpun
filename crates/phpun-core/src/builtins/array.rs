@@ -1150,24 +1150,13 @@ pub(crate) fn dispatch(
         "compact" => {
             // Missing names warn 'Undefined variable $x' and are
             // skipped; defined-but-null names land in the result.
+            // zend walks args left-to-right, expanding array elements
+            // in place; a self-referential array hits zend's hash
+            // recursion guard — catchable Error 'Recursion detected'.
             let mut out = PhpArray::new();
-            let mut items: Vec<Value> = args.iter().map(|c| c.borrow().clone()).collect();
-            while let Some(v) = items.pop() {
-                match v {
-                    Value::Str(s) => {
-                        let n = crate::value::lossy(&s);
-                        match it.lookup_var(&n) {
-                            Some(v) => out.set(ArrKey::Str(n.into_owned().into()), v),
-                            None => {
-                                it.warn_pub(&format!("compact(): Undefined variable ${}", n))?;
-                            }
-                        }
-                    }
-                    Value::Array(a) => {
-                        items.extend(a.borrow().entries.iter().map(|(_, c)| c.borrow().clone()));
-                    }
-                    _ => {}
-                }
+            let mut active = std::collections::HashSet::new();
+            for c in args {
+                compact_one(it, &c.borrow().clone(), &mut out, &mut active)?;
             }
             Value::Array(Rc::new(RefCell::new(out)))
         }
@@ -1667,6 +1656,48 @@ fn sort_array(
             a.next = i;
         }
         a.iter_pos = 0;
+    }
+    Ok(())
+}
+
+/// `compact` element walk: strings look up scope vars (missing →
+/// 'Undefined variable' warning), arrays expand in place.
+/// `active` tracks arrays mid-expansion — a self-referential element
+/// hits zend's hash-recursion guard ('Recursion detected' Error).
+fn compact_one(
+    it: &mut Interp,
+    v: &Value,
+    out: &mut PhpArray,
+    active: &mut std::collections::HashSet<usize>,
+) -> Result<(), PhpError> {
+    match v {
+        Value::Str(s) => {
+            let n = crate::value::lossy(s);
+            match it.lookup_var(&n) {
+                Some(val) => out.set(ArrKey::Str(n.into_owned().into()), val),
+                None => {
+                    it.warn_pub(&format!("compact(): Undefined variable ${}", n))?;
+                }
+            }
+        }
+        Value::Array(a) => {
+            let id = Rc::as_ptr(a) as usize;
+            if !active.insert(id) {
+                let e = it.exception("Error", "Recursion detected");
+                return Err(it.throw_value(e));
+            }
+            let entries: Vec<Value> = a
+                .borrow()
+                .entries
+                .iter()
+                .map(|(_, c)| c.borrow().clone())
+                .collect();
+            for e in &entries {
+                compact_one(it, e, out, active)?;
+            }
+            active.remove(&id);
+        }
+        _ => {}
     }
     Ok(())
 }
