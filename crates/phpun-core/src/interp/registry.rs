@@ -1149,6 +1149,187 @@ impl<'a> Interp<'a> {
             },
             false,
         );
+        // php_user_filter — the userland stream-filter base class
+        // (user_filters.stub.php). Method bodies stay empty: calls into
+        // the stubs are intercepted in method_invoke so zend's defaults
+        // apply (filter() → PSFS_ERR_FATAL, onCreate() → true, …) and
+        // userland overrides go through normal method dispatch.
+        let uf_method = |name: &str, params: Vec<Param>, ret: Option<Vec<String>>| {
+            Rc::new(MethodDecl {
+                decl: FunctionDecl {
+                    ret,
+                    name: name.into(),
+                    params,
+                    body: vec![],
+                    attrs: vec![],
+                    by_ref: false,
+                    line: 0,
+                    end_line: 0,
+                    file: String::new(),
+                    ns: String::new(),
+                    decl_in: None,
+                },
+                is_static: false,
+                is_abstract: false,
+                is_final: false,
+                visibility: Visibility::Public,
+                trait_alias_of: None,
+            })
+        };
+        let uf_param = |name: &str, ty: Option<Vec<String>>, by_ref: bool| Param {
+            name: name.into(),
+            default: None,
+            ty,
+            by_ref,
+            variadic: false,
+            promoted: false,
+            vis: None,
+            readonly: false,
+            is_final: false,
+            set_vis: None,
+            hooks: None,
+        };
+        reg(
+            ClassDecl {
+                name: "php_user_filter".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: {
+                    let mut ms = vec![
+                        uf_method(
+                            "filter",
+                            vec![
+                                uf_param("in", None, false),
+                                uf_param("out", None, false),
+                                uf_param("consumed", None, true),
+                                uf_param("closing", Some(vec!["bool".into()]), false),
+                            ],
+                            Some(vec!["int".into()]),
+                        ),
+                        uf_method("onCreate", vec![], Some(vec!["bool".into()])),
+                        uf_method("onClose", vec![], Some(vec!["void".into()])),
+                    ];
+                    for m in [
+                        "onFlush",
+                        "onRead",
+                        "onWrite",
+                        "onAppend",
+                        "onPrepend",
+                        "onStart",
+                        "onStop",
+                        "onSeek",
+                        "onSkip",
+                        "onEof",
+                        "onDetach",
+                    ] {
+                        ms.push(uf_method(m, vec![], Some(vec!["bool".into()])));
+                    }
+                    ms
+                },
+                props: vec![
+                    PropDecl {
+                        name: "filtername".into(),
+                        default: Some(Expr::Str("".into())),
+                        is_static: false,
+                        visibility: Visibility::Public,
+                        readonly: false,
+                        ty: None,
+                        is_abstract: false,
+                        is_final: false,
+                        set_vis: None,
+                        decl_in: None,
+                        hooks: None,
+                        attrs: vec![],
+                        line: 0,
+                    },
+                    PropDecl {
+                        name: "params".into(),
+                        default: Some(Expr::Str("".into())),
+                        is_static: false,
+                        visibility: Visibility::Public,
+                        readonly: false,
+                        ty: None,
+                        is_abstract: false,
+                        is_final: false,
+                        set_vis: None,
+                        decl_in: None,
+                        hooks: None,
+                        attrs: vec![],
+                        line: 0,
+                    },
+                    PropDecl {
+                        name: "stream".into(),
+                        default: Some(Expr::Null),
+                        is_static: false,
+                        visibility: Visibility::Public,
+                        readonly: false,
+                        ty: None,
+                        is_abstract: false,
+                        is_final: false,
+                        set_vis: None,
+                        decl_in: None,
+                        hooks: None,
+                        attrs: vec![],
+                        line: 0,
+                    },
+                ],
+                consts: vec![],
+                file: String::new(),
+                line: 0,
+            },
+            false,
+        );
+        // StreamBucket — the object stream_bucket_make_writeable() /
+        // stream_bucket_new() hand to php_user_filter::filter().
+        reg(
+            ClassDecl {
+                name: "StreamBucket".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: false,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: vec![],
+                props: {
+                    let p = |name: &str, default: Option<Expr>, ty: Option<Vec<String>>| PropDecl {
+                        name: name.into(),
+                        default,
+                        is_static: false,
+                        visibility: Visibility::Public,
+                        readonly: false,
+                        ty,
+                        is_abstract: false,
+                        is_final: false,
+                        set_vis: None,
+                        decl_in: None,
+                        hooks: None,
+                        attrs: vec![],
+                        line: 0,
+                    };
+                    vec![
+                        p("bucket", Some(Expr::Null), None),
+                        p("data", None, Some(vec!["string".into()])),
+                        p("datalen", None, Some(vec!["int".into()])),
+                        p("dataLength", None, Some(vec!["int".into()])),
+                    ]
+                },
+                consts: vec![],
+                file: String::new(),
+                line: 0,
+            },
+            false,
+        );
         // Reflection stubs — enough surface for the hooked-prop tests:
         // ReflectionClass::newInstanceWithoutConstructor builds the shell
         // without running __construct; ReflectionProperty::isInitialized
@@ -1989,8 +2170,96 @@ impl<'a> Interp<'a> {
             },
             false,
         );
+        // WeakReference — native dispatch: static_invoke's `create`
+        // and method_invoke's `get` on the WeakRef internal.
+        let weakref_methods = vec![
+            Rc::new(MethodDecl {
+                decl: FunctionDecl {
+                    ret: Some(vec!["WeakReference".into()]),
+                    name: "create".into(),
+                    params: vec![Param {
+                        name: "object".into(),
+                        default: None,
+                        by_ref: false,
+                        variadic: false,
+                        ty: Some(vec!["object".into()]),
+                        promoted: false,
+                        vis: None,
+                        readonly: false,
+                        is_final: false,
+                        set_vis: None,
+                        hooks: None,
+                    }],
+                    body: vec![],
+                    attrs: vec![],
+                    by_ref: false,
+                    line: 0,
+                    end_line: 0,
+                    file: String::new(),
+                    ns: String::new(),
+                    decl_in: None,
+                },
+                is_static: true,
+                is_abstract: false,
+                is_final: false,
+                visibility: Visibility::Public,
+                trait_alias_of: None,
+            }),
+            Rc::new(MethodDecl {
+                decl: FunctionDecl {
+                    ret: Some(vec!["object".into(), "null".into()]),
+                    name: "get".into(),
+                    params: vec![],
+                    body: vec![],
+                    attrs: vec![],
+                    by_ref: false,
+                    line: 0,
+                    end_line: 0,
+                    file: String::new(),
+                    ns: String::new(),
+                    decl_in: None,
+                },
+                is_static: false,
+                is_abstract: false,
+                is_final: false,
+                visibility: Visibility::Public,
+                trait_alias_of: None,
+            }),
+        ];
+        reg(
+            ClassDecl {
+                name: "WeakReference".into(),
+                kind: ClassKind::Class,
+                is_abstract: false,
+                is_final: true,
+                readonly: false,
+                parent: None,
+                implements: vec![],
+                attrs: vec![],
+                traits: vec![],
+                adaptations: vec![],
+                methods: weakref_methods,
+                props: vec![],
+                consts: vec![],
+                file: String::new(),
+                line: 0,
+            },
+            false,
+        );
+        {
+            // ErrorException declares its own 6-arg __construct shape
+            // (severity/filename/line before previous), a `severity`
+            // prop and getSeverity() — the ctor stub reads the class
+            // family to pick the signature.
+            let mut d = throwable_class(
+                "ErrorException",
+                Some("Exception"),
+                &["message", "code", "file", "line", "severity"],
+            );
+            d.methods.push(method("getSeverity", &[]));
+            reg(d, false);
+        }
         for (name, parent) in [
-            ("ErrorException", "Exception"),
             ("RuntimeException", "Exception"),
             ("LogicException", "Exception"),
             ("InvalidArgumentException", "LogicException"),

@@ -3275,6 +3275,40 @@ impl<'a> Interp<'a> {
         rc
     }
 
+    /// `WeakReference::create($obj)` — object holding a weak handle to
+    /// $obj (the WeakRef internal; get() upgrades it). Zend keeps a
+    /// per-handle weakref list: repeated create() on the same live
+    /// target returns the identical wrapper (`===` true).
+    pub(in crate::interp) fn new_weakref(
+        &mut self,
+        target: Rc<RefCell<PhpObject>>,
+    ) -> Result<Value, PhpError> {
+        let target_id = target.borrow().id;
+        if let Some(existing) = self.weakrefs.get(&target_id).and_then(|w| w.upgrade()) {
+            return Ok(Value::Object(existing));
+        }
+        let cls = match self.classes.get("weakreference").cloned() {
+            Some(c) => c,
+            None => {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    "Class \"WeakReference\" not found",
+                    0,
+                ))
+            }
+        };
+        let rc = self.alloc_obj(PhpObject {
+            class: cls,
+            props: HashMap::new(),
+            prop_order: vec![],
+            id: 0,
+            internal: Some(ObjectInternal::WeakRef(Rc::downgrade(&target))),
+            unset_props: std::collections::HashSet::new(),
+        });
+        self.weakrefs.insert(target_id, Rc::downgrade(&rc));
+        Ok(Value::Object(rc))
+    }
+
     /// `new X(args)` — instantiate + call __construct.
     pub(in crate::interp) fn new_instance(
         &mut self,
@@ -3307,6 +3341,13 @@ impl<'a> Interp<'a> {
             return self.fail(PhpError::uncaught(
                 "Error",
                 "Instantiation of class Closure is not allowed",
+                0,
+            ));
+        }
+        if cls.name().eq_ignore_ascii_case("weakreference") {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Direct instantiation of WeakReference is not allowed, use WeakReference::create instead",
                 0,
             ));
         }

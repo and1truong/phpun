@@ -268,6 +268,15 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// get_class() (no args): the executing class scope — the current
+    /// method's DECLARING class, None outside a class context.
+    pub fn executed_scope_name(&self) -> Option<String> {
+        self.stack
+            .last()
+            .and_then(|f| f.scope_class.as_ref().or(f.decl_class.as_ref()).cloned())
+            .map(|c| c.name().to_string())
+    }
+
     /// property_exists(): instance prop declared on the class or any
     /// ancestor (property002).
     pub fn class_has_prop(&self, c: &Rc<PhpClass>, name: &str) -> bool {
@@ -299,6 +308,16 @@ impl<'a> Interp<'a> {
     }
     pub fn warn_pub(&mut self, msg: &str) -> Result<(), PhpError> {
         self.warn(msg)
+    }
+
+    /// Run `f` with diagnostics suppressed — zend's inner stream opens
+    /// (the php://filter wrapper's resource= target) fail silently; the
+    /// wrapper reports the generic failure itself.
+    pub fn silenced_pub<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.silence += 1;
+        let r = f(self);
+        self.silence -= 1;
+        r
     }
 
     /// Backtrace frames (innermost first) for an E_ERROR raised inside a
