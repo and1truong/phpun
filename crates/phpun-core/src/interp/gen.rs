@@ -941,11 +941,19 @@ impl<'a> Interp<'a> {
         }
         let mut terminal = None;
         for (_, c) in cells {
-            // The frame's CV decrefs: the cell's stored value dies,
+            // The frame's CV decrefs: a plain cell's stored value dies,
             // not just this clone — journal snapshots (delegate fins)
             // hold sibling clones of the same cell and must observe
             // the release as Null instead of resurrecting the local.
-            let v = std::mem::replace(&mut *c.borrow_mut(), Value::Null);
+            // An is_ref cell is a shared binding (by-ref yield): the
+            // frame gives up its hold but the referent stays live —
+            // Zend decrefs the CV's reference, it does not null the
+            // referent.
+            let v = if self.is_ref_cell(&c) {
+                c.borrow().clone()
+            } else {
+                std::mem::replace(&mut *c.borrow_mut(), Value::Null)
+            };
             drop(c);
             let obj = match v {
                 Value::Object(o) => Some(o),
