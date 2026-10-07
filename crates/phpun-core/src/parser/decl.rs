@@ -226,8 +226,8 @@ impl<'a> Parser<'a> {
             return Err(expecting(self));
         }
         if nullsafe {
-            return Err(PhpError::compile_fatal(
-                "Can't use nullsafe operator in write context",
+            self.write_ctx_errs.push((
+                "Can't use nullsafe operator in write context".to_string(),
                 self.line(),
             ));
         }
@@ -248,29 +248,31 @@ impl<'a> Parser<'a> {
                     | Expr::New { .. }
             );
             if !writable {
-                self.write_ctx_errs.push(self.line());
+                self.write_ctx_errs.push((
+                    "Cannot use temporary expression in write context".to_string(),
+                    self.line(),
+                ));
             }
         }
         if has_append {
-            return Err(PhpError::compile_fatal(
-                "Cannot use [] for unsetting",
-                self.line(),
-            ));
+            self.write_ctx_errs
+                .push(("Cannot use [] for unsetting".to_string(), self.line()));
         }
         if leaf {
             match &e {
                 Expr::Var(n) if n == "this" => {
-                    return Err(PhpError::compile_fatal("Cannot unset $this", self.line()));
+                    self.write_ctx_errs
+                        .push(("Cannot unset $this".to_string(), self.line()));
                 }
                 Expr::Call { .. } => {
-                    return Err(PhpError::compile_fatal(
-                        "Can't use function return value in write context",
+                    self.write_ctx_errs.push((
+                        "Can't use function return value in write context".to_string(),
                         self.line(),
                     ));
                 }
                 Expr::MethodCall { .. } | Expr::StaticCall { .. } | Expr::StaticCallDyn { .. } => {
-                    return Err(PhpError::compile_fatal(
-                        "Can't use method return value in write context",
+                    self.write_ctx_errs.push((
+                        "Can't use method return value in write context".to_string(),
                         self.line(),
                     ));
                 }
@@ -281,7 +283,7 @@ impl<'a> Parser<'a> {
                         Expr::Call { .. } => "Can't use function return value in write context",
                         _ => "Can't use method return value in write context",
                     };
-                    return Err(PhpError::compile_fatal(msg, self.line()));
+                    self.write_ctx_errs.push((msg.to_string(), self.line()));
                 }
                 _ => {}
             }
@@ -390,12 +392,14 @@ impl<'a> Parser<'a> {
                     }
                 }
                 if Self::has_nullsafe(&e) {
-                    return Err(PhpError::compile_fatal(
-                        if in_list {
-                            "Assignments can only happen to writable values"
-                        } else {
-                            "Can't use nullsafe operator in write context"
-                        },
+                    if in_list {
+                        self.write_ctx_errs.push((
+                            "Assignments can only happen to writable values".to_string(),
+                            self.line(),
+                        ));
+                    }
+                    self.write_ctx_errs.push((
+                        "Can't use nullsafe operator in write context".to_string(),
                         self.line(),
                     ));
                 }
@@ -408,13 +412,27 @@ impl<'a> Parser<'a> {
                     Ok(ForeachTarget::Lvalue(Box::new(e)))
                 }
             }
-            t => Err(PhpError::parse(
-                format!(
-                    "syntax error, unexpected {}, expecting variable",
-                    desc_t(t.as_ref())
-                ),
-                self.line(),
-            )),
+            t => {
+                // `as f()` parses — zend's write-context check then
+                // defers 'Can't use function return value in write
+                // context' past later syntax errors (like any other
+                // write-context violation). Bare idents still die
+                // 'expecting variable'.
+                if matches!(&t, Some(Token::Ident(_)))
+                    && matches!(self.peek(), Some(Token::Op("(")))
+                {
+                    self.pos -= 1;
+                    let e = self.expr()?;
+                    return self.expr_to_foreach_target(e);
+                }
+                Err(PhpError::parse(
+                    format!(
+                        "syntax error, unexpected {}, expecting variable",
+                        desc_t(t.as_ref())
+                    ),
+                    self.line(),
+                ))
+            }
         }
     }
 
@@ -1245,6 +1263,10 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect_op("=")?;
+                    // Value-expr start line — a lazy init Error
+                    // attributes to the expr's own line, not the
+                    // `const` keyword's (p3m multi-line defaults).
+                    let cline = self.line();
                     let cv = self.const_expr()?;
                     // A const name redeclared inside the same class body
                     // is a compile fatal — the body compiles wherever the
@@ -1268,6 +1290,7 @@ impl<'a> Parser<'a> {
                         attrs: member_attrs.clone(),
                         decl_in: None,
                         enum_case: false,
+                        line: cline,
                     });
                     if !self.eat_op(",") {
                         break;
@@ -1395,6 +1418,7 @@ impl<'a> Parser<'a> {
                     attrs: vec![],
                     decl_in: None,
                     enum_case: true,
+                    line: cline,
                 });
                 self.expect_op(";")?;
                 continue;
@@ -1427,7 +1451,9 @@ impl<'a> Parser<'a> {
                         ))
                     }
                 };
+                let mut dline = 0;
                 let default = if self.eat_op("=") {
+                    dline = self.line();
                     Some(self.const_expr()?)
                 } else {
                     None
@@ -1450,6 +1476,7 @@ impl<'a> Parser<'a> {
                     hooks: None,
                     attrs: member_attrs.clone(),
                     line: pline,
+                    dline,
                 });
                 if !self.eat_op(",") {
                     break;

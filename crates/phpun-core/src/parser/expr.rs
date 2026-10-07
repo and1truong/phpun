@@ -228,6 +228,7 @@ impl<'a> Parser<'a> {
                 if self.ident_is("const") {
                     self.pos += 1;
                     loop {
+                        let cline = self.line();
                         let cname = self.ident().unwrap_or_default();
                         self.expect_op("=")?;
                         consts.push(crate::ast::ConstDecl {
@@ -239,6 +240,7 @@ impl<'a> Parser<'a> {
                             attrs: vec![],
                             decl_in: None,
                             enum_case: false,
+                            line: cline,
                         });
                         if !self.eat_op(",") {
                             break;
@@ -272,6 +274,7 @@ impl<'a> Parser<'a> {
                 }
                 if self.ident_is("case") {
                     self.pos += 1;
+                    let cline = self.line();
                     let cname = self.ident().unwrap_or_default();
                     let cv = if self.eat_op("=") {
                         self.expr()?
@@ -287,6 +290,7 @@ impl<'a> Parser<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: cline,
                     });
                     self.expect_op(";")?;
                     continue;
@@ -318,7 +322,9 @@ impl<'a> Parser<'a> {
                             ))
                         }
                     };
+                    let mut dline = 0;
                     let default = if self.eat_op("=") {
+                        dline = self.line();
                         Some(self.expr()?)
                     } else {
                         None
@@ -337,6 +343,7 @@ impl<'a> Parser<'a> {
                         hooks: None,
                         attrs: vec![],
                         line: pline,
+                        dline,
                     });
                     if !self.eat_op(",") {
                         break;
@@ -632,16 +639,18 @@ impl<'a> Parser<'a> {
             _ => None,
         };
         if let Some(k) = callish {
-            return Err(PhpError::compile_fatal(
+            self.write_ctx_errs.push((
                 format!("Can't use {} return value in write context", k),
                 self.line(),
             ));
+            return Ok(());
         }
         if Self::has_nullsafe(e) {
-            return Err(PhpError::compile_fatal(
-                "Can't use nullsafe operator in write context",
+            self.write_ctx_errs.push((
+                "Can't use nullsafe operator in write context".to_string(),
                 self.line(),
             ));
+            return Ok(());
         }
         match e {
             Var(_) | VarVar(_) | StaticProp { .. } => Ok(()),
@@ -655,7 +664,10 @@ impl<'a> Parser<'a> {
                     // Deferred — zend's compile-time check fires only
                     // after the whole file parses, so a later syntax
                     // error wins over it (probe m8).
-                    self.write_ctx_errs.push(self.line());
+                    self.write_ctx_errs.push((
+                        "Cannot use temporary expression in write context".to_string(),
+                        self.line(),
+                    ));
                     Ok(())
                 }
             }
@@ -756,14 +768,8 @@ impl<'a> Parser<'a> {
     /// call/method results die with the return-value fatals, and
     /// everything else (nullsafe chains included) is
     /// `Assignments can only happen to writable values` (p13 l*).
-    pub(in crate::parser) fn list_writable(&self, e: &Expr) -> Result<(), PhpError> {
+    pub(in crate::parser) fn list_writable(&mut self, e: &Expr) -> Result<(), PhpError> {
         use crate::ast::Expr::*;
-        let writable = || {
-            Err(PhpError::compile_fatal(
-                "Assignments can only happen to writable values",
-                self.line(),
-            ))
-        };
         match e {
             Var(_) | VarVar(_) | StaticProp { .. } => Ok(()),
             Paren(inner) | ByRef(inner) => self.list_writable(inner),
@@ -781,23 +787,36 @@ impl<'a> Parser<'a> {
                 }
                 Ok(())
             }
-            Call { .. } | Fcc(_) => Err(PhpError::compile_fatal(
-                "Can't use function return value in write context",
-                self.line(),
-            )),
-            MethodCall { .. } | StaticCall { .. } | StaticCallDyn { .. } => {
-                Err(PhpError::compile_fatal(
-                    "Can't use method return value in write context",
+            Call { .. } | Fcc(_) => {
+                self.write_ctx_errs.push((
+                    "Can't use function return value in write context".to_string(),
                     self.line(),
-                ))
+                ));
+                Ok(())
+            }
+            MethodCall { .. } | StaticCall { .. } | StaticCallDyn { .. } => {
+                self.write_ctx_errs.push((
+                    "Can't use method return value in write context".to_string(),
+                    self.line(),
+                ));
+                Ok(())
             }
             Index { .. } | Prop { .. } => {
                 if Self::has_nullsafe(e) || !Self::writeable_root(e) {
-                    return writable();
+                    self.write_ctx_errs.push((
+                        "Assignments can only happen to writable values".to_string(),
+                        self.line(),
+                    ));
                 }
                 Ok(())
             }
-            _ => writable(),
+            _ => {
+                self.write_ctx_errs.push((
+                    "Assignments can only happen to writable values".to_string(),
+                    self.line(),
+                ));
+                Ok(())
+            }
         }
     }
 
@@ -1502,7 +1521,7 @@ impl<'a> Parser<'a> {
                 | StaticCallDyn { .. }
                 | Fcc(_) => {
                     if write_ctx {
-                        return Err(PhpError::compile_fatal(
+                        self.write_ctx_errs.push((
                             format!(
                                 "Can't use {} return value in write context",
                                 callish(leaf).unwrap_or("function")
@@ -1563,7 +1582,10 @@ impl<'a> Parser<'a> {
                 | Paren(_)
                 | StaticProp { .. } => {}
                 _ => {
-                    self.write_ctx_errs.push(self.line());
+                    self.write_ctx_errs.push((
+                        "Cannot use temporary expression in write context".to_string(),
+                        self.line(),
+                    ));
                 }
             }
             // In write context (foreach `&`) a call-shaped OUTER node
@@ -1575,7 +1597,7 @@ impl<'a> Parser<'a> {
             }
             if write_ctx {
                 if let Some(kind) = kind {
-                    return Err(PhpError::compile_fatal(
+                    self.write_ctx_errs.push((
                         format!("Can't use {} return value in write context", kind),
                         self.line(),
                     ));
@@ -1583,14 +1605,17 @@ impl<'a> Parser<'a> {
             }
         }
         if Self::has_nullsafe(&e) {
-            return Err(PhpError::compile_fatal(
-                if write_ctx {
-                    "Can't use nullsafe operator in write context"
-                } else {
-                    "Cannot take reference of a nullsafe chain"
-                },
-                self.line(),
-            ));
+            if write_ctx {
+                self.write_ctx_errs.push((
+                    "Can't use nullsafe operator in write context".to_string(),
+                    self.line(),
+                ));
+            } else {
+                self.write_ctx_errs.push((
+                    "Cannot take reference of a nullsafe chain".to_string(),
+                    self.line(),
+                ));
+            }
         }
         Ok(e)
     }
@@ -1632,8 +1657,8 @@ impl<'a> Parser<'a> {
             }
         }
         if Self::has_nullsafe(&e) {
-            return Err(PhpError::compile_fatal(
-                "Can't use nullsafe operator in write context",
+            self.write_ctx_errs.push((
+                "Can't use nullsafe operator in write context".to_string(),
                 self.line(),
             ));
         }
@@ -1655,8 +1680,8 @@ impl<'a> Parser<'a> {
         // `$o->m()++` — the ++ targets a method result directly:
         // zend's write-context check rejects it.
         if matches!(&e, MethodCall { .. }) {
-            return Err(PhpError::compile_fatal(
-                "Can't use method return value in write context",
+            self.write_ctx_errs.push((
+                "Can't use method return value in write context".to_string(),
                 self.line(),
             ));
         }
@@ -1682,21 +1707,22 @@ impl<'a> Parser<'a> {
                 | Paren(_)
                 | StaticProp { .. } => {}
                 _ => {
-                    self.write_ctx_errs.push(self.line());
+                    self.write_ctx_errs.push((
+                        "Cannot use temporary expression in write context".to_string(),
+                        self.line(),
+                    ));
                 }
             }
         } else {
             match &e {
                 Var(_) | VarVar(_) | StaticProp { .. } => {}
-                Call { .. } | Fcc(_) => {
-                    return Err(PhpError::compile_fatal(
-                        "Can't use function return value in write context",
-                        self.line(),
-                    ))
-                }
+                Call { .. } | Fcc(_) => self.write_ctx_errs.push((
+                    "Can't use function return value in write context".to_string(),
+                    self.line(),
+                )),
                 MethodCall { .. } | StaticCall { .. } | StaticCallDyn { .. } => {
-                    return Err(PhpError::compile_fatal(
-                        "Can't use method return value in write context",
+                    self.write_ctx_errs.push((
+                        "Can't use method return value in write context".to_string(),
                         self.line(),
                     ))
                 }

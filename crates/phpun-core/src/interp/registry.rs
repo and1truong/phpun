@@ -45,6 +45,7 @@ impl<'a> Interp<'a> {
                         hooks: None,
                         attrs: vec![],
                         line: 0,
+                        dline: 0,
                     })
                     .collect(),
                 consts: vec![],
@@ -473,6 +474,7 @@ impl<'a> Interp<'a> {
             attrs: vec![],
             decl_in: None,
             enum_case: false,
+            line: 0,
         };
         reg(
             ClassDecl {
@@ -601,6 +603,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "FETCH_NUM".into(),
@@ -611,6 +614,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "FETCH_BOTH".into(),
@@ -621,6 +625,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "FETCH_OBJ".into(),
@@ -631,6 +636,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "ATTR_ERRMODE".into(),
@@ -641,6 +647,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "ATTR_DEFAULT_FETCH_MODE".into(),
@@ -651,6 +658,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "ATTR_EMULATE_PREPARES".into(),
@@ -661,6 +669,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "ERRMODE_SILENT".into(),
@@ -671,6 +680,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "ERRMODE_WARNING".into(),
@@ -681,6 +691,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "ERRMODE_EXCEPTION".into(),
@@ -691,6 +702,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_STR".into(),
@@ -701,6 +713,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_INT".into(),
@@ -711,6 +724,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_BOOL".into(),
@@ -721,6 +735,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_NULL".into(),
@@ -731,6 +746,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_LOB".into(),
@@ -741,6 +757,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                 ],
                 file: String::new(),
@@ -867,6 +884,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "ARRAY_AS_PROPS".into(),
@@ -877,6 +895,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                 ],
                 file: String::new(),
@@ -1143,6 +1162,7 @@ impl<'a> Interp<'a> {
                     attrs: vec![],
                     decl_in: None,
                     enum_case: false,
+                    line: 0,
                 }],
                 file: String::new(),
                 line: 0,
@@ -1373,6 +1393,7 @@ impl<'a> Interp<'a> {
                     attrs: vec![],
                     decl_in: None,
                     enum_case: false,
+                    line: 0,
                 })
                 .collect(),
                 file: String::new(),
@@ -1500,6 +1521,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_FUNCTION".into(),
@@ -1510,6 +1532,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_METHOD".into(),
@@ -1520,6 +1543,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_PROPERTY".into(),
@@ -1530,6 +1554,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_CLASS_CONSTANT".into(),
@@ -1540,6 +1565,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_PARAMETER".into(),
@@ -1550,6 +1576,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_ALL".into(),
@@ -1560,6 +1587,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "IS_REPEATABLE".into(),
@@ -1570,6 +1598,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                 ],
                 file: String::new(),
@@ -1990,6 +2019,7 @@ impl<'a> Interp<'a> {
                 hooks: None,
                 attrs: vec![],
                 line: 0,
+                dline: 0,
             })
             .collect();
             reg(d, false);

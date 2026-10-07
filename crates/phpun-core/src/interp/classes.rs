@@ -194,6 +194,7 @@ impl<'a> Interp<'a> {
                             hooks: p.hooks.clone(),
                             attrs: vec![],
                             line: 0,
+                            dline: 0,
                         });
                     }
                 }
@@ -1295,7 +1296,7 @@ impl<'a> Interp<'a> {
             .unwrap_or_default();
         let old = std::mem::replace(&mut self.globals.ns, ns);
         let f = self.cur_file.clone();
-        let r = self.eval_decl_const(e, &f);
+        let r = self.eval_decl_const(e, &f, 0);
         self.globals.ns = old;
         r
     }
@@ -2767,7 +2768,7 @@ impl<'a> Interp<'a> {
             // Compile-time values: fatal now. Runtime values (define'd
             // consts, `new`) defer to the access-time TypeError below.
             if is_compile_const(&cd.value) {
-                if let Ok(v) = self.eval_decl_const(&cd.value, &d.file) {
+                if let Ok(v) = self.eval_decl_const(&cd.value, &d.file, cd.line) {
                     if !self.const_ty_accepts(ty, &v, &d.name) {
                         let tn = self.zval_type_name(&v);
                         return Err(PhpError::fatal(
@@ -2804,7 +2805,11 @@ impl<'a> Interp<'a> {
                 self.check_ty_redundant(ty, &ctx)?;
                 if let Some(def) = &pd.default {
                     if is_compile_const(def) {
-                        if let Ok(v) = self.eval_decl_const(def, &d.file) {
+                        if let Ok(v) = self.eval_decl_const(
+                            def,
+                            &d.file,
+                            if pd.dline > 0 { pd.dline } else { pd.line },
+                        ) {
                             // `= null` on a non-nullable prop needs `?T`
                             // (typed_properties_015).
                             if matches!(v, Value::Null)
@@ -2999,7 +3004,7 @@ impl<'a> Interp<'a> {
                 // inside the decl (Enum::MAPPING) resolves correctly.
                 let old = self.const_self.replace(c.clone());
                 self.class_const_ctx += 1;
-                let r = self.eval_decl_const(&cd.value, &file);
+                let r = self.eval_decl_const(&cd.value, &file, cd.line);
                 self.class_const_ctx -= 1;
                 self.const_self = old;
                 let v = r?;
@@ -3036,7 +3041,7 @@ impl<'a> Interp<'a> {
             // 'no parent' catchable Error like any class scope.
             let old = ecls.map(|c| self.const_self.replace(c));
             self.class_const_ctx += 1;
-            let r = self.eval_decl_const(&cd.value, &file);
+            let r = self.eval_decl_const(&cd.value, &file, cd.line);
             self.class_const_ctx -= 1;
             if let Some(o) = old {
                 self.const_self = o;
@@ -3674,7 +3679,11 @@ impl<'a> Interp<'a> {
                     Some(d) => {
                         let old = self.const_self.replace(c.clone());
                         self.class_const_ctx += 1;
-                        let r = self.eval_decl_const(d, &c.decl.file);
+                        let r = self.eval_decl_const(
+                            d,
+                            &c.decl.file,
+                            if p.dline > 0 { p.dline } else { p.line },
+                        );
                         self.class_const_ctx -= 1;
                         self.const_self = old;
                         r?

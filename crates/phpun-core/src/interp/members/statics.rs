@@ -352,6 +352,21 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        // First-access class init resolves the constants table ahead of
+        // static defaults: `B::$s`/`new B` evaluate `const C = <expr>`
+        // decls first, so a failing const reports ITS decl line even on
+        // a static-prop access (p3j/p3n).
+        for cd in &cls.decl.consts {
+            if cd.enum_case {
+                continue;
+            }
+            let old = self.const_self.replace(cls.clone());
+            self.class_const_ctx += 1;
+            let r = self.eval_decl_const(&cd.value, &cls.decl.file, cd.line);
+            self.class_const_ctx -= 1;
+            self.const_self = old;
+            r?;
+        }
         for p in &cls.decl.props {
             if !p.is_static {
                 continue;
@@ -360,7 +375,11 @@ impl<'a> Interp<'a> {
                 Some(d) => {
                     let old = self.const_self.replace(cls.clone());
                     self.class_const_ctx += 1;
-                    let v = self.eval_decl_const(d, &cls.decl.file);
+                    let v = self.eval_decl_const(
+                        d,
+                        &cls.decl.file,
+                        if p.dline > 0 { p.dline } else { p.line },
+                    );
                     self.class_const_ctx -= 1;
                     self.const_self = old;
                     // Gate/const errors are real fatals (e.g. a
@@ -944,7 +963,7 @@ impl<'a> Interp<'a> {
                 for cd in &c.consts {
                     if cd.name == name {
                         self.class_const_ctx += 1;
-                        let r = self.eval_decl_const(&cd.value, &c.file);
+                        let r = self.eval_decl_const(&cd.value, &c.file, cd.line);
                         self.class_const_ctx -= 1;
                         return match r {
                             Ok(v) => self.const_apply_ty(cd, &c.name, v),
@@ -991,7 +1010,7 @@ impl<'a> Interp<'a> {
                     }
                     let old = self.const_self.replace(c.clone());
                     self.class_const_ctx += 1;
-                    let r = self.eval_decl_const(&cd.value, &c.decl.file);
+                    let r = self.eval_decl_const(&cd.value, &c.decl.file, cd.line);
                     self.class_const_ctx -= 1;
                     self.const_self = old;
                     return match r {
@@ -1019,7 +1038,7 @@ impl<'a> Interp<'a> {
                         let old = self.const_self.replace(cls.clone());
                         self.class_const_ctx += 1;
                         let r = self
-                            .eval_decl_const(&cd.value, &c.file)
+                            .eval_decl_const(&cd.value, &c.file, cd.line)
                             .and_then(|v| self.const_apply_ty(cd, &c.name, v));
                         self.class_const_ctx -= 1;
                         self.const_self = old;

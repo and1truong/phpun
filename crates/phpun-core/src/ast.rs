@@ -176,6 +176,10 @@ pub struct ConstDecl {
     pub decl_in: Option<String>,
     /// `case` member of an enum — materializes a singleton case object.
     pub enum_case: bool,
+    /// Declaration line — lazy const-init errors attribute to the
+    /// declaring file at this line (zend reports the const's own line,
+    /// not the resolution site).
+    pub line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +211,9 @@ pub struct PropDecl {
     pub attrs: Vec<AttrDecl>,
     /// Source line of the declaration.
     pub line: usize,
+    /// Line of the default-value expr's first token (lazy-init Errors
+    /// attribute there); 0 = same as `line`.
+    pub dline: usize,
 }
 
 /// One `get`/`set` hook on a hooked property (Zend/tests/property_hooks).

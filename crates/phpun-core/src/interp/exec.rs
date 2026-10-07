@@ -552,17 +552,11 @@ impl<'a> Interp<'a> {
                             if self.stack.is_empty() {
                                 if let Some(arr) = self.globals_arr.clone() {
                                     let ak = ArrKey::Str(Rc::from(n.as_str()));
-                                    if self.in_handler {
-                                        if let Some(ec) = arr.borrow().get_cell(&ak) {
-                                            self.touch_write(&ec);
-                                        }
-                                    }
                                     arr.borrow_mut().unset(&ak);
                                 }
                                 self.globals_synced.remove(n);
                             }
                             if let Some(c) = self.cur().vars.remove(n) {
-                                self.touch_write(&c);
                                 // Removing the last handle runs
                                 // __destruct immediately — for a
                                 // Callable that also decrefs its bound
@@ -715,13 +709,12 @@ impl<'a> Interp<'a> {
                         e.trace = Some(self.compile_err_frames());
                         return self.err_flow(e);
                     }
-                    // A `const X = <expr>` initializer is zend's
-                    // constant expression — Errors raised inside it
-                    // get the `[constant expression]()` pseudo-frame
-                    // and eval'd-code caller attribution (probe m9).
-                    self.class_const_ctx += 1;
+                    // A top-level `const X = <expr>` decl evaluates its
+                    // initializer eagerly in {main} — zend only enters
+                    // the lazy const-expr context (its `[constant
+                    // expression]()` pseudo-frame) for class-init
+                    // exprs (prop/static/class-const), not here.
                     let v = self.eval_const(e);
-                    self.class_const_ctx -= 1;
                     match v {
                         Ok(v) => self.define_const(n, v),
                         Err(e) => return self.err_flow(e),

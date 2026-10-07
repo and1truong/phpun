@@ -276,6 +276,11 @@ pub struct Interp<'a> {
     /// (prop/const/param defaults, attr args): __FILE__/__DIR__ bind to
     /// the declaring file, not the accessing file.
     decl_file_ctx: Option<String>,
+    /// (file, line) of the lazy class-const/prop/static decl currently
+    /// evaluating — an uncaught Error from inside it attributes to the
+    /// declaration site (zend reports the decl's own file+line, with
+    /// the [constant expression] pseudo-frame pointing at resolution).
+    const_decl_ctx: Option<(String, u32)>,
     /// Headers queued by header()/setcookie() — `phpun serve` emits them
     /// into the HTTP response; CLI ignores them (like php-cli).
     pub out_headers: Vec<String>,
@@ -389,19 +394,14 @@ pub struct Interp<'a> {
     pub script_args: Vec<String>,
     exception_handler: Option<Value>,
     in_handler: bool,
-    /// Cells written while an error handler ran — zend binds a dim
-    /// write's container slot BEFORE the dim key evaluates, so a
-    /// handler that reassigns the container leaves the pending write
-    /// on the stale slot: invisible and silent (assign_dim_014). The
-    /// stored Rcs pin the allocations so a freed cell's address can't
-    /// recycle into a false hit.
-    handler_writes: std::collections::HashMap<usize, Cell>,
-    /// Cells read while an error handler ran — a prior read links the
-    /// binding, so a later write stays on the live slot.
-    handler_reads: std::collections::HashMap<usize, Cell>,
-    /// The current dim write is detached (see `handler_writes`) —
-    /// offset-key conversions stay silent.
+    /// The current dim write is detached — a handler mid-key-eval
+    /// rebound or mutated the container, so the pending write lands on
+    /// the stale slot: invisible and silent (assign_dim_014).
     detached_dim: bool,
+    /// Inside `unset()`: null dim keys convert to "" without the
+    /// 'Using null as an array offset' deprecation (zend's UNSET_DIM
+    /// maps IS_NULL silently — float/resource/illegal still diagnose).
+    unset_ctx: bool,
     /// Dim-key conversions already emitted for this assign op — zend
     /// casts each dim operand once: the compound read, the write gate
     /// and the write itself reuse it without re-warning (`.=`/`|=`
@@ -410,6 +410,16 @@ pub struct Interp<'a> {
     /// `(cell, ArrKey)` keeps the Rc alive so a dropped cell's address
     /// can't be reused and mis-key a later conversion (ABA).
     dim_key_conv: std::collections::HashMap<usize, (Cell, ArrKey)>,
+    /// Per-dim-op CV-key bindings — zend reads each CV operand once
+    /// per op, so `$a[$u] += v` warns 'Undefined variable' once even
+    /// though the bound cell feeds both the read and the write
+    /// (`??=` is two ops: its assign pass re-reads the CV).
+    dim_cv_bound: HashMap<String, Cell>,
+    /// Dim operand cells bound to a fresh Null by an UNDEFINED var —
+    /// zend keeps them IS_UNDEF so a later fetch's CV re-read warns
+    /// again (`??=`'s ASSIGN_DIM is a second fetch). Reset with the
+    /// other dim-op caches.
+    dim_undef_cells: std::collections::HashSet<usize>,
     /// Current line estimate for error messages (best-effort).
     pub cur_line: usize,
     /// Active generator body's yield collector — `Expr::Yield` pushes
@@ -901,6 +911,7 @@ impl<'a> Interp<'a> {
             err_buf: String::new(),
             live_io: false,
             decl_file_ctx: None,
+            const_decl_ctx: None,
             out_headers: Vec::new(),
             resp_code: 200,
             last_json_error: 0,
@@ -930,10 +941,11 @@ impl<'a> Interp<'a> {
             script_args: Vec::new(),
             exception_handler: None,
             in_handler: false,
-            handler_writes: std::collections::HashMap::new(),
-            handler_reads: std::collections::HashMap::new(),
             detached_dim: false,
+            unset_ctx: false,
             dim_key_conv: std::collections::HashMap::new(),
+            dim_undef_cells: std::collections::HashSet::new(),
+            dim_cv_bound: HashMap::new(),
             cur_line: 1,
             gen_sink: None,
             pending_gen_captures: Vec::new(),
@@ -1082,13 +1094,27 @@ impl<'a> Interp<'a> {
 
     /// eval_const for a decl-attached expr (prop/const/param default):
     /// __FILE__/__DIR__ inside resolve to the declaring file.
-    fn eval_decl_const(&mut self, e: &Expr, decl_file: &str) -> Result<Value, PhpError> {
+    fn eval_decl_const(
+        &mut self,
+        e: &Expr,
+        decl_file: &str,
+        decl_line: usize,
+    ) -> Result<Value, PhpError> {
         if decl_file.is_empty() {
             return self.eval_const(e);
         }
         let old = self.decl_file_ctx.replace(decl_file.to_string());
+        let old_ctx = if decl_line > 0 {
+            self.const_decl_ctx
+                .replace((decl_file.to_string(), decl_line as u32))
+        } else {
+            None
+        };
         let r = self.eval_const(e);
         self.decl_file_ctx = old;
+        if decl_line > 0 {
+            self.const_decl_ctx = old_ctx;
+        }
         r
     }
 
@@ -2149,10 +2175,9 @@ impl<'a> Interp<'a> {
         self.ob_stack.clear();
         self.silence = 0;
         self.isset_quiet = 0;
-        self.handler_writes.clear();
-        self.handler_reads.clear();
         self.detached_dim = false;
         self.dim_key_conv.clear();
+        self.dim_undef_cells.clear();
         self.pending_exception = None;
         self.call_trace.clear();
         self.deadline = None;
@@ -2282,26 +2307,6 @@ impl<'a> Interp<'a> {
         Some(c)
     }
 
-    /// Record a read of `c` while an error handler runs — a prior read
-    /// links the binding for zend's pending-write semantics.
-    pub(crate) fn touch_read(&mut self, c: &Cell) {
-        if self.in_handler {
-            self.handler_reads.insert(Rc::as_ptr(c) as usize, c.clone());
-        }
-    }
-
-    /// Record a write of `c` while an error handler runs — a write
-    /// without a prior read detaches any pending dim write whose
-    /// container was this cell.
-    pub(crate) fn touch_write(&mut self, c: &Cell) {
-        if self.in_handler {
-            let p = Rc::as_ptr(c) as usize;
-            if !self.handler_reads.contains_key(&p) {
-                self.handler_writes.insert(p, c.clone());
-            }
-        }
-    }
-
     /// Does the variable name resolve to an existing cell?
     fn var_lookup(&mut self, name: &str) -> Option<Cell> {
         let r = if self.stack.is_empty() {
@@ -2316,9 +2321,6 @@ impl<'a> Interp<'a> {
                 .cloned()
                 .or_else(|| self.superglobal_cell(name))
         };
-        if let Some(c) = &r {
-            self.touch_read(c);
-        }
         r
     }
 
@@ -2338,11 +2340,9 @@ impl<'a> Interp<'a> {
         // still sitting in vars (unset($GLOBALS['x'])).
         if self.stack.is_empty() {
             if let Some(c) = self.global_var_cell(name) {
-                self.touch_read(&c);
                 return Ok(c.borrow().clone());
             }
             if let Some(c) = self.superglobal_cell(name) {
-                self.touch_read(&c);
                 return Ok(c.borrow().clone());
             }
             if !self.is_quiet() {
@@ -2352,15 +2352,9 @@ impl<'a> Interp<'a> {
         }
         let found = self.cur().vars.get(name).cloned();
         match found {
-            Some(c) => {
-                self.touch_read(&c);
-                Ok(c.borrow().clone())
-            }
+            Some(c) => Ok(c.borrow().clone()),
             None => match self.superglobal_cell(name) {
-                Some(c) => {
-                    self.touch_read(&c);
-                    Ok(c.borrow().clone())
-                }
+                Some(c) => Ok(c.borrow().clone()),
                 None => {
                     // Inside any function frame, a missing $this is a
                     // hard "Using $this when not in object context"
@@ -2491,7 +2485,6 @@ impl<'a> Interp<'a> {
     fn var_set(&mut self, name: &str, v: Value) {
         match self.var_cell_opt(name) {
             Some(c) => {
-                self.touch_write(&c);
                 *c.borrow_mut() = v;
             }
             None => {
@@ -2509,7 +2502,6 @@ impl<'a> Interp<'a> {
     fn var_set_gated(&mut self, name: &str, v: Value, strict: bool) -> Result<(), PhpError> {
         match self.var_cell_opt(name) {
             Some(c) => {
-                self.touch_write(&c);
                 let nv = self.typed_slot_store_mode(&c, v, strict)?;
                 *c.borrow_mut() = nv;
                 Ok(())
@@ -3129,7 +3121,16 @@ impl<'a> Interp<'a> {
         Ok(out)
     }
 
+    #[track_caller]
     fn fail<T>(&mut self, e: PhpError) -> Result<T, PhpError> {
+        if std::env::var("PHPUN_DBG_FAIL").is_ok() {
+            eprintln!(
+                "FAIL@{}: {:?} {:?}",
+                std::panic::Location::caller(),
+                e.kind,
+                e.message
+            );
+        }
         self.last_err_file = self.diag_file();
         if let ErrorKind::Uncaught { class } = e.kind {
             // Errors raised mid-const-expr get a pseudo-frame for the
@@ -3180,20 +3181,17 @@ impl<'a> Interp<'a> {
                     if let Some(m) = &e.display_msg {
                         *full_msg = m.clone();
                     }
-                    // A const-expr Error inside eval'd code attributes
-                    // to the CALLER file + the eval string's own line —
-                    // the `FILE(N) : eval()'d code` composite only
-                    // shows in trace frames (probe m9).
-                    if self.class_const_ctx > 0 && self.cur_file.contains("eval()'d code") {
-                        let caller = self
-                            .cur_file
-                            .strip_suffix(" : eval()'d code")
-                            .and_then(|s| s.rsplit_once('('))
-                            .map(|(f, _)| f.to_string())
-                            .unwrap_or_else(|| self.cur_file.clone());
-                        *file = caller;
-                        *line = self.cur_line as u32;
-                        *thrown = self.cur_line as u32;
+                    // A lazy class-const/prop/static init Error
+                    // attributes to the DECL site (zend reports the
+                    // decl's own file+line — the `FILE(N) : eval()'d
+                    // code` composite included — while the pseudo-frame
+                    // keeps the resolution site).
+                    if self.class_const_ctx > 0 {
+                        if let Some((df, dl)) = &self.const_decl_ctx {
+                            *file = df.clone();
+                            *line = *dl;
+                            *thrown = *dl;
+                        }
                     }
                 }
             }

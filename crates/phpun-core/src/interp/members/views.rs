@@ -873,7 +873,11 @@ impl<'a> Interp<'a> {
                                 Some(d) => {
                                     let old = self.const_self.replace(c.clone());
                                     self.class_const_ctx += 1;
-                                    let r = self.eval_decl_const(d, &c.decl.file);
+                                    let r = self.eval_decl_const(
+                                        d,
+                                        &c.decl.file,
+                                        if p.dline > 0 { p.dline } else { p.line },
+                                    );
                                     self.class_const_ctx -= 1;
                                     self.const_self = old;
                                     match r {
@@ -969,7 +973,7 @@ impl<'a> Interp<'a> {
                                     Some(sc) => self.const_self.replace(sc.clone()),
                                     None => self.const_self.take(),
                                 };
-                                let r = self.eval_decl_const(de, &decl_file);
+                                let r = self.eval_decl_const(de, &decl_file, 0);
                                 self.const_self = old;
                                 match r {
                                     Ok(v) => {
@@ -2136,7 +2140,7 @@ impl<'a> Interp<'a> {
                             .get(&cn.to_lowercase())
                             .map(|c| self.const_self.replace(c.clone()));
                         self.class_const_ctx += 1;
-                        let r = self.eval_decl_const(&cd.value, &f);
+                        let r = self.eval_decl_const(&cd.value, &f, cd.line);
                         self.class_const_ctx -= 1;
                         if let Some(o) = old {
                             self.const_self = o;

@@ -3961,7 +3961,7 @@ impl<'a> Interp<'a> {
                     // blank the enclosing fn name the way class-init
                     // const eval does ({closure:M::m():L}).
                     let pb = self.param_bind_ctx.replace(self.class_const_ctx);
-                    let r = self.eval_decl_const(d, &decl.file);
+                    let r = self.eval_decl_const(d, &decl.file, decl.line);
                     self.param_bind_ctx = pb;
                     self.const_self = old;
                     self.cur_line = prev_line;

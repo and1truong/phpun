@@ -97,7 +97,7 @@ pub struct Parser<'a> {
     /// violations seen while parsing — zend detects them in
     /// zend_compile AFTER the whole file parses, so a later syntax
     /// error wins over them; they emit only once the file parses clean.
-    write_ctx_errs: Vec<usize>,
+    write_ctx_errs: Vec<(String, usize)>,
 }
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
@@ -185,11 +185,8 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
     // Zend's write-context check runs in zend_compile — AFTER the
     // whole file parses — so a later syntax error always wins over
     // 'Cannot use temporary expression in write context' (probe m8).
-    if let Some(&line) = p.write_ctx_errs.first() {
-        return Err(PhpError::compile_fatal(
-            "Cannot use temporary expression in write context",
-            line,
-        ));
+    if let Some((msg, line)) = p.write_ctx_errs.first() {
+        return Err(PhpError::compile_fatal(msg.clone(), *line));
     }
     let mut diags: Vec<(String, &'static str, usize)> = lex_diags;
     diags.extend(
@@ -632,8 +629,8 @@ impl<'a> Parser<'a> {
                     } else {
                         let e = self.expr()?;
                         if self.ret_by_ref && Self::has_nullsafe(&e) {
-                            return Err(PhpError::compile_fatal(
-                                "Cannot take reference of a nullsafe chain",
+                            self.write_ctx_errs.push((
+                                "Cannot take reference of a nullsafe chain".to_string(),
                                 self.line(),
                             ));
                         }
