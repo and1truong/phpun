@@ -589,7 +589,7 @@ pub fn end_line(e: &Expr) -> Option<usize> {
         | Expr::MethodCall { args, site, .. }
         | Expr::StaticCall { args, site, .. }
         | Expr::StaticCallDyn { args, site, .. }
-        | Expr::New { args, site, .. } => end_line(args.last()?).or(Some(*site)),
+        | Expr::New { args, site, .. } => args.last().and_then(end_line).or(Some(*site)),
         Expr::ArrayLit(items) => items.iter().rev().find_map(|(_, v)| end_line(v)),
         Expr::Binary {
             op: "argline",
