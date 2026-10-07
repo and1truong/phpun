@@ -32,12 +32,15 @@ fn main() -> ExitCode {
     }
 }
 
-/// `phpun [-d k=v]* [-q] [-f] <file.php> [args...]`
+/// `phpun [-d k=v]* [-n] [-c PATH] [-z EXT] [-q] [-f] <file.php> [args...]`
+/// `phpun [-d k=v]* [-n] -r <code> [args...]`
 ///
-/// `-d` ini flags and `-q`/`--` separators are accepted so the PHPT harness
-/// can invoke phpun with the same argv as reference php.
+/// `-d` ini flags, the ini-related switches (`-n`/`--no-php-ini`, `-c`,
+/// `-z`) and `-q`/`--` separators are accepted so the PHPT harness can
+/// invoke phpun with the same argv as reference php.
 fn run_script(args: &[String]) -> ExitCode {
     let mut file: Option<&str> = None;
+    let mut code: Option<String> = None;
     let mut ini: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -57,12 +60,37 @@ fn run_script(args: &[String]) -> ExitCode {
                 i += 2;
                 continue;
             }
-            "-f" | "-q" => {
+            "-r" => {
+                if i + 1 < args.len() {
+                    code = Some(args[i + 1].clone());
+                }
+                i += 2;
+                break;
+            }
+            // php.ini switches zend accepts: `-n`/`--no-php-ini` skip ini
+            // loading (we have none anyway), `-c` points at an ini path
+            // and `-z` loads a zend extension — all ignored.
+            "-n" | "--no-php-ini" => {
                 i += 1;
+                continue;
+            }
+            "-c" | "--php-ini" | "-z" | "--zend-extension" => {
+                i += 2;
                 continue;
             }
             s if s.starts_with("-d") => {
                 ini.push(s[2..].to_string());
+                i += 1;
+                continue;
+            }
+            s if s.starts_with("-c")
+                || s.starts_with("--php-ini=")
+                || s.starts_with("--zend-extension=") =>
+            {
+                i += 1;
+                continue;
+            }
+            "-f" | "-q" => {
                 i += 1;
                 continue;
             }
@@ -72,32 +100,56 @@ fn run_script(args: &[String]) -> ExitCode {
             }
         }
     }
-    let Some(file) = file else {
-        eprintln!("phpun: no input file");
-        return ExitCode::FAILURE;
-    };
-    let src = match std::fs::read_to_string(file) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Could not open input file: {}", file);
-            let _ = e;
+    let (src, label): (String, &str) = match (&code, file) {
+        // `php -r` labels the source "Command line code" and argv[0] /
+        // PHP_SELF/SCRIPT_NAME "Standard input code".
+        (Some(code), _) => (code.clone(), "Command line code"),
+        (None, Some(file)) => {
+            let s = match std::fs::read_to_string(file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Could not open input file: {}", file);
+                    let _ = e;
+                    return ExitCode::FAILURE;
+                }
+            };
+            (s, file)
+        }
+        (None, None) => {
+            eprintln!("phpun: no input file");
             return ExitCode::FAILURE;
         }
     };
     // __FILE__/__DIR__ are always absolute in PHP.
-    let abs = std::fs::canonicalize(file)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| file.to_string());
+    let abs = if code.is_some() {
+        label.to_string()
+    } else {
+        std::fs::canonicalize(label)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| label.to_string())
+    };
     let mut it = Interp::new(&abs);
     // CLI PHP sets the script-path SERVER vars to the path AS INVOKED
     // (`php console.php` shows "console.php"), unlike __FILE__ which is
-    // always canonical.
-    for k in ["SCRIPT_FILENAME", "PHP_SELF", "SCRIPT_NAME"] {
-        it.set_server_var(k, file);
-    }
-    // Args after the script path become $argv[1..] like reference php;
-    // argv[0] keeps the as-invoked path too.
-    it.set_script_args(file, &args[(i + 1).min(args.len())..]);
+    // always canonical. `-r` code sets SCRIPT_FILENAME to "" and
+    // PHP_SELF/SCRIPT_NAME to "Standard input code".
+    let (svar_file, svar_name) = if code.is_some() {
+        ("", "Standard input code")
+    } else {
+        (label, label)
+    };
+    it.set_server_var("SCRIPT_FILENAME", svar_file);
+    it.set_server_var("PHP_SELF", svar_name);
+    it.set_server_var("SCRIPT_NAME", svar_name);
+    // Args after the script path (or after `-r <code>`) become $argv[1..]
+    // like reference php; argv[0] keeps the as-invoked path too.
+    let argv0 = if code.is_some() {
+        "Standard input code"
+    } else {
+        label
+    };
+    let rest = if code.is_some() { i } else { i + 1 };
+    it.set_script_args(argv0, &args[rest.min(args.len())..]);
     for kv in ini {
         if let Some((k, v)) = kv.split_once('=') {
             it.ini.insert(k.trim().to_string(), v.trim().to_string());
