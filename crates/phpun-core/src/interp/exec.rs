@@ -968,7 +968,10 @@ impl<'a> Interp<'a> {
                             }
                             ForeachTarget::Lvalue(e) => {
                                 let v = c.borrow().clone();
-                                let _ = self.store(e, v);
+                                match self.store(e, v) {
+                                    Ok(()) => {}
+                                    Err(e2) => break self.err_flow(e2),
+                                }
                             }
                             ForeachTarget::List(items) => {
                                 match self.foreach_list(items, &c, stmt_line) {
@@ -1037,7 +1040,10 @@ impl<'a> Interp<'a> {
                         }
                         ForeachTarget::Lvalue(e) => {
                             let v = c.borrow().clone();
-                            let _ = self.store(e, v);
+                            match self.store(e, v) {
+                                Ok(()) => {}
+                                Err(e2) => return self.err_flow(e2),
+                            }
                         }
                         ForeachTarget::List(items) => {
                             match self.foreach_list(items, &c, stmt_line) {
@@ -1327,7 +1333,10 @@ impl<'a> Interp<'a> {
                         }
                         ForeachTarget::Lvalue(e) => {
                             let v = c.borrow().clone();
-                            let _ = self.store(e, v);
+                            match self.store(e, v) {
+                                Ok(()) => {}
+                                Err(e2) => return self.err_flow(e2),
+                            }
                         }
                         ForeachTarget::List(items) => {
                             if let Err(e2) = self.foreach_list(items, &c, stmt_line) {
@@ -1467,7 +1476,9 @@ impl<'a> Interp<'a> {
                     }
                 }
                 ForeachTarget::Lvalue(e) => {
-                    let _ = self.store(e, v);
+                    if let Err(e2) = self.store(e, v) {
+                        return self.err_flow(e2);
+                    }
                 }
                 ForeachTarget::List(items) => {
                     if let Err(e2) = self.foreach_list(items, &cell(v), stmt_line) {
@@ -1626,7 +1637,7 @@ impl<'a> Interp<'a> {
                     match t {
                         ForeachTarget::Var(n) => self.var_set(n, iv),
                         ForeachTarget::Lvalue(e) => {
-                            let _ = self.store(e, iv);
+                            self.store(e, iv)?;
                         }
                         ForeachTarget::ByRef(e) => {
                             self.notice(&format!(
@@ -1663,13 +1674,13 @@ impl<'a> Interp<'a> {
                         },
                         ForeachTarget::Lvalue(e) => match a.borrow().get(&key) {
                             Some(iv) => {
-                                let _ = self.store(e, iv);
+                                self.store(e, iv)?;
                             }
                             None => {
                                 if !quiet {
                                     self.foreach_missing_key(&key)?;
                                 }
-                                let _ = self.store(e, Value::Null);
+                                self.store(e, Value::Null)?;
                             }
                         },
                         ForeachTarget::ByRef(e) => {

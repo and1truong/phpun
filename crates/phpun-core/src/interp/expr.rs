@@ -1305,6 +1305,11 @@ impl<'a> Interp<'a> {
         // Dynamic-prop slots materialized below record themselves so
         // the read side can replay zend's 'Undefined property' warns.
         self.fresh_dyn_props.clear();
+        // A typed slot this write's fetch materializes reverts to
+        // uninit if the auto-init gate fails — the marker lives from
+        // here to the gate (a stale one from an earlier write would
+        // wrongly revert a legitimately-committed NULL).
+        self.last_fresh_cell = None;
         let target_cell = match target {
             Expr::Prop { obj, name, .. } => {
                 // zend fetches the object operand in write context —
@@ -1506,15 +1511,6 @@ impl<'a> Interp<'a> {
                 return Ok(cur);
             }
         }
-        // A static-prop compound assign gates set-visibility BEFORE the
-        // RHS evaluates — `C::$a .= expr` on private(set) dies 'Cannot
-        // indirectly modify' with no side effects from expr; instance
-        // props evaluate first and gate at the write.
-        if needs_read && op != "??=" {
-            if let Late::Static { class, pn } = &late {
-                self.static_prop_indirect_gate(class, pn)?;
-            }
-        }
         let rhs = self.eval(value)?;
         let cur = if needs_read {
             if op == "??=" {
@@ -1526,6 +1522,15 @@ impl<'a> Interp<'a> {
         } else {
             Value::Null
         };
+        // A static-prop compound assign gates set-visibility on the
+        // RW fetch — AFTER the RHS and the fetch proper (an uninit
+        // typed static's 'must not be accessed' wins) but BEFORE the
+        // op (`C::$a += []` names 'indirectly modify', not operands).
+        if needs_read && op != "??=" {
+            if let Late::Static { class, pn } = &late {
+                self.static_prop_indirect_gate(class, pn)?;
+            }
+        }
         // A compound op gates on the target container BEFORE the
         // operator evaluates — `$s[k] += v` throws the string-offset
         // gate (or the offset TypeError) rather than an operand error
@@ -1727,7 +1732,11 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                let c = self.static_prop_named(&class, &pn)?;
+                // `??=`'s null-slot store is zend's plain assign —
+                // 'Cannot modify' — while compound/dim writes stay
+                // 'indirectly modify'.
+                let c =
+                    self.static_prop_named_ctx(&class, &pn, needs_read && op != "??=")?;
                 // Static prop writes coerce to the declared type like
                 // instance props (typed_properties_023).
                 if let Ok((cls, _)) = self.member_class_of(&class) {
@@ -3006,7 +3015,6 @@ impl<'a> Interp<'a> {
         v: Value,
         compound: bool,
     ) -> Result<Value, PhpError> {
-        self.last_fresh_cell = None;
         let last = keys.len() - 1;
         for (n, k) in keys.iter().enumerate() {
             // Auto-init gate: writing through a typed slot that is

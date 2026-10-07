@@ -174,13 +174,18 @@ impl<'a> Interp<'a> {
         name: &PropName,
     ) -> Result<Cell, PhpError> {
         let name = self.prop_name(name)?;
-        self.static_prop_named(class, &name)
+        self.static_prop_named_ctx(class, &name, true)
     }
 
-    pub(in crate::interp) fn static_prop_named(
+    /// `indirect` picks the set-visibility message: the cell path IS
+    /// an indirect write (`[]`, `&`, compound, `++`, by-ref args) —
+    /// 'Cannot indirectly modify' — while `=` and `??=`'s null-slot
+    /// store are plain writes ('Cannot modify').
+    pub(in crate::interp) fn static_prop_named_ctx(
         &mut self,
         class: &Expr,
         name: &str,
+        indirect: bool,
     ) -> Result<Cell, PhpError> {
         let (cls, tname) = self.member_class_of(class)?;
         if let Some(t) = tname {
@@ -191,15 +196,18 @@ impl<'a> Interp<'a> {
         }
         self.statics_init(&cls)?;
         self.static_prop_vis(&cls, name)?;
-        // private(set)/protected(set): the cell path IS an indirect
-        // write (`[]`, `&`, compound, `++`, by-ref args) — plain `=`
+        // private(set)/protected(set): gated by write kind — plain `=`
         // is gated in store() with 'Cannot modify' first, and unsets
         // carry their own 'Attempt to unset static property'.
         if !self.in_unset {
             if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
                 if let Some(sv) = pd.set_vis {
                     if self.set_vis_scope_denied(&dcls, sv) {
-                        return self.set_visibility_indirect_error(&dcls, &pd.name, sv);
+                        return if indirect {
+                            self.set_visibility_indirect_error(&dcls, &pd.name, sv)
+                        } else {
+                            self.set_visibility_error(&dcls, &pd.name, sv)
+                        };
                     }
                 }
             }

@@ -1671,14 +1671,35 @@ impl<'a> Interp<'a> {
                                 )),
                             };
                         }
-                        // private(set)/protected(set): every cell fetch
-                        // is an indirect write — `[]`, `&`, `&arg`,
-                        // `+=`, `++`, foreach-by-ref all name it (a
+                        // private(set)/protected(set): a cell fetch is
+                        // an indirect write — `[]`, `&`, `&arg`, `+=`,
+                        // `++`, foreach-by-ref all name it (a
                         // whole-prop unset carries its own error).
+                        // Like readonly, a slot already holding an
+                        // OBJECT hands the object out instead — writes
+                        // then target it (`$foo->bar->baz = 42`), and
+                        // dim/compound ops on the slot itself hit the
+                        // object's own errors, not 'indirectly modify'.
                         if !self.in_unset {
                             if let Some(sv) = pd.set_vis {
                                 if !self.hook_scope_allows(&o, &dcls, &pn, sv) {
-                                    return self.set_visibility_indirect_error(&dcls, &pd.name, sv);
+                                    let dk =
+                                        if pd.visibility == crate::ast::Visibility::Private {
+                                            format!("\0{}\0{}", dcls.name(), pd.name)
+                                        } else {
+                                            pd.name.clone()
+                                        };
+                                    let held = o.borrow().props.get(&dk).cloned();
+                                    return match held {
+                                        Some(c)
+                                            if matches!(&*c.borrow(), Value::Object(_)) =>
+                                        {
+                                            Ok(cell(c.borrow().clone()))
+                                        }
+                                        _ => self.set_visibility_indirect_error(
+                                            &dcls, &pd.name, sv,
+                                        ),
+                                    };
                                 }
                             }
                         }
