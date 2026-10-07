@@ -567,10 +567,8 @@ impl<'a> Interp<'a> {
                                 src.borrow().internal,
                                 Some(ObjectInternal::ArrayIter { .. })
                             );
-                        if !spl_src {
-                            if src.borrow_mut().props.remove(&pname).is_some() {
-                                self.mem_credit(&src, 32);
-                            }
+                        if !spl_src && src.borrow_mut().props.remove(&pname).is_some() {
+                            self.mem_credit(&src, 32);
                         }
                     }
                 }
@@ -1377,7 +1375,7 @@ impl<'a> Interp<'a> {
             let had = arr.borrow().get_cell(&k).is_some();
             let evicted = arr.borrow_mut().unset(&k);
             if had {
-                self.mem_credit(&arr, 32);
+                self.mem_credit(arr, 32);
             }
             if let Some(v) = evicted {
                 let _ = self.destruct_dying_value(&v);

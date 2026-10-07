@@ -191,6 +191,10 @@ pub(crate) type FilterBinding = (
     Rc<RefCell<PhpResource>>,
 );
 
+/// Liveness probe for a charged allocation: weak ref to the owning
+/// Rc — returns false once every strong handle died (zend's efree).
+pub(crate) type MemProbe = Box<dyn Fn() -> bool>;
+
 pub struct Interp<'a> {
     pub file: &'a str,
     globals: Frame,
@@ -721,7 +725,7 @@ pub struct Interp<'a> {
     /// when every strong ref to a tracked alloc dies its bytes release
     /// back into mem_used, so reclaimable churn never trips the limit
     /// while genuinely-growing structures do.
-    mem_tracked: HashMap<usize, (u64, Box<dyn Fn() -> bool>)>,
+    mem_tracked: HashMap<usize, (u64, MemProbe)>,
     /// Registry size that trips the next dead-entry sweep — bounds the
     /// tracker footprint for alloc-churn loops.
     mem_sweep_at: usize,
