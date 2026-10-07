@@ -3796,56 +3796,42 @@ impl<'a> Interp<'a> {
         // journaled captures never ran in Zend's frame.
         fq.borrow_mut().kill_tree();
         let killed = true;
-        // Zend destroys a level by flushing its contents into the
-        // level BELOW its stack slot (or real output at the bottom)
-        // — never into levels stacked above it. Suspended windows
-        // sat above the pre-existing consumer levels, so their
-        // parent is the window beneath them or the stack's bottom.
-        let sink = |interp: &mut Self, v: &[u8]| {
-            if interp.live_io {
-                use std::io::Write;
-                let mut so = std::io::stdout().lock();
-                let _ = so.write_all(v);
-                let _ = so.flush();
-            } else {
-                interp.out.extend_from_slice(v);
-            }
-        };
+        // Zend leaves the dead gen's output buffers ON the global
+        // stack: a suspended window's content materializes at the
+        // confirmed cursor, consumer writes keep capturing into it,
+        // and its handler fires at the final flush like any orphaned
+        // level. Promote each owned level to a real consumer level at
+        // the slot it occupied (suspend_base for parked windows).
+        for l in self
+            .suspended_obs
+            .iter_mut()
+            .chain(self.ob_stack.iter_mut())
+            .filter(|l| owned(l))
+        {
+            Self::ob_drain_level(l, false);
+            l.buf = Self::ob_level_content(l, pos, killed);
+            l.drained_segs.clear();
+            l.cap_segs.clear();
+            l.caps.clear();
+            l.gen_pending.clear();
+            l.read_vals.clear();
+            l.gen_drained = 0;
+            l.gen_q = None;
+            l.gen_open = None;
+            l.gen_close = None;
+        }
+        let mut promote: Vec<(usize, ObLevel)> = Vec::new();
         let mut i = self.suspended_obs.len();
         while i > 0 {
             i -= 1;
-            if owned(&self.suspended_obs[i]) {
-                let mut l = self.suspended_obs.remove(i);
-                // Materialize the captures the cursor already passed —
-                // Zend ran those writes into the real buffer.
-                Self::ob_drain_level(&mut l, false);
-                let v = Self::ob_level_content(&l, pos, killed);
-                if !v.is_empty() {
-                    if let Some(below) = self.suspended_obs.get_mut(i.wrapping_sub(1)) {
-                        below.buf.extend_from_slice(&v);
-                    } else if let Some(below) = self.ob_stack.first_mut() {
-                        below.buf.extend_from_slice(&v);
-                    } else {
-                        sink(self, &v);
-                    }
-                }
+            if self.suspended_obs[i].gen_q.is_none() {
+                let l = self.suspended_obs.remove(i);
+                promote.push((l.suspend_base, l));
             }
         }
-        let mut i = self.ob_stack.len();
-        while i > 0 {
-            i -= 1;
-            if owned(&self.ob_stack[i]) {
-                let mut l = self.ob_stack.remove(i);
-                Self::ob_drain_level(&mut l, false);
-                let v = Self::ob_level_content(&l, pos, killed);
-                if !v.is_empty() {
-                    if i > 0 {
-                        self.ob_stack[i - 1].buf.extend_from_slice(&v);
-                    } else {
-                        sink(self, &v);
-                    }
-                }
-            }
+        promote.sort_by_key(|(b, _)| *b);
+        for (base, l) in promote {
+            self.ob_stack.insert(base.min(self.ob_stack.len()), l);
         }
     }
 
