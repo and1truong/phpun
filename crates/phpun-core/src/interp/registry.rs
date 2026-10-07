@@ -2172,6 +2172,60 @@ impl<'a> Interp<'a> {
         );
         // WeakReference — native dispatch: static_invoke's `create`
         // and method_invoke's `get` on the WeakRef internal.
+        let weakref_methods = vec![
+            Rc::new(MethodDecl {
+                decl: FunctionDecl {
+                    ret: Some(vec!["WeakReference".into()]),
+                    name: "create".into(),
+                    params: vec![Param {
+                        name: "object".into(),
+                        default: None,
+                        by_ref: false,
+                        variadic: false,
+                        ty: Some(vec!["object".into()]),
+                        promoted: false,
+                        vis: None,
+                        readonly: false,
+                        is_final: false,
+                        set_vis: None,
+                        hooks: None,
+                    }],
+                    body: vec![],
+                    attrs: vec![],
+                    by_ref: false,
+                    line: 0,
+                    end_line: 0,
+                    file: String::new(),
+                    ns: String::new(),
+                    decl_in: None,
+                },
+                is_static: true,
+                is_abstract: false,
+                is_final: false,
+                visibility: Visibility::Public,
+                trait_alias_of: None,
+            }),
+            Rc::new(MethodDecl {
+                decl: FunctionDecl {
+                    ret: Some(vec!["object".into(), "null".into()]),
+                    name: "get".into(),
+                    params: vec![],
+                    body: vec![],
+                    attrs: vec![],
+                    by_ref: false,
+                    line: 0,
+                    end_line: 0,
+                    file: String::new(),
+                    ns: String::new(),
+                    decl_in: None,
+                },
+                is_static: false,
+                is_abstract: false,
+                is_final: false,
+                visibility: Visibility::Public,
+                trait_alias_of: None,
+            }),
+        ];
         reg(
             ClassDecl {
                 name: "WeakReference".into(),
@@ -2184,7 +2238,7 @@ impl<'a> Interp<'a> {
                 attrs: vec![],
                 traits: vec![],
                 adaptations: vec![],
-                methods: vec![],
+                methods: weakref_methods,
                 props: vec![],
                 consts: vec![],
                 file: String::new(),

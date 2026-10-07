@@ -701,17 +701,48 @@ fn proc_open(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
         // Install child ends at their descriptor indexes inside the
         // spawned process: close parent ends, dup2(child, index), then
         // close the original child fd — zend's child_init path.
-        let descs_c = descs.clone();
+        let mut descs_c = descs.clone();
         unsafe {
             cmd.pre_exec(move || {
                 // Rust's Command resets SIGPIPE to SIG_DFL before exec;
                 // zend children inherit PHP's SIG_IGN so writes to dead
                 // pipes fail EPIPE instead of killing the child.
                 libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+                // Close every parent end first — a target index may
+                // alias a later descriptor's parent fd (specs at child
+                // indexes 5 and 6, pipe child ends 3/4 and 5/6: the
+                // interleaved close(parent)+dup2 would wipe the target).
                 for d in descs_c.iter() {
                     if d.parent >= 0 {
                         libc::close(d.parent);
                     }
+                }
+                // A target index may also collide with another
+                // descriptor's still-unconsumed source fd — relocate
+                // colliding sources to fresh fds first.
+                let n = descs_c.len();
+                for _ in 0..n {
+                    let mut moved = false;
+                    for j in 0..n {
+                        if descs_c[j].child == descs_c[j].index {
+                            continue;
+                        }
+                        let collides =
+                            (0..n).any(|i| i != j && descs_c[i].index == descs_c[j].child);
+                        if collides {
+                            let fresh = libc::dup(descs_c[j].child);
+                            if fresh < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            descs_c[j].child = fresh;
+                            moved = true;
+                        }
+                    }
+                    if !moved {
+                        break;
+                    }
+                }
+                for d in descs_c.iter() {
                     if libc::dup2(d.child, d.index) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
@@ -803,9 +834,18 @@ fn spec_array(
     descs: &[Desc],
     pty_pair: &mut Option<(RawFd, RawFd)>,
 ) -> Result<Option<Desc>, PhpError> {
-    let items: Vec<Value> = a.borrow().iter().map(|(_, c)| c.borrow().clone()).collect();
+    // Fields are positional by NUMERIC key, not insertion order:
+    // [1 => 'w', 0 => 'pipe'] reads index 0 as the qualifier.
+    let items: std::collections::HashMap<i64, Value> = a
+        .borrow()
+        .iter()
+        .filter_map(|(k, c)| match k {
+            crate::value::ArrKey::Int(i) => Some((*i, c.borrow().clone())),
+            _ => None,
+        })
+        .collect();
     let get_bytes = |it: &mut Interp, i: usize, name: &str| -> Result<Vec<u8>, PhpError> {
-        match items.get(i) {
+        match items.get(&(i as i64)) {
             Some(v) => Ok(it.to_bytes_of(v)),
             None => err("ValueError", format!("Missing {}", name)),
         }
@@ -898,7 +938,7 @@ fn spec_array(
             }
         }
         b"redirect" => {
-            let target = match items.get(1) {
+            let target = match items.get(&1) {
                 None => return err("ValueError", "Missing redirection target"),
                 Some(Value::Int(i)) => *i as i32,
                 Some(v) => {

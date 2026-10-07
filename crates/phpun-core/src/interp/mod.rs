@@ -349,6 +349,11 @@ pub struct Interp<'a> {
     /// entries, so the direction disambiguates them.
     pub codec_states:
         std::collections::HashMap<(u64, bool), crate::builtins::fs::CodecState>,
+    /// Live WeakReference wrapper per target object id — zend keeps a
+    /// per-handle weakref list so repeated create() calls on the same
+    /// live object return the identical wrapper (`===` true).
+    pub weakrefs:
+        std::collections::HashMap<u64, std::rc::Weak<RefCell<crate::value::PhpObject>>>,
     /// Output buffer stack for ob_*().
     ob_stack: Vec<ObLevel>,
     /// While >0, warnings are suppressed (implements `??`, `isset`,
@@ -994,6 +999,7 @@ impl<'a> Interp<'a> {
             filter_warn_ctx: String::new(),
             stream_filter_busy: std::collections::HashSet::new(),
             codec_states: std::collections::HashMap::new(),
+            weakrefs: std::collections::HashMap::new(),
             ob_stack: Vec::new(),
             silence: 0,
             statics: HashMap::new(),

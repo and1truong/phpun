@@ -851,6 +851,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         "proc_close" => bp!(("process", Req)),
         "proc_get_status" => bp!(("process", Req)),
         "proc_terminate" => bp!(("process", Req), ("signal", Int(15))),
+        "proc_nice" => bp!(("priority", Req)),
         "exec" => bp!(("command", Req), ("output", Null), ("result_code", Null)),
         "system" | "passthru" => bp!(("command", Req), ("result_code", Null)),
         "shell_exec" => bp!(("command", Req)),
@@ -881,7 +882,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
             ("microseconds", Null)
         ),
         // oracle takes exactly 2 args — zend's $mode has no default.
-        "stream_set_blocking" => bp!(("stream", Req), ("mode", Req)),
+        "stream_set_blocking" => bp!(("stream", Req), ("enable", Req)),
         "stream_get_meta_data" => bp!(("stream", Req)),
         "flock" => bp!(("stream", Req), ("operation", Req), ("would_block", Null)),
         "header" => bp!(

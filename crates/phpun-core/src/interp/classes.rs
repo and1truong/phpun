@@ -3275,12 +3275,22 @@ impl<'a> Interp<'a> {
         rc
     }
 
-    /// `WeakReference::create($obj)` — fresh object holding a weak
-    /// handle to $obj (the WeakRef internal; get() upgrades it).
+    /// `WeakReference::create($obj)` — object holding a weak handle to
+    /// $obj (the WeakRef internal; get() upgrades it). Zend keeps a
+    /// per-handle weakref list: repeated create() on the same live
+    /// target returns the identical wrapper (`===` true).
     pub(in crate::interp) fn new_weakref(
         &mut self,
         target: Rc<RefCell<PhpObject>>,
     ) -> Result<Value, PhpError> {
+        let target_id = target.borrow().id;
+        if let Some(existing) = self
+            .weakrefs
+            .get(&target_id)
+            .and_then(|w| w.upgrade())
+        {
+            return Ok(Value::Object(existing));
+        }
         let cls = match self.classes.get("weakreference").cloned() {
             Some(c) => c,
             None => {
@@ -3299,6 +3309,7 @@ impl<'a> Interp<'a> {
             internal: Some(ObjectInternal::WeakRef(Rc::downgrade(&target))),
             unset_props: std::collections::HashSet::new(),
         });
+        self.weakrefs.insert(target_id, Rc::downgrade(&rc));
         Ok(Value::Object(rc))
     }
 
