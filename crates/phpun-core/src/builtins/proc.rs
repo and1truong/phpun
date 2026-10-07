@@ -416,15 +416,13 @@ fn resource_child_fd(
                 }
             }
         }
-        PhpResource::Other { kind, .. } => {
-            spec_err(
-                it,
-                &format!(
-                    "Cannot represent a stream of type {} as a File Descriptor",
-                    kind
-                ),
-            )?;
-            return Ok(None);
+        // A stream_filter_* handle / bucket brigade is a resource but
+        // not a stream — zend's PHP_Z_PARAM_STREAM check TypeErrors.
+        PhpResource::Other { .. } => {
+            return crate::builtins::err(
+                "TypeError",
+                "proc_open(): supplied resource is not a valid stream resource",
+            );
         }
     };
     match dup_fd(fd) {

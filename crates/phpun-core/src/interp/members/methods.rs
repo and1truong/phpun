@@ -2193,7 +2193,24 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        // Reflection stubs are native: constructor stores the target
+        // php_user_filter stubs — zend's internal defaults: filter()
+        // returns PSFS_ERR_FATAL, onCreate() true, onClose() void, the
+        // on* hooks true. Only fires when the resolved method is the
+        // registered stub — a userland override runs its own body.
+        if self.obj_is_a_str(cls.name(), "php_user_filter") {
+            let stub = self
+                .find_method_in(&cls, name)
+                .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
+                .unwrap_or(false);
+            if stub {
+                return Ok(match name.to_lowercase().as_str() {
+                    "filter" => Value::Int(0),
+                    "oncreate" => Value::Bool(true),
+                    "onclose" => Value::Null,
+                    _ => Value::Bool(true),
+                });
+            }
+        }
         // name, methods act on it (gh15438_2).
         if cls.name().starts_with("Reflection") || cls.name().starts_with("reflection") {
             let stub = self

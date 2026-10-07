@@ -3,12 +3,17 @@
 use super::crypto::base64_decode;
 use super::string::{zpp_long, zpp_long_arg};
 use super::*;
+use crate::interp::CallArgs;
+use crate::value::{Dechunk, DechunkState, FilterState, StreamFilter};
 
 pub(crate) fn dispatch(
     it: &mut Interp,
     name: &str,
     args: &[Cell],
 ) -> Result<Option<Value>, PhpError> {
+    // zend's php_error_docref prefixes warnings with the active builtin.
+    it.filter_warn_ctx.clear();
+    it.filter_warn_ctx.push_str(name);
     Ok(Some(match name {
         // ----- filesystem/process -----
         "file_exists" => Value::Bool(std::path::Path::new(fs_path(&arg_str(it, args, 0))).exists()),
@@ -353,6 +358,7 @@ pub(crate) fn dispatch(
                     spilled_fd: None,
                     srbuf: Default::default(),
                     rcap: 0,
+                    fraw: 0,
                 })))
             } else if let Some(body) = parse_data_uri(&path) {
                 // `data:[mediatype][;base64],payload` — zend's RFC2397
@@ -370,6 +376,7 @@ pub(crate) fn dispatch(
                     spilled_fd: None,
                     srbuf: Default::default(),
                     rcap: 0,
+                    fraw: 0,
                 })))
             } else if let Some(mem) = mem_uri_kind(&path) {
                 // php://memory and php://temp are always read/write
@@ -415,6 +422,7 @@ pub(crate) fn dispatch(
                     spilled_fd: None,
                     srbuf: Default::default(),
                     rcap: 0,
+                    fraw: 0,
                 })))
             } else if let Some(which) = match path.as_str() {
                 "php://stdin" => Some(0u8),
@@ -477,6 +485,33 @@ pub(crate) fn dispatch(
                 if let Value::Resource(r) = &*c.borrow() {
                     let mut rb = r.borrow_mut();
                     let id = rb.id();
+                    // PHP_STREAM_FLAG_NO_FCLOSE — an fclose() issued
+                    // from inside a php_user_filter::filter() callback
+                    // on this stream silently does nothing (zend).
+                    if it.filter_no_fclose == Some(id) {
+                        return Ok(Some(Value::Bool(true)));
+                    }
+                    // zend's stream dtor flushes the WRITE chain once
+                    // with empty input + the closing flag, writes the
+                    // trailing bytes, then calls onClose on every
+                    // php_user_filter (userfilter_dtor).
+                    if let Some(filters) = it.stream_filters.get(&id).cloned() {
+                        if filters.iter().any(|f| f.write) {
+                            drop(rb);
+                            let sv = Value::Resource(r.clone());
+                            let (out, _) =
+                                run_filter_chain(it, id, &sv, false, Vec::new(), true, &mut None)?;
+                            if !out.is_empty() {
+                                let _ = write_resource_raw(it, r, &out)?;
+                            }
+                            rb = r.borrow_mut();
+                        }
+                        for f in &filters {
+                            if let FilterState::User(obj) = &f.state {
+                                let _ = it.method_invoke(obj.clone(), "onClose", CallArgs::empty());
+                            }
+                        }
+                    }
                     *rb = PhpResource::Closed { id };
                     drop(rb);
                     // zend's stream dtor frees the attached filter
@@ -486,11 +521,11 @@ pub(crate) fn dispatch(
                     let dead: Vec<u64> = it
                         .stream_filter_bindings
                         .iter()
-                        .filter(|(_, (sid, _, _))| *sid == id)
+                        .filter(|(_, (sid, _, _, _))| *sid == id)
                         .map(|(fid, _)| *fid)
                         .collect();
                     for fid in dead {
-                        if let Some((_, _, fres)) = it.stream_filter_bindings.remove(&fid) {
+                        if let Some((_, _, fres, _)) = it.stream_filter_bindings.remove(&fid) {
                             let mut fb = fres.borrow_mut();
                             *fb = PhpResource::Closed { id: fid };
                         }
@@ -577,11 +612,19 @@ pub(crate) fn dispatch(
             stream_open_check(args, 0, name, 1, "stream")?;
             match args.first() {
                 Some(c) => match &*c.borrow() {
+                    // zend's feof = stream->eof && the read buffer is
+                    // drained — a filtered fill latches stream->eof
+                    // while FILTERED bytes are still pending (the flag
+                    // in meta['eof'] reports raw eof; feof gates it).
                     Value::Resource(r) => match &*r.borrow() {
-                        PhpResource::File { eof, .. } => Value::Bool(*eof),
-                        PhpResource::Mem { eof, .. } => Value::Bool(*eof),
-                        PhpResource::Pipe { eof, .. } => Value::Bool(*eof),
-                        PhpResource::Input { eof, .. } => Value::Bool(*eof),
+                        PhpResource::File { eof, rbuf, .. } => Value::Bool(*eof && rbuf.is_empty()),
+                        PhpResource::Mem { eof, srbuf, .. } => {
+                            Value::Bool(*eof && srbuf.is_empty())
+                        }
+                        PhpResource::Pipe { eof, rbuf, .. } => Value::Bool(*eof && rbuf.is_empty()),
+                        PhpResource::Input { eof, srbuf, .. } => {
+                            Value::Bool(*eof && srbuf.is_empty())
+                        }
                         _ => Value::Bool(true),
                     },
                     _ => Value::Bool(true),
@@ -631,6 +674,7 @@ pub(crate) fn dispatch(
                             temp_smax,
                             spilled_fd,
                             srbuf,
+                            fraw,
                             ..
                         } => {
                             // temp_cast'd temp streams behave like the
@@ -685,6 +729,8 @@ pub(crate) fn dispatch(
                             match new_pos {
                                 Some(np) if np >= 0 => {
                                     *pos = np as u64;
+                                    *fraw = np as u64;
+                                    srbuf.clear();
                                     *pos_broken = false;
                                     *eof = false;
                                 }
@@ -697,6 +743,8 @@ pub(crate) fn dispatch(
                                     // both CUR and END.
                                     if whence == 2 || (whence == 1 && memory) {
                                         *pos = 0;
+                                        *fraw = 0;
+                                        srbuf.clear();
                                         *pos_broken = true;
                                     }
                                     return Ok(Some(Value::Int(-1)));
@@ -710,6 +758,7 @@ pub(crate) fn dispatch(
                             pos_broken,
                             spilled_fd,
                             srbuf,
+                            fraw,
                             ..
                         } => {
                             if let Some(fd) = *spilled_fd {
@@ -744,6 +793,8 @@ pub(crate) fn dispatch(
                             match new_pos {
                                 Some(np) if np >= 0 => {
                                     *pos = np as u64;
+                                    *fraw = np as u64;
+                                    srbuf.clear();
                                     *pos_broken = false;
                                     *eof = false;
                                 }
@@ -754,6 +805,8 @@ pub(crate) fn dispatch(
                                     // it untouched.
                                     if whence == 2 {
                                         *pos = 0;
+                                        *fraw = 0;
+                                        srbuf.clear();
                                         *pos_broken = true;
                                     }
                                     return Ok(Some(Value::Int(-1)));
@@ -911,6 +964,7 @@ pub(crate) fn dispatch(
                             pos_broken,
                             spilled_fd,
                             srbuf,
+                            fraw,
                             ..
                         }
                         | PhpResource::Input {
@@ -919,13 +973,15 @@ pub(crate) fn dispatch(
                             pos_broken,
                             spilled_fd,
                             srbuf,
+                            fraw,
                             ..
                         } => {
                             *pos = 0;
+                            *fraw = 0;
                             *pos_broken = false;
                             *eof = false;
+                            srbuf.clear();
                             if let Some(fd) = *spilled_fd {
-                                srbuf.clear();
                                 unsafe {
                                     libc::lseek(fd, 0, libc::SEEK_SET);
                                 }
@@ -1260,6 +1316,7 @@ pub(crate) fn dispatch(
                             pos_broken,
                             spilled_fd,
                             srbuf,
+                            fraw,
                             ..
                         }
                         | PhpResource::Input {
@@ -1268,6 +1325,7 @@ pub(crate) fn dispatch(
                             pos_broken,
                             spilled_fd,
                             srbuf,
+                            fraw,
                             ..
                         } => {
                             if let Some(fd) = *spilled_fd {
@@ -1278,6 +1336,8 @@ pub(crate) fn dispatch(
                                 }
                             } else {
                                 *pos = offset as u64;
+                                *fraw = offset as u64;
+                                srbuf.clear();
                                 *pos_broken = false;
                                 *eof = false;
                             }
@@ -1349,6 +1409,7 @@ pub(crate) fn dispatch(
                             pos_broken,
                             spilled_fd,
                             srbuf,
+                            fraw,
                             ..
                         }
                         | PhpResource::Input {
@@ -1357,6 +1418,7 @@ pub(crate) fn dispatch(
                             pos_broken,
                             spilled_fd,
                             srbuf,
+                            fraw,
                             ..
                         } => {
                             if let Some(fd) = *spilled_fd {
@@ -1367,6 +1429,8 @@ pub(crate) fn dispatch(
                                 }
                             } else {
                                 *pos = offset as u64;
+                                *fraw = offset as u64;
+                                srbuf.clear();
                                 *pos_broken = false;
                                 *eof = false;
                             }
@@ -1711,6 +1775,7 @@ pub(crate) fn dispatch(
                             uri,
                             mode,
                             temp_smax,
+                            srbuf,
                             ..
                         } => {
                             // zend quirk: php://memory reports the full
@@ -1731,9 +1796,10 @@ pub(crate) fn dispatch(
                                 }),
                             ));
                             base.push(("mode", Value::str(mode.clone())));
-                            // outer temp streams are NO_BUFFER — zend's
-                            // unread_bytes (outer writepos-readpos) is 0.
-                            base.push(("unread_bytes", Value::Int(0)));
+                            // NO_BUFFER while unfiltered (0); once a read
+                            // filter is attached the buffered FILTERED
+                            // bytes are pending.
+                            base.push(("unread_bytes", Value::Int(srbuf.len() as i64)));
                             base.push(("seekable", Value::Bool(true)));
                             base.push(("uri", Value::str(uri.clone())));
                             mk(base)
@@ -1760,12 +1826,14 @@ pub(crate) fn dispatch(
                             a.set(ArrKey::Str("uri".into()), Value::str(uri.clone()));
                             Value::Array(Rc::new(RefCell::new(a)))
                         }
-                        PhpResource::Input { eof, uri, .. } => {
+                        PhpResource::Input {
+                            eof, uri, srbuf, ..
+                        } => {
                             base.push(("eof", Value::Bool(*eof)));
                             base.push(("wrapper_type", Value::str("PHP")));
                             base.push(("stream_type", Value::str("Input")));
                             base.push(("mode", Value::str("rb")));
-                            base.push(("unread_bytes", Value::Int(0)));
+                            base.push(("unread_bytes", Value::Int(srbuf.len() as i64)));
                             base.push(("seekable", Value::Bool(true)));
                             base.push(("uri", Value::str(uri.clone())));
                             mk(base)
@@ -1777,7 +1845,8 @@ pub(crate) fn dispatch(
             }
         }
         "stream_get_filters" => {
-            // zend's builtin filter registry, in registration order.
+            // zend's filter factory map in registration order — the
+            // builtins plus every stream_filter_register() name.
             let mut out = PhpArray::new();
             for f in [
                 "zlib.*",
@@ -1792,39 +1861,213 @@ pub(crate) fn dispatch(
             ] {
                 out.push(Value::str(f));
             }
+            for (n, _) in &it.user_filter_map {
+                out.push(Value::str(n.clone()));
+            }
             Value::Array(Rc::new(RefCell::new(out)))
         }
         "stream_get_wrappers" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
-        "stream_filter_register" => Value::Bool(false),
+        "stream_filter_register" => {
+            if args.len() != 2 {
+                return err(
+                    "ArgumentCountError",
+                    format!(
+                        "stream_filter_register() expects exactly 2 arguments, {} given",
+                        args.len()
+                    ),
+                );
+            }
+            let fname = zpp_strict_string(it, args, 0, name, "$filter_name")?;
+            let cls = zpp_strict_string(it, args, 1, name, "$class")?;
+            if fname.is_empty() {
+                return err(
+                    "ValueError",
+                    "stream_filter_register(): Argument #1 ($filter_name) must be a non-empty string",
+                );
+            }
+            if cls.is_empty() {
+                return err(
+                    "ValueError",
+                    "stream_filter_register(): Argument #2 ($class) must be a non-empty string",
+                );
+            }
+            it.user_filter_map.push((fname, cls));
+            Value::Bool(true)
+        }
         "stream_filter_append" | "stream_filter_prepend" => {
             stream_filter_attach(it, args, name, name == "stream_filter_prepend")?
         }
-        "stream_filter_remove" => {
-            let Value::Resource(r) = arg(args, 0) else {
+        "stream_filter_remove" => stream_filter_remove(it, args)?,
+        "stream_bucket_make_writeable" => {
+            if args.len() != 1 {
                 return err(
-                    "TypeError",
+                    "ArgumentCountError",
                     format!(
-                        "stream_filter_remove(): Argument #1 ($stream_filter) must be of type resource, {} given",
-                        zval_word(&arg(args, 0))
+                        "stream_bucket_make_writeable() expects exactly 1 argument, {} given",
+                        args.len()
                     ),
                 );
-            };
-            let fid = r.borrow().id();
-            match it.stream_filter_bindings.remove(&fid) {
-                Some((sid, _, _)) => {
-                    if let Some(v) = it.stream_filters.get_mut(&sid) {
-                        if let Some(ix) = v.iter().position(|f| f.fid == fid) {
-                            v.remove(ix);
+            }
+            match arg(args, 0) {
+                Value::Resource(r) => {
+                    let rid = r.borrow().id();
+                    let is_brig = matches!(
+                        &*r.borrow(),
+                        PhpResource::Other {
+                            kind: "userfilter.bucket brigade",
+                            ..
                         }
+                    );
+                    if !is_brig {
+                        return err(
+                            "TypeError",
+                            "stream_bucket_make_writeable(): supplied resource is not a valid userfilter.bucket brigade resource",
+                        );
                     }
-                    let mut rb = r.borrow_mut();
-                    *rb = PhpResource::Closed { id: fid };
-                    Value::Bool(true)
+                    match it.stream_brigades.get_mut(&rid).and_then(|b| b.pop_front()) {
+                        Some(bytes) => new_stream_bucket(it, bytes)?,
+                        // an empty brigade yields falsy (zend returns
+                        // NULL — the var_dump/null-print path).
+                        None => Value::Null,
+                    }
                 }
-                None => {
+                v => {
                     return err(
                         "TypeError",
-                        "stream_filter_remove(): supplied resource is not a valid stream filter resource",
+                        format!(
+                            "stream_bucket_make_writeable(): Argument #1 ($brigade) must be of type resource, {} given",
+                            zval_word(&v)
+                        ),
+                    );
+                }
+            }
+        }
+        "stream_bucket_append" | "stream_bucket_prepend" => {
+            let append = name == "stream_bucket_append";
+            if args.len() != 2 {
+                return err(
+                    "ArgumentCountError",
+                    format!("{name}() expects exactly 2 arguments, {} given", args.len()),
+                );
+            }
+            match arg(args, 0) {
+                Value::Resource(r) => {
+                    let rid = r.borrow().id();
+                    let is_brig = matches!(
+                        &*r.borrow(),
+                        PhpResource::Other {
+                            kind: "userfilter.bucket brigade",
+                            ..
+                        }
+                    );
+                    if !is_brig {
+                        return err(
+                            "TypeError",
+                            format!(
+                                "{name}(): supplied resource is not a valid userfilter.bucket brigade resource",
+                            ),
+                        );
+                    }
+                    let bval = arg(args, 1);
+                    let Value::Object(bobj) = &bval else {
+                        return err(
+                            "TypeError",
+                            format!(
+                                "{name}(): Argument #2 ($bucket) must be of type StreamBucket, {} given",
+                                zval_word(&bval)
+                            ),
+                        );
+                    };
+                    if !it.obj_is_a_str(bobj.borrow().class.name(), "streambucket") {
+                        return err(
+                            "TypeError",
+                            format!(
+                                "{name}(): Argument #2 ($bucket) must be of type StreamBucket, {} given",
+                                zval_word(&bval)
+                            ),
+                        );
+                    }
+                    // a missing/invalid 'bucket' property:
+                    // ValueError arg #2 'must be an object that has a
+                    // "bucket" property'.
+                    let has_bucket = bobj
+                        .borrow()
+                        .props
+                        .get("bucket")
+                        .map(|c| matches!(&*c.borrow(), Value::Resource(_)))
+                        .unwrap_or(false);
+                    if !has_bucket {
+                        return err(
+                            "ValueError",
+                            format!(
+                                "{name}(): Argument #2 ($bucket) must be an object that has a \"bucket\" property",
+                            ),
+                        );
+                    }
+                    // zend memcpy's the 'data' prop over the bucket's
+                    // bytes — userland edits to ->data take effect.
+                    let bytes = it.to_bytes_of(
+                        &bobj
+                            .borrow()
+                            .props
+                            .get("data")
+                            .map(|c| c.borrow().clone())
+                            .unwrap_or(Value::Str(Vec::new().into())),
+                    );
+                    if append {
+                        it.stream_brigades.entry(rid).or_default().push_back(bytes);
+                    } else {
+                        it.stream_brigades.entry(rid).or_default().push_front(bytes);
+                    }
+                    Value::Null
+                }
+                v => {
+                    return err(
+                        "TypeError",
+                        format!(
+                            "{name}(): Argument #1 ($brigade) must be of type resource, {} given",
+                            zval_word(&v)
+                        ),
+                    );
+                }
+            }
+        }
+        "stream_bucket_new" => {
+            if args.len() != 2 {
+                return err(
+                    "ArgumentCountError",
+                    format!(
+                        "stream_bucket_new() expects exactly 2 arguments, {} given",
+                        args.len()
+                    ),
+                );
+            }
+            match arg(args, 0) {
+                Value::Resource(r) => {
+                    // zend PHP_Z_PARAM_STREAM — a non-stream resource
+                    // (a filter or brigade handle) is a TypeError.
+                    let streamish = !matches!(
+                        &*r.borrow(),
+                        PhpResource::Closed { .. }
+                            | PhpResource::Proc { .. }
+                            | PhpResource::Other { .. }
+                    );
+                    if !streamish {
+                        return err(
+                            "TypeError",
+                            "stream_bucket_new(): supplied resource is not a valid stream resource",
+                        );
+                    }
+                    let bytes = zpp_strict_string(it, args, 1, name, "$buffer")?;
+                    new_stream_bucket(it, bytes.into_bytes())?
+                }
+                v => {
+                    return err(
+                        "TypeError",
+                        format!(
+                            "stream_bucket_new(): Argument #1 ($stream) must be of type resource, {} given",
+                            zval_word(&v)
+                        ),
                     );
                 }
             }
@@ -2294,187 +2537,198 @@ pub(in crate::builtins) fn write_resource(
     c: Option<&Cell>,
     data: &[u8],
 ) -> Result<StreamWrite, PhpError> {
-    use std::io::Write;
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
-            let mut rb = r.borrow_mut();
-            let rid = rb.id();
-            // stream write filters transform the outgoing bytes.
+            let rid = r.borrow().id();
+            // stream write filters transform the outgoing bytes —
+            // zend's _php_stream_write_filtered runs the write chain
+            // and ops->write receives the OUTPUT; fwrite() still
+            // reports the input length.
             let mut owned: Option<Vec<u8>> = None;
-            if it
-                .stream_filters
-                .get(&rid)
-                .is_some_and(|v| v.iter().any(|f| f.write))
-            {
-                let mut b = data.to_vec();
-                apply_stream_filters(it, rid, &mut b, false);
-                owned = Some(b);
+            if stream_write_filtered(it, rid) {
+                let sv = Value::Resource(r.clone());
+                let (out, status) =
+                    run_filter_chain(it, rid, &sv, false, data.to_vec(), false, &mut None)?;
+                if status != 2 {
+                    return Ok(StreamWrite::Discarded);
+                }
+                owned = Some(out);
             }
-            let data: &[u8] = owned.as_deref().unwrap_or(data);
-            match &mut *rb {
-                PhpResource::Stdio { which, pos, .. } => match *which {
-                    1 => {
-                        if it.live_io {
-                            let mut so = std::io::stdout().lock();
-                            let _ = so.write_all(data);
-                            let _ = so.flush();
-                        } else {
-                            it.out.extend_from_slice(data);
-                        }
-                        Ok(StreamWrite::Written)
-                    }
-                    3 => {
-                        it.emit_bytes(data);
-                        // zend tracks bytes written for ftell().
-                        *pos += data.len() as u64;
-                        Ok(StreamWrite::Written)
-                    }
-                    2 => {
-                        if it.live_io {
-                            let _ = std::io::stderr().write_all(data);
-                        } else {
-                            it.err_buf.push_str(&String::from_utf8_lossy(data));
-                        }
-                        Ok(StreamWrite::Written)
-                    }
-                    // STDIN: the fd exists but isn't open for writing —
-                    // write(2) returns EBADF.
-                    _ => Ok(StreamWrite::Ebadf(9, "Bad file descriptor".into())),
-                },
-                PhpResource::Pipe {
-                    file,
-                    write,
-                    pos,
-                    nonblock,
-                    ..
-                } => {
-                    if !*write {
-                        return Ok(StreamWrite::Ebadf(9, "Bad file descriptor".into()));
-                    }
-                    match file.write(data) {
-                        Ok(n) => {
-                            *pos += n as u64;
-                            if n == data.len() {
-                                Ok(StreamWrite::Written)
-                            } else {
-                                Ok(StreamWrite::Partial(n))
-                            }
-                        }
-                        Err(e) if *nonblock && e.kind() == std::io::ErrorKind::WouldBlock => {
-                            Ok(StreamWrite::Partial(0))
-                        }
-                        Err(e) => {
-                            let (errno, msg) = io_errno_str(&e);
-                            Ok(StreamWrite::Ebadf(errno, msg))
-                        }
-                    }
-                }
-                PhpResource::File {
-                    file,
-                    pos,
-                    write,
-                    rbuf,
-                    ..
-                } => {
-                    if !*write {
-                        return Ok(StreamWrite::Ebadf(9, "Bad file descriptor".into()));
-                    }
-                    use std::os::fd::AsRawFd;
-                    // zend's buffered write resyncs the fd to the
-                    // logical position only when a userspace read
-                    // buffer still holds unread bytes on a seekable
-                    // stream (streams.c:1194) — otherwise the write
-                    // lands at the real fd offset, which a dup'd child
-                    // may have moved.
-                    if !rbuf.is_empty() && stdio_seekable(file.as_raw_fd()) {
-                        fd_resync(file.as_raw_fd(), *pos, rbuf);
-                    }
-                    if let Err(e) = file.write_all(data) {
-                        let (errno, msg) = io_errno_str(&e);
-                        return Ok(StreamWrite::Ebadf(errno, msg));
-                    }
-                    *pos += data.len() as u64;
-                    Ok(StreamWrite::Written)
-                }
-                PhpResource::Mem {
-                    buf,
-                    pos,
-                    eof,
-                    write,
-                    append,
-                    spilled_fd,
-                    srbuf,
-                    temp_smax,
-                    ..
-                } => {
-                    // Once the buffer spills (temp_cast or a write that
-                    // crossed smax) the stream io hits the inner r+b
-                    // tmpfile — writes land even on 'r'-mode php://temp
-                    // (the write flag only gates the in-buffer op).
-                    if let Some(fd) = *spilled_fd {
-                        // zend's buffered write discards the read buffer
-                        // and reseeks the fd to the logical position ONLY
-                        // when userspace-buffered bytes are pending
-                        // (streams.c:1194 readpos != writepos) — with an
-                        // empty buffer the write lands at the kernel's
-                        // leftover offset (e.g. after a proc child
-                        // consumed bytes).
-                        if !srbuf.is_empty() {
-                            fd_resync(fd, *pos, srbuf);
-                        }
-                        return Ok(fd_stream_write(fd, pos, eof, data));
-                    }
-                    // zend php_stream_temp_write: the whole buffer
-                    // spills to a tmpfile once stream->position+count
-                    // reaches smax — BEFORE the inner memory stream's
-                    // readonly check, so a spilling write lands even
-                    // on 'r'-mode temps.
-                    if let Some(smax) = *temp_smax {
-                        if *pos as u128 + data.len() as u128 >= smax as u128 {
-                            match temp_spill_fd(buf, *pos) {
-                                Some(fd) => {
-                                    *spilled_fd = Some(fd);
-                                    return Ok(fd_stream_write(fd, pos, eof, data));
-                                }
-                                None => {
-                                    it.warn_pub("Unable to create temporary file, Check permissions in temporary files directory.")?;
-                                    return Ok(StreamWrite::Partial(0));
-                                }
-                            }
-                        }
-                    }
-                    // TEMP_STREAM_READONLY → php_stream_memory_write
-                    // returns -1 and the bytes are silently dropped
-                    // (no E_NOTICE — only plain stdio notices).
-                    if !*write {
-                        return Ok(StreamWrite::Discarded);
-                    }
-                    // TEMP_STREAM_APPEND: an 'a'-mode write lands at
-                    // end-of-buffer regardless of the current position.
-                    if *append {
-                        *pos = buf.len() as u64;
-                    }
-                    let start = *pos as usize;
-                    if start > buf.len() {
-                        buf.resize(start, 0);
-                    }
-                    let end = (start + data.len()).min(buf.len());
-                    if start < end {
-                        buf[start..end].copy_from_slice(&data[..end - start]);
-                    }
-                    buf.extend_from_slice(&data[end - start..]);
-                    *pos += data.len() as u64;
-                    *eof = false;
-                    Ok(StreamWrite::Written)
-                }
-                // RFC2397 streams notice like a plain fd failing the
-                // writable check; php://input drops silently.
-                PhpResource::Input { uri, .. } if is_data_uri(uri) => Ok(StreamWrite::NotWritable),
-                PhpResource::Input { .. } => Ok(StreamWrite::Discarded),
-                _ => Err(PhpError::fatal("bad resource", 0)),
-            }
+            write_resource_raw(it, &r, owned.as_deref().unwrap_or(data))
         }
         _ => Err(PhpError::fatal("not a resource", 0)),
+    }
+}
+
+/// The ops->write half — bytes already filtered.
+fn write_resource_raw(
+    it: &mut Interp,
+    r: &Rc<RefCell<PhpResource>>,
+    data: &[u8],
+) -> Result<StreamWrite, PhpError> {
+    use std::io::Write;
+    let mut rb = r.borrow_mut();
+    match &mut *rb {
+        PhpResource::Stdio { which, pos, .. } => match *which {
+            1 => {
+                if it.live_io {
+                    let mut so = std::io::stdout().lock();
+                    let _ = so.write_all(data);
+                    let _ = so.flush();
+                } else {
+                    it.out.extend_from_slice(data);
+                }
+                Ok(StreamWrite::Written)
+            }
+            3 => {
+                it.emit_bytes(data);
+                // zend tracks bytes written for ftell().
+                *pos += data.len() as u64;
+                Ok(StreamWrite::Written)
+            }
+            2 => {
+                if it.live_io {
+                    let _ = std::io::stderr().write_all(data);
+                } else {
+                    it.err_buf.push_str(&String::from_utf8_lossy(data));
+                }
+                Ok(StreamWrite::Written)
+            }
+            // STDIN: the fd exists but isn't open for writing —
+            // write(2) returns EBADF.
+            _ => Ok(StreamWrite::Ebadf(9, "Bad file descriptor".into())),
+        },
+        PhpResource::Pipe {
+            file,
+            write,
+            pos,
+            nonblock,
+            ..
+        } => {
+            if !*write {
+                return Ok(StreamWrite::Ebadf(9, "Bad file descriptor".into()));
+            }
+            match file.write(data) {
+                Ok(n) => {
+                    *pos += n as u64;
+                    if n == data.len() {
+                        Ok(StreamWrite::Written)
+                    } else {
+                        Ok(StreamWrite::Partial(n))
+                    }
+                }
+                Err(e) if *nonblock && e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Ok(StreamWrite::Partial(0))
+                }
+                Err(e) => {
+                    let (errno, msg) = io_errno_str(&e);
+                    Ok(StreamWrite::Ebadf(errno, msg))
+                }
+            }
+        }
+        PhpResource::File {
+            file,
+            pos,
+            write,
+            rbuf,
+            ..
+        } => {
+            if !*write {
+                return Ok(StreamWrite::Ebadf(9, "Bad file descriptor".into()));
+            }
+            use std::os::fd::AsRawFd;
+            // zend's buffered write resyncs the fd to the
+            // logical position only when a userspace read
+            // buffer still holds unread bytes on a seekable
+            // stream (streams.c:1194) — otherwise the write
+            // lands at the real fd offset, which a dup'd child
+            // may have moved.
+            if !rbuf.is_empty() && stdio_seekable(file.as_raw_fd()) {
+                fd_resync(file.as_raw_fd(), *pos, rbuf);
+            }
+            if let Err(e) = file.write_all(data) {
+                let (errno, msg) = io_errno_str(&e);
+                return Ok(StreamWrite::Ebadf(errno, msg));
+            }
+            *pos += data.len() as u64;
+            Ok(StreamWrite::Written)
+        }
+        PhpResource::Mem {
+            buf,
+            pos,
+            eof,
+            write,
+            append,
+            spilled_fd,
+            srbuf,
+            temp_smax,
+            ..
+        } => {
+            // Once the buffer spills (temp_cast or a write that
+            // crossed smax) the stream io hits the inner r+b
+            // tmpfile — writes land even on 'r'-mode php://temp
+            // (the write flag only gates the in-buffer op).
+            if let Some(fd) = *spilled_fd {
+                // zend's buffered write discards the read buffer
+                // and reseeks the fd to the logical position ONLY
+                // when userspace-buffered bytes are pending
+                // (streams.c:1194 readpos != writepos) — with an
+                // empty buffer the write lands at the kernel's
+                // leftover offset (e.g. after a proc child
+                // consumed bytes).
+                if !srbuf.is_empty() {
+                    fd_resync(fd, *pos, srbuf);
+                }
+                return Ok(fd_stream_write(fd, pos, eof, data));
+            }
+            // zend php_stream_temp_write: the whole buffer
+            // spills to a tmpfile once stream->position+count
+            // reaches smax — BEFORE the inner memory stream's
+            // readonly check, so a spilling write lands even
+            // on 'r'-mode temps.
+            if let Some(smax) = *temp_smax {
+                if *pos as u128 + data.len() as u128 >= smax as u128 {
+                    match temp_spill_fd(buf, *pos) {
+                        Some(fd) => {
+                            *spilled_fd = Some(fd);
+                            return Ok(fd_stream_write(fd, pos, eof, data));
+                        }
+                        None => {
+                            it.warn_pub("Unable to create temporary file, Check permissions in temporary files directory.")?;
+                            return Ok(StreamWrite::Partial(0));
+                        }
+                    }
+                }
+            }
+            // TEMP_STREAM_READONLY → php_stream_memory_write
+            // returns -1 and the bytes are silently dropped
+            // (no E_NOTICE — only plain stdio notices).
+            if !*write {
+                return Ok(StreamWrite::Discarded);
+            }
+            // TEMP_STREAM_APPEND: an 'a'-mode write lands at
+            // end-of-buffer regardless of the current position.
+            if *append {
+                *pos = buf.len() as u64;
+            }
+            let start = *pos as usize;
+            if start > buf.len() {
+                buf.resize(start, 0);
+            }
+            let end = (start + data.len()).min(buf.len());
+            if start < end {
+                buf[start..end].copy_from_slice(&data[..end - start]);
+            }
+            buf.extend_from_slice(&data[end - start..]);
+            *pos += data.len() as u64;
+            *eof = false;
+            Ok(StreamWrite::Written)
+        }
+        // RFC2397 streams notice like a plain fd failing the
+        // writable check; php://input drops silently.
+        PhpResource::Input { uri, .. } if is_data_uri(uri) => Ok(StreamWrite::NotWritable),
+        PhpResource::Input { .. } => Ok(StreamWrite::Discarded),
+        _ => Err(PhpError::fatal("bad resource", 0)),
     }
 }
 
@@ -2982,12 +3236,14 @@ fn read_line_pipe(
     Ok(StreamRead::Data(out))
 }
 
-fn read_resource(it: &Interp, c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
+fn read_resource(it: &mut Interp, c: Option<&Cell>, n: usize) -> Result<StreamRead, PhpError> {
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
+            let sv = Value::Resource(r.clone());
             let mut rb = r.borrow_mut();
             let rid = rb.id();
-            let mut res = match &mut *rb {
+            let filtered = stream_read_filtered(it, rid);
+            match &mut *rb {
                 PhpResource::Pipe {
                     file,
                     pos,
@@ -2996,7 +3252,25 @@ fn read_resource(it: &Interp, c: Option<&Cell>, n: usize) -> Result<StreamRead, 
                     id,
                     rbuf,
                     ..
-                } => read_pipe(file, eof, *nonblock, pos, rbuf, stream_chunk(it, *id), n),
+                } => {
+                    use std::os::fd::AsRawFd;
+                    let fd = file.as_raw_fd();
+                    if filtered {
+                        pipe_read_filtered(
+                            it,
+                            rid,
+                            &sv,
+                            fd,
+                            pos,
+                            eof,
+                            rbuf,
+                            stream_chunk(it, *id),
+                            n,
+                        )
+                    } else {
+                        read_pipe(file, eof, *nonblock, pos, rbuf, stream_chunk(it, *id), n)
+                    }
+                }
                 PhpResource::Stdio { which, .. } => match *which {
                     // STDIN reads are not modeled; php://output has no
                     // read op at all (silent false); STDOUT/STDERR are
@@ -3012,6 +3286,7 @@ fn read_resource(it: &Interp, c: Option<&Cell>, n: usize) -> Result<StreamRead, 
                     spilled_fd,
                     srbuf,
                     rcap,
+                    fraw,
                     id,
                     ..
                 } => {
@@ -3019,7 +3294,24 @@ fn read_resource(it: &Interp, c: Option<&Cell>, n: usize) -> Result<StreamRead, 
                     // through zend's outer readbuf.
                     if let Some(fd) = *spilled_fd {
                         let chunk = stream_chunk(it, *id);
-                        Ok(fd_stream_read(fd, pos, eof, srbuf, rcap, chunk, n))
+                        if filtered {
+                            fd_stream_read_filtered(it, rid, &sv, fd, pos, eof, srbuf, chunk, n)
+                        } else {
+                            Ok(fd_stream_read(fd, pos, eof, srbuf, rcap, chunk, n))
+                        }
+                    } else if filtered {
+                        mem_filtered_read(
+                            it,
+                            rid,
+                            &sv,
+                            body,
+                            fraw,
+                            pos,
+                            eof,
+                            srbuf,
+                            stream_chunk(it, *id),
+                            n,
+                        )
                     } else {
                         // pos may sit past the end (fseek allows it) —
                         // clamp the slice start instead of panicking.
@@ -3027,6 +3319,7 @@ fn read_resource(it: &Interp, c: Option<&Cell>, n: usize) -> Result<StreamRead, 
                         let take = (body.len() - start).min(n);
                         let out = body[start..start + take].to_vec();
                         *pos += take as u64;
+                        *fraw = *pos;
                         if take < n {
                             *eof = true;
                         }
@@ -3040,17 +3333,36 @@ fn read_resource(it: &Interp, c: Option<&Cell>, n: usize) -> Result<StreamRead, 
                     spilled_fd,
                     srbuf,
                     rcap,
+                    fraw,
                     id,
                     ..
                 } => {
                     if let Some(fd) = *spilled_fd {
                         let chunk = stream_chunk(it, *id);
-                        Ok(fd_stream_read(fd, pos, eof, srbuf, rcap, chunk, n))
+                        if filtered {
+                            fd_stream_read_filtered(it, rid, &sv, fd, pos, eof, srbuf, chunk, n)
+                        } else {
+                            Ok(fd_stream_read(fd, pos, eof, srbuf, rcap, chunk, n))
+                        }
+                    } else if filtered {
+                        mem_filtered_read(
+                            it,
+                            rid,
+                            &sv,
+                            buf,
+                            fraw,
+                            pos,
+                            eof,
+                            srbuf,
+                            stream_chunk(it, *id),
+                            n,
+                        )
                     } else {
                         let start = (*pos as usize).min(buf.len());
                         let take = (buf.len() - start).min(n);
                         let out = buf[start..start + take].to_vec();
                         *pos += take as u64;
+                        *fraw = *pos;
                         if take < n {
                             *eof = true;
                         }
@@ -3077,34 +3389,49 @@ fn read_resource(it: &Interp, c: Option<&Cell>, n: usize) -> Result<StreamRead, 
                     // break). `pos` is the PHP-side ftell counter; an
                     // fd dup'd to a proc_open child shares the kernel
                     // offset, so a draining child moves reads to EOF.
-                    Ok(fd_stream_read(
-                        file.as_raw_fd(),
-                        pos,
-                        eof,
-                        rbuf,
-                        rcap,
-                        stream_chunk(it, *id),
-                        n,
-                    ))
+                    if filtered {
+                        fd_stream_read_filtered(
+                            it,
+                            rid,
+                            &sv,
+                            file.as_raw_fd(),
+                            pos,
+                            eof,
+                            rbuf,
+                            stream_chunk(it, *id),
+                            n,
+                        )
+                    } else {
+                        Ok(fd_stream_read(
+                            file.as_raw_fd(),
+                            pos,
+                            eof,
+                            rbuf,
+                            rcap,
+                            stream_chunk(it, *id),
+                            n,
+                        ))
+                    }
                 }
                 _ => Ok(StreamRead::Data(Vec::new())),
-            };
-            // stream read filters transform the delivered bytes.
-            if let Ok(StreamRead::Data(b)) = &mut res {
-                apply_stream_filters(it, rid, b, true);
             }
-            res
         }
         _ => Err(PhpError::fatal("not a resource", 0)),
     }
 }
 
-fn read_line_resource(it: &Interp, c: Option<&Cell>, limit: usize) -> Result<StreamRead, PhpError> {
+fn read_line_resource(
+    it: &mut Interp,
+    c: Option<&Cell>,
+    limit: usize,
+) -> Result<StreamRead, PhpError> {
     match c.map(|c| c.borrow().clone()) {
         Some(Value::Resource(r)) => {
+            let sv = Value::Resource(r.clone());
             let mut rb = r.borrow_mut();
             let rid = rb.id();
-            let mut res = match &mut *rb {
+            let filtered = stream_read_filtered(it, rid);
+            match &mut *rb {
                 PhpResource::Pipe {
                     file,
                     pos,
@@ -3113,15 +3440,34 @@ fn read_line_resource(it: &Interp, c: Option<&Cell>, limit: usize) -> Result<Str
                     id,
                     rbuf,
                     ..
-                } => read_line_pipe(
-                    file,
-                    eof,
-                    *nonblock,
-                    pos,
-                    rbuf,
-                    stream_chunk(it, *id),
-                    limit,
-                ),
+                } => {
+                    use std::os::fd::AsRawFd;
+                    let fd = file.as_raw_fd();
+                    if filtered {
+                        pipe_line_read_filtered(
+                            it,
+                            rid,
+                            &sv,
+                            fd,
+                            pos,
+                            eof,
+                            rbuf,
+                            stream_chunk(it, *id),
+                            limit,
+                            true,
+                        )
+                    } else {
+                        read_line_pipe(
+                            file,
+                            eof,
+                            *nonblock,
+                            pos,
+                            rbuf,
+                            stream_chunk(it, *id),
+                            limit,
+                        )
+                    }
+                }
                 PhpResource::Stdio { which, .. } => match *which {
                     0 => Ok(StreamRead::Data(Vec::new())),
                     _ if *which > 2 => Ok(StreamRead::FailSilent),
@@ -3134,12 +3480,30 @@ fn read_line_resource(it: &Interp, c: Option<&Cell>, limit: usize) -> Result<Str
                     spilled_fd,
                     srbuf,
                     rcap,
+                    fraw,
                     id,
                     ..
                 } => {
                     if let Some(fd) = *spilled_fd {
                         let chunk = stream_chunk(it, *id);
-                        Ok(fd_line_read(fd, pos, eof, srbuf, rcap, chunk, limit))
+                        if filtered {
+                            fd_line_read_filtered(it, rid, &sv, fd, pos, eof, srbuf, chunk, limit)
+                        } else {
+                            Ok(fd_line_read(fd, pos, eof, srbuf, rcap, chunk, limit))
+                        }
+                    } else if filtered {
+                        mem_line_read_filtered(
+                            it,
+                            rid,
+                            &sv,
+                            body,
+                            fraw,
+                            pos,
+                            eof,
+                            srbuf,
+                            stream_chunk(it, *id),
+                            limit,
+                        )
                     } else {
                         let start = *pos as usize;
                         if start >= body.len() {
@@ -3154,6 +3518,7 @@ fn read_line_resource(it: &Interp, c: Option<&Cell>, limit: usize) -> Result<Str
                                 .min(start.saturating_add(limit));
                             let out = body[start..nl].to_vec();
                             *pos = nl as u64;
+                            *fraw = *pos;
                             Ok(StreamRead::Data(out))
                         }
                     }
@@ -3165,12 +3530,30 @@ fn read_line_resource(it: &Interp, c: Option<&Cell>, limit: usize) -> Result<Str
                     spilled_fd,
                     srbuf,
                     rcap,
+                    fraw,
                     id,
                     ..
                 } => {
                     if let Some(fd) = *spilled_fd {
                         let chunk = stream_chunk(it, *id);
-                        Ok(fd_line_read(fd, pos, eof, srbuf, rcap, chunk, limit))
+                        if filtered {
+                            fd_line_read_filtered(it, rid, &sv, fd, pos, eof, srbuf, chunk, limit)
+                        } else {
+                            Ok(fd_line_read(fd, pos, eof, srbuf, rcap, chunk, limit))
+                        }
+                    } else if filtered {
+                        mem_line_read_filtered(
+                            it,
+                            rid,
+                            &sv,
+                            buf,
+                            fraw,
+                            pos,
+                            eof,
+                            srbuf,
+                            stream_chunk(it, *id),
+                            limit,
+                        )
                     } else {
                         let start = *pos as usize;
                         if start >= buf.len() {
@@ -3185,6 +3568,7 @@ fn read_line_resource(it: &Interp, c: Option<&Cell>, limit: usize) -> Result<Str
                                 .min(start.saturating_add(limit));
                             let out = buf[start..nl].to_vec();
                             *pos = nl as u64;
+                            *fraw = *pos;
                             Ok(StreamRead::Data(out))
                         }
                     }
@@ -3203,23 +3587,32 @@ fn read_line_resource(it: &Interp, c: Option<&Cell>, limit: usize) -> Result<Str
                     if !*read {
                         return Ok(StreamRead::Ebadf(9, "Bad file descriptor".into()));
                     }
-                    Ok(fd_line_read(
-                        file.as_raw_fd(),
-                        pos,
-                        eof,
-                        rbuf,
-                        rcap,
-                        stream_chunk(it, *id),
-                        limit,
-                    ))
+                    if filtered {
+                        fd_line_read_filtered(
+                            it,
+                            rid,
+                            &sv,
+                            file.as_raw_fd(),
+                            pos,
+                            eof,
+                            rbuf,
+                            stream_chunk(it, *id),
+                            limit,
+                        )
+                    } else {
+                        Ok(fd_line_read(
+                            file.as_raw_fd(),
+                            pos,
+                            eof,
+                            rbuf,
+                            rcap,
+                            stream_chunk(it, *id),
+                            limit,
+                        ))
+                    }
                 }
                 _ => Ok(StreamRead::Data(Vec::new())),
-            };
-            // stream read filters transform the delivered bytes.
-            if let Ok(StreamRead::Data(b)) = &mut res {
-                apply_stream_filters(it, rid, b, true);
             }
-            res
         }
         _ => Err(PhpError::fatal("not a resource", 0)),
     }
@@ -3227,12 +3620,14 @@ fn read_line_resource(it: &Interp, c: Option<&Cell>, limit: usize) -> Result<Str
 
 /// php_stream_gets: read up to `limit` bytes, stopping after '\n'.
 /// Returns an empty vec at EOF (or on a non-readable stream).
-fn csv_gets(it: &Interp, c: &Cell, limit: usize) -> Result<StreamRead, PhpError> {
+fn csv_gets(it: &mut Interp, c: &Cell, limit: usize) -> Result<StreamRead, PhpError> {
     match c.borrow().clone() {
         Value::Resource(r) => {
+            let sv = Value::Resource(r.clone());
             let mut rb = r.borrow_mut();
             let rid = rb.id();
-            let mut res = match &mut *rb {
+            let filtered = stream_read_filtered(it, rid);
+            match &mut *rb {
                 PhpResource::Pipe {
                     file,
                     pos,
@@ -3241,15 +3636,34 @@ fn csv_gets(it: &Interp, c: &Cell, limit: usize) -> Result<StreamRead, PhpError>
                     id,
                     rbuf,
                     ..
-                } => read_line_pipe(
-                    file,
-                    eof,
-                    *nonblock,
-                    pos,
-                    rbuf,
-                    stream_chunk(it, *id),
-                    limit,
-                ),
+                } => {
+                    use std::os::fd::AsRawFd;
+                    let fd = file.as_raw_fd();
+                    if filtered {
+                        pipe_line_read_filtered(
+                            it,
+                            rid,
+                            &sv,
+                            fd,
+                            pos,
+                            eof,
+                            rbuf,
+                            stream_chunk(it, *id),
+                            limit,
+                            true,
+                        )
+                    } else {
+                        read_line_pipe(
+                            file,
+                            eof,
+                            *nonblock,
+                            pos,
+                            rbuf,
+                            stream_chunk(it, *id),
+                            limit,
+                        )
+                    }
+                }
                 PhpResource::File {
                     id,
                     file,
@@ -3264,15 +3678,29 @@ fn csv_gets(it: &Interp, c: &Cell, limit: usize) -> Result<StreamRead, PhpError>
                     if !*read {
                         return Ok(StreamRead::Ebadf(9, "Bad file descriptor".into()));
                     }
-                    Ok(fd_line_read(
-                        file.as_raw_fd(),
-                        pos,
-                        eof,
-                        rbuf,
-                        rcap,
-                        stream_chunk(it, *id),
-                        limit,
-                    ))
+                    if filtered {
+                        fd_line_read_filtered(
+                            it,
+                            rid,
+                            &sv,
+                            file.as_raw_fd(),
+                            pos,
+                            eof,
+                            rbuf,
+                            stream_chunk(it, *id),
+                            limit,
+                        )
+                    } else {
+                        Ok(fd_line_read(
+                            file.as_raw_fd(),
+                            pos,
+                            eof,
+                            rbuf,
+                            rcap,
+                            stream_chunk(it, *id),
+                            limit,
+                        ))
+                    }
                 }
                 PhpResource::Mem {
                     buf,
@@ -3281,12 +3709,30 @@ fn csv_gets(it: &Interp, c: &Cell, limit: usize) -> Result<StreamRead, PhpError>
                     spilled_fd,
                     srbuf,
                     rcap,
+                    fraw,
                     id,
                     ..
                 } => {
                     if let Some(fd) = *spilled_fd {
                         let chunk = stream_chunk(it, *id);
-                        Ok(fd_line_read(fd, pos, eof, srbuf, rcap, chunk, limit))
+                        if filtered {
+                            fd_line_read_filtered(it, rid, &sv, fd, pos, eof, srbuf, chunk, limit)
+                        } else {
+                            Ok(fd_line_read(fd, pos, eof, srbuf, rcap, chunk, limit))
+                        }
+                    } else if filtered {
+                        mem_line_read_filtered(
+                            it,
+                            rid,
+                            &sv,
+                            buf,
+                            fraw,
+                            pos,
+                            eof,
+                            srbuf,
+                            stream_chunk(it, *id),
+                            limit,
+                        )
                     } else {
                         let start = *pos as usize;
                         if start >= buf.len() {
@@ -3302,6 +3748,7 @@ fn csv_gets(it: &Interp, c: &Cell, limit: usize) -> Result<StreamRead, PhpError>
                                 }
                             }
                             *pos = end as u64;
+                            *fraw = *pos;
                             Ok(StreamRead::Data(buf[start..end].to_vec()))
                         }
                     }
@@ -3313,12 +3760,30 @@ fn csv_gets(it: &Interp, c: &Cell, limit: usize) -> Result<StreamRead, PhpError>
                     spilled_fd,
                     srbuf,
                     rcap,
+                    fraw,
                     id,
                     ..
                 } => {
                     if let Some(fd) = *spilled_fd {
                         let chunk = stream_chunk(it, *id);
-                        Ok(fd_line_read(fd, pos, eof, srbuf, rcap, chunk, limit))
+                        if filtered {
+                            fd_line_read_filtered(it, rid, &sv, fd, pos, eof, srbuf, chunk, limit)
+                        } else {
+                            Ok(fd_line_read(fd, pos, eof, srbuf, rcap, chunk, limit))
+                        }
+                    } else if filtered {
+                        mem_line_read_filtered(
+                            it,
+                            rid,
+                            &sv,
+                            body,
+                            fraw,
+                            pos,
+                            eof,
+                            srbuf,
+                            stream_chunk(it, *id),
+                            limit,
+                        )
                     } else {
                         let start = *pos as usize;
                         if start >= body.len() {
@@ -3334,17 +3799,13 @@ fn csv_gets(it: &Interp, c: &Cell, limit: usize) -> Result<StreamRead, PhpError>
                                 }
                             }
                             *pos = end as u64;
+                            *fraw = *pos;
                             Ok(StreamRead::Data(body[start..end].to_vec()))
                         }
                     }
                 }
                 _ => Ok(StreamRead::Data(Vec::new())),
-            };
-            // stream read filters transform the delivered bytes.
-            if let Ok(StreamRead::Data(b)) = &mut res {
-                apply_stream_filters(it, rid, b, true);
             }
-            res
         }
         _ => Ok(StreamRead::Data(Vec::new())),
     }
@@ -3352,7 +3813,7 @@ fn csv_gets(it: &Interp, c: &Cell, limit: usize) -> Result<StreamRead, PhpError>
 
 /// php_stream_get_line equivalent: read the rest of the current line
 /// (through '\n' inclusive), unbounded. Returns None at EOF.
-fn csv_get_line(it: &Interp, c: &Cell) -> Result<StreamRead, PhpError> {
+fn csv_get_line(it: &mut Interp, c: &Cell) -> Result<StreamRead, PhpError> {
     match csv_gets(it, c, usize::MAX)? {
         StreamRead::Data(out) if out.is_empty() => Ok(StreamRead::Data(Vec::new())),
         other => Ok(other),
@@ -4174,46 +4635,829 @@ pub(in crate::builtins) fn stream_is_filtered(it: &Interp, id: u64) -> bool {
     it.stream_filters.get(&id).is_some_and(|v| !v.is_empty())
 }
 
-/// Names stream_filter_create resolves in this build — zend's builtin
-/// filter registry (stream_get_filters() order): the concrete names
-/// plus the wildcard families, which accept anything after the dot.
-fn filter_name_known(name: &str) -> bool {
-    matches!(
-        name,
-        "string.rot13"
-            | "string.toupper"
-            | "string.tolower"
-            | "consumed"
-            | "dechunk"
-            | "zlib.inflate"
-            | "zlib.deflate"
-            | "bzip2.compress"
-            | "bzip2.decompress"
-            | "convert.base64-encode"
-            | "convert.base64-decode"
-            | "convert.quoted-printable-encode"
-            | "convert.quoted-printable-decode"
-            | "convert.uuencode"
-            | "convert.uudecode"
-    ) || name.starts_with("convert.iconv.")
+// -----------------------------------------------------------------
+// zend stream-filter machinery (main/streams.c fill path, filter.c
+// factory/attach, ext/standard/filters.c + user_filters.c).
+// -----------------------------------------------------------------
+
+/// What a factory resolution hit — the builtin state template or a
+/// registered php_user_filter class name.
+enum FactoryHit {
+    State(Result<FilterState, String>),
+    Class(String),
 }
 
-/// zend's filter chain applied to a chunk of stream data. Only the
-/// stateless byte-map filters transform bytes here; other attached
-/// names still count for stream_is_filtered/cast refusal but leave
-/// the data untouched (their transforms are unimplemented).
-fn apply_stream_filters(it: &Interp, id: u64, data: &mut [u8], read_dir: bool) {
-    let Some(filters) = it.stream_filters.get(&id) else {
-        return;
-    };
-    for f in filters.iter() {
-        let applies = if read_dir { f.read } else { f.write };
-        if !applies {
+/// Which direction of the chain one run targets.
+const FILTER_READ: bool = true;
+
+/// zend's php_stream_filter_create lookup (filter.c): the full name
+/// is tried first, then it is shortened a dotted segment at a time —
+/// `a.b.c` → `a.b.*` → `a.*`. Every level is checked against the
+/// builtin factory keys AND the user_filter_map.
+fn filter_resolve(it: &Interp, name: &str) -> Option<FactoryHit> {
+    let mut probe = name.to_string();
+    loop {
+        match probe.as_str() {
+            "string.rot13" | "string.toupper" | "string.tolower" => {
+                return Some(FactoryHit::State(Ok(FilterState::Plain)));
+            }
+            "consumed" => {
+                return Some(FactoryHit::State(Ok(FilterState::Consumed {
+                    count: 0,
+                    offset: None,
+                })));
+            }
+            "dechunk" => {
+                return Some(FactoryHit::State(Ok(FilterState::Dechunk(Dechunk {
+                    chunk_size: 0,
+                    state: DechunkState::SizeStart,
+                }))));
+            }
+            "convert.iconv.*" => {
+                let spec = &name["convert.iconv.".len()..];
+                return Some(match parse_iconv_spec(spec) {
+                    Some((from, to)) => FactoryHit::State(Ok(FilterState::Iconv {
+                        from,
+                        to,
+                        pending: Vec::new(),
+                    })),
+                    None => FactoryHit::State(Err(String::new())),
+                });
+            }
+            "convert.*" => {
+                let member = &name[name.find('.').map(|i| i + 1).unwrap_or(0)..];
+                let st = match member.to_ascii_lowercase().as_str() {
+                    "base64-encode" => FilterState::Base64 {
+                        decode: false,
+                        tail: Vec::new(),
+                    },
+                    "base64-decode" => FilterState::Base64 {
+                        decode: true,
+                        tail: Vec::new(),
+                    },
+                    "quoted-printable-encode" => FilterState::Qp {
+                        encode: true,
+                        col: 0,
+                        tail: Vec::new(),
+                    },
+                    "quoted-printable-decode" => FilterState::Qp {
+                        encode: false,
+                        col: 0,
+                        tail: Vec::new(),
+                    },
+                    _ => return Some(FactoryHit::State(Err(String::new()))),
+                };
+                return Some(FactoryHit::State(Ok(st)));
+            }
+            "zlib.*" | "bzip2.*" => {
+                let member = &name[name.find('.').map(|i| i + 1).unwrap_or(0)..];
+                let ok = if probe.starts_with("zlib") {
+                    matches!(member, "deflate" | "inflate")
+                } else {
+                    matches!(member, "compress" | "decompress")
+                };
+                return Some(FactoryHit::State(if ok {
+                    Ok(FilterState::CodecStub)
+                } else {
+                    Err(String::new())
+                }));
+            }
+            _ => {}
+        }
+        for (n, cls) in &it.user_filter_map {
+            if probe == *n {
+                return Some(FactoryHit::Class(cls.clone()));
+            }
+        }
+        let i = probe.rfind('.')?;
+        if probe.ends_with(".*") {
+            // 'a.b.*' missed: drop '.b.*' and try 'a.*' next
+            // (zend's strrchr walk pops one real segment).
+            let stem = &probe[..probe.len() - 2];
+            probe = format!("{}.*", &stem[..stem.rfind('.')?]);
+        } else {
+            probe.truncate(i + 1);
+            probe.push('*');
+        }
+    }
+}
+
+/// 'convert.iconv.FROM.TO' or '.../FROM/TO' — split the spec on the
+/// first '/' or '.', normalize both encoding names, and validate
+/// against the encodings this build recognizes (zend hands the pair
+/// to iconv_open and fails on unrecognized names).
+fn parse_iconv_spec(spec: &str) -> Option<(String, String)> {
+    let cut = spec.find(['/', '.'])?;
+    let (from, to) = (&spec[..cut], &spec[cut + 1..]);
+    let from = iconv_enc_normal(from);
+    let to = iconv_enc_normal(to);
+    if iconv_enc_known(&from) && iconv_enc_known(&to) {
+        Some((from, to))
+    } else {
+        None
+    }
+}
+
+/// Uppercase, strip '-'/'_' — "ISO-8859-1" → "ISO88591".
+fn iconv_enc_normal(enc: &str) -> String {
+    enc.chars()
+        .filter(|c| *c != '-' && *c != '_')
+        .flat_map(|c| c.to_uppercase())
+        .collect()
+}
+
+/// Encodings the attach-time check accepts — the common iconv set.
+fn iconv_enc_known(enc: &str) -> bool {
+    if enc.is_empty() {
+        return false;
+    }
+    // patterned families: CP1252 / WINDOWS1251 / ISO8859X / IBMx / EBCDIC-x
+    if let Some(rest) = enc
+        .strip_prefix("ISO8859")
+        .or_else(|| enc.strip_prefix("CP"))
+        .or_else(|| enc.strip_prefix("WINDOWS"))
+        .or_else(|| enc.strip_prefix("IBM"))
+    {
+        return !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
+    }
+    if enc.starts_with("EBCDIC") {
+        return true;
+    }
+    matches!(
+        enc,
+        "UTF8"
+            | "UTF16"
+            | "UTF16LE"
+            | "UTF16BE"
+            | "UTF32"
+            | "UTF32LE"
+            | "UTF32BE"
+            | "UCS2"
+            | "UCS2LE"
+            | "UCS2BE"
+            | "UCS4"
+            | "UCS4LE"
+            | "UCS4BE"
+            | "UCS4INTERNAL"
+            | "UCS2INTERNAL"
+            | "UCS2LEINTERNAL"
+            | "UCS2BEINTERNAL"
+            | "UTF7"
+            | "UTF7IMAP"
+            | "ASCII"
+            | "USASCII"
+            | "ANSIX341968"
+            | "LATIN1"
+            | "LATIN2"
+            | "LATIN3"
+            | "LATIN4"
+            | "LATIN5"
+            | "LATIN6"
+            | "LATIN7"
+            | "LATIN8"
+            | "LATIN9"
+            | "LATIN10"
+            | "KOI8R"
+            | "KOI8U"
+            | "KOI8"
+            | "KOI8T"
+            | "KOI8RU"
+            | "ARMSCII8"
+            | "TIS620"
+            | "VISCII"
+            | "EUCJP"
+            | "EUCCN"
+            | "EUCKR"
+            | "EUCTW"
+            | "EUCJISX0213"
+            | "SJIS"
+            | "SHIFTJIS"
+            | "SHIFTJISX0213"
+            | "ISO2022JP"
+            | "GB2312"
+            | "GBK"
+            | "GB18030"
+            | "BIG5"
+            | "BIG5HKSCS"
+            | "MACINTOSH"
+            | "MACROMAN"
+            | "HPROMAN8"
+            | "T64"
+            | "T65"
+            | "TCVN"
+            | "GEORGIANACADEMY"
+            | "GEORGIANPS"
+            | "TURKISH8"
+            | "MULELAO1"
+            | "NEXTSTEP"
+            | "RISCOSLATIN1"
+            | "PT154"
+            | "RK1048"
+    )
+}
+
+/// Decode bytes into code points. Returns (code points, bytes used).
+/// Unrecognized-in-practice encodings decode byte-wise as ISO-8859-1.
+fn iconv_decode(enc: &str, bytes: &[u8]) -> (Vec<u32>, usize) {
+    match enc {
+        "UTF8" => iconv_decode_utf8(bytes),
+        "UTF16LE" | "UCS2LE" | "UCS2LEINTERNAL" => iconv_decode_u16(bytes, true),
+        "UTF16BE" | "UCS2" | "UCS2BE" | "UCS2INTERNAL" | "UCS2BEINTERNAL" => {
+            iconv_decode_u16(bytes, false)
+        }
+        "UTF32LE" | "UCS4LE" | "UCS4INTERNAL" => iconv_decode_u32(bytes, true),
+        "UTF32BE" | "UCS4BE" | "UCS4" => iconv_decode_u32(bytes, false),
+        "UTF16" => iconv_decode_u16_bom(bytes),
+        "UTF32" => iconv_decode_u32_bom(bytes),
+        _ => (bytes.iter().map(|b| *b as u32).collect(), bytes.len()),
+    }
+}
+
+/// 'UTF-16' without LE/BE: BOM-tolerant, defaults BE (iconv semantics).
+fn iconv_decode_u16_bom(bytes: &[u8]) -> (Vec<u32>, usize) {
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let (cps, used) = iconv_decode_u16(&bytes[2..], true);
+        return (cps, used + 2.min(bytes.len()));
+    }
+    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+        let (cps, used) = iconv_decode_u16(&bytes[2..], false);
+        return (cps, used + 2.min(bytes.len()));
+    }
+    iconv_decode_u16(bytes, false)
+}
+
+fn iconv_decode_u32_bom(bytes: &[u8]) -> (Vec<u32>, usize) {
+    if bytes.len() >= 4 && bytes[..4] == [0xFF, 0xFE, 0, 0] {
+        let (cps, used) = iconv_decode_u32(&bytes[4..], true);
+        return (cps, used + 4.min(bytes.len()));
+    }
+    if bytes.len() >= 4 && bytes[..4] == [0, 0, 0xFE, 0xFF] {
+        let (cps, used) = iconv_decode_u32(&bytes[4..], false);
+        return (cps, used + 4.min(bytes.len()));
+    }
+    iconv_decode_u32(bytes, false)
+}
+
+/// UTF-8 → code points. An incomplete/invalid tail is left
+/// undecoded (used < len) so it can carry into the next call.
+fn iconv_decode_utf8(bytes: &[u8]) -> (Vec<u32>, usize) {
+    let mut cps = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let (len, min): (usize, u32) = match b {
+            0x00..=0x7F => (1, 0),
+            0xC0..=0xDF => (2, 0x80),
+            0xE0..=0xEF => (3, 0x800),
+            _ => (4, 0x10000),
+        };
+        if i + len > bytes.len() {
+            break;
+        }
+        let lead_mask = [0x7F, 0x1F, 0x0F, 0x07][len - 1];
+        let mut cp = (b as u32) & lead_mask;
+        let mut valid = true;
+        for j in 1..len {
+            let c = bytes[i + j];
+            if !(0x80..=0xBF).contains(&c) {
+                valid = false;
+                break;
+            }
+            cp = (cp << 6) | (c as u32 & 0x3F);
+        }
+        if !valid || cp < min || cp > 0x10FFFF || (0xD800..=0xDFFF).contains(&cp) {
+            // invalid sequence — consume one byte as U+FFFD-ish
+            cps.push(0xFFFD);
+            i += 1;
             continue;
         }
-        match f.name.as_str() {
+        cps.push(cp);
+        i += len;
+    }
+    (cps, i)
+}
+
+fn iconv_decode_u16(bytes: &[u8], le: bool) -> (Vec<u32>, usize) {
+    let units = bytes.len() / 2;
+    let mut cps = Vec::new();
+    let mut i = 0;
+    while i < units * 2 {
+        let u = if le {
+            u16::from_le_bytes([bytes[i], bytes[i + 1]])
+        } else {
+            u16::from_be_bytes([bytes[i], bytes[i + 1]])
+        };
+        if (0xD800..0xDC00).contains(&u) && i + 4 <= bytes.len() {
+            let u2 = if le {
+                u16::from_le_bytes([bytes[i + 2], bytes[i + 3]])
+            } else {
+                u16::from_be_bytes([bytes[i + 2], bytes[i + 3]])
+            };
+            if (0xDC00..0xE000).contains(&u2) {
+                cps.push(0x10000 + (((u as u32 - 0xD800) << 10) | (u2 as u32 - 0xDC00)));
+                i += 4;
+                continue;
+            }
+        }
+        cps.push(u as u32);
+        i += 2;
+    }
+    (cps, i)
+}
+
+fn iconv_decode_u32(bytes: &[u8], le: bool) -> (Vec<u32>, usize) {
+    let units = bytes.len() / 4;
+    let mut cps = Vec::with_capacity(units);
+    for i in 0..units {
+        let w = &bytes[i * 4..i * 4 + 4];
+        let u = if le {
+            u32::from_le_bytes([w[0], w[1], w[2], w[3]])
+        } else {
+            u32::from_be_bytes([w[0], w[1], w[2], w[3]])
+        };
+        cps.push(u);
+    }
+    (cps, units * 4)
+}
+
+/// Encode code points back to bytes in the target encoding.
+fn iconv_encode(enc: &str, cps: &[u32]) -> Vec<u8> {
+    match enc {
+        "UTF8" => {
+            let mut out = Vec::new();
+            for &cp in cps {
+                let ch = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                let mut b = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut b).as_bytes());
+            }
+            out
+        }
+        "UTF16" | "UTF16LE" | "UCS2LE" | "UCS2LEINTERNAL" => {
+            iconv_encode_u16(cps, true, enc == "UTF16")
+        }
+        "UTF16BE" | "UCS2" | "UCS2BE" | "UCS2INTERNAL" | "UCS2BEINTERNAL" => {
+            iconv_encode_u16(cps, false, false)
+        }
+        "UTF32" | "UTF32LE" | "UCS4LE" | "UCS4INTERNAL" => {
+            iconv_encode_u32(cps, true, enc == "UTF32")
+        }
+        "UTF32BE" | "UCS4BE" | "UCS4" => iconv_encode_u32(cps, false, false),
+        "ASCII" | "USASCII" | "ANSIX341968" => cps
+            .iter()
+            .map(|&cp| if cp < 0x80 { cp as u8 } else { b'?' })
+            .collect(),
+        _ => cps
+            .iter()
+            .map(|&cp| if cp < 0x100 { cp as u8 } else { b'?' })
+            .collect(),
+    }
+}
+
+fn iconv_encode_u16(cps: &[u32], le: bool, bom: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    if bom {
+        out.extend_from_slice(if le { &[0xFF, 0xFE] } else { &[0xFE, 0xFF] });
+    }
+    for &cp in cps {
+        if cp > 0xFFFF {
+            let v = cp - 0x10000;
+            for u in [0xD800 + (v >> 10) as u16, 0xDC00 + (v & 0x3FF) as u16] {
+                let b = if le { u.to_le_bytes() } else { u.to_be_bytes() };
+                out.extend_from_slice(&b);
+            }
+        } else {
+            let u = cp as u16;
+            let b = if le { u.to_le_bytes() } else { u.to_be_bytes() };
+            out.extend_from_slice(&b);
+        }
+    }
+    out
+}
+
+fn iconv_encode_u32(cps: &[u32], le: bool, bom: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    if bom {
+        let b: &[u8] = if le {
+            &[0xFF, 0xFE, 0, 0]
+        } else {
+            &[0, 0, 0xFE, 0xFF]
+        };
+        out.extend_from_slice(b);
+    }
+    for &cp in cps {
+        let b = if le {
+            cp.to_le_bytes()
+        } else {
+            cp.to_be_bytes()
+        };
+        out.extend_from_slice(&b);
+    }
+    out
+}
+
+/// zend's php_dechunk (filters.c) — the HTTP chunked-transfer decoder
+/// state machine operating in place; returns the decoded length.
+fn php_dechunk(d: &mut crate::value::Dechunk, buf: &mut Vec<u8>) {
+    use crate::value::DechunkState as S;
+    let end = buf.len();
+    let mut p = 0;
+    let mut out: Vec<u8> = Vec::with_capacity(end);
+    while p < end {
+        match d.state {
+            S::SizeStart => {
+                d.chunk_size = 0;
+                d.state = S::Size;
+            }
+            S::Size => {
+                while p < end {
+                    let c = buf[p];
+                    if c.is_ascii_hexdigit() {
+                        d.chunk_size = d.chunk_size * 16 + (c as char).to_digit(16).unwrap() as u64;
+                        d.state = S::Size;
+                        p += 1;
+                    } else if d.state == S::SizeStart {
+                        d.state = S::Error;
+                        break;
+                    } else {
+                        d.state = S::SizeExt;
+                        break;
+                    }
+                }
+                if d.state == S::Error {
+                    continue;
+                } else if p == end {
+                    *buf = out;
+                    return;
+                }
+            }
+            S::SizeExt => {
+                while p < end && buf[p] != b'\r' && buf[p] != b'\n' {
+                    p += 1;
+                }
+                if p == end {
+                    *buf = out;
+                    return;
+                }
+                d.state = S::SizeCr;
+            }
+            S::SizeCr => {
+                if buf[p] == b'\r' {
+                    p += 1;
+                    if p == end {
+                        d.state = S::SizeLf;
+                        *buf = out;
+                        return;
+                    }
+                }
+                d.state = S::SizeLf;
+            }
+            S::SizeLf => {
+                if buf[p] == b'\n' {
+                    p += 1;
+                    if d.chunk_size == 0 {
+                        d.state = S::Trailer;
+                        continue;
+                    } else if p == end {
+                        d.state = S::Body;
+                        *buf = out;
+                        return;
+                    }
+                } else {
+                    d.state = S::Error;
+                    continue;
+                }
+                d.state = S::Body;
+            }
+            S::Body => {
+                if (end - p) as u64 >= d.chunk_size {
+                    out.extend_from_slice(&buf[p..p + d.chunk_size as usize]);
+                    p += d.chunk_size as usize;
+                    if p == end {
+                        d.state = S::BodyCr;
+                        *buf = out;
+                        return;
+                    }
+                } else {
+                    out.extend_from_slice(&buf[p..end]);
+                    d.chunk_size -= (end - p) as u64;
+                    d.state = S::Body;
+                    *buf = out;
+                    return;
+                }
+                d.state = S::BodyCr;
+            }
+            S::BodyCr => {
+                if buf[p] == b'\r' {
+                    p += 1;
+                    if p == end {
+                        d.state = S::BodyLf;
+                        *buf = out;
+                        return;
+                    }
+                }
+                d.state = S::BodyLf;
+            }
+            S::BodyLf => {
+                if buf[p] == b'\n' {
+                    p += 1;
+                    d.state = S::SizeStart;
+                    continue;
+                } else {
+                    d.state = S::Error;
+                    continue;
+                }
+            }
+            S::Trailer => {
+                p = end;
+                continue;
+            }
+            S::Error => {
+                out.extend_from_slice(&buf[p..end]);
+                *buf = out;
+                return;
+            }
+        }
+    }
+    *buf = out;
+}
+
+/// base64 helpers (zend php_conv_base64_*): encode keeps a <3-byte
+/// tail; decode skips non-alphabet bytes and keeps a <4-char tail.
+fn b64_encode_filter(tail: &mut Vec<u8>, input: &[u8], closing: bool) -> Vec<u8> {
+    tail.extend_from_slice(input);
+    let whole = tail.len() / 3 * 3;
+    let mut out = super::crypto::base64_encode(&tail[..whole]).into_bytes();
+    tail.drain(..whole);
+    if closing && !tail.is_empty() {
+        out.extend_from_slice(super::crypto::base64_encode(tail).as_bytes());
+        tail.clear();
+    }
+    out
+}
+
+fn b64_decode_filter(tail: &mut Vec<u8>, input: &[u8], closing: bool) -> Vec<u8> {
+    for &b in input {
+        if b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=' {
+            tail.push(b);
+        }
+    }
+    let whole = tail.len() / 4 * 4;
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    if whole > 0 {
+        match base64_decode(std::str::from_utf8(&tail[..whole]).unwrap_or("")) {
+            Some(v) => {
+                out = v;
+                used = whole;
+            }
+            None => {
+                // a quad containing '=' stops decoding; keep the
+                // remainder as tail.
+                used = whole;
+            }
+        }
+    }
+    tail.drain(..used);
+    if closing {
+        if let Some(v) = base64_decode(std::str::from_utf8(tail).unwrap_or("")) {
+            out.extend(v);
+        }
+        tail.clear();
+    }
+    out
+}
+
+/// quoted-printable codec (zend php_conv_qprint_*): encode wraps at
+/// 75 columns with '=\r\n'; decode turns '=XX' into bytes and drops
+/// soft line breaks.
+fn qp_encode_filter(col: &mut usize, input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let emit = |out: &mut Vec<u8>, col: &mut usize, s: &[u8]| {
+        if *col + s.len() > 75 {
+            out.extend_from_slice(b"=\r\n");
+            *col = 0;
+        }
+        out.extend_from_slice(s);
+        *col += s.len();
+    };
+    let mut i = 0;
+    while i < input.len() {
+        let b = input[i];
+        match b {
+            b'=' => emit(&mut out, col, b"=3D"),
+            b'\t' | b' ' => {
+                // at line end these must be escaped; lookahead for EOL
+                let eol = matches!(input.get(i + 1), Some(b'\r') | Some(b'\n'));
+                if eol {
+                    emit(&mut out, col, &[b'=', b'0' + (b >> 4), hex_digit(b & 0xF)]);
+                } else {
+                    emit(&mut out, col, &[b]);
+                }
+            }
+            b'\r' if input.get(i + 1) == Some(&b'\n') => {
+                out.extend_from_slice(b"\r\n");
+                *col = 0;
+                i += 1;
+            }
+            b'\n' => {
+                out.push(b'\n');
+                *col = 0;
+            }
+            33..=60 | 62..=126 => emit(&mut out, col, &[b]),
+            _ => emit(
+                &mut out,
+                col,
+                &[b'=', hex_digit(b >> 4), hex_digit(b & 0xF)],
+            ),
+        }
+        i += 1;
+    }
+    out
+}
+
+fn hex_digit(v: u8) -> u8 {
+    b"0123456789ABCDEF"[v as usize & 0xF]
+}
+
+fn qp_decode_filter(tail: &mut Vec<u8>, input: &[u8], closing: bool) -> Vec<u8> {
+    tail.extend_from_slice(input);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tail.len() {
+        if tail[i] == b'=' {
+            if i + 1 >= tail.len() {
+                break; // lone '=' — wait for more input
+            }
+            let c1 = tail[i + 1];
+            if c1 == b'\r' {
+                if i + 2 >= tail.len() {
+                    break;
+                }
+                if tail[i + 2] == b'\n' {
+                    i += 3;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if c1 == b'\n' {
+                i += 2;
+                continue;
+            }
+            if i + 2 >= tail.len() {
+                break;
+            }
+            let c2 = tail[i + 2];
+            if c1.is_ascii_hexdigit() && c2.is_ascii_hexdigit() {
+                out.push(
+                    (c1 as char).to_digit(16).unwrap() as u8 * 16
+                        + (c2 as char).to_digit(16).unwrap() as u8,
+                );
+                i += 3;
+                continue;
+            }
+            // invalid escape — zend emits the '=' literally
+            out.push(b'=');
+            i += 1;
+            continue;
+        }
+        out.push(tail[i]);
+        i += 1;
+    }
+    let keep = tail[i..].to_vec();
+    *tail = keep;
+    if closing {
+        out.extend_from_slice(tail);
+        tail.clear();
+    }
+    out
+}
+
+/// The user-filter call — zend's userfilter_filter: ->stream is set
+/// to the stream resource for the duration of filter(), the
+/// brigades are registered as resources, $consumed is a by-ref arg,
+/// and the int return maps onto PSFS_*.
+/// Mutable access to the stream's raw read state during a fill — the
+/// resource RefCell is already mutably borrowed by the read fn, so
+/// filters that capture or restore the stream position (consumed)
+/// work through these fields directly. `fd` is the physical cursor
+/// for fd-backed streams; `fraw`/`srbuf-style buf` cover the
+/// in-memory stores. A None seek context means the caller is outside
+/// a fill and `stream_seek_to`/`stream_pos_of` apply instead.
+struct FillSeek<'a> {
+    fd: Option<std::os::unix::io::RawFd>,
+    pos: &'a mut u64,
+    fraw: Option<&'a mut u64>,
+    buf: &'a mut std::collections::VecDeque<u8>,
+    eof: &'a mut bool,
+}
+
+fn user_filter_call(
+    it: &mut Interp,
+    obj: &Rc<RefCell<PhpObject>>,
+    stream_id: u64,
+    stream_val: &Value,
+    input: Vec<u8>,
+    closing: bool,
+) -> Result<(i64, Vec<u8>), PhpError> {
+    let in_id = it.next_res_id();
+    let out_id = it.next_res_id();
+    let mut in_brig = std::collections::VecDeque::new();
+    in_brig.push_back(input);
+    it.stream_brigades.insert(in_id, in_brig);
+    it.stream_brigades
+        .insert(out_id, std::collections::VecDeque::new());
+    // hook the stream back per zend; unset again after the call
+    obj.borrow_mut()
+        .props
+        .insert("stream".into(), cell(stream_val.clone()));
+    let prev_nofclose = it.filter_no_fclose;
+    it.filter_no_fclose = Some(stream_id);
+    let args = vec![
+        cell(Value::Resource(Rc::new(RefCell::new(PhpResource::Other {
+            id: in_id,
+            kind: "userfilter.bucket brigade",
+        })))),
+        cell(Value::Resource(Rc::new(RefCell::new(PhpResource::Other {
+            id: out_id,
+            kind: "userfilter.bucket brigade",
+        })))),
+        // $consumed binds by-ref — the callee may bump it.
+        cell(Value::Int(0)),
+        cell(Value::Bool(closing)),
+    ];
+    let call = it.method_invoke(obj.clone(), "filter", CallArgs::positional(args));
+    obj.borrow_mut()
+        .props
+        .insert("stream".into(), cell(Value::Null));
+    it.filter_no_fclose = prev_nofclose;
+    let ret = match call {
+        Ok(v) => v.to_int(),
+        Err(e) => {
+            // zend: an exception out of filter() propagates; a call
+            // failure warns 'Failed to call filter function'.
+            it.stream_brigades.remove(&in_id);
+            it.stream_brigades.remove(&out_id);
+            return Err(e);
+        }
+    };
+    let leftover = it.stream_brigades.remove(&in_id).unwrap_or_default();
+    if !leftover.is_empty() {
+        it.warn_pub(&format!(
+            "{}(): Unprocessed filter buckets remaining on input brigade",
+            it.filter_warn_ctx
+        ))?;
+    }
+    let out = it
+        .stream_brigades
+        .remove(&out_id)
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .collect();
+    Ok((ret, out))
+}
+
+/// One chain entry's transform. Returns (output, status) where
+/// status is the PSFS code: 2=PASS_ON (output feeds the next entry),
+/// 1=FEED_ME (filter wants more input; its output is discarded),
+/// 0=ERR_FATAL (stream is borked; the fill fails).
+fn filter_apply_one(
+    it: &mut Interp,
+    sid: u64,
+    idx: usize,
+    stream_val: &Value,
+    input: Vec<u8>,
+    closing: bool,
+    seek: &mut Option<FillSeek<'_>>,
+) -> Result<(Vec<u8>, i64), PhpError> {
+    let is_user = matches!(
+        it.stream_filters.get(&sid).and_then(|v| v.get(idx)),
+        Some(StreamFilter {
+            state: FilterState::User(_),
+            ..
+        })
+    );
+    if is_user {
+        let obj = match &it
+            .stream_filters
+            .get(&sid)
+            .and_then(|v| v.get(idx))
+            .unwrap()
+            .state
+        {
+            FilterState::User(o) => o.clone(),
+            _ => unreachable!(),
+        };
+        let (status, out) = user_filter_call(it, &obj, sid, stream_val, input, closing)?;
+        return Ok((out, status));
+    }
+    let entry = &mut it.stream_filters.get_mut(&sid).unwrap()[idx];
+    let mut buf = input;
+    match &mut entry.state {
+        FilterState::Plain => match entry.name.as_str() {
             "string.rot13" => {
-                for b in data.iter_mut() {
+                for b in buf.iter_mut() {
                     *b = match *b {
                         b'a'..=b'z' => b'a' + (*b - b'a' + 13) % 26,
                         b'A'..=b'Z' => b'A' + (*b - b'A' + 13) % 26,
@@ -4222,63 +5466,921 @@ fn apply_stream_filters(it: &Interp, id: u64, data: &mut [u8], read_dir: bool) {
                 }
             }
             "string.toupper" => {
-                for b in data.iter_mut() {
+                for b in buf.iter_mut() {
                     *b = b.to_ascii_uppercase();
                 }
             }
             "string.tolower" => {
-                for b in data.iter_mut() {
+                for b in buf.iter_mut() {
                     *b = b.to_ascii_lowercase();
                 }
             }
             _ => {}
+        },
+        FilterState::CodecStub => {}
+        FilterState::Consumed { count, offset } => {
+            if offset.is_none() {
+                *offset = Some(
+                    seek.as_ref()
+                        .map(|s| *s.pos)
+                        .unwrap_or_else(|| stream_pos_of(stream_val)),
+                );
+            }
+            *count += buf.len() as u64;
+            if closing {
+                if let Some(off) = *offset {
+                    let target = off + *count;
+                    if let Some(s) = seek.as_mut() {
+                        if let Some(fd) = s.fd {
+                            unsafe {
+                                libc::lseek(fd, target as libc::off_t, libc::SEEK_SET);
+                            }
+                        }
+                        *s.pos = target;
+                        if let Some(fr) = s.fraw.as_deref_mut() {
+                            *fr = target;
+                        }
+                        s.buf.clear();
+                        *s.eof = false;
+                    } else {
+                        stream_seek_to(stream_val, target);
+                    }
+                }
+            }
         }
+        FilterState::Dechunk(d) => php_dechunk(d, &mut buf),
+        FilterState::Iconv { from, to, pending } => {
+            pending.extend_from_slice(&buf);
+            let (cps, used) = iconv_decode(&from.clone(), pending.as_slice());
+            pending.drain(..used);
+            buf = iconv_encode(&to.clone(), &cps);
+        }
+        FilterState::Base64 { decode, tail } => {
+            buf = if *decode {
+                b64_decode_filter(tail, &buf, closing)
+            } else {
+                b64_encode_filter(tail, &buf, closing)
+            };
+        }
+        FilterState::Qp { encode, col, tail } => {
+            buf = if *encode {
+                qp_encode_filter(col, &buf)
+            } else {
+                qp_decode_filter(tail, &buf, closing)
+            };
+        }
+        FilterState::User(_) => unreachable!(),
+    }
+    // builtins always pass on.
+    Ok((buf, 2))
+}
+
+/// The read/write chain for one direction — each applicable entry
+/// transforms head→tail (zend's buckets_in→buckets_out walk). A
+/// non-PASS_ON status breaks the walk and discards the output (zend:
+/// brig_out is freed on FEED_ME/ERR_FATAL). Returns (data, status).
+fn run_filter_chain(
+    it: &mut Interp,
+    sid: u64,
+    stream_val: &Value,
+    read_dir: bool,
+    raw: Vec<u8>,
+    closing: bool,
+    seek: &mut Option<FillSeek<'_>>,
+) -> Result<(Vec<u8>, i64), PhpError> {
+    let n = it.stream_filters.get(&sid).map(|v| v.len()).unwrap_or(0);
+    let mut data = raw;
+    for i in 0..n {
+        let applies = it
+            .stream_filters
+            .get(&sid)
+            .and_then(|v| v.get(i))
+            .map(|f| if read_dir { f.read } else { f.write })
+            .unwrap_or(false);
+        if !applies {
+            continue;
+        }
+        let (out, status) = filter_apply_one(it, sid, i, stream_val, data, closing, seek)?;
+        if status != 2 {
+            return Ok((Vec::new(), status));
+        }
+        data = out;
+    }
+    Ok((data, 2))
+}
+
+fn stream_read_filtered(it: &Interp, sid: u64) -> bool {
+    it.stream_filters
+        .get(&sid)
+        .is_some_and(|v| v.iter().any(|f| f.read))
+}
+
+fn stream_write_filtered(it: &Interp, sid: u64) -> bool {
+    it.stream_filters
+        .get(&sid)
+        .is_some_and(|v| v.iter().any(|f| f.write))
+}
+
+/// The stream's current logical position — consumed filter's
+/// offset capture.
+fn stream_pos_of(v: &Value) -> u64 {
+    let Value::Resource(r) = v else { return 0 };
+    let rb = r.borrow();
+    match &*rb {
+        PhpResource::File { pos, .. }
+        | PhpResource::Mem { pos, .. }
+        | PhpResource::Input { pos, .. }
+        | PhpResource::Pipe { pos, .. } => *pos,
+        _ => 0,
     }
 }
 
-/// stream_filter_append/prepend: validate the stream + filter name,
-/// push the chain entry, and hand back a 'stream filter' resource.
+/// The consumed filter's closing seek — restore the store cursor to
+/// offset+consumed.
+fn stream_seek_to(v: &Value, target: u64) {
+    let Value::Resource(r) = v else { return };
+    let mut rb = r.borrow_mut();
+    match &mut *rb {
+        PhpResource::File {
+            file,
+            pos,
+            eof,
+            rbuf,
+            ..
+        } => {
+            use std::io::{Seek, SeekFrom};
+            if let Ok(newp) = file.seek(SeekFrom::Start(target)) {
+                *pos = newp;
+                *eof = false;
+                rbuf.clear();
+            }
+        }
+        PhpResource::Mem {
+            pos,
+            eof,
+            fraw,
+            srbuf,
+            ..
+        } => {
+            *pos = target;
+            *fraw = target;
+            *eof = false;
+            srbuf.clear();
+        }
+        PhpResource::Input {
+            pos,
+            eof,
+            fraw,
+            srbuf,
+            ..
+        } => {
+            *pos = target;
+            *fraw = target;
+            *eof = false;
+            srbuf.clear();
+        }
+        PhpResource::Pipe { pos, eof, rbuf, .. } => {
+            *pos = target;
+            *eof = false;
+            rbuf.clear();
+        }
+        _ => {}
+    }
+}
+
+/// The resource's open-mode string (zend stream->mode) — the
+/// mode==0 attach derivation reads it.
+fn stream_open_mode(res: &PhpResource) -> String {
+    match res {
+        PhpResource::File { mode, .. } => mode.clone(),
+        PhpResource::Mem { mode, .. } => mode.clone(),
+        PhpResource::Input { mode, .. } => mode.clone(),
+        PhpResource::Stdio { which, .. } => {
+            if *which == 0 {
+                "rb".into()
+            } else {
+                "wb".into()
+            }
+        }
+        PhpResource::Pipe {
+            write, socket, pty, ..
+        } => {
+            if *socket || *pty {
+                "r+".into()
+            } else if *write {
+                "w".into()
+            } else {
+                "r".into()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// stream_filter_append/prepend — zend's php_stream_filter_attach.
 fn stream_filter_attach(
     it: &mut Interp,
     args: &[Cell],
     fname: &str,
     prepend: bool,
 ) -> Result<Value, PhpError> {
+    if args.len() < 2 {
+        return err(
+            "ArgumentCountError",
+            format!(
+                "{fname}() expects at least 2 arguments, {} given",
+                args.len()
+            ),
+        );
+    }
+    if args.len() > 4 {
+        return err(
+            "ArgumentCountError",
+            format!(
+                "{fname}() expects at most 4 arguments, {} given",
+                args.len()
+            ),
+        );
+    }
     stream_open_check(args, 0, fname, 1, "stream")?;
     let Value::Resource(r) = &*args[0].borrow() else {
         unreachable!()
     };
     let sid = r.borrow().id();
-    let filter = arg_str(it, args, 1);
-    if !filter_name_known(&filter) {
-        it.warn_pub(&format!("{fname}(): Unable to locate filter \"{filter}\""))?;
+    let filter = zpp_strict_string(it, args, 1, fname, "$filter_name")?;
+    let mode = zpp_long_arg(it, args, 2, fname, 3, "$mode")?;
+    // mode==0 derives the chains from the stream's open mode
+    // (filter.c: 'r' or '+' → READ; 'w', 'a' or '+' → WRITE; other
+    // open modes like 'x'/'c' leave mask 0 → silent failure).
+    let mut mask = mode & 3;
+    if mask == 0 {
+        let m = stream_open_mode(&r.borrow());
+        if m.contains('r') || m.contains('+') {
+            mask |= 1;
+        }
+        if m.contains('w') || m.contains('+') || m.contains('a') {
+            mask |= 2;
+        }
+    }
+    if mask == 0 {
         return Ok(Value::Bool(false));
     }
-    // STREAM_FILTER_READ=1, WRITE=2, ALL=3 (the default).
-    let mode = args.get(2).map(|c| c.borrow().to_int()).unwrap_or(3);
-    let fid = it.next_res_id();
-    // mode 0 attaches to neither chain — the stream is not filtered.
-    if mode & 3 != 0 {
-        let f = crate::value::StreamFilter {
-            name: filter.clone(),
-            read: mode & 1 != 0,
-            write: mode & 2 != 0,
-            fid,
+    let params = args.get(3);
+    let stream_val = Value::Resource(r.clone());
+    let mut bound_fid = 0u64;
+    // STREAM_FILTER_ALL creates one instance PER chain (zend binds
+    // the resource to the last instantiated — the write one).
+    for dir in [FILTER_READ, false] {
+        let on = if dir { mask & 1 != 0 } else { mask & 2 != 0 };
+        if !on {
+            continue;
+        }
+        let fid = it.next_res_id();
+        let entry = match filter_instantiate(it, &stream_val, &filter, params, fid) {
+            Ok(Some(e)) => e,
+            Ok(None) => return Ok(Value::Bool(false)),
+            Err(e) => return Err(e),
         };
-        let chain = it.stream_filters.entry(sid).or_default();
-        if prepend {
-            chain.insert(0, f);
-        } else {
-            chain.push(f);
+        let mut entry = entry;
+        entry.read = dir;
+        entry.write = !dir;
+        {
+            let chain = it.stream_filters.entry(sid).or_default();
+            if prepend {
+                chain.insert(0, entry);
+            } else {
+                chain.push(entry);
+            }
+        }
+        bound_fid = fid;
+        // appending to the READ chain re-filters already-buffered
+        // bytes through only the new filter (filter.c:303-387);
+        // prepend does not.
+        if dir && !prepend {
+            refilter_pending(it, sid, stream_val.clone(), fid)?;
         }
     }
     let fres = Rc::new(RefCell::new(PhpResource::Other {
-        id: fid,
+        id: bound_fid,
         kind: "stream filter",
     }));
     it.stream_filter_bindings
-        .insert(fid, (sid, filter, fres.clone()));
+        .insert(bound_fid, (sid, filter, fres.clone(), r.clone()));
     Ok(Value::Resource(fres))
+}
+
+/// Factory-resolve + instantiate one chain entry; None → create
+/// failed (warn already emitted).
+fn filter_instantiate(
+    it: &mut Interp,
+    stream_val: &Value,
+    name: &str,
+    params: Option<&Cell>,
+    fid: u64,
+) -> Result<Option<StreamFilter>, PhpError> {
+    match filter_resolve(it, name) {
+        None => {
+            it.warn_pub(&format!(
+                "{}(): Unable to locate filter \"{name}\"",
+                it.filter_warn_ctx
+            ))?;
+            Ok(None)
+        }
+        Some(FactoryHit::State(Ok(state))) => Ok(Some(StreamFilter {
+            name: name.to_string(),
+            read: false,
+            write: false,
+            fid,
+            state,
+        })),
+        Some(FactoryHit::State(Err(_))) => {
+            it.warn_pub(&format!(
+                "{}(): Unable to create or locate filter \"{name}\"",
+                it.filter_warn_ctx
+            ))?;
+            Ok(None)
+        }
+        Some(FactoryHit::Class(cls)) => {
+            if it.lookup_class(&cls).is_none() {
+                it.run_autoload(&cls)?;
+            }
+            if it.lookup_class(&cls).is_none() {
+                it.warn_pub(&format!(
+                    "{}(): User-filter \"{name}\" requires class \"{cls}\", but that class is not defined",
+                    it.filter_warn_ctx
+                ))?;
+                it.warn_pub(&format!(
+                    "{}(): Unable to create or locate filter \"{name}\"",
+                    it.filter_warn_ctx
+                ))?;
+                return Ok(None);
+            }
+            let Value::Object(obj) = it.instantiate(&cls.to_lowercase(), &[])? else {
+                unreachable!()
+            };
+            // $filtername/$params get the attach args; ->stream stays
+            // null outside filter() calls (zend).
+            obj.borrow_mut()
+                .props
+                .insert("filtername".into(), cell(Value::str(name)));
+            let pv = params.map(|c| c.borrow().clone()).unwrap_or(Value::Null);
+            obj.borrow_mut().props.insert("params".into(), cell(pv));
+            let _ = stream_val;
+            let ok = it
+                .method_invoke(obj.clone(), "onCreate", CallArgs::empty())
+                .map(|v| v.is_truthy())
+                .unwrap_or(false);
+            if !ok {
+                it.warn_pub(&format!(
+                    "{}(): Unable to create or locate filter \"{name}\"",
+                    it.filter_warn_ctx
+                ))?;
+                return Ok(None);
+            }
+            Ok(Some(StreamFilter {
+                name: name.to_string(),
+                read: false,
+                write: false,
+                fid,
+                state: FilterState::User(obj),
+            }))
+        }
+    }
+}
+
+/// After an append to the read chain, buffered bytes re-run through
+/// only the new entry (zend wraps readpos..writepos in one bucket).
+fn refilter_pending(
+    it: &mut Interp,
+    sid: u64,
+    stream_val: Value,
+    new_fid: u64,
+) -> Result<(), PhpError> {
+    let idx = it
+        .stream_filters
+        .get(&sid)
+        .and_then(|v| v.iter().position(|f| f.fid == new_fid));
+    let Some(idx) = idx else { return Ok(()) };
+    let Value::Resource(r) = &stream_val else {
+        return Ok(());
+    };
+    // drain the pending filtered buffer for this stream
+    let pending: Vec<u8> = {
+        let mut rb = r.borrow_mut();
+        match &mut *rb {
+            PhpResource::File { rbuf, .. } | PhpResource::Pipe { rbuf, .. } => {
+                rbuf.drain(..).collect()
+            }
+            PhpResource::Mem { srbuf, .. } | PhpResource::Input { srbuf, .. } => {
+                srbuf.drain(..).collect()
+            }
+            _ => Vec::new(),
+        }
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let (out, _) = filter_apply_one(it, sid, idx, &stream_val, pending, false, &mut None)?;
+    let mut rb = r.borrow_mut();
+    match &mut *rb {
+        PhpResource::File { rbuf, .. } | PhpResource::Pipe { rbuf, .. } => rbuf.extend(out),
+        PhpResource::Mem { srbuf, .. } | PhpResource::Input { srbuf, .. } => srbuf.extend(out),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// zend fill_read_buffer's filtered path: raw chunk reads keep
+/// landing until the buffered count reaches to_read_now or the store
+/// dries up; every chunk passes through the read chain BEFORE the
+/// buffer (zend buffers FILTERED bytes). got==0 latches stream->eof
+/// and runs the chain once with the closing flag.
+#[allow(clippy::too_many_arguments)]
+fn fd_filtered_fill(
+    it: &mut Interp,
+    sid: u64,
+    stream_val: &Value,
+    fd: std::os::unix::io::RawFd,
+    pos: &mut u64,
+    fraw: Option<&mut u64>,
+    eof: &mut bool,
+    rbuf: &mut std::collections::VecDeque<u8>,
+    chunk: usize,
+    to_read_now: usize,
+) -> Result<bool, PhpError> {
+    let mut seek = Some(FillSeek {
+        fd: Some(fd),
+        pos,
+        fraw,
+        buf: rbuf,
+        eof,
+    });
+    while !seek.as_ref().map(|s| *s.eof).unwrap_or(true)
+        && seek.as_ref().map(|s| s.buf.len()).unwrap_or(0) < to_read_now
+    {
+        let mut buf = vec![0u8; chunk.max(1)];
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let (raw, last) = if n < 0 {
+            // zend treats read errors (incl. EAGAIN on nonblocking)
+            // like a dry read: chain runs once non-closing, fill ends.
+            (Vec::new(), true)
+        } else if n == 0 {
+            *seek.as_mut().unwrap().eof = true;
+            (Vec::new(), true)
+        } else {
+            buf.truncate(n as usize);
+            (buf, false)
+        };
+        let closing = seek.as_ref().map(|s| *s.eof).unwrap_or(true);
+        let (out, status) = run_filter_chain(it, sid, stream_val, true, raw, closing, &mut seek)?;
+        if status == 0 {
+            // PSFS_ERR_FATAL — stream->eof + fatal_error, fill FAILURE.
+            *seek.as_mut().unwrap().eof = true;
+            return Ok(true);
+        }
+        if status == 2 {
+            let sk = seek.as_mut().unwrap();
+            sk.buf.extend(out);
+        }
+        // PSFS_FEED_ME: discard the output and keep looping.
+        if last {
+            break;
+        }
+    }
+    Ok(false)
+}
+
+/// fd_stream_read's filtered variant — the drain→fill loop zend's
+/// _php_stream_read runs for the FILE-family streams (plain/STDIO/
+/// spilled temp): it drains then refills until the request is met,
+/// the store dies, or a filter reports fatal.
+#[allow(clippy::too_many_arguments)]
+fn fd_stream_read_filtered(
+    it: &mut Interp,
+    sid: u64,
+    stream_val: &Value,
+    fd: std::os::unix::io::RawFd,
+    pos: &mut u64,
+    eof: &mut bool,
+    rbuf: &mut std::collections::VecDeque<u8>,
+    chunk: usize,
+    n: usize,
+) -> Result<StreamRead, PhpError> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut fatal = false;
+    // zend _php_stream_read: drain the FILTERED buffer first (even
+    // at eof — pending closing-flush bytes still deliver), then fill.
+    while out.len() < n {
+        out.extend(rbuf.drain(..(n - out.len()).min(rbuf.len())));
+        if out.len() >= n || *eof || fatal {
+            break;
+        }
+        let to_read_now = (n - out.len()).min(chunk);
+        fatal = fd_filtered_fill(
+            it,
+            sid,
+            stream_val,
+            fd,
+            pos,
+            None,
+            eof,
+            rbuf,
+            chunk,
+            to_read_now,
+        )?;
+    }
+    *pos += out.len() as u64;
+    if fatal && out.is_empty() {
+        Ok(StreamRead::FailSilent)
+    } else {
+        Ok(StreamRead::Data(out))
+    }
+}
+
+/// The same fill for php://memory / php://temp* / data: /
+/// php://input bodies — raw bytes slice from `fraw`, delivered bytes
+/// buffer in `srbuf` while `pos` stays the delivered count.
+#[allow(clippy::too_many_arguments)]
+fn mem_filtered_read(
+    it: &mut Interp,
+    sid: u64,
+    stream_val: &Value,
+    store: &[u8],
+    fraw: &mut u64,
+    pos: &mut u64,
+    eof: &mut bool,
+    srbuf: &mut std::collections::VecDeque<u8>,
+    chunk: usize,
+    n: usize,
+) -> Result<StreamRead, PhpError> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut fatal = false;
+    while out.len() < n {
+        out.extend(srbuf.drain(..(n - out.len()).min(srbuf.len())));
+        if out.len() >= n || *eof || fatal {
+            break;
+        }
+        let to_read_now = (n - out.len()).min(chunk);
+        while !*eof && srbuf.len() < to_read_now {
+            let start = (*fraw as usize).min(store.len());
+            let (raw, last) = if start >= store.len() {
+                *eof = true;
+                (Vec::new(), true)
+            } else {
+                let got = (store.len() - start).min(chunk);
+                let b = store[start..start + got].to_vec();
+                *fraw += got as u64;
+                (b, false)
+            };
+            let closing = *eof;
+            let mut seek = Some(FillSeek {
+                fd: None,
+                pos: &mut *pos,
+                fraw: Some(&mut *fraw),
+                buf: &mut *srbuf,
+                eof: &mut *eof,
+            });
+            let (filtered, status) =
+                run_filter_chain(it, sid, stream_val, true, raw, closing, &mut seek)?;
+            if status == 0 {
+                *eof = true;
+                fatal = true;
+                break;
+            }
+            if status == 2 {
+                srbuf.extend(filtered);
+            }
+            if last {
+                break;
+            }
+        }
+        if fatal {
+            break;
+        }
+    }
+    *pos += out.len() as u64;
+    if fatal && out.is_empty() {
+        Ok(StreamRead::FailSilent)
+    } else {
+        Ok(StreamRead::Data(out))
+    }
+}
+
+/// Filtered variant of fd_line_read — buffered+filtered fills.
+#[allow(clippy::too_many_arguments)]
+fn fd_line_read_filtered(
+    it: &mut Interp,
+    sid: u64,
+    stream_val: &Value,
+    fd: std::os::unix::io::RawFd,
+    pos: &mut u64,
+    eof: &mut bool,
+    rbuf: &mut std::collections::VecDeque<u8>,
+    chunk: usize,
+    limit: usize,
+) -> Result<StreamRead, PhpError> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut fatal = false;
+    while out.len() < limit {
+        let take = (limit - out.len()).min(rbuf.len());
+        let mut i = 0;
+        let mut hit = false;
+        while i < take {
+            let b = rbuf.pop_front().unwrap();
+            i += 1;
+            out.push(b);
+            if b == b'\n' {
+                hit = true;
+                break;
+            }
+        }
+        if hit || *eof || fatal {
+            break;
+        }
+        let to_read_now = (limit - out.len()).min(chunk);
+        fatal = fd_filtered_fill(
+            it,
+            sid,
+            stream_val,
+            fd,
+            pos,
+            None,
+            eof,
+            rbuf,
+            chunk,
+            to_read_now,
+        )?;
+    }
+    *pos += out.len() as u64;
+    if fatal && out.is_empty() {
+        Ok(StreamRead::FailSilent)
+    } else {
+        Ok(StreamRead::Data(out))
+    }
+}
+
+/// Filtered variant of read_line_pipe / the Pipe one-shot read:
+/// drain once, a single fill, drain again — zend doesn't re-fill
+/// pipes inside one user call. `nl` selects fgets (stop at '\n')
+/// vs fread (byte count only).
+#[allow(clippy::too_many_arguments)]
+fn pipe_line_read_filtered(
+    it: &mut Interp,
+    sid: u64,
+    stream_val: &Value,
+    fd: std::os::unix::io::RawFd,
+    pos: &mut u64,
+    eof: &mut bool,
+    rbuf: &mut std::collections::VecDeque<u8>,
+    chunk: usize,
+    limit: usize,
+    nl: bool,
+) -> Result<StreamRead, PhpError> {
+    let mut out: Vec<u8> = Vec::new();
+    let take = (limit - out.len()).min(rbuf.len());
+    for _ in 0..take {
+        let b = rbuf.pop_front().unwrap();
+        out.push(b);
+        if nl && b == b'\n' {
+            *pos += out.len() as u64;
+            return Ok(StreamRead::Data(out));
+        }
+    }
+    if out.len() < limit && !*eof {
+        let to_read_now = (limit - out.len()).min(chunk);
+        let fatal = fd_filtered_fill(
+            it,
+            sid,
+            stream_val,
+            fd,
+            pos,
+            None,
+            eof,
+            rbuf,
+            chunk,
+            to_read_now,
+        )?;
+        let take = (limit - out.len()).min(rbuf.len());
+        for _ in 0..take {
+            let b = rbuf.pop_front().unwrap();
+            out.push(b);
+            if nl && b == b'\n' {
+                break;
+            }
+        }
+        *pos += out.len() as u64;
+        if fatal && out.is_empty() {
+            return Ok(StreamRead::FailSilent);
+        }
+        return Ok(StreamRead::Data(out));
+    }
+    *pos += out.len() as u64;
+    Ok(StreamRead::Data(out))
+}
+
+/// fread on a filtered pipe — pipe_line_read_filtered with nl=false.
+#[allow(clippy::too_many_arguments)]
+fn pipe_read_filtered(
+    it: &mut Interp,
+    sid: u64,
+    stream_val: &Value,
+    fd: std::os::unix::io::RawFd,
+    pos: &mut u64,
+    eof: &mut bool,
+    rbuf: &mut std::collections::VecDeque<u8>,
+    chunk: usize,
+    n: usize,
+) -> Result<StreamRead, PhpError> {
+    pipe_line_read_filtered(it, sid, stream_val, fd, pos, eof, rbuf, chunk, n, false)
+}
+
+/// zend zpp 's' for params that must be a real string: scalars
+/// coerce, everything else TypeErrors.
+fn zpp_strict_string(
+    it: &mut Interp,
+    args: &[Cell],
+    i: usize,
+    fname: &str,
+    pname: &str,
+) -> Result<String, PhpError> {
+    match arg(args, i) {
+        Value::Str(s) => Ok(String::from_utf8_lossy(&s).into_owned()),
+        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => Ok(arg_str(it, args, i)),
+        v => err(
+            "TypeError",
+            format!(
+                "{fname}(): Argument #{p} (${pname}) must be of type string, {} given",
+                zval_word(&v),
+                p = i + 1,
+            ),
+        ),
+    }
+}
+
+/// Build a StreamBucket object wrapping `bytes` — stream_bucket_new()
+/// and stream_bucket_make_writeable() share it.
+fn new_stream_bucket(it: &mut Interp, bytes: Vec<u8>) -> Result<Value, PhpError> {
+    let Value::Object(obj) = it.instantiate("streambucket", &[])? else {
+        unreachable!()
+    };
+    let bid = it.next_res_id();
+    it.stream_buckets.insert(bid, bytes.clone());
+    {
+        let mut o = obj.borrow_mut();
+        o.props.insert(
+            "bucket".into(),
+            cell(Value::Resource(Rc::new(RefCell::new(PhpResource::Other {
+                id: bid,
+                kind: "userfilter.bucket",
+            })))),
+        );
+        o.props
+            .insert("data".into(), cell(Value::bytes(bytes.clone())));
+        let n = Value::Int(bytes.len() as i64);
+        o.props.insert("datalen".into(), cell(n.clone()));
+        o.props.insert("dataLength".into(), cell(n));
+    }
+    Ok(Value::Object(obj))
+}
+
+/// stream_filter_remove — zend's php_stream_filter_remove: flush the
+/// entry once with the closing flag, then unlink it and run a user
+/// filter's onClose. A non-PASS_ON flush keeps the entry attached
+/// with 'Unable to flush filter, not removing'.
+fn stream_filter_remove(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
+    if args.len() != 1 {
+        return err(
+            "ArgumentCountError",
+            format!(
+                "stream_filter_remove() expects exactly 1 argument, {} given",
+                args.len()
+            ),
+        );
+    }
+    let Value::Resource(r) = arg(args, 0) else {
+        return err(
+            "TypeError",
+            format!(
+                "stream_filter_remove(): Argument #1 ($stream_filter) must be of type resource, {} given",
+                zval_word(&arg(args, 0))
+            ),
+        );
+    };
+    let fid = r.borrow().id();
+    let Some((sid, _fname, _fres, sres)) = it.stream_filter_bindings.get(&fid).cloned() else {
+        return err(
+            "TypeError",
+            "stream_filter_remove(): supplied resource is not a valid stream filter resource",
+        );
+    };
+    let idx = it
+        .stream_filters
+        .get(&sid)
+        .and_then(|v| v.iter().position(|f| f.fid == fid));
+    let Some(idx) = idx else {
+        return err(
+            "TypeError",
+            "stream_filter_remove(): supplied resource is not a valid stream filter resource",
+        );
+    };
+    // flush: one call with an empty brigade + PSFS_FLAG_FLUSH_CLOSE —
+    // consumed seeks back, user filters see $closing=true.
+    let sv = Value::Resource(sres);
+    let (_out, status) = filter_apply_one(it, sid, idx, &sv, Vec::new(), true, &mut None)?;
+    if status != 2 {
+        it.warn_pub(&format!(
+            "{}(): Unable to flush filter, not removing",
+            it.filter_warn_ctx
+        ))?;
+        return Ok(Value::Bool(false));
+    }
+    if let Some(v) = it.stream_filters.get_mut(&sid) {
+        // unlink first; a php_user_filter dtor calls onClose after.
+        let entry = v.remove(idx);
+        if let FilterState::User(obj) = entry.state {
+            let _ = it.method_invoke(obj, "onClose", CallArgs::empty());
+        }
+    }
+    it.stream_filter_bindings.remove(&fid);
+    let mut rb = r.borrow_mut();
+    *rb = PhpResource::Closed { id: fid };
+    Ok(Value::Bool(true))
+}
+
+/// Filtered fgets over an in-memory store (Mem/Input unspilled).
+#[allow(clippy::too_many_arguments)]
+fn mem_line_read_filtered(
+    it: &mut Interp,
+    sid: u64,
+    stream_val: &Value,
+    store: &[u8],
+    fraw: &mut u64,
+    pos: &mut u64,
+    eof: &mut bool,
+    srbuf: &mut std::collections::VecDeque<u8>,
+    chunk: usize,
+    limit: usize,
+) -> Result<StreamRead, PhpError> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut fatal = false;
+    while out.len() < limit {
+        let take = (limit - out.len()).min(srbuf.len());
+        let mut hit = false;
+        for _ in 0..take {
+            let b = srbuf.pop_front().unwrap();
+            out.push(b);
+            if b == b'\n' {
+                hit = true;
+                break;
+            }
+        }
+        if hit || *eof || fatal {
+            break;
+        }
+        let to_read_now = (limit - out.len()).min(chunk);
+        while !*eof && srbuf.len() < to_read_now {
+            let start = (*fraw as usize).min(store.len());
+            let (raw, last) = if start >= store.len() {
+                *eof = true;
+                (Vec::new(), true)
+            } else {
+                let got = (store.len() - start).min(chunk);
+                let b = store[start..start + got].to_vec();
+                *fraw += got as u64;
+                (b, false)
+            };
+            let closing = *eof;
+            let mut seek = Some(FillSeek {
+                fd: None,
+                pos: &mut *pos,
+                fraw: Some(&mut *fraw),
+                buf: &mut *srbuf,
+                eof: &mut *eof,
+            });
+            let (filtered, status) =
+                run_filter_chain(it, sid, stream_val, true, raw, closing, &mut seek)?;
+            if status == 0 {
+                *eof = true;
+                fatal = true;
+                break;
+            }
+            if status == 2 {
+                srbuf.extend(filtered);
+            }
+            if last {
+                break;
+            }
+        }
+        if fatal {
+            break;
+        }
+    }
+    *pos += out.len() as u64;
+    if fatal && out.is_empty() {
+        Ok(StreamRead::FailSilent)
+    } else {
+        Ok(StreamRead::Data(out))
+    }
 }
 
 /// zend's non-FOR_SELECT buffer sync (cast.c: php_stream_flush +

@@ -101,7 +101,7 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-fn base64_encode(data: &[u8]) -> String {
+pub(in crate::builtins) fn base64_encode(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in data.chunks(3) {

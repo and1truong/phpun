@@ -1823,13 +1823,18 @@ pub enum PhpResource {
         /// tmpfile() the stream then KEEPS — later casts reuse it and
         /// flock(2)/fstat(2) see it).
         spilled_fd: Option<std::os::unix::io::RawFd>,
-        /// zend stream->readbuf over the spilled fd — read(2) fills
-        /// land here and reads/seeks drain it before touching the fd.
-        /// Used only while spilled_fd is set.
+        /// zend stream->readbuf — read(2) fills land here while
+        /// spilled, and FILTERED bytes land here once a read filter is
+        /// attached (zend's fill applies the chain before buffering).
         srbuf: std::collections::VecDeque<u8>,
         /// zend stream->readbuflen for srbuf — grows one chunk_size
         /// whenever a fill finds less than a chunk of free space.
         rcap: usize,
+        /// The raw store cursor (zend's inner-stream fpos): filtered
+        /// fills slice the body from here while pos stays the
+        /// delivered count. Unfiltered reads bypass the buffer, so
+        /// fraw tracks pos then.
+        fraw: u64,
     },
     /// php://memory / php://temp — an in-memory byte buffer that is
     /// always read/write, seekable (Composer's BufferIO).
@@ -1867,13 +1872,17 @@ pub enum PhpResource {
         /// the stream then KEEPS (later casts reuse it and
         /// flock(2)/fstat(2) see it). php://memory is not castable.
         spilled_fd: Option<std::os::unix::io::RawFd>,
-        /// zend stream->readbuf over the spilled fd — read(2) fills
-        /// land here and reads/seeks drain it before touching the fd.
-        /// Used only while spilled_fd is set.
+        /// zend stream->readbuf — read(2) fills land here while
+        /// spilled, and FILTERED bytes land here once a read filter is
+        /// attached (zend's fill applies the chain before buffering).
         srbuf: std::collections::VecDeque<u8>,
         /// zend stream->readbuflen for srbuf — grows one chunk_size
         /// whenever a fill finds less than a chunk of free space.
         rcap: usize,
+        /// The raw store cursor (zend ms->fpos): filtered fills slice
+        /// the buffer from here while pos stays the delivered count.
+        /// Unfiltered reads bypass the buffer, so fraw tracks pos.
+        fraw: u64,
     },
     /// A resource closed via fclose()/fclose-aliased wrappers — Zend
     /// keeps the zval `resource (closed)` (gettype "resource (closed)",
@@ -1949,10 +1958,8 @@ impl PhpResource {
 
 /// A stream filter attached by stream_filter_append/prepend — zend's
 /// php_stream_filter on a stream's read/write chains. `read`/`write`
-/// say which chain it sits on (STREAM_FILTER_READ=1, WRITE=2, ALL=3).
-/// Byte-map filters (string.rot13/toupper/tolower) actually transform
-/// data; the other registered names only mark the stream filtered —
-/// their transforms are not implemented.
+/// say which chain it sits on (STREAM_FILTER_READ=1, WRITE=2, ALL=3 —
+/// ALL creates TWO entries, one per chain, with separate state).
 #[derive(Debug, Clone)]
 pub struct StreamFilter {
     pub name: String,
@@ -1962,6 +1969,74 @@ pub struct StreamFilter {
     /// the chain entry by this, not by name (two same-name filters
     /// stay distinct).
     pub fid: u64,
+    /// zend's filter->abstract — per-instance state.
+    pub state: FilterState,
+}
+
+/// Per-instance state for the stateful stream filters.
+#[derive(Debug, Clone)]
+pub enum FilterState {
+    /// Stateless transforms (string.rot13/toupper/tolower) and
+    /// recognized-but-unimplemented factories (zlib.*, bzip2.*).
+    Plain,
+    /// `consumed` — passes bytes through while counting them; on the
+    /// closing flush zend seeks the stream back to offset+consumed
+    /// (filters.c consumed_filter_filter).
+    Consumed {
+        count: u64,
+        /// stream->position captured on the first filter call.
+        offset: Option<u64>,
+    },
+    /// `dechunk` — the HTTP chunked-transfer decoder's state machine
+    /// (filters.c php_dechunk): bytes between calls.
+    Dechunk(Dechunk),
+    /// convert.iconv.FROM/TO — normalized encoding pair plus the
+    /// partial multibyte sequence carried between calls.
+    Iconv {
+        from: String,
+        to: String,
+        pending: Vec<u8>,
+    },
+    /// convert.base64-encode / -decode — tail bytes carried between
+    /// calls (3-in/4-out groupings).
+    Base64 { decode: bool, tail: Vec<u8> },
+    /// convert.quoted-printable-encode / -decode. `col` is the
+    /// encoder's line-wrap column (75), `tail` the decoder's
+    /// partial-escape carry.
+    Qp {
+        encode: bool,
+        col: usize,
+        tail: Vec<u8>,
+    },
+    /// zlib.inflate/deflate, bzip2.compress/decompress — recognized
+    /// factories whose codecs this build doesn't carry; the bytes
+    /// pass through (documented divergence vs zend's real zlib/bz2).
+    CodecStub,
+    /// A php_user_filter subclass instance created at attach time.
+    User(std::rc::Rc<std::cell::RefCell<PhpObject>>),
+}
+
+/// The `dechunk` filter's persistent state machine — a byte-for-byte
+/// port of zend's php_chunked_filter_data (filters.c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DechunkState {
+    SizeStart,
+    Size,
+    SizeExt,
+    SizeCr,
+    SizeLf,
+    Body,
+    BodyCr,
+    BodyLf,
+    Trailer,
+    Error,
+}
+
+/// `dechunk` filter instance data (zend's php_chunked_filter_data).
+#[derive(Debug, Clone)]
+pub struct Dechunk {
+    pub chunk_size: u64,
+    pub state: DechunkState,
 }
 
 /// A dropped process handle closes its pipes and gets one non-blocking

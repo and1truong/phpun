@@ -182,6 +182,15 @@ impl Frame {
     }
 }
 
+/// stream_filter_remove's binding record: (stream res id, filter name,
+/// the filter resource itself, the stream resource for ->stream props).
+pub(crate) type FilterBinding = (
+    u64,
+    String,
+    Rc<RefCell<PhpResource>>,
+    Rc<RefCell<PhpResource>>,
+);
+
 pub struct Interp<'a> {
     pub file: &'a str,
     globals: Frame,
@@ -301,18 +310,32 @@ pub struct Interp<'a> {
     /// fails (cast.c:300).
     pub stream_filters: std::collections::HashMap<u64, Vec<crate::value::StreamFilter>>,
     /// Filter RESOURCE id → (stream resource id, filter name, the
-    /// resource itself) — stream_filter_remove() detaches the right
-    /// chain entry and fclose() invalidates still-held filter handles
-    /// when their stream dies (zend's stream dtor frees the chain,
-    /// leaving the zval 'of type (Unknown)').
-    pub stream_filter_bindings: std::collections::HashMap<
-        u64,
-        (
-            u64,
-            String,
-            std::rc::Rc<std::cell::RefCell<crate::value::PhpResource>>,
-        ),
-    >,
+    /// filter resource, the STREAM resource) — stream_filter_remove()
+    /// detaches the right chain entry, fclose() invalidates held
+    /// filter handles when their stream dies, and the flush in
+    /// remove() hands filter() callbacks their ->stream prop (zend's
+    /// stream zval on the filter call).
+    pub stream_filter_bindings: std::collections::HashMap<u64, FilterBinding>,
+    /// stream_filter_register() — name → userland class name (zend's
+    /// BG(user_filter_map); the class is resolved lazily at attach).
+    /// Insertion-ordered so stream_get_filters() lists them in the
+    /// order they were registered.
+    pub user_filter_map: Vec<(String, String)>,
+    /// userfilter.bucket brigade resource id → the brigade's queue of
+    /// bucket payloads — populated while a php_user_filter::filter()
+    /// call is in flight.
+    pub stream_brigades: std::collections::HashMap<u64, std::collections::VecDeque<Vec<u8>>>,
+    /// userfilter.bucket resource id → the bucket's raw bytes — the
+    /// backing for StreamBucket::$bucket.
+    pub stream_buckets: std::collections::HashMap<u64, Vec<u8>>,
+    /// The stream resource id a php_user_filter::filter() call is
+    /// running on (zend's PHP_STREAM_FLAG_NO_FCLOSE): an fclose() on
+    /// it from inside the callback is a silent no-op.
+    pub filter_no_fclose: Option<u64>,
+    /// The builtin name zend's php_error_docref would use for warnings
+    /// raised inside filter() calls ('fread(): Unprocessed filter
+    /// buckets...'). fs::dispatch refreshes it per call.
+    pub filter_warn_ctx: String,
     /// Output buffer stack for ob_*().
     ob_stack: Vec<ObLevel>,
     /// While >0, warnings are suppressed (implements `??`, `isset`,
@@ -741,6 +764,10 @@ impl<'a> Interp<'a> {
         constants.insert("STREAM_FILTER_READ".into(), Value::Int(1));
         constants.insert("STREAM_FILTER_WRITE".into(), Value::Int(2));
         constants.insert("STREAM_FILTER_ALL".into(), Value::Int(3));
+        // php_stream_filter_status_t — php_user_filter::filter() returns.
+        constants.insert("PSFS_ERR_FATAL".into(), Value::Int(0));
+        constants.insert("PSFS_FEED_ME".into(), Value::Int(1));
+        constants.insert("PSFS_PASS_ON".into(), Value::Int(2));
         constants.insert("PHP_OUTPUT_HANDLER_START".into(), Value::Int(1));
         constants.insert("PHP_OUTPUT_HANDLER_WRITE".into(), Value::Int(0));
         constants.insert("PHP_OUTPUT_HANDLER_CONT".into(), Value::Int(0));
@@ -901,6 +928,27 @@ impl<'a> Interp<'a> {
             tentative: {
                 let mut t = HashSet::new();
                 t.insert(("datetimezone".into(), "listidentifiers".into()));
+                // php_user_filter's methods carry tentative return
+                // types — overrides without matching types warn
+                // (ReturnTypeWillChange suppresses).
+                for m in [
+                    "filter",
+                    "oncreate",
+                    "onclose",
+                    "onflush",
+                    "onread",
+                    "onwrite",
+                    "onappend",
+                    "onprepend",
+                    "onstart",
+                    "onstop",
+                    "onseek",
+                    "onskip",
+                    "oneof",
+                    "ondetach",
+                ] {
+                    t.insert(("php_user_filter".into(), m.into()));
+                }
                 t
             },
             interfaces: HashMap::new(),
@@ -926,6 +974,11 @@ impl<'a> Interp<'a> {
             stream_chunk_sizes: std::collections::HashMap::new(),
             stream_filters: std::collections::HashMap::new(),
             stream_filter_bindings: std::collections::HashMap::new(),
+            user_filter_map: Vec::new(),
+            stream_brigades: std::collections::HashMap::new(),
+            stream_buckets: std::collections::HashMap::new(),
+            filter_no_fclose: None,
+            filter_warn_ctx: String::new(),
             ob_stack: Vec::new(),
             silence: 0,
             statics: HashMap::new(),
