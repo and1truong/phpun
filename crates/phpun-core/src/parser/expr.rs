@@ -747,15 +747,15 @@ impl<'a> Parser<'a> {
                     *cg,
                 ));
             }
-            let base = Self::writable_base(var);
-            if Self::short_circuited(base) {
-                return Some(PhpError::compile_fatal(
-                    "Assignments can only happen to writable values",
-                    *cg,
-                ));
-            }
-            match base {
-                Expr::Call { .. } => {
+            // Element-level write-context fatals: zend checks the
+            // unmarked element's own kind — a bare call, `clone` or
+            // `f(...)` element is a function-result write; a method
+            // call a method-result one. Call-family exprs as a
+            // dim/prop chain's ROOT stay writable instead: the call
+            // result is a temp container zend writes through —
+            // `[f()->p]`, `[$o->m()[0]]`, `[C::m()->p]` all compile.
+            match var {
+                Expr::Call { .. } | Expr::Clone(_) | Expr::Fcc(_) => {
                     return Some(PhpError::compile_fatal(
                         "Can't use function return value in write context",
                         Self::call_err_line(var, elem),
@@ -767,7 +767,23 @@ impl<'a> Parser<'a> {
                         Self::call_err_line(var, elem),
                     ));
                 }
-                Expr::Var(_) | Expr::VarVar(..) | Expr::StaticProp { .. } => {
+                _ => {}
+            }
+            let base = Self::writable_base(var);
+            if Self::short_circuited(base) {
+                return Some(PhpError::compile_fatal(
+                    "Assignments can only happen to writable values",
+                    *cg,
+                ));
+            }
+            match base {
+                Expr::Var(_)
+                | Expr::VarVar(..)
+                | Expr::StaticProp { .. }
+                | Expr::Call { .. }
+                | Expr::MethodCall { .. }
+                | Expr::StaticCall { .. }
+                | Expr::StaticCallDyn { .. } => {
                     // Writable. A CV target's assign ends at the var's
                     // own line (zend's PAREN node keeps the inner
                     // var's lineno); delayed dim/prop targets leave
@@ -777,6 +793,15 @@ impl<'a> Parser<'a> {
                             *cg = l;
                         }
                     }
+                }
+                // `clone`/`f(...)` chain roots get zend's distinct
+                // built-in-function message, sited at the element's
+                // own first-token line.
+                Expr::Clone(_) | Expr::Fcc(_) => {
+                    return Some(PhpError::compile_fatal(
+                        "Cannot use result of built-in function in write context",
+                        crate::ast::start_line(elem).unwrap_or(*cg),
+                    ));
                 }
                 _ => {
                     return Some(PhpError::compile_fatal(
@@ -872,7 +897,9 @@ impl<'a> Parser<'a> {
             Expr::Call { .. }
             | Expr::MethodCall { .. }
             | Expr::StaticCall { .. }
-            | Expr::StaticCallDyn { .. } => crate::ast::start_line(elem),
+            | Expr::StaticCallDyn { .. }
+            | Expr::Clone(_)
+            | Expr::Fcc(_) => crate::ast::start_line(elem),
             _ => crate::ast::end_line(var),
         }
         .unwrap_or(0)
