@@ -206,9 +206,13 @@ impl<'a> Interp<'a> {
                             // refcount 0 here — Zend runs its
                             // __destruct immediately (methods_003
                             // `new bar;`). strong_count 2 = the
-                            // statement value + its expr_temps slot.
+                            // statement value + its expr_temps slot —
+                            // and the temps slot must actually pin it,
+                            // else a `=&`/`=` result aliased to a live
+                            // cell would falsely count 2 (gh10168).
                             if let Value::Object(o) = &v {
                                 if Rc::strong_count(o) == 2
+                                    && self.expr_temps.iter().any(|t| Rc::ptr_eq(t, o))
                                     && self
                                         .find_method_in(&o.borrow().class, "__destruct")
                                         .is_some()
@@ -222,6 +226,7 @@ impl<'a> Interp<'a> {
                                         self.expr_temps.truncate(base);
                                         return self.err_flow(e);
                                     }
+                                    self.mark_obj_died(o);
                                 }
                             }
                             // Statement end frees expression
@@ -1043,10 +1048,16 @@ impl<'a> Interp<'a> {
                         };
                         last = Some(c.clone());
                         if let Some(ForeachKey::Var(kn)) = key {
-                            self.var_set(kn, key_value(&k));
+                            if let Err(e) = self.var_set(kn, key_value(&k)) {
+                                break self.err_flow(e);
+                            }
                         }
                         match val {
-                            ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                            ForeachTarget::Var(n) => {
+                                if let Err(e) = self.var_set(n, c.borrow().clone()) {
+                                    break self.err_flow(e);
+                                }
+                            }
                             ForeachTarget::ByRef(n) => {
                                 if let Some(f) = self.readonly_ref_error(&c) {
                                     break f;
@@ -1090,10 +1101,16 @@ impl<'a> Interp<'a> {
                 for (idx, (k, c)) in snapshot.into_iter().enumerate() {
                     self.cur_line = idx;
                     if let Some(ForeachKey::Var(kn)) = key {
-                        self.var_set(kn, key_value(&k));
+                        if let Err(e) = self.var_set(kn, key_value(&k)) {
+                            return self.err_flow(e);
+                        }
                     }
                     match val {
-                        ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                        ForeachTarget::Var(n) => {
+                            if let Err(e) = self.var_set(n, c.borrow().clone()) {
+                                return self.err_flow(e);
+                            }
+                        }
                         ForeachTarget::ByRef(n) => {
                             if let Some(f) = self.readonly_ref_error(&c) {
                                 return f;
@@ -1351,10 +1368,16 @@ impl<'a> Interp<'a> {
                             Some(i) => Value::Int(i),
                             None => Value::str(n.clone()),
                         };
-                        self.var_set(kn, kv);
+                        if let Err(e) = self.var_set(kn, kv) {
+                            return self.err_flow(e);
+                        }
                     }
                     match val {
-                        ForeachTarget::Var(n) => self.var_set(n, c.borrow().clone()),
+                        ForeachTarget::Var(n) => {
+                            if let Err(e) = self.var_set(n, c.borrow().clone()) {
+                                return self.err_flow(e);
+                            }
+                        }
                         ForeachTarget::ByRef(n) => {
                             self.mark_ref(&c);
                             self.cur().vars.insert(n.clone(), c.clone());
@@ -1471,10 +1494,16 @@ impl<'a> Interp<'a> {
                     Ok(k) => k,
                     Err(e) => return self.err_flow(e),
                 };
-                self.var_set(kn, k);
+                if let Err(e) = self.var_set(kn, k) {
+                    return self.err_flow(e);
+                }
             }
             match val {
-                ForeachTarget::Var(n) => self.var_set(n, v),
+                ForeachTarget::Var(n) => {
+                    if let Err(e) = self.var_set(n, v) {
+                        return self.err_flow(e);
+                    }
+                }
                 ForeachTarget::ByRef(n) => {
                     // A by-ref generator's current() is the yielded
                     // cell itself — bind to it directly. An
@@ -1534,11 +1563,11 @@ impl<'a> Interp<'a> {
                 if let Some(t) = t {
                     let iv = a.get(&ArrKey::Int(i as i64)).unwrap_or(Value::Null);
                     match t {
-                        ForeachTarget::Var(n) => self.var_set(n, iv),
+                        ForeachTarget::Var(n) => self.var_set(n, iv)?,
                         ForeachTarget::Lvalue(e) => {
                             let _ = self.store(e, iv);
                         }
-                        ForeachTarget::ByRef(n) => self.var_set(n, iv),
+                        ForeachTarget::ByRef(n) => self.var_set(n, iv)?,
                         ForeachTarget::List(sub) => {
                             self.foreach_list(sub, &iv)?;
                         }

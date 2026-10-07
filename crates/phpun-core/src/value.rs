@@ -107,16 +107,20 @@ impl PhpArray {
     }
 
     /// Bind an element slot to a specific cell (`$a[k] =& $x`).
-    pub fn bind_cell(&mut self, k: ArrKey, c: Cell) {
+    /// Returns the displaced slot cell — an object it held dies only
+    /// after the new binding is visible (its __destruct writes land
+    /// on the shared cell, gh10168).
+    pub fn bind_cell(&mut self, k: ArrKey, c: Cell) -> Option<Cell> {
         if let ArrKey::Int(i) = k {
             if i >= self.next {
                 self.next = i + 1;
             }
         }
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
-            slot.1 = c;
+            Some(std::mem::replace(&mut slot.1, c))
         } else {
             self.entries.push((k, c));
+            None
         }
     }
 
@@ -1713,6 +1717,11 @@ pub struct GenFinData {
     /// Mirrored `GenState::pos` — the object is gone when a dead
     /// weak's entry replays.
     pub pos: usize,
+    /// Consumer-visible cursor: `pos` counts the body's own resumes
+    /// (a `yield from` drain drives them eagerly), while this mirrors
+    /// what the outermost consumer has reached — the value ob
+    /// windows, drains, and journal gates actually check.
+    pub vis_pos: usize,
     /// The body closed or died — its deferred-output journal is
     /// complete, so every buffered byte it tagged is materialized
     /// for reads from then on. (Not mirrored from
@@ -1750,9 +1759,10 @@ pub struct GenFinData {
     /// displaced this frame — so its destruction replay stays silent.
     pub suppressed: bool,
     /// Live journals of `yield from` delegates this gen collected —
-    /// killing this incarnation displaces them: their un-run tails
-    /// are kill-dropped too.
-    pub delegate_fins: Vec<FinQueue>,
+    /// (parent item index where the delegate's stream begins, its
+    /// journal). Killing this incarnation displaces them: their
+    /// un-run tails are kill-dropped too.
+    pub delegate_fins: Vec<(usize, FinQueue)>,
 }
 
 impl GenFinData {
@@ -1761,7 +1771,7 @@ impl GenFinData {
     /// teardown's delegate chain alike leave eager tails un-run.
     pub fn kill_tree(&mut self) {
         self.killed = true;
-        for d in &self.delegate_fins {
+        for (_, d) in &self.delegate_fins {
             d.borrow_mut().kill_tree();
         }
     }
@@ -1810,6 +1820,21 @@ impl GenFinData {
         self.pos = pos;
         for d in &mut self.delegates {
             d.fin.set_pos_tree(pos.saturating_sub(d.entry));
+        }
+        self.set_vis_tree(pos);
+    }
+
+    /// Mirror only the consumer-visible cursor down the chain — a
+    /// delegate's own `pos` (its production cursor) stays at
+    /// whatever its eager drain left behind. Item `pos` of this
+    /// gen's stream is item `pos - entry` inside a delegate's.
+    pub fn set_vis_tree(&mut self, pos: usize) {
+        self.vis_pos = pos;
+        for d in &mut self.delegates {
+            d.fin.set_vis_tree(pos.saturating_sub(d.entry));
+        }
+        for (entry, q) in &self.delegate_fins {
+            q.borrow_mut().set_vis_tree(pos.saturating_sub(*entry));
         }
     }
 

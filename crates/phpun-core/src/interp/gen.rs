@@ -1324,7 +1324,7 @@ impl<'a> Interp<'a> {
                             fin.yields.clear();
                             fin.delegates.clear();
                             fin.fin_err = None;
-                            for d in fin.delegate_fins.drain(..) {
+                            for (_, d) in fin.delegate_fins.drain(..) {
                                 // The re-run displaces this
                                 // delegate's incarnation — its eager
                                 // tail never ran.
@@ -1429,7 +1429,7 @@ impl<'a> Interp<'a> {
                         fin.yields.clear();
                         fin.delegates.clear();
                         fin.fin_err = None;
-                        for d in fin.delegate_fins.drain(..) {
+                        for (_, d) in fin.delegate_fins.drain(..) {
                             // The re-run displaces this delegate's
                             // incarnation — its eager tail never ran.
                             d.borrow_mut().kill_tree();
@@ -1526,6 +1526,20 @@ impl<'a> Interp<'a> {
                 self.gen_flush_out(&state, pos);
                 self.gen_raise_deferred(&state, "getReturn", &args.cells)?;
                 let st = state.borrow();
+                // Still inside its first drive (the live sink has no
+                // item yet): ensure_initialized hits Zend's resume
+                // guard — an Error. Once items exist the unfinished
+                // check is what reports (Exception).
+                if st.running && st.live.as_ref().is_none_or(|l| l.borrow().is_empty()) {
+                    let msg = "Cannot resume an already running generator";
+                    drop(st);
+                    return Err(self.gen_method_throw_kind(
+                        "Error",
+                        "getReturn",
+                        &args.cells,
+                        msg,
+                    ));
+                }
                 if st.pos < st.items.len() || st.closed || st.dead || st.running {
                     let msg = "Cannot get return value of a generator that hasn't returned";
                     drop(st);
@@ -1652,6 +1666,7 @@ impl<'a> Interp<'a> {
                         }
                         .unwrap_or_else(|| cell(val));
                         out.push((k, c));
+                        self.gen_collect_seen += 1;
                         // A consumer injection queued for this splice
                         // index delivers to the delegate's suspended
                         // yield — Zend's chain is live: send()/throw()
