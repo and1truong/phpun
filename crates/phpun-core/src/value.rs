@@ -124,15 +124,18 @@ impl PhpArray {
         }
     }
 
-    /// Remove a key (unset). The bucket is tombstoned — position kept,
-    /// value released (see ArrKey::Tomb). Returns the evicted payload
-    /// when the table owned the cell outright — an aliased (by-ref)
-    /// slot keeps sharing its value with the other holders.
+    /// Remove a key (unset). The bucket is tombstoned — position kept
+    /// (see ArrKey::Tomb) — and the table drops its hold on the cell
+    /// entirely: an aliased (by-ref) slot keeps its value through the
+    /// other owners, so a later `unset` of the last owner still sees
+    /// the eager-destruct refcount. Returns the evicted payload when
+    /// the table owned the cell outright.
     pub fn unset(&mut self, k: &ArrKey) -> Option<Value> {
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| ek == k) {
             slot.0 = ArrKey::Tomb;
-            if Rc::strong_count(&slot.1) == 1 {
-                return Some(std::mem::replace(&mut *slot.1.borrow_mut(), Value::Null));
+            let old = std::mem::replace(&mut slot.1, Rc::new(RefCell::new(Value::Null)));
+            if Rc::strong_count(&old) == 1 {
+                return Some(std::mem::replace(&mut *old.borrow_mut(), Value::Null));
             }
         }
         None
