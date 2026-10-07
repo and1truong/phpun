@@ -2169,7 +2169,16 @@ impl<'a> Parser<'a> {
                 } else if self.ident_is("__line__") {
                     let line = self.line();
                     self.pos += 1;
-                    Ok(Expr::Int(line as i64))
+                    // `foldlit`: the VALUE is fixed at parse, but zend
+                    // keeps it an AST const (folded by the const scan,
+                    // not a literal zval) — matters for match/switch
+                    // cond siting and literal-only checks (break N,
+                    // declare strict_types).
+                    Ok(Expr::Binary {
+                        op: "foldlit",
+                        l: Box::new(Expr::Int(line as i64)),
+                        r: Box::new(Expr::Null),
+                    })
                 } else if self.ident_is("__file__") {
                     self.pos += 1;
                     Ok(Expr::MagicConst(MagicConst::File))
@@ -2192,8 +2201,13 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     // __NAMESPACE__ is compile-time per the file the
                     // literal sits in — an include's top level is global
-                    // even inside a namespaced caller (ns_069).
-                    Ok(Expr::Str(self.cur_ns.clone()))
+                    // even inside a namespaced caller (ns_069). Kept a
+                    // `foldlit` const like __LINE__ for cond scanning.
+                    Ok(Expr::Binary {
+                        op: "foldlit",
+                        l: Box::new(Expr::Str(self.cur_ns.clone())),
+                        r: Box::new(Expr::Null),
+                    })
                 } else if self.ident_is("__property__") {
                     self.pos += 1;
                     Ok(Expr::MagicConst(MagicConst::Property))

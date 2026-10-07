@@ -4935,6 +4935,10 @@ impl<'a> Interp<'a> {
                 self.compare_op(op, l, r, &lv, &rv)
             }
             "named" => self.eval(r), // named-arg marker: value passthrough
+            // `foldlit` (parse-fixed __LINE__/__NAMESPACE__): the value
+            // is l; the marker keeps it non-literal for zend's scan
+            // classification and literal-only compile checks.
+            "foldlit" => self.eval(l),
             // `argline` (line marker on call args and their inner
             // sub-expressions): diagnostics during the eval attribute
             // to the operand's own first-token line (zend per-op
