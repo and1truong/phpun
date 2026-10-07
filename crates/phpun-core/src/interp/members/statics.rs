@@ -649,6 +649,7 @@ impl<'a> Interp<'a> {
                 }
                 self.pending_decl_class = Some(dc.clone());
                 self.pending_called_class = Some(called_class.clone().unwrap_or(cls.clone()));
+                self.pending_decl_site = Some(Rc::as_ptr(&m) as usize);
                 let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(dc));
                 self.pending_decl_class = None;
                 self.pending_called_class = None;
@@ -692,6 +693,7 @@ impl<'a> Interp<'a> {
                 if let Some((m, dc)) = self.find_method_in(&cls, "__callstatic") {
                     self.pending_decl_class = Some(dc.clone());
                     self.pending_called_class = Some(called_class.clone().unwrap_or(cls.clone()));
+                    self.pending_decl_site = Some(Rc::as_ptr(&m) as usize);
                     let r = self.invoke_fn(&Rc::new(m.decl.clone()), magic_args, None, Some(dc));
                     self.pending_decl_class = None;
                     self.pending_called_class = None;

@@ -483,17 +483,31 @@ impl<'a> Interp<'a> {
                 if let Some(u) = unit {
                     key = format!("{}\u{0}u{}", key, u);
                 }
-                // Site identity: (compile unit, stmt node). A `static $a`
-                // redeclared at a different statement in the same scope
-                // and unit is a compile fatal — even on the same line
-                // (static_basic_002) — while re-executing the same
-                // statement (loops) or redeclaring in a different unit
-                // — a separate include/eval/run, which Zend compiles to
-                // a fresh op_array — is not. The serial (not the file
-                // string) keys the unit: a re-parsed unit may recycle
-                // the freed Vec's stmt ptr and must still count as new.
-                let site = (self.cur_unit_id, vars.as_ptr() as usize);
+                // Site identity: (compile unit, decl origin, stmt line).
+                // A `static $a` redeclared at a different statement in the
+                // same scope and unit is a compile fatal — even on the
+                // same line (static_basic_002) — while re-executing the
+                // same statement (loops, repeated calls) or redeclaring
+                // in a different unit — a separate include/eval/run,
+                // which Zend compiles to a fresh op_array — is not. The
+                // serial (not the file string) keys the unit: a re-parsed
+                // unit may recycle the freed Vec's stmt ptr and must
+                // still count as new. The decl origin anchors the
+                // statement: method dispatch clones the decl body per
+                // call, so `vars.as_ptr()` differs between calls of the
+                // same method — the frame's decl_site (the registered
+                // decl Rc) stays stable. `var_line` separates
+                // statements inside that decl; same-line duplicates are
+                // already compile-time errors (flow_scan), so the
+                // line is sufficient stmt identity here.
+                let anchor = self
+                    .stack
+                    .last()
+                    .map(|f| f.decl_site)
+                    .filter(|a| *a != 0)
+                    .unwrap_or(0);
                 for (name, default, var_line) in vars {
+                    let site = (self.cur_unit_id, anchor, *var_line);
                     // Every site is kept: a decl in a different unit is
                     // legal AND must not erase the same-unit record a
                     // later duplicate checks against.
@@ -503,7 +517,9 @@ impl<'a> Interp<'a> {
                         .or_default()
                         .entry(name.clone())
                         .or_default();
-                    let dup = sites.iter().any(|(u, l)| u == &site.0 && *l != site.1);
+                    let dup = sites
+                        .iter()
+                        .any(|(u, a, l)| u == &site.0 && a == &site.1 && *l != site.2);
                     sites.insert(site);
                     if dup {
                         // A compile fatal in Zend — carry the compile-

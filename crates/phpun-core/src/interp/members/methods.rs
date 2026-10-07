@@ -1887,6 +1887,7 @@ impl<'a> Interp<'a> {
         let called = obj.borrow().class.clone();
         self.pending_decl_class = Some(dc.clone());
         self.pending_called_class = Some(called);
+        self.pending_decl_site = Some(Rc::as_ptr(m) as usize);
         let r = if m.is_static {
             self.invoke_fn(&Rc::new(m.decl.clone()), args, None, Some(dc))
         } else {
@@ -1988,6 +1989,7 @@ impl<'a> Interp<'a> {
             }
             self.pending_decl_class = Some(sc.clone());
             self.pending_called_class = Some(called_class.unwrap_or(cls.clone()));
+            self.pending_decl_site = Some(Rc::as_ptr(&m) as usize);
             let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(sc));
             self.pending_decl_class = None;
             self.pending_called_class = None;
@@ -2018,6 +2020,7 @@ impl<'a> Interp<'a> {
                     let arr = self.magic_args_array(&args);
                     self.pending_decl_class = Some(cdc.clone());
                     self.pending_called_class = Some(called_class.unwrap_or(cls.clone()));
+                    self.pending_decl_site = Some(Rc::as_ptr(&cm) as usize);
                     let r = self.invoke_fn(
                         &Rc::new(cm.decl.clone()),
                         CallArgs::positional(vec![

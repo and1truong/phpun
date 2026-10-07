@@ -391,6 +391,7 @@ impl<'a> Interp<'a> {
             decl_class,
             called_class,
             closure_rc,
+            None,
         );
         // Output buffers the body opened past a yield leave the real
         // stack while it is suspended — Zend's buffers are global, so

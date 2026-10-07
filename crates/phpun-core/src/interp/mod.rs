@@ -157,6 +157,11 @@ pub struct Frame {
     /// op_array (and fresh static_variables) per eval/include call.
     /// None = the frame's own op_array, whose statics persist.
     statics_unit: Option<u64>,
+    /// Anchor identifying the fn/method DECL this frame executes —
+    /// `Rc::as_ptr` of the registered decl (stable across the per-call
+    /// `m.decl.clone()` method dispatch takes, so `static` site
+    /// identity survives cloned bodies).
+    decl_site: usize,
 }
 
 impl Frame {
@@ -178,6 +183,7 @@ impl Frame {
             closure_rc: None,
             call_alias: None,
             statics_unit: None,
+            decl_site: 0,
         }
     }
 }
@@ -194,6 +200,12 @@ pub(crate) type FilterBinding = (
 /// Liveness probe for a charged allocation: weak ref to the owning
 /// Rc — returns false once every strong handle died (zend's efree).
 pub(crate) type MemProbe = Box<dyn Fn() -> bool>;
+
+/// `static` decl site registry: fn-statics key → var name → set of
+/// (compile-unit serial, decl-origin anchor, stmt line). See
+/// Stmt::Static for the duplicate-declaration rule it enforces.
+type StaticDeclSites =
+    HashMap<String, HashMap<String, std::collections::HashSet<(u64, usize, usize)>>>;
 
 pub struct Interp<'a> {
     pub file: &'a str,
@@ -437,7 +449,7 @@ pub struct Interp<'a> {
     /// bumped at every parse boundary (include/eval/run) since Zend
     /// compiles each into a fresh op_array — a freed Vec may recycle
     /// the same stmt ptr across re-parses.
-    static_decls: HashMap<String, HashMap<String, std::collections::HashSet<(u64, usize)>>>,
+    static_decls: StaticDeclSites,
     /// Serial of the compile unit currently executing (see static_decls).
     cur_unit_id: u64,
     /// Next unit serial to hand out — bumps monotonically.
@@ -612,6 +624,11 @@ pub struct Interp<'a> {
     /// Called-scope (LSB) for the next invoke_fn frame — set by
     /// invoke_method/static_invoke, consumed like pending_decl_class.
     pending_called_class: Option<Rc<PhpClass>>,
+    /// Origin anchor for the next invoke_fn frame — set by method
+    /// dispatch sites that pass `Rc::new(m.decl.clone())` (whose
+    /// cloned bodies would otherwise get fresh `vars.as_ptr()` sites
+    /// per call). Consumed like pending_decl_class.
+    pending_decl_site: Option<usize>,
     /// (object id, prop, is_get, owner) whose hook is about to run —
     /// consumed by invoke_fn to fill Frame::hook_prop.
     pending_hook_prop: Option<(u64, String, bool, String)>,
@@ -1435,7 +1452,7 @@ impl<'a> Interp<'a> {
             silence: 0,
             isset_quiet: 0,
             statics: HashMap::new(),
-            static_decls: HashMap::new(),
+            static_decls: StaticDeclSites::new(),
             cur_unit_id: 0,
             next_unit_id: 1,
             included: HashSet::new(),
@@ -1485,6 +1502,7 @@ impl<'a> Interp<'a> {
             live_gens: Vec::new(),
             pending_decl_class: None,
             pending_called_class: None,
+            pending_decl_site: None,
             pending_hook_prop: None,
             in_const_expr: 0,
             class_const_ctx: 0,
