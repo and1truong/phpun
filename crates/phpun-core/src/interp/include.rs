@@ -201,9 +201,15 @@ impl<'a> Interp<'a> {
                         });
                     }
                     // Non-parse fatals raised while compiling the included
-                    // file still attribute to the included file.
+                    // file still attribute to the included file — and carry
+                    // the compile-context backtrace: the live stack minus
+                    // this include's own pseudo-frame (Zend keeps the outer
+                    // frames: `#0 FILE(N): eval()` for a unit included from
+                    // eval'd code, the real call frames inside a function).
                     _ => {
                         self.last_err_file = fname.clone();
+                        let mut e = e;
+                        e.trace = Some(self.compile_err_frames());
                         self.print_fatal(&e);
                     }
                 }
