@@ -306,6 +306,70 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
+                // ReflectionFunction's ctor validates through its
+                // Closure|string ZPP: scalars coerce (null is
+                // deprecated), other values TypeError, and an unknown
+                // name throws ReflectionException — language constructs
+                // (isset/print/eval) are not functions.
+                if obj.borrow().class.name().to_lowercase().as_str() == "reflectionfunction" {
+                    if args.is_empty() {
+                        return self.fail(PhpError::uncaught(
+                            "ArgumentCountError",
+                            "ReflectionFunction::__construct() expects exactly 1 argument, 0 given",
+                            0,
+                        ));
+                    }
+                    let a = args[0].borrow().clone();
+                    let sname = match &a {
+                        Value::Callable(_) => None,
+                        Value::Null => {
+                            self.deprecated(
+                                "ReflectionFunction::__construct(): Passing null to parameter #1 ($function) of type Closure|string is deprecated",
+                            )?;
+                            Some(String::new())
+                        }
+                        Value::Str(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) => {
+                            Some(self.conv_str(&a)?.to_string())
+                        }
+                        other => {
+                            return self.fail(PhpError::uncaught(
+                                "TypeError",
+                                format!(
+                                    "ReflectionFunction::__construct(): Argument #1 ($function) must be of type Closure|string, {} given",
+                                    self.zval_type_name(other)
+                                ),
+                                0,
+                            ));
+                        }
+                    };
+                    if let Some(s) = sname {
+                        let key = s.trim_start_matches('\\').to_lowercase();
+                        let canon = if let Some(d) = self.functions.get(&key) {
+                            d.name.clone()
+                        } else if crate::builtins::is_builtin(&key)
+                            || crate::builtins::builtin_params(&key).is_some()
+                        {
+                            key.clone()
+                        } else {
+                            return self.fail(PhpError::uncaught(
+                                "ReflectionException",
+                                format!("Function {}() does not exist", s),
+                                0,
+                            ));
+                        };
+                        let mut ob = obj.borrow_mut();
+                        ob.props
+                            .insert("\0rc\0class".into(), cell(Value::str(&canon)));
+                        ob.props.insert("\0rc\0prop".into(), cell(Value::Null));
+                        ob.props.insert("name".into(), cell(Value::str(&canon)));
+                        if !ob.prop_order.contains(&"name".into()) {
+                            ob.prop_order.push("name".into());
+                        }
+                        return Ok(Some(Value::Null));
+                    }
+                    // Callable arg falls through to the generic prop
+                    // setup, which derives `name` from its kind.
+                }
                 let mut ob = obj.borrow_mut();
                 let cls = args
                     .first()
@@ -401,6 +465,7 @@ impl<'a> Interp<'a> {
                         named: args.named.clone(),
                         trav_cells: Vec::new(),
                         nonref_cells: Vec::new(),
+                        end_line: args.end_line,
                     };
                     match target {
                         Value::Object(o) => Ok(Some(self.method_invoke(o, &mn, ca)?)),
@@ -413,7 +478,12 @@ impl<'a> Interp<'a> {
                                 .map(|c| c.borrow().clone())
                                 .unwrap_or(Value::Null);
                             let cn = self.conv_str(&cn)?.to_string();
-                            Ok(Some(self.call_named(&format!("{}::{}", cn, mn), &[])?))
+                            Ok(Some(self.call_named(
+                                &format!("{}::{}", cn, mn),
+                                &[],
+                                None,
+                                None,
+                            )?))
                         }
                         _ => Ok(Some(Value::Null)),
                     }
@@ -429,6 +499,7 @@ impl<'a> Interp<'a> {
                         named: args.named.clone(),
                         trav_cells: args.trav_cells.clone(),
                         nonref_cells: args.nonref_cells.clone(),
+                        end_line: args.end_line,
                     };
                     Ok(Some(self.call_value(&cb, ca)?))
                 }
@@ -817,8 +888,18 @@ impl<'a> Interp<'a> {
                     } else {
                         None
                     };
+                    // zend types every arginfo param, but this table
+                    // carries no member names for internal functions —
+                    // the flag drives object-vs-NULL instead.
+                    let hasty = obj
+                        .borrow()
+                        .props
+                        .get("\0rp\0hasty")
+                        .is_some_and(|c| c.borrow().is_truthy());
                     match tys {
-                        Some(ta) => {
+                        // No declared type -> NULL (zend returns NULL
+                        // for an untyped param, not a named type).
+                        Some(ta) if hasty || !ta.borrow().entries.is_empty() => {
                             let members: Vec<String> = ta
                                 .borrow()
                                 .entries
@@ -837,7 +918,7 @@ impl<'a> Interp<'a> {
                             }
                             Ok(Some(nt))
                         }
-                        None => Ok(Some(Value::Null)),
+                        _ => Ok(Some(Value::Null)),
                     }
                 }
             }
@@ -945,92 +1026,239 @@ impl<'a> Interp<'a> {
                         .unwrap_or(Value::Null);
                     self.callable_decl(&cb)
                 };
-                let decl_file = decl.as_ref().map(|d| d.file.clone()).unwrap_or_default();
-                let mut arr = PhpArray::default();
-                if let Some(d) = decl {
-                    for p in &d.params {
-                        let rp = self.instantiate("reflectionparameter", &[])?;
-                        if let Value::Object(o) = &rp {
-                            o.borrow_mut()
-                                .props
-                                .insert("\0rp\0name".into(), cell(Value::str(&p.name)));
-                            // Zend's ReflectionParameter exposes the name
-                            // as a public prop rendered by var_dump.
-                            let mut ob = o.borrow_mut();
-                            ob.props.insert("name".into(), cell(Value::str(&p.name)));
-                            if !ob.prop_order.contains(&"name".into()) {
-                                ob.prop_order.push("name".into());
+                let _decl_file = decl.as_ref().map(|d| d.file.clone()).unwrap_or_default();
+                // userland decls read Param; internal functions
+                // synthesize from arginfo (builtin_params).
+                struct RParam {
+                    name: String,
+                    variadic: bool,
+                    has_def: bool,
+                    def: Value,
+                    ty: Vec<String>,
+                    hasty: bool,
+                    opt: bool,
+                    by_ref: bool,
+                    allow_null: bool,
+                    const_name: Option<String>,
+                    /// zend evaluates the default lazily inside
+                    /// getDefaultValue(); a failing const expr stashes
+                    /// its throwable (class, message) until then.
+                    dmsg: Option<(String, String)>,
+                }
+                let mut prs: Vec<RParam> = Vec::new();
+                let bp: Option<&'static [(&'static str, crate::builtins::BDef)]> = if is_method {
+                    None
+                } else {
+                    match obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null)
+                    {
+                        Value::Str(s) => {
+                            let n = String::from_utf8_lossy(&s).to_lowercase();
+                            if !self.functions.contains_key(&n) {
+                                crate::builtins::builtin_params(&n)
+                            } else {
+                                None
                             }
-                            drop(ob);
-                            o.borrow_mut()
-                                .props
-                                .insert("\0rp\0variadic".into(), cell(Value::Bool(p.variadic)));
-                            // zend evaluates the default lazily inside
-                            // getDefaultValue(); a failing const expr
-                            // stashes its throwable until then.
-                            if let Some(de) = &p.default {
-                                let old = match &scope_cls {
-                                    Some(sc) => self.const_self.replace(sc.clone()),
-                                    None => self.const_self.take(),
-                                };
-                                let r = self.eval_decl_const(de, &decl_file, 0);
-                                self.const_self = old;
-                                match r {
-                                    Ok(v) => {
-                                        o.borrow_mut()
-                                            .props
-                                            .insert("\0rp\0default".into(), cell(v));
-                                    }
-                                    Err(pe) => {
-                                        // A Throw-kind error carries the
-                                        // real throwable in
-                                        // pending_exception ('Undefined
-                                        // constant X' etc.) — its class
-                                        // and message are what
-                                        // getDefaultValue() rethrows.
-                                        let thrown = self.pending_exception.take();
-                                        let (cls, msg) = match &thrown {
-                                            Some(Value::Object(o)) => {
-                                                let b = o.borrow();
-                                                let m = b
-                                                    .props
-                                                    .get("message")
-                                                    .map(|c| c.borrow().to_php_string())
-                                                    .unwrap_or_else(|| pe.message.clone());
-                                                (b.class.name().to_string(), m.to_string())
-                                            }
-                                            _ => {
-                                                let cls = match &pe.kind {
-                                                    crate::error::ErrorKind::Uncaught { class } => {
-                                                        *class
-                                                    }
-                                                    _ => "Error",
-                                                };
-                                                (cls.to_string(), pe.message.clone())
-                                            }
-                                        };
-                                        let mut ob = o.borrow_mut();
-                                        ob.props
-                                            .insert("\0rp\0dmsg".into(), cell(Value::str(&msg)));
-                                        ob.props
-                                            .insert("\0rp\0dcls".into(), cell(Value::str(&cls)));
-                                        drop(ob);
-                                    }
-                                }
-                            }
-                            let mut ta = PhpArray::default();
-                            if let Some(ty) = &p.ty {
-                                for m in ty {
-                                    ta.push(Value::str(m));
-                                }
-                            }
-                            o.borrow_mut().props.insert(
-                                "\0rp\0ty".into(),
-                                cell(Value::Array(Rc::new(RefCell::new(ta)))),
-                            );
                         }
-                        arr.push(rp);
+                        _ => None,
                     }
+                };
+                if let Some(params) = bp {
+                    for (pn, d) in params.iter() {
+                        let var = matches!(d, crate::builtins::BDef::Var);
+                        // Unk/OptReq params are optional but carry no
+                        // default (Zend arginfo opt/dva flags).
+                        let has = !matches!(
+                            d,
+                            crate::builtins::BDef::Req
+                                | crate::builtins::BDef::Unk
+                                | crate::builtins::BDef::OptReq
+                                | crate::builtins::BDef::Var
+                        );
+                        let opt = has
+                            || var
+                            || matches!(
+                                d,
+                                crate::builtins::BDef::Unk | crate::builtins::BDef::OptReq
+                            );
+                        // arginfo carries no type/nullable info here —
+                        // zend marks internal params non-nullable
+                        // unless arginfo says otherwise (strlen $string),
+                        // but every arginfo param does have a type.
+                        prs.push(RParam {
+                            name: pn.to_string(),
+                            variadic: var,
+                            has_def: has,
+                            def: d.val(),
+                            ty: Vec::new(),
+                            hasty: true,
+                            opt,
+                            by_ref: false,
+                            allow_null: false,
+                            const_name: None,
+                            dmsg: None,
+                        });
+                    }
+                } else if let Some(d) = &decl {
+                    let req = d
+                        .params
+                        .iter()
+                        .rposition(|p| p.default.is_none() && !p.variadic)
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    for (i, p) in d.params.iter().enumerate() {
+                        // Zend erases the default on a param its
+                        // optional-before-required rule makes required.
+                        let has = p.default.is_some() && i >= req;
+                        let (dv, dmsg) = if has {
+                            let de = p.default.as_ref().unwrap();
+                            let old = match &scope_cls {
+                                Some(sc) => self.const_self.replace(sc.clone()),
+                                None => self.const_self.take(),
+                            };
+                            let r = self.eval_decl_const(de, &d.file, 0);
+                            self.const_self = old;
+                            match r {
+                                Ok(v) => (v, None),
+                                Err(pe) => {
+                                    // A Throw-kind error carries the real
+                                    // throwable in pending_exception — its
+                                    // class/message are what getDefaultValue()
+                                    // rethrows.
+                                    let thrown = self.pending_exception.take();
+                                    let (cls, msg) = match &thrown {
+                                        Some(Value::Object(o)) => {
+                                            let b = o.borrow();
+                                            let m = b
+                                                .props
+                                                .get("message")
+                                                .map(|c| c.borrow().to_php_string())
+                                                .unwrap_or_else(|| pe.message.clone());
+                                            (b.class.name().to_string(), m.to_string())
+                                        }
+                                        _ => {
+                                            let cls = match &pe.kind {
+                                                crate::error::ErrorKind::Uncaught { class } => {
+                                                    *class
+                                                }
+                                                _ => "Error",
+                                            };
+                                            (cls.to_string(), pe.message.clone())
+                                        }
+                                    };
+                                    (Value::Null, Some((cls, msg)))
+                                }
+                            }
+                        } else {
+                            (Value::Null, None)
+                        };
+                        let tys = p.ty.clone().unwrap_or_default();
+                        // allowsNull: untyped, explicit ?T/T|null, mixed,
+                        // or the (deprecated) implicit-nullable
+                        // `T $a = null` form.
+                        let allow_null = tys.is_empty()
+                            || tys.iter().any(|t| {
+                                t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("mixed")
+                            })
+                            || (has && matches!(dv, Value::Null));
+                        // zend's isDefaultValueConstant flags literal
+                        // constant refs (CONST, self::C) — not constant
+                        // expressions like `1+2` or `'a'.'b'`.
+                        let const_name = if has {
+                            match p.default.as_ref().unwrap() {
+                                Expr::Const(n) => Some(n.clone()),
+                                Expr::ClassConst { class, name }
+                                    if matches!(class.as_ref(), Expr::Const(_)) =>
+                                {
+                                    let cn = match class.as_ref() {
+                                        Expr::Const(cn) => cn.clone(),
+                                        _ => unreachable!(),
+                                    };
+                                    Some(format!("{}::{}", cn, name))
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        prs.push(RParam {
+                            name: p.name.clone(),
+                            variadic: p.variadic,
+                            has_def: has,
+                            def: dv,
+                            hasty: !tys.is_empty(),
+                            ty: tys,
+                            opt: has || p.variadic,
+                            by_ref: p.by_ref,
+                            allow_null,
+                            const_name,
+                            dmsg,
+                        });
+                    }
+                }
+                let mut arr = PhpArray::default();
+                for (pos, rp_decl) in prs.iter().enumerate() {
+                    let rp = self.instantiate("reflectionparameter", &[])?;
+                    if let Value::Object(o) = &rp {
+                        o.borrow_mut()
+                            .props
+                            .insert("\0rp\0name".into(), cell(Value::str(&rp_decl.name)));
+                        // Zend's ReflectionParameter exposes the name
+                        // as a public prop rendered by var_dump.
+                        let mut ob = o.borrow_mut();
+                        ob.props
+                            .insert("name".into(), cell(Value::str(&rp_decl.name)));
+                        if !ob.prop_order.contains(&"name".into()) {
+                            ob.prop_order.push("name".into());
+                        }
+                        drop(ob);
+                        let mut ob = o.borrow_mut();
+                        ob.props
+                            .insert("\0rp\0variadic".into(), cell(Value::Bool(rp_decl.variadic)));
+                        ob.props
+                            .insert("\0rp\0pos".into(), cell(Value::Int(pos as i64)));
+                        ob.props
+                            .insert("\0rp\0hasdef".into(), cell(Value::Bool(rp_decl.has_def)));
+                        ob.props
+                            .insert("\0rp\0opt".into(), cell(Value::Bool(rp_decl.opt)));
+                        ob.props
+                            .insert("\0rp\0def".into(), cell(rp_decl.def.clone()));
+                        ob.props
+                            .insert("\0rp\0byref".into(), cell(Value::Bool(rp_decl.by_ref)));
+                        ob.props
+                            .insert("\0rp\0hasty".into(), cell(Value::Bool(rp_decl.hasty)));
+                        ob.props.insert(
+                            "\0rp\0allownull".into(),
+                            cell(Value::Bool(rp_decl.allow_null)),
+                        );
+                        if let Some(cn) = &rp_decl.const_name {
+                            ob.props
+                                .insert("\0rp\0defconst".into(), cell(Value::str(cn.clone())));
+                        }
+                        if rp_decl.has_def && rp_decl.dmsg.is_none() {
+                            ob.props
+                                .insert("\0rp\0default".into(), cell(rp_decl.def.clone()));
+                        }
+                        if let Some((cls, msg)) = &rp_decl.dmsg {
+                            ob.props
+                                .insert("\0rp\0dmsg".into(), cell(Value::str(msg.clone())));
+                            ob.props
+                                .insert("\0rp\0dcls".into(), cell(Value::str(cls.clone())));
+                        }
+                        let mut ta = PhpArray::default();
+                        for m in &rp_decl.ty {
+                            ta.push(Value::str(m));
+                        }
+                        ob.props.insert(
+                            "\0rp\0ty".into(),
+                            cell(Value::Array(Rc::new(RefCell::new(ta)))),
+                        );
+                    }
+                    arr.push(rp);
                 }
                 Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
             }
@@ -1038,6 +1266,75 @@ impl<'a> Interp<'a> {
                 obj.borrow()
                     .props
                     .get("\0rp\0variadic")
+                    .is_some_and(|c| c.borrow().is_truthy()),
+            ))),
+            "ispassedbyreference" => Ok(Some(Value::Bool(
+                obj.borrow()
+                    .props
+                    .get("\0rp\0byref")
+                    .is_some_and(|c| c.borrow().is_truthy()),
+            ))),
+            "allowsnull" => Ok(Some(Value::Bool(
+                obj.borrow()
+                    .props
+                    .get("\0rp\0allownull")
+                    .is_some_and(|c| c.borrow().is_truthy()),
+            ))),
+            // zend throws ReflectionException when the param carries
+            // no default at all — a non-const default answers false
+            // for is* / NULL for get*Name.
+            "isdefaultvalueconstant" => {
+                let has = obj
+                    .borrow()
+                    .props
+                    .get("\0rp\0hasdef")
+                    .is_some_and(|c| c.borrow().is_truthy());
+                if !has {
+                    return self.fail(PhpError::uncaught(
+                        "ReflectionException",
+                        "Internal error: Failed to retrieve the default value",
+                        0,
+                    ));
+                }
+                Ok(Some(Value::Bool(
+                    obj.borrow().props.contains_key("\0rp\0defconst"),
+                )))
+            }
+            "getdefaultvalueconstantname" => {
+                let has = obj
+                    .borrow()
+                    .props
+                    .get("\0rp\0hasdef")
+                    .is_some_and(|c| c.borrow().is_truthy());
+                if !has {
+                    return self.fail(PhpError::uncaught(
+                        "ReflectionException",
+                        "Internal error: Failed to retrieve the default value",
+                        0,
+                    ));
+                }
+                let v = obj
+                    .borrow()
+                    .props
+                    .get("\0rp\0defconst")
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null);
+                Ok(Some(v))
+            }
+            "getposition" => Ok(Some(Value::Int(
+                obj.borrow()
+                    .props
+                    .get("\0rp\0pos")
+                    .map(|c| c.borrow().to_int())
+                    .unwrap_or(0),
+            ))),
+            // Optional = has a usable default or is the variadic tail;
+            // a param the optional-before-required rule made required
+            // reports no default (zend erases it at compile time).
+            "isoptional" => Ok(Some(Value::Bool(
+                obj.borrow()
+                    .props
+                    .get("\0rp\0opt")
                     .is_some_and(|c| c.borrow().is_truthy()),
             ))),
             "getdefaultvalue" => {
@@ -1079,13 +1376,19 @@ impl<'a> Interp<'a> {
                 let has = obj
                     .borrow()
                     .props
-                    .get("\0rp\0ty")
-                    .map(|c| c.borrow().clone())
-                    .and_then(|v| match v {
-                        Value::Array(a) => Some(!a.borrow().entries.is_empty()),
-                        _ => None,
-                    })
-                    .unwrap_or(false);
+                    .get("\0rp\0hasty")
+                    .map(|c| c.borrow().is_truthy())
+                    .unwrap_or_else(|| {
+                        obj.borrow()
+                            .props
+                            .get("\0rp\0ty")
+                            .map(|c| c.borrow().clone())
+                            .and_then(|v| match v {
+                                Value::Array(a) => Some(!a.borrow().entries.is_empty()),
+                                _ => None,
+                            })
+                            .unwrap_or(false)
+                    });
                 Ok(Some(Value::Bool(has)))
             }
             "getclass" => {
@@ -1443,6 +1746,7 @@ impl<'a> Interp<'a> {
                         named,
                         trav_cells: Vec::new(),
                         nonref_cells: Vec::new(),
+                        end_line: 0,
                     };
                     return self.new_instance(&name, ca).map(Some);
                 }
@@ -1458,6 +1762,7 @@ impl<'a> Interp<'a> {
                         named: args.named.clone(),
                         trav_cells: args.trav_cells.clone(),
                         nonref_cells: args.nonref_cells.clone(),
+                        end_line: args.end_line,
                     }
                 };
                 let cn = obj
@@ -1468,6 +1773,85 @@ impl<'a> Interp<'a> {
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
                 Ok(Some(self.new_instance(&cn, ca)?))
+            }
+            // Arity introspection (ReflectionFunctionAbstract). Zend
+            // counts every declared slot — variadic included; required
+            // covers the non-optional, non-variadic prefix (fprintf
+            // arginfo stream/format/values → 2 of 3).
+            "getnumberofparameters" | "getnumberofrequiredparameters" => {
+                // ReflectionMethod stores its CLASS name in \0rc\0class
+                // and its method name in \0rc\0prop (the one-arg
+                // `new ReflectionMethod('K::m')` form packs both into
+                // \0rc\0class); every other reflector stores its
+                // subject (fn name string or a Callable) in \0rc\0class.
+                let arity = if obj
+                    .borrow()
+                    .class
+                    .name()
+                    .eq_ignore_ascii_case("reflectionmethod")
+                {
+                    let cn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let cn = self.conv_str(&cn)?.to_string();
+                    let mn = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0prop")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let mn = self.conv_str(&mn)?.to_string();
+                    let (cn, mn) = if mn.is_empty() {
+                        cn.rsplit_once("::")
+                            .map(|(c, m)| (c.to_string(), m.to_string()))
+                            .unwrap_or((cn, mn))
+                    } else {
+                        (cn, mn)
+                    };
+                    self.method_arity(&cn, &mn)
+                } else {
+                    let stored = obj
+                        .borrow()
+                        .props
+                        .get("\0rc\0class")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    match &stored {
+                        Value::Callable(c) => match &c.kind {
+                            CallableKind::Closure(d) => Some(reflect_decl_arity(d)),
+                            CallableKind::Named(n) => self.name_arity(n),
+                            CallableKind::Method {
+                                obj: mo,
+                                class,
+                                name,
+                            } => {
+                                let cls = class
+                                    .clone()
+                                    .or_else(|| mo.as_ref().map(|o| o.borrow().class.clone()));
+                                cls.and_then(|ce| {
+                                    self.find_method_in(&ce, name)
+                                        .map(|(m, _)| reflect_decl_arity(&m.decl))
+                                })
+                            }
+                        },
+                        _ => {
+                            let n = self.conv_str(&stored)?.to_string();
+                            self.name_arity(&n)
+                        }
+                    }
+                };
+                let pick = if lname == "getnumberofparameters" {
+                    arity.map(|(t, _)| t)
+                } else {
+                    arity.map(|(_, r)| r)
+                };
+                Ok(Some(match pick {
+                    Some(n) => Value::Int(n),
+                    None => Value::Null,
+                }))
             }
             "getname" => {
                 if let Some(ObjectInternal::ReflectionAttribute { name, .. }) =
@@ -2338,6 +2722,7 @@ impl<'a> Interp<'a> {
             .iter()
             .rev()
             .skip_while(|f| f.internal && !crate::value::include_frame(f) && f.function != "eval")
+            .filter(|f| !crate::value::trace_frame_hidden(f))
             .cloned()
             .collect()
     }
@@ -2478,4 +2863,89 @@ impl<'a> Interp<'a> {
         }
         out
     }
+}
+
+impl Interp<'_> {
+    /// Arity of a named function — builtin arginfo first (zend's
+    /// required/total split: variadic counts as a param but not as
+    /// required), then userland decls.
+    fn name_arity(&mut self, name: &str) -> Option<(i64, i64)> {
+        let n = name.trim_start_matches('\\').to_lowercase();
+        if let Some(params) = crate::builtins::builtin_params(&n) {
+            let total = params.len() as i64;
+            // OptReq params are arginfo-optional (rand reports 0
+            // required); their arity rule lives in the call path.
+            let required = params
+                .iter()
+                .filter(|(_, d)| matches!(d, crate::builtins::BDef::Req))
+                .count() as i64;
+            return Some((total, required));
+        }
+        // builtin_sig's catch-all answers (0,0) for every name — only
+        // consult it for names that actually are builtins so userland
+        // decls still resolve below. A builtin with no known signature
+        // reports NULL rather than a bogus (0,0).
+        if crate::builtins::is_builtin(&n) {
+            return crate::builtins::builtin_sig(&n).and_then(|sig| {
+                if sig.is_empty() {
+                    return None;
+                }
+                let total = sig.len() as i64;
+                let required = sig.iter().filter(|(_, req)| *req).count() as i64;
+                Some((total, required))
+            });
+        }
+        self.functions.get(&n).map(|d| reflect_decl_arity(d))
+    }
+
+    /// Arity of a class/interface method for ReflectionMethod —
+    /// `find_method_in` walks the parent chain; interfaces hold their
+    /// own decl table (with their own `extends` parents).
+    fn method_arity(&mut self, cn: &str, mn: &str) -> Option<(i64, i64)> {
+        let key = self
+            .resolve_class(cn)
+            .unwrap_or_else(|| cn.trim_start_matches('\\').to_string())
+            .to_lowercase();
+        if let Some(cls) = self.classes.get(&key).cloned() {
+            return self
+                .find_method_in(&cls, mn)
+                .map(|(m, _)| reflect_decl_arity(&m.decl));
+        }
+        // Interfaces record their (possibly several) parents in
+        // `implements` — BFS the extends graph for the method decl.
+        let lname = mn.to_lowercase();
+        let mut seen = std::collections::HashSet::new();
+        let mut todo: Vec<Rc<crate::ast::ClassDecl>> =
+            self.interfaces.get(&key).into_iter().cloned().collect();
+        while let Some(id) = todo.pop() {
+            if !seen.insert(id.name.to_lowercase()) {
+                continue;
+            }
+            if let Some(m) = id.find_method(&lname) {
+                return Some(reflect_decl_arity(&m.decl));
+            }
+            for p in &id.implements {
+                if let Some(pd) = self.interfaces.get(&p.to_lowercase()).cloned() {
+                    todo.push(pd);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Total and required param counts for a function/method decl — a
+/// variadic tail is a declared slot but not required. Zend counts as
+/// required every param up to and including the last one without a
+/// default, so an optional declared before a required param is required
+/// too (`function f($a = 1, $b)` reflects 2/2).
+fn reflect_decl_arity(d: &crate::ast::FunctionDecl) -> (i64, i64) {
+    (
+        d.params.len() as i64,
+        d.params
+            .iter()
+            .rposition(|p| p.default.is_none() && !p.variadic)
+            .map(|i| i as i64 + 1)
+            .unwrap_or(0),
+    )
 }

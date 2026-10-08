@@ -42,6 +42,12 @@ pub struct PhpArray {
     /// rebuild mutators (unshift/shift/splice) adjust cursors the way
     /// zend's iterators_update does. None = a finished loop's freed slot.
     pub foreach_pos: Vec<Option<usize>>,
+    /// Slots charged to memory_limit — counts every slot ever appended
+    /// (tombstones keep their bucket charge like zend's arData, which
+    /// never shrinks on unset). Decremented wholesale at Drop.
+    /// pub(crate) so literal constructions can init it; growth callers
+    /// must go through mem_note_append/mem_note_seed, never this field.
+    pub(crate) mem_elems: i64,
 }
 
 impl Default for PhpArray {
@@ -58,6 +64,49 @@ impl PhpArray {
             is_ref: false,
             iter_pos: 0,
             foreach_pos: Vec::new(),
+            mem_elems: 0,
+        }
+    }
+
+    /// Charge one appended entry slot against ARR_LIVE, plus the base
+    /// table on the first append (zend materializes the HashTable when
+    /// the empty literal first gains an element — `[]` alone is free).
+    /// Out-of-impl `entries.push` callers must go through here so the
+    /// charge and Drop's decrement stay symmetric.
+    pub fn mem_note_append(&mut self) {
+        let old = arr_foot(self.mem_elems);
+        self.mem_elems += 1;
+        // Zend trips inside the arData grow — a pow2-bucket realloc —
+        // so the reported request is the live table's size (our meter
+        // uses the packed stride; zend's hashed arData runs 32/elem —
+        // oracle stamped 2097160 = 65536*32+8 on its mixed loop).
+        let request =
+            (self.mem_elems.max(8) as u64).next_power_of_two() as i64 * ARR_ELEM_BYTES + 8;
+        mem_charge(&ARR_LIVE, arr_foot(self.mem_elems) - old, request);
+    }
+
+    /// Release the charged slots alongside an `entries.clear()`
+    /// rebuild (zend's buckets are dropped, the table lives on —
+    /// matching zend_hash_clean semantics under our element model).
+    pub fn mem_clear(&mut self) {
+        if self.mem_elems > 0 {
+            ARR_LIVE.fetch_sub(
+                arr_foot(self.mem_elems),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.mem_elems = 0;
+        }
+    }
+
+    /// Charge a literal-built table's pre-populated entries at
+    /// construction (dup_array copies, globals snapshots). No-op on an
+    /// empty table — matches zend's free `[]`.
+    pub fn mem_note_seed(&mut self) {
+        if self.mem_elems == 0 && !self.entries.is_empty() {
+            self.mem_elems = self.entries.len() as i64;
+            let request =
+                (self.mem_elems.max(8) as u64).next_power_of_two() as i64 * ARR_ELEM_BYTES + 8;
+            mem_charge(&ARR_LIVE, arr_foot(self.mem_elems), request);
         }
     }
 
@@ -80,12 +129,14 @@ impl PhpArray {
         self.entries
             .push((ArrKey::Int(self.next), Rc::new(RefCell::new(v))));
         self.next += 1;
+        self.mem_note_append();
     }
 
     /// Append an existing cell (by-ref variadics alias their args).
     pub fn push_cell(&mut self, c: Cell) {
         self.entries.push((ArrKey::Int(self.next), c));
         self.next += 1;
+        self.mem_note_append();
     }
 
     pub fn set(&mut self, k: ArrKey, v: Value) {
@@ -121,6 +172,7 @@ impl PhpArray {
         } else {
             self.entries.push((k, c));
         }
+        self.mem_note_append();
     }
 
     /// Bind an element slot to a specific cell (`$a[k] =& $x`).
@@ -137,6 +189,7 @@ impl PhpArray {
             Some(std::mem::replace(&mut slot.1, c))
         } else {
             self.entries.push((k, c));
+            self.mem_note_append();
             None
         }
     }
@@ -313,18 +366,21 @@ impl PhpArray {
 impl Clone for PhpArray {
     fn clone(&self) -> Self {
         // Deep-clone cell contents (PHP copy-on-write: the copy is independent).
-        Self {
+        let mut a = Self {
             entries: self
                 .entries
                 .iter()
                 .map(|(k, c)| (k.clone(), Rc::new(RefCell::new(c.borrow().clone()))))
                 .collect(),
+            mem_elems: 0,
             next: self.next,
             is_ref: false,
             iter_pos: self.iter_pos,
             // A CoW copy does not inherit the source's live foreach loops.
             foreach_pos: Vec::new(),
-        }
+        };
+        a.mem_note_seed();
+        a
     }
 }
 
@@ -369,19 +425,24 @@ pub fn int_prop_index(k: &str) -> Option<i64> {
 /// Render Zend-style stack frames innermost-first, `#N {main}` last:
 /// `#0 file(7): fn('a', 2)` / `#0 [internal function]: cb('x')`.
 /// Internal callees hide their args (PHP: no arg info for builtins).
-/// call_user_func*/forward_static_call trampolines are
-/// ZEND_ACC_CALL_VIA_TRAMPOLINE — Zend omits them from backtraces
-/// (named_params/call_user_func_array_variadic shows only the
-/// forwarded `array_multisort(: 1)` frame).
+/// call_user_func* are ZEND_ACC_CALL_VIA_TRAMPOLINE — Zend omits them
+/// from backtraces (named_params/call_user_func_array_variadic shows
+/// only the forwarded `array_multisort(: 1)` frame).
+/// forward_static_call* are ORDINARY internal functions — their frames
+/// always render, and callees they dispatch sit at
+/// `[internal function]`.
+/// `!visible` frames — literal calls Zend compile-specializes into
+/// dedicated opcodes (rope sprintf) — emit no call at all, so every
+/// render path (backtraces, exception traces, fatal frames) skips
+/// them here rather than at each call site.
 pub fn trace_frame_hidden(fr: &TraceFrame) -> bool {
-    fr.internal
-        && matches!(
-            fr.function.as_str(),
-            "call_user_func"
-                | "call_user_func_array"
-                | "forward_static_call"
-                | "forward_static_call_array"
-        )
+    !fr.visible
+        || (fr.internal
+            && !fr.named_dispatch
+            && matches!(
+                fr.function.as_str(),
+                "call_user_func" | "call_user_func_array"
+            ))
 }
 
 pub fn format_trace(frames: &[TraceFrame]) -> String {
@@ -551,7 +612,7 @@ pub enum Value {
     Int(i64),
     Float(f64),
     /// PHP strings are byte arrays — UTF-8 only at display boundaries.
-    Str(Rc<[u8]>),
+    Str(PhpStr),
     /// Copy-on-write via Rc: clones share until mutated (see interp::set_index).
     Array(Rc<RefCell<PhpArray>>),
     /// Instances of user-defined and builtin classes.
@@ -564,12 +625,12 @@ pub enum Value {
 
 impl Value {
     pub fn str(s: impl Into<String>) -> Self {
-        Value::Str(s.into().into_bytes().into())
+        Value::Str(PhpStr::new(s.into().into_bytes()))
     }
 
     /// Build a string Value from raw bytes (binary literals, byte ops).
     pub fn bytes(b: impl Into<Vec<u8>>) -> Self {
-        Value::Str(b.into().into())
+        Value::Str(PhpStr::new(b.into()))
     }
 
     /// Byte-faithful string coercion — the workhorse for concat, offsets,
@@ -1700,6 +1761,213 @@ impl PhpClass {
     }
 }
 
+/// Per-object-shell charge against memory_limit — zend's arena
+/// counts LIVE allocations, so freeing the last Rc of an object
+/// returns its charge (gc_* tests churn hundreds of thousands of
+/// shells under 128M without exhausting). 72B ≈ a property-less
+/// stdClass zend_object + handle slot (oracle-measured: 50k live
+/// stdClass ≈ 3.6M against 8M).
+pub const OBJ_SHELL_BYTES: i64 = 72;
+
+/// zend-HashTable-faithful array charge: a live table's footprint is
+/// its pow2 bucket/packed table plus a small header — usage grows in
+/// doublings, not per element (oracle: packed int arrays at 65536
+/// elements ≈ 1M = 65536*16 + ~200, at 100000 ≈ 2.1M = 131072*16).
+/// Tombstoned slots stay charged — zend's arData never shrinks.
+pub const ARR_BASE_BYTES: i64 = 200;
+pub const ARR_ELEM_BYTES: i64 = 16;
+
+/// Charged footprint of a live table holding `n` slots.
+pub(crate) fn arr_foot(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        ARR_BASE_BYTES + (n.max(8) as u64).next_power_of_two() as i64 * ARR_ELEM_BYTES
+    }
+}
+
+/// zend_string charge ≈ len + len/64 + 40: a 24B header plus
+/// zend_alloc's size-class rounding. Oracle: str10≈48B, str100≈112B,
+/// str1M≈1003520B. Mid-range sizes run to ~20% under zend's chunky
+/// octave bins (str1000 oracle 1290) — ponytail: a 10-line bin-ladder
+/// (steps doubling per octave: 8,16,32,...) would fit it exactly.
+pub fn str_charge(len: usize) -> i64 {
+    (len + len / 64 + 40) as i64
+}
+
+/// PHP string payload: refcounted bytes carrying their memory_limit
+/// charge — a clone shares the charge (zend's CoW) and the last
+/// owner's drop returns it to the arena. `Deref` lands on `[u8]` so
+/// `s.len()`/`s[..]`/iteration sites read unchanged; `.rc` reaches the
+/// shared `Rc<[u8]>` for downgrade/ptr_eq/cache sites.
+#[derive(Debug, Clone)]
+pub struct PhpStr {
+    pub rc: Rc<[u8]>,
+}
+
+impl PhpStr {
+    /// Build and charge a new string. Every fresh byte string must go
+    /// through here so STR_LIVE bookkeeping stays symmetric.
+    pub fn new(bytes: Vec<u8>) -> Self {
+        // zend's reported request is the zend_string alloc — len + 32
+        // (24B header + 8B emalloc header; oracle: 8000032 for 8MB).
+        let req = bytes.len() as i64 + 32;
+        mem_charge(&STR_LIVE, str_charge(bytes.len()), req);
+        PhpStr { rc: bytes.into() }
+    }
+
+    /// Re-attach a charge to shared bytes whose PhpStr owner died
+    /// while a weak/raw clone kept the payload alive (DimPre
+    /// resurrection). Bytes that stay live stay charged.
+    pub fn adopt(rc: Rc<[u8]>) -> Self {
+        let req = rc.len() as i64 + 32;
+        mem_charge(&STR_LIVE, str_charge(rc.len()), req);
+        PhpStr { rc }
+    }
+}
+
+impl std::ops::Deref for PhpStr {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.rc
+    }
+}
+
+impl Drop for PhpStr {
+    fn drop(&mut self) {
+        if Rc::strong_count(&self.rc) == 1 {
+            STR_LIVE.fetch_sub(str_charge(self.len()), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+// Byte-payload adapters so `PhpStr` stays a drop-in for the old
+// `Rc<[u8]>` payload at comparison/AsRef/From sites.
+impl AsRef<[u8]> for PhpStr {
+    fn as_ref(&self) -> &[u8] {
+        &self.rc
+    }
+}
+
+impl From<Vec<u8>> for PhpStr {
+    fn from(v: Vec<u8>) -> Self {
+        PhpStr::new(v)
+    }
+}
+
+impl PartialEq for PhpStr {
+    fn eq(&self, other: &Self) -> bool {
+        self[..] == other[..]
+    }
+}
+impl Eq for PhpStr {}
+
+impl PartialEq<[u8]> for PhpStr {
+    fn eq(&self, other: &[u8]) -> bool {
+        &self[..] == other
+    }
+}
+
+impl PartialEq<PhpStr> for [u8] {
+    fn eq(&self, other: &PhpStr) -> bool {
+        self == &other[..]
+    }
+}
+
+impl std::hash::Hash for PhpStr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self[..].hash(state)
+    }
+}
+
+impl std::borrow::Borrow<[u8]> for PhpStr {
+    fn borrow(&self) -> &[u8] {
+        &self.rc
+    }
+}
+
+static OBJ_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static ARR_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static STR_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static OB_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// High-water of the three live counters' sum (memory_get_peak_usage).
+static MEM_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// The most recent charge's request size — the OOM fatal's
+/// 'tried to allocate N' arg.
+static LAST_ALLOC: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Add `bytes` to a live counter and keep the peak at the high-water
+/// of the live total. `request` stamps the OOM fatal's
+/// 'tried to allocate N' arg — zend reports the emalloc request size,
+/// which for big allocs exceeds the charged footprint (a zend_string's
+/// request is len+32 while its bin-rounded footprint runs ~len+len/4+40).
+fn mem_charge(counter: &std::sync::atomic::AtomicI64, bytes: i64, request: i64) {
+    counter.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    LAST_ALLOC.store(request, std::sync::atomic::Ordering::Relaxed);
+    MEM_PEAK.fetch_max(mem_live_raw(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn mem_live_raw() -> i64 {
+    OBJ_LIVE.load(std::sync::atomic::Ordering::Relaxed)
+        + ARR_LIVE.load(std::sync::atomic::Ordering::Relaxed)
+        + STR_LIVE.load(std::sync::atomic::Ordering::Relaxed)
+        + OB_LIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Charge one live object shell (alloc_obj).
+pub fn obj_charge() {
+    mem_charge(&OBJ_LIVE, OBJ_SHELL_BYTES, OBJ_SHELL_BYTES);
+}
+
+/// Live bytes held by object shells (clamped — objects wrapped before
+/// or outside `alloc_obj` can dip the counter briefly negative).
+pub fn obj_live_bytes() -> i64 {
+    OBJ_LIVE.load(std::sync::atomic::Ordering::Relaxed).max(0)
+}
+
+/// Live bytes held by array tables (clamped like obj_live_bytes).
+pub fn arr_live_bytes() -> i64 {
+    ARR_LIVE.load(std::sync::atomic::Ordering::Relaxed).max(0)
+}
+
+/// Live bytes held by strings (clamped like obj_live_bytes).
+pub fn str_live_bytes() -> i64 {
+    STR_LIVE.load(std::sync::atomic::Ordering::Relaxed).max(0)
+}
+
+/// Runtime baseline under the metered bytes — zend reports ~465K at
+/// an idle script start (oracle: memory_get_usage after unset = 465304
+/// on this build; env-dependent, the metered deltas are what matter).
+/// The 2M figure in -d/startup refusal messages is zend's emalloc
+/// bootstrap RESERVE, a different number — don't reuse it here.
+pub const MEM_BASE_BYTES: i64 = 465_304;
+
+/// Charge `delta` bytes of output-buffer contents (zend's arena
+/// holds ob buffers while open — flush/clean/pop releases them).
+pub fn ob_charge(delta: i64) {
+    mem_charge(&OB_LIVE, delta, delta.max(0));
+}
+
+/// zend-arena live total: objects + array tables + strings + ob buffers.
+pub fn mem_live_bytes() -> i64 {
+    mem_live_raw().max(0)
+}
+
+/// High-water of the live total (memory_get_peak_usage).
+pub fn mem_peak_bytes() -> i64 {
+    MEM_PEAK.load(std::sync::atomic::Ordering::Relaxed).max(0)
+}
+
+/// memory_reset_peak_usage: zend re-baselines the peak at current usage.
+pub fn mem_peak_reset() {
+    MEM_PEAK.store(mem_live_raw(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Last charge's request size — 'tried to allocate N' in the OOM fatal.
+pub fn mem_last_alloc() -> i64 {
+    LAST_ALLOC.load(std::sync::atomic::Ordering::Relaxed).max(0)
+}
+
 #[derive(Debug)]
 pub struct PhpObject {
     pub class: Rc<PhpClass>,
@@ -1714,6 +1982,23 @@ pub struct PhpObject {
     /// Typed props that were `unset()` — reads route to `__get` like
     /// undefined props instead of the uninitialized-typed Error.
     pub unset_props: std::collections::HashSet<String>,
+}
+
+impl Drop for PhpObject {
+    fn drop(&mut self) {
+        OBJ_LIVE.fetch_sub(OBJ_SHELL_BYTES, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for PhpArray {
+    fn drop(&mut self) {
+        if self.mem_elems > 0 {
+            ARR_LIVE.fetch_sub(
+                arr_foot(self.mem_elems),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
 }
 
 /// One recorded call for exception backtraces (getTrace()).
@@ -1736,6 +2021,27 @@ pub struct TraceFrame {
     /// Callee is an internal/builtin function — marks builtin frames so
     /// callers can attribute userland callbacks (`[internal function]`).
     pub internal: bool,
+    /// Zend emits this frame in exception/backtraces — every real call
+    /// produces one, literal or dynamic. False only for a literal call
+    /// Zend compile-specializes into dedicated opcodes (a const-format
+    /// `sprintf` becomes rope-concat — no call exists, conversion
+    /// errors trace `{main}` only).
+    pub visible: bool,
+    /// A call_user_func* call carrying named args isn't trampoline-
+    /// inlined in Zend — it's a real internal frame: it shows in
+    /// traces (overriding the cufa transparency filter) and the
+    /// callee's call site attributes to `[internal function]`.
+    pub named_dispatch: bool,
+    /// Frame pushed by `Generator->{m}()` for the resume itself.
+    /// A throwable constructed inside the running body snapshots it
+    /// into its construction stack, but Zend's deferred raise renders
+    /// the CURRENT resume — a stale resumer frame drops out of the
+    /// rewritten trace (the live resume stack supplies the real one).
+    pub gen_resume: bool,
+    /// The generator BODY's own frame. A throwable constructed inside
+    /// the body snapshots the drive stack that ran it below this
+    /// frame — stale resume context the deferred rewrite drops.
+    pub gen_body: bool,
 }
 
 /// Shared storage slot for spl array-objects — zend's `intern->array`
