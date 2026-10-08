@@ -2710,7 +2710,7 @@ impl<'a> Interp<'a> {
             }
             matches!(v, Expr::Var(_))
         };
-        // `=`'s dim-write defers the bare-CV operand even later:
+        // `=`/`??=`'s dim-write defers the bare-CV operand even later:
         // zend's ASSIGN_DIM runs every key's bind+conversion inside
         // its FETCH_DIM_W walk BEFORE OP_DATA reads the RHS —
         // `$a[$k] = $u` warns/converts $k ahead of reading $u. The
@@ -2720,14 +2720,15 @@ impl<'a> Interp<'a> {
         // the same-named bare RHS to an early QM_ASSIGN — the op-entry
         // read is frozen before the dim ops run, so the store never
         // sees the write's own vivifications (`$a[0] = $a` keeps the
-        // pre-fetch $a).
+        // pre-fetch $a). `??=` freezes its self-assign the same way
+        // ($a warns ahead of the store's key re-read).
         let rhs_name = match rhs_u {
             Expr::Var(n) => Some(n.clone()),
             Expr::VarVar(inner, _) => Self::lit_var_name(inner),
             _ => None,
         };
         let rhs_self = rhs_name.is_some() && rhs_name == Self::dim_self_root(target);
-        let rhs_late: Option<(&Expr, usize)> = if op == "="
+        let rhs_late: Option<(&Expr, usize)> = if matches!(op, "=" | "??=")
             && pin_rhs
             && !rhs_self
             && matches!(&late, Late::Keyed { .. } | Late::Index { .. })
@@ -2942,8 +2943,9 @@ impl<'a> Interp<'a> {
         // The bare-CV RHS's own operand read — zend does it after the
         // fetch's diagnostics and the container gate (an aborting gate
         // or a detached fetch never reads op_data), before the operator
-        // applies.
-        let rhs = if needs_read && rhs_var {
+        // applies. A `??=` dim-target RHS defers further to OP_DATA
+        // (rhs_late) — the store's dispatch dies before ever reading it.
+        let rhs = if needs_read && rhs_var && rhs_late.is_none() {
             if dim_det {
                 Value::Null
             } else {
@@ -6269,6 +6271,15 @@ impl<'a> Interp<'a> {
         // handler's in-place dim write cow-splits instead of mutating
         // the very table this fetch is walking.
         let _hold = det.and_then(|d| d.pre.value());
+        // An append has no slot for `??=`'s isset read — zend's compiler
+        // rejects `[]` there ("Cannot use [] for reading"). Other compound
+        // ops read via ASSIGN_DIM_OP, where appending stays legal.
+        if quiet && keys.iter().any(|k| matches!(k, DimArg::Append)) {
+            return self.fail(PhpError::compile_fatal(
+                "Cannot use [] for reading",
+                self.cur_line,
+            ));
+        }
         for (n, ka) in keys.iter().enumerate() {
             // A diagnostic fired inside this fetch (CV bind, offset
             // conversion) may have rebound the root container — zend's
@@ -6537,7 +6548,36 @@ impl<'a> Interp<'a> {
                         c = cell(iv);
                         continue;
                     }
-                    _ => (Step::Stop, None),
+                    _ => {
+                        // zend's ISSET_DIM fetch dies on a non-ArrayAccess
+                        // object/Closure itself — a `??=` store never
+                        // reaches its RHS or the write's dispatch
+                        // (oracle dies inside the quiet read). Scalars
+                        // quietly miss and keep walking.
+                        let bad = if quiet && det.is_none_or(|d| d.coalesce) {
+                            match &*b {
+                                Value::Object(o) if !self.obj_is_a(o, "ArrayAccess") => {
+                                    Some(format!(
+                                        "Cannot use object of type {} as array",
+                                        o.borrow().class.name()
+                                    ))
+                                }
+                                Value::Callable(_) => {
+                                    Some("Cannot use object of type Closure as array".to_string())
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        match bad {
+                            Some(m) => {
+                                drop(b);
+                                return self.fail(PhpError::uncaught("Error", m, self.cur_line));
+                            }
+                            None => (Step::Stop, None),
+                        }
+                    }
                 }
             };
             match step {
