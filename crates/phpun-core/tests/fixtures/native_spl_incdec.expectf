@@ -20,3 +20,6 @@ Notice: Indirect modification of overloaded element of SplFixedArray has no effe
 Deprecated: Increment on non-numeric string is deprecated, use str_increment() instead in %s/crates/phpun-core/tests/fixtures/native_spl_incdec.php on line 23
 fa-str=string(3) "abc"
 Error: Modification of ArrayObject during sorting is prohibited
+[w:Undefined array key "miss"]inc:ErrorException inc-miss=int(2)
+[w:Undefined array key "m2"]pe:ErrorException pe-miss=int(5)
+gpe:gf gpe-a=int(5)
