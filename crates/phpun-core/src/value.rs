@@ -2082,8 +2082,10 @@ pub const MEM_BASE_BYTES: i64 = 465_304;
 
 /// Charge `delta` bytes of output-buffer contents (zend's arena
 /// holds ob buffers while open — flush/clean/pop releases them).
-pub fn ob_charge(delta: i64) {
-    mem_charge(&OB_LIVE, delta, delta.max(0));
+/// `request` is the alloc zend attempted — the fatal's 'tried to
+/// allocate' figure, which is the buffer alloc, not the delta.
+pub fn ob_charge(delta: i64, request: i64) {
+    mem_charge(&OB_LIVE, delta, request.max(0));
 }
 
 /// zend-arena live total: objects + array tables + strings + ob buffers.
@@ -2897,8 +2899,12 @@ pub enum FilterState {
         pending: Vec<u8>,
         /// UTF-16/32's BOM already emitted (iconv emits it once).
         bom_done: bool,
-        /// to-charset carried //IGNORE — unrepresentable cps drop.
-        ignore: bool,
+        /// to-charset carried //TRANSLIT — unrepresentable cps
+        /// transliterate (é→e, €→EUR, unknown→'?') instead of
+        /// erroring. zend's stream filter ignores //IGNORE
+        /// (unrepresentable output still EILSEQ-fails), so only
+        /// TRANSLIT is modeled.
+        translit: bool,
     },
     /// convert.base64-encode / -decode — tail bytes carried between
     /// calls (3-in/4-out groupings).

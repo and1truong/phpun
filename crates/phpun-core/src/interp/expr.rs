@@ -361,7 +361,16 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(arr))))
+                // zend: HashTable alloc + one bucket per element —
+                // tracked so the charge releases when the literal dies.
+                let rc = Rc::new(RefCell::new(arr));
+                // zend allocs the packed/mixed arData up front.
+                let req = {
+                    let b = rc.borrow();
+                    Self::ht_req(b.entries.len(), b.packed)
+                };
+                self.mem_track(&rc, req);
+                Ok(Value::Array(rc))
             }
             Expr::ByRef(e) => {
                 // `&expr` outside array literals binds the target cell.
@@ -1222,12 +1231,22 @@ impl<'a> Interp<'a> {
         match m {
             MagicConst::Line => Value::Int(self.cur_line as i64),
             MagicConst::File => Value::str(decl_file.clone()),
-            MagicConst::Dir => Value::str(
-                std::path::Path::new(&decl_file)
+            MagicConst::Dir => Value::str({
+                let d = std::path::Path::new(&decl_file)
                     .parent()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
-            ),
+                    .unwrap_or_default();
+                // A pseudo-path with no dir part ("Command line code",
+                // "Standard input code", a top-level eval) resolves to
+                // the process cwd, like Zend's `php -r`.
+                if d.is_empty() {
+                    std::env::current_dir()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                } else {
+                    d
+                }
+            }),
             MagicConst::Function => Value::str(
                 self.stack
                     .last()
@@ -2796,7 +2815,23 @@ impl<'a> Interp<'a> {
                 let mut l = self.conv_bytes(&cur)?;
                 let mut r = self.conv_bytes(&rhs)?;
                 l.append(&mut r);
-                Value::bytes(l)
+                let nv = Value::bytes(l);
+                // zend emallocs the new zend_string buffer — tracked
+                // so the freed old buffer credits back on overwrite.
+                if let Value::Str(s) = &nv {
+                    // erealloc on an unshared string grows in place
+                    // (strong_count==2 = the cell's ref + `cur`).
+                    if let Value::Str(o) = &cur {
+                        if Rc::strong_count(&o.rc) == 2 {
+                            self.mem_grow_str(&o.rc, &s.rc, s.len() as u64 + 25);
+                        } else {
+                            self.mem_track(&s.rc, s.len() as u64 + 25);
+                        }
+                    } else {
+                        self.mem_track(&s.rc, s.len() as u64 + 25);
+                    }
+                }
+                nv
             }
             "??=" => {
                 if matches!(cur, Value::Null) {
@@ -2837,9 +2872,9 @@ impl<'a> Interp<'a> {
                         next: a.next,
                         is_ref: false,
                         iter_pos: a.iter_pos,
+                        packed: a.packed,
                         foreach_pos: Vec::new(),
                         mem_elems: 0,
-                        packed: a.packed,
                         key_bytes: 0,
                     };
                     crate::value::gc_root_note(1);
@@ -2896,7 +2931,10 @@ impl<'a> Interp<'a> {
                     self.auto_init_gate(&base)?;
                     let mut b = base.borrow_mut();
                     if matches!(*b, Value::Null) {
-                        *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+                        // zend: auto-init HashTable alloc.
+                        let rc = Rc::new(RefCell::new(PhpArray::new()));
+                        self.mem_track(&rc, Self::ht_req(0, true));
+                        *b = Value::Array(rc);
                     }
                 }
                 if append && matches!(&*base.borrow(), Value::Str(_)) {
@@ -2937,14 +2975,25 @@ impl<'a> Interp<'a> {
                             None => newv,
                         };
                         let mut arr = rc.borrow_mut();
-                        if append {
+                        let grew = if append {
                             arr.push(newv.clone());
+                            true
                         } else {
                             let key = match ak {
                                 Some(k) => k,
                                 None => to_key(&newv),
                             };
+                            let grew = arr.get_cell(&key).is_none();
                             arr.set(key, newv.clone());
+                            grew
+                        };
+                        if grew {
+                            // zend: new bucket (arData capacity
+                            // realloc — the OOM request names the
+                            // grown table, not the element).
+                            let req = Self::ht_req(arr.entries.len(), arr.packed);
+                            drop(arr);
+                            self.mem_realloc(&rc, req);
                         }
                     }
                 }
@@ -3454,7 +3503,10 @@ impl<'a> Interp<'a> {
                             Some(k) => arr.bind_cell(self.arr_key(k)?, src),
                             None => arr.bind_cell(ArrKey::Int(arr.next), src),
                         };
-                        *b = Value::Array(Rc::new(RefCell::new(arr)));
+                        // zend: auto-init HashTable alloc.
+                        let rc = Rc::new(RefCell::new(arr));
+                        self.mem_track(&rc, Self::ht_req(0, true));
+                        *b = Value::Array(rc);
                     }
                     Value::Array(_) => {
                         // `$b = $a; $b['k'] =& $r` — bind through a COW
@@ -3481,7 +3533,14 @@ impl<'a> Interp<'a> {
                                 arr.bind_cell(k, src.clone())
                             }
                         };
-                        drop(arr);
+                        if old.is_none() {
+                            // zend: new bucket (arData realloc).
+                            let req = Self::ht_req(arr.entries.len(), arr.packed);
+                            drop(arr);
+                            self.mem_realloc(&rc, req);
+                        } else {
+                            drop(arr);
+                        }
                         self.destruct_displaced(old)?;
                         // `$GLOBALS['x'] =& y` — keep the vars table
                         // entry pointed at the bound cell too.
@@ -3571,7 +3630,18 @@ impl<'a> Interp<'a> {
                                         .unwrap_or(true);
                                 if native_stub {
                                     if let (Some(arr), Some(k)) = (spl_arr, &key) {
-                                        let old = arr.borrow_mut().bind_cell(to_key(k), src);
+                                        let ak = to_key(k);
+                                        let had = arr.borrow().get_cell(&ak).is_some();
+                                        let old = arr.borrow_mut().bind_cell(ak, src);
+                                        if !had {
+                                            // arData grow charge like
+                                            // the plain =& dim paths.
+                                            let req = {
+                                                let b = arr.borrow();
+                                                Self::ht_req(b.entries.len(), b.packed)
+                                            };
+                                            self.mem_realloc(&arr, req);
+                                        }
                                         // A `=&` element can close a
                                         // cycle through the backing
                                         // store — put it in the GC
@@ -3750,6 +3820,10 @@ impl<'a> Interp<'a> {
 
                         let old = ob.props.insert(key.clone(), src.clone());
                         drop(ob);
+                        if old.is_none() {
+                            // zend: a new dynamic-prop bucket allocs.
+                            self.mem_track(o, OBJ_SLOT_REQ);
+                        }
                         self.destruct_displaced(old)?;
                         if let (Some(m), Some((_, dcls))) = (merged, self.decl_prop(o, &pn)) {
                             let sptr = Rc::as_ptr(&src) as usize;
@@ -4852,6 +4926,9 @@ impl<'a> Interp<'a> {
                             ob.prop_order.push(k.clone());
                         }
                         ob.props.insert(k, cell(v.clone()));
+                        drop(ob);
+                        // zend: a new declared-slot materialization allocs.
+                        self.mem_track(&o, OBJ_SLOT_REQ);
                     }
                     Ok(v)
                 } else if self.find_method_in(&cls, "__set").is_some()
@@ -4913,6 +4990,11 @@ impl<'a> Interp<'a> {
                         ob.prop_order.push(pn.clone());
                     }
                     ob.props.insert(pn, cell(v.clone()));
+                    drop(ob);
+                    if is_new {
+                        // zend: a new dynamic-prop bucket allocs.
+                        self.mem_track(&o, OBJ_SLOT_REQ);
+                    }
                     Ok(v)
                 }
             }
@@ -5480,9 +5562,12 @@ impl<'a> Interp<'a> {
                 match self.str_offset_write(&mut bytes, off, &v)? {
                     OffWrite::Skipped => return Ok(v),
                     OffWrite::Stored(byte) => {
+                        let n = bytes.len() as u64 + 25;
+                        let rc: Rc<[u8]> = bytes.into();
+                        self.mem_track(&rc, n);
                         let mut b = c.borrow_mut();
                         if let Value::Str(s) = &mut *b {
-                            *s = bytes.into();
+                            *s = PhpStr::adopt(rc);
                         }
                         return Ok(Value::bytes(vec![byte]));
                     }
@@ -6288,7 +6373,10 @@ impl<'a> Interp<'a> {
                         Some(ak) => arr.set(ak, v),
                         None => arr.push(v),
                     }
-                    *b = Value::Array(Rc::new(RefCell::new(arr)));
+                    // zend: auto-init HashTable alloc.
+                    let rc = Rc::new(RefCell::new(arr));
+                    self.mem_track(&rc, Self::ht_req(0, true));
+                    *b = Value::Array(rc);
                 }
                 Value::Array(_) => {
                     // CoW: shared arrays get replaced wholesale by
@@ -6306,9 +6394,24 @@ impl<'a> Interp<'a> {
                     // unborrowed.
                     drop(b);
                     let mut arr = rc.borrow_mut();
-                    match ak {
-                        Some(ak) => arr.set(ak, v),
-                        None => arr.push(v),
+                    let grew = match ak {
+                        Some(ak) => {
+                            let grew = arr.get_cell(&ak).is_none();
+                            arr.set(ak, v);
+                            grew
+                        }
+                        None => {
+                            arr.push(v);
+                            true
+                        }
+                    };
+                    if grew {
+                        // zend: bucket + amortized arData growth —
+                        // the OOM 'tried' names the realloc request,
+                        // not the element.
+                        let req = Self::ht_req(arr.entries.len(), arr.packed);
+                        drop(arr);
+                        self.mem_realloc(&rc, req);
                     }
                 }
                 _ => {}
@@ -6331,8 +6434,11 @@ impl<'a> Interp<'a> {
                 // diagnostics like zend's GC_DELREF check.
                 if !self.detached_dim {
                     if let OffWrite::Stored(_) = self.str_offset_write(&mut bytes, off, &v)? {
-                        *arr_cell.borrow_mut() =
-                            Value::str(String::from_utf8_lossy(&bytes).into_owned());
+                        let nv = Value::str(String::from_utf8_lossy(&bytes).into_owned());
+                        if let Value::Str(s) = &nv {
+                            self.mem_track(&s.rc, s.len() as u64 + 25);
+                        }
+                        *arr_cell.borrow_mut() = nv;
                     }
                 }
             }
@@ -6681,8 +6787,8 @@ impl<'a> Interp<'a> {
             is_ref: a.is_ref,
             iter_pos: a.iter_pos,
             foreach_pos: Vec::new(),
-            mem_elems: 0,
             packed: a.packed,
+            mem_elems: 0,
             key_bytes: 0,
         };
         crate::value::gc_root_note(1);
@@ -6731,7 +6837,10 @@ impl<'a> Interp<'a> {
             };
         }
         if matches!(*b, Value::Null | Value::Bool(false)) {
-            *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+            // zend: auto-init HashTable alloc.
+            let rc = Rc::new(RefCell::new(PhpArray::new()));
+            self.mem_track(&rc, Self::ht_req(0, true));
+            *b = Value::Array(rc);
         }
         if let Value::Array(_) = &mut *b {
             // Deliberately-shared arrays ($GLOBALS, &-bound storage)
@@ -6751,6 +6860,10 @@ impl<'a> Interp<'a> {
                     let k = ArrKey::Int(arr.next);
                     let c = cell(Value::Null);
                     arr.bind_cell(k.clone(), c.clone());
+                    // zend: new bucket growth.
+                    let req = Self::ht_req(arr.entries.len(), arr.packed);
+                    drop(arr);
+                    self.mem_realloc(&rc, req);
                     return Ok(c);
                 }
             };
@@ -6760,6 +6873,9 @@ impl<'a> Interp<'a> {
                 None => {
                     let c = cell(Value::Null);
                     arr.bind_cell(key, c.clone());
+                    let req = Self::ht_req(arr.entries.len(), arr.packed);
+                    drop(arr);
+                    self.mem_realloc(&rc, req);
                     Ok(c)
                 }
             }
@@ -6962,7 +7078,6 @@ impl<'a> Interp<'a> {
         let Value::Object(o) = c.borrow().clone() else {
             unreachable!()
         };
-        // Non-ArrayAccess objects under a dim write/ref — catchable
         // `Cannot use object of type C as array` (probe4b/4d); zend
         // never looks for offsetGet on a plain object.
         if !self.obj_is_a(&o, "ArrayAccess") {
@@ -8955,7 +9070,12 @@ impl<'a> Interp<'a> {
                 let mut ls = self.conv_bytes(&lv)?;
                 let rs = self.conv_bytes(&rv)?;
                 ls.extend_from_slice(&rs);
-                Ok(Value::bytes(ls))
+                let nv = Value::bytes(ls);
+                // zend emallocs the concat result zend_string.
+                if let Value::Str(s) = &nv {
+                    self.mem_track(&s.rc, s.len() as u64 + 25);
+                }
+                Ok(nv)
             }
             "==" | "!=" | "===" | "!==" | "<" | "<=" | ">" | ">=" | "<=>" => {
                 let (lv, rv) = self.binary_operands(l, r)?;

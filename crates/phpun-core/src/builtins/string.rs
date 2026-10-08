@@ -63,23 +63,48 @@ pub(crate) fn dispatch(
                         && (-9223372036854775808.0..9223372036854775808.0).contains(&f)
                 }
             };
-            // The result buffer is ~dec bytes (MAX_LENGTH_OF_LONG(32)
-            // + decimals + dec_point on the int path) — charge it
-            // against memory_limit before allocating so dec=INT_MAX
-            // fatals instead of OOMing (zend emalloc-check parity).
-            let want = 32i128 + dec.max(0) as i128 + dp.len() as i128;
-            let limit = it.ini_bytes("memory_limit");
-            if limit > 0 && (it.mem_total() as i128) + want > limit as i128 {
+            // zend's number_format result is a zend_string_alloc whose
+            // request — the 'tried to allocate N' figure on OOM — is
+            // align8(reslen + 25) with reslen = intdigits
+            // + seps*ts_len + (dec>0 ? dec + dp_len : 0) + sign. Charge
+            // through the shared path so oom_at + mem_last record it.
+            let intlen = match &num {
+                Num::Int(i) => i.unsigned_abs().to_string().len(),
+                Num::Float(f) => {
+                    if f.abs() == 0.0 {
+                        1
+                    } else {
+                        format!("{:.0}", f.abs()).len()
+                    }
+                }
+            };
+            let neg = match &num {
+                Num::Int(i) => *i < 0,
+                Num::Float(f) => *f < 0.0 && f.abs() >= 0.5,
+            };
+            let mut reslen: i128 = intlen as i128 + ((intlen - 1) / 3 * ts.len()) as i128;
+            // The double path clamps dec to i32 before sizing; the long
+            // path sizes with the raw arg.
+            let dec_res = if is_long {
+                dec
+            } else {
+                dec.clamp(i32::MIN as i64, i32::MAX as i64)
+            };
+            if dec_res > 0 {
+                reslen += dec_res as i128 + dp.len() as i128;
+            }
+            if neg {
+                reslen += 1;
+            }
+            // zend emallocs the result zend_string up front — the
+            // limit check runs inside emalloc against committed
+            // memory (dead tracked charges sweep first), and the
+            // fatal reports the committed footprint.
+            let want = reslen + 25;
+            let wantu = want.clamp(0, u64::MAX as i128) as u64;
+            if it.mem_check(wantu).is_some() {
                 it.mem_exceeded = true;
-                let mut e = PhpError::fatal(
-                    format!(
-                        "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
-                        limit, want
-                    ),
-                    it.cur_line,
-                );
-                e.trace = Some(it.fatal_frames());
-                return Err(e);
+                return Err(it.oom_fatal());
             }
             if want > isize::MAX as i128 {
                 // Unlimited memory_limit: zend's emalloc fails inside
@@ -96,7 +121,7 @@ pub(crate) fn dispatch(
                 e.trace = Some(it.fatal_frames());
                 return Err(e);
             }
-            Value::bytes(if is_long {
+            let nv = Value::bytes(if is_long {
                 let n = match num {
                     Num::Int(i) => i,
                     Num::Float(f) => f as i64,
@@ -113,7 +138,11 @@ pub(crate) fn dispatch(
                     &dp,
                     &ts,
                 )
-            })
+            });
+            if let Value::Str(s) = &nv {
+                it.mem_track(&s.rc, wantu);
+            }
+            nv
         }
 
         // ----- strings -----
@@ -167,10 +196,20 @@ pub(crate) fn dispatch(
         "str_repeat" => {
             let s = arg_bs(it, args, 0);
             let n = arg(args, 1).to_int().max(0) as usize;
-            // zend_emalloc inside php_string_repeat — request is the
-            // zend_string's len + 32-byte header.
-            it.mem_check_alloc(s.len() as i64 * n as i64 + 32)?;
-            Value::bytes(s.repeat(n))
+            // zend emallocs the result zend_string up front — the
+            // limit check runs inside emalloc (dead tracked charges
+            // sweep first) so huge n fatals instead of OOMing the host.
+            let want = s.len() as i128 * n as i128 + 25;
+            let wantu = want.clamp(0, u64::MAX as i128) as u64;
+            if it.mem_check(wantu).is_some() {
+                it.mem_exceeded = true;
+                return Err(it.oom_fatal());
+            }
+            let v = Value::bytes(s.repeat(n));
+            if let Value::Str(r) = &v {
+                it.mem_track(&r.rc, wantu);
+            }
+            v
         }
         "strrev" => Value::bytes({
             let mut s = arg_bs(it, args, 0);
