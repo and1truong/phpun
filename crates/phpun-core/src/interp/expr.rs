@@ -7434,7 +7434,9 @@ impl<'a> Interp<'a> {
                     };
                 }
                 if matches!(*b, Value::Null | Value::Bool(false)) {
-                    *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+                    let rc = Rc::new(RefCell::new(PhpArray::new()));
+                    self.mem_track(&rc, Self::ht_req(0, true));
+                    *b = Value::Array(rc);
                 }
                 let stale_rc = match &*b {
                     Value::Array(r) => r.clone(),
@@ -7475,6 +7477,11 @@ impl<'a> Interp<'a> {
                     drop(arr);
                     return Ok((cc, Some(v)));
                 }
+                // Our sentinel hold is over — drop it or the inner
+                // cow_split counts it as a real share and separates
+                // (dup_array) on EVERY deferred-RHS write: O(N) per
+                // append → the `$a[]=$v` loop goes quadratic.
+                drop(stale_rc);
                 // `$b[0][0] = $b`: op_data's read shares an ancestor's
                 // table — the write separates it, and every deeper
                 // fetch re-resolves on the fresh copies (each inner
