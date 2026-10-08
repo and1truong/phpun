@@ -3596,15 +3596,24 @@ impl<'a> Interp<'a> {
                                             true,
                                         );
                                     }
-                                    let cn = o.borrow().class.name().to_string();
-                                    // zend emits the notice while the
-                                    // engine error is still pending —
-                                    // it lands before the caught
-                                    // message in the output.
-                                    self.notice(&format!(
-                                        "Indirect modification of overloaded element of {} has no effect",
-                                        cn
-                                    ))?;
+                                    // zend's overloaded-dim notice only
+                                    // fires when the fetch yielded no
+                                    // usable reference — a `&`-declared
+                                    // offsetGet leaves a real ref cell
+                                    // and the assign-by-ref Error lands
+                                    // alone; on an engine error it
+                                    // still fires (pending-error
+                                    // ordering).
+                                    let yielded_ref = !native_stub
+                                        && self.last_ret_cell.take().is_some()
+                                        && res.is_ok();
+                                    if !yielded_ref {
+                                        let cn = o.borrow().class.name().to_string();
+                                        self.notice(&format!(
+                                            "Indirect modification of overloaded element of {} has no effect",
+                                            cn
+                                        ))?;
+                                    }
                                     // `fail` converts an uncaught-kind
                                     // error into a real throwable so
                                     // userland catch(Error) intercepts
@@ -6754,11 +6763,15 @@ impl<'a> Interp<'a> {
                 if native {
                     let arr = self.ao_arr(&o);
                     let ak = self.arr_key(&kc.borrow())?;
+                    // `=&` binds the bucket itself — zend marks the
+                    // store cell IS_REFERENCE (dumps show `&int`).
                     if let Some(cc) = arr.borrow().get_cell(&ak) {
+                        self.mark_ref(&cc);
                         return Ok(cc);
                     }
                     let c = cell(Value::Null);
                     arr.borrow_mut().set_cell(ak, c.clone());
+                    self.mark_ref(&c);
                     return Ok(c);
                 }
             }
@@ -6767,7 +6780,7 @@ impl<'a> Interp<'a> {
         // zend evaluates this read as BP_VAR_RW — a missing bucket is
         // created silently inside offsetGet.
         let was = std::mem::replace(&mut self.dim_by_ref, true);
-        let rv = self.aa_offset_get(&o, key, spl_iter, false);
+        let rv = self.aa_offset_get(&o, key, spl_iter, true);
         self.dim_by_ref = was;
         match self.last_ret_cell.take() {
             Some(rc) => {
@@ -6862,7 +6875,10 @@ impl<'a> Interp<'a> {
                 self.cur_line,
             );
             e.thrown_line = Some(m.decl.line);
-            return Err(e);
+            // zend's engine-invoked ACE is a real throwable — `fail`
+            // installs it as pending_exception so userland catch sees
+            // it (a raw Err would die uncatchable).
+            return self.fail(e);
         }
         let args = if undef {
             CallArgs::empty()
@@ -8371,9 +8387,10 @@ impl<'a> Interp<'a> {
     }
 
     /// `$o[k]++` on an ArrayAccess: `&offsetGet` hands back the real
-    /// backing cell and ++/-- writes through it (no offsetSet);
-    /// a value-returning offsetGet falls back to offsetSet
-    /// (typed_properties_065).
+    /// backing cell and ++/-- writes through it; a value-returning
+    /// offsetGet yields a temp zend can't write back — it never falls
+    /// back to offsetSet for ++/--, it just notices the indirect
+    /// modification (spl and plain ArrayAccess alike).
     fn incdec_aa(
         &mut self,
         o: Rc<RefCell<PhpObject>>,
@@ -8381,7 +8398,6 @@ impl<'a> Interp<'a> {
         delta: i64,
         post: bool,
     ) -> Result<Value, PhpError> {
-        let append = key.is_none();
         let spl_iter = matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. }));
         self.last_ret_cell = None;
         let was = std::mem::replace(&mut self.dim_by_ref, true);
@@ -8455,21 +8471,16 @@ impl<'a> Interp<'a> {
                 let nv = self.typed_slot_store(&c, new.clone())?;
                 *c.borrow_mut() = nv;
             }
-            None if append => {
-                // `[]++` fetched a temp it can't write back — zend just
-                // notices the indirect modification.
+            None => {
+                // `++`/`--` never routes through offsetSet — a
+                // value-returning offsetGet yields a temp zend can't
+                // write back, so it just notices (spl and plain
+                // ArrayAccess alike; only `+=`/`.=`/assign SET).
                 let cn = o.borrow().class.name().to_string();
                 self.notice(&format!(
                     "Indirect modification of overloaded element of {} has no effect",
                     cn
                 ))?;
-            }
-            None => {
-                self.method_invoke(
-                    o,
-                    "offsetSet",
-                    CallArgs::positional(vec![cell(key.unwrap()), cell(new.clone())]),
-                )?;
             }
         }
         Ok(if post { old } else { new })
@@ -9174,7 +9185,15 @@ impl<'a> Interp<'a> {
                             if let ArrKey::Tomb = k {
                                 continue;
                             }
-                            a.set(k.clone(), c.borrow().clone());
+                            // zend's cast shares reference zvals — a
+                            // `&`-bound bucket aliases into the cast
+                            // array (writes through it hit the store);
+                            // non-ref buckets copy.
+                            if self.is_ref_cell(c) {
+                                a.set_cell(k.clone(), c.clone());
+                            } else {
+                                a.set(k.clone(), c.borrow().clone());
+                            }
                         }
                         return Ok(Value::Array(Rc::new(RefCell::new(a))));
                     }
