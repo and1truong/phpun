@@ -594,7 +594,13 @@ pub fn format_backtrace_frames(frames: &[TraceFrame]) -> String {
 
 pub fn trace_arg(v: &Value) -> String {
     match v {
-        Value::Object(o) => format!("Object({})", o.borrow().class.name()),
+        // A fatal can trace a frame while one of its args is still
+        // mutably borrowed by an in-flight builtin — degrade to a
+        // placeholder rather than panic on the double borrow.
+        Value::Object(o) => match o.try_borrow() {
+            Ok(b) => format!("Object({})", b.class.name()),
+            Err(_) => "Object(?)".into(),
+        },
         Value::Str(s) => {
             // Zend escapes args in stack traces: named escapes plus
             // `\xNN` (uppercase) for other non-printables.
@@ -626,7 +632,10 @@ pub fn trace_arg(v: &Value) -> String {
         Value::Null => "NULL".into(),
         Value::Bool(b) => if *b { "true" } else { "false" }.into(),
         Value::Callable(_) => "Object(Closure)".into(),
-        Value::Resource(r) => format!("Resource id #{}", r.borrow().id()),
+        Value::Resource(r) => match r.try_borrow() {
+            Ok(b) => format!("Resource id #{}", b.id()),
+            Err(_) => "Resource id #?".into(),
+        },
         Value::Float(f) => {
             if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e16 {
                 format!("{f:.1}")
