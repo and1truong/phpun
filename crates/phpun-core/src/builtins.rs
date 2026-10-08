@@ -220,593 +220,615 @@ pub(crate) fn builtin_param_ty(f: &str, p: &str) -> Option<Vec<String>> {
     Some(ms.iter().map(|m| m.to_string()).collect())
 }
 
+/// Every dispatchable internal-function name — the table
+/// `get_defined_functions()['internal']` walks and `function_exists`
+/// probes (kept sorted; add a name here when a new family arm lands).
+pub(crate) const BUILTIN_NAMES: &[&str] = &[
+    "abs",
+    "acos",
+    "addcslashes",
+    "addslashes",
+    "array_change_key_case",
+    "array_chunk",
+    "array_column",
+    "array_combine",
+    "array_count_values",
+    "array_diff",
+    "array_diff_assoc",
+    "array_diff_key",
+    "array_fill",
+    "array_fill_keys",
+    "array_filter",
+    "array_first",
+    "array_flip",
+    "array_intersect",
+    "array_intersect_assoc",
+    "array_intersect_key",
+    "array_is_list",
+    "array_key_exists",
+    "array_key_first",
+    "array_key_last",
+    "array_keys",
+    "array_map",
+    "array_merge",
+    "array_merge_recursive",
+    "array_multisort",
+    "array_pad",
+    "array_pop",
+    "array_product",
+    "array_push",
+    "array_rand",
+    "array_reduce",
+    "array_replace",
+    "array_replace_recursive",
+    "array_reverse",
+    "array_search",
+    "array_shift",
+    "array_slice",
+    "array_splice",
+    "array_sum",
+    "array_unique",
+    "array_unshift",
+    "array_values",
+    "array_walk",
+    "array_walk_recursive",
+    "arsort",
+    "asin",
+    "asort",
+    "assert",
+    "assert_options",
+    "atan",
+    "atan2",
+    "base64_decode",
+    "base64_encode",
+    "base_convert",
+    "basename",
+    "bin2hex",
+    "bindec",
+    "boolval",
+    "call_user_func",
+    "call_user_func_array",
+    "ceil",
+    "chdir",
+    "checkdate",
+    "chgrp",
+    "chmod",
+    "chop",
+    "chown",
+    "chr",
+    "chunk_split",
+    "class_alias",
+    "class_exists",
+    "class_implements",
+    "class_parents",
+    "class_uses",
+    "clearstatcache",
+    "cli_get_process_title",
+    "cli_set_process_title",
+    "clone",
+    "closedir",
+    "closelog",
+    "compact",
+    "connection_aborted",
+    "connection_status",
+    "constant",
+    "copy",
+    "cos",
+    "cosh",
+    "count",
+    "count_chars",
+    "crc32",
+    "ctype_alnum",
+    "ctype_alpha",
+    "ctype_cntrl",
+    "ctype_digit",
+    "ctype_graph",
+    "ctype_lower",
+    "ctype_print",
+    "ctype_punct",
+    "ctype_space",
+    "ctype_upper",
+    "ctype_xdigit",
+    "current",
+    "date",
+    "date_default_timezone_get",
+    "date_default_timezone_set",
+    "date_parse",
+    "date_sun_info",
+    "date_sunrise",
+    "date_sunset",
+    "debug_backtrace",
+    "debug_print_backtrace",
+    "debug_zval_dump",
+    "decbin",
+    "dechex",
+    "decoct",
+    "define",
+    "defined",
+    "deg2rad",
+    "die",
+    "dirname",
+    "disk_free_space",
+    "disk_total_space",
+    "diskfreespace",
+    "dl",
+    "doubleval",
+    "end",
+    "enum_exists",
+    "error_clear_last",
+    "error_get_last",
+    "error_reporting",
+    "escapeshellarg",
+    "escapeshellcmd",
+    "exec",
+    "exit",
+    "exp",
+    "explode",
+    "extension_loaded",
+    "extract",
+    "fastcgi_finish_request",
+    "fclose",
+    "fdiv",
+    "feof",
+    "fflush",
+    "fgetc",
+    "fgetcsv",
+    "fgets",
+    "file",
+    "file_exists",
+    "file_get_contents",
+    "file_put_contents",
+    "fileatime",
+    "filectime",
+    "filegroup",
+    "fileinode",
+    "filemtime",
+    "fileowner",
+    "fileperms",
+    "filesize",
+    "filetype",
+    "filter_var",
+    "floatval",
+    "flock",
+    "floor",
+    "flush",
+    "fmod",
+    "fnmatch",
+    "fopen",
+    "forward_static_call",
+    "forward_static_call_array",
+    "fpassthru",
+    "fprintf",
+    "fputcsv",
+    "fputs",
+    "fread",
+    "fscanf",
+    "fseek",
+    "fstat",
+    "ftell",
+    "ftruncate",
+    "func_get_arg",
+    "func_get_args",
+    "func_num_args",
+    "function_exists",
+    "fwrite",
+    "gc_collect_cycles",
+    "gc_disable",
+    "gc_enable",
+    "gc_enabled",
+    "gc_mem_caches",
+    "gc_status",
+    "get_called_class",
+    "get_cfg_var",
+    "get_class",
+    "get_class_methods",
+    "get_class_vars",
+    "get_current_user",
+    "get_debug_type",
+    "get_declared_classes",
+    "get_declared_interfaces",
+    "get_declared_traits",
+    "get_defined_functions",
+    "get_extension_funcs",
+    "get_include_path",
+    "get_loaded_extensions",
+    "get_mangled_object_vars",
+    "get_meta_tags",
+    "get_object_vars",
+    "get_parent_class",
+    "get_resource_id",
+    "get_resource_type",
+    "getcwd",
+    "getenv",
+    "getmygid",
+    "getmyinode",
+    "getmypid",
+    "getmyuid",
+    "getopt",
+    "getrandmax",
+    "gettype",
+    "glob",
+    "gmdate",
+    "gmmktime",
+    "hash",
+    "hash_equals",
+    "header",
+    "header_register_callback",
+    "header_remove",
+    "headers_list",
+    "headers_sent",
+    "hex2bin",
+    "hexdec",
+    "highlight_file",
+    "highlight_string",
+    "hrtime",
+    "html_entity_decode",
+    "htmlentities",
+    "htmlspecialchars",
+    "htmlspecialchars_decode",
+    "http_build_query",
+    "http_response_code",
+    "hypot",
+    "ignore_user_abort",
+    "implode",
+    "in_array",
+    "ini_alter",
+    "ini_get",
+    "ini_get_all",
+    "ini_parse_quantity",
+    "ini_restore",
+    "ini_set",
+    "intdiv",
+    "interface_exists",
+    "intval",
+    "ip2long",
+    "is_a",
+    "is_array",
+    "is_bool",
+    "is_callable",
+    "is_countable",
+    "is_dir",
+    "is_double",
+    "is_executable",
+    "is_file",
+    "is_finite",
+    "is_float",
+    "is_infinite",
+    "is_int",
+    "is_integer",
+    "is_iterable",
+    "is_link",
+    "is_long",
+    "is_nan",
+    "is_null",
+    "is_numeric",
+    "is_object",
+    "is_readable",
+    "is_resource",
+    "is_scalar",
+    "is_string",
+    "is_subclass_of",
+    "is_uploaded_file",
+    "is_writable",
+    "is_writeable",
+    "iterator_apply",
+    "iterator_count",
+    "iterator_to_array",
+    "join",
+    "json_decode",
+    "json_encode",
+    "json_last_error",
+    "json_last_error_msg",
+    "json_validate",
+    "key",
+    "key_exists",
+    "krsort",
+    "ksort",
+    "lcfirst",
+    "lcg_value",
+    "levenshtein",
+    "link",
+    "linkinfo",
+    "log",
+    "log10",
+    "lstat",
+    "ltrim",
+    "mail",
+    "max",
+    "mb_check_encoding",
+    "mb_chr",
+    "mb_convert_case",
+    "mb_convert_encoding",
+    "mb_convert_variables",
+    "mb_detect_encoding",
+    "mb_detect_order",
+    "mb_encoding_aliases",
+    "mb_http_input",
+    "mb_http_output",
+    "mb_internal_encoding",
+    "mb_language",
+    "mb_lcfirst",
+    "mb_list_encodings",
+    "mb_ltrim",
+    "mb_ord",
+    "mb_regex_encoding",
+    "mb_rtrim",
+    "mb_scrub",
+    "mb_split",
+    "mb_str_pad",
+    "mb_str_split",
+    "mb_strcut",
+    "mb_stripos",
+    "mb_stristr",
+    "mb_strlen",
+    "mb_strpos",
+    "mb_strrchr",
+    "mb_strrichr",
+    "mb_strripos",
+    "mb_strrpos",
+    "mb_strstr",
+    "mb_strtolower",
+    "mb_strtoupper",
+    "mb_substitute_character",
+    "mb_substr",
+    "mb_substr_count",
+    "mb_trim",
+    "mb_ucfirst",
+    "md5",
+    "memory_get_peak_usage",
+    "memory_get_usage",
+    "memory_reset_peak_usage",
+    "metaphone",
+    "method_exists",
+    "microtime",
+    "min",
+    "mkdir",
+    "mktime",
+    "move_uploaded_file",
+    "mt_getrandmax",
+    "mt_rand",
+    "mt_srand",
+    "natcasesort",
+    "natsort",
+    "next",
+    "nl2br",
+    "number_format",
+    "ob_clean",
+    "ob_end_clean",
+    "ob_end_flush",
+    "ob_flush",
+    "ob_get_clean",
+    "ob_get_contents",
+    "ob_get_flush",
+    "ob_get_length",
+    "ob_get_level",
+    "ob_get_status",
+    "ob_implicit_flush",
+    "ob_list_handlers",
+    "ob_start",
+    "octdec",
+    "opendir",
+    "openlog",
+    "openssl_random_pseudo_bytes",
+    "openssl_x509_parse",
+    "ord",
+    "output_add_rewrite_var",
+    "output_reset_rewrite_vars",
+    "pack",
+    "parse_ini_file",
+    "parse_ini_string",
+    "parse_str",
+    "parse_url",
+    "passthru",
+    "pathinfo",
+    "pathinfo_dirname",
+    "pclose",
+    "php_ini_loaded_file",
+    "php_ini_scanned_files",
+    "php_sapi_name",
+    "php_strip_whitespace",
+    "php_uname",
+    "phpcredits",
+    "phpinfo",
+    "phpversion",
+    "pi",
+    "popen",
+    "pos",
+    "posix_isatty",
+    "pow",
+    "preg_filter",
+    "preg_grep",
+    "preg_jit",
+    "preg_last_error",
+    "preg_last_error_msg",
+    "preg_match",
+    "preg_match_all",
+    "preg_quote",
+    "preg_replace",
+    "preg_replace_callback",
+    "preg_replace_callback_array",
+    "preg_split",
+    "prev",
+    "print",
+    "print_r",
+    "printf",
+    "proc_close",
+    "proc_get_status",
+    "proc_nice",
+    "proc_open",
+    "proc_terminate",
+    "property_exists",
+    "putenv",
+    "quotemeta",
+    "rad2deg",
+    "rand",
+    "random_bytes",
+    "random_int",
+    "range",
+    "rawurldecode",
+    "rawurlencode",
+    "readdir",
+    "readfile",
+    "readlink",
+    "realpath",
+    "register_shutdown_function",
+    "register_tick_function",
+    "rename",
+    "reset",
+    "restore_error_handler",
+    "restore_exception_handler",
+    "rewind",
+    "rewinddir",
+    "rmdir",
+    "round",
+    "rsort",
+    "rtrim",
+    "scandir",
+    "serialize",
+    "set_error_handler",
+    "set_exception_handler",
+    "set_include_path",
+    "set_time_limit",
+    "setcookie",
+    "setlocale",
+    "setrawcookie",
+    "settype",
+    "sha1",
+    "shell_exec",
+    "show_source",
+    "shuffle",
+    "similar_text",
+    "sin",
+    "sinh",
+    "sizeof",
+    "sleep",
+    "sort",
+    "soundex",
+    "spl_autoload_call",
+    "spl_autoload_functions",
+    "spl_autoload_register",
+    "spl_autoload_unregister",
+    "spl_object_hash",
+    "spl_object_id",
+    "sprintf",
+    "sqrt",
+    "srand",
+    "sscanf",
+    "stat",
+    "str_contains",
+    "str_ends_with",
+    "str_ireplace",
+    "str_pad",
+    "str_repeat",
+    "str_replace",
+    "str_rot13",
+    "str_split",
+    "str_starts_with",
+    "str_word_count",
+    "strcasecmp",
+    "strchr",
+    "strcmp",
+    "strcspn",
+    "stream_bucket_append",
+    "stream_bucket_make_writeable",
+    "stream_bucket_new",
+    "stream_bucket_prepend",
+    "stream_context_create",
+    "stream_context_get_default",
+    "stream_context_get_options",
+    "stream_context_set_option",
+    "stream_copy_to_stream",
+    "stream_filter_append",
+    "stream_filter_prepend",
+    "stream_filter_register",
+    "stream_filter_remove",
+    "stream_get_contents",
+    "stream_get_filters",
+    "stream_get_meta_data",
+    "stream_get_wrappers",
+    "stream_isatty",
+    "stream_select",
+    "stream_set_blocking",
+    "stream_set_chunk_size",
+    "stream_set_read_buffer",
+    "stream_set_timeout",
+    "stream_set_write_buffer",
+    "stream_wrapper_register",
+    "stream_wrapper_unregister",
+    "strip_tags",
+    "stripcslashes",
+    "stripos",
+    "stripslashes",
+    "stristr",
+    "strlen",
+    "strncasecmp",
+    "strncmp",
+    "strpos",
+    "strrev",
+    "strripos",
+    "strrpos",
+    "strspn",
+    "strstr",
+    "strtolower",
+    "strtotime",
+    "strtoupper",
+    "strtr",
+    "strval",
+    "substr",
+    "substr_count",
+    "substr_replace",
+    "symlink",
+    "sys_get_temp_dir",
+    "syslog",
+    "system",
+    "tan",
+    "tanh",
+    "tempnam",
+    "time",
+    "time_nanosleep",
+    "time_sleep_until",
+    "tmpfile",
+    "token_get_all",
+    "token_name",
+    "touch",
+    "trait_exists",
+    "trigger_error",
+    "trim",
+    "uasort",
+    "ucfirst",
+    "ucwords",
+    "uksort",
+    "umask",
+    "uniqid",
+    "unlink",
+    "unpack",
+    "unregister_tick_function",
+    "unserialize",
+    "urldecode",
+    "urlencode",
+    "user_error",
+    "usleep",
+    "usort",
+    "var_dump",
+    "var_export",
+    "version_compare",
+    "vfprintf",
+    "vprintf",
+    "vsprintf",
+    "wordwrap",
+    "zend_version",
+];
+
 pub(crate) fn is_builtin(n: &str) -> bool {
     // `fastcgi_finish_request`/`print` are real function-table
     // entries callable by name even though they aren't arity-typed.
-    if matches!(n, "fastcgi_finish_request" | "print") {
-        return true;
-    }
-    matches!(
-        n,
-        "abs"
-            | "acos"
-            | "addcslashes"
-            | "addslashes"
-            | "array_change_key_case"
-            | "array_chunk"
-            | "array_column"
-            | "array_combine"
-            | "array_count_values"
-            | "array_diff"
-            | "array_diff_assoc"
-            | "array_diff_key"
-            | "array_fill"
-            | "array_fill_keys"
-            | "array_filter"
-            | "array_first"
-            | "array_flip"
-            | "array_intersect"
-            | "array_intersect_assoc"
-            | "array_intersect_key"
-            | "array_is_list"
-            | "array_key_exists"
-            | "array_key_first"
-            | "array_key_last"
-            | "array_keys"
-            | "array_map"
-            | "array_merge"
-            | "array_merge_recursive"
-            | "array_multisort"
-            | "array_pad"
-            | "array_pop"
-            | "array_product"
-            | "array_push"
-            | "array_rand"
-            | "array_reduce"
-            | "array_replace"
-            | "array_replace_recursive"
-            | "array_reverse"
-            | "array_search"
-            | "array_shift"
-            | "array_slice"
-            | "array_splice"
-            | "array_sum"
-            | "array_unique"
-            | "array_unshift"
-            | "array_values"
-            | "array_walk"
-            | "arsort"
-            | "asin"
-            | "asort"
-            | "assert"
-            | "assert_options"
-            | "atan"
-            | "atan2"
-            | "base64_decode"
-            | "base64_encode"
-            | "base_convert"
-            | "basename"
-            | "bin2hex"
-            | "bindec"
-            | "boolval"
-            | "call_user_func"
-            | "call_user_func_array"
-            | "ceil"
-            | "chdir"
-            | "checkdate"
-            | "chgrp"
-            | "chmod"
-            | "chop"
-            | "chown"
-            | "chr"
-            | "chunk_split"
-            | "class_alias"
-            | "class_exists"
-            | "class_implements"
-            | "class_parents"
-            | "class_uses"
-            | "clearstatcache"
-            | "cli_get_process_title"
-            | "cli_set_process_title"
-            | "clone"
-            | "closedir"
-            | "closelog"
-            | "compact"
-            | "connection_aborted"
-            | "connection_status"
-            | "constant"
-            | "copy"
-            | "cos"
-            | "cosh"
-            | "count"
-            | "count_chars"
-            | "crc32"
-            | "ctype_alnum"
-            | "ctype_alpha"
-            | "ctype_cntrl"
-            | "ctype_digit"
-            | "ctype_graph"
-            | "ctype_lower"
-            | "ctype_print"
-            | "ctype_punct"
-            | "ctype_space"
-            | "ctype_upper"
-            | "ctype_xdigit"
-            | "current"
-            | "date"
-            | "date_default_timezone_get"
-            | "date_default_timezone_set"
-            | "date_parse"
-            | "date_sun_info"
-            | "date_sunrise"
-            | "date_sunset"
-            | "debug_backtrace"
-            | "debug_print_backtrace"
-            | "debug_zval_dump"
-            | "decbin"
-            | "dechex"
-            | "decoct"
-            | "define"
-            | "defined"
-            | "deg2rad"
-            | "die"
-            | "dirname"
-            | "disk_free_space"
-            | "disk_total_space"
-            | "dl"
-            | "doubleval"
-            | "end"
-            | "enum_exists"
-            | "error_clear_last"
-            | "error_get_last"
-            | "error_reporting"
-            | "escapeshellarg"
-            | "escapeshellcmd"
-            | "exec"
-            | "exit"
-            | "exp"
-            | "explode"
-            | "extension_loaded"
-            | "extract"
-            | "fclose"
-            | "fdiv"
-            | "feof"
-            | "fflush"
-            | "fgetc"
-            | "fgetcsv"
-            | "fgets"
-            | "file"
-            | "file_exists"
-            | "file_get_contents"
-            | "file_put_contents"
-            | "fileatime"
-            | "filectime"
-            | "filemtime"
-            | "fileperms"
-            | "filesize"
-            | "filter_var"
-            | "floatval"
-            | "flock"
-            | "floor"
-            | "flush"
-            | "fmod"
-            | "fnmatch"
-            | "fopen"
-            | "forward_static_call"
-            | "forward_static_call_array"
-            | "fpassthru"
-            | "fprintf"
-            | "fputs"
-            | "fread"
-            | "fseek"
-            | "fstat"
-            | "ftell"
-            | "ftruncate"
-            | "func_get_arg"
-            | "func_get_args"
-            | "func_num_args"
-            | "function_exists"
-            | "fwrite"
-            | "gc_collect_cycles"
-            | "gc_disable"
-            | "gc_enable"
-            | "gc_enabled"
-            | "gc_mem_caches"
-            | "gc_status"
-            | "get_called_class"
-            | "get_cfg_var"
-            | "get_class"
-            | "get_class_methods"
-            | "get_class_vars"
-            | "get_current_user"
-            | "get_debug_type"
-            | "get_declared_classes"
-            | "get_declared_interfaces"
-            | "get_declared_traits"
-            | "get_extension_funcs"
-            | "get_include_path"
-            | "get_loaded_extensions"
-            | "get_mangled_object_vars"
-            | "get_object_vars"
-            | "get_parent_class"
-            | "get_resource_id"
-            | "get_resource_type"
-            | "getcwd"
-            | "getenv"
-            | "getmygid"
-            | "getmyinode"
-            | "getmypid"
-            | "getmyuid"
-            | "getopt"
-            | "getrandmax"
-            | "gettype"
-            | "glob"
-            | "gmdate"
-            | "gmmktime"
-            | "hash"
-            | "hash_equals"
-            | "header"
-            | "header_register_callback"
-            | "header_remove"
-            | "headers_list"
-            | "headers_sent"
-            | "hex2bin"
-            | "hexdec"
-            | "highlight_file"
-            | "highlight_string"
-            | "hrtime"
-            | "html_entity_decode"
-            | "htmlentities"
-            | "htmlspecialchars"
-            | "htmlspecialchars_decode"
-            | "http_build_query"
-            | "http_response_code"
-            | "hypot"
-            | "ignore_user_abort"
-            | "implode"
-            | "in_array"
-            | "ini_get"
-            | "ini_get_all"
-            | "ini_parse_quantity"
-            | "ini_restore"
-            | "ini_set"
-            | "intdiv"
-            | "interface_exists"
-            | "intval"
-            | "ip2long"
-            | "is_a"
-            | "is_array"
-            | "is_bool"
-            | "is_callable"
-            | "is_countable"
-            | "is_dir"
-            | "is_double"
-            | "is_executable"
-            | "is_file"
-            | "is_finite"
-            | "is_float"
-            | "is_infinite"
-            | "is_int"
-            | "is_integer"
-            | "is_iterable"
-            | "is_link"
-            | "is_long"
-            | "is_nan"
-            | "is_null"
-            | "is_numeric"
-            | "is_object"
-            | "is_readable"
-            | "is_resource"
-            | "is_scalar"
-            | "is_string"
-            | "is_subclass_of"
-            | "is_uploaded_file"
-            | "is_writable"
-            | "is_writeable"
-            | "iterator_apply"
-            | "iterator_count"
-            | "iterator_to_array"
-            | "join"
-            | "json_decode"
-            | "json_encode"
-            | "json_last_error"
-            | "json_last_error_msg"
-            | "json_validate"
-            | "key"
-            | "key_exists"
-            | "krsort"
-            | "ksort"
-            | "lcfirst"
-            | "lcg_value"
-            | "levenshtein"
-            | "link"
-            | "linkinfo"
-            | "log"
-            | "log10"
-            | "lstat"
-            | "ltrim"
-            | "mail"
-            | "max"
-            | "mb_check_encoding"
-            | "mb_chr"
-            | "mb_convert_case"
-            | "mb_convert_encoding"
-            | "mb_convert_variables"
-            | "mb_detect_encoding"
-            | "mb_detect_order"
-            | "mb_encoding_aliases"
-            | "mb_http_input"
-            | "mb_http_output"
-            | "mb_internal_encoding"
-            | "mb_language"
-            | "mb_lcfirst"
-            | "mb_list_encodings"
-            | "mb_ltrim"
-            | "mb_ord"
-            | "mb_regex_encoding"
-            | "mb_rtrim"
-            | "mb_scrub"
-            | "mb_split"
-            | "mb_str_pad"
-            | "mb_str_split"
-            | "mb_strcut"
-            | "mb_stripos"
-            | "mb_stristr"
-            | "mb_strlen"
-            | "mb_strpos"
-            | "mb_strrchr"
-            | "mb_strrichr"
-            | "mb_strripos"
-            | "mb_strrpos"
-            | "mb_strstr"
-            | "mb_strtolower"
-            | "mb_strtoupper"
-            | "mb_substitute_character"
-            | "mb_substr"
-            | "mb_substr_count"
-            | "mb_trim"
-            | "mb_ucfirst"
-            | "md5"
-            | "memory_get_peak_usage"
-            | "memory_get_usage"
-            | "memory_reset_peak_usage"
-            | "method_exists"
-            | "metaphone"
-            | "microtime"
-            | "min"
-            | "mkdir"
-            | "mktime"
-            | "move_uploaded_file"
-            | "mt_getrandmax"
-            | "mt_rand"
-            | "mt_srand"
-            | "natcasesort"
-            | "natsort"
-            | "next"
-            | "nl2br"
-            | "number_format"
-            | "ob_clean"
-            | "ob_end_clean"
-            | "ob_end_flush"
-            | "ob_flush"
-            | "ob_get_clean"
-            | "ob_get_contents"
-            | "ob_get_flush"
-            | "ob_get_length"
-            | "ob_get_level"
-            | "ob_get_status"
-            | "ob_implicit_flush"
-            | "ob_list_handlers"
-            | "ob_start"
-            | "octdec"
-            | "opendir"
-            | "openlog"
-            | "openssl_random_pseudo_bytes"
-            | "openssl_x509_parse"
-            | "ord"
-            | "output_reset_rewrite_vars"
-            | "pack"
-            | "parse_ini_file"
-            | "parse_ini_string"
-            | "parse_str"
-            | "parse_url"
-            | "passthru"
-            | "pathinfo"
-            | "pclose"
-            | "php_ini_loaded_file"
-            | "php_ini_scanned_files"
-            | "php_sapi_name"
-            | "php_strip_whitespace"
-            | "php_uname"
-            | "phpcredits"
-            | "phpinfo"
-            | "phpversion"
-            | "pi"
-            | "popen"
-            | "pos"
-            | "posix_isatty"
-            | "pow"
-            | "preg_filter"
-            | "preg_grep"
-            | "preg_jit"
-            | "preg_last_error"
-            | "preg_last_error_msg"
-            | "preg_match"
-            | "preg_match_all"
-            | "preg_quote"
-            | "preg_replace"
-            | "preg_replace_callback"
-            | "preg_replace_callback_array"
-            | "preg_split"
-            | "prev"
-            | "print"
-            | "print_r"
-            | "printf"
-            | "proc_close"
-            | "proc_get_status"
-            | "proc_nice"
-            | "proc_open"
-            | "proc_terminate"
-            | "property_exists"
-            | "putenv"
-            | "quotemeta"
-            | "rad2deg"
-            | "rand"
-            | "random_bytes"
-            | "random_int"
-            | "range"
-            | "rawurldecode"
-            | "rawurlencode"
-            | "readdir"
-            | "readfile"
-            | "readlink"
-            | "realpath"
-            | "register_shutdown_function"
-            | "register_tick_function"
-            | "rename"
-            | "reset"
-            | "restore_error_handler"
-            | "restore_exception_handler"
-            | "rewind"
-            | "rewinddir"
-            | "rmdir"
-            | "round"
-            | "rsort"
-            | "rtrim"
-            | "scandir"
-            | "serialize"
-            | "set_error_handler"
-            | "set_exception_handler"
-            | "set_include_path"
-            | "set_time_limit"
-            | "setcookie"
-            | "setlocale"
-            | "setrawcookie"
-            | "settype"
-            | "sha1"
-            | "shell_exec"
-            | "show_source"
-            | "shuffle"
-            | "similar_text"
-            | "sin"
-            | "sinh"
-            | "sizeof"
-            | "sleep"
-            | "sort"
-            | "soundex"
-            | "spl_autoload_call"
-            | "spl_autoload_functions"
-            | "spl_autoload_register"
-            | "spl_autoload_unregister"
-            | "spl_object_hash"
-            | "spl_object_id"
-            | "sprintf"
-            | "sqrt"
-            | "srand"
-            | "stat"
-            | "str_contains"
-            | "str_ends_with"
-            | "str_ireplace"
-            | "str_pad"
-            | "str_repeat"
-            | "str_replace"
-            | "str_rot13"
-            | "str_split"
-            | "str_starts_with"
-            | "str_word_count"
-            | "strcasecmp"
-            | "strchr"
-            | "strcmp"
-            | "strcspn"
-            | "stream_bucket_append"
-            | "stream_bucket_make_writeable"
-            | "stream_bucket_new"
-            | "stream_bucket_prepend"
-            | "stream_context_create"
-            | "stream_context_get_default"
-            | "stream_context_get_options"
-            | "stream_context_set_option"
-            | "stream_copy_to_stream"
-            | "stream_filter_append"
-            | "stream_filter_prepend"
-            | "stream_filter_register"
-            | "stream_filter_remove"
-            | "stream_get_contents"
-            | "stream_get_filters"
-            | "stream_get_meta_data"
-            | "stream_get_wrappers"
-            | "stream_isatty"
-            | "stream_select"
-            | "stream_set_blocking"
-            | "stream_set_chunk_size"
-            | "stream_set_read_buffer"
-            | "stream_set_timeout"
-            | "stream_set_write_buffer"
-            | "stream_wrapper_register"
-            | "stream_wrapper_unregister"
-            | "strip_tags"
-            | "stripcslashes"
-            | "stripos"
-            | "stripslashes"
-            | "stristr"
-            | "strlen"
-            | "strncasecmp"
-            | "strncmp"
-            | "strpos"
-            | "strrev"
-            | "strripos"
-            | "strrpos"
-            | "strspn"
-            | "strstr"
-            | "strtolower"
-            | "strtotime"
-            | "strtoupper"
-            | "strtr"
-            | "strval"
-            | "substr"
-            | "substr_count"
-            | "substr_replace"
-            | "symlink"
-            | "sys_get_temp_dir"
-            | "syslog"
-            | "system"
-            | "tan"
-            | "tanh"
-            | "tempnam"
-            | "time"
-            | "time_nanosleep"
-            | "time_sleep_until"
-            | "tmpfile"
-            | "token_get_all"
-            | "token_name"
-            | "touch"
-            | "trait_exists"
-            | "trigger_error"
-            | "trim"
-            | "uasort"
-            | "ucfirst"
-            | "ucwords"
-            | "uksort"
-            | "umask"
-            | "uniqid"
-            | "unlink"
-            | "unpack"
-            | "unregister_tick_function"
-            | "unserialize"
-            | "urldecode"
-            | "urlencode"
-            | "user_error"
-            | "usleep"
-            | "usort"
-            | "var_dump"
-            | "var_export"
-            | "version_compare"
-            | "vfprintf"
-            | "vprintf"
-            | "vsprintf"
-            | "wordwrap"
-            | "zend_version"
-    )
+    BUILTIN_NAMES.binary_search(&n).is_ok()
+}
+
+/// The internal names, in zend's function-table order (alphabetical —
+/// the const list is kept sorted so binary_search works).
+pub(crate) fn builtin_names() -> &'static [&'static str] {
+    BUILTIN_NAMES
 }
 
 /// Named-argument resolution for internal functions

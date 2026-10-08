@@ -592,6 +592,35 @@ pub(crate) fn dispatch(
             Value::Array(Rc::new(RefCell::new(a)))
         }
         "get_extension_funcs" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+        "get_defined_functions" => {
+            // zend returns {internal: every registered internal fn,
+            // user: every userland decl} keyed lowercased. `it.functions`
+            // is already lowercased at insert; sort for deterministic
+            // output (zend emits insertion order we don't track).
+            // ponytail: internal list = BUILTIN_NAMES (sorted), so
+            // per-extension grouping/prepended aliases are flattened —
+            // a real fn-table would restore zend's registration order.
+            let mut internal = PhpArray::new();
+            for &n in crate::builtins::builtin_names() {
+                internal.push(Value::str(n));
+            }
+            let mut user_names: Vec<&String> = it.functions.keys().collect();
+            user_names.sort();
+            let mut user = PhpArray::new();
+            for n in user_names {
+                user.push(Value::str(n.clone()));
+            }
+            let mut out = PhpArray::new();
+            out.set(
+                ArrKey::Str("internal".into()),
+                Value::Array(Rc::new(RefCell::new(internal))),
+            );
+            out.set(
+                ArrKey::Str("user".into()),
+                Value::Array(Rc::new(RefCell::new(user))),
+            );
+            Value::Array(Rc::new(RefCell::new(out)))
+        }
         "dl" => Value::Bool(false),
         "assert" => {
             let v = arg(args, 0);
