@@ -334,7 +334,13 @@ impl<'a> Interp<'a> {
                     // callees never alias the cells: zend addrefs the
                     // zvals straight onto vm_stack, so the separation
                     // (and its doubled arData) is pure churn — skip it.
-                    if Rc::strong_count(a) > 1 && (decl.is_empty() || decl.iter().any(|p| p.by_ref))
+                    if Rc::strong_count(a) > 1
+                        && (decl.is_empty()
+                            || decl
+                                .iter()
+                                .skip(pos)
+                                .take(a.borrow().entries.len())
+                                .any(|p| p.by_ref))
                     {
                         let mut na = a.borrow().clone();
                         for (_, c) in na.entries.iter_mut() {
