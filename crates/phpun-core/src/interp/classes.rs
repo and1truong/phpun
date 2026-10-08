@@ -3547,8 +3547,19 @@ impl<'a> Interp<'a> {
         target: Rc<RefCell<PhpObject>>,
     ) -> Result<Value, PhpError> {
         let target_id = target.borrow().id;
+        // The dedup hit must prove the TARGET still lives: the wrapper
+        // object itself stays alive in userland while its handle id is
+        // recycled to a new object, so upgrading the wrapper's own weak
+        // is not enough — a recycled id would hand back a stale wrapper
+        // whose get() reads null on a live target.
         if let Some(existing) = self.weakrefs.get(&target_id).and_then(|w| w.upgrade()) {
-            return Ok(Value::Object(existing));
+            let live = matches!(
+                &existing.borrow().internal,
+                Some(ObjectInternal::WeakRef(tw)) if tw.upgrade().is_some()
+            );
+            if live {
+                return Ok(Value::Object(existing));
+            }
         }
         let cls = match self.classes.get("weakreference").cloned() {
             Some(c) => c,

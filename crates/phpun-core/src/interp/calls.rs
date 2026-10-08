@@ -2179,6 +2179,12 @@ impl<'a> Interp<'a> {
         // callee's leftover must not keep that object alive after the
         // call returns (typed_properties_094).
         let saved_prop_ov = self.last_prop_ov.take();
+        // The by-ref dim-read flag describes the CALLER's current op
+        // (`$a['k'] =&`/BP_VAR_RW) — a callee's own op context starts
+        // clean: a native offsetGet nested inside an override would
+        // otherwise take the silent by-ref bucket path and swallow
+        // the missing-key warning zend emits on a normal read.
+        let saved_dim_by_ref = std::mem::replace(&mut self.dim_by_ref, false);
         let fr = self.call_site_frame(decl, &args);
         self.call_trace.push(fr);
         self.last_call_by_ref = decl.by_ref;
@@ -2288,6 +2294,7 @@ impl<'a> Interp<'a> {
             r
         };
         self.last_prop_ov = saved_prop_ov;
+        self.dim_by_ref = saved_dim_by_ref;
         out
     }
 
