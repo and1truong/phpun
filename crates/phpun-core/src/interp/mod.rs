@@ -873,6 +873,10 @@ pub type SlotOwner = (Vec<String>, String, String, SlotAnchor);
 /// One output-buffer level (ob_start) with its optional handler.
 pub struct ObLevel {
     pub buf: Vec<u8>,
+    /// Bytes of `buf` charged to OB_LIVE — `mem_sync` reconciles
+    /// after every mutation; `Drop` releases the remainder on level
+    /// teardown (zend's arena holds the buffer while open).
+    pub charged: i64,
     pub handler: Option<Value>,
     /// Set after the handler's first invocation — PHP's
     /// PHP_OUTPUT_HANDLER_START bit is only passed once (bug24951).
@@ -958,6 +962,28 @@ pub struct RunResult {
 /// per-tag segments in tag order, with each consumer capture
 /// spliced ahead of the segment whose tag is >= its arrival cursor
 /// — the global stack's real write order across suspends.
+impl ObLevel {
+    /// Reconcile OB_LIVE with `buf`'s current len after a mutation
+    /// (zend charges the buffer's arena bytes; flush/clean paths
+    /// drain `buf` so the release falls out of the same diff).
+    pub(in crate::interp) fn mem_sync(&mut self) {
+        let want = self.buf.len() as i64;
+        let d = want - self.charged;
+        if d != 0 {
+            crate::value::ob_charge(d);
+            self.charged = want;
+        }
+    }
+}
+
+impl Drop for ObLevel {
+    fn drop(&mut self) {
+        if self.charged != 0 {
+            crate::value::ob_charge(-self.charged);
+        }
+    }
+}
+
 pub(in crate::interp) fn ob_splice(
     head: &[u8],
     segs: &[(usize, Vec<u8>)],
@@ -3515,6 +3541,7 @@ impl<'a> Interp<'a> {
                 l.cap_segs.push((pos, l.buf.len(), b.len()));
             }
             l.buf.extend_from_slice(b);
+            l.mem_sync();
             return;
         }
         if self.live_io {
@@ -3540,6 +3567,7 @@ impl<'a> Interp<'a> {
                 buf.cap_segs.push((pos, buf.buf.len(), b.len()));
             }
             buf.buf.extend_from_slice(b);
+            buf.mem_sync();
         } else if self.live_io {
             use std::io::Write;
             let mut so = std::io::stdout().lock();
@@ -3586,6 +3614,7 @@ impl<'a> Interp<'a> {
                     });
                 }
                 l.buf = v;
+                l.mem_sync();
                 l.gen_drained = 0;
             }
             false
@@ -3714,14 +3743,15 @@ impl<'a> Interp<'a> {
             .iter()
             .rposition(|x| x.gen_q.is_none() && x.pop_head.is_none())
             .map(|i| self.ob_stack.remove(i));
-        if let Some(st) = stolen {
+        if let Some(mut st) = stolen {
             let mut old_v = head.clone();
             for (_, s) in &l.pop_segs {
                 old_v.extend_from_slice(s);
             }
             let min_tag = l.gen_close.unwrap_or(0).saturating_sub(1);
             if !old_v.is_empty() {
-                let new_v = st.buf;
+                let new_v = std::mem::take(&mut st.buf);
+                st.mem_sync();
                 if let Some(gs) = &l.gen_state {
                     if let Some(st2) = gs.upgrade() {
                         let mut st2 = st2.borrow_mut();
@@ -3752,8 +3782,9 @@ impl<'a> Interp<'a> {
                 for (_, c) in &l.caps {
                     buf.extend_from_slice(c);
                 }
-                self.ob_stack.push(ObLevel {
+                let mut level = ObLevel {
                     buf,
+                    charged: 0,
                     handler: l.handler.clone(),
                     started: l.started,
                     gen_q: l.gen_q.clone(),
@@ -3793,7 +3824,9 @@ impl<'a> Interp<'a> {
                     read_vals: l.read_vals.clone(),
                     suspend_base: l.suspend_base,
                     gen_state: l.gen_state.clone(),
-                });
+                };
+                level.mem_sync();
+                self.ob_stack.push(level);
             }
             return;
         }
@@ -4015,6 +4048,7 @@ impl<'a> Interp<'a> {
             level.drained_segs.push((t, level.buf.len(), b.len()));
             level.buf.extend_from_slice(&b);
         }
+        level.mem_sync();
     }
 
     /// Drain the top buffer's journaled gen captures — `all` when the
@@ -4252,6 +4286,7 @@ impl<'a> Interp<'a> {
     fn ob_dead_level(l: &mut ObLevel, pos: usize, killed: bool) {
         Self::ob_drain_level(l, false);
         l.buf = Self::ob_level_content(l, pos, killed);
+        l.mem_sync();
         l.drained_segs.clear();
         l.cap_segs.clear();
         l.caps.clear();

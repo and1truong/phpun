@@ -1889,6 +1889,7 @@ impl std::borrow::Borrow<[u8]> for PhpStr {
 static OBJ_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static ARR_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static STR_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static OB_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 /// High-water of the three live counters' sum (memory_get_peak_usage).
 static MEM_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 /// The most recent charge's request size — the OOM fatal's
@@ -1910,6 +1911,7 @@ fn mem_live_raw() -> i64 {
     OBJ_LIVE.load(std::sync::atomic::Ordering::Relaxed)
         + ARR_LIVE.load(std::sync::atomic::Ordering::Relaxed)
         + STR_LIVE.load(std::sync::atomic::Ordering::Relaxed)
+        + OB_LIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Charge one live object shell (alloc_obj).
@@ -1940,7 +1942,13 @@ pub fn str_live_bytes() -> i64 {
 /// bootstrap RESERVE, a different number — don't reuse it here.
 pub const MEM_BASE_BYTES: i64 = 465_304;
 
-/// zend-arena live total: objects + array tables + strings.
+/// Charge `delta` bytes of output-buffer contents (zend's arena
+/// holds ob buffers while open — flush/clean/pop releases them).
+pub fn ob_charge(delta: i64) {
+    mem_charge(&OB_LIVE, delta, delta.max(0));
+}
+
+/// zend-arena live total: objects + array tables + strings + ob buffers.
 pub fn mem_live_bytes() -> i64 {
     mem_live_raw().max(0)
 }

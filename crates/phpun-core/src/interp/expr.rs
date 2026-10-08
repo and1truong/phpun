@@ -4365,7 +4365,7 @@ impl<'a> Interp<'a> {
                     _ => self.store(t, Value::Null)?,
                 },
                 other => {
-                    let (inner, by_ref) = match t {
+                    let (inner, by_ref) = match tu {
                         Expr::ByRef(inner) => (inner.as_ref(), true),
                         _ => (t, false),
                     };

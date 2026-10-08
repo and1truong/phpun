@@ -44,6 +44,7 @@ impl<'a> Interp<'a> {
                 if dead.1 && !l.drained_segs.is_empty() {
                     let v = Self::ob_level_content(l, dead.0, true);
                     l.buf = v;
+                    l.mem_sync();
                     l.drained_segs.clear();
                     l.gen_drained = 0;
                 }
@@ -64,6 +65,7 @@ impl<'a> Interp<'a> {
                         }
                     }
                     l.buf = new_v;
+                    l.mem_sync();
                     l.drained_segs.clear();
                     l.cap_segs.clear();
                     l.gen_drained = 0;
@@ -111,6 +113,7 @@ impl<'a> Interp<'a> {
         let (handler, buf, already) = match self.ob_stack.last_mut() {
             Some(l) => {
                 let buf = std::mem::take(&mut l.buf);
+                l.mem_sync();
                 let st = l.started;
                 l.started = true;
                 (l.handler.clone(), buf, st)
@@ -277,6 +280,7 @@ impl<'a> Interp<'a> {
         };
         self.ob_stack.push(ObLevel {
             buf: Vec::new(),
+            charged: 0,
             handler,
             started: false,
             gen_q,
@@ -361,6 +365,7 @@ impl<'a> Interp<'a> {
                 }
             }
             l.buf = v;
+            l.mem_sync();
             return Some(l);
         }
         let content = snap.unwrap_or_else(|| l.buf.clone());
@@ -397,6 +402,7 @@ impl<'a> Interp<'a> {
                 let mut v = head;
                 v.extend_from_slice(&crate::interp::ob_splice(&[], &segs, &caps));
                 l.buf = v;
+                l.mem_sync();
             } else {
                 // Register the window mirror: keep the pop value
                 // split into a head and per-tag segments so consumer
@@ -419,6 +425,7 @@ impl<'a> Interp<'a> {
                 let gen_state = self.gen_run_state.as_ref().map(std::rc::Rc::downgrade);
                 self.suspended_obs.push(ObLevel {
                     buf: Vec::new(),
+                    charged: 0,
                     handler: None,
                     started: true,
                     gen_q: l.gen_q.clone(),
@@ -481,7 +488,11 @@ impl<'a> Interp<'a> {
     pub fn ob_get_clean(&mut self) -> Value {
         self.ob_drain_pending();
         self.ob_pop()
-            .map(|l| Value::bytes(l.buf))
+            .map(|mut l| {
+                let b = std::mem::take(&mut l.buf);
+                l.mem_sync();
+                Value::bytes(b)
+            })
             .unwrap_or(Value::Bool(false))
     }
     /// ob_get_flush: handler(mode=FINAL) result emitted, RAW buffer
