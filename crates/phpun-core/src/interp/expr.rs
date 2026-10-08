@@ -2322,7 +2322,23 @@ impl<'a> Interp<'a> {
                 // zend fetches the object operand in write context —
                 // an intermediate readonly prop holding a non-object
                 // dies here, naming THAT prop (R3 finding 3).
-                let ov = self.eval_lvalue_obj(obj)?;
+                // A compound op's object fetch is a READ — zend warns
+                // on the dim miss the write-context cell fetch
+                // resolves to Null silently, and the read's throwable
+                // kills the prop write outright.
+                let ov = if needs_read
+                    && op != "??="
+                    && matches!(
+                        &**obj,
+                        Expr::Index { .. }
+                            | Expr::Prop { .. }
+                            | Expr::StaticProp { .. }
+                            | Expr::VarVar(..)
+                    ) {
+                    self.eval(obj)?
+                } else {
+                    self.eval_lvalue_obj(obj)?
+                };
                 // A {dynamic} name expr resolves now (side effects +
                 // the var-var temp is read early, matching Zend);
                 // a plain $var name reads late at write time.
