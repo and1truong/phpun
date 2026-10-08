@@ -2331,7 +2331,6 @@ impl<'a> Interp<'a> {
                     && matches!(
                         &**obj,
                         Expr::Index { .. }
-                            | Expr::Prop { .. }
                             | Expr::StaticProp { .. }
                             | Expr::VarVar(..)
                     ) {
