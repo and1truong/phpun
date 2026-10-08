@@ -1364,10 +1364,7 @@ impl<'a> Interp<'a> {
                 keys.reverse();
                 let mut evald: Vec<Option<Option<Value>>> = Vec::with_capacity(keys.len());
                 for k in &keys {
-                    let mut kk = *k;
-                    while let Some(Expr::Paren(inner)) = kk {
-                        kk = Some(inner.as_ref());
-                    }
+                    let kk = k.map(Self::unmark_rhs);
                     match kk {
                         Some(Expr::Var(_)) => evald.push(None),
                         Some(kk) => {
@@ -2591,9 +2588,7 @@ impl<'a> Interp<'a> {
             } else {
                 None
             };
-        let rhs_r = if needs_read && rhs_var {
-            Ok(Value::Null)
-        } else if rhs_late.is_some() {
+        let rhs_r = if (needs_read && rhs_var) || rhs_late.is_some() {
             Ok(Value::Null)
         } else if pin_rhs {
             let r = self.eval_cv_at(rhs_u, rhs_site);
@@ -3394,10 +3389,7 @@ impl<'a> Interp<'a> {
                 for (lv, d) in dims.iter().enumerate() {
                     let kc: Option<Cell> = match d {
                         Some(ie) => {
-                            let mut ve = *ie;
-                            while let Expr::Paren(inner) = ve {
-                                ve = inner.as_ref();
-                            }
+                            let ve = Self::unmark_rhs(ie);
                             match ve {
                                 Expr::Var(n2) => {
                                     let bad = {
@@ -5134,16 +5126,10 @@ impl<'a> Interp<'a> {
         // container dies 'Cannot use a scalar value as an array' before
         // the key's 'Undefined variable' even runs.
         let cv_key = match i {
-            Some(ie) => {
-                let mut ve = ie;
-                while let Expr::Paren(inner) = ve {
-                    ve = inner.as_ref();
-                }
-                match ve {
-                    Expr::Var(n) => Some(n.clone()),
-                    _ => None,
-                }
-            }
+            Some(ie) => match Self::unmark_rhs(ie) {
+                Expr::Var(n) => Some(n.clone()),
+                _ => None,
+            },
             None => None,
         };
         let key = match (&i, &cv_key) {

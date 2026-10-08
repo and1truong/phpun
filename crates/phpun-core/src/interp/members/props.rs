@@ -1740,24 +1740,20 @@ impl<'a> Interp<'a> {
                         // then target it (`$foo->bar->baz = 42`), and
                         // dim/compound ops on the slot itself hit the
                         // object's own errors, not 'indirectly modify'.
-                        if !self.in_unset {
-                            if let Some(sv) = pd.set_vis {
-                                if !self.hook_scope_allows(&o, &dcls, &pn, sv) {
-                                    let dk = if pd.visibility == crate::ast::Visibility::Private {
-                                        format!("\0{}\0{}", dcls.name(), pd.name)
-                                    } else {
-                                        pd.name.clone()
-                                    };
-                                    let held = o.borrow().props.get(&dk).cloned();
-                                    return match held {
-                                        Some(c) if matches!(&*c.borrow(), Value::Object(_)) => {
-                                            Ok(cell(c.borrow().clone()))
-                                        }
-                                        _ => {
-                                            self.set_visibility_indirect_error(&dcls, &pd.name, sv)
-                                        }
-                                    };
-                                }
+                        if let Some(sv) = pd.set_vis {
+                            if !self.hook_scope_allows(&o, &dcls, &pn, sv) {
+                                let dk = if pd.visibility == crate::ast::Visibility::Private {
+                                    format!("\0{}\0{}", dcls.name(), pd.name)
+                                } else {
+                                    pd.name.clone()
+                                };
+                                let held = o.borrow().props.get(&dk).cloned();
+                                return match held {
+                                    Some(c) if matches!(&*c.borrow(), Value::Object(_)) => {
+                                        Ok(cell(c.borrow().clone()))
+                                    }
+                                    _ => self.set_visibility_indirect_error(&dcls, &pd.name, sv),
+                                };
                             }
                         }
                     }
