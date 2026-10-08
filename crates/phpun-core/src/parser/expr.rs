@@ -725,11 +725,12 @@ impl<'a> Parser<'a> {
         op_pos: usize,
     ) -> Result<(), PhpError> {
         use crate::ast::Expr::*;
+        // The LHS itself carries argline marks — strip them before the
+        // shape checks (`f()[] = v` reached the catch-all otherwise).
+        let e = Self::unmark_lval(e);
         if let List(items) = e {
             for it in items.iter().flatten() {
-                // Elements keep `argline` marks — zend's writability
-                // check sees through them.
-                self.list_writable(Self::unmark_lval(&it.1))?;
+                self.list_writable(&it.1)?;
             }
             return Ok(());
         }
@@ -2555,8 +2556,12 @@ impl<'a> Parser<'a> {
         let mut leaf: &Expr = &e;
         loop {
             leaf = match leaf {
-                Index { e: c, .. } | Prop { obj: c, .. } | MethodCall { obj: c, .. } => c.as_ref(),
+                Index { e: c, .. } | Prop { obj: c, .. } => c.as_ref(),
                 Paren(inner) => inner.as_ref(),
+                // A call-shaped link is itself a legal root — a dim
+                // write binds to its temporary result (`f()['k'] = v`,
+                // `(new R)->getValue()[] = v`), so stop here instead
+                // of exposing the callee's root (which can be `new`).
                 _ => break,
             };
         }
@@ -2680,6 +2685,9 @@ impl<'a> Parser<'a> {
 
     pub(in crate::parser) fn list_writable(&mut self, e: &Expr) -> Result<(), PhpError> {
         use crate::ast::Expr::*;
+        // Elements keep `argline`/`Paren`/`ByRef` marks — zend's
+        // writability check sees through them.
+        let e = Self::unmark_lval(e);
         match e {
             Var(_) | VarVar(..) | StaticProp { .. } => Ok(()),
             Paren(inner) | ByRef(inner) => self.list_writable(inner),
@@ -2742,6 +2750,11 @@ impl<'a> Parser<'a> {
                     c.as_ref()
                 }
                 Paren(inner) => inner.as_ref(),
+                // argline/markline wraps nest INSIDE the chain nodes —
+                // `(new R)->m()[]` roots at Paren{argline: New}.
+                Binary { op, r, .. } if matches!(*op, "argline" | "markline" | "listkey") => {
+                    r.as_ref()
+                }
                 _ => break,
             };
         }
