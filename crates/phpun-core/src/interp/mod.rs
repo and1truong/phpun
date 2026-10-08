@@ -3497,6 +3497,13 @@ impl<'a> Interp<'a> {
         self.mem_committed + self.mem_huge
     }
 
+    /// Whether a charge already tripped the limit — callers simulating
+    /// multi-alloc sequences stop at the first failure like zend's
+    /// emalloc bailout (the stmt boundary raises the same fatal).
+    pub(crate) fn mem_tripped(&self) -> bool {
+        self.oom_at.is_some()
+    }
+
     /// zend's memory_limit check runs inside the allocator where a
     /// request forces newly committed memory: a huge alloc needs its
     /// own segment (real_size + aligned request vs limit), anything

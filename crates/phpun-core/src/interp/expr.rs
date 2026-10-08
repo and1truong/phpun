@@ -6071,11 +6071,7 @@ impl<'a> Interp<'a> {
                         // The borrow must drop before the evicted
                         // payload's dtors run — a __destruct reading
                         // this same array would re-borrow it.
-                        let had = cur_arr.borrow().get_cell(&ak).is_some();
                         let evicted = cur_arr.borrow_mut().unset(&ak);
-                        if had {
-                            self.mem_credit(&cur_arr, 0);
-                        }
                         if let Some(v) = evicted {
                             self.destruct_dying_value(&v)?;
                         }
@@ -6223,11 +6219,7 @@ impl<'a> Interp<'a> {
                         // borrow_mut must end before userland dtors
                         // run: an element by-ref aliasing this array
                         // reads it inside __destruct (bug65051).
-                        let had = rc.borrow().get_cell(ak).is_some();
                         let evicted = rc.borrow_mut().unset(ak);
-                        if had {
-                            self.mem_credit(&rc, 0);
-                        }
                         if let Some(v) = evicted {
                             self.destruct_dying_value(&v)?;
                         }

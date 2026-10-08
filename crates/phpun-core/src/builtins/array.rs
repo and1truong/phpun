@@ -393,7 +393,7 @@ pub(crate) fn dispatch(
                     "array_fill(): Argument #2 ($count) is too large",
                 );
             }
-            if n > 1_073_741_823 {
+            if n > 1_073_741_824 {
                 let mut e = PhpError::fatal(
                     format!(
                         "Possible integer overflow in memory allocation ({} * 32 + 32)",
@@ -404,6 +404,15 @@ pub(crate) fn dispatch(
                 e.trace = Some(it.fatal_frames());
                 return Err(e);
             }
+            // zend allocates the packed arData up front — the emalloc
+            // limit check fires before the fill loop, so a legal-but-
+            // huge fill (n=2^30 is buildable) fatals here instead of
+            // exhausting host memory.
+            let want = Interp::ht_req(n as usize, false);
+            if it.mem_check(want).is_some() {
+                it.mem_exceeded = true;
+                return Err(it.oom_fatal());
+            }
             let mut out = PhpArray::new();
             // Keys are sequential and unique — append O(1) each
             // instead of set()'s O(n) key search (a 2M fill was
@@ -413,10 +422,6 @@ pub(crate) fn dispatch(
                 out.entries.push((ArrKey::Int(start + i), cell(v.clone())));
             }
             out.next = start + n;
-            // zend allocates the packed arData up front — charge the
-            // whole capacity (pow2 slots * 16B + 8 header) so a huge
-            // fill trips the limit where the oracle does.
-            let want = Interp::ht_req(n as usize, false);
             let rc = Rc::new(RefCell::new(out));
             it.mem_track(&rc, want);
             Value::Array(rc)
@@ -1077,6 +1082,27 @@ pub(crate) fn dispatch(
             let lo = arg(args, 0);
             let hi = arg(args, 1);
             let step_arg = arg(args, 2);
+            // zend rejects non-finite float args before computing the
+            // size bound (the check also covers the char-range path).
+            for (i, (v, pname)) in [(&lo, "$start"), (&hi, "$end"), (&step_arg, "$step")]
+                .into_iter()
+                .enumerate()
+            {
+                if let Value::Float(f) = v {
+                    if !f.is_finite() {
+                        let shown = if f.is_nan() { "NAN" } else { "INF" };
+                        return err(
+                            "ValueError",
+                            format!(
+                                "range(): Argument #{} ({}) must be a finite number, {} provided",
+                                i + 1,
+                                pname,
+                                shown
+                            ),
+                        );
+                    }
+                }
+            }
             let step = step_arg.to_float();
             let step = if step == 0.0 { 1.0 } else { step.abs() };
             // zend bounds the element count before allocating

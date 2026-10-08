@@ -2047,7 +2047,7 @@ impl<'a> Interp<'a> {
                     if let Some(ptr) = prune {
                         self.prune_typed_slot(ptr);
                         // efree the prop bucket — charged at insert.
-                        self.mem_credit(&o, 32);
+                        self.mem_credit(&o, OBJ_SLOT_REQ);
                     }
                 } else if let Some(e) = hidden {
                     // __unset overloads the invisible decl like a
@@ -2089,7 +2089,7 @@ impl<'a> Interp<'a> {
                     let had = arr.borrow().get_cell(&kk).is_some();
                     let evicted = arr.borrow_mut().unset(&kk);
                     if had {
-                        self.mem_credit(&arr, 32);
+                        self.mem_credit(&arr, OBJ_SLOT_REQ);
                     }
                     if let Some(v) = evicted {
                         self.destruct_dying_value(&v)?;
