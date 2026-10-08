@@ -281,6 +281,7 @@ impl<'a> Interp<'a> {
         self.ob_stack.push(ObLevel {
             buf: Vec::new(),
             charged: 0,
+            cap: OB_INIT_CAP,
             mem_tok: std::rc::Rc::new(()),
             handler,
             started: false,
@@ -298,6 +299,7 @@ impl<'a> Interp<'a> {
             suspend_base: 0,
             gen_state,
         });
+        self.ob_meter_sync();
     }
 
     /// Pop the top buffer — a gen-opened one popped by the body
@@ -427,6 +429,7 @@ impl<'a> Interp<'a> {
                 self.suspended_obs.push(ObLevel {
                     buf: Vec::new(),
                     charged: 0,
+                    cap: OB_INIT_CAP,
                     mem_tok: std::rc::Rc::new(()),
                     handler: None,
                     started: true,
@@ -493,7 +496,13 @@ impl<'a> Interp<'a> {
             .map(|mut l| {
                 let b = std::mem::take(&mut l.buf);
                 l.mem_sync();
-                Value::bytes(b)
+                let v = Value::bytes(b);
+                // zend hands the buffer to a zend_string — the
+                // charge moves, not dies.
+                if let Value::Str(r) = &v {
+                    self.mem_track(&r.rc, r.len() as u64 + 32);
+                }
+                v
             })
             .unwrap_or(Value::Bool(false))
     }
@@ -507,7 +516,13 @@ impl<'a> Interp<'a> {
         if let Some(s) = r {
             self.emit_bytes(&s);
         }
-        Ok(raw.map(Value::bytes).unwrap_or(Value::Bool(false)))
+        let v = raw.map(Value::bytes).unwrap_or(Value::Bool(false));
+        // zend hands the buffer to a zend_string — the charge moves,
+        // not dies.
+        if let Value::Str(r) = &v {
+            self.mem_track(&r.rc, r.len() as u64 + 32);
+        }
+        Ok(v)
     }
     pub fn ob_top(&mut self) -> Option<&Vec<u8>> {
         self.ob_promote();
