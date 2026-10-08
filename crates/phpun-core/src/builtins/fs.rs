@@ -2984,10 +2984,24 @@ fn write_resource_raw(
     data: &[u8],
 ) -> Result<StreamWrite, PhpError> {
     use std::io::Write;
+    // php://output's write emits through the output stack — a limit
+    // fatal inside the buffer's erealloc renders this frame's args,
+    // which include this resource. Never hold a borrow across a
+    // diagnostic-capable call: borrow only for the position update.
+    let to_out = matches!(&*r.borrow(), PhpResource::Stdio { which: 3, .. });
+    if to_out {
+        it.emit_bytes(data);
+        // zend tracks bytes written for ftell().
+        if let PhpResource::Stdio { pos, .. } = &mut *r.borrow_mut() {
+            *pos += data.len() as u64;
+        }
+        return Ok(StreamWrite::Written);
+    }
     let mut rb = r.borrow_mut();
     match &mut *rb {
-        PhpResource::Stdio { which, pos, .. } => match *which {
+        PhpResource::Stdio { which, .. } => match *which {
             1 => {
+                it.emit_seen = true;
                 if it.live_io {
                     let mut so = std::io::stdout().lock();
                     let _ = so.write_all(data);
@@ -2997,12 +3011,7 @@ fn write_resource_raw(
                 }
                 Ok(StreamWrite::Written)
             }
-            3 => {
-                it.emit_bytes(data);
-                // zend tracks bytes written for ftell().
-                *pos += data.len() as u64;
-                Ok(StreamWrite::Written)
-            }
+            3 => unreachable!("php://output handled above the borrow"),
             2 => {
                 if it.live_io {
                     let _ = std::io::stderr().write_all(data);
