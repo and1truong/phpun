@@ -51,15 +51,21 @@ impl<'a> Interp<'a> {
             i += 1;
             // memory_limit fires between statements (bug45392) once
             // a charge recorded its overflowing call site in oom_at,
-            // or the live arena itself passed the limit (ob buffers —
-            // bytes the zend_mm sim doesn't own).
+            // or the live arena itself passed the limit. Buffer
+            // growth since the last boundary reconciles into the
+            // sim here — ob bytes are why the walk exists.
+            self.ob_meter_sync();
             let lim = self.ini_bytes("memory_limit");
-            let arena_over = lim >= 0 && self.mem_total() > lim;
+            crate::value::mem_set_arena_lim(lim);
+            // lim > 0: zend refuses memory_limit=0 at ini_set, and a
+            // limit of -1 (unlimited) can never trip.
+            let arena_over = lim > 0 && self.mem_total() > lim;
             if self.oom_at.is_some() || arena_over {
                 self.mem_exceeded = true;
                 // zend's bailout backtraces the allocating call —
                 // oom_at captured it inside mem_charge. Arena trips
-                // report the last tracked request (no sim figure).
+                // report the crossing charge's request, not whatever
+                // charge happened to come last before the boundary.
                 let (line, frames) = self
                     .oom_at
                     .clone()
@@ -69,7 +75,10 @@ impl<'a> Interp<'a> {
                         "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
                         lim,
                         if arena_over {
-                            crate::value::mem_last_alloc()
+                            match crate::value::mem_arena_trip() {
+                                0 => crate::value::mem_last_alloc(),
+                                n => n,
+                            }
                         } else {
                             self.mem_last as i64
                         }

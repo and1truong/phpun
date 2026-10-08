@@ -9300,13 +9300,22 @@ impl<'a> Interp<'a> {
             }
             "." => {
                 let (lv, rv) = self.binary_operands(l, r)?;
+                // zend ereallocs a uniquely-held LHS in place
+                // (concat_function's refcount==1 fast path) — model
+                // as a grow, not a fresh emalloc (cat3's oracle).
+                let grow = matches!(&lv, Value::Str(s) if Rc::strong_count(&s.rc) == 1);
                 let mut ls = self.conv_bytes(&lv)?;
                 let rs = self.conv_bytes(&rv)?;
                 ls.extend_from_slice(&rs);
                 let nv = Value::bytes(ls);
                 // zend emallocs the concat result zend_string.
                 if let Value::Str(s) = &nv {
-                    self.mem_track(&s.rc, s.len() as u64 + 25);
+                    match &lv {
+                        Value::Str(os) if grow => {
+                            self.mem_grow_str(&os.rc, &s.rc, s.len() as u64 + 25)
+                        }
+                        _ => self.mem_track(&s.rc, s.len() as u64 + 25),
+                    }
                 }
                 Ok(nv)
             }

@@ -322,13 +322,16 @@ pub(crate) fn dispatch(
             if k == "memory_limit" {
                 it.ini.insert(k.clone(), v);
                 let lim = it.ini_bytes(&k);
-                // zend refuses limits below committed heap usage;
-                // dead tracked charges sweep first so a freed 20MB
-                // string doesn't hold committed pages hostage
-                // (zend_mm's real usage drops on free).
+                // zend refuses limits below committed heap usage —
+                // lim=0 too (real usage is always >0), while -1 stays
+                // the unlimited sentinel. Buffered ob bytes count:
+                // dead tracked charges and open buffers reconcile
+                // first so a freed 20MB string doesn't hold committed
+                // pages hostage (zend_mm's real usage drops on free).
+                it.ob_meter_sync();
                 it.mem_sweep();
                 let usage = it.mem_real() as i64;
-                if lim > 0 && usage > lim {
+                if lim >= 0 && usage > lim {
                     let _ = it
                         .ini
                         .insert(k.clone(), prev.clone().unwrap_or_else(|| "-1".into()));

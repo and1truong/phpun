@@ -2010,12 +2010,18 @@ impl std::borrow::Borrow<[u8]> for PhpStr {
 static OBJ_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static ARR_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static STR_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-static OB_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 /// High-water of the three live counters' sum (memory_get_peak_usage).
 static MEM_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 /// The most recent charge's request size — the OOM fatal's
 /// 'tried to allocate N' arg.
 static LAST_ALLOC: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// memory_limit as last synced by the stmt boundary, and the request
+/// of the first charge whose post-total crossed it — zend dies
+/// inside the crossing emalloc, so the fatal reports that request,
+/// not whatever smaller charge happened to come last (the
+/// last-charge garbage figure, e.g. 36).
+static ARENA_LIM: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+static ARENA_TRIP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// Add `bytes` to a live counter and keep the peak at the high-water
 /// of the live total. `request` stamps the OOM fatal's
@@ -2026,13 +2032,35 @@ fn mem_charge(counter: &std::sync::atomic::AtomicI64, bytes: i64, request: i64) 
     counter.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     LAST_ALLOC.store(request, std::sync::atomic::Ordering::Relaxed);
     MEM_PEAK.fetch_max(mem_live_raw(), std::sync::atomic::Ordering::Relaxed);
+    let lim = ARENA_LIM.load(std::sync::atomic::Ordering::Relaxed);
+    if lim >= 0
+        && MEM_BASE_BYTES + mem_live_raw() > lim
+        && ARENA_TRIP.load(std::sync::atomic::Ordering::Relaxed) == 0
+    {
+        ARENA_TRIP.store(request, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Sync the boundary check's memory_limit into the arena trip
+/// machinery; clears the crossing record when usage is under it
+/// again (ini_set raised the ceiling or frees dropped usage).
+pub fn mem_set_arena_lim(lim: i64) {
+    ARENA_LIM.store(lim, std::sync::atomic::Ordering::Relaxed);
+    if lim < 0 || MEM_BASE_BYTES + mem_live_raw() <= lim {
+        ARENA_TRIP.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The crossing charge's request, or 0 when usage sits under the
+/// synced limit (caller falls back to the last charge).
+pub fn mem_arena_trip() -> i64 {
+    ARENA_TRIP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn mem_live_raw() -> i64 {
     OBJ_LIVE.load(std::sync::atomic::Ordering::Relaxed)
         + ARR_LIVE.load(std::sync::atomic::Ordering::Relaxed)
         + STR_LIVE.load(std::sync::atomic::Ordering::Relaxed)
-        + OB_LIVE.load(std::sync::atomic::Ordering::Relaxed)
         + GC_PEAK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -2080,15 +2108,9 @@ pub fn str_live_bytes() -> i64 {
 /// bootstrap RESERVE, a different number — don't reuse it here.
 pub const MEM_BASE_BYTES: i64 = 465_304;
 
-/// Charge `delta` bytes of output-buffer contents (zend's arena
-/// holds ob buffers while open — flush/clean/pop releases them).
-/// `request` is the alloc zend attempted — the fatal's 'tried to
-/// allocate' figure, which is the buffer alloc, not the delta.
-pub fn ob_charge(delta: i64, request: i64) {
-    mem_charge(&OB_LIVE, delta, request.max(0));
-}
-
-/// zend-arena live total: objects + array tables + strings + ob buffers.
+/// zend-arena live total: objects + array tables + strings.
+/// Output-buffer contents are NOT in this arena — the zend_mm sim
+/// owns them via ObLevel's token charge (`ob_meter_sync`).
 pub fn mem_live_bytes() -> i64 {
     mem_live_raw().max(0)
 }

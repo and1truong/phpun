@@ -198,10 +198,12 @@ pub(crate) fn dispatch(
             let n = arg(args, 1).to_int().max(0) as usize;
             // zend emallocs the result zend_string up front — the
             // limit check runs inside emalloc (dead tracked charges
-            // sweep first) so huge n fatals instead of OOMing the host.
-            let want = s.len() as i128 * n as i128 + 25;
+            // sweep first) so huge n fatals instead of OOMing the
+            // host. str_repeat's safe_emalloc request is len*n + 32
+            // (zend_string header), reported raw on the huge path.
+            let want = s.len() as i128 * n as i128 + 32;
             let wantu = want.clamp(0, u64::MAX as i128) as u64;
-            if it.mem_check(wantu).is_some() {
+            if it.mem_check_flat(wantu).is_some() {
                 it.mem_exceeded = true;
                 return Err(it.oom_fatal());
             }
