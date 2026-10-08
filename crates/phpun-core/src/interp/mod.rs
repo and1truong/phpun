@@ -430,11 +430,6 @@ pub struct Interp<'a> {
     /// write-reference bind (uninit non-nullable typed props error
     /// 'by reference'; uninit *nullable* statics report 'undeclared').
     foreach_by_ref: bool,
-    /// Inside a whole-target `unset($x)` root fetch — set-visibility
-    /// checks stand down so unset's own errors ('Cannot unset
-    /// private(set) property', 'Attempt to unset static property')
-    /// win over 'Cannot indirectly modify'.
-    in_unset: bool,
     /// Autoload/lookup error swallowed by the last `is_callable_value`
     /// probe — re-raised when a `callable` param type rejects the arg.
     callable_probe_err: Option<(Value, PhpError)>,
@@ -1405,7 +1400,6 @@ impl<'a> Interp<'a> {
             globals_synced: std::collections::HashSet::new(),
             dim_by_ref: false,
             foreach_by_ref: false,
-            in_unset: false,
             anon_class_names: HashMap::new(),
             anon_class_seq: 0,
             callable_probe_err: None,
