@@ -3052,12 +3052,25 @@ impl<'a> Interp<'a> {
                         .as_ref()
                         .map(|kc| kc.borrow().clone())
                         .unwrap_or_else(|| newv.clone());
+                    // With a throwable pending the write dispatch dies
+                    // on the container itself — zend reports 'Cannot
+                    // use object of type C as array', not the defer.
+                    if self.dim_throw.is_some() && !self.is_native_offset(&o, "offsetSet") {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Cannot use object of type {} as array",
+                                o.borrow().class.name()
+                            ),
+                            self.cur_line,
+                        ));
+                    }
                     // A pending throwable kills the userland
                     // zend_call_method — spl's own write_dimension
                     // (native stub) still lands; its own throw loses
                     // to the already-pending first one (zend keeps
                     // the earliest EG(exception)).
-                    if self.dim_throw.is_none() || self.is_native_offsetset(&o) {
+                    if self.dim_throw.is_none() || self.is_native_offset(&o, "offsetSet") {
                         match self.method_invoke(
                             o,
                             "offsetSet",
@@ -5828,10 +5841,23 @@ impl<'a> Interp<'a> {
                         Some((e, s)) => self.eval_cv_at(e, s)?,
                         None => v,
                     };
+                    // With a throwable pending the write dispatch dies
+                    // on the container itself — zend reports 'Cannot
+                    // use object of type C as array', not the defer.
+                    if self.dim_throw.is_some() && !self.is_native_offset(&o, "offsetSet") {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Cannot use object of type {} as array",
+                                o.borrow().class.name()
+                            ),
+                            self.cur_line,
+                        ));
+                    }
                     // A pending throwable kills the userland
                     // zend_call_method — spl's own write_dimension
                     // (native stub) still lands.
-                    if self.dim_throw.is_none() || self.is_native_offsetset(&o) {
+                    if self.dim_throw.is_none() || self.is_native_offset(&o, "offsetSet") {
                         match self.method_invoke(
                             o,
                             "offsetSet",
@@ -6453,7 +6479,7 @@ impl<'a> Interp<'a> {
                                     let live = n + 1 == keys.len();
                                     if (!live || viv_last)
                                         && spl_iter
-                                        && self.is_native_offsetget(&o)
+                                        && self.is_native_offset(&o, "offsetGet")
                                         // zend creates the bucket only
                                         // after the dim converted — an
                                         // illegal key dies at conversion.
@@ -7429,16 +7455,10 @@ impl<'a> Interp<'a> {
     /// Native-stub spl offsetGet (empty decl body, engine-declared) —
     /// zend's own read_dimension machinery handles it; a userland
     /// override takes the engine-call path instead.
-    fn is_native_offsetget(&mut self, o: &Rc<RefCell<PhpObject>>) -> bool {
-        self.find_method_in(&o.borrow().class, "offsetGet")
-            .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
-            .unwrap_or(true)
-    }
-
-    /// Native-stub spl offsetSet — a deferred throwable suppresses
-    /// userland zend_call_method but not zend's own write_dimension.
-    fn is_native_offsetset(&mut self, o: &Rc<RefCell<PhpObject>>) -> bool {
-        self.find_method_in(&o.borrow().class, "offsetSet")
+    /// Native-stub spl offset method — a deferred throwable suppresses
+    /// userland zend_call_method but not zend's own read/write_dimension.
+    fn is_native_offset(&mut self, o: &Rc<RefCell<PhpObject>>, name: &str) -> bool {
+        self.find_method_in(&o.borrow().class, name)
             .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
             .unwrap_or(true)
     }
@@ -7471,7 +7491,7 @@ impl<'a> Interp<'a> {
         // `[]` falls to the overloaded-dim notice + Error below).
         if spl_iter {
             if let Some(kc) = &key {
-                if self.is_native_offsetget(&o) {
+                if self.is_native_offset(&o, "offsetGet") {
                     let arr = self.ao_arr(&o);
                     let ak = self.arr_key(&kc.borrow())?;
                     // `=&` binds the bucket itself — zend marks the
@@ -9191,7 +9211,7 @@ impl<'a> Interp<'a> {
         // cell — the write lands on storage directly (no offsetSet
         // dispatch, no overloaded-dim notice, no IS_REFERENCE mark).
         // Only a userland offsetGet override takes the engine path.
-        let native = spl_iter && key.is_some() && self.is_native_offsetget(&o);
+        let native = spl_iter && key.is_some() && self.is_native_offset(&o, "offsetGet");
         self.last_ret_cell = None;
         let was = std::mem::replace(&mut self.dim_by_ref, true);
         let r = if native {
