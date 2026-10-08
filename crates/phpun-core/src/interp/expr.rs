@@ -2101,6 +2101,19 @@ impl<'a> Interp<'a> {
         value: &Expr,
         aline: usize,
     ) -> Result<Value, PhpError> {
+        // Op boundary for the armed dim throwable — see dim_op_outlet.
+        let outer = self.dim_throw.take();
+        let r = self.assign_inner(target, op, value, aline);
+        self.dim_op_outlet(r, outer)
+    }
+
+    fn assign_inner(
+        &mut self,
+        target: &Expr,
+        op: &'static str,
+        value: &Expr,
+        aline: usize,
+    ) -> Result<Value, PhpError> {
         // `$this` may never be an assignment target (compile fatal,
         // bug24573); plain and compound assigns both route here.
         if let Expr::Var(n) = target {
@@ -2309,7 +2322,20 @@ impl<'a> Interp<'a> {
                 // zend fetches the object operand in write context —
                 // an intermediate readonly prop holding a non-object
                 // dies here, naming THAT prop (R3 finding 3).
-                let ov = self.eval_lvalue_obj(obj)?;
+                // A compound op's object fetch is a READ — zend warns
+                // on the dim miss the write-context cell fetch
+                // resolves to Null silently, and the read's throwable
+                // kills the prop write outright.
+                let ov = if needs_read
+                    && op != "??="
+                    && matches!(
+                        &**obj,
+                        Expr::Index { .. } | Expr::StaticProp { .. } | Expr::VarVar(..)
+                    ) {
+                    self.eval(obj)?
+                } else {
+                    self.eval_lvalue_obj(obj)?
+                };
                 // A {dynamic} name expr resolves now (side effects +
                 // the var-var temp is read early, matching Zend);
                 // a plain $var name reads late at write time.
@@ -2807,6 +2833,12 @@ impl<'a> Interp<'a> {
         } else {
             Value::Null
         };
+        // zend's EG(exception) check at the fetch's end kills the
+        // whole write opcode for a non-final-level defer: no gate,
+        // op_data read, or operator runs — the defer unwinds now.
+        if self.dim_throw.as_ref().is_some_and(|(_, _, live)| !*live) {
+            return self.dim_raise(Value::Null);
+        }
         // A diagnostic mid-fetch can still kill the container — zend's
         // sentinel then aborts the op before its gate and its op_data
         // read, so re-check after the read too.
@@ -3002,13 +3034,6 @@ impl<'a> Interp<'a> {
             }
             v => v,
         };
-        // A throwable deferred from an intermediate dim fetch killed the
-        // whole write opcode — zend checks EG(exception) at the opcode
-        // boundary. A defer from the write op's own last-dim read leaves
-        // the write live: only the userland dispatch is suppressed.
-        if self.dim_throw.as_ref().is_some_and(|(_, _, live)| !*live) {
-            return self.dim_raise(newv);
-        }
         match late {
             Late::Prop { ov, name } => {
                 let pn = match name {
@@ -3042,12 +3067,25 @@ impl<'a> Interp<'a> {
                         .as_ref()
                         .map(|kc| kc.borrow().clone())
                         .unwrap_or_else(|| newv.clone());
+                    // With a throwable pending the write dispatch dies
+                    // on the container itself — zend reports 'Cannot
+                    // use object of type C as array', not the defer.
+                    if self.dim_throw.is_some() && !self.is_native_offset(&o, "offsetSet") {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Cannot use object of type {} as array",
+                                o.borrow().class.name()
+                            ),
+                            self.cur_line,
+                        ));
+                    }
                     // A pending throwable kills the userland
                     // zend_call_method — spl's own write_dimension
                     // (native stub) still lands; its own throw loses
                     // to the already-pending first one (zend keeps
                     // the earliest EG(exception)).
-                    if self.dim_throw.is_none() || self.is_native_offsetset(&o) {
+                    if self.dim_throw.is_none() || self.is_native_offset(&o, "offsetSet") {
                         match self.method_invoke(
                             o,
                             "offsetSet",
@@ -4496,12 +4534,39 @@ impl<'a> Interp<'a> {
     fn dim_raise<T>(&mut self, v: T) -> Result<T, PhpError> {
         match self.dim_throw.take() {
             Some((tv, e, _)) => {
-                if e.kind == ErrorKind::Throw {
-                    self.pending_exception = Some(tv);
-                }
+                self.pending_exception = Some(tv);
                 Err(e)
             }
             None => Ok(v),
+        }
+    }
+
+    /// Op-boundary drain for the armed dim throwable — every `?`/Err
+    /// or early `return Ok` between the fetch's defer and `dim_raise`
+    /// would strand it for a LATER op to re-raise (or a next op's
+    /// entry-clear to silently drop it). zend has a single
+    /// EG(exception) slot: an error already unwinding is the newer
+    /// throwable and wins; a quiet op end raises the deferred one.
+    /// `outer` is the arm a nested op inherited — zend clears
+    /// EG(exception) around the nested call, so a clean nested run
+    /// restores it for the outer op's own end.
+    fn dim_op_outlet<T>(
+        &mut self,
+        r: Result<T, PhpError>,
+        outer: Option<(crate::value::Value, PhpError, bool)>,
+    ) -> Result<T, PhpError> {
+        match r {
+            Err(e) => {
+                self.dim_throw = None;
+                Err(e)
+            }
+            Ok(v) => {
+                let r = self.dim_raise(v);
+                if self.dim_throw.is_none() {
+                    self.dim_throw = outer;
+                }
+                r
+            }
         }
     }
 
@@ -5791,10 +5856,23 @@ impl<'a> Interp<'a> {
                         Some((e, s)) => self.eval_cv_at(e, s)?,
                         None => v,
                     };
+                    // With a throwable pending the write dispatch dies
+                    // on the container itself — zend reports 'Cannot
+                    // use object of type C as array', not the defer.
+                    if self.dim_throw.is_some() && !self.is_native_offset(&o, "offsetSet") {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            format!(
+                                "Cannot use object of type {} as array",
+                                o.borrow().class.name()
+                            ),
+                            self.cur_line,
+                        ));
+                    }
                     // A pending throwable kills the userland
                     // zend_call_method — spl's own write_dimension
                     // (native stub) still lands.
-                    if self.dim_throw.is_none() || self.is_native_offsetset(&o) {
+                    if self.dim_throw.is_none() || self.is_native_offset(&o, "offsetSet") {
                         match self.method_invoke(
                             o,
                             "offsetSet",
@@ -6193,7 +6271,6 @@ impl<'a> Interp<'a> {
         // handler's in-place dim write cow-splits instead of mutating
         // the very table this fetch is walking.
         let _hold = det.and_then(|d| d.pre.value());
-        self.dim_throw = None;
         // An append has no slot for `??=`'s isset read — zend's compiler
         // rejects `[]` there ("Cannot use [] for reading"). Other compound
         // ops read via ASSIGN_DIM_OP, where appending stays legal.
@@ -6426,7 +6503,7 @@ impl<'a> Interp<'a> {
                                     let live = n + 1 == keys.len();
                                     if (!live || viv_last)
                                         && spl_iter
-                                        && self.is_native_offsetget(&o)
+                                        && self.is_native_offset(&o, "offsetGet")
                                         // zend creates the bucket only
                                         // after the dim converted — an
                                         // illegal key dies at conversion.
@@ -7431,16 +7508,10 @@ impl<'a> Interp<'a> {
     /// Native-stub spl offsetGet (empty decl body, engine-declared) —
     /// zend's own read_dimension machinery handles it; a userland
     /// override takes the engine-call path instead.
-    fn is_native_offsetget(&mut self, o: &Rc<RefCell<PhpObject>>) -> bool {
-        self.find_method_in(&o.borrow().class, "offsetGet")
-            .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
-            .unwrap_or(true)
-    }
-
-    /// Native-stub spl offsetSet — a deferred throwable suppresses
-    /// userland zend_call_method but not zend's own write_dimension.
-    fn is_native_offsetset(&mut self, o: &Rc<RefCell<PhpObject>>) -> bool {
-        self.find_method_in(&o.borrow().class, "offsetSet")
+    /// Native-stub spl offset method — a deferred throwable suppresses
+    /// userland zend_call_method but not zend's own read/write_dimension.
+    fn is_native_offset(&mut self, o: &Rc<RefCell<PhpObject>>, name: &str) -> bool {
+        self.find_method_in(&o.borrow().class, name)
             .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
             .unwrap_or(true)
     }
@@ -7473,7 +7544,7 @@ impl<'a> Interp<'a> {
         // `[]` falls to the overloaded-dim notice + Error below).
         if spl_iter {
             if let Some(kc) = &key {
-                if self.is_native_offsetget(&o) {
+                if self.is_native_offset(&o, "offsetGet") {
                     let arr = self.ao_arr(&o);
                     let ak = self.arr_key(&kc.borrow())?;
                     // `=&` binds the bucket itself — zend marks the
@@ -8739,6 +8810,13 @@ impl<'a> Interp<'a> {
     }
 
     fn incdec(&mut self, target: &Expr, delta: i64, post: bool) -> Result<Value, PhpError> {
+        // Op boundary for the armed dim throwable — see dim_op_outlet.
+        let outer = self.dim_throw.take();
+        let r = self.incdec_inner(target, delta, post);
+        self.dim_op_outlet(r, outer)
+    }
+
+    fn incdec_inner(&mut self, target: &Expr, delta: i64, post: bool) -> Result<Value, PhpError> {
         // PHP warns on undefined vars/props/keys during ++/-- (bug25547).
         let mut ro_target: Option<(Rc<RefCell<PhpObject>>, String)> = None;
         let old = match target {
@@ -9071,7 +9149,6 @@ impl<'a> Interp<'a> {
             self.dim_key_conv.clear();
             self.dim_cv_bound.clear();
             self.dim_undef_cells.clear();
-            self.dim_throw = None;
         }
         let arr_cell = self.var_cell(root);
         let det = DimDetach {
@@ -9125,6 +9202,11 @@ impl<'a> Interp<'a> {
             }
         }
         let old = self.compound_dim_read(arr_cell.clone(), &keys, false, Some(&det), true)?;
+        // zend's EG(exception) check at the fetch's end kills the
+        // whole op for a non-final-level defer — no incdec, no write.
+        if self.dim_throw.as_ref().is_some_and(|(_, _, live)| !*live) {
+            return self.dim_raise(old);
+        }
         let new = self.incdec_value(&old, delta)?;
         // int-boundary overflow writes a float back — zend words the
         // typed-ref rejection `Cannot increment/decrement a reference
@@ -9182,7 +9264,7 @@ impl<'a> Interp<'a> {
         // cell — the write lands on storage directly (no offsetSet
         // dispatch, no overloaded-dim notice, no IS_REFERENCE mark).
         // Only a userland offsetGet override takes the engine path.
-        let native = spl_iter && key.is_some() && self.is_native_offsetget(&o);
+        let native = spl_iter && key.is_some() && self.is_native_offset(&o, "offsetGet");
         self.last_ret_cell = None;
         let was = std::mem::replace(&mut self.dim_by_ref, true);
         let r = if native {
