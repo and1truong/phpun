@@ -202,6 +202,7 @@ impl<'a> Interp<'a> {
                 store: Rc::new(RefCell::new(crate::value::AoStore {
                     arr: backing.map(|(a, _)| a).unwrap_or_default(),
                     src: src_obj,
+                    gen: 0,
                 })),
                 pos: 0,
                 flags,
@@ -355,10 +356,12 @@ impl<'a> Interp<'a> {
                     } else if arg_is_spl {
                         // zend caches the arg's table pointer — our own
                         // sb.arr becomes the arg's live table.
+                        sb.gen += 1;
                         let prev = std::mem::replace(&mut sb.arr, new.clone());
                         let mut prev = prev.borrow_mut();
                         Some(std::mem::take(&mut *prev))
                     } else {
+                        sb.gen += 1;
                         let copied = self.dup_array(&new.borrow());
                         Some(std::mem::replace(&mut *sb.arr.borrow_mut(), copied))
                     }
@@ -874,6 +877,7 @@ impl<'a> Interp<'a> {
                             store: Rc::new(RefCell::new(crate::value::AoStore {
                                 arr: backing,
                                 src: src_obj,
+                                gen: 0,
                             })),
                             pos: 0,
                             flags: pflags,
@@ -991,6 +995,7 @@ impl<'a> Interp<'a> {
                     store: Rc::new(RefCell::new(crate::value::AoStore {
                         arr: backing,
                         src: src_obj,
+                        gen: 0,
                     })),
                     pos: 0,
                     flags: flags_i,
@@ -1060,6 +1065,7 @@ impl<'a> Interp<'a> {
                                 store: Rc::new(RefCell::new(crate::value::AoStore {
                                     arr: backing.0,
                                     src: src_obj,
+                                    gen: 0,
                                 })),
                                 pos: 0,
                                 // The iterator is a different object —
@@ -1144,6 +1150,7 @@ impl<'a> Interp<'a> {
                 store: Rc::new(RefCell::new(crate::value::AoStore {
                     arr: Rc::new(RefCell::new(PhpArray::new())),
                     src: None,
+                    gen: 0,
                 })),
                 pos: 0,
                 flags: 0,
@@ -1163,6 +1170,12 @@ impl<'a> Interp<'a> {
     /// on the source stays visible through this wrapper, so resolve
     /// through the src chain instead of the mirror snapshot.
     pub(crate) fn ao_arr(&mut self, obj: &Rc<RefCell<PhpObject>>) -> Rc<RefCell<PhpArray>> {
+        self.ao_resolve(obj).borrow().arr.clone()
+    }
+
+    /// The AoStore backing `obj`'s live table — resolves through the
+    /// src chain like zend's spl_array_get_hash_table.
+    fn ao_resolve(&mut self, obj: &Rc<RefCell<PhpObject>>) -> Rc<RefCell<crate::value::AoStore>> {
         let mut cur = obj.clone();
         let mut seen = std::collections::HashSet::new();
         loop {
@@ -1184,9 +1197,22 @@ impl<'a> Interp<'a> {
             };
             match next {
                 Some(src_o) => cur = src_o,
-                None => return st.borrow().arr.clone(),
+                None => return st,
             }
         }
+    }
+
+    /// Identity stamp of `obj`'s live backing store — a handler-side
+    /// `exchangeArray`/`unserialize` replaces it, so comparing the
+    /// (store, generation) pair before and after a diagnostic marks
+    /// writes that zend would have landed on the dead table.
+    pub(in crate::interp) fn ao_storage_id(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+    ) -> (usize, u64) {
+        let st = self.ao_resolve(obj);
+        let gen = st.borrow().gen;
+        (Rc::as_ptr(&st) as usize, gen)
     }
 
     /// (storage, pos, flags) of an spl array-object, lazily creating the
