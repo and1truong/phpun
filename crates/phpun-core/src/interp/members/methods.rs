@@ -419,7 +419,10 @@ impl<'a> Interp<'a> {
                             ArrKey::Str(s) => format!("\"{}\"", s),
                             ArrKey::Tomb => "0".into(),
                         };
-                        let _ = self.warn(&format!("Undefined array key {}", kn));
+                        // A throwing handler's throwable propagates —
+                        // the compound-op read arm defers it past the
+                        // write like zend's EG(exception) op-end check.
+                        self.warn(&format!("Undefined array key {}", kn))?;
                         Value::Null
                     }
                 }

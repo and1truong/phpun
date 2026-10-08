@@ -531,6 +531,11 @@ pub struct Interp<'a> {
     /// rebound or mutated the container, so the pending write lands on
     /// the stale slot: invisible and silent (assign_dim_014).
     detached_dim: bool,
+    /// A throwable raised by a compound op's dim fetch engine call
+    /// (offsetGet's own throw or its missing-key warn's handler) —
+    /// zend's assign op keeps running with EG(exception) pending, so
+    /// the write still lands before the throwable surfaces at op end.
+    dim_throw: Option<PhpError>,
     /// `++`/`--` overflow context while the pending dim write stores:
     /// a ref held by a typed-int prop reports `Cannot
     /// increment/decrement a reference held by property ... past its
@@ -1598,6 +1603,7 @@ impl<'a> Interp<'a> {
             in_handler: false,
             incdec_ref_ctx: None,
             detached_dim: false,
+            dim_throw: None,
             unset_ctx: false,
             dim_key_conv: std::collections::HashMap::new(),
             dim_undef_cells: std::collections::HashSet::new(),

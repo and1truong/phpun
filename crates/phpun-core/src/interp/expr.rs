@@ -2925,7 +2925,7 @@ impl<'a> Interp<'a> {
                         Ok(_) => {}
                         Err(e) => return Err(e),
                     }
-                    return Ok(newv);
+                    return self.dim_raise(newv);
                 }
                 if matches!(&*base.borrow(), Value::Null) {
                     self.auto_init_gate(&base)?;
@@ -3136,7 +3136,7 @@ impl<'a> Interp<'a> {
                                     _ => (cell(cur), false),
                                 }
                             }
-                            _ => return Ok(newv),
+                            _ => return self.dim_raise(newv),
                         }
                     } else {
                         // zend's `=` on a false container vivifies it
@@ -3147,7 +3147,7 @@ impl<'a> Interp<'a> {
                             self.deprecated_ns(
                                 "Automatic conversion of false to array is deprecated",
                             )?;
-                            return Ok(newv);
+                            return self.dim_raise(newv);
                         }
                         (d.scratch(), true)
                     }
@@ -3220,7 +3220,7 @@ impl<'a> Interp<'a> {
                         Value::Int(_) | Value::Float(_) | Value::Bool(_)
                     )
                 {
-                    return Ok(newv);
+                    return self.dim_raise(newv);
                 }
                 let was_detached = std::mem::replace(&mut self.detached_dim, silence);
                 let r =
@@ -3254,7 +3254,7 @@ impl<'a> Interp<'a> {
                 }
             },
         }
-        Ok(newv)
+        self.dim_raise(newv)
     }
 
     /// Evaluate the object operand of a Prop write target — zend
@@ -4324,6 +4324,16 @@ impl<'a> Interp<'a> {
             ArrKey::Str(s) => self.warn(&format!("Undefined array key \"{}\"", s)),
             ArrKey::Int(i) => self.warn(&format!("Undefined array key {}", i)),
             ArrKey::Tomb => Ok(()),
+        }
+    }
+
+    /// Op-end drain for a deferred dim-fetch throwable — zend checks
+    /// EG(exception) once the op's write has landed, so a pending
+    /// dim_throw outranks the op's own result value.
+    fn dim_raise<T>(&mut self, v: T) -> Result<T, PhpError> {
+        match self.dim_throw.take() {
+            Some(e) => Err(e),
+            None => Ok(v),
         }
     }
 
@@ -5933,6 +5943,7 @@ impl<'a> Interp<'a> {
         // handler's in-place dim write cow-splits instead of mutating
         // the very table this fetch is walking.
         let _hold = det.and_then(|d| d.pre.value());
+        self.dim_throw = None;
         for (n, ka) in keys.iter().enumerate() {
             // A diagnostic fired inside this fetch (CV bind, offset
             // conversion) may have rebound the root container — zend's
@@ -6130,16 +6141,31 @@ impl<'a> Interp<'a> {
                                     "offsetExists",
                                     CallArgs::positional(vec![cell(kv.clone())]),
                                 )
-                                .map(|v| v.is_truthy())
-                                .unwrap_or(false);
+                                .map(|v| v.is_truthy())?;
                             if !exists {
                                 return Ok(Value::Null);
                             }
                         }
                         let iv = if let Some(kc) = k {
                             let kv = kc.borrow().clone();
-                            self.method_invoke(o, "offsetGet", CallArgs::positional(vec![cell(kv)]))
-                                .unwrap_or(Value::Null)
+                            match self.method_invoke(
+                                o,
+                                "offsetGet",
+                                CallArgs::positional(vec![cell(kv)]),
+                            ) {
+                                Ok(v) => v,
+                                // A compound op's throwing offsetGet leaves
+                                // zend's write to run — EG(exception) is
+                                // checked at op end, so the throwable defers
+                                // to dim_raise while the read yields Null.
+                                // `??=`'s isset read can't decide without
+                                // the value — its exception propagates now.
+                                Err(e) if !quiet && matches!(e.kind, ErrorKind::Throw) => {
+                                    self.dim_throw = Some(e);
+                                    Value::Null
+                                }
+                                Err(e) => return Err(e),
+                            }
                         } else {
                             // spl `[]` reads through the UNDEF-arg
                             // engine call — its arity error is real
@@ -7078,6 +7104,15 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Native-stub spl offsetGet (empty decl body, engine-declared) —
+    /// zend's own read_dimension machinery handles it; a userland
+    /// override takes the engine-call path instead.
+    fn is_native_offsetget(&mut self, o: &Rc<RefCell<PhpObject>>) -> bool {
+        self.find_method_in(&o.borrow().class, "offsetGet")
+            .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
+            .unwrap_or(true)
+    }
+
     /// Write-context cell fetch on an ArrayAccess object (`$x =&
     /// $o['k']`, `foreach (&$o['k'])`): zend's spl read_dimension is
     /// by-ref, so `&offsetGet` hands back the storage cell through
@@ -7106,11 +7141,7 @@ impl<'a> Interp<'a> {
         // `[]` falls to the overloaded-dim notice + Error below).
         if spl_iter {
             if let Some(kc) = &key {
-                let native = self
-                    .find_method_in(&o.borrow().class, "offsetGet")
-                    .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
-                    .unwrap_or(true);
-                if native {
+                if self.is_native_offsetget(&o) {
                     let arr = self.ao_arr(&o);
                     let ak = self.arr_key(&kc.borrow())?;
                     // `=&` binds the bucket itself — zend marks the
@@ -8708,6 +8739,7 @@ impl<'a> Interp<'a> {
             self.dim_key_conv.clear();
             self.dim_cv_bound.clear();
             self.dim_undef_cells.clear();
+            self.dim_throw = None;
         }
         let arr_cell = self.var_cell(root);
         let det = DimDetach {
@@ -8790,7 +8822,7 @@ impl<'a> Interp<'a> {
         self.detached_dim = was;
         self.incdec_ref_ctx = saved_ctx;
         r?;
-        Ok(if post { old } else { new })
+        self.dim_raise(if post { old } else { new })
     }
 
     /// `$o[k]++` on an ArrayAccess: `&offsetGet` hands back the real
@@ -8811,12 +8843,7 @@ impl<'a> Interp<'a> {
         // cell — the write lands on storage directly (no offsetSet
         // dispatch, no overloaded-dim notice, no IS_REFERENCE mark).
         // Only a userland offsetGet override takes the engine path.
-        let native = spl_iter
-            && key.is_some()
-            && self
-                .find_method_in(&o.borrow().class, "offsetGet")
-                .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
-                .unwrap_or(true);
+        let native = spl_iter && key.is_some() && self.is_native_offsetget(&o);
         self.last_ret_cell = None;
         let was = std::mem::replace(&mut self.dim_by_ref, true);
         let r = if native {
@@ -8833,7 +8860,11 @@ impl<'a> Interp<'a> {
                 // A missed ++/-- fetch still warns Undefined array key
                 // (the by-ref create inside offsetGet stays silent) —
                 // the new bucket then materializes for the write-back.
-                self.list_missing_key(&ak)?;
+                // zend_error returns even when the handler throws (the
+                // exception stays pending), so the slot materializes
+                // before the warn's error propagates — a handler that
+                // wrote the key is still overwritten by the NULL.
+                let w = self.list_missing_key(&ak);
                 match self.ao_src_obj(&o) {
                     Some(src) => {
                         self.ao_obj_dim_write(&o, &src, &arr, ak.clone(), Value::Null);
@@ -8843,6 +8874,7 @@ impl<'a> Interp<'a> {
                     }
                 }
                 self.last_ret_cell = arr.borrow().get_cell(&ak);
+                w?;
                 Ok(Value::Null)
             })()
         } else {
