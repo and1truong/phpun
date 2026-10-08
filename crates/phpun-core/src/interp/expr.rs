@@ -2603,9 +2603,10 @@ impl<'a> Interp<'a> {
                                 // (the generic overloaded-dim flow);
                                 // only the native stub reads/writes the
                                 // backing store directly.
+                                let off_get = self.find_method_in(&o.borrow().class, "offsetGet");
                                 let native_stub = is_spl
-                                    && self
-                                        .find_method_in(&o.borrow().class, "offsetGet")
+                                    && off_get
+                                        .as_ref()
                                         .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
                                         .unwrap_or(true);
                                 if native_stub {
@@ -2624,55 +2625,16 @@ impl<'a> Interp<'a> {
                                 if self.obj_is_a(o, "ArrayAccess") {
                                     let mut res = Ok(Value::Null);
                                     if !native_stub {
-                                        // Append supplies no dim: spl's
-                                        // handler calls the override
-                                        // with zero args, the generic
-                                        // ArrayAccess path passes NULL.
-                                        let given = usize::from(!(is_spl && key.is_none()));
-                                        // An engine-invoked method
-                                        // (`zend_call_method`) reports a
-                                        // missing required param via the
-                                        // per-param bind error "#N ($x)
-                                        // not passed", not the userland
-                                        // positional count check.
-                                        let missing = self
-                                            .find_method_in(&o.borrow().class, "offsetGet")
-                                            .and_then(|(m, _)| {
-                                                m.decl
-                                                    .params
-                                                    .iter()
-                                                    .enumerate()
-                                                    .find(|(i, p)| {
-                                                        *i >= given
-                                                            && p.default.is_none()
-                                                            && !p.variadic
-                                                    })
-                                                    .map(|(i, p)| (i, p.name.clone(), m.decl.line))
-                                            });
-                                        res = if let Some((i, pname, dline)) = missing {
-                                            let cn = o.borrow().class.name().to_string();
-                                            let mut e = PhpError::uncaught(
-                                                "ArgumentCountError",
-                                                format!(
-                                                    "{}::offsetGet(): Argument #{} (${}) not passed",
-                                                    cn,
-                                                    i + 1,
-                                                    pname
-                                                ),
-                                                self.cur_line,
-                                            );
-                                            e.thrown_line = Some(dline);
-                                            Err(e)
-                                        } else {
-                                            let args = if given == 0 {
-                                                CallArgs::empty()
-                                            } else {
-                                                CallArgs::positional(vec![cell(
-                                                    key.clone().unwrap_or(Value::Null),
-                                                )])
-                                            };
-                                            self.method_invoke(o.clone(), "offsetGet", args)
-                                        };
+                                        // The engine invokes offsetGet
+                                        // (zend_call_method +
+                                        // handle_undef_args): spl `[]`
+                                        // passes an UNDEF arg, a
+                                        // variadic or required param at
+                                        // that slot arity-errors as
+                                        // `{Decl}::offsetGet():
+                                        // Argument #N[ ($x)] not
+                                        // passed`.
+                                        res = self.aa_offset_get(o, key.clone().map(cell), is_spl);
                                     }
                                     let cn = o.borrow().class.name().to_string();
                                     // zend emits the notice while the
@@ -4739,16 +4701,18 @@ impl<'a> Interp<'a> {
                     Value::Object(o) if self.obj_is_a(o, "ArrayAccess") => {
                         let o = o.clone();
                         drop(b);
-                        let kv = k
-                            .as_ref()
-                            .map(|kc| kc.borrow().clone())
-                            .unwrap_or(Value::Null);
+                        let spl_iter =
+                            matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. }));
 
                         if quiet {
                             // `??=` is isset()-based: offsetExists gates
                             // — a hit fetches via offsetGet, a miss is a
                             // Null read so the RHS/write path runs; zend
                             // never calls offsetGet for the check.
+                            let kv = k
+                                .as_ref()
+                                .map(|kc| kc.borrow().clone())
+                                .unwrap_or(Value::Null);
                             let exists = self
                                 .method_invoke(
                                     o.clone(),
@@ -4761,9 +4725,17 @@ impl<'a> Interp<'a> {
                                 return Ok(Value::Null);
                             }
                         }
-                        let iv = self
-                            .method_invoke(o, "offsetGet", CallArgs::positional(vec![cell(kv)]))
-                            .unwrap_or(Value::Null);
+                        let iv = if let Some(kc) = k {
+                            let kv = kc.borrow().clone();
+                            self.method_invoke(o, "offsetGet", CallArgs::positional(vec![cell(kv)]))
+                                .unwrap_or(Value::Null)
+                        } else {
+                            // spl `[]` reads through the UNDEF-arg
+                            // engine call — its arity error is real
+                            // (zend's handle_undef_args), it must not be
+                            // swallowed like a missing-bucket miss.
+                            self.aa_offset_get(&o, None, spl_iter)?
+                        };
                         c = cell(iv);
                         continue;
                     }
@@ -5506,15 +5478,12 @@ impl<'a> Interp<'a> {
                 self.cur_line,
             ));
         }
+        let spl_iter = matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. }));
         self.last_ret_cell = None;
         // zend evaluates this read as BP_VAR_RW — a missing bucket is
         // created silently inside offsetGet.
         let was = std::mem::replace(&mut self.dim_by_ref, true);
-        let rv = self.method_invoke(
-            o.clone(),
-            "offsetGet",
-            CallArgs::positional(vec![key.unwrap_or_else(|| cell(Value::Null))]),
-        );
+        let rv = self.aa_offset_get(&o, key, spl_iter);
         self.dim_by_ref = was;
         match self.last_ret_cell.take() {
             Some(rc) => {
@@ -5522,22 +5491,106 @@ impl<'a> Interp<'a> {
                 Ok(rc)
             }
             None => {
-                // offsetGet returned by value — the element can't be
-                // aliased, so writes through this fetch silently
-                // no-op. zend notices the indirect modification only
-                // when the fetched value isn't itself an object
-                // (object-typed elements carry their own storage).
-                let v = rv?;
-                if !matches!(v, Value::Object(_)) {
-                    let cn = o.borrow().class.name().to_string();
-                    self.notice(&format!(
-                        "Indirect modification of overloaded element of {} has no effect",
-                        cn
-                    ))?;
+                // spl's overloaded-dim machinery notices the indirect
+                // modification even when the engine call threw (zend
+                // emits it while the error is pending); a plain
+                // ArrayAccess only notices when the fetched value
+                // isn't itself an object (object-typed elements carry
+                // their own storage).
+                match rv {
+                    Err(e) => {
+                        if spl_iter {
+                            let cn = o.borrow().class.name().to_string();
+                            self.notice(&format!(
+                                "Indirect modification of overloaded element of {} has no effect",
+                                cn
+                            ))?;
+                        }
+                        Err(e)
+                    }
+                    Ok(v) => {
+                        if !matches!(v, Value::Object(_)) {
+                            let cn = o.borrow().class.name().to_string();
+                            self.notice(&format!(
+                                "Indirect modification of overloaded element of {} has no effect",
+                                cn
+                            ))?;
+                        }
+                        Ok(cell(v))
+                    }
                 }
-                Ok(cell(v))
             }
         }
+    }
+
+    /// Engine-invoked `offsetGet` — zend calls the override through
+    /// `zend_call_method`; on spl classes `[]` hands it an UNDEF arg
+    /// (`spl_array_read_dimension_ex` → `zend_handle_undef_args`) so
+    /// a required — or variadic — param at that slot arity-errors
+    /// `{DeclCls}::offsetGet(): Argument #N[ ($x)] not passed`, a
+    /// default fills in, and native storage returns uninitialized.
+    /// Other ArrayAccess objects get a defined NULL for `[]`.
+    fn aa_offset_get(
+        &mut self,
+        o: &Rc<RefCell<PhpObject>>,
+        key: Option<Cell>,
+        spl: bool,
+    ) -> Result<Value, PhpError> {
+        let Some((m, dc)) = self.find_method_in(&o.borrow().class, "offsetGet") else {
+            return Ok(Value::Null);
+        };
+        let undef = spl && key.is_none();
+        if undef && m.decl.body.is_empty() && m.decl.line == 0 {
+            return Ok(Value::Null);
+        }
+        let given = usize::from(key.is_some());
+        if let Some((i, pname)) = m
+            .decl
+            .params
+            .iter()
+            .enumerate()
+            .find(|(i, p)| {
+                *i >= given && p.default.is_none() && (!p.variadic || (undef && *i == given))
+            })
+            .map(|(i, p)| {
+                (
+                    i,
+                    if p.variadic {
+                        String::new()
+                    } else {
+                        format!(" (${})", p.name)
+                    },
+                )
+            })
+        {
+            let mut e = PhpError::uncaught(
+                "ArgumentCountError",
+                format!(
+                    "{}::offsetGet(): Argument #{}{} not passed",
+                    dc.name(),
+                    i + 1,
+                    pname
+                ),
+                self.cur_line,
+            );
+            e.thrown_line = Some(m.decl.line);
+            return Err(e);
+        }
+        let args = if undef {
+            CallArgs::empty()
+        } else {
+            CallArgs::positional(vec![key.unwrap_or_else(|| cell(Value::Null))])
+        };
+        let rv = self.method_invoke(o.clone(), "offsetGet", args);
+        // A value-returning offsetGet can't bind — only a `&`-declared
+        // callee leaves a consumable return cell; anything still in
+        // last_ret_cell after a non-`&` call is a stale cell the callee
+        // read internally (e.g. an inner `$this->x['k']`), and honoring
+        // it would bind the caller's `=&` into that inner bucket.
+        if !m.decl.by_ref {
+            self.last_ret_cell = None;
+        }
+        rv
     }
 
     fn index_cell(&mut self, e: &Expr, i: Option<&Expr>) -> Result<Cell, PhpError> {
@@ -6573,17 +6626,20 @@ impl<'a> Interp<'a> {
                 }
                 let base = self.eval(e)?;
                 let key = match i {
-                    Some(ie) => self.eval(ie)?,
-                    None => return self.fail(PhpError::fatal("[] used in read context", 0)),
+                    Some(ie) => Some(self.eval(ie)?),
+                    None => None,
                 };
                 // `++`/`--` on an ArrayAccess offset writes the by-ref
                 // offsetGet cell directly — no offsetSet call
-                // (typed_properties_065).
+                // (typed_properties_065); `[]` appends into a temp.
                 if let Value::Object(o) = &base {
                     if self.obj_is_a(o, "ArrayAccess") {
                         return self.incdec_aa(o.clone(), key, delta, post);
                     }
                 }
+                let Some(key) = key else {
+                    return self.fail(PhpError::fatal("[] used in read context", 0));
+                };
                 // `++`/`--` never lands on a string offset — zend
                 // validates the key, then the catchable Error beats
                 // the non-numeric-increment deprecation the byte
@@ -6895,7 +6951,11 @@ impl<'a> Interp<'a> {
             Value::Object(o) if self.obj_is_a(o, "ArrayAccess") => {
                 let o = o.clone();
                 let key = match idxs {
-                    [Some(ie)] => self.eval(ie)?,
+                    [Some(ie)] => Some(self.eval(ie)?),
+                    // `[]` on an overloaded object reads through the
+                    // engine's dim machinery like `+=` — not a fatal
+                    // (the temp result just can't write back).
+                    [None] => None,
                     _ => return self.fail(PhpError::fatal("[] used in read context", 0)),
                 };
                 return self.incdec_aa(o, key, delta, post);
@@ -6967,19 +7027,29 @@ impl<'a> Interp<'a> {
     fn incdec_aa(
         &mut self,
         o: Rc<RefCell<PhpObject>>,
-        key: Value,
+        key: Option<Value>,
         delta: i64,
         post: bool,
     ) -> Result<Value, PhpError> {
+        let append = key.is_none();
+        let spl_iter = matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. }));
         self.last_ret_cell = None;
         let was = std::mem::replace(&mut self.dim_by_ref, true);
-        let rv = self.method_invoke(
-            o.clone(),
-            "offsetGet",
-            CallArgs::positional(vec![cell(key.clone())]),
-        );
+        let rv = self.aa_offset_get(&o, key.clone().map(cell), spl_iter);
         self.dim_by_ref = was;
-        let rv = rv?;
+        // spl's overloaded-dim notice fires even when the engine call
+        // threw — zend emits it while the error is still pending.
+        let rv = match rv {
+            Err(e) if spl_iter => {
+                let cn = o.borrow().class.name().to_string();
+                self.notice(&format!(
+                    "Indirect modification of overloaded element of {} has no effect",
+                    cn
+                ))?;
+                return Err(e);
+            }
+            r => r?,
+        };
         let rc = self.last_ret_cell.take();
         if let Some(c) = &rc {
             self.mark_ref(c);
@@ -7035,11 +7105,20 @@ impl<'a> Interp<'a> {
                 let nv = self.typed_slot_store(&c, new.clone())?;
                 *c.borrow_mut() = nv;
             }
+            None if append => {
+                // `[]++` fetched a temp it can't write back — zend just
+                // notices the indirect modification.
+                let cn = o.borrow().class.name().to_string();
+                self.notice(&format!(
+                    "Indirect modification of overloaded element of {} has no effect",
+                    cn
+                ))?;
+            }
             None => {
                 self.method_invoke(
                     o,
                     "offsetSet",
-                    CallArgs::positional(vec![cell(key), cell(new.clone())]),
+                    CallArgs::positional(vec![cell(key.unwrap()), cell(new.clone())]),
                 )?;
             }
         }

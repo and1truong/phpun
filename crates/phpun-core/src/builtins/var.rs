@@ -1327,13 +1327,23 @@ pub(crate) fn php_unserialize(
                 }
                 return Ok(this);
             }
-            // The `previous` mirror key: whichever base throwable class
-            // declared it on this object — `\0Error\0previous` on
-            // Errors, `\0Exception\0previous` elsewhere.
-            let prev_key: &[u8] = if it.obj_implements(&obj, "error") {
-                b"\0Error\0previous"
+            // A Throwable's `previous` lives in the exception internal
+            // (getPrevious reads it, not the prop slot) — zend routes
+            // every prop-key form resolving to the base's declared
+            // private `previous` into that C-field, enforcing
+            // `?Throwable` (see unserial_resolve_key).
+            let prev_slot = format!(
+                "\0{}\0previous",
+                if it.obj_implements(&obj, "error") {
+                    "Error"
+                } else {
+                    "Exception"
+                }
+            );
+            let prev_base = if it.obj_implements(&obj, "error") {
+                "Error"
             } else {
-                b"\0Exception\0previous"
+                "Exception"
             };
             for _ in 0..n {
                 let k = php_unserialize_key(s, pos)?;
@@ -1379,25 +1389,39 @@ pub(crate) fn php_unserialize(
                     return Err(());
                 }
                 let v = php_unserialize(it, s, pos, err, vhash)?;
+                // zend resolves each serialized key into the canonical
+                // declared-prop name (mangled or plain) before writing —
+                // mismatched scopes stay verbatim dynamic props.
+                let canon = it.unserial_resolve_key(&obj, ks.as_ref());
                 let mut ob = obj.borrow_mut();
-                // A Throwable's `previous` lives in the exception
-                // internal (getPrevious reads it, not the prop slot)
-                // — zend's C-field mirrors the serialized member the
-                // base class declared. Match the raw key: a demangled
-                // compare would let a subclass-private, protected, or
-                // plain `previous` prop clobber the real chain (and
-                // order-dependently null it out).
                 if let Some(crate::value::ObjectInternal::Exception { previous, .. }) =
                     &mut ob.internal
                 {
-                    if ks.as_ref() == prev_key {
-                        *previous = match &*v.borrow() {
-                            Value::Object(o) => Some(Value::Object(o.clone())),
-                            _ => None,
-                        };
+                    if canon.as_deref() == Some(prev_slot.as_str()) {
+                        match &*v.borrow() {
+                            Value::Null => *previous = None,
+                            Value::Object(o) if it.obj_implements(o, "throwable") => {
+                                *previous = Some(Value::Object(o.clone()))
+                            }
+                            _ => {
+                                let tn = it.zval_type_name(&v.borrow());
+                                let mut e = PhpError::uncaught(
+                                    "TypeError",
+                                    format!(
+                                        "Cannot assign {} to property {}::$previous of type ?Throwable",
+                                        tn, prev_base
+                                    ),
+                                    it.cur_line,
+                                );
+                                e.thrown_line = Some(it.cur_line);
+                                *err = Some(e);
+                                return Err(());
+                            }
+                        }
+                        continue;
                     }
                 }
-                let key = crate::value::lossy(&ks).into_owned();
+                let key = canon.unwrap_or_else(|| crate::value::lossy(&ks).into_owned());
                 if !ob.prop_order.contains(&key) {
                     ob.prop_order.push(key.clone());
                 }
