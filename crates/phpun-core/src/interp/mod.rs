@@ -92,10 +92,11 @@ pub struct CallArgs {
     /// alive until the call returns, so its table stays charged
     /// through the builtin's own allocs).
     pub hold: Vec<Value>,
-    /// Arg-stack page charges — each `...` unpack commits a
-    /// roundup-256KB(n*16) zend_vm_stack segment, live until the
-    /// frame dies. Rc-shared through CallArgs clones so the release
-    /// fires once at the last clone's drop.
+    /// Arg-stack tokens — each `...` unpack site pushes `n*16` bytes
+    /// onto the request-scoped vm_stack arena (Interp::arg_stack_bytes)
+    /// and commits only the 256KB pages its push newly crosses. The
+    /// Rc dies with the frame's last CallArgs clone; mem_sweep then
+    /// releases the marginal pages and repays the arena counter.
     pub arg_stack: Vec<Rc<ArgStack>>,
     /// Diagnostic line of the last-evaluated argument — the deepest
     /// line marker reached while building this list. Zend sites the
@@ -104,9 +105,10 @@ pub struct CallArgs {
     pub end_line: usize,
 }
 
-/// One arg-stack page charge carried by a CallArgs — registered via
-/// mem_track at build time, released by mem_sweep once the frame's
-/// last CallArgs clone dies (see `arg_stack`).
+/// Token for one `...` unpack site's push onto the shared vm_stack
+/// arena — the payload is its arg bytes (`n*16`); the marginal page
+/// charge lives in its MemCharge, released once the frame's last
+/// CallArgs clone dies (see `arg_stack`).
 pub struct ArgStack(pub i64);
 
 impl CallArgs {
@@ -189,6 +191,11 @@ pub struct Frame {
     /// Zend renders it `[internal function]: fn(args)` in backtraces
     /// (the resume call, not a userland call, carries the visible frame).
     gen_body: bool,
+    /// vm_stack arg-page tokens moved here from CallArgs at bind —
+    /// zend keeps a call's arg zvals on vm_stack until the FRAME is
+    /// destroyed, so the charges outlive arg binding and die with
+    /// this frame's pop.
+    arg_stack: Vec<Rc<ArgStack>>,
 }
 
 impl Frame {
@@ -212,6 +219,7 @@ impl Frame {
             statics_unit: None,
             decl_site: 0,
             gen_body: false,
+            arg_stack: Vec::new(),
         }
     }
 }
@@ -238,6 +246,9 @@ struct MemCharge {
     inner: u64,
     huge: u64,
     table_req: u64,
+    /// vm_stack arg bytes this charge added to `arg_stack_bytes` —
+    /// ArgStack entries only; repaid to the arena counter at sweep.
+    arg_bytes: i64,
     probe: MemProbe,
 }
 
@@ -942,6 +953,12 @@ pub struct Interp<'a> {
     mem_tracked: HashMap<usize, MemCharge>,
     /// High-water mark of mem_used — memory_get_peak_usage().
     pub(crate) mem_peak: u64,
+    /// Live bytes on zend's ONE request-scoped vm_stack arena for
+    /// unpacked args — cumulative `n*16` across all live calls (NOT
+    /// per-frame pages); each unpack site commits only the 256KB
+    /// pages its push newly crosses, released at sweep when the
+    /// site's ArgStack dies (unwinding is LIFO ⇒ marginal = exact).
+    arg_stack_bytes: i64,
     /// Registry size that trips the next dead-entry sweep — bounds the
     /// tracker footprint for alloc-churn loops.
     mem_sweep_at: usize,
@@ -1700,6 +1717,7 @@ impl<'a> Interp<'a> {
             mem_in_chunk: MM_BASE_CHUNK,
             mem_huge: 0,
             mem_real_peak: MM_CHUNK,
+            arg_stack_bytes: 0,
             mem_tracked: HashMap::new(),
             mem_peak: MM_BASE_USED,
             mem_sweep_at: 4096,
@@ -3719,10 +3737,12 @@ impl<'a> Interp<'a> {
                     self.mem_in_chunk = self.mem_in_chunk.saturating_sub(e.get().inner);
                     self.mem_huge = self.mem_huge.saturating_sub(e.get().huge);
                     self.mem_used = self.mem_used.saturating_sub(e.get().inner + e.get().huge);
+                    self.arg_stack_bytes -= e.get().arg_bytes;
                     let c = e.get_mut();
                     c.inner = 0;
                     c.huge = 0;
                     c.table_req = 0;
+                    c.arg_bytes = 0;
                     let weak = Rc::downgrade(rc);
                     c.probe = Box::new(move || weak.strong_count() > 0);
                 }
@@ -3735,6 +3755,7 @@ impl<'a> Interp<'a> {
                     inner,
                     huge,
                     table_req: 0,
+                    arg_bytes: 0,
                     probe: Box::new(move || weak.strong_count() > 0),
                 });
             }
@@ -3778,6 +3799,7 @@ impl<'a> Interp<'a> {
                     inner,
                     huge,
                     table_req: req,
+                    arg_bytes: 0,
                     probe: Box::new(move || weak.strong_count() > 0),
                 });
             }
@@ -3820,18 +3842,21 @@ impl<'a> Interp<'a> {
     pub(crate) fn mem_sweep(&mut self) {
         let mut inner = 0u64;
         let mut huge = 0u64;
+        let mut arg_bytes = 0i64;
         self.mem_tracked.retain(|_, c| {
             if (c.probe)() {
                 true
             } else {
                 inner += c.inner;
                 huge += c.huge;
+                arg_bytes += c.arg_bytes;
                 false
             }
         });
         self.mem_in_chunk = self.mem_in_chunk.saturating_sub(inner);
         self.mem_huge = self.mem_huge.saturating_sub(huge);
         self.mem_used = self.mem_used.saturating_sub(inner + huge);
+        self.arg_stack_bytes -= arg_bytes;
         self.mem_sweep_at = self.mem_tracked.len() + 4096;
     }
 
@@ -3870,6 +3895,7 @@ impl<'a> Interp<'a> {
             self.mem_in_chunk = self.mem_in_chunk.saturating_sub(c.inner);
             self.mem_huge = self.mem_huge.saturating_sub(c.huge);
             self.mem_used = self.mem_used.saturating_sub(c.inner + c.huge);
+            self.arg_stack_bytes -= c.arg_bytes;
         }
     }
 
@@ -3942,6 +3968,7 @@ impl<'a> Interp<'a> {
                 inner,
                 huge,
                 table_req: 0,
+                arg_bytes: 0,
                 probe: Box::new(move || weak.strong_count() > 0),
             },
         );

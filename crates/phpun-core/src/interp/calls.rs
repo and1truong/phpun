@@ -326,8 +326,12 @@ impl<'a> Interp<'a> {
                     // `...$ary` may hand out element cells for by-ref
                     // binding — Zend cow-separates $ary first so other
                     // variables sharing the array keep the old cells
-                    // (named_params/unpack's $ary2 stays 0).
-                    if Rc::strong_count(a) > 1 {
+                    // (named_params/unpack's $ary2 stays 0). By-value
+                    // callees never alias the cells: zend addrefs the
+                    // zvals straight onto vm_stack, so the separation
+                    // (and its doubled arData) is pure churn — skip it.
+                    if Rc::strong_count(a) > 1 && (decl.is_empty() || decl.iter().any(|p| p.by_ref))
+                    {
                         let mut na = a.borrow().clone();
                         for (_, c) in na.entries.iter_mut() {
                             let v = c.borrow().clone();
@@ -366,18 +370,30 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                // zend's SEND_UNPACK commits vm_stack pages for the
-                // copied args (256KB segments over n*16) while the
-                // source zval is still live, then frees the zval —
-                // so the emalloc guard here sees the source table,
-                // and the stack pages stay charged until the frame
-                // dies (ArgStack drop at CallArgs teardown).
+                // zend's vm_stack is ONE request arena: copied args
+                // (n*16 each) accumulate across ALL live calls and it
+                // grows 256KB pages on the cumulative total — charge
+                // only the marginal pages this push crosses, not a
+                // page per frame. Committed while the source zval is
+                // still live (the emalloc guard sees the source table),
+                // released by mem_sweep once the frame's last CallArgs
+                // clone dies — unwinding is LIFO, so each site's
+                // marginal delta is exactly what zend frees.
                 let n = (out.cells.len() + out.named.len() - stack0) as i64;
                 if n > 0 {
-                    let seg = (n * 16 + 262_143) & !262_143;
-                    let arc = Rc::new(ArgStack(seg));
-                    // Charged until the frame's last CallArgs clone dies.
-                    self.mem_track(&arc, seg as u64);
+                    let bytes = n * 16;
+                    let live = self.arg_stack_bytes;
+                    let delta =
+                        ((live + bytes + 262_143) & !262_143) - ((live + 262_143) & !262_143);
+                    self.arg_stack_bytes = live + bytes;
+                    let arc = Rc::new(ArgStack(bytes));
+                    self.mem_track(&arc, delta as u64);
+                    if let Some(c) = self
+                        .mem_tracked
+                        .get_mut(&(Rc::as_ptr(&arc) as *const u8 as usize))
+                    {
+                        c.arg_bytes += bytes;
+                    }
                     out.arg_stack.push(arc);
                 }
                 continue;
@@ -2191,9 +2207,16 @@ impl<'a> Interp<'a> {
     fn bind_and_run(
         &mut self,
         decl: &FunctionDecl,
-        args: CallArgs,
+        mut args: CallArgs,
         unused: Vec<Cell>,
     ) -> Result<Value, PhpError> {
+        // zend frees a call's vm_stack arg space when the FRAME dies,
+        // not when args finish binding — keep the unpack page tokens
+        // on the pushed frame so their charge outlives bind_and_run_inner's
+        // CallArgs drop.
+        if let Some(f) = self.stack.last_mut() {
+            f.arg_stack.append(&mut args.arg_stack);
+        }
         // Callee `Stmt::Line` markers must not leak into the caller:
         // diagnostics after the call report the call-site line.
         let saved_line = self.cur_line;
@@ -4225,10 +4248,23 @@ impl<'a> Interp<'a> {
                             arr.set(ArrKey::Str(n.clone().into()), c.borrow().clone());
                         }
                     }
-                    binds.push((
-                        p.name.clone(),
-                        cell(Value::Array(Rc::new(RefCell::new(arr)))),
-                    ));
+                    // zend packs the spill args into a fresh arData at
+                    // bind — a real emalloc the frame pays until teardown;
+                    // the charge model must see it too (it's the figure
+                    // oracle's fatals report: ht_req(n, packed)).
+                    let packed = arr.entries.iter().all(|(k, _)| matches!(k, ArrKey::Int(_)));
+                    let n = arr.entries.len();
+                    let rc = Rc::new(RefCell::new(arr));
+                    if n > 0 {
+                        // The pack's emalloc runs inside the callee
+                        // frame — zend attributes its OOM to the
+                        // callee's decl line, not the send site.
+                        let pl = self.cur_line;
+                        self.cur_line = decl.line;
+                        self.mem_realloc(&rc, Self::ht_req(n, packed));
+                        self.cur_line = pl;
+                    }
+                    binds.push((p.name.clone(), cell(Value::Array(rc))));
                 } else if let Some((v, refable, trav)) = args
                     .cells
                     .get(i)
