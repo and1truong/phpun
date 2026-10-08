@@ -956,7 +956,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                         // zend emallocs each result zend_string (bug81243).
                         let nv = Value::bytes(v);
                         if let Value::Str(s) = &nv {
-                            it.mem_track(s, s.len() as u64 + 25);
+                            it.mem_track(&s.rc, s.len() as u64 + 25);
                         }
                         out.set(k, nv);
                     }
@@ -968,7 +968,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                     Some((_, Some(v))) => {
                         let nv = Value::bytes(v);
                         if let Value::Str(s) = &nv {
-                            it.mem_track(s, s.len() as u64 + 25);
+                            it.mem_track(&s.rc, s.len() as u64 + 25);
                         }
                         nv
                     }
@@ -1258,7 +1258,7 @@ impl PhpRe {
         s: &[u8],
         offset: usize,
         global: bool,
-        subj_rc: Option<Rc<[u8]>>,
+        subj_rc: Option<crate::value::PhpStr>,
         it: &mut Interp,
     ) -> (Vec<PhpCap>, i32) {
         match self {
@@ -1272,7 +1272,7 @@ impl PhpRe {
                 let known_valid = r.utf8
                     && subj_rc.as_ref().is_some_and(|rc| {
                         it.valid_utf8
-                            .contains_key(&(Rc::as_ptr(rc) as *const u8 as usize))
+                            .contains_key(&(Rc::as_ptr(&rc.rc) as *const u8 as usize))
                     })
                     && (offset == s.len() || (s[offset] & 0xC0) != 0x80);
                 let (v, e) = r.match_all(
@@ -1295,7 +1295,7 @@ impl PhpRe {
                 if r.utf8 && e == 0 && offset == 0 && !known_valid {
                     if let Some(rc) = subj_rc {
                         it.valid_utf8
-                            .insert(Rc::as_ptr(&rc) as *const u8 as usize, rc);
+                            .insert(Rc::as_ptr(&rc.rc) as *const u8 as usize, rc.rc.clone());
                     }
                 }
                 (

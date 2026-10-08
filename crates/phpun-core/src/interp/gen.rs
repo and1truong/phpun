@@ -169,7 +169,7 @@ impl<'a> Interp<'a> {
             | Expr::PostDec(e)
             | Expr::Empty(e)
             | Expr::Print(e)
-            | Expr::VarVar(e)
+            | Expr::VarVar(e, _)
             | Expr::Paren(e)
             | Expr::Fcc(e)
             | Expr::Unpack(e)
@@ -179,7 +179,7 @@ impl<'a> Interp<'a> {
             Expr::Ternary { c, t, f } => Self::expr_yield_kind(c)
                 .or_else(|| t.as_ref().and_then(|t| Self::expr_yield_kind(t)))
                 .or_else(|| Self::expr_yield_kind(f)),
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, .. } => {
                 Self::expr_yield_kind(name).or_else(|| args.iter().find_map(Self::expr_yield_kind))
             }
             Expr::MethodCall {
@@ -193,7 +193,9 @@ impl<'a> Interp<'a> {
             Expr::StaticCall { class, args, .. } => {
                 Self::expr_yield_kind(class).or_else(|| args.iter().find_map(Self::expr_yield_kind))
             }
-            Expr::StaticCallDyn { class, name, args } => Self::expr_yield_kind(class)
+            Expr::StaticCallDyn {
+                class, name, args, ..
+            } => Self::expr_yield_kind(class)
                 .or_else(|| Self::expr_yield_kind(name))
                 .or_else(|| args.iter().find_map(Self::expr_yield_kind)),
             Expr::Index { e, i } => Self::expr_yield_kind(e)
@@ -220,7 +222,7 @@ impl<'a> Interp<'a> {
                     .and_then(|k| Self::expr_yield_kind(k))
                     .or_else(|| Self::expr_yield_kind(v))
             }),
-            Expr::Match { subject, arms } => Self::expr_yield_kind(subject).or_else(|| {
+            Expr::Match { subject, arms, .. } => Self::expr_yield_kind(subject).or_else(|| {
                 arms.iter().find_map(|a| {
                     a.conds
                         .iter()
@@ -228,7 +230,7 @@ impl<'a> Interp<'a> {
                         .or_else(|| Self::expr_yield_kind(&a.result))
                 })
             }),
-            Expr::New { class, args } => {
+            Expr::New { class, args, .. } => {
                 Self::expr_yield_kind(class).or_else(|| args.iter().find_map(Self::expr_yield_kind))
             }
             Expr::ClassConst { class, .. } => Self::expr_yield_kind(class),
@@ -383,6 +385,7 @@ impl<'a> Interp<'a> {
         if !captures.is_empty() {
             self.pending_gen_captures = captures;
         }
+        self.pending_gen_body = true;
         let r = self.invoke_fn_run(
             &decl,
             args,
@@ -869,7 +872,9 @@ impl<'a> Interp<'a> {
             frames.push(format!(
                 "{}({}): {}({})",
                 self.diag_file(),
-                self.cur_line,
+                // Zend's FE ops carry the foreach header's line —
+                // cur_line has already drifted into the loop body.
+                self.gen_iter_site.unwrap_or(self.cur_line),
                 fn_name,
                 call_args
             ));
@@ -1028,28 +1033,25 @@ impl<'a> Interp<'a> {
         args: &[crate::value::Cell],
         include_method: bool,
     ) -> Vec<String> {
-        let fn_name = {
+        let (fn_name, call_args) = {
             let st = state.borrow();
             match &st.setup {
-                GenSetup::Invoke { decl, .. } => decl.name.clone(),
+                GenSetup::Invoke { decl, args, .. } => (
+                    decl.name.clone(),
+                    args.cells
+                        .iter()
+                        .map(|c| crate::value::trace_arg(&c.borrow()))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
             }
         };
-        let mut frames = vec![format!("[internal function]: {}()", fn_name)];
-        if include_method {
-            // Zend renders the resume-call args (`Generator->send(5)`).
-            let args_str = args
-                .iter()
-                .map(|c| crate::value::trace_arg(&c.borrow()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            frames.push(format!(
-                "{}({}): Generator->{}({})",
-                self.diag_file(),
-                self.cur_line,
-                method,
-                args_str
-            ));
-        }
+        let mut frames = vec![format!("[internal function]: {}({})", fn_name, call_args)];
+        // The userland `Generator->{m}()` call frame is already on
+        // call_trace (pushed by generator_method) — the walk below
+        // renders it with its real call site; engine resumes pushed
+        // none (their consumer reports the resume instead).
+        let _ = (method, args, include_method);
         for fr in self.call_trace.iter().rev() {
             if crate::value::trace_frame_hidden(fr) {
                 continue;
@@ -1081,23 +1083,12 @@ impl<'a> Interp<'a> {
         args: &[crate::value::Cell],
         msg: &str,
     ) -> PhpError {
-        let userland = self.iter_calls == 0 && self.gen_internal_resume == 0;
-        if userland {
-            self.call_trace.push(TraceFrame {
-                function: method.to_string(),
-                class: Some("Generator".into()),
-                ty: "->".into(),
-                file: self.diag_file(),
-                line: self.cur_line as u32,
-                args: args.to_vec(),
-                named_args: Vec::new(),
-                internal: false,
-            });
-        }
+        // The call's own frame is already on call_trace — pushed by
+        // generator_method for userland calls; engine resumes carry
+        // no call frame (Zend reports the real consumer frame).
+        let _ = method;
+        let _ = args;
         let v = self.exception(class, msg);
-        if userland {
-            self.call_trace.pop();
-        }
         self.throw(v)
     }
 
@@ -1119,6 +1110,52 @@ impl<'a> Interp<'a> {
             && (self.gen_collect_base.is_some()
                 || self.gen_internal_resume > 0
                 || self.iter_calls > 0);
+        // A userland `Generator->{m}()` is a real call — Zend emits
+        // its frame in backtraces (`FILE(n): Generator->send(5)`);
+        // engine-driven resumes (foreach/iterator_*) aren't calls.
+        // The SPL iterator-wrapper stubs are plain-PHP stand-ins for
+        // Zend's C-level delegation — `IteratorIterator->next()`
+        // driving the inner generator isn't a userland call either,
+        // so it emits neither the resume frame nor its `eval()'d
+        // code` pseudo-site.
+        // Transitive provenance: SPL stub frames chain by DELEGATION —
+        // II-of-II/subclass/AppendIterator hops all run through another
+        // SPL-prelude frame as the immediate caller (is_a walks the
+        // parent chain, so userland SPL subclasses count too). Oracle:
+        // a resume initiated by a non-SPL frame inside an SPL call —
+        // e.g. CallbackFilterIterator's cb calling $gen->next() — IS a
+        // userland call and keeps its resume frame, so only the
+        // immediate caller's provenance gates this.
+        let caller_is_spl_stub = self.stack.last().is_some_and(|f| {
+            // Executing prelude code too — a userland override in
+            // an SPL subclass keeps real call sites.
+            f.file.contains("eval()'d code")
+                && f.decl_class
+                    .as_ref()
+                    .or(f.scope_class.as_ref())
+                    .is_some_and(|c| self.class_is_spl_prelude(c))
+        });
+        let userland = self.iter_calls == 0 && self.gen_internal_resume == 0 && !caller_is_spl_stub;
+        if userland {
+            self.call_trace.push(TraceFrame {
+                function: name.to_string(),
+                class: Some("Generator".into()),
+                ty: "->".into(),
+                file: self.diag_file(),
+                line: self.cur_line as u32,
+                args: args.cells.clone(),
+                named_args: args
+                    .named
+                    .iter()
+                    .map(|(n, c, ..)| (n.clone(), c.clone()))
+                    .collect(),
+                internal: true,
+                visible: true,
+                named_dispatch: false,
+                gen_resume: true,
+                gen_body: false,
+            });
+        }
         let saved_site = self.gen_resume_site;
         if !engine_nested {
             self.gen_resume_site = Some(self.cur_line);
@@ -1126,6 +1163,9 @@ impl<'a> Interp<'a> {
         let r = self.generator_method_body(obj, name, args);
         if !engine_nested {
             self.gen_resume_site = saved_site;
+        }
+        if userland {
+            self.call_trace.pop();
         }
         r
     }

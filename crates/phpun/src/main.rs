@@ -297,7 +297,9 @@ fn run_script(args: &[String]) -> ExitCode {
     };
     let mut it = Interp::new(&abs);
     // `-n`/`--no-php-ini`: zend falls back to compiler ini defaults —
-    // log_errors off, so the 'PHP Fatal error' stderr copy vanishes.
+    // the binary's compiled-in default is log_errors=0 (the dist
+    // php.ini turns it on), so -n leaves the `PHP Fatal error:` stderr
+    // copy off entirely (new_oom's merged 2>&1 stream).
     if no_ini {
         it.ini.insert("log_errors".into(), "0".into());
     }
@@ -316,16 +318,44 @@ fn run_script(args: &[String]) -> ExitCode {
     // $argv[0] is the as-invoked path (or "Standard input code" for
     // -r/stdin); everything collected after the file/code is $argv[1..].
     it.set_script_args(svar_name, &script_args);
+    // Stream output to the real fds so stderr notices interleave with
+    // stdout in PHP's order; `phpun test`/`serve` keep buffered capture.
+    // Set before -d application so a refused-limit warning streams
+    // ahead of the script's output like zend's does.
+    it.live_io = true;
     for kv in ini {
         if let Some((k, v)) = kv.split_once('=') {
-            it.ini.insert(k.trim().to_string(), v.trim().to_string());
+            if k.trim() == "memory_limit" {
+                // A -d limit under zend's 2M bootstrap floor refuses
+                // at startup: 'in Unknown on line 0' warning pair and
+                // the previous value stays in effect.
+                let prev = it.ini.get("memory_limit").cloned();
+                it.ini
+                    .insert("memory_limit".to_string(), v.trim().to_string());
+                let lim = it.ini_bytes("memory_limit");
+                if lim > 0 && lim <= 2097152 {
+                    let msg = format!(
+                        "Failed to set memory limit to {} bytes (Current memory usage is 2097152 bytes)",
+                        lim
+                    );
+                    eprintln!("PHP Warning:  {} in Unknown on line 0", msg);
+                    it.emit(&format!("Warning: {} in Unknown on line 0\n", msg));
+                    match prev {
+                        Some(p) => {
+                            it.ini.insert("memory_limit".to_string(), p);
+                        }
+                        None => {
+                            it.ini.remove("memory_limit");
+                        }
+                    }
+                }
+            } else {
+                it.ini.insert(k.trim().to_string(), v.trim().to_string());
+            }
         } else {
             it.ini.insert(kv, String::new());
         }
     }
-    // Stream output to the real fds so stderr notices interleave with
-    // stdout in PHP's order; `phpun test`/`serve` keep buffered capture.
-    it.live_io = true;
     let res = if code.is_some() {
         // `-r` code is tagless source parsed in-script like eval()'d
         // code — a `<?php` is a syntax error, never an open tag.

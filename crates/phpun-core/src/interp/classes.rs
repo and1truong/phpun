@@ -1443,11 +1443,14 @@ impl<'a> Interp<'a> {
             ));
         }
         let req = |ms: &MethodDecl| {
+            // Optional-before-required counts as required (zend's
+            // "implicitly required"), matching call-site arity.
             ms.decl
                 .params
                 .iter()
-                .filter(|p| p.default.is_none() && !p.variadic)
-                .count()
+                .rposition(|p| p.default.is_none() && !p.variadic)
+                .map(|i| i + 1)
+                .unwrap_or(0)
         };
         let (ir, ar) = (req(impl_m), req(abs_m));
         let count_ok = ir <= ar
@@ -3588,6 +3591,9 @@ impl<'a> Interp<'a> {
         // bulk of `while(true) { $a[] = new X }` growth. Tracked: the
         // charge releases when the object dies (efree).
         let bytes = 72 + 16 * o.props.len() as u64;
+        // The arena counter counts every shell too — a flat cost per
+        // allocation (new_oom), decremented at Drop like zend's arena.
+        crate::value::obj_charge();
         let rc = Rc::new(RefCell::new(o));
         self.mem_track(&rc, bytes);
         let id = self.next_obj_id(&rc);
@@ -3728,7 +3734,7 @@ impl<'a> Interp<'a> {
         let cls = match cls {
             Some(c) => c,
             None => {
-                return Ok(Value::Object(Rc::new(RefCell::new(PhpObject {
+                return Ok(Value::Object(self.alloc_obj(PhpObject {
                     class: Rc::new(PhpClass {
                         decl: Rc::new(ClassDecl {
                             name: lname.into(),
@@ -3755,7 +3761,7 @@ impl<'a> Interp<'a> {
                     id: 0,
                     internal: None,
                     unset_props: std::collections::HashSet::new(),
-                }))))
+                })))
             }
         };
         // Collect decl chain (self + parents, parent-first for prop order).
@@ -3868,9 +3874,9 @@ impl<'a> Interp<'a> {
                 .unwrap_or_else(|| self.diag_file());
             Some(ObjectInternal::Exception {
                 file: exec_file,
-                line: self.cur_line as u32,
+                line: self.send_line.unwrap_or(self.cur_line) as u32,
                 trace: String::new(),
-                thrown: self.cur_line as u32,
+                thrown: self.send_line.unwrap_or(self.cur_line) as u32,
                 full_msg: String::new(),
                 eval_ctx: 0,
                 previous: None,

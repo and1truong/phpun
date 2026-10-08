@@ -47,6 +47,10 @@ impl<'a> Interp<'a> {
             args: Vec::new(),
             named_args: Vec::new(),
             internal: true,
+            visible: true,
+            named_dispatch: false,
+            gen_resume: false,
+            gen_body: false,
         });
         let inc_pop = |it: &mut Interp| {
             it.call_trace.pop();
@@ -205,9 +209,11 @@ impl<'a> Interp<'a> {
                         });
                     }
                     // Non-parse fatals raised while compiling the included
-                    // file still attribute to the included file — with the
-                    // compile-context backtrace (the live stack minus this
-                    // include's own pseudo-frame) like the post-parse gates.
+                    // file still attribute to the included file — and carry
+                    // the compile-context backtrace: the live stack minus
+                    // this include's own pseudo-frame (Zend keeps the outer
+                    // frames: `#0 FILE(N): eval()` for a unit included from
+                    // eval'd code, the real call frames inside a function).
                     _ => {
                         self.last_err_file = fname.clone();
                         let mut e = e;
@@ -434,6 +440,10 @@ impl<'a> Interp<'a> {
                     args: Vec::new(),
                     named_args: Vec::new(),
                     internal: true,
+                    visible: true,
+                    named_dispatch: false,
+                    gen_resume: false,
+                    gen_body: false,
                 });
                 // A compile diagnostic's handler runs at THIS eval()'s callsite.
                 let saved_callsite = self
@@ -534,18 +544,35 @@ impl<'a> Interp<'a> {
                     Flow::Break(_) | Flow::Continue(_) | Flow::Goto(_) => unreachable!(),
                 }
             }
-            Err(e) => {
-                // E_COMPILE_ERROR-class fatals inside eval'd code are
-                // uncatchable in Zend (`try{eval(...)}catch(ParseError)`
-                // does not see them) — only real syntax errors surface
-                // as ParseError.
+            Err(mut e) => {
                 if e.kind != ErrorKind::Parse {
+                    // Engine compile checks raised while compiling
+                    // eval'd code (destructure writability verify,
+                    // write-context gates, ...) are E_COMPILE_ERRORs
+                    // in Zend — uncatchable, attributed
+                    // `FILE(N) : eval()'d code`, carrying the
+                    // compile-context backtrace with the eval frame
+                    // itself dropped like the exec-time gates below.
+                    self.call_trace.push(TraceFrame {
+                        function: "eval".to_string(),
+                        class: None,
+                        ty: String::new(),
+                        file: self.cur_file.clone(),
+                        line: self.cur_line as u32,
+                        args: Vec::new(),
+                        named_args: Vec::new(),
+                        internal: true,
+                        visible: true,
+                        named_dispatch: false,
+                        gen_resume: false,
+                        gen_body: false,
+                    });
                     self.last_err_file =
-                        format!("{}({}) : eval()'d code", self.diag_file(), self.cur_line);
-                    let mut e = e;
+                        format!("{}({}) : eval()'d code", self.cur_file, self.cur_line);
                     if e.trace.as_ref().is_none_or(|t| t.is_empty()) {
                         e.trace = Some(self.compile_err_frames());
                     }
+                    self.call_trace.pop();
                     self.print_fatal(&e);
                     return Err(PhpError {
                         trace: None,

@@ -12,7 +12,7 @@ use crate::parser;
 use crate::value::{
     compare, format_backtrace_frames, format_float_repr, format_trace, identical, numeric, to_key,
     trace_arg, ArrKey, CallableKind, Cell, GenSetup, GenState, Numeric, ObjectInternal, PhpArray,
-    PhpCallable, PhpClass, PhpObject, PhpResource, TraceFrame, Value,
+    PhpCallable, PhpClass, PhpObject, PhpResource, PhpStr, TraceFrame, Value,
 };
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -87,6 +87,11 @@ pub struct CallArgs {
     /// references, so zend warns "must be passed by reference, value
     /// given" (closure_invoke_ref_warning).
     pub nonref_cells: Vec<usize>,
+    /// Diagnostic line of the last-evaluated argument — the deepest
+    /// line marker reached while building this list. Zend sites the
+    /// diagnostics of a compile-specialized literal call (sprintf rope)
+    /// at the line of its final operand, not the call's first token.
+    pub end_line: usize,
 }
 
 impl CallArgs {
@@ -96,6 +101,7 @@ impl CallArgs {
             named: Vec::new(),
             trav_cells: Vec::new(),
             nonref_cells: Vec::new(),
+            end_line: 0,
         }
     }
     pub fn empty() -> Self {
@@ -162,6 +168,10 @@ pub struct Frame {
     /// `m.decl.clone()` method dispatch takes, so `static` site
     /// identity survives cloned bodies).
     decl_site: usize,
+    /// This frame is a generator body invoked by the engine's resume —
+    /// Zend renders it `[internal function]: fn(args)` in backtraces
+    /// (the resume call, not a userland call, carries the visible frame).
+    gen_body: bool,
 }
 
 impl Frame {
@@ -184,6 +194,7 @@ impl Frame {
             call_alias: None,
             statics_unit: None,
             decl_site: 0,
+            gen_body: false,
         }
     }
 }
@@ -548,6 +559,25 @@ pub struct Interp<'a> {
     dim_undef_cells: std::collections::HashSet<usize>,
     /// Current line estimate for error messages (best-effort).
     pub cur_line: usize,
+    /// Site a pending `=`'s folded `${expr}` value reads at — zend's
+    /// delayed-compile RHS takes the ASSIGN op's own lineno instead of
+    /// the varvar's `}` line. Set in `assign()` only when the paren/
+    /// marker-stripped value root is a folded VarVar; consumed by the
+    /// VarVar eval arm.
+    pub(in crate::interp) vv_rhs_site: Option<usize>,
+    /// The match/switch subject's compiled-end line while a scanned
+    /// (unfolded) cond evaluates — zend stamped every const-scan
+    /// folded leaf with it, so each op in the cond takes its line
+    /// from its rightmost leaf (`unfold_tail_site` instead of the
+    /// operand's own first-token line). `None` outside the scan.
+    pub(in crate::interp) scan_stamp: Option<usize>,
+    /// Source line of the innermost call currently dispatching — Zend
+    /// sites a pushed frame at the call's own line (the DO_FCALL op
+    /// line: callee-name/`(` token for `f(...)`, member-name for
+    /// `->m(...)`/`::m(...)`, class expr for `new X(...)`). Set by the
+    /// call dispatchers right after their args evaluate, cleared at
+    /// each `Stmt::Line`.
+    pub(in crate::interp) send_line: Option<usize>,
     /// Active generator body's yield collector — `Expr::Yield` pushes
     /// (key, value) here while a generator function's body runs.
     gen_sink: Option<Rc<RefCell<Vec<crate::value::GenItem>>>>,
@@ -588,6 +618,11 @@ pub struct Interp<'a> {
     /// call, so destructors it runs cite the resume's line (the
     /// `->next()` call / foreach header), not the body's last line.
     gen_resume_site: Option<usize>,
+    /// The `foreach` statement's own line while `exec_foreach_iter`
+    /// drives an iterator — a deferred body death cites it for the
+    /// gen's suspended frame (Zend's FE ops carry the header line,
+    /// not the loop-body line `cur_line` has drifted to).
+    gen_iter_site: Option<usize>,
     /// A fatal surfaced by err_flow while a generator body runs —
     /// stored instead of printed so the deferred death restamps the
     /// resume-stack trace and prints once at the consumer's resume.
@@ -852,6 +887,10 @@ pub struct Interp<'a> {
     pub mem_used: u64,
     /// 'tried to allocate N' figure of the charge that overflowed.
     mem_last: u64,
+    /// Set by gen_start so invoke_fn_run marks the gen-body frame —
+    /// its TraceFrame sites `[internal function]` (Zend's resume
+    /// isn't a userland call).
+    pending_gen_body: bool,
     /// Raised once the memory_limit fatal fired — buffers are dropped
     /// at shutdown instead of flushed (bug45392).
     pub mem_exceeded: bool,
@@ -921,6 +960,10 @@ pub type SlotOwner = (Vec<String>, String, String, SlotAnchor);
 /// One output-buffer level (ob_start) with its optional handler.
 pub struct ObLevel {
     pub buf: Vec<u8>,
+    /// Bytes of `buf` charged to OB_LIVE — `mem_sync` reconciles
+    /// after every mutation; `Drop` releases the remainder on level
+    /// teardown (zend's arena holds the buffer while open).
+    pub charged: i64,
     pub handler: Option<Value>,
     /// Set after the handler's first invocation — PHP's
     /// PHP_OUTPUT_HANDLER_START bit is only passed once (bug24951).
@@ -1006,6 +1049,28 @@ pub struct RunResult {
 /// per-tag segments in tag order, with each consumer capture
 /// spliced ahead of the segment whose tag is >= its arrival cursor
 /// — the global stack's real write order across suspends.
+impl ObLevel {
+    /// Reconcile OB_LIVE with `buf`'s current len after a mutation
+    /// (zend charges the buffer's arena bytes; flush/clean paths
+    /// drain `buf` so the release falls out of the same diff).
+    pub(in crate::interp) fn mem_sync(&mut self) {
+        let want = self.buf.len() as i64;
+        let d = want - self.charged;
+        if d != 0 {
+            crate::value::ob_charge(d);
+            self.charged = want;
+        }
+    }
+}
+
+impl Drop for ObLevel {
+    fn drop(&mut self) {
+        if self.charged != 0 {
+            crate::value::ob_charge(-self.charged);
+        }
+    }
+}
+
 pub(in crate::interp) fn ob_splice(
     head: &[u8],
     segs: &[(usize, Vec<u8>)],
@@ -1525,8 +1590,12 @@ impl<'a> Interp<'a> {
             dim_undef_cells: std::collections::HashSet::new(),
             dim_cv_bound: HashMap::new(),
             cur_line: 1,
+            vv_rhs_site: None,
+            scan_stamp: None,
+            send_line: None,
             gen_sink: None,
             pending_gen_captures: Vec::new(),
+            pending_gen_body: false,
             gen_sends: std::collections::VecDeque::new(),
             gen_throws: std::collections::VecDeque::new(),
             gen_throws_fired: Vec::new(),
@@ -1535,6 +1604,7 @@ impl<'a> Interp<'a> {
             iter_calls: 0,
             gen_internal_resume: 0,
             gen_resume_site: None,
+            gen_iter_site: None,
             gen_pending_fatal: None,
             gen_raise_ctx: Vec::new(),
             compile_callsite: None,
@@ -1969,7 +2039,7 @@ impl<'a> Interp<'a> {
             | Expr::PostDec(e)
             | Expr::Empty(e)
             | Expr::Print(e)
-            | Expr::VarVar(e)
+            | Expr::VarVar(e, _)
             | Expr::Paren(e)
             | Expr::Fcc(e)
             | Expr::Unpack(e)
@@ -1983,7 +2053,7 @@ impl<'a> Interp<'a> {
                 }
                 Self::gate_expr(f, m)
             }
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, .. } => {
                 Self::gate_expr(name, m)?;
                 for a in args {
                     Self::gate_expr(a, m)?;
@@ -2023,7 +2093,7 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
             Expr::YieldFrom(e) => Self::gate_expr(e, m),
-            Expr::Match { subject, arms } => {
+            Expr::Match { subject, arms, .. } => {
                 Self::gate_expr(subject, m)?;
                 for a in arms {
                     for c in &a.conds {
@@ -2052,7 +2122,9 @@ impl<'a> Interp<'a> {
                 }
                 Ok(())
             }
-            Expr::StaticCallDyn { class, name, args } => {
+            Expr::StaticCallDyn {
+                class, name, args, ..
+            } => {
                 Self::gate_expr(class, m)?;
                 Self::gate_expr(name, m)?;
                 for a in args {
@@ -2074,7 +2146,7 @@ impl<'a> Interp<'a> {
                 }
                 Ok(())
             }
-            Expr::New { class, args } => {
+            Expr::New { class, args, .. } => {
                 Self::gate_expr(class, m)?;
                 for a in args {
                     Self::gate_expr(a, m)?;
@@ -3931,6 +4003,13 @@ impl<'a> Interp<'a> {
         self.emit_routed(b);
     }
 
+    /// Zend-arena usage against memory_limit: runtime baseline + live
+    /// object shells + array tables + string payloads (drops decrement
+    /// each counter, mirroring the arena returning freed memory).
+    pub(crate) fn mem_total(&self) -> i64 {
+        crate::value::MEM_BASE_BYTES + crate::value::mem_live_bytes()
+    }
+
     /// Emit journaled/replayed bytes at their materialization point:
     /// inside another gen's run they join its deferred journal (an
     /// inner's death bytes attribute to the outer's cursor window);
@@ -3965,6 +4044,7 @@ impl<'a> Interp<'a> {
                 l.cap_segs.push((pos, l.buf.len(), b.len()));
             }
             l.buf.extend_from_slice(b);
+            l.mem_sync();
             return;
         }
         if self.live_io {
@@ -3990,6 +4070,7 @@ impl<'a> Interp<'a> {
                 buf.cap_segs.push((pos, buf.buf.len(), b.len()));
             }
             buf.buf.extend_from_slice(b);
+            buf.mem_sync();
         } else if self.live_io {
             use std::io::Write;
             let mut so = std::io::stdout().lock();
@@ -4036,6 +4117,7 @@ impl<'a> Interp<'a> {
                     });
                 }
                 l.buf = v;
+                l.mem_sync();
                 l.gen_drained = 0;
             }
             false
@@ -4164,14 +4246,15 @@ impl<'a> Interp<'a> {
             .iter()
             .rposition(|x| x.gen_q.is_none() && x.pop_head.is_none())
             .map(|i| self.ob_stack.remove(i));
-        if let Some(st) = stolen {
+        if let Some(mut st) = stolen {
             let mut old_v = head.clone();
             for (_, s) in &l.pop_segs {
                 old_v.extend_from_slice(s);
             }
             let min_tag = l.gen_close.unwrap_or(0).saturating_sub(1);
             if !old_v.is_empty() {
-                let new_v = st.buf;
+                let new_v = std::mem::take(&mut st.buf);
+                st.mem_sync();
                 if let Some(gs) = &l.gen_state {
                     if let Some(st2) = gs.upgrade() {
                         let mut st2 = st2.borrow_mut();
@@ -4202,8 +4285,9 @@ impl<'a> Interp<'a> {
                 for (_, c) in &l.caps {
                     buf.extend_from_slice(c);
                 }
-                self.ob_stack.push(ObLevel {
+                let mut level = ObLevel {
                     buf,
+                    charged: 0,
                     handler: l.handler.clone(),
                     started: l.started,
                     gen_q: l.gen_q.clone(),
@@ -4243,7 +4327,9 @@ impl<'a> Interp<'a> {
                     read_vals: l.read_vals.clone(),
                     suspend_base: l.suspend_base,
                     gen_state: l.gen_state.clone(),
-                });
+                };
+                level.mem_sync();
+                self.ob_stack.push(level);
             }
             return;
         }
@@ -4465,6 +4551,7 @@ impl<'a> Interp<'a> {
             level.drained_segs.push((t, level.buf.len(), b.len()));
             level.buf.extend_from_slice(&b);
         }
+        level.mem_sync();
     }
 
     /// Drain the top buffer's journaled gen captures — `all` when the
@@ -4702,6 +4789,7 @@ impl<'a> Interp<'a> {
     fn ob_dead_level(l: &mut ObLevel, pos: usize, killed: bool) {
         Self::ob_drain_level(l, false);
         l.buf = Self::ob_level_content(l, pos, killed);
+        l.mem_sync();
         l.drained_segs.clear();
         l.cap_segs.clear();
         l.caps.clear();
@@ -5729,25 +5817,56 @@ impl<'a> Interp<'a> {
                 // `FILE(line): f()` frame (foreach-resume), and an
                 // engine error raised while in-body calls were live
                 // re-reports those calls in raise_frames.
-                let mut names: Vec<String> = frames
-                    .iter()
-                    .filter_map(|f| {
-                        f.strip_prefix("[internal function]: ")
-                            .and_then(|s| s.split('(').next())
-                            .map(|n| n.to_string())
-                    })
-                    .collect();
+                // Dedup is by call, not by callee name: two frames
+                // may share a callee (`Generator->send` at the body's
+                // re-entrant resume vs the consumer's outer resume)
+                // and only same-site entries are the same call.
+                let mut internal_names: Vec<String> = Vec::new();
+                let mut site_names: Vec<String> = Vec::new();
+                let mut site_keys: Vec<(String, String)> = Vec::new();
                 for f in frames {
-                    if let Some(pos) = f.find("): ") {
+                    if let Some(rest) = f.strip_prefix("[internal function]: ") {
+                        if let Some(end) = rest.find('(') {
+                            internal_names.push(rest[..end].to_string());
+                        }
+                    } else if let Some(pos) = f.find("): ") {
                         let call = &f[pos + 3..];
                         if let Some(end) = call.find('(') {
-                            names.push(call[..end].to_string());
+                            site_names.push(call[..end].to_string());
+                            site_keys.push((call[..end].to_string(), f[..pos + 1].to_string()));
                         }
                     }
                 }
+                // The OUTERMOST gen-body frame in the construction
+                // stack: everything at/below it is the eager run's
+                // drive — engine resumes (`IteratorIterator->rewind()`
+                // and friends) leave real method frames there citing
+                // the FIRST resume, and a `Generator->{m}()` push
+                // cites its own call site. Zend constructs the
+                // throwable inside the CURRENT resume, so its stored
+                // stack only ever holds the live drive — drop that
+                // prefix and let `frames` supply it. Nested-gen
+                // bodies sit BETWEEN the outermost body and the
+                // construction point: they keep their suspended
+                // call/drain frames (`f()`, `It->getIterator()` in
+                // gh15275).
+                let cut = cframes
+                    .iter()
+                    .position(|f| f.gen_body)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
                 let mut parts: Vec<String> = Vec::new();
-                for fr in cframes.clone().iter().rev() {
+                for fr in cframes.clone()[cut..].iter().rev() {
                     if crate::value::trace_frame_hidden(fr) {
+                        continue;
+                    }
+                    // A `Generator->{m}()` frame snapshotted into the
+                    // construction stack is the resume that RAN the
+                    // body — Zend's deferred render shows the resume
+                    // live at the raise, already in `frames`. Dropping
+                    // it here is what keeps a stale first-resume frame
+                    // from leading the rewritten trace.
+                    if fr.gen_resume {
                         continue;
                     }
                     let callee = fr
@@ -5755,7 +5874,22 @@ impl<'a> Interp<'a> {
                         .as_ref()
                         .map(|c| format!("{}{}{}", c, fr.ty, fr.function))
                         .unwrap_or_else(|| fr.function.clone());
-                    if names.contains(&fr.function) || names.contains(&callee) {
+                    let dup = if fr.file == "[internal function]" {
+                        // Engine-resumed frames (gen bodies, builtin
+                        // callbacks) have no call site of their own —
+                        // match by callee name against either render
+                        // shape the resume stack can carry.
+                        internal_names
+                            .iter()
+                            .chain(site_names.iter())
+                            .any(|n| *n == fr.function || *n == callee)
+                    } else {
+                        let site = format!("{}({})", fr.file, fr.line);
+                        site_keys
+                            .iter()
+                            .any(|(n, s)| (*n == fr.function || *n == callee) && *s == site)
+                    };
+                    if dup {
                         continue;
                     }
                     parts.push(crate::value::trace_frame_str(fr));
@@ -5875,9 +6009,9 @@ impl<'a> Interp<'a> {
             o.props.insert("code".into(), cell(Value::Int(0)));
             o.internal = Some(ObjectInternal::Exception {
                 file: self.diag_file(),
-                line: self.cur_line as u32,
+                line: self.send_line.unwrap_or(self.cur_line) as u32,
                 trace: String::new(),
-                thrown: self.cur_line as u32,
+                thrown: self.send_line.unwrap_or(self.cur_line) as u32,
                 full_msg: String::new(),
                 eval_ctx: 0,
                 frames: Rc::new(self.call_trace.clone()),
@@ -5908,20 +6042,55 @@ impl<'a> Interp<'a> {
     }
 
     /// Builtin call — errors become catchable throwables via `fail`.
-    fn call_builtin(&mut self, name: &str, args: &CallArgs) -> Result<Option<Value>, PhpError> {
+    /// `visible` marks frames Zend keeps in exception traces — every
+    /// real call, literal or dynamic; false only for literal calls
+    /// compile-specialized into dedicated opcodes (sprintf rope).
+    fn call_builtin(
+        &mut self,
+        name: &str,
+        args: &CallArgs,
+        visible: bool,
+    ) -> Result<Option<Value>, PhpError> {
+        // A builtin frame pushed while dispatched from inside another
+        // builtin's own machinery (internal_cb: sort/ob/array-callbacks)
+        // reports `[internal function]` — Zend emits no file/line for a
+        // frame whose caller is internal. call_user_func* trampolines
+        // are transparent to the walk (trace_frame_hidden).
+        let (site_file, site_line) = self.call_site(false, self.diag_file(), self.cur_line);
+        // Trace frame args mirror Zend's bound param array: named args
+        // that resolve to a declared fixed param merge into that
+        // positional slot (interior unbound slots materialize as NULL);
+        // names that don't match land in the variadic tail and keep
+        // their `name:` marker (`substr(string: 'x', length: 2)`
+        // renders `substr('x', NULL, 2)`).
+        let (frame_args, frame_named) = match builtins::builtin_params(name) {
+            Some(params) => Self::bind_frame_args(args, params),
+            None => (
+                args.to_vec(),
+                args.named
+                    .iter()
+                    .map(|(n, c, ..)| (n.clone(), c.clone()))
+                    .collect(),
+            ),
+        };
         self.call_trace.push(TraceFrame {
             function: name.to_string(),
             class: None,
             ty: String::new(),
-            file: self.diag_file(),
-            line: self.cur_line as u32,
-            args: args.to_vec(),
-            named_args: args
-                .named
-                .iter()
-                .map(|(n, c, ..)| (n.clone(), c.clone()))
-                .collect(),
+            file: site_file,
+            line: site_line,
+            args: frame_args,
+            named_args: frame_named,
             internal: true,
+            visible,
+            // A cufa-family call with named args is a real frame, not
+            // a transparent trampoline (zend only inlines positional
+            // cufa calls). forward_static_call* always render — they
+            // are ordinary internal functions, not trampolines.
+            named_dispatch: !args.named.is_empty()
+                && matches!(name, "call_user_func" | "call_user_func_array"),
+            gen_resume: false,
+            gen_body: false,
         });
         if name == "assert" {
             // AssertionError message = `assert(<args>)` as written.
@@ -5954,8 +6123,9 @@ impl<'a> Interp<'a> {
             } else if let Some(i) = cb_named {
                 args.named[i].1.borrow().clone()
             } else {
-                self.call_trace.pop();
-                return self.fail(PhpError::uncaught(
+                // fail() captures call_trace — the frame must still be
+                // there (Zend keeps the cufa frame in this trace).
+                let r = self.fail(PhpError::uncaught(
                     "ArgumentCountError",
                     format!(
                         "{}() expects at least 1 argument, {} given",
@@ -5964,16 +6134,23 @@ impl<'a> Interp<'a> {
                     ),
                     0,
                 ));
+                self.call_trace.pop();
+                return r;
             };
             if fwd && args.named.iter().any(|(n, ..)| n != "callback") {
-                self.call_trace.pop();
-                return self.fail(PhpError::uncaught(
+                // '*' variadic: the reject fires after the arity
+                // checks — `forward_static_call(x:)` with no callback
+                // reports the missing param first.
+                let r = self.fail(PhpError::uncaught(
                     "ArgumentCountError",
                     format!("{}() does not accept unknown named parameters", name),
                     0,
                 ));
+                self.call_trace.pop();
+                return r;
             }
             let ca = CallArgs {
+                end_line: args.end_line,
                 cells: args.cells[1.min(args.cells.len())..].to_vec(),
                 named: args
                     .named
@@ -6000,8 +6177,9 @@ impl<'a> Interp<'a> {
             if !self.is_callable_value(&cb) {
                 if fwd {
                     if let Some(pe) = self.take_callable_probe_err() {
+                        let r = self.fail(pe);
                         self.call_trace.pop();
-                        return self.fail(pe);
+                        return r;
                     }
                 }
                 let msg = format!(
@@ -6016,12 +6194,33 @@ impl<'a> Interp<'a> {
                 return r;
             }
             if fwd && self.caller_scope_name().is_none() {
-                self.call_trace.pop();
-                return self.fail(PhpError::uncaught(
+                let r = self.fail(PhpError::uncaught(
                     "Error",
                     "Cannot call forward_static_call() when no class scope is active",
                     0,
                 ));
+                self.call_trace.pop();
+                return r;
+            }
+            // Forwarded names bind against the CALLEE's params at this
+            // frame's level in Zend (zend_call_function resolves the
+            // callee's arg array from the caller context): an unknown
+            // name on a non-variadic callee errors here —
+            // `call_user_func('strlen', x: 'a')` traces the
+            // call_user_func frame, not a strlen frame. Variadic
+            // callees collect every name into the tail.
+            if !ca.named.is_empty() {
+                if let Some(bad) = self.callee_unknown_named(&cb, &ca) {
+                    // The cufa frame itself is what traces — fail()
+                    // must capture before it pops.
+                    let r = self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Unknown named parameter ${bad}"),
+                        0,
+                    ));
+                    self.call_trace.pop();
+                    return r;
+                }
             }
             // Callbacks dispatched from inside an internal function
             // trace from `[internal function]` (closure_064).
@@ -6111,48 +6310,255 @@ impl<'a> Interp<'a> {
             // Internal fns with a known signature get Zend's named-arg
             // resolution AND positional arity checks.
             Some(params) => {
-                self.internal_cb += 1;
+                let (save_l, save_s) = (self.cur_line, self.send_line);
+                if visible {
+                    self.internal_cb += 1;
+                } else {
+                    // A compile-specialized literal call (sprintf rope)
+                    // has no DO_FCALL of its own in Zend — the builtin
+                    // runs as inline ops of the caller, so conversions
+                    // and the callbacks they reach (__toString, thrown
+                    // errors) site at the last argument's line, never
+                    // `[internal function]`.
+                    self.cur_line = args.end_line;
+                    self.send_line = Some(args.end_line);
+                }
                 let r = match self.resolve_named_builtin(name, params, args) {
                     Ok(cells) => builtins::call(self, name, &cells),
                     Err(e) => Err(e),
                 };
-                self.internal_cb -= 1;
+                if visible {
+                    self.internal_cb -= 1;
+                }
                 // fail() captures call_trace — pop AFTER it so the
                 // builtin's own frame shows in the backtrace
                 // (`array_multisort(: 1)` in call_user_func_array_variadic).
+                // Named-arg resolution errors raised while the
+                // callee's param array is still being built
+                // mean the frame never existed in Zend — the
+                // trace shows `{main}` only (`substr('x',
+                // bogus: 3)`, `sprintf('%s', format:)`). Pop it
+                // here once and skip the shared pop below.
+                let mut frame_popped = false;
                 let r = match r {
                     Ok(v) => Ok(v),
-                    Err(e) => self.fail(e),
+                    Err(e) => {
+                        if Self::named_init_err(&e) {
+                            self.call_trace.pop();
+                            frame_popped = true;
+                        }
+                        self.fail(e)
+                    }
                 };
-                self.call_trace.pop();
-                self.emit_cmp_notices()?;
+                if !frame_popped {
+                    self.call_trace.pop();
+                }
+                let n = self.emit_cmp_notices();
+                if !visible {
+                    self.cur_line = save_l;
+                    self.send_line = save_s;
+                }
+                n?;
                 r
             }
             // Internal fns without a signature accept no named args;
             // names that aren't builtins at all fall through so the
             // userland invoke path sees them.
             None if builtins::is_builtin(name) && !args.named.is_empty() => {
+                // Same param-build-phase error: no frame in the trace.
+                self.call_trace.pop();
                 let r = self.fail(PhpError::uncaught(
                     "Error",
                     format!("Unknown named parameter ${}", args.named[0].0),
                     0,
                 ));
-                self.call_trace.pop();
                 r
             }
             None => {
-                self.internal_cb += 1;
+                let (save_l, save_s) = (self.cur_line, self.send_line);
+                if visible {
+                    self.internal_cb += 1;
+                } else {
+                    self.cur_line = args.end_line;
+                    self.send_line = Some(args.end_line);
+                }
                 let r = builtins::call(self, name, args);
-                self.internal_cb -= 1;
+                if visible {
+                    self.internal_cb -= 1;
+                }
                 let r = match r {
                     Ok(r) => Ok(r),
                     Err(e) => self.fail(e),
                 };
                 self.call_trace.pop();
-                self.emit_cmp_notices()?;
+                let n = self.emit_cmp_notices();
+                if !visible {
+                    self.cur_line = save_l;
+                    self.send_line = save_s;
+                }
+                n?;
                 r
             }
         }
+    }
+
+    /// The first name in `args.named` that can't bind to a fixed param
+    /// of `cb`'s callee signature — used for the cufa-family rule that
+    /// forwarded named args resolve at the trampoline's level. None
+    /// when the callee is variadic (unknown names collect into the
+    /// tail) or its signature is unavailable.
+    fn callee_unknown_named(&mut self, cb: &Value, args: &CallArgs) -> Option<String> {
+        fn decl_sig(d: &crate::ast::FunctionDecl) -> (Vec<String>, bool) {
+            (
+                d.params.iter().map(|p| p.name.clone()).collect(),
+                d.params.iter().any(|p| p.variadic),
+            )
+        }
+        // (fixed param names, variadic tail?) for a named callable.
+        let name_sig = |interp: &mut Self, n: &str| -> Option<(Vec<String>, bool)> {
+            let lower = crate::value::lossy(n).to_lowercase();
+            let lower = lower.trim_start_matches('\\').to_string();
+            if let Some((cn, mn)) = lower.split_once("::") {
+                let key = interp.resolve_class(cn).unwrap_or_else(|| cn.to_string());
+                if let Some(cls) = interp.classes.get(&key.to_lowercase()).cloned() {
+                    return interp
+                        .find_method_in(&cls, mn)
+                        .map(|(m, _)| decl_sig(&m.decl));
+                }
+                return None;
+            }
+            if let Some(params) = builtins::builtin_params(&lower) {
+                let variadic = params.iter().any(|(_, d)| matches!(d, builtins::BDef::Var));
+                let names = params
+                    .iter()
+                    .take_while(|(_, d)| !matches!(d, builtins::BDef::Var))
+                    .map(|(pn, _)| pn.to_string())
+                    .collect();
+                return Some((names, variadic));
+            }
+            interp.functions.get(&lower).map(|d| decl_sig(d))
+        };
+        let sig: Option<(Vec<String>, bool)> = match cb {
+            Value::Str(s) => name_sig(self, &crate::value::lossy(s)),
+            Value::Callable(rc) => match &rc.kind {
+                crate::value::CallableKind::Closure(d) => Some(decl_sig(d)),
+                crate::value::CallableKind::Named(n) => name_sig(self, n),
+                crate::value::CallableKind::Method { obj, class, name } => {
+                    let cls = obj
+                        .as_ref()
+                        .map(|o| o.borrow().class.clone())
+                        .or_else(|| class.clone());
+                    cls.and_then(|c| {
+                        self.find_method_in(&c, &name.to_lowercase())
+                            .map(|(m, _)| decl_sig(&m.decl))
+                    })
+                }
+            },
+            Value::Array(a) => {
+                let arr = a.borrow();
+                let cn = arr.iter().find_map(|(k, v)| {
+                    if !matches!(k, crate::value::ArrKey::Int(0)) {
+                        return None;
+                    }
+                    match &*v.borrow() {
+                        Value::Object(o) => Some(o.borrow().class.name().to_string()),
+                        Value::Str(s) => Some(crate::value::lossy(s).into_owned()),
+                        _ => None,
+                    }
+                })?;
+                let mn = arr.iter().find_map(|(k, v)| {
+                    if !matches!(k, crate::value::ArrKey::Int(1)) {
+                        return None;
+                    }
+                    match &*v.borrow() {
+                        Value::Str(s) => Some(crate::value::lossy(s).to_lowercase()),
+                        _ => None,
+                    }
+                })?;
+                drop(arr);
+                let key = self.resolve_class(&cn).unwrap_or(cn);
+                self.classes
+                    .get(&key.to_lowercase())
+                    .cloned()
+                    .and_then(|cls| {
+                        self.find_method_in(&cls, &mn)
+                            .map(|(m, _)| decl_sig(&m.decl))
+                    })
+            }
+            Value::Object(o) => {
+                let cls = o.borrow().class.clone();
+                self.find_method_in(&cls, "__invoke")
+                    .map(|(m, _)| decl_sig(&m.decl))
+            }
+            _ => None,
+        };
+        let (names, variadic) = sig?;
+        if variadic {
+            return None;
+        }
+        args.named
+            .iter()
+            .map(|(n, ..)| n)
+            .find(|n| !names.iter().any(|p| p == *n))
+            .cloned()
+    }
+
+    /// Materialize the frame's display args the way Zend's bound param
+    /// array does: named args matching a fixed param occupy that slot
+    /// (unbound interior slots render as NULL, positional tail args
+    /// follow); names that match nothing stay in `named` so traces
+    /// render `name: value`. Pure display logic — rejection/overwrite
+    /// errors happen later in resolve_named_builtin.
+    fn bind_frame_args(
+        args: &CallArgs,
+        params: &[(&'static str, builtins::BDef)],
+    ) -> (Vec<Cell>, Vec<(String, Cell)>) {
+        use builtins::BDef;
+        let n_fixed = params
+            .iter()
+            .take_while(|(_, d)| !matches!(d, BDef::Var))
+            .count();
+        let mut slot: Vec<Option<Cell>> = vec![None; n_fixed];
+        for (i, c) in args.cells.iter().enumerate() {
+            if i < n_fixed {
+                slot[i] = Some(c.clone());
+            }
+        }
+        let mut named: Vec<(String, Cell)> = Vec::new();
+        for (n, c, ..) in &args.named {
+            match params[..n_fixed]
+                .iter()
+                .position(|(pn, _)| *pn == n.as_str())
+            {
+                Some(j) => slot[j] = Some(c.clone()),
+                None => named.push((n.clone(), c.clone())),
+            }
+        }
+        let last = slot
+            .iter()
+            .rposition(|s| s.is_some())
+            .map(|i| i + 1)
+            .unwrap_or(0)
+            .max(args.cells.len().min(n_fixed));
+        let mut out: Vec<Cell> = Vec::new();
+        for s in &slot[..last] {
+            out.push(match s {
+                Some(c) => c.clone(),
+                None => Rc::new(RefCell::new(Value::Null)),
+            });
+        }
+        out.extend(args.cells.iter().skip(n_fixed).cloned());
+        (out, named)
+    }
+
+    /// Named-arg binding errors that Zend raises while still building
+    /// the callee's param array — the call frame doesn't exist yet,
+    /// so traces drop it (`{main}` only). Everything else (arity,
+    /// '*' reject, execution) happens inside a live frame.
+    fn named_init_err(e: &PhpError) -> bool {
+        matches!(&e.kind, ErrorKind::Uncaught { class } if *class == "Error")
+            && (e.message.starts_with("Unknown named parameter")
+                || e.message.starts_with("Named parameter"))
     }
 
     /// Reorder named args to positional cells against an internal
@@ -6173,6 +6579,15 @@ impl<'a> Interp<'a> {
         const NAMED_REJECT: &[&str] = &[
             "array_merge",
             "array_merge_recursive",
+            "array_replace",
+            "array_replace_recursive",
+            "array_multisort",
+            "min",
+            "max",
+            "sprintf",
+            "printf",
+            "fprintf",
+            "fscanf",
             "array_diff",
             "array_diff_key",
             "array_diff_assoc",
@@ -6190,21 +6605,24 @@ impl<'a> Interp<'a> {
             "array_uintersect_assoc",
             "array_uintersect_uassoc",
         ];
-        if NAMED_REJECT.contains(&name) && !args.named.is_empty() {
-            return Err(PhpError::uncaught(
-                "ArgumentCountError",
-                format!("{}() does not accept unknown named parameters", name),
-                0,
-            ));
-        }
+        // '*' variadics defer their unknown-name rejection past the
+        // arity checks: `min(x: 1)` reports the missing required param
+        // ("expects at least 1 argument, 0 given") while
+        // `min(value: 1, x: 2)` rejects ("does not accept unknown named
+        // parameters"). Unknown names also don't count as "given".
+        let reject_named = NAMED_REJECT.contains(&name);
+        let mut pending_reject = 0usize;
         let variadic = params.iter().any(|(_, d)| matches!(d, BDef::Var));
         let n_fixed = params
             .iter()
             .take_while(|(_, d)| !matches!(d, BDef::Var))
             .count();
+        // `required` counts OptReq params too: arginfo declares them
+        // required (reflection/named-arg checks) even though ZPP accepts
+        // the call without them (rand/mt_rand).
         let required = params[..n_fixed]
             .iter()
-            .filter(|(_, d)| matches!(d, BDef::Req))
+            .filter(|(_, d)| matches!(d, BDef::Req | BDef::OptReq))
             .count();
         // Positional arity errors use Zend's internal-function wording:
         // "expects exactly" when all fixed params are required, else
@@ -6280,6 +6698,7 @@ impl<'a> Interp<'a> {
                     slot[j] = Some(c.clone());
                     given += 1;
                 }
+                None if variadic && reject_named => pending_reject += 1,
                 None if variadic => extra_pos.push(c.clone()),
                 None => {
                     return Err(PhpError::uncaught(
@@ -6322,7 +6741,7 @@ impl<'a> Interp<'a> {
                     }
                     return Err(arity_err(given, false));
                 }
-                None if matches!(params[i].1, BDef::Unk) && i < last_bound => {
+                None if matches!(params[i].1, BDef::Unk | BDef::OptReq) && i < last_bound => {
                     return Err(PhpError::uncaught(
                         "ArgumentCountError",
                         format!(
@@ -6334,9 +6753,25 @@ impl<'a> Interp<'a> {
                         0,
                     ));
                 }
+                // OptReq params accept nothing-or-all: a tail gap when
+                // args were given is the arginfo arity error
+                // (`rand(1)`/`rand(min: 1)` => "expects exactly 2, 1
+                // given"); `rand()` binds no slot at all.
+                None if matches!(params[i].1, BDef::OptReq)
+                    && (args.cells.len() + args.named.len()) > 0 =>
+                {
+                    return Err(arity_err(given, false));
+                }
                 None if i < last_bound => out.push(cell(params[i].1.val())),
                 None => break,
             }
+        }
+        if pending_reject > 0 {
+            return Err(PhpError::uncaught(
+                "ArgumentCountError",
+                format!("{}() does not accept unknown named parameters", name),
+                0,
+            ));
         }
         out.extend(extra_pos);
         Ok(out)
@@ -6372,6 +6807,12 @@ impl<'a> Interp<'a> {
                     args: Vec::new(),
                     named_args: Vec::new(),
                     internal: true,
+                    // The pseudo-frame renders in zend's traces
+                    // (`#0 %s(%d): [constant expression]()`).
+                    visible: true,
+                    named_dispatch: false,
+                    gen_resume: false,
+                    gen_body: false,
                 });
             }
             // Internal errors raised as exceptions become real throwables so
@@ -6432,8 +6873,25 @@ impl<'a> Interp<'a> {
         Err(e)
     }
 
+    /// `cls` is-a an SPL-prelude delegation class (subclasses included)
+    /// — the PHP stand-ins for zend's C-level SPL delegation. A call
+    /// made FROM one of their frames sites `[internal function]` like
+    /// zend's internal SPL internals.
+    pub(in crate::interp) fn class_is_spl_prelude(&self, cls: &Rc<PhpClass>) -> bool {
+        const SPL_PRELUDE_CLASSES: &[&str] = &[
+            "OuterIterator",
+            "IteratorIterator",
+            "FilterIterator",
+            "RecursiveFilterIterator",
+            "CallbackFilterIterator",
+            "RecursiveIteratorIterator",
+            "AppendIterator",
+        ];
+        SPL_PRELUDE_CLASSES.iter().any(|n| self.is_a(cls, n))
+    }
+
     /// `class X` is-a `name` (name = class or interface), parents included.
-    fn is_a(&mut self, cls: &Rc<PhpClass>, name: &str) -> bool {
+    fn is_a(&self, cls: &Rc<PhpClass>, name: &str) -> bool {
         let lname = name.trim_start_matches('\\').to_lowercase();
         let mut cur = Some(cls.clone());
         while let Some(c) = cur {

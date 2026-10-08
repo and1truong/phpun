@@ -3,7 +3,7 @@ mod expr;
 
 use crate::ast::*;
 use crate::error::{ErrorKind, PhpError};
-use crate::lexer::{lex, lex_with, Lexed, Token};
+use crate::lexer::{lex, lex_with, Lexed, StringPart, Token};
 use std::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -23,6 +23,9 @@ pub enum ConstCtx {
 
 pub struct Parser<'a> {
     toks: &'a [Lexed],
+    /// Source the tokens were lexed from — Lexed start/end offsets
+    /// index it (raw token text for shape checks like `<<<`).
+    src: &'a str,
     pos: usize,
     /// Compile-time deprecation diagnostics (msg, line, token pos) — PHP
     /// emits them at their position while compiling; `parse_toks` binds
@@ -36,6 +39,10 @@ pub struct Parser<'a> {
     stmt_starts: Vec<usize>,
     /// Enclosing class name while parsing members (hook error text).
     cur_class: String,
+    /// Display names of the function-likes being parsed (innermost
+    /// last) — Zend names a nested closure `{closure:enclosing():L}` in
+    /// the optional-before-required Deprecated notice.
+    fn_ctx: Vec<String>,
     /// (prop name, is_get) while inside a hook body — gates
     /// `parent::$p::get()/set()` syntax.
     hook_ctx: Option<(String, bool)>,
@@ -60,6 +67,10 @@ pub struct Parser<'a> {
     /// 0 none, 1 unbraced, 2 braced (mixing is a compile fatal,
     /// namespaces/ns_081/ns_084).
     ns_style: u8,
+    /// The last parsed call's last arg end line — `args()` records it
+    /// for the dedicated-op fold, where every CV arg binds at the
+    /// line zend_lineno held after compiling the final argument.
+    arg_end: usize,
     /// Enclosing class-like declarations as (has_parent, is_trait) —
     /// `self`/`static`/`parent` type members are compile errors
     /// outside class scope (static_type_outside_class).
@@ -81,6 +92,16 @@ pub struct Parser<'a> {
     /// the no-class-scope compile fatal doesn't apply
     /// (static_type_return's unbound `{closure:...}(): static`).
     in_closure: bool,
+    /// Statement nesting under a conditional or runtime context —
+    /// a `function` decl only early-binds at depth 0 (the top-level
+    /// program or a braced-namespace body); inside if/loops/functions/
+    /// try it's a runtime decl zend can't bind calls to at compile.
+    fn_nest: u32,
+    /// Fully-qualified lowercase names of functions declared at top
+    /// level so far — zend's compile-time function table, used to tell
+    /// whether a call's bare-CV args send per-arg (bound callee) or
+    /// fused at the first arg's line (unbound or dynamic callee).
+    declared_funcs: std::collections::HashSet<String>,
     /// Inside a NAMED function's signature/body — zend compile-fatals
     /// `self::`/`new self()`/`parent::$p` there even when the decl is
     /// nested in a method ('Cannot use "self" when no class scope is
@@ -115,7 +136,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
 /// `parse` honoring `short_open_tag` (INI `short_open_tag=On`).
 pub fn parse_with(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
     let toks = lex_with(src, short_open)?;
-    parse_toks(toks, 1 + src.bytes().filter(|&b| b == b'\n').count())
+    parse_toks(toks, 1 + src.bytes().filter(|&b| b == b'\n').count(), src)
 }
 
 /// phpun source mode: PHP code from byte 0, no `<?php` required (a
@@ -144,7 +165,7 @@ pub fn parse_source(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> 
 /// eval()'d code, which in PHP is always tag-free source.
 pub fn parse_pure(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
     let toks = crate::lexer::lex_php_source(src, short_open)?;
-    parse_toks(toks, 1 + src.bytes().filter(|&b| b == b'\n').count())
+    parse_toks(toks, 1 + src.bytes().filter(|&b| b == b'\n').count(), src)
 }
 
 /// eval()/`-r` code parse — tagless like [`parse_pure`], except the
@@ -153,12 +174,12 @@ pub fn parse_pure(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
 /// like eval()'d code.
 pub fn parse_eval(src: &str, short_open: bool) -> Result<Vec<Stmt>, PhpError> {
     let toks = crate::lexer::lex_php_eval(src, short_open)?;
-    parse_toks(toks, 1 + src.bytes().filter(|&b| b == b'\n').count())
+    parse_toks(toks, 1 + src.bytes().filter(|&b| b == b'\n').count(), src)
 }
 
 /// `eof_line` is Zend's scanner line at end-of-input (one past the
 /// last consumed newline) — where EOF-attributed errors are reported.
-fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> {
+fn parse_toks(toks: Vec<Lexed>, eof_line: usize, src: &str) -> Result<Vec<Stmt>, PhpError> {
     // Compile-time diagnostics ride the token stream; each records the
     // index it would occupy in the filtered stream — its binding
     // position for stmt attribution (Zend emits a diagnostic while
@@ -180,7 +201,7 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
         })
         .collect();
     let bracket_err = bracket_check(&toks, eof_line);
-    let mut p = Parser::new(&toks, eof_line);
+    let mut p = Parser::new(&toks, eof_line, src);
     let stmts = match p.program() {
         Ok(s) => s,
         Err(pe) => {
@@ -195,6 +216,7 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
                 let mut p2 = Parser::new(
                     &toks[..bpos],
                     toks.get(bpos).map(|t| t.line).unwrap_or(eof_line),
+                    src,
                 );
                 match p2.program() {
                     Err(pe2) if !pe2.message.starts_with("syntax error, unexpected end of") => {
@@ -255,15 +277,17 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize) -> Result<Vec<Stmt>, PhpError> 
 }
 
 impl<'a> Parser<'a> {
-    fn new(toks: &'a [Lexed], eof_line: usize) -> Self {
+    fn new(toks: &'a [Lexed], eof_line: usize, src: &'a str) -> Self {
         Self {
             toks,
+            src,
             pos: 0,
             eof_line,
             deprecations: Vec::new(),
             compile_warnings: Vec::new(),
             stmt_starts: Vec::new(),
             cur_class: String::new(),
+            fn_ctx: Vec::new(),
             hook_ctx: None,
             pending_class_attrs: Vec::new(),
             cur_ns: String::new(),
@@ -273,10 +297,13 @@ impl<'a> Parser<'a> {
             declared_types: std::collections::HashSet::new(),
             in_braced_ns: false,
             ns_style: 0,
+            arg_end: 0,
             class_ctx: Vec::new(),
             first_stmt_slot: false,
             strict_slot: false,
             in_closure: false,
+            fn_nest: 0,
+            declared_funcs: std::collections::HashSet::new(),
             in_named_fn: false,
             const_ctx: ConstCtx::Runtime,
             ret_by_ref: false,
@@ -342,31 +369,58 @@ fn bracket_check(toks: &[crate::lexer::Lexed], eof_line: usize) -> Option<(PhpEr
 pub type SrcDiags = Vec<(&'static str, String, usize)>;
 
 /// Parse a standalone PHP expression source (used for string
-/// interpolation). Diagnostics produced while re-lexing the embedded
-/// source (e.g. octal overflow inside `${"\400"}`) come back in the
-/// second tuple element so the evaluator can print them inline.
-pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
+/// interpolation). `base` is the absolute line the source's first byte
+/// sits on in the enclosing file: snippet token/marker lines are
+/// 1-based relative, so every line is rebased by `base - 1` for
+/// diagnostics to report file lines. Diagnostics produced while
+/// re-lexing the embedded source (e.g. octal overflow inside
+/// `${"\400"}`) come back in the second tuple element so the
+/// evaluator can print them inline.
+pub fn parse_expr_src(src: &str, base: usize) -> Result<(Expr, SrcDiags), PhpError> {
     let wrapped = format!("<?php {};", src);
-    let toks = lex(&wrapped)?;
+    let rebase = |mut e: PhpError| {
+        e.line += base - 1;
+        e
+    };
+    let toks = lex(&wrapped).map_err(rebase)?;
     let mut diags = Vec::new();
     let toks: Vec<Lexed> = toks
         .into_iter()
-        .filter_map(|t| match t.token {
-            Token::Diag(level, msg) => {
-                diags.push((level, msg, t.line));
-                None
+        .filter_map(|mut t| {
+            t.line += base - 1;
+            match &mut t.token {
+                Token::Diag(level, msg) => {
+                    diags.push((*level, std::mem::take(msg), t.line));
+                    None
+                }
+                // Part bases inside an embedded string are
+                // snippet-relative as well — rebase them with the
+                // token (a part's own parts rebase when IT parses).
+                Token::InterpString(parts) => {
+                    for p in parts.iter_mut() {
+                        match p {
+                            StringPart::Lit(_) => {}
+                            StringPart::Var(_, b)
+                            | StringPart::Expr(_, b)
+                            | StringPart::DollarBraceExpr(_, b) => *b += base - 1,
+                        }
+                    }
+                    Some(t)
+                }
+                _ => Some(t),
             }
-            _ => Some(t),
         })
         .collect();
     let mut p = Parser {
         toks: &toks,
+        src: &wrapped,
         pos: 0,
         eof_line: toks.last().map(|t| t.line).unwrap_or(1),
         deprecations: Vec::new(),
         compile_warnings: Vec::new(),
         stmt_starts: Vec::new(),
         cur_class: String::new(),
+        fn_ctx: Vec::new(),
         hook_ctx: None,
         pending_class_attrs: Vec::new(),
         cur_ns: String::new(),
@@ -376,15 +430,20 @@ pub fn parse_expr_src(src: &str) -> Result<(Expr, SrcDiags), PhpError> {
         declared_types: std::collections::HashSet::new(),
         in_braced_ns: false,
         ns_style: 0,
+        arg_end: 0,
         class_ctx: Vec::new(),
         first_stmt_slot: false,
         strict_slot: false,
         in_closure: false,
+        fn_nest: 0,
+        declared_funcs: std::collections::HashSet::new(),
         in_named_fn: false,
         const_ctx: ConstCtx::Runtime,
         ret_by_ref: false,
         write_ctx_errs: Vec::new(),
     };
+    // No rebase here: token lines are already absolute, so the
+    // parser's own error lines report file lines.
     let e = p.expr()?;
     Ok((e, diags))
 }
@@ -563,7 +622,7 @@ impl<'a> Parser<'a> {
             }
             Some(Token::Variable(s)) => format!("variable \"${}\"", s),
             Some(Token::Int(v)) => format!("integer \"{}\"", v),
-            Some(Token::Float(v)) => format!("float {}", v),
+            Some(Token::Float(v)) => format!("floating-point number \"{}\"", v),
             Some(Token::Op(o)) => format!("token \"{}\"", o),
             Some(_) => "token".to_string(),
         }
@@ -685,10 +744,12 @@ impl<'a> Parser<'a> {
 
     /// A `{ ... }` block or a single statement body.
     pub(in crate::parser) fn body(&mut self) -> Result<Vec<Stmt>, PhpError> {
-        if self.eat_op("{") {
+        self.fn_nest += 1;
+        let r = if self.eat_op("{") {
             let mut v = Vec::new();
             while !self.eat_op("}") {
                 if self.peek().is_none() {
+                    self.fn_nest -= 1;
                     return Err(PhpError::parse(
                         "syntax error, unexpected end of file",
                         self.line(),
@@ -701,7 +762,9 @@ impl<'a> Parser<'a> {
         } else {
             let l = self.line();
             Ok(vec![Stmt::Line(l), self.stmt()?])
-        }
+        };
+        self.fn_nest -= 1;
+        r
     }
 
     /// Like `body()` but also accepts PHP's `:` alternative syntax:
@@ -719,12 +782,14 @@ impl<'a> Parser<'a> {
     /// Statements up to (not consuming) any terminator keyword — the
     /// body of a `:` alternative-syntax block.
     pub(in crate::parser) fn body_until(&mut self, stops: &[&str]) -> Result<Vec<Stmt>, PhpError> {
+        self.fn_nest += 1;
         let mut v = Vec::new();
         loop {
             if stops.iter().any(|s| self.ident_is(s)) {
                 break;
             }
             if self.peek().is_none() {
+                self.fn_nest -= 1;
                 return Err(PhpError::parse(
                     "syntax error, unexpected end of file",
                     self.line(),
@@ -733,6 +798,7 @@ impl<'a> Parser<'a> {
             v.push(Stmt::Line(self.line()));
             v.push(self.stmt()?);
         }
+        self.fn_nest -= 1;
         Ok(v)
     }
 
@@ -1074,7 +1140,7 @@ pub(in crate::parser) fn desc_t(t: Option<&Token>) -> String {
         Some(Token::Variable(s)) => format!("variable \"${}\"", s),
         Some(Token::Op(o)) => format!("token \"{}\"", o),
         Some(Token::Int(v)) => format!("integer \"{}\"", v),
-        Some(Token::Float(v)) => format!("float {}", v),
+        Some(Token::Float(v)) => format!("floating-point number \"{}\"", v),
         _ => "token".to_string(),
     }
 }

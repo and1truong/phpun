@@ -30,13 +30,17 @@ pub enum StringPart {
     /// Literal bytes — escapes decode to raw bytes (PHP strings are
     /// byte arrays; `\xNN` is a byte, not a codepoint).
     Lit(Vec<u8>),
-    /// `$name`
-    Var(String),
-    /// `{$expr_source}` — re-lexed lazily by the parser.
-    Expr(String),
+    /// `$name` — the usize is the `$`'s absolute line (diagnostics
+    /// while reading the variable site there, Zend's per-op lines).
+    Var(String, usize),
+    /// `{$expr_source}` — re-lexed lazily by the parser. The usize is
+    /// the embedded source's absolute start line: the snippet re-lexes
+    /// with snippet-relative (1-based) lines, and diagnostics rebase
+    /// onto this so they report file lines.
+    Expr(String, usize),
     /// `${expr_source}` — deprecated variable-variable interpolation
     /// (evaluates the expr to a *name*, then reads that variable).
-    DollarBraceExpr(String),
+    DollarBraceExpr(String, usize),
 }
 
 #[derive(Debug, Clone)]
@@ -836,14 +840,15 @@ fn interp_scan(
                 }
                 flush!();
                 // Compile-time diags inside `{$expr}` (e.g. octal
-                // overflow) scan at lex time like Zend.
+                // overflow) scan at lex time like Zend — each sites
+                // at its own inner-source line, not the marker's.
                 let inner = &src[pos + n + 1..pos + k];
                 if let Ok(toks) = lex(&format!("<?php {}", inner)) {
                     for t in toks {
                         if let Token::Diag(level, msg) = t.token {
                             diags.push(Lexed {
                                 token: Token::Diag(level, msg),
-                                line: line + s_matches(&src[pos..pos + n]),
+                                line: line + s_matches(&src[pos..pos + n]) + t.line - 1,
                                 ws_adj: 0,
                                 start: usize::MAX,
                                 end: usize::MAX,
@@ -851,7 +856,10 @@ fn interp_scan(
                         }
                     }
                 }
-                parts.push(StringPart::Expr(src[pos + n + 1..pos + k].to_string()));
+                parts.push(StringPart::Expr(
+                    src[pos + n + 1..pos + k].to_string(),
+                    line + s_matches(&src[pos..pos + n]),
+                ));
                 n = k + 1;
             }
             Some(&b'$') => {
@@ -887,7 +895,7 @@ fn interp_scan(
                             if let Token::Diag(level, msg) = t.token {
                                 diags.push(Lexed {
                                     token: Token::Diag(level, msg),
-                                    line: line + s_matches(&src[pos..pos + n]),
+                                    line: line + s_matches(&src[pos..pos + n]) + t.line - 1,
                                     ws_adj: 0,
                                     start: usize::MAX,
                                     end: usize::MAX,
@@ -903,15 +911,16 @@ fn interp_scan(
                     let (_, ilen) = ident(inner, 0);
                     let is_var =
                         ilen > 0 && matches!(inner.as_bytes().get(ilen), None | Some(&b'['));
+                    let part_base = line + s_matches(&src[pos..pos + n]);
                     let (msg, part) = if is_var {
                         (
                             "Using ${var} in strings is deprecated, use {$var} instead",
-                            StringPart::Expr(format!("${}", inner)),
+                            StringPart::Expr(format!("${}", inner), part_base),
                         )
                     } else {
                         (
                             "Using ${expr} (variable variables) in strings is deprecated, use {${expr}} instead",
-                            StringPart::DollarBraceExpr(inner.to_string()),
+                            StringPart::DollarBraceExpr(inner.to_string(), part_base),
                         )
                     };
                     diags.push(Lexed {
@@ -936,20 +945,27 @@ fn interp_scan(
                         if src[rest..].starts_with("->") {
                             let (pn, plen) = ident(src, rest + 2);
                             if !pn.is_empty() {
-                                parts.push(StringPart::Expr(format!("${}->{}", name, pn)));
+                                parts.push(StringPart::Expr(
+                                    format!("${}->{}", name, pn),
+                                    line + s_matches(&src[pos..pos + n]),
+                                ));
                                 n = rest + 2 + plen - pos;
                             } else {
-                                parts.push(StringPart::Var(name));
+                                parts.push(StringPart::Var(
+                                    name,
+                                    line + s_matches(&src[pos..pos + n]),
+                                ));
                                 n += 1 + len;
                             }
                         } else if src[rest..].starts_with('[') {
                             // Quoted keys are illegal in simple
                             // interpolation — `$arr['x']` is E_PARSE
-                            // (bug21820).
+                            // (bug21820). Zend sites it at the `$`,
+                            // not the string's opening quote.
                             if matches!(b.get(rest + 1), Some(b'\'') | Some(b'"')) {
                                 return Err(PhpError::parse(
                                     "syntax error, unexpected string content \"\", expecting \"-\" or identifier or variable or number",
-                                    line,
+                                    line + s_matches(&src[pos..pos + n]),
                                 ));
                             }
                             // One-dimensional index (unquoted ident/number/quoted).
@@ -961,18 +977,20 @@ fn interp_scan(
                                 k += 1;
                             }
                             if b.get(k) == Some(&b']') {
-                                parts.push(StringPart::Expr(format!(
-                                    "${}{}",
-                                    name,
-                                    &src[rest..=k]
-                                )));
+                                parts.push(StringPart::Expr(
+                                    format!("${}{}", name, &src[rest..=k]),
+                                    line + s_matches(&src[pos..pos + n]),
+                                ));
                                 n = k + 1 - pos;
                             } else {
-                                parts.push(StringPart::Var(name));
+                                parts.push(StringPart::Var(
+                                    name,
+                                    line + s_matches(&src[pos..pos + n]),
+                                ));
                                 n += 1 + len;
                             }
                         } else {
-                            parts.push(StringPart::Var(name));
+                            parts.push(StringPart::Var(name, line + s_matches(&src[pos..pos + n])));
                             n += 1 + len;
                         }
                     }

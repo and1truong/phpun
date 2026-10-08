@@ -129,7 +129,7 @@ pub(in crate::interp) fn ty_disp(ty: &[String]) -> String {
 /// (literals and operators over them — no fetches, calls, `new`).
 /// Only these get Zend's eager "Cannot use ... as value" fatal at
 /// class registration; everything else type-checks lazily at access.
-pub(in crate::interp) fn is_compile_const(e: &Expr) -> bool {
+pub(crate) fn is_compile_const(e: &Expr) -> bool {
     match e {
         Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::Str(_) => true,
         Expr::Interp(parts) => parts
@@ -157,6 +157,8 @@ pub(in crate::interp) fn is_compile_const(e: &Expr) -> bool {
 pub(in crate::interp) fn compare_operand_rank(e: &Expr) -> u8 {
     match e {
         Expr::Var(_) => 8,
+        // A folded varvar compiles to a CV — same IS_CV rank.
+        Expr::VarVar(inner, _) if is_compile_const(inner) => 8,
         // zend strips parens during compilation — `($x)` is the CV.
         Expr::Paren(e) => compare_operand_rank(e),
         Expr::Call { .. }
@@ -186,5 +188,21 @@ pub(in crate::interp) fn compare_operand_rank(e: &Expr) -> u8 {
         }
         _ if is_compile_const(e) => 1,
         _ => 2,
+    }
+}
+
+/// zend_zval_value_name for `Unhandled match case %s`: ints/floats by
+/// value, strings single-quoted, scalars by name, compound values as
+/// "of type <t>".
+pub(in crate::interp) fn match_case_desc(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Bool(b) => if *b { "true" } else { "false" }.into(),
+        Value::Int(_) | Value::Float(_) => v.to_php_string(),
+        Value::Str(s) => format!("'{}'", String::from_utf8_lossy(s)),
+        Value::Array(_) => "of type array".into(),
+        Value::Object(o) => format!("of type {}", o.borrow().class.name()),
+        Value::Callable(_) => "of type Closure".into(),
+        Value::Resource(_) => "of type resource".into(),
     }
 }

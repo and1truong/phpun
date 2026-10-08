@@ -458,6 +458,20 @@ impl<'a> Interp<'a> {
         sc: &mut ScanScope,
     ) -> Result<(), PhpError> {
         let kw = if is_break { "break" } else { "continue" };
+        // `break (2)`/`break (expr)` — parens and the arg's line
+        // marker wrap the literal; peel both for the operand check.
+        let mut op = op;
+        while let Some(
+            Expr::Paren(inner)
+            | Expr::Binary {
+                op: "argline",
+                r: inner,
+                ..
+            },
+        ) = op
+        {
+            op = Some(inner);
+        }
         let n = match op {
             None => 1usize,
             Some(e) => match Self::flow_op_lit(e) {
@@ -603,7 +617,7 @@ impl<'a> Interp<'a> {
             | Expr::PostDec(e)
             | Expr::Empty(e)
             | Expr::Print(e)
-            | Expr::VarVar(e)
+            | Expr::VarVar(e, _)
             | Expr::Paren(e)
             | Expr::Fcc(e)
             | Expr::Unpack(e)
@@ -635,7 +649,7 @@ impl<'a> Interp<'a> {
                 self.flow_expr(obj, sc)?;
                 self.flow_expr(class, sc)
             }
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, .. } => {
                 self.flow_expr(name, sc)?;
                 for a in args {
                     self.flow_expr(a, sc)?;
@@ -674,7 +688,7 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
 
-            Expr::Match { subject, arms } => {
+            Expr::Match { subject, arms, .. } => {
                 self.flow_expr(subject, sc)?;
                 for a in arms {
                     for c in &a.conds {
@@ -684,7 +698,7 @@ impl<'a> Interp<'a> {
                 }
                 Ok(())
             }
-            Expr::New { class, args } => {
+            Expr::New { class, args, .. } => {
                 self.flow_expr(class, sc)?;
                 for a in args {
                     self.flow_expr(a, sc)?;
@@ -724,7 +738,9 @@ impl<'a> Interp<'a> {
                 }
                 Ok(())
             }
-            Expr::StaticCallDyn { class, name, args } => {
+            Expr::StaticCallDyn {
+                class, name, args, ..
+            } => {
                 self.flow_expr(class, sc)?;
                 self.flow_expr(name, sc)?;
                 for a in args {
