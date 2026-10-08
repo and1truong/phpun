@@ -2779,6 +2779,8 @@ impl<'a> Parser<'a> {
         match e {
             Expr::MethodCall { obj, nullsafe, .. } => *nullsafe || Self::has_nullsafe(obj),
             Expr::Prop { obj, nullsafe, .. } => *nullsafe || Self::has_nullsafe(obj),
+            // `$o?->p['k']` — the nullsafe sits under the dim.
+            Expr::Index { e, .. } => Self::has_nullsafe(e),
             _ => false,
         }
     }
