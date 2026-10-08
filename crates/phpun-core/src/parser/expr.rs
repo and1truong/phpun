@@ -1133,7 +1133,10 @@ impl<'a> Parser<'a> {
                 });
             }
             let tl = self.line();
-            let t = self.ternary()?;
+            // The middle arm is zend's full `expr` — `a ? b or c : d`,
+            // `a ? b and c : d`, `a ? $x = f() : e` all parse (word ops
+            // bind below `=`; the expr stops at the `:` separator).
+            let t = self.expr()?;
             self.expect_op(":")?;
             let fl = self.line();
             let f = self.ternary()?;
