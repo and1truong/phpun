@@ -335,12 +335,21 @@ impl<'a> Interp<'a> {
                     // zvals straight onto vm_stack, so the separation
                     // (and its doubled arData) is pure churn — skip it.
                     if Rc::strong_count(a) > 1
-                        && (decl.is_empty()
-                            || decl
+                        && (decl.is_empty() || {
+                            let b = a.borrow();
+                            let n_pos = b
+                                .entries
                                 .iter()
-                                .skip(pos)
-                                .take(a.borrow().entries.len())
-                                .any(|p| p.by_ref))
+                                .filter(|(k, _)| matches!(k, ArrKey::Int(_)))
+                                .count();
+                            decl.iter().enumerate().any(|(i, p)| {
+                                p.by_ref
+                                    && (i >= pos && i < pos + n_pos
+                                        || b.entries.iter().any(|(k, _)| {
+                                            matches!(k, ArrKey::Str(s) if &**s == p.name.as_str())
+                                        }))
+                            })
+                        })
                     {
                         let mut na = a.borrow().clone();
                         for (_, c) in na.entries.iter_mut() {
