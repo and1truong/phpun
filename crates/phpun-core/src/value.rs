@@ -93,14 +93,16 @@ impl PhpArray {
         // 1310720@nSize=32768, 5242880@131072 on 'k$i' loops).
         let request = arr_req(self.mem_elems, self.packed);
         let new = arr_foot(self.mem_elems, self.packed);
-        // zend's emalloc check reads real_size before this grow
-        // commits — captured ahead of the dedicated-chunk swap.
-        real_peak_note(mem_real_raw() + request);
-        arr_huge_note(
-            (old, arr_req(self.mem_elems - 1, self.packed)),
-            (new, request),
-        );
-        mem_charge(&ARR_LIVE, new - old, request);
+        let old_req = arr_req(self.mem_elems - 1, self.packed);
+        // zend only emallocs when the grow crosses a pow2 bucket
+        // boundary — in-band appends reuse the committed arData.
+        // The guard reads real_size before this grow commits —
+        // captured ahead of the dedicated-chunk swap.
+        if request != old_req {
+            real_peak_note(mem_real_raw() + request);
+        }
+        arr_huge_note((old, old_req), (new, request));
+        mem_charge_raw(&ARR_LIVE, new - old, request);
     }
 
     /// Bulk-charge `n` appended slots — the mass-prepend path in
@@ -115,12 +117,13 @@ impl PhpArray {
         self.mem_elems += n;
         let request = arr_req(self.mem_elems, self.packed);
         let new = arr_foot(self.mem_elems, self.packed);
-        real_peak_note(mem_real_raw() + request);
-        arr_huge_note(
-            (old, arr_req(self.mem_elems - n, self.packed)),
-            (new, request),
-        );
-        mem_charge(&ARR_LIVE, new - old, request);
+        let old_req = arr_req(self.mem_elems - n, self.packed);
+        // Same pow2-crossing rule as mem_note_append.
+        if request != old_req {
+            real_peak_note(mem_real_raw() + request);
+        }
+        arr_huge_note((old, old_req), (new, request));
+        mem_charge_raw(&ARR_LIVE, new - old, request);
     }
 
     /// Key-side meter bookkeeping before a NEW entry is pushed: a
@@ -131,20 +134,32 @@ impl PhpArray {
     /// Call with the key BEFORE the push so the packed check sees the
     /// pre-insert slot count.
     pub fn mem_note_key(&mut self, k: &ArrKey) {
-        match k {
-            ArrKey::Str(s) => {
-                self.packed = false;
-                let c = key_charge(s.len());
-                self.key_bytes += c;
-                str_mem_charge(c, c);
-                gc_root_note(1);
-            }
-            ArrKey::Int(i) => {
-                if *i != self.entries.len() as i64 {
-                    self.packed = false;
-                }
-            }
-            ArrKey::Tomb => {}
+        let flip = match k {
+            ArrKey::Str(_) => self.packed,
+            ArrKey::Int(i) => self.packed && *i != self.entries.len() as i64,
+            ArrKey::Tomb => false,
+        };
+        if flip {
+            // Packed→mixed conversion rebuilds the whole arData as
+            // 40B buckets — the emalloc guard sees the new alloc while
+            // the old arData is still committed, then it's freed.
+            let n = self.mem_elems;
+            let req = arr_req(n + 1, false);
+            real_peak_note(mem_real_raw() + req);
+            arr_huge_note(
+                (arr_foot(n, true), arr_req(n, true)),
+                (arr_foot(n, false), req),
+            );
+            ARR_LIVE.fetch_add(
+                arr_foot(n, false) - arr_foot(n, true),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.packed = false;
+        }
+        if let ArrKey::Str(s) = k {
+            let c = key_charge(s.len());
+            self.key_bytes += c;
+            str_mem_charge(c, c);
         }
     }
 
@@ -161,13 +176,6 @@ impl PhpArray {
         if self.key_bytes > 0 {
             STR_LIVE.fetch_sub(self.key_bytes, std::sync::atomic::Ordering::Relaxed);
             self.key_bytes = 0;
-            gc_root_note(
-                -(self
-                    .entries
-                    .iter()
-                    .filter(|(k, _)| matches!(k, ArrKey::Str(_)))
-                    .count() as i64),
-            );
         }
     }
 
@@ -190,7 +198,6 @@ impl PhpArray {
                         let c = key_charge(s.len());
                         self.key_bytes += c;
                         str_mem_charge(c, c);
-                        gc_root_note(1);
                     }
                     ArrKey::Tomb => {}
                 }
@@ -200,7 +207,7 @@ impl PhpArray {
             let new = arr_foot(self.mem_elems, self.packed);
             real_peak_note(mem_real_raw() + request);
             arr_huge_note((0, 0), (new, request));
-            mem_charge(&ARR_LIVE, new, request);
+            mem_charge_raw(&ARR_LIVE, new, request);
         }
     }
 
@@ -307,7 +314,6 @@ impl PhpArray {
                 let c = key_charge(s.len());
                 self.key_bytes -= c;
                 STR_LIVE.fetch_sub(c, std::sync::atomic::Ordering::Relaxed);
-                gc_root_note(-1);
             }
             slot.0 = ArrKey::Tomb;
             let old = std::mem::replace(&mut slot.1, Rc::new(RefCell::new(Value::Null)));
@@ -2035,13 +2041,13 @@ static LAST_ALLOC: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::
 /// High-water of live bytes held in the small-pool chunks — zend
 /// never returns a 2MB block to the OS, so committed tracks the
 /// high-water even when live frees back down.
-static SMALL_HW: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub(crate) static SMALL_HW: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 /// Live bytes held inside dedicated huge chunks (requests ≥ the
 /// 2MB block's usable ~2,093,056 bytes get their own page-aligned
 /// chunk — freed back to the OS when the value dies).
-static HUGE_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub(crate) static HUGE_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 /// Committed bytes of the live dedicated chunks (page-rounded).
-static HUGE_REAL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub(crate) static HUGE_REAL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 /// High-water of zend's emalloc check value (real_size + request at
 /// each alloc) — the guard trips MID-expression when a commit would
 /// cross the limit even though the statement ends below it (a 200k
@@ -2059,6 +2065,14 @@ const HUGE_MIN: i64 = 2_093_056;
 fn mem_charge(counter: &std::sync::atomic::AtomicI64, bytes: i64, request: i64) {
     // zend's guard reads real_size BEFORE this alloc's commit.
     real_peak_note(mem_real_raw() + request);
+    mem_charge_raw(counter, bytes, request);
+}
+
+/// The commit half of mem_charge for callers that already latched
+/// the pre-commit check value (mem_note_* note BEFORE arr_huge_note
+/// swaps a dedicated chunk — re-noting after the swap would see the
+/// new chunk and double it into the check).
+fn mem_charge_raw(counter: &std::sync::atomic::AtomicI64, bytes: i64, request: i64) {
     counter.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     LAST_ALLOC.store(request, std::sync::atomic::Ordering::Relaxed);
     mem_note_hw();
@@ -2086,6 +2100,14 @@ fn mem_note_hw() {
 /// in page-rounded request units.
 fn arr_huge_note(old: (i64, i64), new: (i64, i64)) {
     let rel = std::sync::atomic::Ordering::Relaxed;
+    if std::env::var_os("PHPUN_MEM_DEBUG").is_some() && (old.1 >= HUGE_MIN || new.1 >= HUGE_MIN) {
+        eprintln!(
+            "huge_note old_req={} new_req={} real_now={}",
+            old.1,
+            new.1,
+            mem_real_raw()
+        );
+    }
     if old.1 >= HUGE_MIN {
         HUGE_LIVE.fetch_sub(old.0, rel);
         HUGE_REAL.fetch_sub(huge_chunk_bytes(old.1), rel);
@@ -2135,6 +2157,41 @@ fn huge_chunk_bytes(request: i64) -> i64 {
     (request + 4095) & !4095
 }
 
+/// Charge the caller's arg-stack pages — `...` unpacking commits
+/// zend_vm_stack segments (256KB pages) that stay live until the
+/// frame tears down (CallArgs teardown releases the charge). A
+/// ≥block-sized segment is itself a dedicated chunk.
+pub(crate) fn stack_charge(bytes: i64, request: i64) {
+    let rel = std::sync::atomic::Ordering::Relaxed;
+    if std::env::var_os("PHPUN_MEM_DEBUG").is_some() {
+        eprintln!("stack_charge {} real_before={}", request, mem_real_raw());
+    }
+    real_peak_note(mem_real_raw() + request);
+    ARR_LIVE.fetch_add(bytes, rel);
+    LAST_ALLOC.store(request, rel);
+    if bytes >= HUGE_MIN {
+        HUGE_LIVE.fetch_add(bytes, rel);
+        HUGE_REAL.fetch_add(huge_chunk_bytes(bytes), rel);
+    }
+    mem_note_hw();
+}
+
+/// Release a stack charge — the segment frees with its frame, and a
+/// ≥block-sized segment also returns its committed pages.
+pub(crate) fn stack_release(bytes: i64) {
+    if std::env::var_os("PHPUN_MEM_DEBUG").is_some() {
+        eprintln!("stack_release {} real_now={}", bytes, mem_real_raw());
+    }
+    ARR_LIVE.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+    if bytes >= HUGE_MIN {
+        HUGE_LIVE.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+        HUGE_REAL.fetch_sub(
+            huge_chunk_bytes(bytes),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
 fn mem_live_raw() -> i64 {
     OBJ_LIVE.load(std::sync::atomic::Ordering::Relaxed)
         + ARR_LIVE.load(std::sync::atomic::Ordering::Relaxed)
@@ -2166,7 +2223,7 @@ pub fn mem_real_peak() -> i64 {
 /// under memory_limit probes), so the charge latches at its high-water
 /// mark.
 static GC_ROOTS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-static GC_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub(crate) static GC_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// +1/-1 a live collectible entity; updates the GC-buffer high-water.
 pub(crate) fn gc_root_note(delta: i64) {
@@ -2262,13 +2319,6 @@ impl Drop for PhpArray {
         }
         if self.key_bytes > 0 {
             STR_LIVE.fetch_sub(self.key_bytes, std::sync::atomic::Ordering::Relaxed);
-            gc_root_note(
-                -(self
-                    .entries
-                    .iter()
-                    .filter(|(k, _)| matches!(k, ArrKey::Str(_)))
-                    .count() as i64),
-            );
         }
         gc_root_note(-1);
     }

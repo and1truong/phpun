@@ -6584,6 +6584,13 @@ impl<'a> Interp<'a> {
     /// The separated copy for CoW / array-copy contexts (`=`, exchange
     /// values): ref-marked cells are re-bound, the rest duplicated.
     pub fn dup_array(&self, a: &PhpArray) -> PhpArray {
+        if std::env::var_os("PHPUN_MEM_DEBUG").is_some() && a.entries.len() > 1000 {
+            eprintln!(
+                "dup_array n={} real={}",
+                a.entries.len(),
+                crate::value::mem_real_raw()
+            );
+        }
         let mut copy = PhpArray {
             entries: Vec::with_capacity(a.entries.len()),
             next: a.next,

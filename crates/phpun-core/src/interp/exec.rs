@@ -56,6 +56,19 @@ impl<'a> Interp<'a> {
             // (transient dedicated chunks freed before the boundary
             // already pushed real_size past the limit).
             if limit > 0 && self.mem_real().max(crate::value::mem_real_peak()) > limit {
+                if std::env::var_os("PHPUN_MEM_DEBUG").is_some() {
+                    eprintln!(
+                        "OOM@boundary: real={} peak={} limit={} last={} live={} arr={} str={} obj={}",
+                        self.mem_real(),
+                        crate::value::mem_real_peak(),
+                        limit,
+                        crate::value::mem_last_alloc(),
+                        self.mem_total(),
+                        crate::value::arr_live_bytes(),
+                        crate::value::str_live_bytes(),
+                        crate::value::obj_live_bytes(),
+                    );
+                }
                 self.mem_exceeded = true;
                 // Zend's OOM fatal always prints a Stack trace:
                 // block (`#0 {main}` at top level) — a plain E_ERROR

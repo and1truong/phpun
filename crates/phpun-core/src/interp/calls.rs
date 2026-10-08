@@ -342,6 +342,7 @@ impl<'a> Interp<'a> {
                 }
                 let trav = matches!(&v, Value::Object(_));
                 let mut unpack_named = false;
+                let stack0 = out.cells.len() + out.named.len();
                 for (k, c) in self.unpack_items(&v, true)? {
                     match k {
                         Some(n) => {
@@ -365,11 +366,18 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                // zend keeps the unpacked zval in the call frame until
-                // teardown — its table stays charged through the
-                // callee's allocs (unshift's range + rebuilt table
-                // coexist at the emalloc guard).
-                out.hold.push(v);
+                // zend's SEND_UNPACK commits vm_stack pages for the
+                // copied args (256KB segments over n*16) while the
+                // source zval is still live, then frees the zval —
+                // so the emalloc guard here sees the source table,
+                // and the stack pages stay charged until the frame
+                // dies (ArgStack drop at CallArgs teardown).
+                let n = (out.cells.len() + out.named.len() - stack0) as i64;
+                if n > 0 {
+                    let seg = (n * 16 + 262_143) & !262_143;
+                    crate::value::stack_charge(seg, seg);
+                    out.arg_stack.push(Rc::new(ArgStack(seg)));
+                }
                 continue;
             }
             let by_ref = match &name {

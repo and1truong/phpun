@@ -92,11 +92,25 @@ pub struct CallArgs {
     /// alive until the call returns, so its table stays charged
     /// through the builtin's own allocs).
     pub hold: Vec<Value>,
+    /// Arg-stack page charges — each `...` unpack commits a
+    /// roundup-256KB(n*16) zend_vm_stack segment, live until the
+    /// frame dies. Rc-shared through CallArgs clones so the release
+    /// fires once at the last clone's drop.
+    pub arg_stack: Vec<Rc<ArgStack>>,
     /// Diagnostic line of the last-evaluated argument — the deepest
     /// line marker reached while building this list. Zend sites the
     /// diagnostics of a compile-specialized literal call (sprintf rope)
     /// at the line of its final operand, not the call's first token.
     pub end_line: usize,
+}
+
+/// One arg-stack page charge carried by a CallArgs — the drop
+/// releases the segment's committed bytes (see `arg_stack`).
+pub struct ArgStack(pub i64);
+impl Drop for ArgStack {
+    fn drop(&mut self) {
+        crate::value::stack_release(self.0);
+    }
 }
 
 impl CallArgs {
@@ -107,6 +121,7 @@ impl CallArgs {
             trav_cells: Vec::new(),
             nonref_cells: Vec::new(),
             hold: Vec::new(),
+            arg_stack: Vec::new(),
             end_line: 0,
         }
     }
@@ -3539,6 +3554,20 @@ impl<'a> Interp<'a> {
     pub(crate) fn mem_check_alloc(&mut self, want: i64) -> Result<(), PhpError> {
         let limit = self.ini_bytes("memory_limit");
         if limit > 0 && self.mem_real() + want > limit {
+            if std::env::var_os("PHPUN_MEM_DEBUG").is_some() {
+                eprintln!(
+                    "OOM: real={} want={} limit={} small_hw={} huge_live={} huge_real={} peak={} live={} arr={} str={} gcpeak={}",
+                    self.mem_real(), want, limit,
+                    crate::value::SMALL_HW.load(std::sync::atomic::Ordering::Relaxed),
+                    crate::value::HUGE_LIVE.load(std::sync::atomic::Ordering::Relaxed),
+                    crate::value::HUGE_REAL.load(std::sync::atomic::Ordering::Relaxed),
+                    crate::value::mem_real_peak(),
+                    self.mem_total(),
+                    crate::value::arr_live_bytes(),
+                    crate::value::str_live_bytes(),
+                    crate::value::GC_PEAK.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
             self.mem_exceeded = true;
             let mut e = PhpError::fatal(
                 format!(
@@ -5719,6 +5748,7 @@ impl<'a> Interp<'a> {
                     .map(|i| i - 1)
                     .collect(),
                 hold: args.hold.clone(),
+                arg_stack: args.arg_stack.clone(),
                 trav_cells: args
                     .trav_cells
                     .iter()

@@ -599,7 +599,7 @@ pub(crate) fn dispatch(
                 let mut new_entries: Vec<(ArrKey, Cell)> = Vec::new();
                 for (i, a) in args[1..].iter().enumerate() {
                     // zval_copy_ctor: a reference arg lands as its cell.
-                    let c = if it.is_ref_cell(a) {
+                    let c = if it.is_ref_cell(a) && Rc::strong_count(a) > 1 {
                         a.clone()
                     } else {
                         cell(a.borrow().clone())
@@ -931,11 +931,13 @@ pub(crate) fn dispatch(
                     if let Value::Array(row) = &*c.borrow() {
                         let row = row.borrow();
                         if let Some(rc) = row.get_cell(&colkey) {
+                            // zend's column extraction copies the
+                            // VALUE — references don't survive.
                             if has_idx {
                                 let k = row.get(&to_key(&idx)).unwrap_or(Value::Null);
-                                copy_elem(it, &mut out, &to_key(&k), &rc);
+                                out.set(to_key(&k), rc.borrow().clone());
                             } else {
-                                push_elem(it, &mut out, &rc);
+                                out.push(rc.borrow().clone());
                             }
                         }
                     }
@@ -985,7 +987,7 @@ pub(crate) fn dispatch(
                             next += 1;
                             // zend renumbers int keys; the zval-copy
                             // keeps a reference element's cell.
-                            if it.is_ref_cell(c) {
+                            if it.is_ref_cell(c) && Rc::strong_count(c) > 1 {
                                 out.entries.push((nk, c.clone()));
                             } else {
                                 out.entries.push((nk, cell(c.borrow().clone())));
@@ -993,7 +995,7 @@ pub(crate) fn dispatch(
                         }
                         _ => {
                             out.mem_note_key(k);
-                            if it.is_ref_cell(c) {
+                            if it.is_ref_cell(c) && Rc::strong_count(c) > 1 {
                                 out.entries.push((k.clone(), c.clone()));
                             } else {
                                 out.entries.push((k.clone(), cell(c.borrow().clone())));
@@ -2366,7 +2368,9 @@ fn array_assoc_match(
 /// value. Bind-replaces on key collision the way an overwritten
 /// bucket does.
 fn copy_elem(it: &Interp, out: &mut PhpArray, k: &ArrKey, c: &Cell) {
-    if it.is_ref_cell(c) {
+    // zend unwraps an IS_REFERENCE bucket whose refcount is 1 —
+    // the cell is shared only while aliased elsewhere.
+    if it.is_ref_cell(c) && Rc::strong_count(c) > 1 {
         out.bind_cell(k.clone(), c.clone());
     } else {
         out.set(k.clone(), c.borrow().clone());
@@ -2375,7 +2379,7 @@ fn copy_elem(it: &Interp, out: &mut PhpArray, k: &ArrKey, c: &Cell) {
 
 /// `copy_elem` for index-appended elements.
 fn push_elem(it: &Interp, out: &mut PhpArray, c: &Cell) {
-    if it.is_ref_cell(c) {
+    if it.is_ref_cell(c) && Rc::strong_count(c) > 1 {
         out.push_cell(c.clone());
     } else {
         out.push(c.borrow().clone());
