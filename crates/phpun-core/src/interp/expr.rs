@@ -2847,7 +2847,10 @@ impl<'a> Interp<'a> {
                         iter_pos: a.iter_pos,
                         foreach_pos: Vec::new(),
                         mem_elems: 0,
+                        packed: a.packed,
+                        key_bytes: 0,
                     };
+                    crate::value::gc_root_note(1);
                     pa.mem_note_seed();
                     pa
                 })))
@@ -6535,7 +6538,10 @@ impl<'a> Interp<'a> {
             iter_pos: a.iter_pos,
             foreach_pos: Vec::new(),
             mem_elems: 0,
+            packed: a.packed,
+            key_bytes: 0,
         };
+        crate::value::gc_root_note(1);
         for (k, c) in &a.entries {
             // zend unwraps a refcount-1 IS_REFERENCE bucket on copy;
             // only cells still aliased elsewhere re-bind (a stale
@@ -6545,6 +6551,7 @@ impl<'a> Interp<'a> {
             } else {
                 cell(c.borrow().clone())
             };
+            copy.mem_note_key(k);
             copy.entries.push((k.clone(), nc));
             copy.mem_note_append();
         }

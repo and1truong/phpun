@@ -131,7 +131,7 @@ fn run_script(args: &[String]) -> ExitCode {
                 // positive value below 2M both warn and keep the
                 // previous value (2M itself is accepted, negatives
                 // mean unlimited and pass silently).
-                if lim >= 0 && lim < 2097152 {
+                if (0..2097152).contains(&lim) {
                     let msg = format!(
                         "Failed to set memory limit to {} bytes (Current memory usage is 2097152 bytes)",
                         lim

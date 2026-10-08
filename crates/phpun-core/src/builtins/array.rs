@@ -1172,6 +1172,7 @@ pub(crate) fn dispatch(
                     if let ArrKey::Int(x) = new_key {
                         arr.next = arr.next.max(x + 1);
                     }
+                    arr.mem_note_key(&new_key);
                     arr.entries.push((new_key, val.clone()));
                     arr.mem_note_append();
                 }
@@ -2307,7 +2308,10 @@ fn ucmp_cb(
     if pending.is_some() {
         return Ordering::Equal;
     }
-    match it.call_value(cb, crate::interp::CallArgs::positional(vec![cell(a), cell(b)])) {
+    match it.call_value(
+        cb,
+        crate::interp::CallArgs::positional(vec![cell(a), cell(b)]),
+    ) {
         Ok(r) => match r.to_int() {
             i if i > 0 => Ordering::Greater,
             i if i < 0 => Ordering::Less,
@@ -2397,33 +2401,37 @@ fn array_umatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Php
     } else {
         None
     };
-    let cmp = |it: &mut Interp,
-               x: &(ArrKey, Value),
-               y: &(ArrKey, Value),
-               pending: &mut Deferred| {
-        let mut c = match data_mode {
-            2 => ucmp_cb(it, &data_cb.clone().unwrap(), x.1.clone(), y.1.clone(), pending),
-            1 => zstr_cmp(it, &x.1, &y.1, pending),
-            _ => Ordering::Equal,
-        };
-        if c == Ordering::Equal && key_mode != 0 {
-            c = match &key_cb {
-                Some(cb) => ucmp_cb(it, cb, key_value(&x.0), key_value(&y.0), pending),
-                // zend_hash_key_compare for the assoc variants is key
-                // EQUALITY (int×int by value, str×str bytewise) — not
-                // the sort-order key_cmp above (its int arm never
-                // reports equal by design for same-table keys).
-                None => {
-                    if x.0 == y.0 {
-                        Ordering::Equal
-                    } else {
-                        Ordering::Less
-                    }
-                }
+    let cmp =
+        |it: &mut Interp, x: &(ArrKey, Value), y: &(ArrKey, Value), pending: &mut Deferred| {
+            let mut c = match data_mode {
+                2 => ucmp_cb(
+                    it,
+                    &data_cb.clone().unwrap(),
+                    x.1.clone(),
+                    y.1.clone(),
+                    pending,
+                ),
+                1 => zstr_cmp(it, &x.1, &y.1, pending),
+                _ => Ordering::Equal,
             };
-        }
-        c
-    };
+            if c == Ordering::Equal && key_mode != 0 {
+                c = match &key_cb {
+                    Some(cb) => ucmp_cb(it, cb, key_value(&x.0), key_value(&y.0), pending),
+                    // zend_hash_key_compare for the assoc variants is key
+                    // EQUALITY (int×int by value, str×str bytewise) — not
+                    // the sort-order key_cmp above (its int arm never
+                    // reports equal by design for same-table keys).
+                    None => {
+                        if x.0 == y.0 {
+                            Ordering::Equal
+                        } else {
+                            Ordering::Less
+                        }
+                    }
+                };
+            }
+            c
+        };
     // Snapshot arg0's entries; other lists stay borrowed per-scan.
     let l0: Vec<(ArrKey, Value)> = match &*arrs[0].borrow() {
         Value::Array(a) => a
