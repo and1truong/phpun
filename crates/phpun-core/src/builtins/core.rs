@@ -319,13 +319,15 @@ pub(crate) fn dispatch(
             if k == "memory_limit" {
                 it.ini.insert(k.clone(), v);
                 let lim = it.ini_bytes(&k);
-                if lim > 0 && (it.mem_used as i64) > lim {
+                // zend refuses limits below committed heap usage.
+                if lim > 0 && (it.mem_real() as i64) > lim {
                     let _ = it
                         .ini
                         .insert(k.clone(), prev.clone().unwrap_or_else(|| "-1".into()));
                     it.warn_pub(&format!(
                         "Failed to set memory limit to {} bytes (Current memory usage is {} bytes)",
-                        lim, it.mem_used
+                        lim,
+                        it.mem_real()
                     ))?;
                     return Ok(Some(match prev {
                         Some(p) => Value::str(p),
@@ -543,21 +545,20 @@ pub(crate) fn dispatch(
         "phpversion" | "phpversion_strict" => Value::str("8.5.11-phpun"),
         "php_uname" => Value::str("Linux"),
         // zend's memory_get_usage reports the live emalloc usage —
-        // our mem_used models it (charges up, credits down on efree).
+        // mem_used models it (charges up, credits down on efree);
+        // real_usage is heap->real_size (committed chunks + huge segs).
         "memory_get_usage" => {
             if arg(args, 0).is_truthy() {
-                // real_usage: heap segments zend never returns to the
-                // OS — model as peak usage rounded up to 2MB chunks.
-                let seg = 2097152u64;
-                Value::Int((it.mem_peak.div_ceil(seg) * seg).max(seg) as i64)
+                it.mem_reconcile();
+                Value::Int(it.mem_real() as i64)
             } else {
                 Value::Int(it.mem_reconcile() as i64)
             }
         }
         "memory_get_peak_usage" => {
             if arg(args, 0).is_truthy() {
-                let seg = 2097152u64;
-                Value::Int((it.mem_peak.div_ceil(seg) * seg).max(seg) as i64)
+                it.mem_reconcile();
+                Value::Int(it.mem_real_peak as i64)
             } else {
                 it.mem_reconcile();
                 Value::Int(it.mem_peak as i64)
@@ -566,6 +567,7 @@ pub(crate) fn dispatch(
         "memory_reset_peak_usage" => {
             it.mem_reconcile();
             it.mem_peak = it.mem_used;
+            it.mem_real_peak = it.mem_real();
             Value::Null
         }
         "zend_version" => Value::str("8.5.11-phpun"),

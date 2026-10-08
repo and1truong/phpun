@@ -96,10 +96,13 @@ pub(crate) fn dispatch(
             if neg {
                 reslen += 1;
             }
-            let want = (reslen + 25 + 7) & !7;
-            let limit = it.ini_bytes("memory_limit");
-            if limit > 0 && (it.mem_used as i128) + want > limit as i128 {
-                it.mem_charge(want.min(u64::MAX as i128) as u64);
+            // zend emallocs the result zend_string up front — the
+            // limit check runs inside emalloc against committed
+            // memory (dead tracked charges sweep first), and the
+            // fatal reports the committed footprint.
+            let want = reslen + 25;
+            let wantu = want.clamp(0, u64::MAX as i128) as u64;
+            if it.mem_check(wantu).is_some() {
                 it.mem_exceeded = true;
                 return Err(it.oom_fatal());
             }
@@ -136,8 +139,7 @@ pub(crate) fn dispatch(
                 )
             });
             if let Value::Str(s) = &nv {
-                let n = want.min(u64::MAX as i128) as u64;
-                it.mem_track(s, n, n);
+                it.mem_track(s, wantu);
             }
             nv
         }
@@ -193,19 +195,18 @@ pub(crate) fn dispatch(
         "str_repeat" => {
             let s = arg_bs(it, args, 0);
             let n = arg(args, 1).to_int().max(0) as usize;
-            // zend emallocs the result zend_string up front — check the
-            // request before the real repeat so huge n fatals instead
-            // of OOMing the host.
-            let want = (s.len() as i128 * n as i128 + 25 + 7) & !7;
-            let limit = it.ini_bytes("memory_limit");
-            if limit > 0 && (it.mem_used as i128) + want > limit as i128 {
-                it.mem_charge(want.min(u64::MAX as i128) as u64);
+            // zend emallocs the result zend_string up front — the
+            // limit check runs inside emalloc (dead tracked charges
+            // sweep first) so huge n fatals instead of OOMing the host.
+            let want = s.len() as i128 * n as i128 + 25;
+            let wantu = want.clamp(0, u64::MAX as i128) as u64;
+            if it.mem_check(wantu).is_some() {
                 it.mem_exceeded = true;
                 return Err(it.oom_fatal());
             }
             let v = Value::bytes(s.repeat(n));
             if let Value::Str(r) = &v {
-                it.mem_track(r, want as u64, want as u64);
+                it.mem_track(r, wantu);
             }
             v
         }

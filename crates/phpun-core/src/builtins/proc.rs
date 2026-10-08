@@ -1165,6 +1165,7 @@ fn php_exec(it: &mut Interp, fname: &str, args: &[Cell], ty: u8) -> Result<Value
                                 is_ref: a.borrow().is_ref,
                                 iter_pos: a.borrow().iter_pos,
                                 foreach_pos: Vec::new(),
+                                mixed: a.borrow().mixed,
                             };
                             let nv = Rc::new(RefCell::new(na));
                             *cb = Value::Array(nv.clone());

@@ -54,6 +54,7 @@ pub(in crate::interp) fn weak_ty_coerce(tys: &[String], v: &Value) -> Option<Val
                 }
             }
             ("int", Value::Bool(b)) => Some(Value::Int(*b as i64)),
+            ("string", Value::Str(_)) => Some(v.clone()),
             ("string", Value::Int(i)) => Some(Value::str(i.to_string())),
             ("string", Value::Float(f)) => Some(Value::str(format_float_repr(*f))),
             ("string", Value::Bool(b)) => Some(Value::str(if *b { "1" } else { "" })),

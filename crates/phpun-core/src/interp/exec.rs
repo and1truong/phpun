@@ -24,9 +24,9 @@ impl<'a> Interp<'a> {
         while i < stmts.len() {
             let s = &stmts[i];
             i += 1;
-            // memory_limit fires between statements (bug45392).
-            let limit = self.ini_bytes("memory_limit");
-            if limit > 0 && self.mem_used as i64 > limit {
+            // memory_limit fires between statements (bug45392) once
+            // a charge recorded its overflowing call site in oom_at.
+            if self.oom_at.is_some() {
                 self.mem_exceeded = true;
                 // zend's bailout backtraces the allocating call —
                 // oom_at captured it inside mem_charge.
@@ -37,7 +37,8 @@ impl<'a> Interp<'a> {
                 let mut e = PhpError::fatal(
                     format!(
                         "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
-                        limit, self.mem_last
+                        self.ini_bytes("memory_limit"),
+                        self.mem_last
                     ),
                     line,
                 );

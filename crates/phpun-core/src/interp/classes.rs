@@ -3589,7 +3589,7 @@ impl<'a> Interp<'a> {
         // charge releases when the object dies (efree).
         let bytes = 72 + 16 * o.props.len() as u64;
         let rc = Rc::new(RefCell::new(o));
-        self.mem_track(&rc, bytes, bytes);
+        self.mem_track(&rc, bytes);
         let id = self.next_obj_id(&rc);
         rc.borrow_mut().id = id;
         rc

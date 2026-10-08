@@ -42,6 +42,13 @@ pub struct PhpArray {
     /// rebuild mutators (unshift/shift/splice) adjust cursors the way
     /// zend's iterators_update does. None = a finished loop's freed slot.
     pub foreach_pos: Vec<Option<usize>>,
+    /// zend's packed-vs-mixed table flag: the array is packed while
+    /// every key is the sequential `next` int; the first
+    /// non-sequential key (string, negative, or gap int) flips it
+    /// permanently — zend never un-packs. Used by the memory_limit
+    /// accounting to size arData the way zend does (~16B/slot packed
+    /// vs ~40B/slot mixed).
+    pub mixed: bool,
 }
 
 impl Default for PhpArray {
@@ -58,6 +65,7 @@ impl PhpArray {
             is_ref: false,
             iter_pos: 0,
             foreach_pos: Vec::new(),
+            mixed: false,
         }
     }
 
@@ -113,6 +121,9 @@ impl PhpArray {
             }
             return;
         }
+        // zend: the first non-sequential key flips packed → mixed,
+        // permanently.
+        self.mixed |= !matches!(&k, ArrKey::Int(i) if *i == self.next);
         if let ArrKey::Int(i) = k {
             if i >= self.next {
                 self.next = i + 1;
@@ -128,6 +139,9 @@ impl PhpArray {
     /// after the new binding is visible (its __destruct writes land
     /// on the shared cell, gh10168).
     pub fn bind_cell(&mut self, k: ArrKey, c: Cell) -> Option<Cell> {
+        // Packed→mixed flip must look at the key BEFORE `next`
+        // advances past it (a sequential append keeps packing).
+        let breaks_packed = !matches!(&k, ArrKey::Int(i) if *i == self.next);
         if let ArrKey::Int(i) = k {
             if i >= self.next {
                 self.next = i + 1;
@@ -136,6 +150,7 @@ impl PhpArray {
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
             Some(std::mem::replace(&mut slot.1, c))
         } else {
+            self.mixed |= breaks_packed;
             self.entries.push((k, c));
             None
         }
@@ -322,6 +337,7 @@ impl Clone for PhpArray {
             next: self.next,
             is_ref: false,
             iter_pos: self.iter_pos,
+            mixed: self.mixed,
             // A CoW copy does not inherit the source's live foreach loops.
             foreach_pos: Vec::new(),
         }

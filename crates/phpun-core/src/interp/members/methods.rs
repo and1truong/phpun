@@ -2521,6 +2521,26 @@ impl<'a> Interp<'a> {
         Ok((bound, ee))
     }
 
+    /// zend's weak `string` zpp coercion for throwable ctor args:
+    /// scalars stringify (weak_ty_coerce); objects dispatch their
+    /// __toString; anything else (array, resource, object without
+    /// __toString) fails so the caller raises its TypeError.
+    fn weak_str_ctor(&mut self, v: &Value) -> Result<Option<String>, PhpError> {
+        if let Value::Object(o) = v {
+            if self
+                .find_method_in(&o.borrow().class, "__tostring")
+                .is_none()
+            {
+                return Ok(None);
+            }
+            return match self.method_invoke(o.clone(), "__toString", CallArgs::empty()) {
+                Ok(v) => Ok(Some(v.to_php_string())),
+                Err(e) => Err(e),
+            };
+        }
+        Ok(weak_ty_coerce(&["string".into()], v).map(|v| v.to_php_string()))
+    }
+
     fn throwable_method_inner(
         &mut self,
         obj: &Rc<RefCell<PhpObject>>,
@@ -2765,7 +2785,18 @@ impl<'a> Interp<'a> {
                         ))?;
                         String::new()
                     }
-                    Some(v) => v.to_php_string(),
+                    Some(v) => {
+                        // The ctor's prop borrow must end before a
+                        // userland __toString runs — it may read the
+                        // object being constructed.
+                        drop(ob);
+                        let s = match self.weak_str_ctor(&v)? {
+                            Some(s) => s,
+                            None => arg_err!(1, "message", "string", &v),
+                        };
+                        ob = obj.borrow_mut();
+                        s
+                    }
                     None => String::new(),
                 };
                 let code = match getv(1) {
@@ -2823,8 +2854,15 @@ impl<'a> Interp<'a> {
                     };
                     let filename = match getv(3) {
                         Some(Value::Null) | None => None,
-                        Some(v @ Value::Array(_)) => arg_err!(4, "filename", "?string", &v),
-                        Some(v) => Some(v.to_php_string()),
+                        Some(v) => {
+                            drop(ob);
+                            let s = match self.weak_str_ctor(&v)? {
+                                Some(s) => s,
+                                None => arg_err!(4, "filename", "?string", &v),
+                            };
+                            ob = obj.borrow_mut();
+                            Some(s)
+                        }
                     };
                     let line = match getv(4) {
                         Some(Value::Null) | None => None,
