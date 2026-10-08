@@ -4076,6 +4076,10 @@ impl<'a> Interp<'a> {
                     let bv = a.borrow().clone();
                     if !self.ty_weak_exact(ty, &bv) {
                         if let Some(cv) = self.coerce_scalar(ty, &bv) {
+                            let pl = self.cur_line;
+                            self.cur_line = decl.line;
+                            self.deprecate_lossy_int(ty, &bv, &cv);
+                            self.cur_line = pl;
                             *a.borrow_mut() = cv;
                         }
                     }
