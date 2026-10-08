@@ -273,6 +273,10 @@ impl<'a> Interp<'a> {
         site: Option<usize>,
     ) -> Result<CallArgs, PhpError> {
         let mut out = CallArgs::empty();
+        // zend's INIT_FCALL pushes the frame's arena span before args
+        // evaluate — the push (or copy into a fresh segment) happens
+        // here, once.
+        self.vm_call_push(&mut out);
         // Position of the *next positional* arg for by-ref lookup — named
         // args don't advance it (they bind by name at call time).
         let mut pos = 0usize;
@@ -330,14 +334,38 @@ impl<'a> Interp<'a> {
                     // callees never alias the cells: zend addrefs the
                     // zvals straight onto vm_stack, so the separation
                     // (and its doubled arData) is pure churn — skip it.
-                    if Rc::strong_count(a) > 1 && (decl.is_empty() || decl.iter().any(|p| p.by_ref))
+                    if Rc::strong_count(a) > 1
+                        && (decl.is_empty() || {
+                            let b = a.borrow();
+                            // zend binds each unpacked element like a
+                            // sent arg: int keys take the next positional
+                            // slots, string keys the same-named param —
+                            // overflow and unknown names land in the
+                            // variadic (the fallback the named-arg path
+                            // below uses).
+                            let vref = || decl.iter().any(|p| p.variadic && p.by_ref);
+                            let mut slot = pos;
+                            b.entries.iter().any(|(k, _)| match k {
+                                ArrKey::Int(_) => {
+                                    let hit =
+                                        decl.get(slot).map(|p| p.by_ref).unwrap_or_else(&vref);
+                                    slot += 1;
+                                    hit
+                                }
+                                ArrKey::Str(s) => decl
+                                    .iter()
+                                    .find(|p| !p.variadic && &**s == p.name.as_str())
+                                    .map(|p| p.by_ref)
+                                    .unwrap_or_else(&vref),
+                                ArrKey::Tomb => false,
+                            })
+                        })
                     {
-                        let mut na = a.borrow().clone();
-                        for (_, c) in na.entries.iter_mut() {
-                            let v = c.borrow().clone();
-                            *c = cell(v);
-                        }
-                        let nv = Value::Array(Rc::new(RefCell::new(na)));
+                        // zend separates the shared hash table before
+                        // binding — plain elements get fresh storage,
+                        // live IS_REFERENCE buckets stay shared (the
+                        // same split `=`-copies use).
+                        let nv = Value::Array(Rc::new(RefCell::new(self.dup_array(&a.borrow()))));
                         if let Ok(c) = self.eval_cell(e) {
                             *c.borrow_mut() = nv.clone();
                         }
@@ -346,8 +374,7 @@ impl<'a> Interp<'a> {
                 }
                 let trav = matches!(&v, Value::Object(_));
                 let mut unpack_named = false;
-                let stack0 = out.cells.len() + out.named.len();
-                for (k, c) in self.unpack_items(&v, true)? {
+                for (k, c, _) in self.unpack_items(&v, true)? {
                     match k {
                         Some(n) => {
                             seen_named = true;
@@ -370,32 +397,10 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                // zend's vm_stack is ONE request arena: copied args
-                // (n*16 each) accumulate across ALL live calls and it
-                // grows 256KB pages on the cumulative total — charge
-                // only the marginal pages this push crosses, not a
-                // page per frame. Committed while the source zval is
-                // still live (the emalloc guard sees the source table),
-                // released by mem_sweep once the frame's last CallArgs
-                // clone dies — unwinding is LIFO, so each site's
-                // marginal delta is exactly what zend frees.
-                let n = (out.cells.len() + out.named.len() - stack0) as i64;
-                if n > 0 {
-                    let bytes = n * 16;
-                    let live = self.arg_stack_bytes;
-                    let delta =
-                        ((live + bytes + 262_143) & !262_143) - ((live + 262_143) & !262_143);
-                    self.arg_stack_bytes = live + bytes;
-                    let arc = Rc::new(ArgStack(bytes));
-                    self.mem_track(&arc, delta as u64);
-                    if let Some(c) = self
-                        .mem_tracked
-                        .get_mut(&(Rc::as_ptr(&arc) as *const u8 as usize))
-                    {
-                        c.arg_bytes += bytes;
-                    }
-                    out.arg_stack.push(arc);
-                }
+                // SEND_UNPACK's extend_call_frame grows the arena by
+                // the call's whole arg span — the source zval is still
+                // live, so the emalloc guard sees its table charged.
+                self.vm_call_push(&mut out);
                 continue;
             }
             let by_ref = match &name {
@@ -521,15 +526,27 @@ impl<'a> Interp<'a> {
                                 .unwrap_or(pos + 1),
                             None => pos + 1,
                         };
+                        // zend names the landing param only for a
+                        // real (non-variadic) slot — `Argument #N
+                        // ($name)`; an arg landing on the variadic
+                        // prints bare `Argument #N`.
+                        let pname = match &name {
+                            Some(n) => decl
+                                .iter()
+                                .find(|p| !p.variadic && p.name == *n)
+                                .map(|p| p.name.as_str()),
+                            None => decl
+                                .get(pos)
+                                .filter(|p| !p.variadic)
+                                .map(|p| p.name.as_str()),
+                        };
                         return self.fail(PhpError::uncaught(
                             "Error",
                             format!(
-                                "{}: Argument #{} (${}) could not be passed by reference",
+                                "{}: Argument #{}{} could not be passed by reference",
                                 ctx,
                                 argno,
-                                name.as_deref()
-                                    .or_else(|| decl.get(pos).map(|p| p.name.as_str()))
-                                    .unwrap_or("")
+                                pname.map(|n| format!(" (${})", n)).unwrap_or_default()
                             ),
                             0,
                         ));
@@ -550,6 +567,9 @@ impl<'a> Interp<'a> {
         // frame's site (nested calls inside the args set their own),
         // and post-eval call diagnostics (arity, dispatch failures)
         // site at the call itself, zend's DO_FCALL line.
+        // Plain/named args pushed by their own sends — catch up the
+        // call's arena span once, after the last arg op.
+        self.vm_call_push(&mut out);
         out.end_line = self.cur_line;
         self.cur_line = site.unwrap_or(saved_line);
         if let Some(s) = site {
@@ -574,21 +594,20 @@ impl<'a> Interp<'a> {
     ) -> Result<SpreadItems, PhpError> {
         match v {
             Value::Array(a) => {
-                // Element cells are handed to the call as potential
-                // references — Zend separates the array first so a
-                // shared copy (e.g. `$ary2 = $ary`) keeps its own
-                // values (named_params/unpack).
-                for (_, c) in a.borrow_mut().entries.iter_mut() {
-                    let fresh = cell(c.borrow().clone());
-                    *c = fresh;
-                }
+                // Elements hand out their real cells — by-ref params
+                // bind them (a shared source is cow-separated at the
+                // call site first), by-value params read the value.
                 let mut out = Vec::new();
                 for (k, c) in a.borrow().iter() {
                     let n = match k {
                         ArrKey::Str(s) => Some(s.clone()),
                         _ => None,
                     };
-                    out.push((n, c.clone()));
+                    // The clone below would count itself — judge
+                    // the ref's liveness while only the source's
+                    // own handles exist.
+                    let shared = self.is_ref_cell(c) && Rc::strong_count(c) > 1;
+                    out.push((n, c.clone(), shared));
                 }
                 Ok(out)
             }
@@ -642,7 +661,7 @@ impl<'a> Interp<'a> {
                         Value::Str(s) => Some(crate::value::lossy(&s).into_owned().into()),
                         _ => None,
                     };
-                    out.push((n, cell(val)));
+                    out.push((n, cell(val), false));
                     let _ = self.method_invoke(it.clone(), "next", CallArgs::empty());
                 }
                 Ok(out)
@@ -2215,7 +2234,7 @@ impl<'a> Interp<'a> {
         // on the pushed frame so their charge outlives bind_and_run_inner's
         // CallArgs drop.
         if let Some(f) = self.stack.last_mut() {
-            f.arg_stack.append(&mut args.arg_stack);
+            f.vm_sites.append(&mut args.vm_sites);
         }
         // Callee `Stmt::Line` markers must not leak into the caller:
         // diagnostics after the call report the call-site line.
@@ -3929,10 +3948,33 @@ impl<'a> Interp<'a> {
             .unwrap_or(base)
     }
 
+    /// zend coerces the frame's own arg slot — a fresh cell — never
+    /// through the caller's (spread args share the source array's
+    /// cell, so `*cell.borrow_mut() = v` retypes caller state).
+    /// The send-time trace frame's arg IS that slot zend coerces
+    /// (`f(5, 'x')`, debug_backtrace args) — repoint it too.
+    fn coerce_arg_slot(
+        &mut self,
+        args: &mut CallArgs,
+        by_name: &mut [Option<(Cell, bool, bool)>],
+        i: usize,
+        cv: Value,
+    ) {
+        let c = cell(cv);
+        if let Some(slot) = args.cells.get_mut(i) {
+            *slot = c.clone();
+        } else if let Some(t) = by_name[i].as_mut() {
+            t.0 = c.clone();
+        }
+        if let Some(a) = self.call_trace.last_mut().and_then(|fr| fr.args.get_mut(i)) {
+            *a = c;
+        }
+    }
+
     fn bind_and_run_inner(
         &mut self,
         decl: &FunctionDecl,
-        args: CallArgs,
+        mut args: CallArgs,
         _unused: Vec<Cell>,
     ) -> Result<Value, PhpError> {
         // Required count runs to the last non-default param: an
@@ -3948,7 +3990,7 @@ impl<'a> Interp<'a> {
         // binding ("Argument #N ($x) not passed"); the count check below
         // is the positional-only form.
         if args.named.is_empty() && args.len() < required {
-            self.stack.pop();
+            self.stack_pop();
             let mut e = PhpError::uncaught(
                 "ArgumentCountError",
                 format!(
@@ -3980,7 +4022,7 @@ impl<'a> Interp<'a> {
         for (n, c, refable, trav) in &args.named {
             match decl.params.iter().position(|p| !p.variadic && p.name == *n) {
                 Some(j) if j < n_pos || by_name[j].is_some() => {
-                    self.stack.pop();
+                    self.stack_pop();
                     // Caller-side arg-verify error: the callee frame
                     // never existed (gh19653_2).
                     if self
@@ -4000,7 +4042,7 @@ impl<'a> Interp<'a> {
                 Some(j) => by_name[j] = Some((c.clone(), *refable, *trav)),
                 None if has_variadic => variadic_named.push((n.clone(), c.clone())),
                 None => {
-                    self.stack.pop();
+                    self.stack_pop();
                     if self
                         .call_trace
                         .last()
@@ -4034,6 +4076,10 @@ impl<'a> Interp<'a> {
                     let bv = a.borrow().clone();
                     if !self.ty_weak_exact(ty, &bv) {
                         if let Some(cv) = self.coerce_scalar(ty, &bv) {
+                            let pl = self.cur_line;
+                            self.cur_line = decl.line;
+                            self.deprecate_lossy_int(ty, &bv, &cv);
+                            self.cur_line = pl;
                             *a.borrow_mut() = cv;
                         }
                     }
@@ -4064,7 +4110,7 @@ impl<'a> Interp<'a> {
                     self.cur_line = decl.line;
                     self.deprecate_lossy_int(ty, &v, &cv);
                     self.cur_line = pl;
-                    *a.borrow_mut() = cv;
+                    self.coerce_arg_slot(&mut args, &mut by_name, i, cv);
                 }
             }
             // strict mode still allows the int->float widening stored
@@ -4074,8 +4120,8 @@ impl<'a> Interp<'a> {
                 && ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
                 && !self.ty_weak_exact(ty, &v)
             {
-                if let Value::Int(i) = v {
-                    *a.borrow_mut() = Value::Float(i as f64);
+                if let Value::Int(n) = v {
+                    self.coerce_arg_slot(&mut args, &mut by_name, i, Value::Float(n as f64));
                 }
             }
             if !ok {
@@ -4084,7 +4130,7 @@ impl<'a> Interp<'a> {
                 // propagate (zend raises it, not the TypeError).
                 if ty.iter().any(|m| m.eq_ignore_ascii_case("callable")) {
                     if let Some(e) = self.take_callable_probe_err() {
-                        self.stack.pop();
+                        self.stack_pop();
                         return self.fail(e);
                     }
                 }
@@ -4201,7 +4247,7 @@ impl<'a> Interp<'a> {
                     }
                     frs.push(crate::value::trace_frame_str(fr));
                 }
-                self.stack.pop();
+                self.stack_pop();
                 let mut e = PhpError::uncaught("TypeError", msg, call_line);
                 e.trace = Some(frs);
                 e.thrown_line = Some(decl.line);
@@ -4350,7 +4396,7 @@ impl<'a> Interp<'a> {
                     let mut dv = match r {
                         Ok(v) => v,
                         Err(e) => {
-                            self.stack.pop();
+                            self.stack_pop();
                             return self.fail(e);
                         }
                     };
@@ -4381,7 +4427,7 @@ impl<'a> Interp<'a> {
                         let ok = (implicit_null && matches!(dv, Value::Null))
                             || ty.iter().any(|m| self.param_type_match(m, &dv));
                         if !ok {
-                            self.stack.pop();
+                            self.stack_pop();
                             let tyv: Vec<String> = if implicit_null {
                                 let mut t = ty.to_vec();
                                 t.push("null".into());
@@ -4414,7 +4460,7 @@ impl<'a> Interp<'a> {
                             let mut e = PhpError::uncaught("TypeError", msg, self.cur_line);
                             e.display_msg = Some(display);
                             e.thrown_line = Some(decl.line);
-                            self.stack.pop();
+                            self.stack_pop();
                             return self.fail(e);
                         }
                         if !self.caller_file_strict() && !self.ty_weak_exact(ty, &dv) {
@@ -4428,7 +4474,7 @@ impl<'a> Interp<'a> {
                     // Unbound required param — only reachable via named
                     // args (the positional count check runs earlier).
                     let fname = self.decl_fname(decl);
-                    self.stack.pop();
+                    self.stack_pop();
                     let mut e = PhpError::uncaught(
                         "ArgumentCountError",
                         format!("{}(): Argument #{} (${}) not passed", fname, i + 1, p.name),
@@ -4491,7 +4537,7 @@ impl<'a> Interp<'a> {
         // `static` resolves against THIS frame's called class — after
         // the pop, `stack.last()` is the caller (static_type_return).
         let resolved_ret = decl.ret.as_ref().map(|ty| self.resolve_static(ty));
-        let popped = self.stack.pop();
+        let popped = self.stack_pop();
         // Zend decrefs the frame's CVs at unwind — the popped frame
         // is handed to bind_and_run, which runs its __destruct pass
         // after the call-trace pop so the dtor's trace attributes to
@@ -4752,7 +4798,7 @@ impl<'a> Interp<'a> {
             let fr = self.call_site_frame(decl, &args);
             self.call_trace.push(fr);
             let fname = self.decl_fname(decl);
-            self.stack.pop();
+            self.stack_pop();
             let mut e = PhpError::uncaught(
                 "ArgumentCountError",
                 format!(

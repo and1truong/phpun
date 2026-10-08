@@ -2525,10 +2525,24 @@ fn array_assoc_match(
 /// `&` dumps, writes alias back); every other element copies by
 /// value. Bind-replaces on key collision the way an overwritten
 /// bucket does.
-fn copy_elem(it: &Interp, out: &mut PhpArray, k: &ArrKey, c: &Cell) {
+pub(crate) fn copy_elem(it: &Interp, out: &mut PhpArray, k: &ArrKey, c: &Cell) {
+    copy_elem_shared(it, out, k, c, it.is_ref_cell(c) && Rc::strong_count(c) > 1)
+}
+
+/// `copy_elem` with the IS_REFERENCE liveness already measured —
+/// a caller that holds its own handle to `c` (spread unpack clones
+/// cells out of the source) would count it as an owner and never
+/// reach the unwrap arm.
+pub(crate) fn copy_elem_shared(
+    it: &Interp,
+    out: &mut PhpArray,
+    k: &ArrKey,
+    c: &Cell,
+    shared: bool,
+) {
     // zend unwraps an IS_REFERENCE bucket whose refcount is 1 —
     // the cell is shared only while aliased elsewhere.
-    if it.is_ref_cell(c) && Rc::strong_count(c) > 1 {
+    if shared {
         out.bind_cell(k.clone(), c.clone());
     } else {
         // A collision overwrite installs a fresh bucket — zend's
@@ -2544,8 +2558,14 @@ fn copy_elem(it: &Interp, out: &mut PhpArray, k: &ArrKey, c: &Cell) {
 }
 
 /// `copy_elem` for index-appended elements.
-fn push_elem(it: &Interp, out: &mut PhpArray, c: &Cell) {
-    if it.is_ref_cell(c) && Rc::strong_count(c) > 1 {
+pub(crate) fn push_elem(it: &Interp, out: &mut PhpArray, c: &Cell) {
+    push_elem_shared(out, c, it.is_ref_cell(c) && Rc::strong_count(c) > 1)
+}
+
+/// `push_elem` with the IS_REFERENCE liveness already measured —
+/// see `copy_elem_shared`.
+pub(crate) fn push_elem_shared(out: &mut PhpArray, c: &Cell, shared: bool) {
+    if shared {
         out.push_cell(c.clone());
     } else {
         out.push(c.borrow().clone());

@@ -170,6 +170,9 @@ pub(crate) fn dispatch(
                 for t in ca.named.iter_mut() {
                     t.2 = false;
                 }
+                // The array send is verbatim — element cells stay
+                // shared into by-value packs (__call's $a, bug50394).
+                ca.verbatim_elems = true;
                 it.call_value(&cb, ca)?
             } else {
                 let mut ca =

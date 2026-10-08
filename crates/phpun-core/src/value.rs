@@ -2639,6 +2639,10 @@ pub struct GenState {
     /// the consumer saw, so emit suppression covers its `done==0`
     /// prefix even though the active horizon targets the outer gen.
     pub suppress_prefix: bool,
+    /// The suspended frame's charged span — retired when the body
+    /// dies or the cursor proves it done, re-charged when a send()/
+    /// throw() revive brings the dead frame back.
+    pub vm_span: u64,
 }
 
 impl GenState {
