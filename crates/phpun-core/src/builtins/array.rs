@@ -2678,11 +2678,11 @@ fn array_umatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Php
     } else {
         None
     };
-    // zend emits the bool-comparator deprecation only on the shapes
-    // whose signature is `..., arrays, cb` — the internal-key-check
-    // assoc/ukey/uassoc-diff variants stay silent (oracle-probed), so
-    // the flag starts pre-set on those.
-    let mut dep_thrown = !(data_mode == 2 && key_mode != 1);
+    // zend warns on EVERY shape carrying a user comparator (data or
+    // key) except the two whose KEY check stays internal —
+    // udiff_assoc/uintersect_assoc (oracle-probed 10-shape matrix:
+    // 8 warn, 2 silent). Pre-set the flag on exactly those.
+    let mut dep_thrown = key_mode == 1;
     let cmp = |it: &mut Interp,
                x: &(ArrKey, Cell),
                y: &(ArrKey, Value),
