@@ -567,7 +567,8 @@ pub struct Interp<'a> {
     /// `?`-exit can't strand it in `pending_exception`; `live` marks a
     /// defer from the write op's own last-dim read — anything earlier
     /// means zend's opcode-boundary check already killed the write.
-    dim_throw: Option<(crate::value::Value, PhpError, bool)>,
+    // (thrown value, its raise error, live-final-level, plain-AA gate)
+    dim_throw: Option<(crate::value::Value, PhpError, bool, bool)>,
     /// `++`/`--` overflow context while the pending dim write stores:
     /// a ref held by a typed-int prop reports `Cannot
     /// increment/decrement a reference held by property ... past its
@@ -6932,6 +6933,19 @@ impl<'a> Interp<'a> {
             // Internal errors raised as exceptions become real throwables so
             // userland `catch` blocks can intercept them.
             let v = self.exception(class, &e.message);
+            // zend_throw_exception_internal: a throwable raised while
+            // EG(exception) is pending links the pending one as its
+            // $previous ('Cannot use object' <- the armed fetch throw,
+            // 'Modulo by zero' <- the armed EH — zend_execute.c:183).
+            if let Some((tv, _, _, _)) = &self.dim_throw {
+                if let Value::Object(o) = &v {
+                    if let Some(ObjectInternal::Exception { previous, .. }) =
+                        &mut o.borrow_mut().internal
+                    {
+                        *previous = Some(tv.clone());
+                    }
+                }
+            }
             if const_frame {
                 self.call_trace.pop();
             }

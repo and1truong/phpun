@@ -56,8 +56,12 @@ impl<'a> Interp<'a> {
                 // abort the op on the diagnostic's error path.
                 Err(e) if e.kind == ErrorKind::Throw && self.dim_throw.is_some() => {
                     let tv = self.pending_exception.take().unwrap_or(Value::Null);
-                    let live = self.dim_throw.as_ref().is_some_and(|(_, _, l)| *l);
-                    self.dim_throw = Some((tv, e, live));
+                    let (live, gate) = self
+                        .dim_throw
+                        .as_ref()
+                        .map(|(_, _, l, g)| (*l, *g))
+                        .unwrap_or((false, false));
+                    self.dim_throw = Some((tv, e, live, gate));
                     return Ok(());
                 }
                 Err(e) => return Err(e),

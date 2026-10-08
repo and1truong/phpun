@@ -2836,7 +2836,11 @@ impl<'a> Interp<'a> {
         // zend's EG(exception) check at the fetch's end kills the
         // whole write opcode for a non-final-level defer: no gate,
         // op_data read, or operator runs — the defer unwinds now.
-        if self.dim_throw.as_ref().is_some_and(|(_, _, live)| !*live) {
+        if self
+            .dim_throw
+            .as_ref()
+            .is_some_and(|(_, _, live, _)| !*live)
+        {
             return self.dim_raise(Value::Null);
         }
         // A diagnostic mid-fetch can still kill the container — zend's
@@ -2954,14 +2958,28 @@ impl<'a> Interp<'a> {
         } else {
             rhs
         };
+        // A plain-ArrayAccess fetch that threw armed the pair with
+        // `gate` — zend's op died at the read_dimension NULL, so the
+        // operator never runs; the write-gate 'Cannot use object'
+        // raises it (armed throwable chained) when dispatch reaches it.
+        let op_dead = self.dim_throw.as_ref().is_some_and(|(_, _, _, gate)| *gate);
         let newv = match op {
+            _ if op_dead => Value::Null,
             "=" => rhs,
-            "+=" => self.arith("+", cur, rhs)?,
-            "-=" => self.arith("-", cur, rhs)?,
-            "*=" => self.arith("*", cur, rhs)?,
-            "/=" => self.arith("/", cur, rhs)?,
-            "%=" => self.arith("%", cur, rhs)?,
+            "+=" => self.arith("+", cur, rhs).or_else(|e| self.arm_binop(e))?,
+            "-=" => self.arith("-", cur, rhs).or_else(|e| self.arm_binop(e))?,
+            "*=" => self.arith("*", cur, rhs).or_else(|e| self.arm_binop(e))?,
+            "/=" => self.arith("/", cur, rhs).or_else(|e| self.arm_binop(e))?,
+            "%=" => self.arith("%", cur, rhs).or_else(|e| self.arm_binop(e))?,
             ".=" => {
+                // zend_call_function's EG(exception) gate: __toString
+                // can't run while a throwable is pending — the
+                // conversion fails, the op dies, the armed one raises.
+                if self.dim_throw.is_some()
+                    && (matches!(&cur, Value::Object(_)) || matches!(&rhs, Value::Object(_)))
+                {
+                    return self.dim_raise(Value::Null);
+                }
                 let mut l = self.conv_bytes(&cur)?;
                 let mut r = self.conv_bytes(&rhs)?;
                 l.append(&mut r);
@@ -2990,9 +3008,9 @@ impl<'a> Interp<'a> {
                     return Ok(cur);
                 }
             }
-            "&=" | "|=" | "^=" | "<<=" | ">>=" | "**=" => {
-                self.arith(&op[..op.len() - 1], cur, rhs)?
-            }
+            "&=" | "|=" | "^=" | "<<=" | ">>=" | "**=" => self
+                .arith(&op[..op.len() - 1], cur, rhs)
+                .or_else(|e| self.arm_binop(e))?,
             _ => {
                 return self.fail(PhpError::fatal(
                     format!("unsupported assignment op {}", op),
@@ -4539,11 +4557,34 @@ impl<'a> Interp<'a> {
     /// the throwable actually raises.
     fn dim_raise<T>(&mut self, v: T) -> Result<T, PhpError> {
         match self.dim_throw.take() {
-            Some((tv, e, _)) => {
+            Some((tv, e, _, _)) => {
                 self.pending_exception = Some(tv);
                 Err(e)
             }
             None => Ok(v),
+        }
+    }
+
+    /// zend_binop_error's `if (EG(exception)) return`: an operand-type
+    /// TypeError under a pending throwable is swallowed — the binary op
+    /// fails, the write never runs, and the armed pair raises in its
+    /// place. Division errors throw unconditionally and keep the arm
+    /// as their $previous (handled by fail()).
+    fn arm_binop(&mut self, e: PhpError) -> Result<Value, PhpError> {
+        // The class may ride in lazily (Uncaught) or already
+        // materialized on pending_exception (Throw) after fail().
+        let type_err = match &e.kind {
+            ErrorKind::Uncaught { class } => *class == "TypeError",
+            ErrorKind::Throw => matches!(
+                &self.pending_exception,
+                Some(Value::Object(o)) if o.borrow().class.name() == "TypeError"
+            ),
+            _ => false,
+        };
+        if self.dim_throw.is_some() && type_err {
+            self.dim_raise(Value::Null)
+        } else {
+            Err(e)
         }
     }
 
@@ -4559,7 +4600,7 @@ impl<'a> Interp<'a> {
     fn dim_op_outlet<T>(
         &mut self,
         r: Result<T, PhpError>,
-        outer: Option<(crate::value::Value, PhpError, bool)>,
+        outer: Option<(crate::value::Value, PhpError, bool, bool)>,
     ) -> Result<T, PhpError> {
         match r {
             Err(e) => {
@@ -6540,7 +6581,12 @@ impl<'a> Interp<'a> {
                                             }
                                         }
                                     }
-                                    self.dim_throw = Some((tv, e, live));
+                                    // A pure-ArrayAccess dispatch arms
+                                    // with `gate`: zend's fetch death
+                                    // means the operator never runs —
+                                    // the write-gate 'Cannot use object'
+                                    // raises it (chained) at dispatch.
+                                    self.dim_throw = Some((tv, e, live, !spl_iter));
                                     c = cell(Value::Null);
                                     break;
                                 }
@@ -9219,7 +9265,11 @@ impl<'a> Interp<'a> {
         let old = self.compound_dim_read(arr_cell.clone(), &keys, false, Some(&det), true)?;
         // zend's EG(exception) check at the fetch's end kills the
         // whole op for a non-final-level defer — no incdec, no write.
-        if self.dim_throw.as_ref().is_some_and(|(_, _, live)| !*live) {
+        if self
+            .dim_throw
+            .as_ref()
+            .is_some_and(|(_, _, live, _)| !*live)
+        {
             return self.dim_raise(old);
         }
         let new = self.incdec_value(&old, delta)?;
