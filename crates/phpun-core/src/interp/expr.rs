@@ -2330,9 +2330,7 @@ impl<'a> Interp<'a> {
                     && op != "??="
                     && matches!(
                         &**obj,
-                        Expr::Index { .. }
-                            | Expr::StaticProp { .. }
-                            | Expr::VarVar(..)
+                        Expr::Index { .. } | Expr::StaticProp { .. } | Expr::VarVar(..)
                     ) {
                     self.eval(obj)?
                 } else {
