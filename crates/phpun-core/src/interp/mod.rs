@@ -248,8 +248,9 @@ struct MemCharge {
     table_req: u64,
     /// Address space a huge segment may still extend into: zend's
     /// mremap grows a mapping only until the next occupied range —
-    /// modelled as the next MM_SEG_STRETCH boundary above the size
-    /// the segment was (re)placed at. Unused for in-chunk charges.
+    /// modelled as its footprint at (re)placement plus the freed
+    /// predecessor's hole and the mapping slack a fresh mmap leaves
+    /// below the next VMA. Unused for in-chunk charges.
     seg_cap: u64,
     /// Index into `mem_chunks` of the chunk holding this charge's
     /// `inner` run (usize::MAX when it lives outside the chunks).
@@ -265,13 +266,14 @@ const MM_CHUNK: u64 = 2 * 1024 * 1024;
 /// zend_mm_max_large_size: largest request served from chunk page
 /// runs; bigger requests get a dedicated segment.
 const MM_MAX_LARGE: u64 = 2_093_056;
-/// Stretch of free address space a huge segment extends into before
-/// mremap is blocked and zend's erealloc relocates: the next
-/// 32,000,000 boundary above the size the segment was (re)placed
-/// at. Calibrated to oracle: a 4M-grown segment relocates crossing
-/// 32M, a 32M-grown one crossing 64M. ponytail: the true ceiling is
-/// the next VMA's address — the real page map PR #88 owns.
-const MM_SEG_STRETCH: u64 = 32_000_000;
+/// Slack of free address space a freshly-placed huge segment may
+/// extend into before mremap is blocked and zend's erealloc
+/// relocates. Kernel top-down placement lands a new mapping just
+/// below the lowest VMA, so a relocated segment's runway is the
+/// freed predecessor's hole plus up to a chunk of gap; oracle walls
+/// put the gap at ~3/4 chunk. ponytail: the true ceiling is the
+/// next VMA's address — the real page map PR #88 owns.
+const MM_SEG_SLACK: u64 = MM_CHUNK * 3 / 4;
 /// zend_mm_max_small_size: largest bin-bucketed request.
 const MM_SMALL: u64 = 3072;
 /// Heap usage a fresh script observes under memory_get_usage()
@@ -3762,10 +3764,11 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Extend runway of a freshly (re)placed huge segment — the next
-    /// MM_SEG_STRETCH boundary above its size.
-    fn seg_stretch(fp: u64) -> u64 {
-        (fp / MM_SEG_STRETCH + 1) * MM_SEG_STRETCH
+    /// Extend runway of a freshly (re)placed huge segment — its own
+    /// footprint plus the freed predecessor's hole (`hole`, 0 for a
+    /// brand-new alloc) and the placement slack.
+    fn seg_stretch(fp: u64, hole: u64) -> u64 {
+        fp + hole + MM_SEG_SLACK
     }
 
     /// mem_check for flat emalloc results: zend reports the raw
@@ -3896,7 +3899,7 @@ impl<'a> Interp<'a> {
                     huge,
                     table_req: 0,
                     seg_cap: if req > MM_MAX_LARGE {
-                        Self::seg_stretch(fp)
+                        Self::seg_stretch(fp, 0)
                     } else {
                         0
                     },
@@ -3982,9 +3985,9 @@ impl<'a> Interp<'a> {
                     c.huge = fp;
                     c.table_req = req;
                     if reloc && !failed {
-                        // Relocated — the new placement gets its own
-                        // stretch of address space.
-                        c.seg_cap = Self::seg_stretch(fp);
+                        // Relocated — the new placement's runway is
+                        // the old segment's hole plus slack.
+                        c.seg_cap = Self::seg_stretch(fp, ofp);
                     }
                 }
                 if self.mem_used > self.mem_peak {
@@ -4031,11 +4034,13 @@ impl<'a> Interp<'a> {
         match self.mem_tracked.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 let old = std::mem::replace(&mut e.get_mut().table_req, req);
+                let mut hole = 0;
                 if old > 0 {
                     let ofp = Self::mem_fp(old);
                     if old > MM_MAX_LARGE {
                         e.get_mut().huge = e.get().huge.saturating_sub(ofp);
                         self.mem_huge = self.mem_huge.saturating_sub(ofp);
+                        hole = ofp;
                     } else {
                         let ci = e.get().chunk;
                         e.get_mut().inner = e.get().inner.saturating_sub(ofp);
@@ -4044,6 +4049,7 @@ impl<'a> Interp<'a> {
                             let nu = u.saturating_sub(ofp);
                             if nu == 0 && *u != 0 && ci != 0 {
                                 self.mem_committed = self.mem_committed.saturating_sub(MM_CHUNK);
+                                hole = MM_CHUNK;
                             }
                             *u = nu;
                         }
@@ -4056,7 +4062,7 @@ impl<'a> Interp<'a> {
                 if req > MM_MAX_LARGE {
                     // Freshly-placed huge segment (dead entry, or
                     // grown up from in-chunk) — new extend runway.
-                    e.get_mut().seg_cap = Self::seg_stretch(fp);
+                    e.get_mut().seg_cap = Self::seg_stretch(fp, hole);
                 }
                 e.get_mut().inner += inner;
                 e.get_mut().huge += huge;
@@ -4068,7 +4074,7 @@ impl<'a> Interp<'a> {
                     huge,
                     table_req: req,
                     seg_cap: if req > MM_MAX_LARGE {
-                        Self::seg_stretch(fp)
+                        Self::seg_stretch(fp, 0)
                     } else {
                         0
                     },
@@ -4246,11 +4252,11 @@ impl<'a> Interp<'a> {
         // unconditionally so freed runs feed the extend test.
         self.mem_sweep();
         let fp = Self::mem_fp(req);
-        let (old_inner, old_chunk) = self
+        let (old_inner, old_huge, old_chunk) = self
             .mem_tracked
             .get(&(Rc::as_ptr(old) as *const u8 as usize))
-            .map(|c| (c.inner, c.chunk))
-            .unwrap_or((0, usize::MAX));
+            .map(|c| (c.inner, c.huge, c.chunk))
+            .unwrap_or((0, 0, usize::MAX));
         // In-place growth: the grown run fits the same chunk once the
         // old bytes are freed — no chunk commits, no limit check.
         let extend = req <= MM_MAX_LARGE
@@ -4271,7 +4277,9 @@ impl<'a> Interp<'a> {
             .map(|c| c.seg_cap);
         let reloc = old_seg.is_none_or(|cap| fp > cap);
         let mut new_seg_cap = if req > MM_MAX_LARGE {
-            Self::seg_stretch(fp)
+            // Only a huge predecessor leaves a VA hole — a freed
+            // in-chunk run stays inside its chunk's mapping.
+            Self::seg_stretch(fp, old_huge)
         } else {
             0
         };
