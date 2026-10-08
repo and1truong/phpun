@@ -3043,7 +3043,9 @@ impl<'a> Interp<'a> {
                         .unwrap_or_else(|| newv.clone());
                     // A pending throwable kills the userland
                     // zend_call_method — spl's own write_dimension
-                    // (native stub) still lands.
+                    // (native stub) still lands; its own throw loses
+                    // to the already-pending first one (zend keeps
+                    // the earliest EG(exception)).
                     if self.dim_throw.is_none() || self.is_native_offsetset(&o) {
                         match self.method_invoke(
                             o,
@@ -3051,7 +3053,12 @@ impl<'a> Interp<'a> {
                             CallArgs::positional(vec![cell(kv), cell(newv.clone())]),
                         ) {
                             Ok(_) => {}
-                            Err(e) => return Err(e),
+                            Err(e) => {
+                                if self.dim_throw.is_some() {
+                                    return self.dim_raise(newv);
+                                }
+                                return Err(e);
+                            }
                         }
                     }
                     return self.dim_raise(newv);
@@ -5814,7 +5821,15 @@ impl<'a> Interp<'a> {
                             CallArgs::positional(vec![cell(kval), cell(v.clone())]),
                         ) {
                             Ok(_) => return Ok(v),
-                            Err(e) => return Err(e),
+                            Err(e) => {
+                                // Under a pending throwable the first
+                                // EG(exception) wins — the write's own
+                                // throw is suppressed.
+                                if self.dim_throw.is_some() {
+                                    return Ok(v);
+                                }
+                                return Err(e);
+                            }
                         }
                     }
                     return Ok(v);
@@ -6364,6 +6379,10 @@ impl<'a> Interp<'a> {
                                     if (!live || viv_last)
                                         && spl_iter
                                         && self.is_native_offsetget(&o)
+                                        // zend creates the bucket only
+                                        // after the dim converted — an
+                                        // illegal key dies at conversion.
+                                        && Self::illegal_offset_ty(&kv).is_none()
                                         && storage.is_some_and(|id| self.ao_storage_id(&o) == id)
                                     {
                                         // Conversion diagnostics ran
