@@ -107,6 +107,13 @@ pub struct CallArgs {
     /// diagnostics of a compile-specialized literal call (sprintf rope)
     /// at the line of its final operand, not the call's first token.
     pub end_line: usize,
+    /// The args arrived as a verbatim array send (`call_user_func_array`,
+    /// Reflection invokeArgs/newInstanceArgs) — element cells ARE the
+    /// source array's buckets, so by-value packs (`__call`'s $a) keep
+    /// IS_REFERENCE elements (bug50394). A `...` unpack or normal send
+    /// separates them instead (oracle: `...[&$w]` packs `string`, cufa
+    /// packs `&string`).
+    pub verbatim_elems: bool,
 }
 
 /// Token anchoring a vm_stack arena record — one per call push (on the
@@ -145,6 +152,7 @@ impl CallArgs {
             vm_sites: Vec::new(),
             vm_slots: 0,
             end_line: 0,
+            verbatim_elems: false,
         }
     }
     pub fn empty() -> Self {
@@ -6450,6 +6458,7 @@ impl<'a> Interp<'a> {
                     .filter(|i| **i >= 1)
                     .map(|i| i - 1)
                     .collect(),
+                verbatim_elems: args.verbatim_elems,
             };
             // Zend's `f` flag validates the callback eagerly with a
             // TypeError before any callee work; forward_static_call's

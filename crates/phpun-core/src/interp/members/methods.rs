@@ -1761,6 +1761,9 @@ impl<'a> Interp<'a> {
         }
         // The source array's zval lives until call teardown.
         ca.hold.push(v.clone());
+        // The array send is verbatim — element cells stay shared into
+        // by-value packs (__call's $a keeps `&` elements, bug50394).
+        ca.verbatim_elems = true;
         ca
     }
 
@@ -1971,7 +1974,7 @@ impl<'a> Interp<'a> {
     fn magic_args_array(&self, args: &CallArgs) -> PhpArray {
         let mut arr = PhpArray::new();
         let share = |a: &Cell| {
-            if self.is_ref_cell(a) && Rc::strong_count(a) > 1 {
+            if args.verbatim_elems && self.is_ref_cell(a) && Rc::strong_count(a) > 1 {
                 a.clone()
             } else {
                 cell(a.borrow().clone())
@@ -2726,6 +2729,7 @@ impl<'a> Interp<'a> {
             vm_sites: Vec::new(),
             vm_slots: 0,
             end_line: args.end_line,
+            verbatim_elems: args.verbatim_elems,
         })
     }
 
