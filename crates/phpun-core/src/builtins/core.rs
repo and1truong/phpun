@@ -322,7 +322,7 @@ pub(crate) fn dispatch(
             if k == "memory_limit" {
                 it.ini.insert(k.clone(), v);
                 let lim = it.ini_bytes(&k);
-                let usage = it.mem_total();
+                let usage = it.mem_real();
                 if lim > 0 && usage > lim {
                     let _ = it
                         .ini
@@ -536,8 +536,14 @@ pub(crate) fn dispatch(
         "phpversion" | "phpversion_strict" => Value::str("8.5.11-phpun"),
         "php_uname" => Value::str("Linux"),
         // Runtime baseline + metered live bytes (obj shells, array
-        // tables, string payloads); emitted output is free.
-        "memory_get_usage" => Value::Int(it.mem_total()),
+        // tables, string payloads); emitted output is free. The
+        // $real_usage flag swaps live `size` for committed
+        // `real_size` — zend's 2MB-block high-water + huge chunks.
+        "memory_get_usage" => Value::Int(if arg(args, 0).is_truthy() {
+            it.mem_real()
+        } else {
+            it.mem_total()
+        }),
         // High-water mark of the live total — zend's peak survives
         // frees until memory_reset_peak_usage re-baselines it.
         "memory_get_peak_usage" => {

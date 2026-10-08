@@ -365,6 +365,11 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
+                // zend keeps the unpacked zval in the call frame until
+                // teardown — its table stays charged through the
+                // callee's allocs (unshift's range + rebuilt table
+                // coexist at the emalloc guard).
+                out.hold.push(v);
                 continue;
             }
             let by_ref = match &name {

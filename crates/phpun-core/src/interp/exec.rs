@@ -51,7 +51,11 @@ impl<'a> Interp<'a> {
             i += 1;
             // memory_limit fires between statements (bug45392).
             let limit = self.ini_bytes("memory_limit");
-            if limit > 0 && self.mem_total() > limit {
+            // zend's emalloc guard trips mid-expression: compare the
+            // committed high-water, not just the still-committed tail
+            // (transient dedicated chunks freed before the boundary
+            // already pushed real_size past the limit).
+            if limit > 0 && self.mem_real().max(crate::value::mem_real_peak()) > limit {
                 self.mem_exceeded = true;
                 // Zend's OOM fatal always prints a Stack trace:
                 // block (`#0 {main}` at top level) — a plain E_ERROR

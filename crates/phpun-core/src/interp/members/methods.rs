@@ -1718,6 +1718,8 @@ impl<'a> Interp<'a> {
                 }
             }
         }
+        // The source array's zval lives until call teardown.
+        ca.hold.push(v.clone());
         ca
     }
 
@@ -2680,6 +2682,7 @@ impl<'a> Interp<'a> {
             named: Vec::new(),
             trav_cells: Vec::new(),
             nonref_cells: Vec::new(),
+            hold: Vec::new(),
             end_line: args.end_line,
         })
     }

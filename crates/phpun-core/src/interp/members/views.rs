@@ -466,6 +466,7 @@ impl<'a> Interp<'a> {
                         trav_cells: Vec::new(),
                         nonref_cells: Vec::new(),
                         end_line: args.end_line,
+                        hold: Vec::new(),
                     };
                     match target {
                         Value::Object(o) => Ok(Some(self.method_invoke(o, &mn, ca)?)),
@@ -500,6 +501,7 @@ impl<'a> Interp<'a> {
                         trav_cells: args.trav_cells.clone(),
                         nonref_cells: args.nonref_cells.clone(),
                         end_line: args.end_line,
+                        hold: Vec::new(),
                     };
                     Ok(Some(self.call_value(&cb, ca)?))
                 }
@@ -1747,6 +1749,7 @@ impl<'a> Interp<'a> {
                         trav_cells: Vec::new(),
                         nonref_cells: Vec::new(),
                         end_line: 0,
+                        hold: Vec::new(),
                     };
                     return self.new_instance(&name, ca).map(Some);
                 }
@@ -1763,6 +1766,7 @@ impl<'a> Interp<'a> {
                         trav_cells: args.trav_cells.clone(),
                         nonref_cells: args.nonref_cells.clone(),
                         end_line: args.end_line,
+                        hold: Vec::new(),
                     }
                 };
                 let cn = obj

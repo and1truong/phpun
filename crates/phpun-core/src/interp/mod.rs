@@ -87,6 +87,11 @@ pub struct CallArgs {
     /// references, so zend warns "must be passed by reference, value
     /// given" (closure_invoke_ref_warning).
     pub nonref_cells: Vec<usize>,
+    /// Temporaries that must outlive the call (an unpacked `...`
+    /// source array holds its elements' cells — zend keeps the zval
+    /// alive until the call returns, so its table stays charged
+    /// through the builtin's own allocs).
+    pub hold: Vec<Value>,
     /// Diagnostic line of the last-evaluated argument — the deepest
     /// line marker reached while building this list. Zend sites the
     /// diagnostics of a compile-specialized literal call (sprintf rope)
@@ -101,6 +106,7 @@ impl CallArgs {
             named: Vec::new(),
             trav_cells: Vec::new(),
             nonref_cells: Vec::new(),
+            hold: Vec::new(),
             end_line: 0,
         }
     }
@@ -3512,11 +3518,19 @@ impl<'a> Interp<'a> {
         self.emit_routed(b);
     }
 
-    /// Zend-arena usage against memory_limit: runtime baseline + live
-    /// object shells + array tables + string payloads (drops decrement
-    /// each counter, mirroring the arena returning freed memory).
+    /// Zend-arena `size` — live bytes (runtime baseline + object
+    /// shells + array tables + string payloads). memory_get_usage
+    /// reports this.
     pub(crate) fn mem_total(&self) -> i64 {
         crate::value::MEM_BASE_BYTES + crate::value::mem_live_bytes()
+    }
+
+    /// Zend-arena `real_size` — committed bytes (2MB blocks at the
+    /// small pool's high-water + dedicated huge chunks). The
+    /// memory_limit checks compare this side, matching zend_alloc's
+    /// `real_size + size > limit`.
+    pub(crate) fn mem_real(&self) -> i64 {
+        crate::value::mem_real_raw()
     }
 
     /// zend's emalloc guard inside C builtins: refuse when the request
@@ -3524,7 +3538,7 @@ impl<'a> Interp<'a> {
     /// the request size as 'tried to allocate N' (str_repeat).
     pub(crate) fn mem_check_alloc(&mut self, want: i64) -> Result<(), PhpError> {
         let limit = self.ini_bytes("memory_limit");
-        if limit > 0 && self.mem_total() + want > limit {
+        if limit > 0 && self.mem_real() + want > limit {
             self.mem_exceeded = true;
             let mut e = PhpError::fatal(
                 format!(
@@ -5704,6 +5718,7 @@ impl<'a> Interp<'a> {
                     .filter(|i| **i >= 1)
                     .map(|i| i - 1)
                     .collect(),
+                hold: args.hold.clone(),
                 trav_cells: args
                     .trav_cells
                     .iter()
