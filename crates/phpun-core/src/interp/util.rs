@@ -9,9 +9,13 @@ pub type MergedHooks = Vec<(PropHook, Rc<PhpClass>)>;
 /// `(emitted key, slot key, decl+decl class)` — `None` decl means a
 /// dynamic property (property-hooks serialization views).
 pub type SerialEntry = (String, String, Option<(PropDecl, Rc<PhpClass>)>);
-/// `(name, cell)` entries a `...$v` unpack yields — `None` name is
-/// positional.
-pub type SpreadItems = Vec<(Option<Rc<str>>, Cell)>;
+/// `(name, cell, shared)` entries a `...$v` unpack yields — `None`
+/// name is positional; `shared` is the element's IS_REFERENCE
+/// liveness (`is_ref_cell && strong_count > 1`) measured while the
+/// source's borrow was still held, since the handed-out cell clone
+/// would otherwise count as an owner itself and a sole-owner ref
+/// could never unwrap the way zend's dup does.
+pub type SpreadItems = Vec<(Option<Rc<str>>, Cell, bool)>;
 
 pub(in crate::interp) fn cell(v: Value) -> Cell {
     Rc::new(RefCell::new(v))

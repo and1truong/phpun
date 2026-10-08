@@ -374,7 +374,7 @@ impl<'a> Interp<'a> {
                 }
                 let trav = matches!(&v, Value::Object(_));
                 let mut unpack_named = false;
-                for (k, c) in self.unpack_items(&v, true)? {
+                for (k, c, _) in self.unpack_items(&v, true)? {
                     match k {
                         Some(n) => {
                             seen_named = true;
@@ -603,7 +603,11 @@ impl<'a> Interp<'a> {
                         ArrKey::Str(s) => Some(s.clone()),
                         _ => None,
                     };
-                    out.push((n, c.clone()));
+                    // The clone below would count itself — judge
+                    // the ref's liveness while only the source's
+                    // own handles exist.
+                    let shared = self.is_ref_cell(c) && Rc::strong_count(c) > 1;
+                    out.push((n, c.clone(), shared));
                 }
                 Ok(out)
             }
@@ -657,7 +661,7 @@ impl<'a> Interp<'a> {
                         Value::Str(s) => Some(crate::value::lossy(&s).into_owned().into()),
                         _ => None,
                     };
-                    out.push((n, cell(val)));
+                    out.push((n, cell(val), false));
                     let _ = self.method_invoke(it.clone(), "next", CallArgs::empty());
                 }
                 Ok(out)

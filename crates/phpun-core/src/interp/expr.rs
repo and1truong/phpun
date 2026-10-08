@@ -355,26 +355,38 @@ impl<'a> Interp<'a> {
                         Some(ke) => {
                             let kv = self.eval(ke)?;
                             let val = self.eval(v)?;
-                            arr.set(self.arr_key(&kv)?, val);
+                            let key = self.arr_key(&kv)?;
+                            // A keyed overwrite of a bound-ref bucket
+                            // installs a fresh cell — zend's update
+                            // separates, never writes into a reference
+                            // an earlier element (spread/`&`) still
+                            // shares.
+                            match arr.get_cell(&key) {
+                                Some(s) if self.is_ref_cell(&s) && Rc::strong_count(&s) > 1 => {
+                                    arr.bind_cell(key, cell(val));
+                                }
+                                _ => arr.set(key, val),
+                            }
                         }
                         None => {
                             // `...$it` spread: int keys renumber
                             // positionally, string keys set (PHP 8.1+).
                             if let Expr::Unpack(e) = shape {
                                 let sv = self.eval(e)?;
-                                for (sk, c) in self.unpack_items(&sv, false)? {
+                                for (sk, c, shared) in self.unpack_items(&sv, false)? {
                                     // zend zval-copies elements — a live
                                     // IS_REFERENCE one keeps its cell.
                                     match sk {
-                                        Some(s) => crate::builtins::array::copy_elem(
+                                        Some(s) => crate::builtins::array::copy_elem_shared(
                                             self,
                                             &mut arr,
                                             &ArrKey::Str(s),
                                             &c,
+                                            shared,
                                         ),
-                                        None => {
-                                            crate::builtins::array::push_elem(self, &mut arr, &c)
-                                        }
+                                        None => crate::builtins::array::push_elem_shared(
+                                            &mut arr, &c, shared,
+                                        ),
                                     }
                                 }
                                 continue;
