@@ -7155,6 +7155,10 @@ impl<'a> Interp<'a> {
         // The spl array-object storage the chain entered through —
         // zend's spl_array_unset_dimension throws mid-sort.
         let mut last_ao: Option<Rc<RefCell<PhpObject>>> = None;
+        // Once an ancestor level's operand detached (a key-read
+        // handler rebound the root), the whole remaining walk is on
+        // the stale operand — deeper conversions stay silent too.
+        let mut det = false;
         for (n, ka) in keys.iter().enumerate() {
             // zend addrefs the level's container operand before reading
             // the key: a handler rebind inside the key's diagnostics
@@ -7200,14 +7204,14 @@ impl<'a> Interp<'a> {
                 UnsetKey::Val(v) => v.clone(),
             };
             if n < last {
-                c = match self.unset_dim_step(c, held, key, &mut last_ao)? {
+                c = match self.unset_dim_step(c, held, key, &mut last_ao, &mut det)? {
                     Some(nc) => nc,
                     // Missing levels keep walking a null sentinel —
                     // later keys still read, nothing unsets.
                     None => cell(Value::Null),
                 };
             } else {
-                return self.unset_last(c, held, key, &mut last_ao);
+                return self.unset_last(c, held, key, &mut last_ao, det);
             }
         }
         Ok(())
@@ -7229,14 +7233,18 @@ impl<'a> Interp<'a> {
         held: Value,
         key: Value,
         last_ao: &mut Option<Rc<RefCell<PhpObject>>>,
+        det: &mut bool,
     ) -> Result<Option<Cell>, PhpError> {
         match held {
             Value::Array(rc) => {
                 // A key-read handler rebind detaches the slot: zend
                 // walks the stale operand and converts SILENTLY (the
                 // assign_dim_014 rule — no null-offset deprecation).
-                let detached =
-                    !Self::same_container(&DimPre::of(&Value::Array(rc.clone())), &c.borrow());
+                // An ancestor level that already detached makes the
+                // whole remaining operand stale too.
+                let detached = *det
+                    || !Self::same_container(&DimPre::of(&Value::Array(rc.clone())), &c.borrow());
+                *det |= detached;
                 let was = self.detached_dim;
                 self.detached_dim = was || detached;
                 // Convert before borrowing the table — the conversion's
@@ -7245,7 +7253,14 @@ impl<'a> Interp<'a> {
                 let ak_r = self.arr_key(&key);
                 self.detached_dim = was;
                 let ak = ak_r?;
-                let c = if detached { cell(Value::Array(rc)) } else { c };
+                let c = if detached {
+                    cell(Value::Array(rc))
+                } else {
+                    // Drop the held pin before cow_split: its extra
+                    // ref would force a gratuitous split every level.
+                    drop(rc);
+                    c
+                };
                 let mut b = c.borrow_mut();
                 self.cow_split(&mut b);
                 let rc = match &*b {
@@ -7259,7 +7274,8 @@ impl<'a> Interp<'a> {
             Value::Null | Value::Bool(false) => Ok(None),
             Value::Str(_) => {
                 // String-offset read diagnostics, then the descend
-                // Error keyed by the offset's shape (s3/s6/v8).
+                // Error keyed by the offset's shape (s3/s6/v8). An
+                // ancestor-detached walk converts silently.
                 match &key {
                     Value::Str(ks) => match Self::str_off_key(ks) {
                         StrOffKey::Bad => {
@@ -7270,16 +7286,20 @@ impl<'a> Interp<'a> {
                             ));
                         }
                         StrOffKey::Junk(_) => {
-                            self.warn(&format!(
-                                "Illegal string offset \"{}\"",
-                                crate::value::lossy(ks)
-                            ))?;
+                            if !*det {
+                                self.warn(&format!(
+                                    "Illegal string offset \"{}\"",
+                                    crate::value::lossy(ks)
+                                ))?;
+                            }
                         }
                         StrOffKey::Int(_) => {}
                     },
                     Value::Int(_) => {}
                     _ => {
-                        self.warn_ns("String offset cast occurred")?;
+                        if !*det {
+                            self.warn_ns("String offset cast occurred")?;
+                        }
                     }
                 }
                 self.fail(PhpError::uncaught(
@@ -7291,7 +7311,11 @@ impl<'a> Interp<'a> {
             Value::Object(o) => {
                 if matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. })) {
                     let arr = self.ao_arr(&o);
-                    let ak = self.arr_key(&key)?;
+                    let was = self.detached_dim;
+                    self.detached_dim = was || *det;
+                    let ak_r = self.arr_key(&key);
+                    self.detached_dim = was;
+                    let ak = ak_r?;
                     let found = arr.borrow().get_cell(&ak);
                     match found {
                         Some(cc) => {
@@ -7354,6 +7378,7 @@ impl<'a> Interp<'a> {
         held: Value,
         key: Value,
         last_ao: &mut Option<Rc<RefCell<PhpObject>>>,
+        ancestor_det: bool,
     ) -> Result<(), PhpError> {
         // Borrowed, not destructured: in the non-detached arm `held`'s
         // pin must die BEFORE destruct_dying_value — its slot keeps the
@@ -7372,8 +7397,9 @@ impl<'a> Interp<'a> {
                 // Same operand-vs-rebind rule as the intermediates:
                 // a key-read handler rebind lands the delete on `rc`
                 // (stale) and converts silently; in-place edits stay
-                // visible.
-                let detached = !Self::same_container(&pre, &c.borrow());
+                // visible. An ancestor's detach makes the operand
+                // stale wholesale.
+                let detached = ancestor_det || !Self::same_container(&pre, &c.borrow());
                 // `unset()` maps null offsets to "" WITHOUT the 'Using
                 // null as an array offset' deprecation; every other
                 // cast still diagnoses. Scoped so conversions inside
