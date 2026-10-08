@@ -2693,7 +2693,7 @@ impl<'a> Interp<'a> {
                             // zend: new bucket (arData realloc).
                             let report = (arr.entries.len() as u64).next_power_of_two() * 32 + 8;
                             drop(arr);
-                            self.mem_track(rc, 32, report.max(32));
+                            self.mem_track(&rc, 32, report.max(32));
                         } else {
                             drop(arr);
                         }
