@@ -3518,6 +3518,26 @@ impl<'a> Interp<'a> {
         crate::value::MEM_BASE_BYTES + crate::value::mem_live_bytes()
     }
 
+    /// zend's emalloc guard inside C builtins: refuse when the request
+    /// would cross memory_limit — fires the OOM fatal mid-eval with
+    /// the request size as 'tried to allocate N' (str_repeat).
+    pub(crate) fn mem_check_alloc(&mut self, want: i64) -> Result<(), PhpError> {
+        let limit = self.ini_bytes("memory_limit");
+        if limit > 0 && self.mem_total() + want > limit {
+            self.mem_exceeded = true;
+            let mut e = PhpError::fatal(
+                format!(
+                    "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
+                    limit, want
+                ),
+                self.cur_line,
+            );
+            e.trace = Some(self.fatal_frames());
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Emit journaled/replayed bytes at their materialization point:
     /// inside another gen's run they join its deferred journal (an
     /// inner's death bytes attribute to the outer's cursor window);
