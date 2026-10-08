@@ -97,7 +97,7 @@ pub(crate) fn dispatch(
                     let preserve = args.get(1).map(|c| c.borrow().is_truthy()).unwrap_or(true);
                     for (k, c) in items {
                         if preserve {
-                            out.bind_cell(crate::value::to_key(&k), c);
+                            out.bind_cell(it.arr_key(&k)?, c);
                         } else {
                             out.push_cell(c);
                         }

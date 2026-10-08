@@ -2,11 +2,155 @@
 
 use super::*;
 
+/// `zend_argument_type_error` for array params: internal fns
+/// ZPP-check the declared `array` type even when the arg bound by
+/// reference (`sort($undef)` binds null, then fails ZPP).
+fn zpp_gate(it: &mut Interp, name: &str, args: &[Cell]) -> Option<PhpError> {
+    let is_arr = |c: &Cell| matches!(&*c.borrow(), Value::Array(_));
+    let type_err = |n: usize, pname: Option<&str>, ty: &str, v: &Value| {
+        PhpError::uncaught(
+            "TypeError",
+            format!(
+                "{}(): Argument #{}{} must be of type {}, {} given",
+                name,
+                n,
+                pname.map(|p| format!(" (${})", p)).unwrap_or_default(),
+                ty,
+                zval_word(v)
+            ),
+            0,
+        )
+    };
+    match name {
+        // `array $array` — by-ref family and value params alike.
+        "sort"
+        | "rsort"
+        | "asort"
+        | "arsort"
+        | "ksort"
+        | "krsort"
+        | "usort"
+        | "uasort"
+        | "uksort"
+        | "natsort"
+        | "natcasesort"
+        | "shuffle"
+        | "array_pop"
+        | "array_shift"
+        | "array_push"
+        | "array_unshift"
+        | "array_keys"
+        | "array_reverse"
+        | "extract"
+        | "array_column"
+        | "array_slice"
+        | "array_sum"
+        | "array_product"
+        | "array_filter"
+        | "array_flip"
+        | "array_values"
+        | "array_unique"
+        | "array_pad"
+        | "array_count_values"
+        | "array_is_list"
+        | "array_chunk"
+        | "array_diff"
+        | "array_udiff"
+        | "array_diff_assoc"
+        | "array_diff_key"
+        | "array_intersect"
+        | "array_uintersect"
+        | "array_intersect_assoc"
+        | "array_intersect_key" => {
+            if let Some(c) = args.first() {
+                if !is_arr(c) {
+                    return Some(type_err(1, Some("array"), "array", &c.borrow()));
+                }
+            }
+        }
+        // `array &$array` with a required second param — missing-args
+        // wins over the arg0 type check (array_splice/array_walk).
+        "array_splice" => {
+            if args.len() >= 2 {
+                if let Some(c) = args.first() {
+                    if !is_arr(c) {
+                        return Some(type_err(1, Some("array"), "array", &c.borrow()));
+                    }
+                }
+            }
+        }
+        // `array|object` — pointer-movement and walk params; zend's
+        // error text still says `array`.
+        "reset"
+        | "end"
+        | "next"
+        | "prev"
+        | "current"
+        | "pos"
+        | "array_walk"
+        | "array_walk_recursive" => {
+            if args.len()
+                < if matches!(name, "array_walk" | "array_walk_recursive") {
+                    2
+                } else {
+                    1
+                }
+            {
+                return None;
+            }
+            if let Some(c) = args.first() {
+                if !is_arr(c) && !matches!(&*c.borrow(), Value::Object(_)) {
+                    return Some(type_err(1, Some("array"), "array", &c.borrow()));
+                }
+            }
+        }
+        "count" | "sizeof" => {
+            if let Some(c) = args.first() {
+                let ok = match &*c.borrow() {
+                    Value::Array(_) => true,
+                    Value::Object(o) => it.obj_is_a(o, "Countable"),
+                    _ => false,
+                };
+                if !ok {
+                    return Some(type_err(1, Some("value"), "Countable|array", &c.borrow()));
+                }
+            }
+        }
+        // `array ...$arrays` — variadic args report without a name.
+        "array_merge" | "array_merge_recursive" | "array_replace" | "array_replace_recursive" => {
+            for (i, c) in args.iter().enumerate() {
+                if !is_arr(c) {
+                    return Some(type_err(i + 1, None, "array", &c.borrow()));
+                }
+            }
+        }
+        "in_array" | "array_search" => {
+            if let Some(c) = args.get(1) {
+                if !is_arr(c) {
+                    return Some(type_err(2, Some("haystack"), "array", &c.borrow()));
+                }
+            }
+        }
+        "array_key_exists" | "key_exists" => {
+            if let Some(c) = args.get(1) {
+                if !is_arr(c) {
+                    return Some(type_err(2, Some("array"), "array", &c.borrow()));
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 pub(crate) fn dispatch(
     it: &mut Interp,
     name: &str,
     args: &[Cell],
 ) -> Result<Option<Value>, PhpError> {
+    if let Some(e) = zpp_gate(it, name, args) {
+        return Err(e);
+    }
     Ok(Some(match name {
         // ----- arrays -----
         "count" | "sizeof" => match arg(args, 0) {
@@ -64,7 +208,16 @@ pub(crate) fn dispatch(
             _ => Value::Null,
         },
         "array_key_exists" | "key_exists" => {
-            let k = to_key(&arg(args, 0));
+            let kv = arg(args, 0);
+            // null names the function, not the offset (zend zpp quirk).
+            let k = if matches!(kv, Value::Null) {
+                it.deprecated_pub(
+                    "Using null as the key parameter for array_key_exists() is deprecated, use an empty string instead",
+                )?;
+                to_key(&kv)
+            } else {
+                it.arr_key(&kv)?
+            };
             match arg(args, 1) {
                 Value::Array(a) => Value::Bool(a.borrow().get_cell(&k).is_some()),
                 _ => Value::Bool(false),
@@ -283,6 +436,15 @@ pub(crate) fn dispatch(
                 } else {
                     n - off
                 };
+                // Element count the replacement contributes (zend's php_splice
+                // `pos` bookkeeping) — needed to move live foreach cursors.
+                let ins = match args.get(3).map(|r| r.borrow().clone()) {
+                    Some(Value::Array(r)) => r.borrow().len(),
+                    Some(Value::Object(o)) => o.borrow().prop_order.len(),
+                    Some(Value::Null) | None => 0,
+                    Some(_) => 1,
+                };
+                arr.foreach_spliced(off as usize, len as usize, ins);
                 let tail: Vec<(ArrKey, Cell)> = std::mem::take(&mut arr.entries);
                 arr.next = 0;
                 let (head, rest) = tail.split_at(off as usize);
@@ -392,6 +554,7 @@ pub(crate) fn dispatch(
                     Some(f) => {
                         let c = arr.entries[f].1.clone();
                         arr.entries[f].0 = ArrKey::Tomb;
+                        arr.foreach_shifted();
                         let mut ni = 0i64;
                         for (k, _) in arr.entries.iter_mut() {
                             if let ArrKey::Int(i) = k {
@@ -412,6 +575,7 @@ pub(crate) fn dispatch(
                 let mut arr = rc.borrow_mut();
                 // Renumber existing int keys up by arg count.
                 let add = args.len() - 1;
+                arr.foreach_unshifted(add);
                 for (k, _) in arr.entries.iter_mut() {
                     if let ArrKey::Int(i) = k {
                         *i += add as i64;
@@ -659,12 +823,14 @@ pub(crate) fn dispatch(
         }
         "array_walk" => {
             let cb = arg(args, 1);
-            // zend hands the callback (value, key) — the userdata arg
-            // only rides along when the call supplied it (internal
-            // arity checks see the real count: `array_walk($a,
-            // 'strlen')` fatals "expects exactly 1 argument, 2 given").
-            let has_extra = args.len() > 2;
-            let extra = arg(args, 2);
+            // zend passes userdata to the callback ONLY when the caller
+            // supplied it — otherwise the cb gets (value, key) exactly
+            // (bug24658's `typehint(1, 1)` trace frame).
+            let extra = if args.len() > 2 {
+                Some(arg(args, 2))
+            } else {
+                None
+            };
             // array_walk on an object iterates its property entries
             // (gh18268: hooked props yield their serialized value).
             let obj = match &*args[0].borrow() {
@@ -693,8 +859,8 @@ pub(crate) fn dispatch(
                         .unwrap_or(&n)
                         .to_string();
                     let mut cb_args = vec![cell(v), cell(Value::str(plain))];
-                    if has_extra {
-                        cb_args.push(cell(extra.clone()));
+                    if let Some(e) = &extra {
+                        cb_args.push(cell(e.clone()));
                     }
                     it.call_value(&cb, crate::interp::CallArgs::positional(cb_args))?;
                 }
@@ -713,8 +879,8 @@ pub(crate) fn dispatch(
                             ArrKey::Tomb => Value::Null,
                         }),
                     ];
-                    if has_extra {
-                        cb_args.push(cell(extra.clone()));
+                    if let Some(e) = &extra {
+                        cb_args.push(cell(e.clone()));
                     }
                     it.call_value(&cb, crate::interp::CallArgs::positional(cb_args))?;
                 }
@@ -1002,14 +1168,15 @@ pub(crate) fn dispatch(
             Value::Bool(true)
         }
         "compact" => {
+            // Missing names warn 'Undefined variable $x' and are
+            // skipped; defined-but-null names land in the result.
+            // zend walks args left-to-right, expanding array elements
+            // in place; a self-referential array hits zend's hash
+            // recursion guard — catchable Error 'Recursion detected'.
             let mut out = PhpArray::new();
-            for a in args {
-                if let Value::Str(s) = &*a.borrow() {
-                    let v = it
-                        .lookup_var(&crate::value::lossy(&s))
-                        .unwrap_or(Value::Null);
-                    out.set(ArrKey::Str(crate::value::lossy(&s).into_owned().into()), v);
-                }
+            let mut active = std::collections::HashSet::new();
+            for (i, c) in args.iter().enumerate() {
+                compact_one(it, &c.borrow().clone(), &mut out, &mut active, i)?;
             }
             Value::Array(Rc::new(RefCell::new(out)))
         }
@@ -1083,30 +1250,6 @@ pub(crate) fn dispatch(
                 b.ptr_entry()
                     .map(|(_, c)| c.borrow().clone())
                     .unwrap_or(Value::Bool(false))
-            }
-            _ => Value::Bool(false),
-        },
-        "each" => match arg(args, 0) {
-            Value::Array(a) => {
-                let mut b = a.borrow_mut();
-                match b.ptr_entry() {
-                    Some((k, c)) => {
-                        let mut r = PhpArray::new();
-                        let kv = match k {
-                            ArrKey::Int(i) => Value::Int(*i),
-                            ArrKey::Str(s) => Value::str(s.to_string()),
-                            ArrKey::Tomb => Value::Null,
-                        };
-                        let vv = c.borrow().clone();
-                        r.set(ArrKey::Int(1), vv.clone());
-                        r.set(ArrKey::Str("value".into()), vv);
-                        r.set(ArrKey::Int(0), kv.clone());
-                        r.set(ArrKey::Str("key".into()), kv);
-                        b.ptr_advance();
-                        Value::Array(Rc::new(RefCell::new(r)))
-                    }
-                    None => Value::Bool(false),
-                }
             }
             _ => Value::Bool(false),
         },
@@ -1533,6 +1676,89 @@ fn sort_array(
             a.next = i;
         }
         a.iter_pos = 0;
+    }
+    Ok(())
+}
+
+/// `compact` element walk: strings look up scope vars (missing →
+/// 'Undefined variable' warning), arrays expand in place.
+/// `active` tracks arrays mid-expansion — a self-referential element
+/// hits zend's hash-recursion guard ('Recursion detected' Error).
+fn compact_one(
+    it: &mut Interp,
+    v: &Value,
+    out: &mut PhpArray,
+    active: &mut std::collections::HashSet<usize>,
+    arg_idx: usize,
+) -> Result<(), PhpError> {
+    // Iterative expansion — a nested-array arg walks down arbitrarily
+    // deep without native recursion. zend charges each level against
+    // zend.max_allowed_stack_size (~a few hundred bytes per compact
+    // frame, 256 used here): past the limit it throws a catchable
+    // 'Maximum call stack size' Error instead of dying (gh23115).
+    enum Work {
+        Val(Value),
+        Pop(usize),
+    }
+    let limit = it.ini_bytes("zend.max_allowed_stack_size");
+    const LEVEL_BYTES: i64 = 256;
+    let mut depth: i64 = 0;
+    let mut stack = vec![Work::Val(v.clone())];
+    while let Some(w) = stack.pop() {
+        match w {
+            Work::Pop(id) => {
+                active.remove(&id);
+                depth -= 1;
+            }
+            Work::Val(v) => match v {
+                Value::Str(s) => {
+                    let n = crate::value::lossy(&s);
+                    match it.lookup_var(&n) {
+                        Some(val) => out.set(ArrKey::Str(n.into_owned().into()), val),
+                        None => {
+                            it.warn_pub(&format!("compact(): Undefined variable ${}", n))?;
+                        }
+                    }
+                }
+                Value::Array(a) => {
+                    let id = Rc::as_ptr(&a) as usize;
+                    if !active.insert(id) {
+                        let e = it.exception("Error", "Recursion detected");
+                        return Err(it.throw_value(e));
+                    }
+                    depth += 1;
+                    if limit > 0 && depth * LEVEL_BYTES > limit {
+                        let e = it.exception(
+                            "Error",
+                            &format!(
+                                "Maximum call stack size of {} bytes (zend.max_allowed_stack_size - zend.reserved_stack_size) reached. Infinite recursion?",
+                                depth * LEVEL_BYTES
+                            ),
+                        );
+                        return Err(it.throw_value(e));
+                    }
+                    let entries: Vec<Value> = a
+                        .borrow()
+                        .entries
+                        .iter()
+                        .map(|(_, c)| c.borrow().clone())
+                        .collect();
+                    stack.push(Work::Pop(id));
+                    for e in entries.into_iter().rev() {
+                        stack.push(Work::Val(e));
+                    }
+                }
+                // Non-string, non-array elements warn with the
+                // containing TOP-LEVEL argument's index (probe m7).
+                v => {
+                    it.warn_pub(&format!(
+                        "compact(): Argument #{} must be string or array of strings, {} given",
+                        arg_idx + 1,
+                        it.zval_type_name(&v)
+                    ))?;
+                }
+            },
+        }
     }
     Ok(())
 }

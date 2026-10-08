@@ -35,6 +35,13 @@ pub struct PhpArray {
     /// Internal pointer for current/key/next/prev/reset/end/each — an index
     /// into `entries` (may sit on a tombstone; live_* helpers skip it).
     pub iter_pos: usize,
+    /// Slot cursors of in-flight by-ref foreach loops (zend's
+    /// HashTableIterator list): each value is the raw `entries` index the
+    /// loop examines next — zend's "one past the yielded element". Tombstoned
+    /// unsets keep indices stable so the cursor survives `unset($a[$k])`;
+    /// rebuild mutators (unshift/shift/splice) adjust cursors the way
+    /// zend's iterators_update does. None = a finished loop's freed slot.
+    pub foreach_pos: Vec<Option<usize>>,
 }
 
 impl Default for PhpArray {
@@ -50,6 +57,7 @@ impl PhpArray {
             next: 0,
             is_ref: false,
             iter_pos: 0,
+            foreach_pos: Vec::new(),
         }
     }
 
@@ -93,7 +101,16 @@ impl PhpArray {
             if Rc::ptr_eq(&slot.1, &c) {
                 return;
             }
-            *slot.1.borrow_mut() = c.borrow().clone();
+            // A self-referential array ($a = [&$a]) can alias the very cell
+            // an ancestor frame is borrowing — never panic on the reentrant
+            // borrow: write through when possible, else rebind the entry.
+            let new_v = c.try_borrow().map(|b| b.clone());
+            let writable = slot.1.try_borrow_mut().is_ok();
+            match (new_v, writable) {
+                (Ok(v), true) => *slot.1.borrow_mut() = v,
+                (Ok(v), false) => slot.1 = Rc::new(RefCell::new(v)),
+                (Err(_), _) => slot.1 = c,
+            }
             return;
         }
         if let ArrKey::Int(i) = k {
@@ -124,15 +141,18 @@ impl PhpArray {
         }
     }
 
-    /// Remove a key (unset). The bucket is tombstoned — position kept,
-    /// value released (see ArrKey::Tomb). Returns the evicted payload
-    /// when the table owned the cell outright — an aliased (by-ref)
-    /// slot keeps sharing its value with the other holders.
+    /// Remove a key (unset). The bucket is tombstoned — position kept
+    /// (see ArrKey::Tomb) — and the table drops its hold on the cell
+    /// entirely: an aliased (by-ref) slot keeps its value through the
+    /// other owners, so a later `unset` of the last owner still sees
+    /// the eager-destruct refcount. Returns the evicted payload when
+    /// the table owned the cell outright.
     pub fn unset(&mut self, k: &ArrKey) -> Option<Value> {
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| ek == k) {
             slot.0 = ArrKey::Tomb;
-            if Rc::strong_count(&slot.1) == 1 {
-                return Some(std::mem::replace(&mut *slot.1.borrow_mut(), Value::Null));
+            let old = std::mem::replace(&mut slot.1, Rc::new(RefCell::new(Value::Null)));
+            if Rc::strong_count(&old) == 1 {
+                return Some(std::mem::replace(&mut *old.borrow_mut(), Value::Null));
             }
         }
         None
@@ -144,6 +164,106 @@ impl PhpArray {
             .iter()
             .position(|(k, _)| !matches!(k, ArrKey::Tomb))
             .map(|off| i + off)
+    }
+
+    /// Lowest registered foreach cursor at or after `start` (zend's
+    /// zend_hash_iterators_lower_pos; `entries.len()` when none — zend uses
+    /// nNumUsed as the "no iterator" sentinel).
+    fn foreach_lower(&self, start: usize) -> usize {
+        self.foreach_pos
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|p| *p >= start)
+            .min()
+            .unwrap_or(self.entries.len())
+    }
+
+    /// Move every cursor sitting exactly on `from` to `to`
+    /// (zend_hash_iterators_update).
+    fn foreach_update(&mut self, from: usize, to: usize) {
+        for c in self.foreach_pos.iter_mut().flatten() {
+            if *c == from {
+                *c = to;
+            }
+        }
+    }
+
+    /// array_unshift prepended `add` slots — cursors slide right to stay on
+    /// the element they tracked (zend reindexes arData up by `add`).
+    pub fn foreach_unshifted(&mut self, add: usize) {
+        for c in self.foreach_pos.iter_mut().flatten() {
+            *c += add;
+        }
+    }
+
+    /// array_shift tombstoned the head bucket — the table conceptually
+    /// slides down one slot (zend repacks), so cursors follow one left.
+    pub fn foreach_shifted(&mut self) {
+        for c in self.foreach_pos.iter_mut().flatten() {
+            *c = c.saturating_sub(1);
+        }
+    }
+
+    /// array_splice cursor maintenance, ported from zend's php_splice
+    /// packed-array path: the rebuild drops `len` slots at `off` and inserts
+    /// `ins` replacement elements. As each surviving input element is
+    /// copied, a cursor sitting on its input index is moved to the
+    /// element's output index — a cursor on a removed index is bumped to
+    /// `off + len` in INPUT units. A moved cursor can coincide with a
+    /// later input index and get bumped AGAIN (the zend cascade quirk that
+    /// slides a past-offset cursor onto the tail instead of the inserted
+    /// block). MUST be called while `entries` still holds the old layout.
+    pub fn foreach_spliced(&mut self, off: usize, len: usize, ins: usize) {
+        if self.foreach_pos.iter().all(Option::is_none) {
+            return;
+        }
+        let n = self.entries.len();
+        let off = off.min(n);
+        let end = (off + len).min(n);
+        let mut iter_pos = self.foreach_lower(0);
+        // Output index of the element currently being copied (zend's `pos`
+        // counts live elements, not raw slots).
+        let mut pos = 0usize;
+        for idx in 0..off {
+            if matches!(self.entries[idx].0, ArrKey::Tomb) {
+                continue;
+            }
+            if idx == iter_pos {
+                if idx != pos {
+                    self.foreach_update(idx, pos);
+                }
+                iter_pos = self.foreach_lower(iter_pos + 1);
+            }
+            pos += 1;
+        }
+        // Removed range: cursors on a removed index bump to `off + len` in
+        // INPUT units (zend's "element after the removed block"). zend does
+        // not advance `pos` here when the splice's return value is unused —
+        // the common statement-form call — so `pos` enters the tail at
+        // `off + ins`, i.e. the true output index.
+        for idx in off..end {
+            if matches!(self.entries[idx].0, ArrKey::Tomb) {
+                continue;
+            }
+            if idx == iter_pos {
+                self.foreach_update(idx, end);
+                iter_pos = self.foreach_lower(iter_pos + 1);
+            }
+        }
+        pos += ins;
+        for idx in end..n {
+            if matches!(self.entries[idx].0, ArrKey::Tomb) {
+                continue;
+            }
+            if idx == iter_pos {
+                if idx != pos {
+                    self.foreach_update(idx, pos);
+                }
+                iter_pos = self.foreach_lower(iter_pos + 1);
+            }
+            pos += 1;
+        }
     }
 
     /// Element under the internal pointer (skips tombstones).
@@ -202,6 +322,8 @@ impl Clone for PhpArray {
             next: self.next,
             is_ref: false,
             iter_pos: self.iter_pos,
+            // A CoW copy does not inherit the source's live foreach loops.
+            foreach_pos: Vec::new(),
         }
     }
 }
@@ -282,11 +404,23 @@ pub fn format_trace(frames: &[TraceFrame]) -> String {
 pub fn format_backtrace_frames(frames: &[TraceFrame]) -> String {
     let mut t = String::new();
     let mut i = 0;
-    for fr in frames.iter() {
+    // Only the innermost surviving include frame renders bare
+    // (`require()`); once a call frame sits above it, the executing
+    // include renders like any call — `require('/path/trunc...')`
+    // (probe9, d9).
+    let bare_incl = frames
+        .iter()
+        .position(|f| !trace_frame_hidden(f))
+        .filter(|&pos| include_frame(&frames[pos]));
+    for (pos, fr) in frames.iter().enumerate() {
         if trace_frame_hidden(fr) {
             continue;
         }
-        t.push_str(&format!("#{} {}\n", i, trace_frame_str_at(fr, i)));
+        t.push_str(&format!(
+            "#{} {}\n",
+            i,
+            trace_frame_str_at(fr, Some(pos) == bare_incl)
+        ));
         i += 1;
     }
     t
@@ -377,13 +511,13 @@ fn trace_frame_str_noargs(fr: &TraceFrame) -> String {
     trace_frame_str(&f)
 }
 
-/// Frame body for the `idx`-th frame of an innermost-first live
-/// backtrace. The innermost include/require pseudo-frame renders bare
-/// (`require()` — the include op_array's own executing context carries
-/// no call args in Zend); deeper include frames keep their path
-/// argument (`require('/tmp/x/inc....')`).
-pub fn trace_frame_str_at(fr: &TraceFrame, idx: usize) -> String {
-    if idx == 0 && include_frame(fr) {
+/// Frame body for an innermost-first live backtrace. The innermost
+/// include/require pseudo-frame renders bare (`require()` — the
+/// include op_array's own executing context carries no call args in
+/// Zend) at WHATEVER depth it sits (bug28213); deeper include frames
+/// keep their path argument (`require('/tmp/x/inc....')`).
+pub fn trace_frame_str_at(fr: &TraceFrame, bare_incl: bool) -> String {
+    if bare_incl && include_frame(fr) {
         trace_frame_str_noargs(fr)
     } else {
         trace_frame_str(fr)
@@ -462,6 +596,21 @@ impl Value {
             Value::Object(o) => format!("Object id #{}", o.borrow().id).into_bytes(),
             Value::Callable(_) => b"Closure".to_vec(),
             Value::Resource(r) => format!("Resource id #{}", r.borrow().id()).into_bytes(),
+        }
+    }
+
+    /// zend's operand type word for 'Unsupported operand types' —
+    /// objects report their CLASS name (anon-class names truncate at
+    /// the \0 file:line$N suffix), scalars report zend_type_name.
+    pub fn operand_type_name(&self) -> String {
+        match self {
+            Value::Object(o) => {
+                let n = o.borrow().class.name().to_string();
+                n.split('\0').next().unwrap_or(&n).to_string()
+            }
+            Value::Callable(_) => "Closure".into(),
+            Value::Null => "null".into(),
+            _ => self.type_name().into(),
         }
     }
 
@@ -1538,12 +1687,14 @@ pub struct PhpClass {
 
 impl PhpClass {
     pub fn name(&self) -> &str {
-        // Anonymous classes carry a `$LINE` uniquifier internally;
-        // Zend's public name is `{Base}@anonymous`.
-        if let Some(pos) = self.decl.name.find("@anonymous$") {
-            &self.decl.name[..pos + "@anonymous".len()]
+        // Anonymous classes carry a `\0FILE:LINE$SEQ` mangled suffix
+        // (or the older `$LINE` uniquifier) internally; the public
+        // display name truncates at the marker.
+        let n = self.decl.name.split('\0').next().unwrap_or(&self.decl.name);
+        if let Some(pos) = n.find("@anonymous$") {
+            &n[..pos + "@anonymous".len()]
         } else {
-            &self.decl.name
+            n
         }
     }
 
@@ -1672,6 +1823,11 @@ pub enum ObjectInternal {
         eval_ctx: u32,
         /// Call stack snapshot at construction → getTrace() (tests/lang/038).
         frames: Rc<Vec<TraceFrame>>,
+        /// Chained exception from the ctor's `previous` arg (or the
+        /// engine's own chains — e.g. the incdec TypeError attached
+        /// under a readonly-modify Error). Uncaught display renders
+        /// the deepest first as `Uncaught`, each enclosing as `Next`.
+        previous: Option<Value>,
     },
     /// SPL ArrayIterator state: shared storage slot + iteration cursor.
     ArrayIter {

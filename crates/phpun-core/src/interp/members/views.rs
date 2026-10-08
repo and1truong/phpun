@@ -954,7 +954,11 @@ impl<'a> Interp<'a> {
                                 Some(d) => {
                                     let old = self.const_self.replace(c.clone());
                                     self.class_const_ctx += 1;
-                                    let r = self.eval_decl_const(d, &c.decl.file);
+                                    let r = self.eval_decl_const(
+                                        d,
+                                        &c.decl.file,
+                                        if p.dline > 0 { p.dline } else { p.line },
+                                    );
                                     self.class_const_ctx -= 1;
                                     self.const_self = old;
                                     match r {
@@ -978,6 +982,7 @@ impl<'a> Interp<'a> {
                     .class
                     .name()
                     .eq_ignore_ascii_case("reflectionmethod");
+                let mut scope_cls: Option<Rc<PhpClass>> = None;
                 let decl: Option<Rc<crate::ast::FunctionDecl>> = if is_method {
                     let cn = obj
                         .borrow()
@@ -1005,9 +1010,10 @@ impl<'a> Interp<'a> {
                         let cn = self.conv_str(&cn)?.to_string();
                         let c = self.classes.get(&cn.to_lowercase()).cloned();
                         match c {
-                            Some(c) => self
-                                .find_method_in(&c, &mn)
-                                .map(|(m, _)| Rc::new(m.decl.clone())),
+                            Some(c) => self.find_method_in(&c, &mn).map(|(m, sc)| {
+                                scope_cls = Some(sc);
+                                Rc::new(m.decl.clone())
+                            }),
                             None => None,
                         }
                     }
@@ -1020,6 +1026,7 @@ impl<'a> Interp<'a> {
                         .unwrap_or(Value::Null);
                     self.callable_decl(&cb)
                 };
+                let _decl_file = decl.as_ref().map(|d| d.file.clone()).unwrap_or_default();
                 // userland decls read Param; internal functions
                 // synthesize from arginfo (builtin_params).
                 struct RParam {
@@ -1033,6 +1040,10 @@ impl<'a> Interp<'a> {
                     by_ref: bool,
                     allow_null: bool,
                     const_name: Option<String>,
+                    /// zend evaluates the default lazily inside
+                    /// getDefaultValue(); a failing const expr stashes
+                    /// its throwable (class, message) until then.
+                    dmsg: Option<(String, String)>,
                 }
                 let mut prs: Vec<RParam> = Vec::new();
                 let bp: Option<&'static [(&'static str, crate::builtins::BDef)]> = if is_method {
@@ -1089,6 +1100,7 @@ impl<'a> Interp<'a> {
                             by_ref: false,
                             allow_null: false,
                             const_name: None,
+                            dmsg: None,
                         });
                     }
                 } else if let Some(d) = &decl {
@@ -1102,11 +1114,47 @@ impl<'a> Interp<'a> {
                         // Zend erases the default on a param its
                         // optional-before-required rule makes required.
                         let has = p.default.is_some() && i >= req;
-                        let dv = if has {
-                            self.eval_decl_const(p.default.as_ref().unwrap(), &d.file)
-                                .unwrap_or(Value::Null)
+                        let (dv, dmsg) = if has {
+                            let de = p.default.as_ref().unwrap();
+                            let old = match &scope_cls {
+                                Some(sc) => self.const_self.replace(sc.clone()),
+                                None => self.const_self.take(),
+                            };
+                            let r = self.eval_decl_const(de, &d.file, 0);
+                            self.const_self = old;
+                            match r {
+                                Ok(v) => (v, None),
+                                Err(pe) => {
+                                    // A Throw-kind error carries the real
+                                    // throwable in pending_exception — its
+                                    // class/message are what getDefaultValue()
+                                    // rethrows.
+                                    let thrown = self.pending_exception.take();
+                                    let (cls, msg) = match &thrown {
+                                        Some(Value::Object(o)) => {
+                                            let b = o.borrow();
+                                            let m = b
+                                                .props
+                                                .get("message")
+                                                .map(|c| c.borrow().to_php_string())
+                                                .unwrap_or_else(|| pe.message.clone());
+                                            (b.class.name().to_string(), m.to_string())
+                                        }
+                                        _ => {
+                                            let cls = match &pe.kind {
+                                                crate::error::ErrorKind::Uncaught { class } => {
+                                                    *class
+                                                }
+                                                _ => "Error",
+                                            };
+                                            (cls.to_string(), pe.message.clone())
+                                        }
+                                    };
+                                    (Value::Null, Some((cls, msg)))
+                                }
+                            }
                         } else {
-                            Value::Null
+                            (Value::Null, None)
                         };
                         let tys = p.ty.clone().unwrap_or_default();
                         // allowsNull: untyped, explicit ?T/T|null, mixed,
@@ -1148,6 +1196,7 @@ impl<'a> Interp<'a> {
                             by_ref: p.by_ref,
                             allow_null,
                             const_name,
+                            dmsg,
                         });
                     }
                 }
@@ -1189,6 +1238,16 @@ impl<'a> Interp<'a> {
                         if let Some(cn) = &rp_decl.const_name {
                             ob.props
                                 .insert("\0rp\0defconst".into(), cell(Value::str(cn.clone())));
+                        }
+                        if rp_decl.has_def && rp_decl.dmsg.is_none() {
+                            ob.props
+                                .insert("\0rp\0default".into(), cell(rp_decl.def.clone()));
+                        }
+                        if let Some((cls, msg)) = &rp_decl.dmsg {
+                            ob.props
+                                .insert("\0rp\0dmsg".into(), cell(Value::str(msg.clone())));
+                            ob.props
+                                .insert("\0rp\0dcls".into(), cell(Value::str(cls.clone())));
                         }
                         let mut ta = PhpArray::default();
                         for m in &rp_decl.ty {
@@ -1278,34 +1337,39 @@ impl<'a> Interp<'a> {
                     .get("\0rp\0opt")
                     .is_some_and(|c| c.borrow().is_truthy()),
             ))),
-            "isdefaultvalueavailable" => Ok(Some(Value::Bool(
-                obj.borrow()
-                    .props
-                    .get("\0rp\0hasdef")
-                    .is_some_and(|c| c.borrow().is_truthy()),
-            ))),
             "getdefaultvalue" => {
                 let ob = obj.borrow();
-                if ob
+                let got = ob.props.get("\0rp\0default").map(|c| c.borrow().clone());
+                let dmsg = ob
                     .props
-                    .get("\0rp\0hasdef")
-                    .is_some_and(|c| c.borrow().is_truthy())
-                {
-                    Ok(Some(
-                        ob.props
-                            .get("\0rp\0def")
-                            .map(|c| c.borrow().clone())
-                            .unwrap_or(Value::Null),
-                    ))
+                    .get("\0rp\0dmsg")
+                    .map(|c| c.borrow().to_php_string());
+                let dcls = ob
+                    .props
+                    .get("\0rp\0dcls")
+                    .map(|c| c.borrow().to_php_string());
+                drop(ob);
+                if let Some(v) = got {
+                    Ok(Some(v))
+                } else if let Some(m) = dmsg {
+                    // The deferred default-eval error rethrows as a
+                    // catchable throwable of its recorded class —
+                    // try/catch around getDefaultValue() works.
+                    let cls = dcls.unwrap_or_else(|| "Error".into());
+                    let e = self.exception(&cls, &m.to_string());
+                    Err(self.throw_value(e))
                 } else {
-                    drop(ob);
-                    self.fail(PhpError::uncaught(
+                    Err(PhpError::uncaught(
                         "ReflectionException",
                         "Internal error: Failed to retrieve the default value",
                         0,
                     ))
                 }
             }
+            "isdefaultvalueavailable" => Ok(Some(Value::Bool({
+                let ob = obj.borrow();
+                ob.props.contains_key("\0rp\0default") || ob.props.contains_key("\0rp\0dmsg")
+            }))),
             "hastype" => {
                 // ReflectionParameter::hasType() — \0rp\0ty members
                 // populated by getParameters().
@@ -2460,7 +2524,7 @@ impl<'a> Interp<'a> {
                             .get(&cn.to_lowercase())
                             .map(|c| self.const_self.replace(c.clone()));
                         self.class_const_ctx += 1;
-                        let r = self.eval_decl_const(&cd.value, &f);
+                        let r = self.eval_decl_const(&cd.value, &f, cd.line);
                         self.class_const_ctx -= 1;
                         if let Some(o) = old {
                             self.const_self = o;
@@ -2636,11 +2700,19 @@ impl<'a> Interp<'a> {
     }
 
     /// Zend backtrace text for debug_print_backtrace(): innermost-first
-    /// frames, no `{main}` line (bug28213). The innermost frame is the
-    /// builtin itself — everything after it is a frame Zend keeps
-    /// (visible non-trampoline internal calls included).
+    /// frames, no `{main}` line (bug28213). The leading skip drops the
+    /// builtin's own frame and call_user_func-family helpers, but the
+    /// EXECUTING include pseudo-frame is a real backtrace frame in Zend
+    /// — it renders bare (`require()`) while deeper includes keep their
+    /// path argument (probe9 vs oracle).
     pub fn format_backtrace(&self) -> String {
-        let frames: Vec<TraceFrame> = self.call_trace.iter().rev().skip(1).cloned().collect();
+        let frames: Vec<TraceFrame> = self
+            .call_trace
+            .iter()
+            .rev()
+            .skip_while(|f| f.internal && !crate::value::include_frame(f) && f.function != "eval")
+            .cloned()
+            .collect();
         format_backtrace_frames(&frames)
     }
 
@@ -2649,7 +2721,7 @@ impl<'a> Interp<'a> {
         self.call_trace
             .iter()
             .rev()
-            .skip(1)
+            .skip_while(|f| f.internal && !crate::value::include_frame(f) && f.function != "eval")
             .filter(|f| !crate::value::trace_frame_hidden(f))
             .cloned()
             .collect()

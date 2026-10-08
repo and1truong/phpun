@@ -101,19 +101,31 @@ impl<'a> Parser<'a> {
             None
         };
         self.fn_ctx.push(clo_name);
+        let prev_ret_by_ref = self.ret_by_ref;
+        self.ret_by_ref = by_ref;
         let (body, end_line) = if arrow {
             self.expect_op("=>")?;
-            let e = self.expr()?;
+            // An arrow body inside a const slot is validated as part of
+            // the enclosing constant expression — scope keywords there
+            // are 'Constant expression contains invalid operations'.
+            let saved_const = self.const_ctx;
+            if self.const_ctx == ConstCtx::Slot {
+                self.const_ctx = ConstCtx::ArrowSlot;
+            }
+            let e = self.expr();
+            self.const_ctx = saved_const;
+            let e = e?;
             let el = self.prev_line();
             // A call inside the arrow expr needs a line marker — the
             // body has no statements to set cur_line (closure_064).
             (vec![Stmt::Line(line), Stmt::Return(Some(e))], el)
         } else {
-            let b = self.body()?;
+            let b = self.runtime_body()?;
             let el = self.prev_line();
             (b, el)
         };
         self.fn_ctx.pop();
+        self.ret_by_ref = prev_ret_by_ref;
         self.hook_ctx = prev_hook;
         Ok(Expr::Closure(ClosureExpr {
             decl: FunctionDecl {
@@ -245,6 +257,7 @@ impl<'a> Parser<'a> {
                             attrs: vec![],
                             decl_in: None,
                             enum_case: false,
+                            line: self.line(),
                         });
                         if !self.eat_op(",") {
                             break;
@@ -293,6 +306,7 @@ impl<'a> Parser<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: self.line(),
                     });
                     self.expect_op(";")?;
                     continue;
@@ -330,6 +344,10 @@ impl<'a> Parser<'a> {
                     } else {
                         None
                     };
+                    let dline = default
+                        .as_ref()
+                        .and_then(crate::ast::start_line)
+                        .unwrap_or(pline);
                     props.push(PropDecl {
                         name: pname,
                         default,
@@ -344,6 +362,7 @@ impl<'a> Parser<'a> {
                         hooks: None,
                         attrs: vec![],
                         line: pline,
+                        dline,
                     });
                     if !self.eat_op(",") {
                         break;
@@ -632,7 +651,7 @@ impl<'a> Parser<'a> {
             Expr::ArrayLit(items) => Ok(Expr::List(
                 items
                     .into_iter()
-                    .map(|(k, v)| Self::list_elem_kv(k, v))
+                    .map(|(k, v)| Self::list_elem_kv(k, v).map(|o| o.map(Self::list_keyed)))
                     .collect::<Result<_, _>>()?,
             )),
             Expr::Call {
@@ -643,7 +662,7 @@ impl<'a> Parser<'a> {
             } => match *name {
                 Expr::Str(n) if n.eq_ignore_ascii_case("list") => Ok(Expr::List(
                     args.into_iter()
-                        .map(Self::list_elem)
+                        .map(|e| Self::list_elem(e).map(|o| o.map(Self::list_keyed)))
                         .collect::<Result<_, _>>()?,
                 )),
                 other => Ok(Expr::Call {
@@ -658,7 +677,7 @@ impl<'a> Parser<'a> {
             Expr::List(items) => Ok(Expr::List(
                 items
                     .into_iter()
-                    .map(|v| v.map_or(Ok(None), Self::list_elem))
+                    .map(|v| v.map_or(Ok(None), |(k, e)| Self::list_elem_keyed(k, e).map(Some)))
                     .collect::<Result<_, _>>()?,
             )),
             // Lvalue targets can't carry the arg's line marker —
@@ -686,7 +705,7 @@ impl<'a> Parser<'a> {
             Expr::ArrayLit(items) => Ok(Some(Expr::List(
                 items
                     .into_iter()
-                    .map(|(k, v)| Self::list_elem_kv(k, v))
+                    .map(|(k, v)| Self::list_elem_kv(k, v).map(|o| o.map(Self::list_keyed)))
                     .collect::<Result<_, _>>()?,
             ))),
             Expr::Call {
@@ -697,7 +716,7 @@ impl<'a> Parser<'a> {
             } => match *name {
                 Expr::Str(n) if n.eq_ignore_ascii_case("list") => Ok(Some(Expr::List(
                     args.into_iter()
-                        .map(Self::list_elem)
+                        .map(|e| Self::list_elem(e).map(|o| o.map(Self::list_keyed)))
                         .collect::<Result<_, _>>()?,
                 ))),
                 other => Ok(Some(Expr::Call {
@@ -726,12 +745,63 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// A re-entering List node's elements get normalized through
+    /// list_elem then re-keyed (the primary path already carries
+    /// key tuples).
+    fn list_elem_keyed(k: Option<Expr>, e: Expr) -> Result<(Option<Expr>, Expr), PhpError> {
+        match Self::list_elem(e)? {
+            Some(u) => Ok(Self::list_keyed(match k {
+                Some(k) => Expr::Binary {
+                    op: "listkey",
+                    l: Box::new(k),
+                    r: Box::new(u),
+                },
+                None => u,
+            })),
+            None => Ok((k, Expr::Null)),
+        }
+    }
+
+    /// `argline`/`listkey` marks around a destructure element split
+    /// into the keyed-tuple form `Expr::List` stores.
+    fn list_keyed(e: Expr) -> (Option<Expr>, Expr) {
+        match e {
+            Expr::Binary {
+                op: "listkey",
+                l,
+                r,
+                ..
+            } => (Some(*l), *r),
+            Expr::Binary {
+                op: "argline",
+                l,
+                r,
+                ..
+            } => {
+                let (k, v) = Self::list_keyed(*r);
+                (
+                    k,
+                    Expr::Binary {
+                        op: "argline",
+                        l,
+                        r: Box::new(v),
+                    },
+                )
+            }
+            other => (None, other),
+        }
+    }
+
     /// zend's `zend_compile_list_assign` writability walk — a
     /// COMPILE error fired at the first bad element before anything
     /// in the file runs. `cg` mirrors CG(zend_lineno): the compiled
     /// RHS leaves it at its end; each element's key then its own
     /// assign end re-sites it for the next.
-    fn list_assign_check(items: &[Option<Expr>], rhs: &Expr, rl: usize) -> Option<PhpError> {
+    fn list_assign_check(
+        items: &[Option<(Option<Expr>, Expr)>],
+        rhs: &Expr,
+        rl: usize,
+    ) -> Option<PhpError> {
         let mut cg = Self::list_rhs_line(items, rhs).unwrap_or(rl);
         Self::list_assign_walk(items, rhs, &mut cg)
     }
@@ -742,13 +812,13 @@ impl<'a> Parser<'a> {
     /// element's); a compile-const array folds without descending
     /// (CG = the array's lineno — its first element's); anything
     /// else ends at its last compiled leaf.
-    fn list_rhs_line(items: &[Option<Expr>], rhs: &Expr) -> Option<usize> {
+    fn list_rhs_line(items: &[Option<(Option<Expr>, Expr)>], rhs: &Expr) -> Option<usize> {
         match Self::unmark_lval(rhs) {
             Expr::Var(_) | Expr::VarVar(..) => items
                 .iter()
                 .flatten()
                 .next()
-                .and_then(crate::ast::start_line),
+                .and_then(|(_, e)| crate::ast::start_line(e)),
             u @ Expr::ArrayLit(elems) if is_compile_const(u) => {
                 elems.first().and_then(|(_, v)| crate::ast::start_line(v))
             }
@@ -760,15 +830,13 @@ impl<'a> Parser<'a> {
     /// count: zend fires the non-referenceable fatal at the
     //  containing level's first element (`[$v, [&$r]] = [[1],[2]]`
     /// sites at `$v`'s line, before the nested list compiles).
-    fn list_any_byref(items: &[Option<Expr>]) -> bool {
-        items.iter().flatten().any(|e| {
-            let mut e = e;
+    fn list_any_byref(items: &[Option<(Option<Expr>, Expr)>]) -> bool {
+        items.iter().flatten().any(|(_, t)| {
+            let mut e = t;
             loop {
                 e = match e {
                     Expr::Binary {
-                        op: "argline" | "listkey",
-                        r,
-                        ..
+                        op: "argline", r, ..
                     } => r,
                     Expr::Paren(inner) => inner,
                     _ => break,
@@ -808,12 +876,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn list_assign_walk(items: &[Option<Expr>], rhs: &Expr, cg: &mut usize) -> Option<PhpError> {
+    fn list_assign_walk(
+        items: &[Option<(Option<Expr>, Expr)>],
+        rhs: &Expr,
+        cg: &mut usize,
+    ) -> Option<PhpError> {
         let keyed = items
             .iter()
             .flatten()
             .next()
-            .is_some_and(|e| matches!(e, Expr::Binary { op: "listkey", .. }));
+            .is_some_and(|(k, _)| k.is_some());
         // zend fires 'Cannot assign reference to non referenceable
         // value' when the level carries a `&` element and the RHS
         // can't produce references — checked as the level's first
@@ -827,7 +899,7 @@ impl<'a> Parser<'a> {
                 .iter()
                 .flatten()
                 .next()
-                .and_then(crate::ast::start_line)
+                .and_then(|(_, e)| crate::ast::start_line(e))
                 .unwrap_or(*cg);
             return Some(PhpError::compile_fatal(
                 "Cannot assign reference to non referenceable value",
@@ -846,14 +918,8 @@ impl<'a> Parser<'a> {
                 continue;
             };
             has_elems = true;
-            let (key, elem) = match elem {
-                Expr::Binary {
-                    op: "listkey",
-                    l,
-                    r,
-                } => (Some(l.as_ref()), r.as_ref()),
-                _ => (None, elem),
-            };
+            let (key, elem) = elem;
+            let key = key.as_ref();
             if keyed != key.is_some() {
                 return Some(PhpError::compile_fatal(
                     "Cannot mix keyed and unkeyed array entries in assignments",
@@ -1793,6 +1859,360 @@ impl<'a> Parser<'a> {
 
     /// `expr(...)` — first-class-callable arg lists rewrite their call
     /// node into `Expr::Fcc`; everything else keeps its args.
+    pub(in crate::parser) fn ref_variable(&mut self, write_ctx: bool) -> Result<Expr, PhpError> {
+        use crate::ast::Expr::*;
+        const KW_REJECT: &[&str] = &[
+            "clone",
+            "function",
+            "fn",
+            "match",
+            "throw",
+            "print",
+            "echo",
+            "foreach",
+            "if",
+            "else",
+            "elseif",
+            "while",
+            "do",
+            "for",
+            "switch",
+            "return",
+            "global",
+            "unset",
+            "include",
+            "include_once",
+            "require",
+            "require_once",
+            "isset",
+            "empty",
+            "list",
+            "array",
+            "eval",
+            "exit",
+            "die",
+            "try",
+            "catch",
+            "finally",
+            "class",
+            "interface",
+            "trait",
+            "enum",
+            "extends",
+            "implements",
+            "use",
+            "namespace",
+            "declare",
+            "var",
+            "const",
+            "public",
+            "private",
+            "protected",
+            "abstract",
+            "final",
+            "readonly",
+            "instanceof",
+            "insteadof",
+            "or",
+            "and",
+            "xor",
+            "yield",
+            "goto",
+            "continue",
+            "break",
+        ];
+        let starter_ok = match self.peek() {
+            Some(Token::Variable(_))
+            | Some(Token::SimpleString(_))
+            | Some(Token::InterpString(_)) => true,
+            Some(Token::Op(o)) => matches!(*o, "$" | "$${" | "(" | "["),
+            Some(Token::Ident(n)) => !KW_REJECT.contains(&n.as_str()),
+            _ => false,
+        };
+        if !starter_ok {
+            let desc = match self.peek().cloned() {
+                Some(Token::Int(n)) => format!("integer \"{}\"", n),
+                Some(Token::Float(n)) => format!("floating-point number \"{}\"", n),
+                Some(Token::Ident(n)) => format!("token \"{}\"", n),
+                t => desc_t(t.as_ref()),
+            };
+            return Err(PhpError::parse(
+                format!("syntax error, unexpected {}", desc),
+                self.line(),
+            ));
+        }
+        // `new_variable` parens must be followed by a deref link —
+        // `=& ($x)` / `=& (f())` / `=& ($$v)` are parse errors while
+        // `(&$x)[0]` and `=& ($f)()` are legal (probe7 vs oracle).
+        if self.at_op("(") {
+            let mut depth = 0usize;
+            let mut i = self.pos;
+            while let Some(t) = self.toks.get(i).map(|l| &l.token) {
+                match t {
+                    Token::Op("(") => depth += 1,
+                    Token::Op(")") => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let next = self.toks.get(i + 1).map(|l| &l.token);
+            if !matches!(
+                next,
+                Some(Token::Op("["))
+                    | Some(Token::Op("->"))
+                    | Some(Token::Op("?->"))
+                    | Some(Token::Op("("))
+            ) {
+                return Err(PhpError::parse(
+                    format!(
+                        "syntax error, unexpected {}, expecting \"->\" or \"?->\" or \"[\"",
+                        desc_t(next)
+                    ),
+                    self.line(),
+                ));
+            }
+        }
+        // `& static` is only legal before `::` (`&static::$p` is a
+        // class-name reference). Before `function`/`fn` postfix would
+        // swallow it into a static closure — zend instead errors
+        // `unexpected token "function", expecting "::"` (probe15b).
+        if self.ident_is("static") && !matches!(self.peek2(), Some(Token::Op("::"))) {
+            let desc = match self.peek2().cloned() {
+                Some(Token::Int(n)) => format!("integer \"{}\"", n),
+                Some(Token::Float(n)) => format!("floating-point number \"{}\"", n),
+                Some(Token::Ident(n)) => format!("token \"{}\"", n),
+                t => desc_t(t.as_ref()),
+            };
+            return Err(PhpError::parse(
+                format!("syntax error, unexpected {}, expecting \"::\"", desc),
+                self.line(),
+            ));
+        }
+        let e = self.postfix()?;
+        // Deepest chain root: container of `x[...]`/`x->y`/`x->m()`.
+        // Parens are transparent for the ROOT search; a Call node is
+        // itself a legal root (`=& f()`, `=& ($f)()`), so call names
+        // are NOT unwrapped. `linked` = the OUTERMOST node is a real
+        // deref link — parens at the top level are NOT a
+        // `new_variable` (`=& ($x)`, `=& ($a[0])`, `=& (f())` all
+        // parse-error expecting "->"/"?->"/"[", while `(&$x)[0]` is
+        // legal because the link is outside).
+        let linked = matches!(&e, Index { .. } | Prop { .. } | MethodCall { .. });
+        let mut leaf: &Expr = &e;
+        loop {
+            leaf = match leaf {
+                Index { e: c, .. } | Prop { obj: c, .. } | MethodCall { obj: c, .. } => c.as_ref(),
+                Paren(inner) => inner.as_ref(),
+                _ => break,
+            };
+        }
+        let callish = |x: &Expr| -> Option<&'static str> {
+            match x {
+                MethodCall { .. } | StaticCall { .. } | StaticCallDyn { .. } => Some("method"),
+                Call { .. } | Fcc(_) => Some("function"),
+                _ => None,
+            }
+        };
+        if !linked {
+            // No deref link — zend's new_variable is a bare variable or
+            // a call, never a parenthesized expr (`=& ($x)` /
+            // `=& (f())` / `=& ($$v)` → parse error).
+            match &e {
+                Var(_) | VarVar(..) | StaticProp { .. } => {}
+                Call { .. }
+                | MethodCall { .. }
+                | StaticCall { .. }
+                | StaticCallDyn { .. }
+                | Fcc(_) => {
+                    if write_ctx {
+                        self.write_ctx_errs.push((
+                            format!(
+                                "Can't use {} return value in write context",
+                                callish(leaf).unwrap_or("function")
+                            ),
+                            self.line(),
+                        ));
+                    }
+                }
+                New { .. } => {
+                    // `new C` wants `(`, `new C()` wants a deref link.
+                    let had_parens = matches!(
+                        self.toks.get(self.pos.wrapping_sub(1)).map(|l| &l.token),
+                        Some(Token::Op(")"))
+                    );
+                    return Err(PhpError::parse(
+                        if had_parens {
+                            "syntax error, unexpected token \";\", expecting \"->\" or \"?->\" or \"[\""
+                        } else {
+                            "syntax error, unexpected token \";\", expecting \"(\""
+                        },
+                        self.line(),
+                    ));
+                }
+                _ => {
+                    // Unexpected token names the token following the
+                    // parsed root (`&self function` → 'function';
+                    // `&1` → ';', p15/n).
+                    let desc = match self.peek().cloned() {
+                        Some(Token::Int(n)) => format!("integer \"{}\"", n),
+                        Some(Token::Float(n)) => format!("floating-point number \"{}\"", n),
+                        Some(Token::Ident(n)) => format!("token \"{}\"", n),
+                        t => desc_t(t.as_ref()),
+                    };
+                    return Err(PhpError::parse(
+                        format!(
+                            "syntax error, unexpected {}, expecting \"->\" or \"?->\" or \"[\"",
+                            desc
+                        ),
+                        self.line(),
+                    ));
+                }
+            }
+        } else {
+            // A chain consumed at least one link — the ROOT must be a
+            // variable/call family; literal, string/interpolated-string
+            // and const-expr roots (`"abc"[0]`, `"a$v"[0]`, `true[0]`,
+            // `C::CONST[0]`, `new C()->x`) are a compile fatal —
+            // string literals are temporaries, not new_variables
+            // (probe6/6b vs oracle).
+            match leaf {
+                Var(_)
+                | VarVar(..)
+                | Call { .. }
+                | MethodCall { .. }
+                | StaticCall { .. }
+                | StaticCallDyn { .. }
+                | Fcc(_)
+                | Paren(_)
+                | StaticProp { .. } => {}
+                _ => {
+                    self.write_ctx_errs.push((
+                        "Cannot use temporary expression in write context".to_string(),
+                        self.line(),
+                    ));
+                }
+            }
+            // In write context (foreach `&`) a call-shaped OUTER node
+            // dies too — `&f()`, `&$o->m()`. A callish root under a
+            // deref (`&f()->x`) survives the leaf check but still dies.
+            let mut kind = callish(&e);
+            if kind.is_none() {
+                kind = callish(leaf);
+            }
+            if write_ctx {
+                if let Some(kind) = kind {
+                    self.write_ctx_errs.push((
+                        format!("Can't use {} return value in write context", kind),
+                        self.line(),
+                    ));
+                }
+            }
+        }
+        if Self::has_nullsafe(&e) {
+            if write_ctx {
+                self.write_ctx_errs.push((
+                    "Can't use nullsafe operator in write context".to_string(),
+                    self.line(),
+                ));
+            } else {
+                self.write_ctx_errs.push((
+                    "Cannot take reference of a nullsafe chain".to_string(),
+                    self.line(),
+                ));
+            }
+        }
+        Ok(e)
+    }
+
+    pub(in crate::parser) fn list_writable(&mut self, e: &Expr) -> Result<(), PhpError> {
+        use crate::ast::Expr::*;
+        match e {
+            Var(_) | VarVar(..) | StaticProp { .. } => Ok(()),
+            Paren(inner) | ByRef(inner) => self.list_writable(inner),
+            List(items) => {
+                for it in items.iter().flatten() {
+                    self.list_writable(&it.1)?;
+                }
+                Ok(())
+            }
+            ArrayLit(items) => {
+                for (_, v) in items {
+                    if !matches!(v, Null) {
+                        self.list_writable(v)?;
+                    }
+                }
+                Ok(())
+            }
+            Call { .. } | Fcc(_) => {
+                self.write_ctx_errs.push((
+                    "Can't use function return value in write context".to_string(),
+                    self.line(),
+                ));
+                Ok(())
+            }
+            MethodCall { .. } | StaticCall { .. } | StaticCallDyn { .. } => {
+                self.write_ctx_errs.push((
+                    "Can't use method return value in write context".to_string(),
+                    self.line(),
+                ));
+                Ok(())
+            }
+            Index { .. } | Prop { .. } => {
+                if Self::has_nullsafe(e) || !Self::writeable_root(e) {
+                    self.write_ctx_errs.push((
+                        "Assignments can only happen to writable values".to_string(),
+                        self.line(),
+                    ));
+                }
+                Ok(())
+            }
+            _ => {
+                self.write_ctx_errs.push((
+                    "Assignments can only happen to writable values".to_string(),
+                    self.line(),
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    fn writeable_root(e: &Expr) -> bool {
+        use crate::ast::Expr::*;
+        let mut leaf = e;
+        let mut call_link = false;
+        loop {
+            leaf = match leaf {
+                Index { e: c, .. } | Prop { obj: c, .. } => c.as_ref(),
+                MethodCall { obj: c, .. } => {
+                    call_link = true;
+                    c.as_ref()
+                }
+                Paren(inner) => inner.as_ref(),
+                _ => break,
+            };
+        }
+        if call_link && matches!(leaf, New { .. }) {
+            return true;
+        }
+        matches!(
+            leaf,
+            Var(_)
+                | VarVar(..)
+                | Call { .. }
+                | MethodCall { .. }
+                | StaticCall { .. }
+                | StaticCallDyn { .. }
+                | Fcc(_)
+                | Paren(_)
+                | StaticProp { .. }
+        )
+    }
+
     pub(in crate::parser) fn has_nullsafe(e: &Expr) -> bool {
         match e {
             Expr::MethodCall { obj, nullsafe, .. } => *nullsafe || Self::has_nullsafe(obj),
@@ -2539,7 +2959,7 @@ impl<'a> Parser<'a> {
                         } else {
                             self.expr()?
                         };
-                        items.push(Some(Self::markline(e, el)));
+                        items.push(Some(Self::list_keyed(Self::markline(e, el))));
                         if !self.eat_op(",") {
                             break;
                         }

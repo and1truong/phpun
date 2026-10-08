@@ -651,12 +651,27 @@ impl<'a> Interp<'a> {
     /// Backtrace frames (innermost first) for an E_ERROR raised inside a
     /// builtin — Zend attaches the call stack to runtime fatals.
     pub fn fatal_frames(&self) -> Vec<String> {
-        self.call_trace
+        let frames: Vec<&crate::value::TraceFrame> = self
+            .call_trace
             .iter()
             .rev()
             .filter(|f| !trace_frame_hidden(f))
+            .collect();
+        // Only the innermost frame renders an include bare — deeper
+        // include frames keep their resolved-path argument (an include
+        // that is still opening has no args and renders bare anyway).
+        let bare = if frames
+            .first()
+            .is_some_and(|f| crate::value::include_frame(f))
+        {
+            Some(0)
+        } else {
+            None
+        };
+        frames
+            .iter()
             .enumerate()
-            .map(|(i, f)| trace_frame_str_at(f, i))
+            .map(|(i, f)| trace_frame_str_at(f, Some(i) == bare))
             .collect()
     }
 

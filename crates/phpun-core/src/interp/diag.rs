@@ -59,7 +59,22 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// Any active suppression: `@`'s silence or an isset/empty/??
+    /// quiet read.
+    pub(in crate::interp) fn is_quiet(&self) -> bool {
+        self.silence > 0 || self.isset_quiet > 0
+    }
+
     pub(in crate::interp) fn warn(&mut self, msg: &str) -> Result<(), PhpError> {
+        if self.is_quiet() || self.error_level & 2 == 0 {
+            return Ok(());
+        }
+        self.emit_diag("Warning", 2, msg)
+    }
+
+    /// Bypass isset/empty/?? quiet — zend still surfaces offset-key
+    /// cast warnings there; only `@` silences them.
+    pub(in crate::interp) fn warn_ns(&mut self, msg: &str) -> Result<(), PhpError> {
         if self.silence > 0 || self.error_level & 2 == 0 {
             return Ok(());
         }
@@ -180,7 +195,7 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn notice(&mut self, msg: &str) -> Result<(), PhpError> {
-        if self.silence > 0 || self.error_level & 8 == 0 {
+        if self.is_quiet() || self.error_level & 8 == 0 {
             return Ok(());
         }
         self.emit_diag("Notice", 8, msg)
@@ -196,6 +211,14 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn deprecated(&mut self, msg: &str) -> Result<(), PhpError> {
+        if self.is_quiet() || self.error_level & 8192 == 0 {
+            return Ok(());
+        }
+        self.emit_diag("Deprecated", 8192, msg)
+    }
+
+    /// Bypass isset/empty/?? quiet — offset-key casts still emit.
+    pub(in crate::interp) fn deprecated_ns(&mut self, msg: &str) -> Result<(), PhpError> {
         if self.silence > 0 || self.error_level & 8192 == 0 {
             return Ok(());
         }
@@ -356,7 +379,7 @@ impl<'a> Interp<'a> {
                 .get("message")
                 .map(|c| c.borrow().to_php_string())
                 .unwrap_or_default();
-            let (file, line, thrown, tr, msg, eval_ctx) = match &o.internal {
+            let (file, line, thrown, tr, msg, eval_ctx, mut next) = match &o.internal {
                 Some(ObjectInternal::Exception {
                     file,
                     line,
@@ -365,6 +388,7 @@ impl<'a> Interp<'a> {
                     full_msg,
                     eval_ctx,
                     frames,
+                    previous,
                 }) => (
                     file.clone(),
                     *line,
@@ -382,6 +406,7 @@ impl<'a> Interp<'a> {
                         full_msg.clone()
                     },
                     *eval_ctx,
+                    previous.clone(),
                 ),
                 _ => (
                     self.diag_file(),
@@ -390,14 +415,90 @@ impl<'a> Interp<'a> {
                     "#0 {main}".to_string(),
                     msg,
                     0,
+                    None,
                 ),
             };
             drop(o);
+            // Zend renders a `previous` chain innermost-first: the
+            // deepest throwable gets the `Uncaught X:` block and each
+            // enclosing level follows as `\nNext X:` (p3/p4).
+            let mut chain: Vec<(String, String, String, u32, String)> =
+                vec![(class, msg.clone(), file.clone(), line, tr.clone())];
+            while let Some(Value::Object(co)) = next {
+                let co = co.borrow();
+                let cls = co.class.name().to_string();
+                let m = co
+                    .props
+                    .get("message")
+                    .map(|c| c.borrow().to_php_string())
+                    .unwrap_or_default();
+                let (f, l, tr2, dm, p) = match &co.internal {
+                    Some(ObjectInternal::Exception {
+                        file,
+                        line,
+                        trace,
+                        full_msg,
+                        frames,
+                        previous,
+                        ..
+                    }) => (
+                        file.clone(),
+                        *line,
+                        if !trace.is_empty() {
+                            trace.clone()
+                        } else if frames.is_empty() {
+                            "#0 {main}".to_string()
+                        } else {
+                            format_trace(frames)
+                        },
+                        if full_msg.is_empty() {
+                            m
+                        } else {
+                            full_msg.clone()
+                        },
+                        previous.clone(),
+                    ),
+                    _ => (
+                        self.diag_file(),
+                        self.cur_line as u32,
+                        "#0 {main}".to_string(),
+                        m,
+                        None,
+                    ),
+                };
+                chain.push((cls, dm, f, l, tr2));
+                next = p;
+            }
+            let mut blocks = String::new();
+            for (i, (cls, m, f, l, tr)) in chain.iter().rev().enumerate() {
+                let colon = if m.is_empty() { "" } else { ": " };
+                if i > 0 {
+                    blocks.push('\n');
+                }
+                let head = if i == 0 { "Uncaught" } else { "Next" };
+                blocks.push_str(&format!(
+                    "{} {}{}{} in {}:{}\nStack trace:\n{}\n",
+                    head, cls, colon, m, f, l, tr
+                ));
+            }
+            let thrown_html = format!("  thrown in <b>{}</b> on line <b>{}</b>", file, thrown);
+            blocks.push_str(&format!("  thrown in {} on line {}", file, thrown));
             if eval_ctx > 0 {
                 // ParseError inside eval'd code prints the plain
                 // `Parse error:` form (tests/lang/019) — `file` is
                 // already the `FILE(N) : eval()'d code` composite and
-                // eval_ctx the line inside the eval string.
+                // eval_ctx the line inside the eval string. The CLI
+                // SAPI still logs the `PHP Parse error:` header to
+                // stderr first, same as a top-level parse error.
+                let log_errors = self.ini.get("log_errors").is_none_or(|v| {
+                    matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
+                });
+                if log_errors {
+                    self.diag_stderr(&format!(
+                        "PHP Parse error:  {} in {} on line {}\n",
+                        msg, file, eval_ctx
+                    ));
+                }
                 self.emit(&format!(
                     "\nParse error: {} in {} on line {}\n",
                     msg, file, eval_ctx
@@ -426,13 +527,17 @@ impl<'a> Interp<'a> {
                 // Buffered output precedes the fatal, as PHP's output
                 // layer would emit it (bug32828's throwing handler).
                 self.flush_ob_all();
-                // Zend prints `Uncaught C: msg` — no colon when msg empty.
-                let colon = if msg.is_empty() { "" } else { ": " };
                 if self.ini_on("html_errors") {
-                    self.out.extend_from_slice(format!(
-                        "<br />\n<b>Fatal error</b>:  Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in <b>{}</b> on line <b>{}</b><br />\n",
-                        class, colon, msg, file, line, tr, file, thrown
-                    ).as_bytes());
+                    let head = blocks
+                        .strip_suffix(&format!("  thrown in {} on line {}", file, thrown))
+                        .unwrap_or(&blocks);
+                    self.out.extend_from_slice(
+                        format!(
+                            "<br />\n<b>Fatal error</b>:  {}{}<br />\n",
+                            head, thrown_html
+                        )
+                        .as_bytes(),
+                    );
                 } else {
                     // The PHP CLI SAPI logs the uncaught to stderr first
                     // (log_errors default on), then prints the display
@@ -441,17 +546,11 @@ impl<'a> Interp<'a> {
                         matches!(v.to_lowercase().as_str(), "1" | "on" | "true" | "yes")
                     });
                     if log_errors {
-                        self.diag_stderr(&format!(
-                            "PHP Fatal error:  Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
-                            class, colon, msg, file, line, tr, file, thrown
-                        ));
+                        self.diag_stderr(&format!("PHP Fatal error:  {}\n", blocks));
                     }
                     // ob_stack is empty here (flushed above), so emit
                     // reaches out-or-stdout like a direct write did.
-                    self.emit(&format!(
-                        "\nFatal error: Uncaught {}{}{} in {}:{}\nStack trace:\n{}\n  thrown in {} on line {}\n",
-                        class, colon, msg, file, line, tr, file, thrown
-                    ));
+                    self.emit(&format!("\nFatal error: {}\n", blocks));
                 }
             }
         } else {
@@ -511,12 +610,27 @@ impl<'a> Interp<'a> {
             .iter()
             .rposition(|f| crate::value::include_frame(f) || (f.internal && f.function == "eval"))
             .unwrap_or(self.call_trace.len());
-        self.call_trace[..upto]
+        let frames: Vec<&crate::value::TraceFrame> = self.call_trace[..upto]
             .iter()
             .rev()
             .filter(|f| !crate::value::trace_frame_hidden(f))
+            .collect();
+        // The innermost surviving frame is still the executing unit in
+        // Zend — an include there renders bare `include()` (a compile
+        // error inside `eval` nested in an include shows `#0 f(2):
+        // include()`), deeper includes keep their path argument.
+        let bare = if frames
+            .first()
+            .is_some_and(|f| crate::value::include_frame(f))
+        {
+            Some(0)
+        } else {
+            None
+        };
+        frames
+            .iter()
             .enumerate()
-            .map(|(i, f)| crate::value::trace_frame_str_at(f, i))
+            .map(|(i, f)| crate::value::trace_frame_str_at(f, Some(i) == bare))
             .collect()
     }
 
@@ -529,13 +643,28 @@ impl<'a> Interp<'a> {
     /// level, the real frames inside a function call.
     pub(in crate::interp) fn decl_fatal_ctx(&mut self, mut e: PhpError) -> PhpError {
         if matches!(e.kind, ErrorKind::Fatal) {
+            let frames: Vec<&crate::value::TraceFrame> = self
+                .call_trace
+                .iter()
+                .rev()
+                .filter(|f| !crate::value::trace_frame_hidden(f))
+                .collect();
+            // Only the INNERMOST (executing) include renders bare
+            // 'include()'; dormant include frames deeper in the chain
+            // keep their path argument — 'include(\'path\')' (m8c).
+            let bare = if frames
+                .first()
+                .is_some_and(|f| crate::value::include_frame(f))
+            {
+                Some(0)
+            } else {
+                None
+            };
             e.trace = Some(
-                self.call_trace
+                frames
                     .iter()
-                    .rev()
-                    .filter(|f| !crate::value::trace_frame_hidden(f))
                     .enumerate()
-                    .map(|(i, f)| crate::value::trace_frame_str_at(f, i))
+                    .map(|(i, f)| crate::value::trace_frame_str_at(f, Some(i) == bare))
                     .collect(),
             );
         }

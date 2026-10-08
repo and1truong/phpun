@@ -45,6 +45,7 @@ impl<'a> Interp<'a> {
                         hooks: None,
                         attrs: vec![],
                         line: 0,
+                        dline: 0,
                     })
                     .collect(),
                 consts: vec![],
@@ -490,6 +491,7 @@ impl<'a> Interp<'a> {
             attrs: vec![],
             decl_in: None,
             enum_case: false,
+            line: 0,
         };
         reg(
             ClassDecl {
@@ -618,6 +620,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "FETCH_NUM".into(),
@@ -628,6 +631,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "FETCH_BOTH".into(),
@@ -638,6 +642,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "FETCH_OBJ".into(),
@@ -648,6 +653,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "ATTR_ERRMODE".into(),
@@ -658,6 +664,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "ATTR_DEFAULT_FETCH_MODE".into(),
@@ -668,6 +675,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "ATTR_EMULATE_PREPARES".into(),
@@ -678,6 +686,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "ERRMODE_SILENT".into(),
@@ -688,6 +697,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "ERRMODE_WARNING".into(),
@@ -698,6 +708,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "ERRMODE_EXCEPTION".into(),
@@ -708,6 +719,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_STR".into(),
@@ -718,6 +730,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_INT".into(),
@@ -728,6 +741,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_BOOL".into(),
@@ -738,6 +752,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_NULL".into(),
@@ -748,6 +763,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "PARAM_LOB".into(),
@@ -758,6 +774,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                 ],
                 file: String::new(),
@@ -884,6 +901,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "ARRAY_AS_PROPS".into(),
@@ -894,6 +912,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                 ],
                 file: String::new(),
@@ -1175,6 +1194,7 @@ impl<'a> Interp<'a> {
                     attrs: vec![],
                     decl_in: None,
                     enum_case: false,
+                    line: 0,
                 }],
                 file: String::new(),
                 line: 0,
@@ -1280,6 +1300,7 @@ impl<'a> Interp<'a> {
                         hooks: None,
                         attrs: vec![],
                         line: 0,
+                        dline: 0,
                     },
                     PropDecl {
                         name: "params".into(),
@@ -1295,6 +1316,7 @@ impl<'a> Interp<'a> {
                         hooks: None,
                         attrs: vec![],
                         line: 0,
+                        dline: 0,
                     },
                     PropDecl {
                         name: "stream".into(),
@@ -1310,6 +1332,7 @@ impl<'a> Interp<'a> {
                         hooks: None,
                         attrs: vec![],
                         line: 0,
+                        dline: 0,
                     },
                 ],
                 consts: vec![],
@@ -1348,6 +1371,7 @@ impl<'a> Interp<'a> {
                         hooks: None,
                         attrs: vec![],
                         line: 0,
+                        dline: 0,
                     };
                     vec![
                         p("bucket", Some(Expr::Null), None),
@@ -1601,6 +1625,7 @@ impl<'a> Interp<'a> {
                     attrs: vec![],
                     decl_in: None,
                     enum_case: false,
+                    line: 0,
                 })
                 .collect(),
                 file: String::new(),
@@ -1641,6 +1666,8 @@ impl<'a> Interp<'a> {
                     mk_method("getDefaultValueConstantName", vec![]),
                     mk_method("allowsNull", vec![]),
                     mk_method("isPassedByReference", vec![]),
+                    mk_method("getDefaultValue", vec![]),
+                    mk_method("isDefaultValueAvailable", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -1746,6 +1773,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_FUNCTION".into(),
@@ -1756,6 +1784,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_METHOD".into(),
@@ -1766,6 +1795,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_PROPERTY".into(),
@@ -1776,6 +1806,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_CLASS_CONSTANT".into(),
@@ -1786,6 +1817,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_PARAMETER".into(),
@@ -1796,6 +1828,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "TARGET_ALL".into(),
@@ -1806,6 +1839,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                     crate::ast::ConstDecl {
                         name: "IS_REPEATABLE".into(),
@@ -1816,6 +1850,7 @@ impl<'a> Interp<'a> {
                         attrs: vec![],
                         decl_in: None,
                         enum_case: false,
+                        line: 0,
                     },
                 ],
                 file: String::new(),
@@ -2212,14 +2247,42 @@ impl<'a> Interp<'a> {
         ] {
             reg(d, false);
         }
-        reg(
-            throwable_class("Exception", None, &["message", "code", "file", "line"]),
-            false,
-        );
-        reg(
-            throwable_class("Error", None, &["message", "code", "file", "line"]),
-            false,
-        );
+        // zend's private string/trace/previous live on the root
+        // classes only — subclasses inherit the declaring-class label
+        // (`"string":"Exception":private` even on RuntimeException).
+        // Declaration order matches zend's default-properties table
+        // (it's the var_dump key order).
+        for root in ["Exception", "Error"] {
+            let mut d = throwable_class(root, None, &[]);
+            d.props = [
+                ("message", Visibility::Protected),
+                ("string", Visibility::Private),
+                ("code", Visibility::Protected),
+                ("file", Visibility::Protected),
+                ("line", Visibility::Protected),
+                ("trace", Visibility::Private),
+                ("previous", Visibility::Private),
+            ]
+            .iter()
+            .map(|(p, vis)| PropDecl {
+                name: p.to_string(),
+                default: None,
+                is_static: false,
+                visibility: *vis,
+                readonly: false,
+                ty: None,
+                is_abstract: false,
+                is_final: false,
+                set_vis: None,
+                decl_in: None,
+                hooks: None,
+                attrs: vec![],
+                line: 0,
+                dline: 0,
+            })
+            .collect();
+            reg(d, false);
+        }
         // Closure — name must resolve for `\Closure::bind()` /
         // `\Closure::fromCallable()` (composer's ClassLoader uses bind to
         // scope-isolate `include`). Methods dispatch natively in
@@ -2320,11 +2383,11 @@ impl<'a> Interp<'a> {
             },
             false,
         );
+        // ErrorException declares its own 6-arg __construct shape
+        // (severity/filename/line before previous), a `severity`
+        // prop and getSeverity() — the ctor stub reads the class
+        // family to pick the signature.
         {
-            // ErrorException declares its own 6-arg __construct shape
-            // (severity/filename/line before previous), a `severity`
-            // prop and getSeverity() — the ctor stub reads the class
-            // family to pick the signature.
             let mut d = throwable_class(
                 "ErrorException",
                 Some("Exception"),
@@ -2366,6 +2429,7 @@ impl<'a> Interp<'a> {
             }
             reg(d, false);
         }
+
         for (name, parent) in [
             ("RuntimeException", "Exception"),
             ("LogicException", "Exception"),

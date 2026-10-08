@@ -40,7 +40,7 @@ impl<'a> Interp<'a> {
                 .or_else(|| Self::block_yield_kind(body)),
             Stmt::Foreach { arr, val, body, .. } => Self::expr_yield_kind(arr)
                 .or_else(|| match val {
-                    ForeachTarget::Lvalue(e) => Self::expr_yield_kind(e),
+                    ForeachTarget::Lvalue(e) | ForeachTarget::ByRef(e) => Self::expr_yield_kind(e),
                     _ => None,
                 })
                 .or_else(|| Self::block_yield_kind(body)),
@@ -211,7 +211,11 @@ impl<'a> Interp<'a> {
                 })
             }
             Expr::Isset(v) => v.iter().find_map(Self::expr_yield_kind),
-            Expr::List(v) => v.iter().flatten().find_map(Self::expr_yield_kind),
+            Expr::List(v) => v.iter().flatten().find_map(|(k, e)| {
+                k.as_ref()
+                    .and_then(|k| Self::expr_yield_kind(k))
+                    .or_else(|| Self::expr_yield_kind(e))
+            }),
             Expr::Exit(Some(e)) => Self::expr_yield_kind(e),
             Expr::ArrayLit(items) => items.iter().find_map(|(k, v)| {
                 k.as_ref()
@@ -853,11 +857,16 @@ impl<'a> Interp<'a> {
             // gen's resume frame — citing the consumer's current
             // site (the foreach header) with the gen's original
             // call args — under the consumer's stack.
+            let bare = if raise_frames.last().is_some_and(crate::value::include_frame) {
+                Some(0)
+            } else {
+                None
+            };
             let mut frames: Vec<String> = raise_frames
                 .iter()
                 .rev()
                 .enumerate()
-                .map(|(i, f)| crate::value::trace_frame_str_at(f, i))
+                .map(|(i, f)| crate::value::trace_frame_str_at(f, Some(i) == bare))
                 .collect();
             frames.push(format!(
                 "{}({}): {}({})",
@@ -889,11 +898,16 @@ impl<'a> Interp<'a> {
             // — eval()/include() pseudo-frames and userland calls —
             // lead the resume stack in Zend's render.
             if !raise_frames.is_empty() {
+                let bare = if raise_frames.last().is_some_and(crate::value::include_frame) {
+                    Some(0)
+                } else {
+                    None
+                };
                 let prefix: Vec<String> = raise_frames
                     .iter()
                     .rev()
                     .enumerate()
-                    .map(|(i, f)| crate::value::trace_frame_str_at(f, i))
+                    .map(|(i, f)| crate::value::trace_frame_str_at(f, Some(i) == bare))
                     .collect();
                 frames = prefix.into_iter().chain(frames).collect();
             }

@@ -165,6 +165,7 @@ pub(crate) fn builtin_sig(n: &str) -> Option<Vec<(String, bool)>> {
         "substr" => &[("string", true), ("offset", true), ("length", false)],
         "strpos" => &[("haystack", true), ("needle", true), ("offset", false)],
         "assert" => &[("assertion", true), ("description", false)],
+        "clone" => &[("object", true), ("withProperties", false)],
         "count" => &[("value", true), ("mode", false)],
         "implode" => &[("separator", false), ("array", true)],
         "explode" => &[("separator", true), ("string", true), ("limit", false)],
@@ -932,6 +933,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         "intval" | "floatval" | "doubleval" | "strval" | "boolval" => {
             bp!(("value", Req))
         }
+        "clone" => bp!(("object", Req), ("withProperties", Arr)),
         "count" | "sizeof" => bp!(("value", Req), ("mode", Int(0))),
         "array_slice" => bp!(
             ("array", Req),
@@ -996,9 +998,12 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         "array_replace" | "array_replace_recursive" => {
             bp!(("array", Req), ("replacements", Var))
         }
-        "array_push" | "array_unshift" => bp!(("array", Req), ("values", Var)),
-        "max" | "min" => bp!(("value", Req), ("values", Var)),
-        "compact" => bp!(("var_name", Req), ("var_names", Var)),
+        "array_push" | "array_unshift" => bp!(("array", Req), ("...", Var)),
+        "reset" | "end" | "next" | "prev" | "current" | "pos" | "shuffle" => {
+            bp!(("array", Req))
+        }
+        "max" | "min" => bp!(("value", Req), ("...", Var)),
+        "compact" => bp!(("var_name", Req), ("...", Var)),
         "array_column" => bp!(("array", Req), ("column_key", Req), ("index_key", Null)),
         "array_unique" => bp!(("array", Req), ("flags", Int(2))),
         "sort" | "rsort" | "asort" | "arsort" | "ksort" | "krsort" | "natsort" | "natcasesort" => {
@@ -1320,7 +1325,6 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         | "sys_get_temp_dir" => bp!(),
         "count_chars" => bp!(("string", Req), ("mode", Int(0))),
         "crc32" => bp!(("string", Req)),
-        "current" | "next" | "pos" | "prev" | "reset" | "shuffle" => bp!(("array", Req)),
         "dechex" => bp!(("num", Req)),
         "debug_backtrace" => bp!(("options", Int(1)), ("limit", Int(0))),
         "debug_print_backtrace" => bp!(("options", Int(0)), ("limit", Int(0))),

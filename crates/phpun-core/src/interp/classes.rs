@@ -10,13 +10,19 @@ impl<'a> Interp<'a> {
 
     /// Class-ish name already registered — (prev-kind word, file,
     /// line) for 'Cannot redeclare' diagnostics. Zend's message names
-    /// the previously declared kind (an enum counts as a class).
+    /// the previously declared kind — an enum entry names 'enum'
+    /// (ev_enum_dup: `enum W {} enum W {}` → 'Cannot redeclare enum W').
     pub(in crate::interp) fn existing_class_site(
         &self,
         key: &str,
     ) -> Option<(&'static str, String, usize)> {
         if let Some(c) = self.classes.get(key) {
-            return Some(("class", c.decl.file.clone(), c.decl.line));
+            let kind = if c.decl.kind == ClassKind::Enum {
+                "enum"
+            } else {
+                "class"
+            };
+            return Some((kind, c.decl.file.clone(), c.decl.line));
         }
         if let Some(c) = self.interfaces.get(key) {
             return Some(("interface", c.file.clone(), c.line));
@@ -57,8 +63,18 @@ impl<'a> Interp<'a> {
         let res = self.register_class_inner(decl);
         self.declaring.pop();
         match res {
-            // Class-linking errors are compile-class fatals — Zend
-            // attaches the live backtrace even at runtime.
+            // Class-linking errors are compile-class fatals. A
+            // registration from early binding (hoist) reports the
+            // compile context's trace — the innermost include/eval
+            // pseudo-frame dropped — while an exec-phase registration
+            // (conditional decl, a class with interfaces/traits, a
+            // redeclare) keeps the live call chain.
+            Err(e) if self.in_hoist && matches!(e.kind, crate::error::ErrorKind::Fatal) => {
+                Err(PhpError {
+                    trace: Some(self.compile_err_frames()),
+                    ..e
+                })
+            }
             Err(e) => Err(self.decl_fatal_ctx(e)),
             r => r,
         }
@@ -146,8 +162,11 @@ impl<'a> Interp<'a> {
         let mut d = (*decl).clone();
         // Declaring file — prop/const default exprs bind __FILE__/__DIR__
         // to it (composer's generated `__DIR__ . '/../..' . ...` paths).
+        // A class decl inside a function attributes to the FUNCTION's
+        // file, not whatever file happens to be executing at call time
+        // (oracle m8c: 'previously declared in m8c.php:3').
         if d.file.is_empty() {
-            d.file = self.cur_file.clone();
+            d.file = self.diag_file();
         }
 
         // Synthesize PropDecls from promoted constructor params
@@ -175,6 +194,7 @@ impl<'a> Interp<'a> {
                             hooks: p.hooks.clone(),
                             attrs: vec![],
                             line: 0,
+                            dline: 0,
                         });
                     }
                 }
@@ -1276,7 +1296,7 @@ impl<'a> Interp<'a> {
             .unwrap_or_default();
         let old = std::mem::replace(&mut self.globals.ns, ns);
         let f = self.cur_file.clone();
-        let r = self.eval_decl_const(e, &f);
+        let r = self.eval_decl_const(e, &f, 0);
         self.globals.ns = old;
         r
     }
@@ -1685,6 +1705,25 @@ impl<'a> Interp<'a> {
                 self.cur_line,
             ));
         }
+        // A class declaring abstract methods itself must be marked
+        // abstract — Zend checks this at the class's own compile with
+        // a different message than the unimplemented-inherited one
+        // ('declares abstract method m()', first own-declared wins).
+        if !d.is_abstract {
+            if let Some(m) = d
+                .methods
+                .iter()
+                .find(|m| m.is_abstract && m.decl.decl_in.is_none())
+            {
+                return Err(PhpError::fatal(
+                    format!(
+                        "Class {} declares abstract method {}() and must therefore be declared abstract",
+                        d.name, m.decl.name
+                    ),
+                    self.cur_line,
+                ));
+            }
+        }
         if d.is_abstract {
             return Ok(());
         }
@@ -2038,7 +2077,7 @@ impl<'a> Interp<'a> {
                                         "Declaration of {}::${}::get() must be compatible with & {}::${}::get()",
                                         d.name, cp.name, pc.decl.name, cp.name
                                     ),
-                                    cp.line,
+                                    ch.line,
                                 ));
                             }
                             let (cty, aty) = (fmt(&cp.ty), fmt(&ap.ty));
@@ -2050,7 +2089,7 @@ impl<'a> Interp<'a> {
                                         "Declaration of {}::${}::get(): {} must be compatible with {}::${}::get(): {}",
                                         d.name, cp.name, cty, pc.decl.name, cp.name, aty
                                     ),
-                                    cp.line,
+                                    ch.line,
                                 ));
                             }
                         } else {
@@ -2080,7 +2119,7 @@ impl<'a> Interp<'a> {
                                         d.name, cp.name, cm.join("|"), cn,
                                         pc.decl.name, cp.name, am.join("|"), an
                                     ),
-                                    cp.line,
+                                    ch.line,
                                 ));
                             }
                         }
@@ -2170,6 +2209,27 @@ impl<'a> Interp<'a> {
             if p.readonly && p.ty.is_none() {
                 return Err(PhpError::fatal(
                     format!("Readonly property {}::${} must have type", d.name, p.name),
+                    self.cur_line,
+                ));
+            }
+            // `readonly $p = v` — 'cannot have default value' outranks
+            // the static-readonly and hook rules below (m11b/m11j).
+            // zend attributes it to the prop's decl line, not the
+            // class's.
+            if p.readonly && p.default.is_some() {
+                return Err(PhpError::fatal(
+                    format!(
+                        "Readonly property {}::${} cannot have default value",
+                        d.name, p.name
+                    ),
+                    p.line.max(1),
+                ));
+            }
+            // `static readonly` — zend's own decl fatal; it outranks
+            // the hook rules but loses to 'must have type' above.
+            if p.readonly && p.is_static {
+                return Err(PhpError::fatal(
+                    format!("Static property {}::${} cannot be readonly", d.name, p.name),
                     self.cur_line,
                 ));
             }
@@ -2315,7 +2375,7 @@ impl<'a> Interp<'a> {
                         "Get hook of backed property {}::{} with set hook may not return by reference",
                         d.name, p.name
                     ),
-                    self.cur_line,
+                    p.line,
                 ));
             }
             // A hook without a body is only legal in an interface or on
@@ -2343,12 +2403,28 @@ impl<'a> Interp<'a> {
                         (Some(_), None) => false,
                     };
                     if !compat {
+                        // Zend reports this on the hook's own line, except
+                        // when a type name wasn't resolvable at check
+                        // time (later-declared class-likes): then the
+                        // verdict lands on the class-decl line
+                        // (set_value_parameter_type_variance_003).
+                        let mut involved =
+                            p.ty.iter()
+                                .flatten()
+                                .chain(sp.ty.iter().flatten())
+                                .flat_map(|t| t.split(['|', '&']).map(str::trim))
+                                .filter(|t| !t.is_empty());
+                        let line = if involved.any(|t| !self.ty_member_registered(t)) {
+                            d.line
+                        } else {
+                            set.line
+                        };
                         return Err(PhpError::fatal(
                             format!(
                                 "Type of parameter ${} of hook {}::${}::set must be compatible with property type",
                                 sp.name, d.name, p.name
                             ),
-                            0,
+                            line,
                         ));
                     }
                 }
@@ -2401,6 +2477,96 @@ impl<'a> Interp<'a> {
     fn ty_sup(&mut self, sup: &[String], sub: &[String]) -> bool {
         sub.iter()
             .all(|t| sup.iter().any(|s| self.ty_member_is_a(t, s)))
+    }
+
+    /// Whether every type name a decl's members mention is already
+    /// resolvable — zend prevents early binding when prop/method/const
+    /// signature types can't be checked at compile time, deferring the
+    /// link (and its variance verdicts) to exec
+    /// (property_types_early_bind, enum_forward_compat).
+    pub(in crate::interp) fn decl_types_resolvable(&self, d: &ClassDecl) -> bool {
+        let mut tys = Vec::new();
+        for p in &d.props {
+            if let Some(t) = &p.ty {
+                tys.extend(t.iter().cloned());
+            }
+            if let Some(hs) = &p.hooks {
+                for h in hs {
+                    for sp in &h.params {
+                        if let Some(t) = &sp.ty {
+                            tys.extend(t.iter().cloned());
+                        }
+                    }
+                }
+            }
+        }
+        for m in &d.methods {
+            for sp in &m.decl.params {
+                if let Some(t) = &sp.ty {
+                    tys.extend(t.iter().cloned());
+                }
+            }
+            if let Some(t) = &m.decl.ret {
+                tys.extend(t.iter().cloned());
+            }
+        }
+        for cd in &d.consts {
+            if let Some(t) = &cd.ty {
+                tys.extend(t.iter().cloned());
+            }
+        }
+        tys.iter()
+            .flat_map(|t| t.split('&'))
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .all(|t| {
+                t.trim_start_matches('\\').eq_ignore_ascii_case(&d.name)
+                    || self.ty_member_registered(t)
+            })
+    }
+
+    /// Whether a type member already names a registered class-like —
+    /// the compile-vs-link distinction Zend's prop-type hook check
+    /// uses to pick its error line (no autoload, just a lookup).
+    fn ty_member_registered(&self, t: &str) -> bool {
+        let tl = t.trim_start_matches('\\').to_lowercase();
+        const BUILTIN: &[&str] = &[
+            "int",
+            "float",
+            "string",
+            "bool",
+            "array",
+            "object",
+            "callable",
+            "iterable",
+            "mixed",
+            "void",
+            "never",
+            "false",
+            "true",
+            "null",
+            "numeric",
+            "resource",
+            "self",
+            "static",
+            "parent",
+            "closure",
+            "traversable",
+            "iterator",
+            "generator",
+        ];
+        BUILTIN.contains(&tl.as_str())
+            || self.classes.contains_key(&tl)
+            || self.interfaces.contains_key(&tl)
+            || self.traits.contains_key(&tl)
+            || self
+                .declaring
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(&tl))
+            || self
+                .linking
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&tl))
     }
 
     /// Whether a single type conjunct resolves to a registered (or
@@ -2605,7 +2771,7 @@ impl<'a> Interp<'a> {
             // Compile-time values: fatal now. Runtime values (define'd
             // consts, `new`) defer to the access-time TypeError below.
             if is_compile_const(&cd.value) {
-                if let Ok(v) = self.eval_decl_const(&cd.value, &d.file) {
+                if let Ok(v) = self.eval_decl_const(&cd.value, &d.file, cd.line) {
                     if !self.const_ty_accepts(ty, &v, &d.name) {
                         let tn = self.zval_type_name(&v);
                         return Err(PhpError::fatal(
@@ -2642,7 +2808,11 @@ impl<'a> Interp<'a> {
                 self.check_ty_redundant(ty, &ctx)?;
                 if let Some(def) = &pd.default {
                     if is_compile_const(def) {
-                        if let Ok(v) = self.eval_decl_const(def, &d.file) {
+                        if let Ok(v) = self.eval_decl_const(
+                            def,
+                            &d.file,
+                            if pd.dline > 0 { pd.dline } else { pd.line },
+                        ) {
                             // `= null` on a non-nullable prop needs `?T`
                             // (typed_properties_015).
                             if matches!(v, Value::Null)
@@ -2837,7 +3007,7 @@ impl<'a> Interp<'a> {
                 // inside the decl (Enum::MAPPING) resolves correctly.
                 let old = self.const_self.replace(c.clone());
                 self.class_const_ctx += 1;
-                let r = self.eval_decl_const(&cd.value, &file);
+                let r = self.eval_decl_const(&cd.value, &file, cd.line);
                 self.class_const_ctx -= 1;
                 self.const_self = old;
                 let v = r?;
@@ -2864,12 +3034,22 @@ impl<'a> Interp<'a> {
         props.insert("name".to_string(), Value::str(case));
         let is_unit = matches!(cd.value, Expr::Null);
         if !is_unit {
-            let file = self
-                .classes
-                .get(&cls.to_lowercase())
+            let ecls = self.classes.get(&cls.to_lowercase()).cloned();
+            let file = ecls
+                .as_ref()
                 .map(|c| c.decl.file.clone())
                 .unwrap_or_default();
-            let v = self.eval_decl_const(&cd.value, &file)?;
+            // Case values are const slots scoped to the enum —
+            // `self::K` resolves to it and `parent::` gets the
+            // 'no parent' catchable Error like any class scope.
+            let old = ecls.map(|c| self.const_self.replace(c));
+            self.class_const_ctx += 1;
+            let r = self.eval_decl_const(&cd.value, &file, cd.line);
+            self.class_const_ctx -= 1;
+            if let Some(o) = old {
+                self.const_self = o;
+            }
+            let v = r?;
             props.insert("value".to_string(), v);
         }
         let o = self.instantiate(cls, &[])?;
@@ -3131,23 +3311,64 @@ impl<'a> Interp<'a> {
         ))
     }
 
-    /// Resolve a class expression to a class name.
+    /// Resolve a class expression to a class name. Scope keywords
+    /// (`self`/`static`/`parent`) resolve ONLY from the literal
+    /// keyword node — a runtime string naming one looks up literally
+    /// and misses ('Class "self" not found', m6 oracle).
     pub(in crate::interp) fn class_name_of(&mut self, e: &Expr) -> Result<String, PhpError> {
         match e {
             Expr::Const(n) => Ok(self.resolve_class_name(n)),
-            Expr::Str(s) => Ok(self.resolve_class_name(s)),
-            Expr::AnonClass(d) => {
-                self.register_class(d.clone())?;
-                Ok(d.name.clone())
-            }
+            Expr::Str(s) => Ok(s.trim_start_matches('\\').to_string()),
+            Expr::Paren(inner) => self.class_name_of(inner),
+            Expr::AnonClass(d) => Ok(self.anon_class_name(d)?),
             _ => {
                 let v = self.eval(e)?;
                 match v {
-                    Value::Object(o) => Ok(o.borrow().class.name().to_string()),
-                    other => Ok(self.resolve_class_name(&other.to_php_string())),
+                    // The object's INTERNAL class name — `name()` is
+                    // the display truncation (`class@anonymous`), which
+                    // doesn't key the class table (anon-class `::`
+                    // postfixes like `(new class)::K` need the mangled
+                    // `class@anonymous\0FILE:LINE$SEQ`).
+                    Value::Object(o) => Ok(o.borrow().class.decl.name.clone()),
+                    other => Ok(other.to_php_string().trim_start_matches('\\').to_string()),
                 }
             }
         }
+    }
+
+    /// zend's anonymous-class name: `{base}@anonymous\0FILE:LINE$SEQ`
+    /// — stable per decl site (a `new class` in a loop reuses the
+    /// registered name) and counted process-wide.
+    pub(in crate::interp) fn anon_class_name(
+        &mut self,
+        decl: &Rc<ClassDecl>,
+    ) -> Result<String, PhpError> {
+        let key = Rc::as_ptr(decl) as usize;
+        if let Some(n) = self.anon_class_names.get(&key) {
+            return Ok(n.clone());
+        }
+        let base = decl
+            .name
+            .rsplit_once('$')
+            .map(|(b, _)| b)
+            .unwrap_or(&decl.name);
+        let file = self
+            .decl_file_ctx
+            .clone()
+            .or_else(|| {
+                self.stack
+                    .last()
+                    .map(|f| f.file.clone())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| self.cur_file.clone());
+        let n = format!("{}\0{}:{}${}", base, file, decl.line, self.anon_class_seq);
+        self.anon_class_seq += 1;
+        let mut d = (**decl).clone();
+        d.name = n.clone();
+        self.register_class(Rc::new(d))?;
+        self.anon_class_names.insert(key, n.clone());
+        Ok(n)
     }
 
     /// `self`/`static`/`parent`/leading-\ name resolution → concrete name.
@@ -3547,7 +3768,11 @@ impl<'a> Interp<'a> {
                     Some(d) => {
                         let old = self.const_self.replace(c.clone());
                         self.class_const_ctx += 1;
-                        let r = self.eval_decl_const(d, &c.decl.file);
+                        let r = self.eval_decl_const(
+                            d,
+                            &c.decl.file,
+                            if p.dline > 0 { p.dline } else { p.line },
+                        );
                         self.class_const_ctx -= 1;
                         self.const_self = old;
                         r?
@@ -3592,19 +3817,28 @@ impl<'a> Interp<'a> {
                 thrown: self.send_line.unwrap_or(self.cur_line) as u32,
                 full_msg: String::new(),
                 eval_ctx: 0,
+                previous: None,
                 frames: Rc::new(self.call_trace.clone()),
             })
         } else {
             None
         };
-        Ok(Value::Object(self.alloc_obj(PhpObject {
+        let v = Value::Object(self.alloc_obj(PhpObject {
             class: cls,
             props,
             prop_order,
             id: 0,
             internal,
             unset_props: std::collections::HashSet::new(),
-        })))
+        }));
+        // zend's throwable dump view needs engine state materialized
+        // into props (file/line/string/trace) before any ctor runs.
+        if let Value::Object(o) = &v {
+            if matches!(o.borrow().internal, Some(ObjectInternal::Exception { .. })) {
+                self.exception_prop_defaults(o);
+            }
+        }
+        Ok(v)
     }
 
     pub(in crate::interp) fn is_throwable_name(&mut self, name: &str) -> bool {

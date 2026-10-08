@@ -177,6 +177,10 @@ pub struct ConstDecl {
     pub decl_in: Option<String>,
     /// `case` member of an enum — materializes a singleton case object.
     pub enum_case: bool,
+    /// Declaration line — lazy const-init errors attribute to the
+    /// declaring file at this line (zend reports the const's own line,
+    /// not the resolution site).
+    pub line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -206,9 +210,11 @@ pub struct PropDecl {
     /// `#[Attr]` groups preceding the declaration (compile-checked
     /// builtins like ReturnTypeWillChange).
     pub attrs: Vec<AttrDecl>,
-    /// Source line of the declaration (Zend reports hook/prop
-    /// incompatibilities on the prop's own line).
+    /// Source line of the declaration.
     pub line: usize,
+    /// Line of the default-value expr's first token (lazy-init Errors
+    /// attribute there); 0 = same as `line`.
+    pub dline: usize,
 }
 
 /// One `get`/`set` hook on a hooked property (Zend/tests/property_hooks).
@@ -231,6 +237,9 @@ pub struct PropHook {
     pub is_final: bool,
     /// Hook's own visibility when written explicitly (`private get`).
     pub visibility: Option<Visibility>,
+    /// Source line of the `get`/`set` keyword (hook-signature
+    /// incompatibilities report on it, not the prop's line).
+    pub line: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -283,10 +292,13 @@ pub enum ForeachKey {
 #[derive(Debug, Clone)]
 pub enum ForeachTarget {
     Var(String),
-    ByRef(String),
+    /// `&$v` / `&$o->p` / `&$a[i]` — a `new_variable` chain bound by ref.
+    ByRef(Box<Expr>),
     /// Any other assignable lvalue (`$b[0]`, `$o->p`, ...).
     Lvalue(Box<Expr>),
-    List(Vec<Option<ForeachTarget>>),
+    /// `as [$a, 'k' => $b]` destructuring — `(key expr, target)` per
+    /// element; zend forbids mixing keyed and unkeyed entries.
+    List(Vec<Option<(Option<Expr>, ForeachTarget)>>),
 }
 
 /// A parsed `#[Name(args)]` attribute group entry — args stay as Exprs
@@ -424,7 +436,10 @@ pub enum Expr {
     YieldFrom(Box<Expr>),
     Exit(Option<Box<Expr>>),
     /// `list($a, $b)` / `[$a, $b]` — only valid as an assignment target.
-    List(Vec<Option<Expr>>),
+    /// Elements are `(key, target)`; `key` is the evaluated key expr of
+    /// a keyed element (`'k' => $v`) — zend forbids mixing keyed and
+    /// unkeyed entries in one list.
+    List(Vec<Option<(Option<Expr>, Expr)>>),
     /// `include/require/eval` — argument is the filename/code expression.
     Include {
         kind: IncludeKind,
@@ -652,7 +667,7 @@ pub fn end_line(e: &Expr) -> Option<usize> {
             .iter()
             .rev()
             .find_map(|i| i.as_ref())
-            .and_then(end_line),
+            .and_then(|(_, e)| end_line(e)),
         // A match expr's compiled end is its last arm's result. A
         // parse-time-folded concat already carries its following-token
         // stamp on its argline mark; `[]`'s lone INIT_ARRAY stamps at
@@ -741,7 +756,11 @@ pub fn start_line(e: &Expr) -> Option<usize> {
         // zend's ARRAY list-node lineno is the first element's —
         // an ARRAY_ELEM's lineno is its VALUE's first token.
         Expr::ArrayLit(items) => items.first().and_then(|(_, v)| start_line(v)),
-        Expr::List(items) => items.iter().flatten().next().and_then(start_line),
+        Expr::List(items) => items
+            .iter()
+            .flatten()
+            .next()
+            .and_then(|(_, e)| start_line(e)),
         Expr::Isset(args) => args.first().and_then(start_line),
         Expr::VarVar(inner, _) => start_line(inner),
         _ => None,

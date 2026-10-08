@@ -13,6 +13,14 @@ enum NsKind {
     Const,
 }
 
+/// Compile-time-constant context — see `Parser::const_ctx`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ConstCtx {
+    Runtime,
+    Slot,
+    ArrowSlot,
+}
+
 pub struct Parser<'a> {
     toks: &'a [Lexed],
     /// Source the tokens were lexed from — Lexed start/end offsets
@@ -94,6 +102,31 @@ pub struct Parser<'a> {
     /// whether a call's bare-CV args send per-arg (bound callee) or
     /// fused at the first arg's line (unbound or dynamic callee).
     declared_funcs: std::collections::HashSet<String>,
+    /// Inside a NAMED function's signature/body — zend compile-fatals
+    /// `self::`/`new self()`/`parent::$p` there even when the decl is
+    /// nested in a method ('Cannot use "self" when no class scope is
+    /// active'); at top level the same constructs are only runtime
+    /// errors, so the gate keys on this flag too.
+    in_named_fn: bool,
+    /// Compile-time-constant context (param defaults, const/prop inits,
+    /// attribute args, enum cases, `declare()` values): `Slot` lets
+    /// `self::`/`parent::`/`new self()` defer scope checks to the slot's
+    /// runtime eval (catchable `Cannot access "X" ...` at call/init) and
+    /// keeps only `static` a compile fatal. `ArrowSlot` — inside an
+    /// arrow-fn body nested in a const slot — validates as part of the
+    /// enclosing constant expression, so every scope keyword there is
+    /// 'Constant expression contains invalid operations'. `Runtime` for
+    /// closure/method bodies nested inside such a slot.
+    const_ctx: ConstCtx,
+    /// Enclosing function/method/closure is declared `function &` —
+    /// `return $o?->p` inside is the "Cannot take reference of a
+    /// nullsafe chain" compile fatal.
+    ret_by_ref: bool,
+    /// Lines of 'Cannot use temporary expression in write context'
+    /// violations seen while parsing — zend detects them in
+    /// zend_compile AFTER the whole file parses, so a later syntax
+    /// error wins over them; they emit only once the file parses clean.
+    write_ctx_errs: Vec<(String, usize)>,
 }
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, PhpError> {
@@ -189,6 +222,12 @@ fn parse_toks(toks: Vec<Lexed>, eof_line: usize, src: &str) -> Result<Vec<Stmt>,
     if let Some((be, _)) = bracket_err {
         return Err(be);
     }
+    // Zend's write-context check runs in zend_compile — AFTER the
+    // whole file parses — so a later syntax error always wins over
+    // 'Cannot use temporary expression in write context' (probe m8).
+    if let Some((msg, line)) = p.write_ctx_errs.first() {
+        return Err(PhpError::compile_fatal(msg.clone(), *line));
+    }
     // Bind each diagnostic to the stmt whose token span covers its
     // position and park it directly before that stmt: `echo "${a}";
     // break;` prints the Deprecated before the break fatal, while
@@ -256,6 +295,10 @@ impl<'a> Parser<'a> {
             in_closure: false,
             fn_nest: 0,
             declared_funcs: std::collections::HashSet::new(),
+            in_named_fn: false,
+            const_ctx: ConstCtx::Runtime,
+            ret_by_ref: false,
+            write_ctx_errs: Vec::new(),
         }
     }
 }
@@ -385,6 +428,10 @@ pub fn parse_expr_src(src: &str, base: usize) -> Result<(Expr, SrcDiags), PhpErr
         in_closure: false,
         fn_nest: 0,
         declared_funcs: std::collections::HashSet::new(),
+        in_named_fn: false,
+        const_ctx: ConstCtx::Runtime,
+        ret_by_ref: false,
+        write_ctx_errs: Vec::new(),
     };
     // No rebase here: token lines are already absolute, so the
     // parser's own error lines report file lines.
@@ -786,6 +833,12 @@ impl<'a> Parser<'a> {
                         Ok(Stmt::Return(None))
                     } else {
                         let e = self.expr_semi_operand()?;
+                        if self.ret_by_ref && Self::has_nullsafe(&e) {
+                            self.write_ctx_errs.push((
+                                "Cannot take reference of a nullsafe chain".to_string(),
+                                self.line(),
+                            ));
+                        }
                         self.expect_op_full(";")?;
                         Ok(Stmt::Return(Some(e)))
                     }
@@ -987,7 +1040,7 @@ impl<'a> Parser<'a> {
                             .to_string();
                         let n = self.ns_qualify(&n);
                         self.expect_op("=")?;
-                        defs.push((n, self.expr()?));
+                        defs.push((n, self.const_expr()?));
                         if !self.eat_op(",") {
                             break;
                         }
