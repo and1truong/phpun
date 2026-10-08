@@ -908,14 +908,25 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                 let mut out = PhpArray::new();
                 for (k, v) in results {
                     if let Some(v) = v {
-                        out.set(k, Value::bytes(v));
+                        // zend emallocs each result zend_string (bug81243).
+                        let nv = Value::bytes(v);
+                        if let Value::Str(s) = &nv {
+                            it.mem_track(s, s.len() as u64 + 25);
+                        }
+                        out.set(k, nv);
                     }
                 }
                 // preg_filter on an all-miss array yields an empty array.
                 Ok(Value::Array(Rc::new(RefCell::new(out))))
             } else {
                 Ok(match results.into_iter().next() {
-                    Some((_, Some(v))) => Value::bytes(v),
+                    Some((_, Some(v))) => {
+                        let nv = Value::bytes(v);
+                        if let Value::Str(s) = &nv {
+                            it.mem_track(s, s.len() as u64 + 25);
+                        }
+                        nv
+                    }
                     _ => Value::Null,
                 })
             }
