@@ -1266,7 +1266,11 @@ impl<'a> Interp<'a> {
     /// prop "0"), so int buckets written by `[]=` stay unreachable.
     /// An SPL backing object resolves through its own storage table —
     /// canonical array keys again, not prop names.
-    fn ao_dim_key(&mut self, obj: &Rc<RefCell<PhpObject>>, kv: &Value) -> Result<ArrKey, PhpError> {
+    pub(in crate::interp) fn ao_dim_key(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        kv: &Value,
+    ) -> Result<ArrKey, PhpError> {
         let spl_src = self.ao_src_obj(obj).is_some_and(|src| {
             !Rc::ptr_eq(&src, obj)
                 && matches!(

@@ -156,12 +156,10 @@ impl<'a> Interp<'a> {
         let (cls, _tname) = self.member_class_of(class)?;
         self.statics_init(&cls)?;
         self.static_prop_vis(&cls, name)?;
-        if !self.in_unset {
-            if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
-                if let Some(sv) = pd.set_vis {
-                    if self.set_vis_scope_denied(&dcls, sv) {
-                        return self.set_visibility_indirect_error(&dcls, &pd.name, sv);
-                    }
+        if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
+            if let Some(sv) = pd.set_vis {
+                if self.set_vis_scope_denied(&dcls, sv) {
+                    return self.set_visibility_indirect_error(&dcls, &pd.name, sv);
                 }
             }
         }
@@ -199,16 +197,14 @@ impl<'a> Interp<'a> {
         // private(set)/protected(set): gated by write kind — plain `=`
         // is gated in store() with 'Cannot modify' first, and unsets
         // carry their own 'Attempt to unset static property'.
-        if !self.in_unset {
-            if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
-                if let Some(sv) = pd.set_vis {
-                    if self.set_vis_scope_denied(&dcls, sv) {
-                        return if indirect {
-                            self.set_visibility_indirect_error(&dcls, &pd.name, sv)
-                        } else {
-                            self.set_visibility_error(&dcls, &pd.name, sv)
-                        };
-                    }
+        if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
+            if let Some(sv) = pd.set_vis {
+                if self.set_vis_scope_denied(&dcls, sv) {
+                    return if indirect {
+                        self.set_visibility_indirect_error(&dcls, &pd.name, sv)
+                    } else {
+                        self.set_visibility_error(&dcls, &pd.name, sv)
+                    };
                 }
             }
         }
