@@ -812,7 +812,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                 v => subjects.push((ArrKey::Int(0), v)),
             };
             let mut total = 0i64;
-            let mut results: Vec<(ArrKey, Option<Vec<u8>>)> = Vec::new();
+            let mut results: Vec<(ArrKey, Option<Value>)> = Vec::new();
             // Callback-family pattern conversion failures are pending
             // errors: they break only the current element's pattern
             // loop and propagate after every subject was processed
@@ -966,7 +966,19 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                     }
                 }
                 let keep = elem_ok && (name != "preg_filter" || matched);
-                results.push((k, if keep { Some(cur) } else { None }));
+                // zend emallocs each result zend_string as it's
+                // produced (bug81243) — a later element's scratch
+                // grow must see the earlier results' charge.
+                let v = if keep {
+                    let nv = Value::bytes(cur);
+                    if let Value::Str(s) = &nv {
+                        it.mem_track(&s.rc, s.len() as u64 + 25);
+                    }
+                    Some(nv)
+                } else {
+                    None
+                };
+                results.push((k, v));
             }
             if let Some(e) = pending_err {
                 return Err(e);
@@ -978,25 +990,14 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                 let mut out = PhpArray::new();
                 for (k, v) in results {
                     if let Some(v) = v {
-                        // zend emallocs each result zend_string (bug81243).
-                        let nv = Value::bytes(v);
-                        if let Value::Str(s) = &nv {
-                            it.mem_track(&s.rc, s.len() as u64 + 25);
-                        }
-                        out.set(k, nv);
+                        out.set(k, v);
                     }
                 }
                 // preg_filter on an all-miss array yields an empty array.
                 Ok(Value::Array(Rc::new(RefCell::new(out))))
             } else {
                 Ok(match results.into_iter().next() {
-                    Some((_, Some(v))) => {
-                        let nv = Value::bytes(v);
-                        if let Value::Str(s) = &nv {
-                            it.mem_track(&s.rc, s.len() as u64 + 25);
-                        }
-                        nv
-                    }
+                    Some((_, Some(v))) => v,
                     _ => Value::Null,
                 })
             }

@@ -281,6 +281,7 @@ impl<'a> Interp<'a> {
         self.ob_stack.push(ObLevel {
             buf: Vec::new(),
             charged: 0,
+            mem_tok: std::rc::Rc::new(()),
             handler,
             started: false,
             gen_q,
@@ -426,6 +427,7 @@ impl<'a> Interp<'a> {
                 self.suspended_obs.push(ObLevel {
                     buf: Vec::new(),
                     charged: 0,
+                    mem_tok: std::rc::Rc::new(()),
                     handler: None,
                     started: true,
                     gen_q: l.gen_q.clone(),

@@ -984,10 +984,15 @@ pub type SlotOwner = (Vec<String>, String, String, SlotAnchor);
 /// One output-buffer level (ob_start) with its optional handler.
 pub struct ObLevel {
     pub buf: Vec<u8>,
-    /// Bytes of `buf` charged to OB_LIVE — `mem_sync` reconciles
-    /// after every mutation; `Drop` releases the remainder on level
-    /// teardown (zend's arena holds the buffer while open).
+    /// Alloc figure of `buf`'s zend smart_string — `mem_sync`
+    /// reconciles it after every mutation; `ob_meter_sync` books it
+    /// into the zend_mm sim against `mem_tok`, whose death releases
+    /// the charge on level teardown (zend frees the buffer then).
     pub charged: i64,
+    /// Token binding this level's buffer charge to its lifetime in
+    /// the zend_mm sim — `mem_realloc`'s weak probe dies with the
+    /// level, releasing the bytes at the next sweep.
+    pub mem_tok: Rc<()>,
     pub handler: Option<Value>,
     /// Set after the handler's first invocation — PHP's
     /// PHP_OUTPUT_HANDLER_START bit is only passed once (bug24951).
@@ -1074,35 +1079,17 @@ pub struct RunResult {
 /// spliced ahead of the segment whose tag is >= its arrival cursor
 /// — the global stack's real write order across suspends.
 impl ObLevel {
-    /// Reconcile OB_LIVE with the buffer's zend-alloc size after a
-    /// mutation. zend's smart_string holds the whole alloc while the
-    /// level is open (doubling on each overrun, minimum 4K); a clean
-    /// drains `buf` and frees it, so the release falls out of the
-    /// same diff. `charged` tracks that alloc, not `buf.len()`.
-    /// ponytail: alloc chain is 2*prev but zend's own baseline is
-    /// not simulated, so an ob-grow OOM reports our alloc figure.
+    /// Reconcile `charged` with the buffer's zend-alloc size after a
+    /// mutation — oracle's ob erealloc requests the buffer page-
+    /// aligned to its content length (a clean drains `buf` and frees
+    /// it, so the release falls out of the same diff).
+    /// `ob_meter_sync` applies `charged` to the zend_mm sim.
     pub(in crate::interp) fn mem_sync(&mut self) {
-        let need = self.buf.len() as i64 + 25;
-        let want = if self.buf.is_empty() {
+        self.charged = if self.buf.is_empty() {
             0
-        } else if need > self.charged {
-            (2 * self.charged).max(need).max(4096)
         } else {
-            self.charged
+            (self.buf.len() as i64 + 4095) & !4095
         };
-        let d = want - self.charged;
-        if d != 0 {
-            crate::value::ob_charge(d, want.max(0));
-            self.charged = want;
-        }
-    }
-}
-
-impl Drop for ObLevel {
-    fn drop(&mut self) {
-        if self.charged != 0 {
-            crate::value::ob_charge(-self.charged, 0);
-        }
     }
 }
 
@@ -3661,12 +3648,29 @@ impl<'a> Interp<'a> {
             None
         };
         if let Some(report) = report {
-            self.mem_last = report;
+            // zend dies inside the FIRST failed emalloc — later
+            // requests in the same deferred run must not overwrite
+            // the fatal's 'tried to allocate' figure.
             if self.oom_at.is_none() {
+                self.mem_last = report;
                 self.oom_at = Some((self.cur_line, self.fatal_frames()));
             }
         }
         report
+    }
+
+    /// mem_check for flat emalloc results: zend reports the raw
+    /// request for huge allocs on this path (str_repeat's figure is
+    /// len+32 unaligned, unlike erealloc-grown buffers' aligned
+    /// report).
+    pub(crate) fn mem_check_flat(&mut self, req: u64) -> Option<u64> {
+        let fresh = self.oom_at.is_none();
+        let r = self.mem_check(req);
+        if fresh && r.is_some() && req > MM_MAX_LARGE {
+            // Same deferred fatal — just restate the figure raw.
+            self.mem_last = req;
+        }
+        r
     }
 
     /// Commit an emalloc request: run the limit check, then book the
@@ -3778,6 +3782,37 @@ impl<'a> Interp<'a> {
                 });
             }
         }
+    }
+
+    /// Book every ob level's smart_string alloc into the sim —
+    /// buffered bytes are otherwise invisible to memory_get_usage,
+    /// ini_set's usage compare, and the limit trip. Runs at stmt
+    /// boundaries and on reconcile; `mem_realloc`'s table_req dedupe
+    /// makes unchanged levels free.
+    pub(crate) fn ob_meter_sync(&mut self) {
+        for i in 0..self.ob_stack.len() {
+            let (tok, want) = (self.ob_stack[i].mem_tok.clone(), self.ob_stack[i].charged);
+            self.ob_mem_apply(&tok, want.max(0) as u64);
+        }
+        for i in 0..self.suspended_obs.len() {
+            let (tok, want) = (
+                self.suspended_obs[i].mem_tok.clone(),
+                self.suspended_obs[i].charged,
+            );
+            self.ob_mem_apply(&tok, want.max(0) as u64);
+        }
+    }
+
+    /// Route one level's current alloc figure through erealloc
+    /// accounting: mem_realloc's commit sizes the grown request while
+    /// the old segment is still counted, then releases it — zend dies
+    /// inside the crossing erealloc with old and new both held.
+    fn ob_mem_apply(&mut self, tok: &Rc<()>, want: u64) {
+        let key = Rc::as_ptr(tok) as *const u8 as usize;
+        if self.mem_tracked.get(&key).map(|c| c.table_req) == Some(want) {
+            return;
+        }
+        self.mem_realloc(tok, want);
     }
 
     /// Release charges whose owning Rc died — the efree counterpart
@@ -3915,6 +3950,7 @@ impl<'a> Interp<'a> {
     /// Reconcile then report the live usage — memory_get_usage()
     /// reads it straight, so sweep dead tracked allocs first.
     pub(crate) fn mem_reconcile(&mut self) -> u64 {
+        self.ob_meter_sync();
         self.mem_sweep();
         self.mem_used
     }
@@ -3944,7 +3980,8 @@ impl<'a> Interp<'a> {
     /// strings, file reads, preg results must not be UTF-8 validated).
     pub fn emit_bytes(&mut self, b: &[u8]) {
         // Emitted output is free — zend charges only ob-buffered
-        // bytes (the OB_LIVE arena charge in ObLevel::mem_sync).
+        // bytes (the ObLevel::mem_sync figure, applied to the zend_mm
+        // sim at stmt boundaries by ob_meter_sync).
         // Inside a generator run, output after a yield is deferred to
         // resume — `f(yield)` must not observe the call (nor its echo)
         // until the consumer advances past that yield.
@@ -4305,6 +4342,7 @@ impl<'a> Interp<'a> {
                 let mut level = ObLevel {
                     buf,
                     charged: 0,
+                    mem_tok: std::rc::Rc::new(()),
                     handler: l.handler.clone(),
                     started: l.started,
                     gen_q: l.gen_q.clone(),
