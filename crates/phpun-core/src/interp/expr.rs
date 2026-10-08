@@ -79,7 +79,8 @@ impl CondFold<'_> {
 enum DimArg {
     Append,
     Key(Cell),
-    Cv(String),
+    /// The CV's marked (argline) line sites its own read diagnostic.
+    Cv(String, Option<usize>),
 }
 
 impl From<Option<Cell>> for DimArg {
@@ -2362,7 +2363,9 @@ impl<'a> Interp<'a> {
                             // operand once (the read and the write see
                             // the same bound cell, warned once).
                             match Self::unmark_rhs(ie) {
-                                Expr::Var(n) => keys.push(DimArg::Cv(n.clone())),
+                                Expr::Var(n) => {
+                                    keys.push(DimArg::Cv(n.clone(), Self::marked_line(ie)))
+                                }
                                 _ => keys.push(DimArg::from(self.dim_key(ie)?)),
                             }
                         }
@@ -2576,7 +2579,21 @@ impl<'a> Interp<'a> {
             }
             matches!(v, Expr::Var(_))
         };
+        // `=`'s dim-write defers the bare-CV operand even later:
+        // zend's ASSIGN_DIM runs every key's bind+conversion inside
+        // its FETCH_DIM_W walk BEFORE OP_DATA reads the RHS —
+        // `$a[$k] = $u` warns/converts $k ahead of reading $u. The
+        // write walk evals it at the last level; expr RHS and
+        // non-dim targets keep the op-entry read (bug79599).
+        let rhs_late: Option<(&Expr, usize)> =
+            if op == "=" && pin_rhs && matches!(&late, Late::Keyed { .. } | Late::Index { .. }) {
+                Some((rhs_u, rhs_site))
+            } else {
+                None
+            };
         let rhs_r = if needs_read && rhs_var {
+            Ok(Value::Null)
+        } else if rhs_late.is_some() {
             Ok(Value::Null)
         } else if pin_rhs {
             let r = self.eval_cv_at(rhs_u, rhs_site);
@@ -2701,7 +2718,14 @@ impl<'a> Interp<'a> {
                         let kc = match k {
                             DimArg::Append => None,
                             DimArg::Key(c) => Some(c.clone()),
-                            DimArg::Cv(n) => {
+                            DimArg::Cv(n, ln) => {
+                                // The CV read sites at its own operand
+                                // line — the dim op carries the key's
+                                // marked line.
+                                if let Some(l) = ln {
+                                    self.cur_line = *l;
+                                    self.send_line = Some(*l);
+                                }
                                 // zend's GC_ADDREF sentinel wraps the
                                 // CV-read diagnostic — a handler's
                                 // write separates instead of landing
@@ -2849,7 +2873,13 @@ impl<'a> Interp<'a> {
                     }
                 };
                 if let Some(o) = aa_obj {
-                    // `$o[k] = v` on ArrayAccess -> offsetSet.
+                    // `$o[k] = v` on ArrayAccess -> offsetSet. A
+                    // deferred bare-CV RHS (zend's OP_DATA) reads
+                    // before the dispatch.
+                    newv = match rhs_late {
+                        Some((e, s)) => self.eval_cv_at(e, s)?,
+                        None => newv,
+                    };
                     let kv = key
                         .as_ref()
                         .map(|kc| kc.borrow().clone())
@@ -2901,6 +2931,13 @@ impl<'a> Interp<'a> {
                             Some(k) => Some(self.dim_arr_key(k)?),
                             None => None,
                         };
+                        // zend's OP_DATA read sits between the key
+                        // conversion and the store — a deferred
+                        // bare-CV RHS evals now.
+                        newv = match rhs_late {
+                            Some((e, s)) => self.eval_cv_at(e, s)?,
+                            None => newv,
+                        };
                         let mut arr = rc.borrow_mut();
                         if append {
                             arr.push(newv.clone());
@@ -2937,6 +2974,12 @@ impl<'a> Interp<'a> {
                             self.cur_line,
                         ));
                     }
+                    // zend's OP_DATA read sits between the offset
+                    // check and the byte splice.
+                    newv = match rhs_late {
+                        Some((e, s)) => self.eval_cv_at(e, s)?,
+                        None => newv,
+                    };
                     if let OffWrite::Stored(byte) = self.str_offset_write(&mut bytes, off, &newv)? {
                         let mut b = base.borrow_mut();
                         if let Value::Str(s) = &mut *b {
@@ -3093,7 +3136,7 @@ impl<'a> Interp<'a> {
                         // diagnostics dispatch before the op TypeError.
                         if let Some(kc) = keys.last().and_then(|k| match k {
                             DimArg::Key(c) => Some(c.clone()),
-                            DimArg::Cv(n) => self.var_cell_opt(n),
+                            DimArg::Cv(n, _) => self.var_cell_opt(n),
                             DimArg::Append => None,
                         }) {
                             let kb = kc.borrow();
@@ -3133,7 +3176,8 @@ impl<'a> Interp<'a> {
                     return Ok(newv);
                 }
                 let was_detached = std::mem::replace(&mut self.detached_dim, silence);
-                let r = self.assign_index_path(target, &keys, newv, needs_read, det.as_ref());
+                let r =
+                    self.assign_index_path(target, &keys, newv, needs_read, det.as_ref(), rhs_late);
                 self.detached_dim = was_detached;
                 newv = r?;
             }
@@ -3958,13 +4002,13 @@ impl<'a> Interp<'a> {
                 for d in dims {
                     match d {
                         Some(ie) => match Self::unmark_rhs(ie) {
-                            Expr::Var(n) => keys.push(DimArg::Cv(n.clone())),
+                            Expr::Var(n) => keys.push(DimArg::Cv(n.clone(), Self::marked_line(ie))),
                             _ => keys.push(DimArg::from(self.dim_key(ie)?)),
                         },
                         None => keys.push(DimArg::Append),
                     }
                 }
-                self.assign_index_path(c, &keys, v, false, det.as_ref())
+                self.assign_index_path(c, &keys, v, false, det.as_ref(), None)
                     .map(|_| ())
             }
             Expr::StaticProp { class, name } => {
@@ -5215,6 +5259,7 @@ impl<'a> Interp<'a> {
         v: Value,
         compound: bool,
         det: Option<&DimDetach>,
+        rhs_late: Option<(&Expr, usize)>,
     ) -> Result<Value, PhpError> {
         // zend GC_ADDREFs the op-start container only across each
         // diagnostic dispatch — a handler's in-place dim write then
@@ -5256,7 +5301,13 @@ impl<'a> Interp<'a> {
                     }
                     Some(kc.clone())
                 }
-                DimArg::Cv(name) => {
+                DimArg::Cv(name, ln) => {
+                    // The CV read sites at its own operand line — the
+                    // dim op carries the key's marked line.
+                    if let Some(l) = ln {
+                        self.cur_line = *l;
+                        self.send_line = Some(*l);
+                    }
                     if !self.detached_dim {
                         let bad = {
                             let b = c.borrow();
@@ -5381,6 +5432,12 @@ impl<'a> Interp<'a> {
                         _ => Vec::new(),
                     }
                 };
+                // zend's OP_DATA read sits between the offset check
+                // and the write — a deferred bare-CV RHS evals now.
+                let v = match rhs_late {
+                    Some((e, s)) => self.eval_cv_at(e, s)?,
+                    None => v,
+                };
                 match self.str_offset_write(&mut bytes, off, &v)? {
                     OffWrite::Skipped => return Ok(v),
                     OffWrite::Stored(byte) => {
@@ -5418,6 +5475,10 @@ impl<'a> Interp<'a> {
                     .map(|kc| kc.borrow().clone())
                     .unwrap_or(Value::Null);
                 if n == last {
+                    let v = match rhs_late {
+                        Some((e, s)) => self.eval_cv_at(e, s)?,
+                        None => v,
+                    };
                     match self.method_invoke(
                         o,
                         "offsetSet",
@@ -5456,6 +5517,22 @@ impl<'a> Interp<'a> {
             match rr {
                 Ok(nc) => {
                     if n == last {
+                        // zend's OP_DATA read sits between the fetch
+                        // walk and the store — a deferred bare-CV RHS
+                        // evals now. A detached fetch aborts before
+                        // OP_DATA (a handler's rebind silences the RHS
+                        // read too) — EXCEPT an object op-start: zend's
+                        // detach check only covers non-object operands,
+                        // offsetSet still fires on the stale object.
+                        let v = match rhs_late {
+                            Some((e, s))
+                                if !self.detached_dim
+                                    || det.is_some_and(|d| matches!(&d.pre, DimPre::Obj(_))) =>
+                            {
+                                self.eval_cv_at(e, s)?
+                            }
+                            _ => v,
+                        };
                         // `$ref[k] = v` where the element cell is bound to
                         // a typed prop stays type-gated (064). The store
                         // goes through cell_store so the displaced zval's
@@ -5739,7 +5816,13 @@ impl<'a> Interp<'a> {
             let k: Option<Cell> = match ka {
                 DimArg::Append => None,
                 DimArg::Key(kc) => Some(kc.clone()),
-                DimArg::Cv(name) => {
+                DimArg::Cv(name, ln) => {
+                    // The CV read sites at its own operand line — the
+                    // dim op carries the key's marked line.
+                    if let Some(l) = ln {
+                        self.cur_line = *l;
+                        self.send_line = Some(*l);
+                    }
                     // ASSIGN_DIM_OP's per-level fetch checks the
                     // container before reading the CV operand — a
                     // scalar dies 'Cannot use a scalar value as an
@@ -8187,7 +8270,7 @@ impl<'a> Interp<'a> {
         for ix in idxs {
             match ix {
                 Some(ie) => match Self::unmark_rhs(ie) {
-                    Expr::Var(n) => keys.push(DimArg::Cv(n.clone())),
+                    Expr::Var(n) => keys.push(DimArg::Cv(n.clone(), Self::marked_line(ie))),
                     _ => keys.push(DimArg::from(self.dim_key(ie)?)),
                 },
                 None => keys.push(DimArg::Append),
@@ -8219,7 +8302,7 @@ impl<'a> Interp<'a> {
             arr_cell
         };
         let was = std::mem::replace(&mut self.detached_dim, detached);
-        let r = self.assign_index_path(target, &keys, new.clone(), true, Some(&det));
+        let r = self.assign_index_path(target, &keys, new.clone(), true, Some(&det), None);
         self.detached_dim = was;
         self.incdec_ref_ctx = saved_ctx;
         r?;
