@@ -246,6 +246,15 @@ struct MemCharge {
     inner: u64,
     huge: u64,
     table_req: u64,
+    /// Address space a huge segment may still extend into: zend's
+    /// mremap grows a mapping only until the next occupied range —
+    /// modelled as its footprint at (re)placement plus the freed
+    /// predecessor's hole and the mapping slack a fresh mmap leaves
+    /// below the next VMA. Unused for in-chunk charges.
+    seg_cap: u64,
+    /// Index into `mem_chunks` of the chunk holding this charge's
+    /// `inner` run (usize::MAX when it lives outside the chunks).
+    chunk: usize,
     /// vm_stack arg bytes this charge added to `arg_stack_bytes` —
     /// ArgStack entries only; repaid to the arena counter at sweep.
     arg_bytes: i64,
@@ -257,6 +266,14 @@ const MM_CHUNK: u64 = 2 * 1024 * 1024;
 /// zend_mm_max_large_size: largest request served from chunk page
 /// runs; bigger requests get a dedicated segment.
 const MM_MAX_LARGE: u64 = 2_093_056;
+/// Slack of free address space a freshly-placed huge segment may
+/// extend into before mremap is blocked and zend's erealloc
+/// relocates. Kernel top-down placement lands a new mapping just
+/// below the lowest VMA, so a relocated segment's runway is the
+/// freed predecessor's hole plus up to a chunk of gap; oracle walls
+/// put the gap at ~3/4 chunk. ponytail: the true ceiling is the
+/// next VMA's address — the real page map PR #88 owns.
+const MM_SEG_SLACK: u64 = MM_CHUNK * 3 / 4;
 /// zend_mm_max_small_size: largest bin-bucketed request.
 const MM_SMALL: u64 = 3072;
 /// Heap usage a fresh script observes under memory_get_usage()
@@ -269,6 +286,30 @@ const MM_BASE_USED: u64 = 463_136;
 /// usage figure. Calibrated to the oracle boundary: a fresh ~1.43MB
 /// string still fits the first chunk, ~1.45MB forces a new one.
 const MM_BASE_CHUNK: u64 = 655_360;
+/// zend's ob smart_string starts each level with a 16KB buffer
+/// (php_output's initial capacity) and ereallocs on append: one
+/// extra 16KB page per incremental crossing, or straight to the
+/// page-aligned content on a single big write — calibrated to the
+/// oracle's capacity curve (16384→32768 at len 16384, align4096
+/// beyond).
+const OB_INIT_CAP: u64 = 16384;
+/// Per open level's non-buffer bookkeeping (php_output_handler
+/// struct and friends) — folded into the boot charge so the level's
+/// erealloc figure stays the buffer's own request.
+const OB_LEVEL_STRUCT: u64 = 128;
+/// ob machinery booked while at least one real level is open — the
+/// output runtime stack plus handler slots (~2.6K).
+const OB_OPEN_STACK: u64 = 2656;
+/// Stub retained after the last level pops — oracle keeps ~128 once
+/// ob has ever been used.
+/// ponytail: lumped — post-pop residuals jitter ±32 across scripts
+/// (freed-run fragmentation); the real page map PR #88 owns could
+/// only pick one.
+const OB_RESID: u64 = 128;
+/// Output machinery zend retains once any bytes reached the real
+/// stdout sink (sapi write path) — +32 on the first emit, none on
+/// stderr.
+const EMIT_RESID: u64 = 32;
 /// emalloc request for a new dynamic-property bucket in an object's
 /// slot table.
 pub(crate) const OBJ_SLOT_REQ: u64 = 32;
@@ -467,6 +508,17 @@ pub struct Interp<'a> {
     /// rematerialize when the consumer's cursor passes each open tag
     /// (Zend's buffers are global across suspends).
     suspended_obs: Vec<ObLevel>,
+    /// One-time token for zend's retained ob machinery (the output
+    /// stack and per-level handler structs) — created on the first
+    /// real level, never released: oracle keeps ~128 after the last
+    /// pop.
+    ob_boot: Option<Rc<()>>,
+    /// One-time token for the output machinery zend retains once
+    /// bytes reach the real stdout sink — EMIT_RESID, never released.
+    emit_boot: Option<Rc<()>>,
+    /// Bytes reached the real stdout sink at least once (live_io's
+    /// writes bypass `self.out`, so the sink can't be probed there).
+    pub(crate) emit_seen: bool,
     /// While >0, warnings are suppressed (implements `??`, `isset`,
     /// `empty`, `@`).
     silence: u32,
@@ -940,10 +992,19 @@ pub struct Interp<'a> {
     /// heap->real_size's chunk share: zend commits whole 2MB chunks
     /// up front; grows when the in-chunk footprint overflows.
     mem_committed: u64,
-    /// Live footprint inside committed chunks. The memory_limit
-    /// check fires when a charge overflows it AND another chunk
-    /// would exceed the limit (zend's get_chunk branch).
+    /// Live footprint inside committed chunks — the sum of
+    /// `mem_chunks` occupancy, kept for cheap arithmetic.
     mem_in_chunk: u64,
+    /// zend_mm's committed chunk list — used bytes per 2MB chunk.
+    /// A run first-fits the oldest chunk with room; a freed run's
+    /// pages stay committed for reuse (chunks only unmap once the
+    /// whole chunk is empty — ponytail: approximated as never, which
+    /// matches oracle on the ob realloc sequences; only huge
+    /// segments munmap on free). Chunk-level fidelity, not
+    /// page-run-level: freed space is treated as contiguous, so a
+    /// badly fragmented tail can pin a chunk the sim thinks
+    /// reusable.
+    mem_chunks: Vec<u64>,
     /// Page-aligned size of live huge allocs — each is its own
     /// segment in real_size and is released when its owner dies.
     mem_huge: u64,
@@ -1010,6 +1071,10 @@ pub struct ObLevel {
     /// into the zend_mm sim against `mem_tok`, whose death releases
     /// the charge on level teardown (zend frees the buffer then).
     pub charged: i64,
+    /// The smart_string's allocated capacity `a`: a clean/flush
+    /// resets `len` only — the allocation survives until the level
+    /// ends, so the charge tracks `cap`, not `buf.len()`.
+    pub cap: u64,
     /// Token binding this level's buffer charge to its lifetime in
     /// the zend_mm sim — `mem_realloc`'s weak probe dies with the
     /// level, releasing the bytes at the next sweep.
@@ -1101,16 +1166,24 @@ pub struct RunResult {
 /// — the global stack's real write order across suspends.
 impl ObLevel {
     /// Reconcile `charged` with the buffer's zend-alloc size after a
-    /// mutation — oracle's ob erealloc requests the buffer page-
-    /// aligned to its content length (a clean drains `buf` and frees
-    /// it, so the release falls out of the same diff).
+    /// mutation. zend's smart_string never shrinks while the level
+    /// lives — a clean/flush resets `len` but keeps `a` — so the
+    /// charge follows capacity, ratcheting up when a write crosses
+    /// it (one 16KB page per incremental crossing, or straight to
+    /// the aligned content on a single big append).
     /// `ob_meter_sync` applies `charged` to the zend_mm sim.
     pub(in crate::interp) fn mem_sync(&mut self) {
-        self.charged = if self.buf.is_empty() {
-            0
-        } else {
-            (self.buf.len() as i64 + 4095) & !4095
-        };
+        if self.pop_head.is_some() {
+            // A pop mirror is journaled bookkeeping, not a real
+            // output-buffer allocation.
+            self.charged = 0;
+            return;
+        }
+        let len = self.buf.len() as u64;
+        if len >= self.cap {
+            self.cap = (self.cap + OB_INIT_CAP).max((len + 4095) & !4095);
+        }
+        self.charged = self.cap as i64;
     }
 }
 
@@ -1604,6 +1677,9 @@ impl<'a> Interp<'a> {
             weakrefs: std::collections::HashMap::new(),
             ob_stack: Vec::new(),
             suspended_obs: Vec::new(),
+            ob_boot: None,
+            emit_boot: None,
+            emit_seen: false,
             silence: 0,
             isset_quiet: 0,
             statics: HashMap::new(),
@@ -1719,6 +1795,7 @@ impl<'a> Interp<'a> {
             // zend_mm_init commits the first 2MB chunk eagerly.
             mem_committed: MM_CHUNK,
             mem_in_chunk: MM_BASE_CHUNK,
+            mem_chunks: vec![MM_BASE_CHUNK],
             mem_huge: 0,
             mem_real_peak: MM_CHUNK,
             arg_stack_bytes: 0,
@@ -3644,41 +3721,54 @@ impl<'a> Interp<'a> {
             return None;
         }
         let limit = limit as u64;
+        let fp = Self::mem_fp(req);
+        // A run needs a fresh chunk when no committed chunk can host
+        // it — zend then commits another 2MB, and the limit check is
+        // that commit's overflow, not the run's own bytes.
+        let needs_chunk =
+            |s: &Self| req <= MM_MAX_LARGE && !s.mem_chunks.iter().any(|&u| u + fp <= MM_CHUNK);
         // Crossing a commit boundary — reclaim dead charges first
         // (zend frees blocks at efree; the Weak probes catch up here
         // so a just-died large alloc never trips the limit).
-        if ((req > MM_MAX_LARGE && self.mem_real().saturating_add(Self::mem_fp(req)) > limit)
-            || (req <= MM_MAX_LARGE
-                && self.mem_in_chunk.saturating_add(Self::mem_fp(req)) > self.mem_committed))
+        if ((req > MM_MAX_LARGE && self.mem_real().saturating_add(fp) > limit) || needs_chunk(self))
             && !self.mem_tracked.is_empty()
         {
             self.mem_sweep();
         }
         let report = if req > MM_MAX_LARGE {
-            if self.mem_real().saturating_add(Self::mem_fp(req)) > limit {
+            if self.mem_real().saturating_add(fp) > limit {
                 // huge segments report the 8-aligned request (zend_mm
                 // safe_error gets the header-adjusted size).
                 Some((req + 7) & !7)
             } else {
                 None
             }
-        } else if self.mem_in_chunk.saturating_add(Self::mem_fp(req)) > self.mem_committed
-            && self.mem_committed.saturating_add(MM_CHUNK) > limit
-        {
-            Some(Self::mem_fp(req))
+        } else if needs_chunk(self) && self.mem_real().saturating_add(MM_CHUNK) > limit {
+            Some(fp)
         } else {
             None
         };
         if let Some(report) = report {
-            // zend dies inside the FIRST failed emalloc — later
-            // requests in the same deferred run must not overwrite
-            // the fatal's 'tried to allocate' figure.
-            if self.oom_at.is_none() {
-                self.mem_last = report;
-                self.oom_at = Some((self.cur_line, self.fatal_frames()));
-            }
+            self.oom_record(report);
         }
         report
+    }
+
+    /// zend dies inside the FIRST failed emalloc — later requests in
+    /// the same deferred run must not overwrite the fatal's 'tried
+    /// to allocate' figure.
+    fn oom_record(&mut self, report: u64) {
+        if self.oom_at.is_none() {
+            self.mem_last = report;
+            self.oom_at = Some((self.cur_line, self.fatal_frames()));
+        }
+    }
+
+    /// Extend runway of a freshly (re)placed huge segment — its own
+    /// footprint plus the freed predecessor's hole (`hole`, 0 for a
+    /// brand-new alloc) and the placement slack.
+    fn seg_stretch(fp: u64, hole: u64) -> u64 {
+        fp + hole + MM_SEG_SLACK
     }
 
     /// mem_check for flat emalloc results: zend reports the raw
@@ -3697,8 +3787,9 @@ impl<'a> Interp<'a> {
 
     /// Commit an emalloc request: run the limit check, then book the
     /// footprint (the alloc exists until the deferred fatal raises).
-    /// Returns the booked footprint.
-    fn mem_commit(&mut self, req: u64) -> u64 {
+    /// Returns the booked footprint and, for chunk-served requests,
+    /// the chunk the run landed in (usize::MAX for huge segments).
+    fn mem_commit(&mut self, req: u64) -> (u64, usize) {
         // efree half of emalloc/efree: dead tracked allocs release
         // their footprint before the fit check — the fatal must not
         // fire on bytes whose owners already died (zend_mm_gc frees
@@ -3709,14 +3800,13 @@ impl<'a> Interp<'a> {
         let fp = Self::mem_fp(req);
         let _ = self.mem_check(req);
         self.mem_used += fp;
-        if req > MM_MAX_LARGE {
+        let chunk = if req > MM_MAX_LARGE {
             self.mem_huge += fp;
+            usize::MAX
         } else {
             self.mem_in_chunk += fp;
-            while self.mem_in_chunk > self.mem_committed {
-                self.mem_committed += MM_CHUNK;
-            }
-        }
+            self.chunk_place(fp)
+        };
         if self.mem_used > self.mem_peak {
             self.mem_peak = self.mem_used;
         }
@@ -3724,13 +3814,47 @@ impl<'a> Interp<'a> {
         if real > self.mem_real_peak {
             self.mem_real_peak = real;
         }
-        fp
+        (fp, chunk)
+    }
+
+    /// First-fit an in-chunk run: the oldest chunk with room takes
+    /// it, else a fresh 2MB chunk commits (zend scans its chunk list
+    /// the same way — this is what makes a 1M temp pack into
+    /// chunk0's tail while a 2MB buffer run needs its own chunk).
+    fn chunk_place(&mut self, fp: u64) -> usize {
+        for (i, u) in self.mem_chunks.iter_mut().enumerate() {
+            if *u + fp <= MM_CHUNK {
+                if *u == 0 {
+                    // Recommitting a span zend had unmapped empty.
+                    self.mem_committed += MM_CHUNK;
+                }
+                *u += fp;
+                return i;
+            }
+        }
+        self.mem_chunks.push(fp);
+        self.mem_committed += MM_CHUNK;
+        self.mem_chunks.len() - 1
+    }
+
+    /// Return fp bytes to the recorded chunk. Occupancy is
+    /// chunk-level, so a release just lowers the tally; a chunk that
+    /// hits zero unmaps outright (zend frees fully-empty chunks —
+    /// only the main chunk, index 0 here, survives).
+    fn chunk_release(&mut self, idx: usize, fp: u64) {
+        if let Some(u) = self.mem_chunks.get_mut(idx) {
+            let nu = u.saturating_sub(fp);
+            if nu == 0 && *u != 0 && idx != 0 {
+                self.mem_committed = self.mem_committed.saturating_sub(MM_CHUNK);
+            }
+            *u = nu;
+        }
     }
 
     /// Charge `req` bytes and tie the footprint to `rc`'s lifetime —
     /// released when every strong ref dies (zend's efree).
     pub(crate) fn mem_track<T: ?Sized + 'static>(&mut self, rc: &Rc<T>, req: u64) {
-        let fp = self.mem_commit(req);
+        let (fp, chunk) = self.mem_commit(req);
         let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
         let key = Rc::as_ptr(rc) as *const u8 as usize;
         match self.mem_tracked.entry(key) {
@@ -3738,17 +3862,32 @@ impl<'a> Interp<'a> {
                 if !(e.get().probe)() {
                     // Allocator recycled a dead owner's pointer —
                     // release the stale charge, then re-register.
-                    self.mem_in_chunk = self.mem_in_chunk.saturating_sub(e.get().inner);
-                    self.mem_huge = self.mem_huge.saturating_sub(e.get().huge);
-                    self.mem_used = self.mem_used.saturating_sub(e.get().inner + e.get().huge);
-                    self.arg_stack_bytes -= e.get().arg_bytes;
+                    let dead = e.get();
+                    self.mem_in_chunk = self.mem_in_chunk.saturating_sub(dead.inner);
+                    self.mem_huge = self.mem_huge.saturating_sub(dead.huge);
+                    self.mem_used = self.mem_used.saturating_sub(dead.inner + dead.huge);
+                    self.arg_stack_bytes -= dead.arg_bytes;
+                    let dead_chunk = dead.chunk;
+                    let dead_inner = dead.inner;
                     let c = e.get_mut();
                     c.inner = 0;
                     c.huge = 0;
                     c.table_req = 0;
+                    c.seg_cap = 0;
                     c.arg_bytes = 0;
+                    c.chunk = usize::MAX;
+                    if let Some(u) = self.mem_chunks.get_mut(dead_chunk) {
+                        let nu = u.saturating_sub(dead_inner);
+                        if nu == 0 && *u != 0 && dead_chunk != 0 {
+                            self.mem_committed = self.mem_committed.saturating_sub(MM_CHUNK);
+                        }
+                        *u = nu;
+                    }
                     let weak = Rc::downgrade(rc);
                     c.probe = Box::new(move || weak.strong_count() > 0);
+                }
+                if inner > 0 {
+                    e.get_mut().chunk = chunk;
                 }
                 e.get_mut().inner += inner;
                 e.get_mut().huge += huge;
@@ -3759,6 +3898,12 @@ impl<'a> Interp<'a> {
                     inner,
                     huge,
                     table_req: 0,
+                    seg_cap: if req > MM_MAX_LARGE {
+                        Self::seg_stretch(fp, 0)
+                    } else {
+                        0
+                    },
+                    chunk: if inner > 0 { chunk } else { usize::MAX },
                     arg_bytes: 0,
                     probe: Box::new(move || weak.strong_count() > 0),
                 });
@@ -3773,26 +3918,151 @@ impl<'a> Interp<'a> {
     /// pow2 class advances).
     pub(crate) fn mem_realloc<T: ?Sized + 'static>(&mut self, rc: &Rc<T>, req: u64) {
         let key = Rc::as_ptr(rc) as *const u8 as usize;
+        let mut old_live = None;
         if let Some(c) = self.mem_tracked.get(&key) {
             if (c.probe)() && c.table_req == req {
                 return;
             }
+            if (c.probe)() {
+                old_live = Some((c.table_req, c.chunk));
+            }
         }
-        let fp = self.mem_commit(req);
+        // Huge→huge erealloc (zend_mm_realloc_huge): extend the
+        // segment in place when the request stays inside its stretch
+        // of free address space — real_size still counts the old
+        // segment and the limit check is the growth *delta* against
+        // headroom. Past seg_cap the kernel can't extend, so zend
+        // relocates: the new segment is sized while the old one is
+        // still held (the stricter check).
+        if let Some((old, _)) = old_live {
+            if req > MM_MAX_LARGE && old > MM_MAX_LARGE {
+                let ofp = Self::mem_fp(old);
+                let fp = Self::mem_fp(req);
+                if fp <= ofp {
+                    // Shrink (or same size): the tail unmaps — zend
+                    // runs no limit check on that path.
+                    let d = ofp - fp;
+                    self.mem_huge = self.mem_huge.saturating_sub(d);
+                    self.mem_used = self.mem_used.saturating_sub(d);
+                    if let Some(c) = self.mem_tracked.get_mut(&key) {
+                        c.huge = c.huge.saturating_sub(d);
+                        c.table_req = req;
+                    }
+                    let real = self.mem_real();
+                    if real > self.mem_real_peak {
+                        self.mem_real_peak = real;
+                    }
+                    return;
+                }
+                let cap = self.mem_tracked.get(&key).map(|c| c.seg_cap).unwrap_or(0);
+                let reloc = fp > cap;
+                let limit = self.ini_bytes("memory_limit");
+                let over = |s: &Self| -> bool {
+                    if limit <= 0 {
+                        return false;
+                    }
+                    let real = s.mem_real();
+                    if reloc {
+                        // alloc-before-free: old seg still held.
+                        real.saturating_add(fp) > limit as u64
+                    } else {
+                        // in-place: only the delta is committed.
+                        real.saturating_add(fp - ofp) > limit as u64
+                    }
+                };
+                // A failing commit frees dead charges and retries
+                // (zend_mm_gc) — sweep before reporting.
+                if over(self) && !self.mem_tracked.is_empty() {
+                    self.mem_sweep();
+                }
+                let failed = over(self);
+                if failed {
+                    self.oom_record((req + 7) & !7);
+                }
+                self.mem_huge += fp - ofp;
+                self.mem_used += fp - ofp;
+                if let Some(c) = self.mem_tracked.get_mut(&key) {
+                    c.huge = fp;
+                    c.table_req = req;
+                    if reloc && !failed {
+                        // Relocated — the new placement's runway is
+                        // the old segment's hole plus slack.
+                        c.seg_cap = Self::seg_stretch(fp, ofp);
+                    }
+                }
+                if self.mem_used > self.mem_peak {
+                    self.mem_peak = self.mem_used;
+                }
+                let real = self.mem_real();
+                if real > self.mem_real_peak {
+                    self.mem_real_peak = real;
+                }
+                return;
+            }
+        }
+        // In-place growth: the grown run still fits the old run's
+        // chunk once the old bytes are freed there — zend merges the
+        // adjacent free pages into the run, no new chunk commits and
+        // no limit check runs at all.
+        if let Some((old, ci)) = old_live {
+            if req <= MM_MAX_LARGE && old > 0 && old <= MM_MAX_LARGE {
+                let ofp = Self::mem_fp(old);
+                let fp = Self::mem_fp(req);
+                if let Some(u) = self.mem_chunks.get_mut(ci) {
+                    if *u - ofp + fp <= MM_CHUNK {
+                        *u = *u - ofp + fp;
+                        self.mem_in_chunk = self.mem_in_chunk - ofp + fp;
+                        self.mem_used = self.mem_used - ofp + fp;
+                        if let Some(c) = self.mem_tracked.get_mut(&key) {
+                            c.inner = c.inner - ofp + fp;
+                            c.table_req = req;
+                        }
+                        if self.mem_used > self.mem_peak {
+                            self.mem_peak = self.mem_used;
+                        }
+                        let real = self.mem_real();
+                        if real > self.mem_real_peak {
+                            self.mem_real_peak = real;
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        let (fp, chunk) = self.mem_commit(req);
         let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
         match self.mem_tracked.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 let old = std::mem::replace(&mut e.get_mut().table_req, req);
+                let mut hole = 0;
                 if old > 0 {
                     let ofp = Self::mem_fp(old);
                     if old > MM_MAX_LARGE {
                         e.get_mut().huge = e.get().huge.saturating_sub(ofp);
                         self.mem_huge = self.mem_huge.saturating_sub(ofp);
+                        hole = ofp;
                     } else {
+                        let ci = e.get().chunk;
                         e.get_mut().inner = e.get().inner.saturating_sub(ofp);
                         self.mem_in_chunk = self.mem_in_chunk.saturating_sub(ofp);
+                        if let Some(u) = self.mem_chunks.get_mut(ci) {
+                            let nu = u.saturating_sub(ofp);
+                            if nu == 0 && *u != 0 && ci != 0 {
+                                self.mem_committed = self.mem_committed.saturating_sub(MM_CHUNK);
+                                hole = MM_CHUNK;
+                            }
+                            *u = nu;
+                        }
                     }
                     self.mem_used = self.mem_used.saturating_sub(ofp);
+                }
+                if inner > 0 {
+                    e.get_mut().chunk = chunk;
+                }
+                if req > MM_MAX_LARGE {
+                    // Freshly-placed huge segment (dead entry, or
+                    // grown up from in-chunk) — new extend runway.
+                    e.get_mut().seg_cap = Self::seg_stretch(fp, hole);
                 }
                 e.get_mut().inner += inner;
                 e.get_mut().huge += huge;
@@ -3803,6 +4073,12 @@ impl<'a> Interp<'a> {
                     inner,
                     huge,
                     table_req: req,
+                    seg_cap: if req > MM_MAX_LARGE {
+                        Self::seg_stretch(fp, 0)
+                    } else {
+                        0
+                    },
+                    chunk: if inner > 0 { chunk } else { usize::MAX },
                     arg_bytes: 0,
                     probe: Box::new(move || weak.strong_count() > 0),
                 });
@@ -3813,9 +4089,50 @@ impl<'a> Interp<'a> {
     /// Book every ob level's smart_string alloc into the sim —
     /// buffered bytes are otherwise invisible to memory_get_usage,
     /// ini_set's usage compare, and the limit trip. Runs at stmt
-    /// boundaries and on reconcile; `mem_realloc`'s table_req dedupe
-    /// makes unchanged levels free.
+    /// boundaries, on reconcile, and inline at every buffer mutation
+    /// — zend checks the limit inside the erealloc that grows the
+    /// buffer, while the write's producing temp is still held, so
+    /// the charge can't wait for the boundary.
+    /// `mem_realloc`'s table_req dedupe makes unchanged levels free.
     pub(crate) fn ob_meter_sync(&mut self) {
+        // The request-lifetime ob stack: booted by the first real
+        // level, plus each open level's small handler struct. Never
+        // released — oracle retains ~128 after the last pop.
+        if self.ob_boot.is_none() {
+            let real = self
+                .ob_stack
+                .iter()
+                .chain(self.suspended_obs.iter())
+                .any(|l| l.pop_head.is_none());
+            if real {
+                self.ob_boot = Some(std::rc::Rc::new(()));
+            }
+        }
+        if let Some(boot) = self.ob_boot.clone() {
+            let n = self
+                .ob_stack
+                .iter()
+                .chain(self.suspended_obs.iter())
+                .filter(|l| l.pop_head.is_none())
+                .count() as u64;
+            // The ob runtime stack + handler structs live while any
+            // real level is open (~2.6K + 128/level); the last pop
+            // frees them except a ~128 stub.
+            let want = if n > 0 {
+                OB_OPEN_STACK + OB_LEVEL_STRUCT * n
+            } else {
+                OB_RESID
+            };
+            self.ob_mem_apply(&boot, want);
+        }
+        // zend's sapi-write machinery is retained for the request
+        // once any bytes reached real stdout (+32, stderr excluded).
+        if self.emit_boot.is_none() && (self.emit_seen || !self.out.is_empty()) {
+            self.emit_boot = Some(std::rc::Rc::new(()));
+        }
+        if let Some(eb) = self.emit_boot.clone() {
+            self.ob_mem_apply(&eb, EMIT_RESID);
+        }
         for i in 0..self.ob_stack.len() {
             let (tok, want) = (self.ob_stack[i].mem_tok.clone(), self.ob_stack[i].charged);
             self.ob_mem_apply(&tok, want.max(0) as u64);
@@ -3847,6 +4164,10 @@ impl<'a> Interp<'a> {
         let mut inner = 0u64;
         let mut huge = 0u64;
         let mut arg_bytes = 0i64;
+        // Releases land on each charge's recorded chunk — a chunk
+        // the release empties unmaps (zend frees non-main chunks).
+        let chunks = &mut self.mem_chunks;
+        let mut emptied = 0u64;
         self.mem_tracked.retain(|_, c| {
             if (c.probe)() {
                 true
@@ -3854,9 +4175,19 @@ impl<'a> Interp<'a> {
                 inner += c.inner;
                 huge += c.huge;
                 arg_bytes += c.arg_bytes;
+                if let Some(u) = chunks.get_mut(c.chunk) {
+                    let nu = u.saturating_sub(c.inner);
+                    // A chunk emptied by this release unmaps (zend
+                    // frees fully-empty non-main chunks).
+                    if nu == 0 && *u != 0 && c.chunk != 0 {
+                        emptied += 1;
+                    }
+                    *u = nu;
+                }
                 false
             }
         });
+        self.mem_committed = self.mem_committed.saturating_sub(emptied * MM_CHUNK);
         self.mem_in_chunk = self.mem_in_chunk.saturating_sub(inner);
         self.mem_huge = self.mem_huge.saturating_sub(huge);
         self.mem_used = self.mem_used.saturating_sub(inner + huge);
@@ -3883,9 +4214,11 @@ impl<'a> Interp<'a> {
                 self.mem_used = self.mem_used.saturating_sub(dead.inner + dead.huge);
             } else {
                 let sub = fp.min(e.get().inner);
+                let ci = e.get().chunk;
                 e.get_mut().inner -= sub;
                 self.mem_in_chunk = self.mem_in_chunk.saturating_sub(sub);
                 self.mem_used = self.mem_used.saturating_sub(sub);
+                self.chunk_release(ci, sub);
             }
         }
     }
@@ -3900,6 +4233,7 @@ impl<'a> Interp<'a> {
             self.mem_huge = self.mem_huge.saturating_sub(c.huge);
             self.mem_used = self.mem_used.saturating_sub(c.inner + c.huge);
             self.arg_stack_bytes -= c.arg_bytes;
+            self.chunk_release(c.chunk, c.inner);
         }
     }
 
@@ -3918,36 +4252,74 @@ impl<'a> Interp<'a> {
         // unconditionally so freed runs feed the extend test.
         self.mem_sweep();
         let fp = Self::mem_fp(req);
-        let old_inner = self
+        let (old_inner, old_huge, old_chunk) = self
             .mem_tracked
             .get(&(Rc::as_ptr(old) as *const u8 as usize))
-            .map(|c| c.inner)
-            .unwrap_or(0);
+            .map(|c| (c.inner, c.huge, c.chunk))
+            .unwrap_or((0, 0, usize::MAX));
+        // In-place growth: the grown run fits the same chunk once the
+        // old bytes are freed — no chunk commits, no limit check.
         let extend = req <= MM_MAX_LARGE
             && old_inner > 0
             && self
-                .mem_in_chunk
-                .saturating_sub(old_inner)
-                .saturating_add(fp)
-                <= self.mem_committed * 7 / 8;
+                .mem_chunks
+                .get(old_chunk)
+                .is_some_and(|&u| u - old_inner + fp <= MM_CHUNK);
+        // Whether the grown segment relocates: past its stretch of
+        // free address space mremap can't extend, so zend allocs the
+        // new segment while the old one is still held (the stricter
+        // check). Otherwise the old segment unmaps and only the
+        // growth delta is checked. Untracked/dead olds relocate.
+        let old_seg = self
+            .mem_tracked
+            .get(&(Rc::as_ptr(old) as *const u8 as usize))
+            .filter(|c| (c.probe)())
+            .map(|c| c.seg_cap);
+        let reloc = old_seg.is_none_or(|cap| fp > cap);
+        let mut new_seg_cap = if req > MM_MAX_LARGE {
+            // Only a huge predecessor leaves a VA hole — a freed
+            // in-chunk run stays inside its chunk's mapping.
+            Self::seg_stretch(fp, old_huge)
+        } else {
+            0
+        };
         if req > MM_MAX_LARGE {
-            // mremap unmaps the old segment before sizing the new one.
-            self.mem_retire(old);
-            let _ = self.mem_check(req);
+            if reloc {
+                // alloc+copy+free: size the new segment with old held.
+                let _ = self.mem_check(req);
+                self.mem_retire(old);
+            } else {
+                // in-place extend: old unmaps → delta-only check.
+                self.mem_retire(old);
+                let _ = self.mem_check(req);
+                new_seg_cap = old_seg.unwrap_or(0);
+            }
         } else if !extend {
             let _ = self.mem_check(req);
         }
         self.mem_used += fp;
+        let mut new_chunk = usize::MAX;
         if req > MM_MAX_LARGE {
             self.mem_huge += fp;
         } else {
             self.mem_in_chunk += fp;
-        }
-        if req <= MM_MAX_LARGE {
-            self.mem_retire(old);
-        }
-        while self.mem_in_chunk > self.mem_committed {
-            self.mem_committed += MM_CHUNK;
+            if extend {
+                // Replace the old run in place inside its chunk:
+                // occupancy changes by the grown fp minus the freed
+                // run, like mem_realloc's in-place arm — adding the
+                // raw fp leaks the old bytes every grow.
+                if let Some(u) = self.mem_chunks.get_mut(old_chunk) {
+                    *u = *u - old_inner + fp;
+                }
+                self.mem_in_chunk = self.mem_in_chunk.saturating_sub(old_inner);
+                self.mem_used = self.mem_used.saturating_sub(old_inner);
+                self.mem_tracked
+                    .remove(&(Rc::as_ptr(old) as *const u8 as usize));
+                new_chunk = old_chunk;
+            } else {
+                new_chunk = self.chunk_place(fp);
+                self.mem_retire(old);
+            }
         }
         if self.mem_used > self.mem_peak {
             self.mem_peak = self.mem_used;
@@ -3963,6 +4335,7 @@ impl<'a> Interp<'a> {
             self.mem_in_chunk = self.mem_in_chunk.saturating_sub(c.inner);
             self.mem_huge = self.mem_huge.saturating_sub(c.huge);
             self.mem_used = self.mem_used.saturating_sub(c.inner + c.huge);
+            self.chunk_release(c.chunk, c.inner);
         }
         let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
         let weak = Rc::downgrade(new);
@@ -3972,6 +4345,8 @@ impl<'a> Interp<'a> {
                 inner,
                 huge,
                 table_req: 0,
+                seg_cap: new_seg_cap,
+                chunk: new_chunk,
                 arg_bytes: 0,
                 probe: Box::new(move || weak.strong_count() > 0),
             },
@@ -4130,8 +4505,10 @@ impl<'a> Interp<'a> {
             }
             l.buf.extend_from_slice(b);
             l.mem_sync();
+            self.ob_meter_sync();
             return;
         }
+        self.emit_seen = true;
         if self.live_io {
             use std::io::Write;
             let mut so = std::io::stdout().lock();
@@ -4156,13 +4533,17 @@ impl<'a> Interp<'a> {
             }
             buf.buf.extend_from_slice(b);
             buf.mem_sync();
-        } else if self.live_io {
-            use std::io::Write;
-            let mut so = std::io::stdout().lock();
-            let _ = so.write_all(b);
-            let _ = so.flush();
+            self.ob_meter_sync();
         } else {
-            self.out.extend_from_slice(b);
+            self.emit_seen = true;
+            if self.live_io {
+                use std::io::Write;
+                let mut so = std::io::stdout().lock();
+                let _ = so.write_all(b);
+                let _ = so.flush();
+            } else {
+                self.out.extend_from_slice(b);
+            }
         }
     }
 
@@ -4223,6 +4604,7 @@ impl<'a> Interp<'a> {
                 i += 1;
             }
         }
+        self.ob_meter_sync();
     }
 
     /// Move the suspended gen-owned buffers whose open tag the
@@ -4373,6 +4755,7 @@ impl<'a> Interp<'a> {
                 let mut level = ObLevel {
                     buf,
                     charged: 0,
+                    cap: OB_INIT_CAP,
                     mem_tok: std::rc::Rc::new(()),
                     handler: l.handler.clone(),
                     started: l.started,
@@ -4416,6 +4799,7 @@ impl<'a> Interp<'a> {
                 };
                 level.mem_sync();
                 self.ob_stack.push(level);
+                self.ob_meter_sync();
             }
             return;
         }
@@ -4652,6 +5036,7 @@ impl<'a> Interp<'a> {
             };
             Self::ob_drain_level(l, all);
         }
+        self.ob_meter_sync();
     }
 
     /// Stack entries the consumer can see through the suspended-gen
