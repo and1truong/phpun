@@ -362,7 +362,7 @@ impl<'a> Interp<'a> {
                             // an earlier element (spread/`&`) still
                             // shares.
                             match arr.get_cell(&key) {
-                                Some(s) if self.is_ref_cell(&s) && Rc::strong_count(&s) > 1 => {
+                                Some(s) if self.is_ref_cell(&s) => {
                                     arr.bind_cell(key, cell(val));
                                 }
                                 _ => arr.set(key, val),
