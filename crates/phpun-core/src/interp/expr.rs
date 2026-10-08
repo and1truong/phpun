@@ -6462,7 +6462,36 @@ impl<'a> Interp<'a> {
                         c = cell(iv);
                         continue;
                     }
-                    _ => (Step::Stop, None),
+                    _ => {
+                        // zend's ISSET_DIM fetch dies on a non-ArrayAccess
+                        // object/Closure itself — a `??=` store never
+                        // reaches its RHS or the write's dispatch
+                        // (oracle dies inside the quiet read). Scalars
+                        // quietly miss and keep walking.
+                        let bad = if quiet && det.map_or(true, |d| d.coalesce) {
+                            match &*b {
+                                Value::Object(o) if !self.obj_is_a(o, "ArrayAccess") => {
+                                    Some(format!(
+                                        "Cannot use object of type {} as array",
+                                        o.borrow().class.name()
+                                    ))
+                                }
+                                Value::Callable(_) => Some(
+                                    "Cannot use object of type Closure as array".to_string(),
+                                ),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        match bad {
+                            Some(m) => {
+                                drop(b);
+                                return self.fail(PhpError::uncaught("Error", m, self.cur_line));
+                            }
+                            None => (Step::Stop, None),
+                        }
+                    }
                 }
             };
             match step {
