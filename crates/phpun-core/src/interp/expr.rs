@@ -2634,7 +2634,12 @@ impl<'a> Interp<'a> {
                                         // `{Decl}::offsetGet():
                                         // Argument #N[ ($x)] not
                                         // passed`.
-                                        res = self.aa_offset_get(o, key.clone().map(cell), is_spl);
+                                        res = self.aa_offset_get(
+                                            o,
+                                            key.clone().map(cell),
+                                            is_spl,
+                                            true,
+                                        );
                                     }
                                     let cn = o.borrow().class.name().to_string();
                                     // zend emits the notice while the
@@ -4734,7 +4739,7 @@ impl<'a> Interp<'a> {
                             // engine call — its arity error is real
                             // (zend's handle_undef_args), it must not be
                             // swallowed like a missing-bucket miss.
-                            self.aa_offset_get(&o, None, spl_iter)?
+                            self.aa_offset_get(&o, None, spl_iter, true)?
                         };
                         c = cell(iv);
                         continue;
@@ -5483,7 +5488,7 @@ impl<'a> Interp<'a> {
         // zend evaluates this read as BP_VAR_RW — a missing bucket is
         // created silently inside offsetGet.
         let was = std::mem::replace(&mut self.dim_by_ref, true);
-        let rv = self.aa_offset_get(&o, key, spl_iter);
+        let rv = self.aa_offset_get(&o, key, spl_iter, false);
         self.dim_by_ref = was;
         match self.last_ret_cell.take() {
             Some(rc) => {
@@ -5535,15 +5540,19 @@ impl<'a> Interp<'a> {
         o: &Rc<RefCell<PhpObject>>,
         key: Option<Cell>,
         spl: bool,
+        undef: bool,
     ) -> Result<Value, PhpError> {
         let Some((m, dc)) = self.find_method_in(&o.borrow().class, "offsetGet") else {
             return Ok(Value::Null);
         };
-        let undef = spl && key.is_none();
+        let undef = undef && spl && key.is_none();
         if undef && m.decl.body.is_empty() && m.decl.line == 0 {
             return Ok(Value::Null);
         }
-        let given = usize::from(key.is_some());
+        // Arity errors only exist on the UNDEF-arg engine call (zend
+        // handle_undef_args); a defined arg — even NULL on `[]` writes —
+        // always counts as passed.
+        let given = usize::from(key.is_some()) | usize::from(!undef);
         if let Some((i, pname)) = m
             .decl
             .params
@@ -7035,7 +7044,7 @@ impl<'a> Interp<'a> {
         let spl_iter = matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. }));
         self.last_ret_cell = None;
         let was = std::mem::replace(&mut self.dim_by_ref, true);
-        let rv = self.aa_offset_get(&o, key.clone().map(cell), spl_iter);
+        let rv = self.aa_offset_get(&o, key.clone().map(cell), spl_iter, true);
         self.dim_by_ref = was;
         // spl's overloaded-dim notice fires even when the engine call
         // threw — zend emits it while the error is still pending.
