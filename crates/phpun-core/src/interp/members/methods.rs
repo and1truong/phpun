@@ -2723,7 +2723,7 @@ impl<'a> Interp<'a> {
             trav_cells: Vec::new(),
             nonref_cells: Vec::new(),
             hold: Vec::new(),
-            arg_stack: Vec::new(),
+            vm_sites: Vec::new(),
             vm_slots: 0,
             end_line: args.end_line,
         })

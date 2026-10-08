@@ -265,7 +265,7 @@ impl<'a> Interp<'a> {
         // the call sites here and charge the frame's real span on the
         // gen state (retired when the body's run finishes or dies).
         let span = args.vm_slots * 16;
-        let sites = std::mem::take(&mut args.arg_stack);
+        let sites = std::mem::take(&mut args.vm_sites);
         args.vm_slots = 0;
         self.vm_frame_free(&sites);
         let fin_q = Rc::new(RefCell::new(crate::value::GenFinData {

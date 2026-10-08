@@ -2234,7 +2234,7 @@ impl<'a> Interp<'a> {
         // on the pushed frame so their charge outlives bind_and_run_inner's
         // CallArgs drop.
         if let Some(f) = self.stack.last_mut() {
-            f.arg_stack.append(&mut args.arg_stack);
+            f.vm_sites.append(&mut args.vm_sites);
         }
         // Callee `Stmt::Line` markers must not leak into the caller:
         // diagnostics after the call report the call-site line.

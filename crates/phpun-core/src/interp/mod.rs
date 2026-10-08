@@ -92,12 +92,12 @@ pub struct CallArgs {
     /// alive until the call returns, so its table stays charged
     /// through the builtin's own allocs).
     pub hold: Vec<Value>,
-    /// Arg-stack tokens — one per vm_stack push this call made (the
+    /// Vm-site tokens — one per vm_stack push this call made (the
     /// frame push plus each `...` unpack site's arg span). Each token's
     /// MemCharge carries the push's arena bookkeeping (see `vm_stack`),
     /// repaid when the owning frame pops or a never-dispatched call's
     /// tokens die at sweep.
-    pub arg_stack: Vec<Rc<ArgStack>>,
+    pub vm_sites: Vec<Rc<VmSite>>,
     /// Arena slots this call has pushed so far — frame overhead plus
     /// args — used by `vm_call_push` to compute the extend delta and
     /// the span a copy_call_frame moves.
@@ -110,9 +110,9 @@ pub struct CallArgs {
 }
 
 /// Token anchoring a vm_stack arena record — one per call push (on the
-/// CallArgs/Frame's arg_stack list) and one per live segment (on its
+/// CallArgs/Frame's vm_sites list) and one per live segment (on its
 /// VmSeg). The payload lives on the token's MemCharge.
-pub struct ArgStack;
+pub struct VmSite;
 
 /// One live segment of zend's request-scoped vm_stack arena.
 struct VmSeg {
@@ -123,7 +123,7 @@ struct VmSeg {
     used: u64,
     /// This segment's emalloc charge — dies with the segment (emptied
     /// by a copy_call_frame, or freed at its owning frame's pop).
-    tok: Rc<ArgStack>,
+    tok: Rc<VmSite>,
 }
 
 /// ZEND_VM_STACK_PAGE_SIZE — zend vm_stack pages are 256KB.
@@ -142,7 +142,7 @@ impl CallArgs {
             trav_cells: Vec::new(),
             nonref_cells: Vec::new(),
             hold: Vec::new(),
-            arg_stack: Vec::new(),
+            vm_sites: Vec::new(),
             vm_slots: 0,
             end_line: 0,
         }
@@ -219,7 +219,7 @@ pub struct Frame {
     /// zend keeps a call's arg zvals on vm_stack until the FRAME is
     /// destroyed, so the charges outlive arg binding and die with
     /// this frame's pop.
-    arg_stack: Vec<Rc<ArgStack>>,
+    vm_sites: Vec<Rc<VmSite>>,
 }
 
 impl Frame {
@@ -243,7 +243,7 @@ impl Frame {
             statics_unit: None,
             decl_site: 0,
             gen_body: false,
-            arg_stack: Vec::new(),
+            vm_sites: Vec::new(),
         }
     }
 }
@@ -1750,7 +1750,7 @@ impl<'a> Interp<'a> {
             vm_stack: vec![VmSeg {
                 size: VM_PAGE,
                 used: 32 + VM_FRAME_SLOTS * 16,
-                tok: Rc::new(ArgStack),
+                tok: Rc::new(VmSite),
             }],
             mem_tracked: HashMap::new(),
             mem_peak: MM_BASE_USED,
@@ -3819,7 +3819,7 @@ impl<'a> Interp<'a> {
             // while the new segment's charge is already committed.
             let used = want * 16;
             let size = (used + 32 + VM_PAGE - 1) & !(VM_PAGE - 1);
-            let tok: Rc<ArgStack> = Rc::new(ArgStack);
+            let tok: Rc<VmSite> = Rc::new(VmSite);
             self.mem_track(&tok, size);
             let own = Rc::as_ptr(&tok) as *const u8 as usize;
             let prev = self.vm_stack.len() - 1;
@@ -3837,7 +3837,7 @@ impl<'a> Interp<'a> {
             });
             // The call's earlier pushes moved into the new segment —
             // their rollbacks were settled by the prev rollback above.
-            for arc in &out.arg_stack {
+            for arc in &out.vm_sites {
                 let key = Rc::as_ptr(arc) as *const u8 as usize;
                 if let Some(c) = self.mem_tracked.get_mut(&key) {
                     c.vm = None;
@@ -3857,13 +3857,13 @@ impl<'a> Interp<'a> {
     /// rollback — repaid at the owning frame's pop (vm_frame_free) or
     /// at sweep once a never-dispatched call's token dies.
     fn vm_site(&mut self, out: &mut CallArgs, seg: usize, slots: u64, own: usize) {
-        let site: Rc<ArgStack> = Rc::new(ArgStack);
+        let site: Rc<VmSite> = Rc::new(VmSite);
         self.mem_track(&site, 0);
         let key = Rc::as_ptr(&site) as *const u8 as usize;
         if let Some(c) = self.mem_tracked.get_mut(&key) {
             c.vm = Some((seg, slots, own));
         }
-        out.arg_stack.push(site);
+        out.vm_sites.push(site);
     }
 
     /// Repay one pushed span's `used` and free its minted segment —
@@ -3884,7 +3884,7 @@ impl<'a> Interp<'a> {
 
     /// Frame teardown frees the call's arena span — zend releases it
     /// at pop, not when the next frame pops.
-    fn vm_frame_free(&mut self, sites: &[Rc<ArgStack>]) {
+    fn vm_frame_free(&mut self, sites: &[Rc<VmSite>]) {
         for arc in sites {
             let key = Rc::as_ptr(arc) as *const u8 as usize;
             let vm = self.mem_tracked.get_mut(&key).and_then(|c| c.vm.take());
@@ -3898,7 +3898,7 @@ impl<'a> Interp<'a> {
     fn stack_pop(&mut self) -> Option<Frame> {
         let f = self.stack.pop();
         if let Some(f) = &f {
-            self.vm_frame_free(&f.arg_stack);
+            self.vm_frame_free(&f.vm_sites);
         }
         f
     }
@@ -6317,7 +6317,7 @@ impl<'a> Interp<'a> {
         // user function will consume the CallArgs — its frame owns it.
         let r = self.call_builtin_inner(name, args, visible);
         if !matches!(r, Ok(None)) {
-            self.vm_frame_free(&args.arg_stack);
+            self.vm_frame_free(&args.vm_sites);
         }
         r
     }
@@ -6442,7 +6442,7 @@ impl<'a> Interp<'a> {
                     .map(|i| i - 1)
                     .collect(),
                 hold: args.hold.clone(),
-                arg_stack: args.arg_stack.clone(),
+                vm_sites: args.vm_sites.clone(),
                 vm_slots: 0,
                 trav_cells: args
                     .trav_cells
