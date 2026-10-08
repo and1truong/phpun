@@ -359,7 +359,7 @@ impl<'a> Interp<'a> {
             | Expr::PostDec(e)
             | Expr::Empty(e)
             | Expr::Print(e)
-            | Expr::VarVar(e)
+            | Expr::VarVar(e, _)
             | Expr::Cast { e, .. }
             | Expr::Throw(e)
             | Expr::Include { e, .. } => Self::expr_uses_this_prop(e, pn),
@@ -368,11 +368,13 @@ impl<'a> Interp<'a> {
                     || t.as_ref().is_some_and(|t| Self::expr_uses_this_prop(t, pn))
                     || Self::expr_uses_this_prop(f, pn)
             }
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, .. } => {
                 Self::expr_uses_this_prop(name, pn)
                     || args.iter().any(|a| Self::expr_uses_this_prop(a, pn))
             }
-            Expr::StaticCallDyn { class, name, args } => {
+            Expr::StaticCallDyn {
+                class, name, args, ..
+            } => {
                 Self::expr_uses_this_prop(class, pn)
                     || Self::expr_uses_this_prop(name, pn)
                     || args.iter().any(|a| Self::expr_uses_this_prop(a, pn))
@@ -391,7 +393,7 @@ impl<'a> Interp<'a> {
                 k.as_ref().is_some_and(|k| Self::expr_uses_this_prop(k, pn))
                     || Self::expr_uses_this_prop(e, pn)
             }),
-            Expr::Match { subject, arms } => {
+            Expr::Match { subject, arms, .. } => {
                 Self::expr_uses_this_prop(subject, pn)
                     || arms.iter().any(|a| {
                         a.conds.iter().any(|c| Self::expr_uses_this_prop(c, pn))
@@ -406,7 +408,7 @@ impl<'a> Interp<'a> {
                     .any(|e| Self::expr_uses_this_prop(e, pn))
                     || Self::stmts_use_this_prop(&c.decl.body, pn)
             }
-            Expr::New { class, args } => {
+            Expr::New { class, args, .. } => {
                 Self::expr_uses_this_prop(class, pn)
                     || args.iter().any(|a| Self::expr_uses_this_prop(a, pn))
             }
@@ -433,7 +435,7 @@ impl<'a> Interp<'a> {
                 // Interpolated `{$expr}` parts are source strings — a
                 // substring check for `$this->prop` is close enough for
                 // the backed-prop heuristic.
-                crate::lexer::StringPart::Expr(s) => {
+                crate::lexer::StringPart::Expr(s, _) => {
                     s.contains(&format!("this->{pn}")) || s.contains(&format!("this->${pn}"))
                 }
                 _ => false,
@@ -1187,7 +1189,11 @@ impl<'a> Interp<'a> {
         pn: &str,
         is_get: bool,
         args: &[Expr],
+        site: Option<usize>,
     ) -> Result<Value, PhpError> {
+        if let Some(s) = site {
+            self.send_line = Some(s);
+        }
         let kind = if is_get { "get" } else { "set" };
         // Borrow-free snapshot of the caller frame's hook context (the
         // outside/different-prop/different-kind rules are parse-time).
@@ -1298,8 +1304,20 @@ impl<'a> Interp<'a> {
         };
         let argvals = {
             let mut vs: Vec<Value> = Vec::new();
+            let saved_line = self.cur_line;
             for a in args {
-                match a {
+                // `argline` per-arg line marker — same per-arg
+                // attribution arg_cells applies (zend's arg-op lines).
+                if let Expr::Binary {
+                    op: "argline", l, ..
+                } = a
+                {
+                    if let Expr::Int(n) = l.as_ref() {
+                        self.cur_line = *n as usize;
+                        self.send_line = Some(*n as usize);
+                    }
+                }
+                match Self::unmark_arg(a) {
                     Expr::Binary {
                         op: "named", l, r, ..
                     } => {
@@ -1323,11 +1341,18 @@ impl<'a> Interp<'a> {
                             }
                         }
                     }
-                    _ => vs.push(self.eval(a)?),
+                    e => vs.push(self.eval(e)?),
                 }
             }
+            // Post-eval call diagnostics site at the call itself.
+            self.cur_line = site.unwrap_or(saved_line);
             vs
         };
+        // Arg eval may have pushed nested frames — restore this call's
+        // own site for the hook frame.
+        if let Some(s) = site {
+            self.send_line = Some(s);
+        }
         if let Some((h, c)) = hook {
             return self.run_hook(&o, &c, pn, &h, argvals.into_iter().next().map(cell));
         }
@@ -1457,9 +1482,32 @@ impl<'a> Interp<'a> {
         obj: &Expr,
         name: &PropName,
         nullsafe: bool,
+        site: usize,
     ) -> Result<Value, PhpError> {
-        let ov = self.eval(obj)?;
+        // Zend sites the prop fetch at the member's end: the name
+        // token's line for `->p`, the name expr's last line for
+        // `->{e}`. A CV obj (bare or folded varvar) binds inside the
+        // FETCH_OBJ op, so its own read sites there too — and its
+        // warn follows the name expr's diagnostics (`->m1` chain
+        // oracle: obj warn after `->{g()}`'s). `?->` keeps the obj's
+        // own line (the JMP_NULL operand is separate).
+        let member_end = match name {
+            PropName::Expr(inner) => Self::inner_end_line(inner).unwrap_or(site),
+            _ => site,
+        };
+        let obj_u = Self::unmark_rhs(obj);
+        let ov = if !nullsafe && Self::is_cv(obj_u) {
+            let pn = self.prop_name(name)?;
+            let ov = self.eval_cv_at(obj_u, member_end)?;
+            self.cur_line = member_end;
+            self.send_line = Some(member_end);
+            return self.prop_read_value(ov, &pn, nullsafe);
+        } else {
+            self.eval(obj)?
+        };
         let pn = self.prop_name(name)?;
+        self.cur_line = member_end;
+        self.send_line = Some(member_end);
         self.prop_read_value(ov, &pn, nullsafe)
     }
 
@@ -1632,15 +1680,27 @@ impl<'a> Interp<'a> {
         obj: &Expr,
         name: &PropName,
         _nullsafe: bool,
+        site: usize,
     ) -> Result<Cell, PhpError> {
+        // Same member-end re-site as prop_read: write-path diags
+        // (default-object creation, magic __get/__set) also site at
+        // the member name's end — and a CV obj's own read fuses into
+        // the fetch op at that line.
+        let member_end = match name {
+            PropName::Expr(inner) => Self::inner_end_line(inner).unwrap_or(site),
+            _ => site,
+        };
+        let obj_u = Self::unmark_rhs(obj);
         self.last_prop_ov = None;
         let pn = self.prop_name(name)?;
-        // Write-context chains evaluate every link as a write fetch —
-        // `$i->p->sub` dies with 'Attempt to modify property "p" on
-        // int' instead of the read warning (probe4j). A paren just
-        // wraps a link.
-        let ov = self.eval_lvalue_obj(obj)?;
+        let ov = if Self::is_cv(obj_u) {
+            self.eval_cv_at(obj_u, member_end)?
+        } else {
+            self.eval_lvalue_obj(obj)?
+        };
         self.last_prop_ov = Some(ov.clone());
+        self.cur_line = member_end;
+        self.send_line = Some(member_end);
         match ov {
             Value::Object(o) => {
                 // Hooks intercept the cell path entirely — `[]`, `&`,

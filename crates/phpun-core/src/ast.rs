@@ -54,6 +54,10 @@ pub enum Stmt {
     Static {
         vars: Vec<(String, Option<Expr>, usize)>,
         line: usize,
+        /// Token index of the `static` keyword — the decl site's stable
+        /// identity within its parse unit (survives FunctionDecl clones,
+        /// unlike the vars Vec's heap address).
+        site: usize,
     },
     Switch {
         cond: Expr,
@@ -380,6 +384,10 @@ pub enum Expr {
         target: Box<Expr>,
         op: &'static str,
         value: Box<Expr>,
+        /// The assignment node's own line — the target's first-token
+        /// line, where zend emits the ASSIGN op (post-eval lineno for
+        /// `${expr}`/`->{expr}` name diagnostics).
+        line: usize,
     },
     Binary {
         op: &'static str,
@@ -398,6 +406,14 @@ pub enum Expr {
     Call {
         name: Box<Expr>,
         args: Vec<Expr>,
+        /// Line the call's pushed frames are sited at: the name token's
+        /// line for `name(...)`, the `(` line for `callable_expr(...)`
+        /// (zend_compile_call_common's `lineno`).
+        site: usize,
+        /// The callee expression's first-token line — zend's
+        /// INIT_DYNAMIC_CALL lineno, where resolution errors
+        /// (undefined function, not-callable) site before args run.
+        callee: usize,
     },
     Index {
         e: Box<Expr>,
@@ -435,6 +451,9 @@ pub enum Expr {
     Match {
         subject: Box<Expr>,
         arms: Vec<MatchArm>,
+        /// Line of the last arm-result's final token — zend stamps an
+        /// empty `[]` result's lone INIT_ARRAY at its `]`.
+        end: usize,
     },
     /// `function (params) use ($a, &$b) { body }` / `fn() => expr`.
     Closure(ClosureExpr),
@@ -442,18 +461,27 @@ pub enum Expr {
     New {
         class: Box<Expr>,
         args: Vec<Expr>,
+        /// Trace site: the class expression's first-token line
+        /// (ZEND_AST_NEW inherits child0's lineno).
+        site: usize,
     },
     /// `$obj->prop` / `$obj->method()` / `?->`.
     Prop {
         obj: Box<Expr>,
         name: PropName,
         nullsafe: bool,
+        /// Trace site: the member-name token's line
+        /// (zend_ast_get_lineno(prop_ast)).
+        site: usize,
     },
     MethodCall {
         obj: Box<Expr>,
         name: PropName,
         args: Vec<Expr>,
         nullsafe: bool,
+        /// Trace site: the member-name token's line
+        /// (zend_ast_get_lineno(method_ast)).
+        site: usize,
     },
     /// `ClassName::CONST` / `::method()` / `::$prop` / `className::class`.
     StaticProp {
@@ -467,12 +495,16 @@ pub enum Expr {
         class: Box<Expr>,
         name: String,
         args: Vec<Expr>,
+        /// Trace site: the member-name token's line.
+        site: usize,
     },
     /// `C::$var(...)` — static call whose method name is an expression.
     StaticCallDyn {
         class: Box<Expr>,
         name: Box<Expr>,
         args: Vec<Expr>,
+        /// Trace site: the member-name expression's first-token line.
+        site: usize,
     },
     ClassConst {
         class: Box<Expr>,
@@ -492,8 +524,12 @@ pub enum Expr {
     },
     /// Magic constant resolved at eval time (__LINE__ handled in parser).
     MagicConst(MagicConst),
-    /// `$$x` / `${expr}` — variable variable.
-    VarVar(Box<Expr>),
+    /// `$$x` / `${expr}` — variable variable. Second field is the
+    /// construct's own end line (the `}`'s line for `${expr}`; the
+    /// last token's line for `$$x`): a folded (`${expr}` with a
+    /// compile-const inner) read sites there, or at the enclosing
+    /// `=`'s own line when it is the assign's direct value.
+    VarVar(Box<Expr>, usize),
     /// `expr(...)` — first-class callable syntax (PHP 8.1): wraps the
     /// call node whose arg list was the bare `...` (Call/MethodCall/
     /// StaticCall/StaticCallDyn, args emptied at parse time).
@@ -556,4 +592,177 @@ pub enum MagicConst {
     Property,
     /// `__TRAIT__` — the trait a method was merged from, "" outside.
     Trait,
+}
+
+/// The line an expression's evaluation ends at — zend's post-eval
+/// (and post-compile) lineno. A call leaves it at the deepest
+/// last-arg marker (dispatch re-sites at the call's own site), a prop
+/// read at the member name's line, a ternary/binary at the last
+/// source operand's end. `None` when `e` has no recorded end.
+pub fn end_line(e: &Expr) -> Option<usize> {
+    match e {
+        // zend's post-eval lineno for a call is its last arg's
+        // line (the DO_FCALL lineno override only touches the op,
+        // not CG) — a zero-arg call leaves it at the call site.
+        Expr::Call { args, site, .. }
+        | Expr::MethodCall { args, site, .. }
+        | Expr::StaticCall { args, site, .. }
+        | Expr::StaticCallDyn { args, site, .. }
+        | Expr::New { args, site, .. } => args.last().and_then(end_line).or(Some(*site)),
+        Expr::ArrayLit(items) => items.iter().rev().find_map(|(_, v)| end_line(v)),
+        Expr::Binary {
+            op: "argline",
+            l,
+            r,
+        } => match r.as_ref() {
+            // A parse-time-folded concat's zval stamps at the reduce
+            // lookahead — the mark records that token's line.
+            Expr::Binary {
+                op: ".",
+                l: cl,
+                r: cr,
+            } if zval_lit(cl) && zval_lit(cr) => match l.as_ref() {
+                Expr::Int(n) => Some(*n as usize),
+                _ => end_line(r),
+            },
+            _ => end_line(r).or_else(|| match l.as_ref() {
+                Expr::Int(n) => Some(*n as usize),
+                _ => None,
+            }),
+        },
+        Expr::Binary { r, .. } => end_line(r),
+        Expr::Ternary { f, .. } => end_line(f),
+        Expr::Prop { name, site, .. } => match name {
+            PropName::Expr(inner) => end_line(inner).or(Some(*site)),
+            _ => Some(*site),
+        },
+        Expr::Index { e, i } => i.as_deref().and_then(end_line).or_else(|| end_line(e)),
+        Expr::Paren(e)
+        | Expr::PreInc(e)
+        | Expr::PreDec(e)
+        | Expr::PostInc(e)
+        | Expr::PostDec(e)
+        | Expr::Print(e)
+        | Expr::Clone(e)
+        | Expr::Unpack(e)
+        | Expr::Fcc(e)
+        | Expr::Throw(e)
+        | Expr::YieldFrom(e)
+        | Expr::Empty(e) => end_line(e),
+        Expr::Unary { e, .. } | Expr::Cast { e, .. } => end_line(e),
+        // A varvar's effective position is its inner's — for a
+        // folded varvar that's the inner's first-token line (CV
+        // semantics), for a dynamic one the inner's last
+        // evaluated line.
+        Expr::VarVar(inner, _) => end_line(inner),
+        // Zend emits the ASSIGN op at the assignment node's own
+        // line (the target's first token) — not the value's end.
+        // A `list()`/`[]` destructure ends at its last element's
+        // own store line instead (zend's post-eval lineno).
+        Expr::Assign { target, line, .. } => match target.as_ref() {
+            Expr::List(_) => end_line(target).or(Some(*line)),
+            _ => Some(*line),
+        },
+        Expr::List(items) => items
+            .iter()
+            .rev()
+            .find_map(|i| i.as_ref())
+            .and_then(|(_, e)| end_line(e)),
+        // A match expr's compiled end is its last arm's result. A
+        // parse-time-folded concat already carries its following-token
+        // stamp on its argline mark; `[]`'s lone INIT_ARRAY stamps at
+        // the `]` token instead of an element line.
+        Expr::Match { arms, end, .. } => match arms.last() {
+            Some(arm) if matches!(unmarked(&arm.result), Expr::ArrayLit(items) if items.is_empty()) => {
+                Some(*end)
+            }
+            _ => arms.last().and_then(|a| end_line(&a.result)),
+        },
+        _ => None,
+    }
+}
+
+/// Marks transparent to a node's shape — `argline`, parens and by-ref
+/// wrappers — so a folded literal under them is still seen.
+fn unmarked(mut e: &Expr) -> &Expr {
+    loop {
+        e = match e {
+            Expr::Paren(inner) | Expr::ByRef(inner) => inner,
+            Expr::Binary {
+                op: "argline", r, ..
+            } => r,
+            _ => return e,
+        };
+    }
+}
+
+/// A literal-string-shaped concat operand — zend's parse-time
+/// `zend_ast_create_concat_op` folds these into one zval.
+pub(crate) fn zval_lit(e: &Expr) -> bool {
+    match unmarked(e) {
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) => true,
+        Expr::Interp(parts) => parts.iter().all(|p| matches!(p, StringPart::Lit(_))),
+        Expr::Binary { op: ".", l, r } => zval_lit(l) && zval_lit(r),
+        _ => false,
+    }
+}
+
+/// The expression's first-token line — zend_ast_get_lineno. An
+/// `argline` mark records exactly that for the expression it wraps;
+/// every other node resolves to its first child's first token
+/// (create_N takes child1's lineno). `None` for bare leaves, which
+/// carry no line (their `argline` wrapper does).
+pub fn start_line(e: &Expr) -> Option<usize> {
+    match e {
+        Expr::Binary {
+            op: "argline",
+            l,
+            r,
+        } => match l.as_ref() {
+            Expr::Int(n) => Some(*n as usize),
+            _ => start_line(r),
+        },
+        // `k => v` in a destructure list: zend's ARRAY_ELEM lineno is
+        // the VALUE's first token, not the key's.
+        Expr::Binary {
+            op: "listkey", r, ..
+        } => start_line(r),
+        Expr::Binary { l, .. } => start_line(l),
+        Expr::Paren(e)
+        | Expr::ByRef(e)
+        | Expr::PreInc(e)
+        | Expr::PreDec(e)
+        | Expr::PostInc(e)
+        | Expr::PostDec(e)
+        | Expr::Print(e)
+        | Expr::Clone(e)
+        | Expr::Unpack(e)
+        | Expr::Fcc(e)
+        | Expr::Throw(e)
+        | Expr::YieldFrom(e)
+        | Expr::Empty(e) => start_line(e),
+        Expr::Unary { e, .. } | Expr::Cast { e, .. } => start_line(e),
+        Expr::Ternary { c, .. } => start_line(c),
+        Expr::Index { e, .. } => start_line(e),
+        Expr::Prop { obj, .. } | Expr::MethodCall { obj, .. } => start_line(obj),
+        Expr::Call { callee, .. } => Some(*callee),
+        Expr::StaticCall { class, .. }
+        | Expr::StaticCallDyn { class, .. }
+        | Expr::StaticProp { class, .. }
+        | Expr::ClassConst { class, .. } => start_line(class),
+        Expr::Instanceof { obj, .. } => start_line(obj),
+        Expr::New { site, .. } => Some(*site),
+        Expr::Assign { line, .. } => Some(*line),
+        // zend's ARRAY list-node lineno is the first element's —
+        // an ARRAY_ELEM's lineno is its VALUE's first token.
+        Expr::ArrayLit(items) => items.first().and_then(|(_, v)| start_line(v)),
+        Expr::List(items) => items
+            .iter()
+            .flatten()
+            .next()
+            .and_then(|(_, e)| start_line(e)),
+        Expr::Isset(args) => args.first().and_then(start_line),
+        Expr::VarVar(inner, _) => start_line(inner),
+        _ => None,
+    }
 }

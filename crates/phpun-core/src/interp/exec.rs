@@ -1,6 +1,7 @@
 //! Statement execution: `exec_block`/`exec` plus the loop and
 //! foreach drivers — the first seam a bytecode pipeline replaces.
 
+use super::expr::CondFold;
 use super::util::*;
 use super::*;
 
@@ -50,15 +51,21 @@ impl<'a> Interp<'a> {
             i += 1;
             // memory_limit fires between statements (bug45392).
             let limit = self.ini_bytes("memory_limit");
-            if limit > 0 && self.mem_used as i64 > limit {
+            if limit > 0 && self.mem_total() > limit {
                 self.mem_exceeded = true;
-                return self.err_flow(PhpError::fatal(
+                // Zend's OOM fatal always prints a Stack trace:
+                // block (`#0 {main}` at top level) — a plain E_ERROR
+                // wouldn't.
+                let mut e = PhpError::fatal(
                     format!(
                         "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
-                        limit, self.mem_last
+                        limit,
+                        crate::value::mem_last_alloc()
                     ),
                     self.cur_line,
-                ));
+                );
+                e.trace = Some(self.fatal_frames());
+                return self.err_flow(e);
             }
             if let Some(d) = self.deadline {
                 if std::time::Instant::now() > d {
@@ -195,6 +202,7 @@ impl<'a> Interp<'a> {
         match s {
             Stmt::Line(l) => {
                 self.cur_line = *l;
+                self.send_line = None;
                 Flow::Normal
             }
             // Compile-time diagnostics park before their source stmt;
@@ -221,7 +229,7 @@ impl<'a> Interp<'a> {
                 }
                 Flow::Normal
             }
-            Stmt::Expr(e) => match e {
+            Stmt::Expr(e) => match Self::unmark_rhs(e) {
                 // A lone `$x;` compiles to a dead FREE op in Zend — no
                 // undefined-variable warning (first_class_callable_dynamic).
                 Expr::Var(n) if self.var_lookup(n).is_none() => Flow::Normal,
@@ -335,50 +343,159 @@ impl<'a> Interp<'a> {
                 body,
             } => self.exec_foreach(arr, key, val, body),
             Stmt::Switch { cond, cases } => {
-                let cv = match self.eval(cond) {
-                    Ok(v) => v,
-                    Err(e) => return self.err_flow(e),
+                // zend compiles the subject once, then const-scans the
+                // case exprs L→R (`determine_switch_jumptable_type`):
+                // each foldable case rewrites to a zval stamped at the
+                // subject's compiled end line; the scan stops at the
+                // first that can't fold to an int/string zval. That
+                // scan decides both the SWITCH_* jumptable op AND the
+                // lineno of every CASE op zend still emits as a
+                // fallback — so whether or not the jumptable fires,
+                // a CV subject's warnings site per case at the case's
+                // scanned line (the SWITCH op itself reads an undef CV
+                // silently and falls through to the chain).
+                let cond_u = Self::unmark_rhs(cond);
+                let cv_subject = Self::is_cv(cond_u);
+                // CG(zend_lineno) after the subject's compile — where
+                // every folded case's stamped zval sites.
+                let subj_site = if cv_subject {
+                    Self::cv_site_of(cond, cond_u).unwrap_or(self.cur_line)
+                } else {
+                    match cond_u {
+                        Expr::Binary { .. } if is_compile_const(cond_u) => {
+                            Self::inner_end_line(cond)
+                                .map(|l| l + 1)
+                                .unwrap_or(self.cur_line)
+                        }
+                        Expr::Binary { .. } => Self::inner_end_line(cond).unwrap_or(self.cur_line),
+                        _ => Self::marked_line(cond).unwrap_or(self.cur_line),
+                    }
+                };
+                // The const scan's per-case compare line and operand
+                // — entries exist only for the scanned prefix; later
+                // cases fall back to their own end line. The operand
+                // differs from the case expr only when zend's scan
+                // spliced a `??`/`?:` survivor into the slot.
+                let mut sites: Vec<(usize, &Expr)> = Vec::with_capacity(cases.len());
+                'scan: for (c, _) in cases {
+                    let Some(ce) = c else { continue };
+                    match self.cond_fold(ce) {
+                        CondFold::Literal(e, v) => {
+                            sites.push((
+                                Self::marked_line(e)
+                                    .or_else(|| Self::inner_end_line(e))
+                                    .unwrap_or(subj_site),
+                                ce,
+                            ));
+                            if !matches!(v, Value::Int(_) | Value::Str(_)) {
+                                break 'scan;
+                            }
+                        }
+                        CondFold::Folded(v) => {
+                            sites.push((subj_site, ce));
+                            if !matches!(v, Value::Int(_) | Value::Str(_)) {
+                                break 'scan;
+                            }
+                        }
+                        CondFold::Unfolded(u) => {
+                            sites.push((
+                                self.unfold_tail_site(u, subj_site)
+                                    .or_else(|| Self::inner_end_line(u))
+                                    .or_else(|| Self::marked_line(u))
+                                    .or_else(|| Self::inner_end_line(ce))
+                                    .or_else(|| Self::marked_line(ce))
+                                    .unwrap_or(self.cur_line),
+                                u,
+                            ));
+                            break 'scan;
+                        }
+                    }
+                }
+                let cv: Option<Value> = if cv_subject {
+                    None
+                } else {
+                    match self.eval(cond) {
+                        Ok(v) => Some(v),
+                        Err(e) => return self.err_flow(e),
+                    }
                 };
                 // Find first matching case (loose ==); default is fallback.
                 let mut start: Option<usize> = None;
                 let mut default_idx: Option<usize> = None;
+                let mut ci = 0;
                 for (i, (c, _)) in cases.iter().enumerate() {
                     match c {
                         Some(ce) => {
+                            let scanned = sites.get(ci).is_some();
+                            let (cl, operand) = sites.get(ci).copied().unwrap_or_else(|| {
+                                (
+                                    Self::inner_end_line(ce)
+                                        .or_else(|| Self::marked_line(ce))
+                                        .unwrap_or(self.cur_line),
+                                    ce,
+                                )
+                            });
+                            ci += 1;
+                            self.cur_line = cl;
                             if start.is_none() {
-                                match self.eval(ce) {
-                                    Ok(v) => {
-                                        // ZEND_CASE (TMP|VAR subjects) is
-                                        // noncommutative — subject stays
-                                        // left; CONST|CV subjects emit
-                                        // IS_EQUAL which pass_two
-                                        // commutative-swaps when the case
-                                        // operand ranks higher.
-                                        let r = compare_operand_rank(cond);
-                                        let (x, y) = if (r & 6) == 0 && r < compare_operand_rank(ce)
-                                        {
-                                            (&v, &cv)
-                                        } else {
-                                            (&cv, &v)
+                                // ZEND_CASE binds op1 (subject) then
+                                // op2 (case) inside the compare op:
+                                // a CV case's own read sites there —
+                                // its warn follows the subject's bind.
+                                // Other cases emit their ops first.
+                                let cu = Self::unmark_rhs(operand);
+                                // The const scan ran on this case: its
+                                // folded leaves carry the subject-end
+                                // stamp, so ops inside the operand site
+                                // by the tail rule.
+                                let prev_stamp = self.scan_stamp.take();
+                                if scanned {
+                                    self.scan_stamp = Some(subj_site);
+                                }
+                                let pair = if cv.is_none() && Self::is_cv(cu) {
+                                    self.eval_cv_at(cond_u, cl)
+                                        .and_then(|cvv| self.eval(operand).map(|v| (v, cvv)))
+                                } else {
+                                    self.eval(operand).and_then(|v| {
+                                        let cvv = match &cv {
+                                            Some(cv) => Ok(cv.clone()),
+                                            None => self.eval_cv_at(cond_u, cl),
                                         };
-                                        crate::value::clear_cmp_depth_err();
-                                        if compare(x, y) == Ordering::Equal {
-                                            start = Some(i);
-                                        }
-                                        if let Err(e) = self.emit_cmp_notices() {
-                                            return self.err_flow(e);
-                                        }
-                                        if crate::value::cmp_depth_err() {
-                                            if let Err(e) = self.fail::<()>(PhpError::uncaught(
-                                                "Error",
-                                                "Nesting level too deep - recursive dependency?",
-                                                self.cur_line,
-                                            )) {
-                                                return self.err_flow(e);
-                                            }
-                                        }
-                                    }
+                                        cvv.map(|cvv| (v, cvv))
+                                    })
+                                };
+                                self.scan_stamp = prev_stamp;
+                                let (v, cvv) = match pair {
+                                    Ok(p) => p,
                                     Err(e) => return self.err_flow(e),
+                                };
+                                // ZEND_CASE (TMP|VAR subjects) is
+                                // noncommutative — subject stays
+                                // left; CONST|CV subjects emit
+                                // IS_EQUAL which pass_two
+                                // commutative-swaps when the case
+                                // operand ranks higher.
+                                let r = compare_operand_rank(cond);
+                                let (x, y) = if (r & 6) == 0 && r < compare_operand_rank(ce) {
+                                    (&v, &cvv)
+                                } else {
+                                    (&cvv, &v)
+                                };
+                                crate::value::clear_cmp_depth_err();
+                                if compare(x, y) == Ordering::Equal {
+                                    start = Some(i);
+                                }
+                                if let Err(e) = self.emit_cmp_notices() {
+                                    return self.err_flow(e);
+                                }
+                                if crate::value::cmp_depth_err() {
+                                    if let Err(e) = self.fail::<()>(PhpError::uncaught(
+                                        "Error",
+                                        "Nesting level too deep - recursive dependency?",
+                                        self.cur_line,
+                                    )) {
+                                        return self.err_flow(e);
+                                    }
                                 }
                             }
                         }
@@ -483,7 +600,7 @@ impl<'a> Interp<'a> {
                 }
                 Flow::Normal
             }
-            Stmt::Static { vars, .. } => {
+            Stmt::Static { vars, site, .. } => {
                 let mut key = self.fn_statics_key();
                 // Static storage keys on the op_array the decl was
                 // compiled into: a function body's own table (bare key),
@@ -505,10 +622,15 @@ impl<'a> Interp<'a> {
                 // (static_basic_002) — while re-executing the same
                 // statement (loops) or redeclaring in a different unit
                 // — a separate include/eval/run, which Zend compiles to
-                // a fresh op_array — is not. The serial (not the file
-                // string) keys the unit: a re-parsed unit may recycle
-                // the freed Vec's stmt ptr and must still count as new.
-                let site = (self.cur_unit_id, vars.as_ptr() as usize);
+                // a fresh op_array — is not. The unit serial (not the
+                // file string) keys the unit; the site key is the
+                // `static` keyword's token index —
+                // stable across the per-call FunctionDecl clones method
+                // dispatch makes (vars.as_ptr() ABA-flakes: a reallocated
+                // clone's address can alias a freed decl's, falsely
+                // deduping, or differ from itself across calls, falsely
+                // reporting 'Duplicate declaration').
+                let site = (self.cur_unit_id, *site);
                 for (name, default, var_line) in vars {
                     // Every site is kept: a decl in a different unit is
                     // legal AND must not erase the same-unit record a
@@ -574,12 +696,15 @@ impl<'a> Interp<'a> {
                     if let Some(e) = e {
                         // `function &f() { return $x; }` — the returned cell is
                         // bound, not copied (returnByReference tests).
+                        // `(expr)` parens are transparent: `return ($a)`
+                        // binds $a's cell just like `return $a`.
+                        let e_u = Self::unmark_rhs(e);
                         let is_lval = matches!(
-                            e,
+                            e_u,
                             Expr::Var(_)
                                 | Expr::Index { .. }
                                 | Expr::Prop { .. }
-                                | Expr::VarVar(_)
+                                | Expr::VarVar(..)
                                 | Expr::StaticProp { .. }
                         );
                         if is_lval {
@@ -591,7 +716,7 @@ impl<'a> Interp<'a> {
                             return Flow::Return(c.borrow().clone());
                         }
                         if matches!(
-                            e,
+                            e_u,
                             Expr::Call { .. }
                                 | Expr::MethodCall { .. }
                                 | Expr::StaticCall { .. }
@@ -639,7 +764,7 @@ impl<'a> Interp<'a> {
                     let name = match e {
                         Expr::Var(n) => n.clone(),
                         // `global $$b` — the global name is $b's value.
-                        Expr::VarVar(inner) => match self.eval(inner) {
+                        Expr::VarVar(inner, _) => match self.eval(inner) {
                             Ok(v) => match self.conv_str(&v) {
                                 Ok(s) => s,
                                 Err(e) => return self.err_flow(e),
@@ -704,7 +829,7 @@ impl<'a> Interp<'a> {
                                 }
                             }
                         }
-                        Expr::VarVar(inner) => {
+                        Expr::VarVar(inner, _) => {
                             if let Ok(n) = self.eval(inner) {
                                 if let Ok(name) = self.conv_str(&n) {
                                     self.cur().vars.remove(&name);
@@ -878,6 +1003,13 @@ impl<'a> Interp<'a> {
     /// Normal.
     fn try_finally(&mut self, out: Flow, finally: &Option<Vec<Stmt>>) -> Flow {
         match finally {
+            Some(_) if matches!(out, Flow::Exit(_)) => {
+                // zend's bailout (exit(), a compile fatal's
+                // unwinding) skips finally blocks entirely —
+                // only throwables and ordinary control flow
+                // run them.
+                out
+            }
             Some(fb) => {
                 // Output of a finally region inside a generator body
                 // is death-time output (Zend replays it when the
@@ -941,8 +1073,14 @@ impl<'a> Interp<'a> {
                 // `break (2)` is a parenthesized literal — still valid;
                 // variables/arithmetic are not supported operands.
                 let mut inner = e;
-                while let Expr::Paren(p) = inner {
-                    inner = p;
+                loop {
+                    inner = match inner {
+                        Expr::Paren(p) => p,
+                        Expr::Binary {
+                            op: "argline", r, ..
+                        } => r,
+                        _ => break,
+                    };
                 }
                 match inner {
                     Expr::Int(i) if *i > 0 => *i as u32,
@@ -1030,6 +1168,10 @@ impl<'a> Interp<'a> {
             e.trace = Some(self.compile_err_frames());
             return self.err_flow(e);
         }
+        // The foreach's own line — Zend's FE ops carry the header's
+        // line, so a deferred gen-body death cites it for the
+        // suspended frame (cur_line drifts into the loop body).
+        let iter_site = self.cur_line;
         // Diagnostics raised while destructuring an element attribute
         // to the foreach statement itself — capture its line before
         // `arr` evaluation drifts cur_line into arg positions.
@@ -1045,7 +1187,7 @@ impl<'a> Interp<'a> {
         let cell_src = Self::foreach_target_by_ref(val)
             && matches!(
                 arr_e,
-                Expr::Prop { .. } | Expr::StaticProp { .. } | Expr::Index { .. } | Expr::VarVar(_)
+                Expr::Prop { .. } | Expr::StaticProp { .. } | Expr::Index { .. } | Expr::VarVar(..)
             );
         let src = if cell_src {
             // A `&` source is a by-ref bind — uninitialized typed props
@@ -1275,7 +1417,8 @@ impl<'a> Interp<'a> {
                             }
                             // getIterator() must return a Traversable.
                             Value::Object(io) if self.obj_is_a(&io, "Iterator") => {
-                                return self.exec_foreach_iter(io, key, val, body, stmt_line);
+                                return self
+                                    .exec_foreach_iter(io, key, val, body, iter_site, stmt_line);
                             }
                             _ => {
                                 let cls_name = cur.borrow().class.name().to_string();
@@ -1309,7 +1452,7 @@ impl<'a> Interp<'a> {
                         let e = self.throw(v);
                         return self.err_flow(e);
                     }
-                    return self.exec_foreach_iter(o.clone(), key, val, body, stmt_line);
+                    return self.exec_foreach_iter(o.clone(), key, val, body, iter_site, stmt_line);
                 }
                 // Plain object: iterate the property table in
                 // declaration order — backed slots plus *virtual* hooked
@@ -1580,15 +1723,21 @@ impl<'a> Interp<'a> {
     }
 
     /// foreach over an Iterator: rewind → valid → current/key → next.
+    /// `iter_site` is the foreach statement's own line — a deferred
+    /// gen-body death cites it for the suspended frame (Zend's FE ops
+    /// carry the header line).
     fn exec_foreach_iter(
         &mut self,
         it: Rc<RefCell<PhpObject>>,
         key: &Option<ForeachKey>,
         val: &ForeachTarget,
         body: &[Stmt],
+        iter_site: usize,
         stmt_line: usize,
     ) -> Flow {
+        let saved_isite = self.gen_iter_site.replace(iter_site);
         let f = self.exec_foreach_iter_loop(it.clone(), key, val, body, stmt_line);
+        self.gen_iter_site = saved_isite;
         // The iterator's temp dies with the foreach — a `new` captured
         // only by the iteration frees here, not at statement end
         // (typed_properties_115: its prop cells must unalias before a

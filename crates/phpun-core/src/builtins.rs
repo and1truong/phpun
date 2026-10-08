@@ -220,372 +220,615 @@ pub(crate) fn builtin_param_ty(f: &str, p: &str) -> Option<Vec<String>> {
     Some(ms.iter().map(|m| m.to_string()).collect())
 }
 
+/// Every dispatchable internal-function name — the table
+/// `get_defined_functions()['internal']` walks and `function_exists`
+/// probes (kept sorted; add a name here when a new family arm lands).
+pub(crate) const BUILTIN_NAMES: &[&str] = &[
+    "abs",
+    "acos",
+    "addcslashes",
+    "addslashes",
+    "array_change_key_case",
+    "array_chunk",
+    "array_column",
+    "array_combine",
+    "array_count_values",
+    "array_diff",
+    "array_diff_assoc",
+    "array_diff_key",
+    "array_fill",
+    "array_fill_keys",
+    "array_filter",
+    "array_first",
+    "array_flip",
+    "array_intersect",
+    "array_intersect_assoc",
+    "array_intersect_key",
+    "array_is_list",
+    "array_key_exists",
+    "array_key_first",
+    "array_key_last",
+    "array_keys",
+    "array_map",
+    "array_merge",
+    "array_merge_recursive",
+    "array_multisort",
+    "array_pad",
+    "array_pop",
+    "array_product",
+    "array_push",
+    "array_rand",
+    "array_reduce",
+    "array_replace",
+    "array_replace_recursive",
+    "array_reverse",
+    "array_search",
+    "array_shift",
+    "array_slice",
+    "array_splice",
+    "array_sum",
+    "array_unique",
+    "array_unshift",
+    "array_values",
+    "array_walk",
+    "array_walk_recursive",
+    "arsort",
+    "asin",
+    "asort",
+    "assert",
+    "assert_options",
+    "atan",
+    "atan2",
+    "base64_decode",
+    "base64_encode",
+    "base_convert",
+    "basename",
+    "bin2hex",
+    "bindec",
+    "boolval",
+    "call_user_func",
+    "call_user_func_array",
+    "ceil",
+    "chdir",
+    "checkdate",
+    "chgrp",
+    "chmod",
+    "chop",
+    "chown",
+    "chr",
+    "chunk_split",
+    "class_alias",
+    "class_exists",
+    "class_implements",
+    "class_parents",
+    "class_uses",
+    "clearstatcache",
+    "cli_get_process_title",
+    "cli_set_process_title",
+    "clone",
+    "closedir",
+    "closelog",
+    "compact",
+    "connection_aborted",
+    "connection_status",
+    "constant",
+    "copy",
+    "cos",
+    "cosh",
+    "count",
+    "count_chars",
+    "crc32",
+    "ctype_alnum",
+    "ctype_alpha",
+    "ctype_cntrl",
+    "ctype_digit",
+    "ctype_graph",
+    "ctype_lower",
+    "ctype_print",
+    "ctype_punct",
+    "ctype_space",
+    "ctype_upper",
+    "ctype_xdigit",
+    "current",
+    "date",
+    "date_default_timezone_get",
+    "date_default_timezone_set",
+    "date_parse",
+    "date_sun_info",
+    "date_sunrise",
+    "date_sunset",
+    "debug_backtrace",
+    "debug_print_backtrace",
+    "debug_zval_dump",
+    "decbin",
+    "dechex",
+    "decoct",
+    "define",
+    "defined",
+    "deg2rad",
+    "die",
+    "dirname",
+    "disk_free_space",
+    "disk_total_space",
+    "diskfreespace",
+    "dl",
+    "doubleval",
+    "end",
+    "enum_exists",
+    "error_clear_last",
+    "error_get_last",
+    "error_reporting",
+    "escapeshellarg",
+    "escapeshellcmd",
+    "exec",
+    "exit",
+    "exp",
+    "explode",
+    "extension_loaded",
+    "extract",
+    "fastcgi_finish_request",
+    "fclose",
+    "fdiv",
+    "feof",
+    "fflush",
+    "fgetc",
+    "fgetcsv",
+    "fgets",
+    "file",
+    "file_exists",
+    "file_get_contents",
+    "file_put_contents",
+    "fileatime",
+    "filectime",
+    "filegroup",
+    "fileinode",
+    "filemtime",
+    "fileowner",
+    "fileperms",
+    "filesize",
+    "filetype",
+    "filter_var",
+    "floatval",
+    "flock",
+    "floor",
+    "flush",
+    "fmod",
+    "fnmatch",
+    "fopen",
+    "forward_static_call",
+    "forward_static_call_array",
+    "fpassthru",
+    "fprintf",
+    "fputcsv",
+    "fputs",
+    "fread",
+    "fscanf",
+    "fseek",
+    "fstat",
+    "ftell",
+    "ftruncate",
+    "func_get_arg",
+    "func_get_args",
+    "func_num_args",
+    "function_exists",
+    "fwrite",
+    "gc_collect_cycles",
+    "gc_disable",
+    "gc_enable",
+    "gc_enabled",
+    "gc_mem_caches",
+    "gc_status",
+    "get_called_class",
+    "get_cfg_var",
+    "get_class",
+    "get_class_methods",
+    "get_class_vars",
+    "get_current_user",
+    "get_debug_type",
+    "get_declared_classes",
+    "get_declared_interfaces",
+    "get_declared_traits",
+    "get_defined_functions",
+    "get_extension_funcs",
+    "get_include_path",
+    "get_loaded_extensions",
+    "get_mangled_object_vars",
+    "get_meta_tags",
+    "get_object_vars",
+    "get_parent_class",
+    "get_resource_id",
+    "get_resource_type",
+    "getcwd",
+    "getenv",
+    "getmygid",
+    "getmyinode",
+    "getmypid",
+    "getmyuid",
+    "getopt",
+    "getrandmax",
+    "gettype",
+    "glob",
+    "gmdate",
+    "gmmktime",
+    "hash",
+    "hash_equals",
+    "header",
+    "header_register_callback",
+    "header_remove",
+    "headers_list",
+    "headers_sent",
+    "hex2bin",
+    "hexdec",
+    "highlight_file",
+    "highlight_string",
+    "hrtime",
+    "html_entity_decode",
+    "htmlentities",
+    "htmlspecialchars",
+    "htmlspecialchars_decode",
+    "http_build_query",
+    "http_response_code",
+    "hypot",
+    "ignore_user_abort",
+    "implode",
+    "in_array",
+    "ini_alter",
+    "ini_get",
+    "ini_get_all",
+    "ini_parse_quantity",
+    "ini_restore",
+    "ini_set",
+    "intdiv",
+    "interface_exists",
+    "intval",
+    "ip2long",
+    "is_a",
+    "is_array",
+    "is_bool",
+    "is_callable",
+    "is_countable",
+    "is_dir",
+    "is_double",
+    "is_executable",
+    "is_file",
+    "is_finite",
+    "is_float",
+    "is_infinite",
+    "is_int",
+    "is_integer",
+    "is_iterable",
+    "is_link",
+    "is_long",
+    "is_nan",
+    "is_null",
+    "is_numeric",
+    "is_object",
+    "is_readable",
+    "is_resource",
+    "is_scalar",
+    "is_string",
+    "is_subclass_of",
+    "is_uploaded_file",
+    "is_writable",
+    "is_writeable",
+    "iterator_apply",
+    "iterator_count",
+    "iterator_to_array",
+    "join",
+    "json_decode",
+    "json_encode",
+    "json_last_error",
+    "json_last_error_msg",
+    "json_validate",
+    "key",
+    "key_exists",
+    "krsort",
+    "ksort",
+    "lcfirst",
+    "lcg_value",
+    "levenshtein",
+    "link",
+    "linkinfo",
+    "log",
+    "log10",
+    "lstat",
+    "ltrim",
+    "mail",
+    "max",
+    "mb_check_encoding",
+    "mb_chr",
+    "mb_convert_case",
+    "mb_convert_encoding",
+    "mb_convert_variables",
+    "mb_detect_encoding",
+    "mb_detect_order",
+    "mb_encoding_aliases",
+    "mb_http_input",
+    "mb_http_output",
+    "mb_internal_encoding",
+    "mb_language",
+    "mb_lcfirst",
+    "mb_list_encodings",
+    "mb_ltrim",
+    "mb_ord",
+    "mb_regex_encoding",
+    "mb_rtrim",
+    "mb_scrub",
+    "mb_split",
+    "mb_str_pad",
+    "mb_str_split",
+    "mb_strcut",
+    "mb_stripos",
+    "mb_stristr",
+    "mb_strlen",
+    "mb_strpos",
+    "mb_strrchr",
+    "mb_strrichr",
+    "mb_strripos",
+    "mb_strrpos",
+    "mb_strstr",
+    "mb_strtolower",
+    "mb_strtoupper",
+    "mb_substitute_character",
+    "mb_substr",
+    "mb_substr_count",
+    "mb_trim",
+    "mb_ucfirst",
+    "md5",
+    "memory_get_peak_usage",
+    "memory_get_usage",
+    "memory_reset_peak_usage",
+    "metaphone",
+    "method_exists",
+    "microtime",
+    "min",
+    "mkdir",
+    "mktime",
+    "move_uploaded_file",
+    "mt_getrandmax",
+    "mt_rand",
+    "mt_srand",
+    "natcasesort",
+    "natsort",
+    "next",
+    "nl2br",
+    "number_format",
+    "ob_clean",
+    "ob_end_clean",
+    "ob_end_flush",
+    "ob_flush",
+    "ob_get_clean",
+    "ob_get_contents",
+    "ob_get_flush",
+    "ob_get_length",
+    "ob_get_level",
+    "ob_get_status",
+    "ob_implicit_flush",
+    "ob_list_handlers",
+    "ob_start",
+    "octdec",
+    "opendir",
+    "openlog",
+    "openssl_random_pseudo_bytes",
+    "openssl_x509_parse",
+    "ord",
+    "output_add_rewrite_var",
+    "output_reset_rewrite_vars",
+    "pack",
+    "parse_ini_file",
+    "parse_ini_string",
+    "parse_str",
+    "parse_url",
+    "passthru",
+    "pathinfo",
+    "pathinfo_dirname",
+    "pclose",
+    "php_ini_loaded_file",
+    "php_ini_scanned_files",
+    "php_sapi_name",
+    "php_strip_whitespace",
+    "php_uname",
+    "phpcredits",
+    "phpinfo",
+    "phpversion",
+    "pi",
+    "popen",
+    "pos",
+    "posix_isatty",
+    "pow",
+    "preg_filter",
+    "preg_grep",
+    "preg_jit",
+    "preg_last_error",
+    "preg_last_error_msg",
+    "preg_match",
+    "preg_match_all",
+    "preg_quote",
+    "preg_replace",
+    "preg_replace_callback",
+    "preg_replace_callback_array",
+    "preg_split",
+    "prev",
+    "print",
+    "print_r",
+    "printf",
+    "proc_close",
+    "proc_get_status",
+    "proc_nice",
+    "proc_open",
+    "proc_terminate",
+    "property_exists",
+    "putenv",
+    "quotemeta",
+    "rad2deg",
+    "rand",
+    "random_bytes",
+    "random_int",
+    "range",
+    "rawurldecode",
+    "rawurlencode",
+    "readdir",
+    "readfile",
+    "readlink",
+    "realpath",
+    "register_shutdown_function",
+    "register_tick_function",
+    "rename",
+    "reset",
+    "restore_error_handler",
+    "restore_exception_handler",
+    "rewind",
+    "rewinddir",
+    "rmdir",
+    "round",
+    "rsort",
+    "rtrim",
+    "scandir",
+    "serialize",
+    "set_error_handler",
+    "set_exception_handler",
+    "set_include_path",
+    "set_time_limit",
+    "setcookie",
+    "setlocale",
+    "setrawcookie",
+    "settype",
+    "sha1",
+    "shell_exec",
+    "show_source",
+    "shuffle",
+    "similar_text",
+    "sin",
+    "sinh",
+    "sizeof",
+    "sleep",
+    "sort",
+    "soundex",
+    "spl_autoload_call",
+    "spl_autoload_functions",
+    "spl_autoload_register",
+    "spl_autoload_unregister",
+    "spl_object_hash",
+    "spl_object_id",
+    "sprintf",
+    "sqrt",
+    "srand",
+    "sscanf",
+    "stat",
+    "str_contains",
+    "str_ends_with",
+    "str_ireplace",
+    "str_pad",
+    "str_repeat",
+    "str_replace",
+    "str_rot13",
+    "str_split",
+    "str_starts_with",
+    "str_word_count",
+    "strcasecmp",
+    "strchr",
+    "strcmp",
+    "strcspn",
+    "stream_bucket_append",
+    "stream_bucket_make_writeable",
+    "stream_bucket_new",
+    "stream_bucket_prepend",
+    "stream_context_create",
+    "stream_context_get_default",
+    "stream_context_get_options",
+    "stream_context_set_option",
+    "stream_copy_to_stream",
+    "stream_filter_append",
+    "stream_filter_prepend",
+    "stream_filter_register",
+    "stream_filter_remove",
+    "stream_get_contents",
+    "stream_get_filters",
+    "stream_get_meta_data",
+    "stream_get_wrappers",
+    "stream_isatty",
+    "stream_select",
+    "stream_set_blocking",
+    "stream_set_chunk_size",
+    "stream_set_read_buffer",
+    "stream_set_timeout",
+    "stream_set_write_buffer",
+    "stream_wrapper_register",
+    "stream_wrapper_unregister",
+    "strip_tags",
+    "stripcslashes",
+    "stripos",
+    "stripslashes",
+    "stristr",
+    "strlen",
+    "strncasecmp",
+    "strncmp",
+    "strpos",
+    "strrev",
+    "strripos",
+    "strrpos",
+    "strspn",
+    "strstr",
+    "strtolower",
+    "strtotime",
+    "strtoupper",
+    "strtr",
+    "strval",
+    "substr",
+    "substr_count",
+    "substr_replace",
+    "symlink",
+    "sys_get_temp_dir",
+    "syslog",
+    "system",
+    "tan",
+    "tanh",
+    "tempnam",
+    "time",
+    "time_nanosleep",
+    "time_sleep_until",
+    "tmpfile",
+    "token_get_all",
+    "token_name",
+    "touch",
+    "trait_exists",
+    "trigger_error",
+    "trim",
+    "uasort",
+    "ucfirst",
+    "ucwords",
+    "uksort",
+    "umask",
+    "uniqid",
+    "unlink",
+    "unpack",
+    "unregister_tick_function",
+    "unserialize",
+    "urldecode",
+    "urlencode",
+    "user_error",
+    "usleep",
+    "usort",
+    "var_dump",
+    "var_export",
+    "version_compare",
+    "vfprintf",
+    "vprintf",
+    "vsprintf",
+    "wordwrap",
+    "zend_version",
+];
+
 pub(crate) fn is_builtin(n: &str) -> bool {
-    matches!(
-        n,
-        "abs"
-            | "acos"
-            | "addcslashes"
-            | "addslashes"
-            | "array_change_key_case"
-            | "array_chunk"
-            | "array_column"
-            | "array_combine"
-            | "array_count_values"
-            | "array_diff"
-            | "array_diff_assoc"
-            | "array_diff_key"
-            | "array_fill"
-            | "array_fill_keys"
-            | "array_filter"
-            | "array_flip"
-            | "array_intersect"
-            | "array_intersect_assoc"
-            | "array_intersect_key"
-            | "array_is_list"
-            | "array_key_exists_slow"
-            | "array_key_last"
-            | "array_keys"
-            | "array_map"
-            | "array_multisort"
-            | "array_pad"
-            | "array_pop"
-            | "array_product"
-            | "array_push"
-            | "array_rand"
-            | "array_reduce"
-            | "array_replace"
-            | "array_reverse"
-            | "array_search"
-            | "array_shift"
-            | "array_slice"
-            | "array_splice"
-            | "array_sum"
-            | "array_unique"
-            | "array_unshift"
-            | "array_values"
-            | "array_walk"
-            | "asin"
-            | "assert"
-            | "assert_options"
-            | "assert_options_now"
-            | "atan"
-            | "atan2"
-            | "base64_decode"
-            | "base64_encode"
-            | "base_convert"
-            | "basename"
-            | "bin2hex"
-            | "bindec"
-            | "boolval"
-            | "call_func"
-            | "ceil"
-            | "chdir"
-            | "checkdate"
-            | "chr"
-            | "chunk_split"
-            | "class_exists"
-            | "clone"
-            | "compact"
-            | "compact_obj"
-            | "constant"
-            | "copy"
-            | "cos"
-            | "cosh"
-            | "count_chars"
-            | "crc32"
-            | "crc32_combine"
-            | "ctype_alnum"
-            | "ctype_alpha"
-            | "ctype_digit"
-            | "ctype_lower"
-            | "ctype_space"
-            | "ctype_upper"
-            | "date_parse"
-            | "debug_backtrace"
-            | "debug_print_backtrace"
-            | "debug_zval_dump"
-            | "decbin"
-            | "dechex"
-            | "decoct"
-            | "define"
-            | "defined"
-            | "deg2rad"
-            | "die"
-            | "divmod"
-            | "dl"
-            | "end"
-            | "enum_exists"
-            | "error_reporting"
-            | "escapeshellarg"
-            | "escapeshellcmd"
-            | "exec"
-            | "exit"
-            | "exp"
-            | "explode"
-            | "extension_loaded"
-            | "extract"
-            | "fastcgi_finish_request"
-            | "fclose"
-            | "fdiv"
-            | "feof"
-            | "fflush"
-            | "fgetc"
-            | "fgetcsv"
-            | "fgets"
-            | "file"
-            | "file_exists"
-            | "file_get_contents"
-            | "file_put_contents"
-            | "fileperms"
-            | "filesize"
-            | "flock"
-            | "floor"
-            | "fmod"
-            | "fnmatch"
-            | "fopen"
-            | "fpassthru"
-            | "fprintf"
-            | "fread"
-            | "fseek"
-            | "fstat"
-            | "ftell"
-            | "ftruncate"
-            | "function_exists"
-            | "gc_enabled"
-            | "gc_status"
-            | "get_called_class"
-            | "get_class"
-            | "get_class_methods"
-            | "get_class_vars"
-            | "get_current_user"
-            | "get_debug_type"
-            | "get_declared_classes"
-            | "get_declared_interfaces"
-            | "get_declared_traits"
-            | "get_extension_funcs"
-            | "get_loaded_extensions"
-            | "get_parent_class"
-            | "getcwd"
-            | "getenv"
-            | "getopt"
-            | "getmypid"
-            | "gettype"
-            | "glob"
-            | "hash"
-            | "hash_equals"
-            | "header"
-            | "header_register_callback"
-            | "header_remove"
-            | "headers_list"
-            | "headers_sent"
-            | "hex2bin"
-            | "hexdec"
-            | "hrtime"
-            | "http_build_query"
-            | "http_response_code"
-            | "hypot"
-            | "ignore_user_abort"
-            | "in_array"
-            | "ini_get"
-            | "ini_get_all"
-            | "ini_parse_quantity"
-            | "ini_restore"
-            | "ini_set"
-            | "intdiv"
-            | "interface_exists"
-            | "is_a"
-            | "is_array"
-            | "is_bool"
-            | "is_callable"
-            | "is_countable"
-            | "is_dir"
-            | "is_executable"
-            | "is_file"
-            | "is_finite"
-            | "is_infinite"
-            | "is_iterable"
-            | "is_link"
-            | "is_nan"
-            | "is_null"
-            | "is_numeric"
-            | "is_object"
-            | "is_readable"
-            | "is_resource"
-            | "is_scalar"
-            | "is_string"
-            | "is_subclass_of"
-            | "iterator_from_array"
-            | "json_decode"
-            | "json_encode"
-            | "json_validate"
-            | "key"
-            | "lcfirst"
-            | "lcg_value"
-            | "levenshtein"
-            | "log10"
-            | "log2"
-            | "ltrim"
-            | "mb_check_encoding"
-            | "mb_chr"
-            | "mb_convert_case"
-            | "mb_convert_encoding"
-            | "mb_detect_encoding"
-            | "mb_detect_order"
-            | "mb_encoding_aliases"
-            | "mb_http_input"
-            | "mb_http_output"
-            | "mb_internal_encoding"
-            | "mb_language"
-            | "mb_lcfirst"
-            | "mb_list_encodings"
-            | "mb_ltrim"
-            | "mb_ord"
-            | "mb_regex_encoding"
-            | "mb_rtrim"
-            | "mb_scrub"
-            | "mb_split"
-            | "mb_str_pad"
-            | "mb_strcut"
-            | "mb_strtolower_nc"
-            | "mb_stripos"
-            | "mb_stristr"
-            | "mb_strpos"
-            | "mb_strrchr"
-            | "mb_strrichr"
-            | "mb_strripos"
-            | "mb_strrpos"
-            | "mb_strstr"
-            | "mb_substr_count"
-            | "mb_substitute_character"
-            | "mb_trim"
-            | "mb_ucfirst"
-            | "mb_strlen"
-            | "md5"
-            | "memory_get_peak_usage"
-            | "memory_get_usage"
-            | "memory_reset_peak_usage"
-            | "method_exists"
-            | "microtime"
-            | "microtime_float"
-            | "mkdir"
-            | "nl2br"
-            | "number_format"
-            | "ob_clean"
-            | "ob_end_clean"
-            | "ob_end_flush"
-            | "ob_get_clean"
-            | "ob_get_contents"
-            | "ob_get_flush"
-            | "ob_get_length"
-            | "ob_get_level"
-            | "ob_get_status"
-            | "ob_start"
-            | "octdec"
-            | "ord"
-            | "output_reset_rewrite_vars"
-            | "parse_str"
-            | "parse_url"
-            | "passthru"
-            | "pathinfo"
-            | "php_check_syntax"
-            | "php_sapi_name"
-            | "php_strip_whitespace"
-            | "php_uname"
-            | "pi"
-            | "pow"
-            | "proc_close"
-            | "proc_get_status"
-            | "proc_nice"
-            | "proc_open"
-            | "proc_terminate"
-            | "preg_jit"
-            | "print"
-            | "print_r"
-            | "printf"
-            | "property_exists"
-            | "putenv"
-            | "quotemeta"
-            | "rad2deg"
-            | "range"
-            | "rawurldecode"
-            | "rawurlencode"
-            | "readfile"
-            | "realpath"
-            | "register_shutdown_function"
-            | "rename"
-            | "reset"
-            | "rewind"
-            | "rmdir"
-            | "round"
-            | "scandir"
-            | "serialize"
-            | "set_error_handler"
-            | "set_exception_handler"
-            | "set_time_limit"
-            | "setcookie"
-            | "setlocale"
-            | "setrawcookie"
-            | "settype"
-            | "sha1"
-            | "shell_exec"
-            | "similar_text"
-            | "sin"
-            | "sinh"
-            | "sleep"
-            | "soundex"
-            | "sprintf"
-            | "sqrt"
-            | "str_contains"
-            | "str_ends_with"
-            | "str_ireplace"
-            | "str_pad"
-            | "str_repeat"
-            | "str_replace"
-            | "str_rot13"
-            | "str_starts_with"
-            | "str_word_count"
-            | "stream_get_contents"
-            | "stream_copy_to_stream"
-            | "stream_get_meta_data"
-            | "stream_select"
-            | "stream_set_blocking"
-            | "strip_tags"
-            | "stripslashes"
-            | "strlen"
-            | "strrev"
-            | "strtotime"
-            | "strtr"
-            | "strval"
-            | "substr_count"
-            | "substr_replace"
-            | "sys_get_temp_dir"
-            | "system"
-            | "tan"
-            | "tanh"
-            | "tempnam"
-            | "time_nanosleep"
-            | "tmpfile"
-            | "trait_exists"
-            | "trim"
-            | "ucfirst"
-            | "ucwords"
-            | "umask"
-            | "uniqid"
-            | "unlink"
-            | "unserialize"
-            | "urldecode"
-            | "urlencode"
-            | "usleep"
-            | "var_dump"
-            | "var_export"
-            | "version_compare"
-            | "vfprintf"
-            | "vprintf"
-            | "vsprintf"
-            | "wordwrap"
-            | "zend_version"
-    )
+    // `fastcgi_finish_request`/`print` are real function-table
+    // entries callable by name even though they aren't arity-typed.
+    BUILTIN_NAMES.binary_search(&n).is_ok()
+}
+
+/// The internal names, in zend's function-table order (alphabetical —
+/// the const list is kept sorted so binary_search works).
+pub(crate) fn builtin_names() -> &'static [&'static str] {
+    BUILTIN_NAMES
 }
 
 /// Named-argument resolution for internal functions
@@ -604,13 +847,17 @@ pub enum BDef {
     /// "Unknown default" — must be passed explicitly when a later param
     /// is bound (array_keys' $filter_value, named_params/missing_param).
     Unk,
+    /// Required in arginfo but optional at runtime: Zend's ZPP accepts
+    /// the call without these while reflection and the named-arg arity
+    /// check still count them as required (rand/mt_rand min,max).
+    OptReq,
     Var,
 }
 
 impl BDef {
     pub fn val(self) -> Value {
         match self {
-            BDef::Req | BDef::Var => Value::Null,
+            BDef::Req | BDef::Var | BDef::OptReq => Value::Null,
             BDef::Null | BDef::Unk => Value::Null,
             BDef::Int(i) => Value::Int(i),
             BDef::Float(f) => Value::Float(f),
@@ -751,27 +998,27 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         // named args forward to the callee (the mod.rs named arm
         // handles them); the *_array stubs are fixed 2-param.
         "call_user_func" | "forward_static_call" => {
-            bp!(("callback", Req), ("...", Var))
+            bp!(("callback", Req), ("args", Var))
         }
         "call_user_func_array" | "forward_static_call_array" => {
             bp!(("callback", Req), ("args", Req))
         }
-        "array_map" => bp!(("callback", Req), ("array", Req), ("...", Var)),
+        "array_map" => bp!(("callback", Req), ("array", Req), ("arrays", Var)),
         "array_filter" => bp!(("array", Req), ("callback", Null), ("mode", Int(0))),
         "array_reduce" => bp!(("array", Req), ("callback", Req), ("initial", Null)),
         "array_walk" | "array_walk_recursive" => {
             bp!(("array", Req), ("callback", Req), ("arg", Null))
         }
-        "array_merge"
-        | "array_merge_recursive"
-        | "array_diff"
+        "array_merge" | "array_merge_recursive" => bp!(("arrays", Var)),
+        "array_diff"
         | "array_diff_key"
         | "array_diff_assoc"
         | "array_intersect"
         | "array_intersect_key"
-        | "array_intersect_assoc" => bp!(("...", Var)),
-        "array_multisort" | "array_replace" | "array_replace_recursive" => {
-            bp!(("array", Req), ("...", Var))
+        | "array_intersect_assoc" => bp!(("array", Req), ("arrays", Var)),
+        "array_multisort" => bp!(("array", Req), ("rest", Var)),
+        "array_replace" | "array_replace_recursive" => {
+            bp!(("array", Req), ("replacements", Var))
         }
         "array_push" | "array_unshift" => bp!(("array", Req), ("...", Var)),
         "reset" | "end" | "next" | "prev" | "current" | "pos" | "shuffle" => {
@@ -829,7 +1076,8 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
             ("encoding", Null),
             ("double_encode", Bool(true))
         ),
-        "htmlspecialchars_decode" | "html_entity_decode" => {
+        "htmlspecialchars_decode" => bp!(("string", Req), ("flags", Int(11))),
+        "html_entity_decode" => {
             bp!(("string", Req), ("flags", Int(11)), ("encoding", Null))
         }
         "define" => bp!(
@@ -860,7 +1108,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         "system" | "passthru" => bp!(("command", Req), ("result_code", Null)),
         "shell_exec" => bp!(("command", Req)),
         "escapeshellarg" | "escapeshellcmd" => bp!(("arg", Req)),
-        "md5" | "sha1" | "crc32" => bp!(("string", Req), ("binary", Bool(false))),
+        "md5" | "sha1" => bp!(("string", Req), ("binary", Bool(false))),
         "file_get_contents" => bp!(
             ("filename", Req),
             ("use_include_path", Bool(false)),
@@ -887,14 +1135,367 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         ),
         // oracle takes exactly 2 args — zend's $mode has no default.
         "stream_set_blocking" => bp!(("stream", Req), ("enable", Req)),
-        "stream_get_meta_data" => bp!(("stream", Req)),
-        "flock" => bp!(("stream", Req), ("operation", Req), ("would_block", Null)),
         "header" => bp!(
             ("header", Req),
             ("replace", Bool(true)),
             ("response_code", Int(0))
         ),
-        "setcookie" => bp!(("...", Var)),
+        "setcookie" => bp!(
+            ("name", Req),
+            ("value", Str("")),
+            ("expires_or_options", Int(0)),
+            ("path", Str("")),
+            ("domain", Str("")),
+            ("secure", Bool(false)),
+            ("httponly", Bool(false))
+        ),
+        // fs / stream arginfo — names + requiredness mirror Zend stubs
+        // so reflection arity and named-arg binding match (fwrite
+        // (stream,data,length) → 3/2).
+        "fwrite" | "fputs" => bp!(("stream", Req), ("data", Req), ("length", Null)),
+        "fread" => bp!(("stream", Req), ("length", Req)),
+        "fseek" => bp!(("stream", Req), ("offset", Req), ("whence", Int(0))),
+        "ftell" | "fclose" | "feof" | "fgetc" | "fpassthru" | "rewind" | "fflush" | "fstat" => {
+            bp!(("stream", Req))
+        }
+        "pclose" => bp!(("handle", Req)),
+        "fgets" => bp!(("stream", Req), ("length", Null)),
+        "fgetcsv" => bp!(
+            ("stream", Req),
+            ("length", Null),
+            ("separator", Str(",")),
+            ("enclosure", Str("\"")),
+            ("escape", Str("\\"))
+        ),
+        "fputcsv" => bp!(
+            ("stream", Req),
+            ("fields", Req),
+            ("separator", Str(",")),
+            ("enclosure", Str("\"")),
+            ("escape", Str("\\")),
+            ("eol", Str("\n"))
+        ),
+        "fscanf" => bp!(("stream", Req), ("format", Req), ("vars", Var)),
+        "sscanf" => bp!(("string", Req), ("format", Req), ("vars", Var)),
+        "get_meta_tags" => bp!(("filename", Req), ("use_include_path", Bool(false))),
+        "get_defined_functions" => bp!(("exclude_disabled", Bool(true))),
+        "flock" => bp!(("stream", Req), ("operation", Req), ("would_block", Null)),
+        "fopen" => bp!(
+            ("filename", Req),
+            ("mode", Req),
+            ("use_include_path", Bool(false)),
+            ("context", Null)
+        ),
+        "ftruncate" => bp!(("stream", Req), ("size", Req)),
+        "popen" => bp!(("command", Req), ("mode", Req)),
+        "unlink" => bp!(("filename", Req), ("context", Null)),
+        "rename" => bp!(("from", Req), ("to", Req), ("context", Null)),
+        "copy" => bp!(("from", Req), ("to", Req), ("context", Null)),
+        "mkdir" => bp!(
+            ("directory", Req),
+            ("permissions", Int(0o777)),
+            ("recursive", Bool(false)),
+            ("context", Null)
+        ),
+        "rmdir" => bp!(("directory", Req), ("context", Null)),
+        "umask" => bp!(("mask", Null)),
+        "chmod" => bp!(("filename", Req), ("permissions", Req)),
+        "chown" => bp!(("filename", Req), ("user", Req)),
+        "chgrp" => bp!(("filename", Req), ("group", Req)),
+        "touch" => bp!(("filename", Req), ("mtime", Null), ("atime", Null)),
+        "symlink" | "link" => bp!(("target", Req), ("link", Req)),
+        "linkinfo" | "readlink" => bp!(("path", Req)),
+        "stat" | "lstat" | "fileatime" | "filectime" | "filemtime" | "filesize" | "filetype"
+        | "fileperms" | "fileinode" | "fileowner" | "filegroup" => {
+            bp!(("filename", Req))
+        }
+        "is_file" | "is_dir" | "is_link" | "is_readable" | "is_writable" | "is_writeable"
+        | "is_executable" | "file_exists" | "is_uploaded_file" => {
+            bp!(("filename", Req))
+        }
+        "basename" => bp!(("path", Req), ("suffix", Str(""))),
+        "dirname" | "pathinfo_dirname" => bp!(("path", Req), ("levels", Int(1))),
+        "pathinfo" => bp!(("path", Req), ("flags", Int(15))),
+        "realpath" => bp!(("path", Req)),
+        "glob" => bp!(("pattern", Req), ("flags", Int(0))),
+        "scandir" => bp!(
+            ("directory", Req),
+            ("sorting_order", Int(0)),
+            ("context", Null)
+        ),
+        "file" => bp!(("filename", Req), ("flags", Int(0)), ("context", Null)),
+        "readfile" => bp!(
+            ("filename", Req),
+            ("use_include_path", Bool(false)),
+            ("context", Null)
+        ),
+        "parse_ini_file" => bp!(
+            ("filename", Req),
+            ("process_sections", Bool(false)),
+            ("scanner_mode", Int(0))
+        ),
+        "parse_ini_string" => bp!(
+            ("ini_string", Req),
+            ("process_sections", Bool(false)),
+            ("scanner_mode", Int(0))
+        ),
+        "fnmatch" => bp!(("pattern", Req), ("filename", Req), ("flags", Int(0))),
+        "disk_free_space" | "disk_total_space" | "diskfreespace" => {
+            bp!(("directory", Req))
+        }
+        "tempnam" => bp!(("directory", Req), ("prefix", Req)),
+        "opendir" => bp!(("directory", Req), ("context", Null)),
+        "closedir" | "readdir" => bp!(("dir_handle", Null)),
+        "chdir" => bp!(("directory", Req)),
+        "clearstatcache" => bp!(("clear_realpath_cache", Bool(false)), ("filename", Str(""))),
+        "move_uploaded_file" => bp!(("from", Req), ("to", Req)),
+        "stream_get_contents" => bp!(("stream", Req), ("length", Null), ("offset", Int(-1))),
+        "stream_get_meta_data" => bp!(("stream", Req)),
+        "stream_copy_to_stream" => bp!(
+            ("from", Req),
+            ("to", Req),
+            ("length", Null),
+            ("offset", Int(0))
+        ),
+        "stream_context_create" => bp!(("options", Null), ("params", Null)),
+        "stream_context_get_default" => bp!(("options", Null)),
+        "stream_context_get_options" => bp!(("stream_or_context", Req)),
+        "stream_context_set_option" => bp!(
+            ("context", Req),
+            ("wrapper_or_options", Req),
+            ("option_name", Null),
+            ("value", Unk)
+        ),
+        "stream_filter_prepend" | "stream_filter_append" => bp!(
+            ("stream", Req),
+            ("filter_name", Req),
+            ("mode", Int(0)),
+            ("params", Unk)
+        ),
+        "stream_filter_remove" => bp!(("stream_filter", Req)),
+        "stream_bucket_new" => bp!(("stream", Req), ("buffer", Req)),
+        "stream_bucket_append" | "stream_bucket_prepend" => {
+            bp!(("brigade", Req), ("bucket", Req))
+        }
+        "stream_bucket_make_writeable" => bp!(("brigade", Req)),
+        "headers_sent" => bp!(("filename", Null), ("line", Null)),
+        // Oracle arginfo for internal functions whose reflection
+        // signature was previously unknown (reported via the (0,0)
+        // catch-all).
+        "abs" => bp!(("num", Req)),
+        "addcslashes" => bp!(("string", Req), ("characters", Req)),
+        "addslashes" => bp!(("string", Req)),
+        "array_chunk" => {
+            bp!(
+                ("array", Req),
+                ("length", Req),
+                ("preserve_keys", Bool(false))
+            )
+        }
+        "array_count_values" | "array_key_first" | "array_key_last" => {
+            bp!(("array", Req))
+        }
+        "base64_encode" | "bin2hex" | "hex2bin" | "quotemeta" | "rawurlencode" | "rawurldecode"
+        | "serialize" | "soundex" | "stripcslashes" | "stripslashes" | "urldecode"
+        | "urlencode" => bp!(("string", Req)),
+        "base64_decode" => bp!(("string", Req), ("strict", Bool(false))),
+        "chunk_split" => bp!(
+            ("string", Req),
+            ("length", Int(76)),
+            ("separator", Str("\r\n"))
+        ),
+        "class_exists" => bp!(("class", Req), ("autoload", Bool(true))),
+        "class_parents" | "class_implements" | "class_uses" => {
+            bp!(("object_or_class", Req), ("autoload", Bool(true)))
+        }
+        "connection_aborted"
+        | "connection_status"
+        | "error_clear_last"
+        | "error_get_last"
+        | "func_get_args"
+        | "func_num_args"
+        | "gc_collect_cycles"
+        | "gc_disable"
+        | "gc_enable"
+        | "gc_mem_caches"
+        | "gc_status"
+        | "get_called_class"
+        | "get_declared_classes"
+        | "get_declared_interfaces"
+        | "get_declared_traits"
+        | "get_include_path"
+        | "getmypid"
+        | "getrandmax"
+        | "lcg_value"
+        | "mt_getrandmax"
+        | "memory_reset_peak_usage"
+        | "ob_clean"
+        | "ob_end_clean"
+        | "ob_end_flush"
+        | "ob_flush"
+        | "ob_get_clean"
+        | "ob_get_contents"
+        | "ob_get_flush"
+        | "ob_get_length"
+        | "ob_get_level"
+        | "ob_list_handlers"
+        | "output_reset_rewrite_vars"
+        | "preg_last_error"
+        | "preg_last_error_msg"
+        | "restore_error_handler"
+        | "restore_exception_handler"
+        | "sys_get_temp_dir" => bp!(),
+        "count_chars" => bp!(("string", Req), ("mode", Int(0))),
+        "crc32" => bp!(("string", Req)),
+        "dechex" => bp!(("num", Req)),
+        "debug_backtrace" => bp!(("options", Int(1)), ("limit", Int(0))),
+        "debug_print_backtrace" => bp!(("options", Int(0)), ("limit", Int(0))),
+        "debug_zval_dump" => bp!(("value", Req), ("values", Var)),
+        "register_shutdown_function" | "register_tick_function" => {
+            bp!(("callback", Req), ("args", Var))
+        }
+        "enum_exists" => bp!(("enum", Req), ("autoload", Bool(true))),
+        "exit" | "die" => bp!(("status", Int(0))),
+        "extension_loaded" | "get_extension_funcs" => bp!(("extension", Req)),
+        "extract" => bp!(("array", Req), ("flags", Int(0)), ("prefix", Str(""))),
+        "func_get_arg" => bp!(("position", Req)),
+        "function_exists" => bp!(("function", Req)),
+        // get_class's $object is optional (the no-arg form reads the
+        // calling scope, deprecated since 8.0); get_class_methods takes
+        // object|string as $object_or_class.
+        "get_class" => bp!(("object", Null)),
+        "get_class_methods" => bp!(("object_or_class", Req)),
+        "get_object_vars" => bp!(("object", Req)),
+        "get_class_vars" => bp!(("class", Req)),
+        "get_debug_type" | "gettype" | "is_array" | "is_bool" | "is_countable" | "is_double"
+        | "is_float" | "is_int" | "is_integer" | "is_iterable" | "is_long" | "is_null"
+        | "is_numeric" | "is_object" | "is_resource" | "is_scalar" | "is_string" => {
+            bp!(("value", Req))
+        }
+        "get_loaded_extensions" => bp!(("zend_extensions", Bool(false))),
+        "get_parent_class" => bp!(("object_or_class", Req)),
+        "get_resource_id" | "get_resource_type" => bp!(("resource", Req)),
+        "hash" => bp!(
+            ("algo", Req),
+            ("data", Req),
+            ("binary", Bool(false)),
+            ("options", Arr)
+        ),
+        "ignore_user_abort" => bp!(("enable", Null)),
+        "ini_parse_quantity" => bp!(("shorthand", Req)),
+        "ini_restore" => bp!(("option", Req)),
+        "interface_exists" => bp!(("interface", Req), ("autoload", Bool(true))),
+        "is_a" => bp!(
+            ("object_or_class", Req),
+            ("class", Req),
+            ("allow_string", Bool(false))
+        ),
+        "is_callable" => bp!(
+            ("value", Req),
+            ("syntax_only", Bool(false)),
+            ("callable_name", Null)
+        ),
+        "is_subclass_of" => bp!(
+            ("object_or_class", Req),
+            ("class", Req),
+            ("allow_string", Bool(true))
+        ),
+        "json_validate" => bp!(("json", Req), ("depth", Int(512)), ("flags", Int(0))),
+        "levenshtein" => bp!(
+            ("string1", Req),
+            ("string2", Req),
+            ("insertion_cost", Int(1)),
+            ("replacement_cost", Int(1)),
+            ("deletion_cost", Int(1))
+        ),
+        "mb_check_encoding" => bp!(("value", Null), ("encoding", Null)),
+        "mb_convert_case" => bp!(("string", Req), ("mode", Req), ("encoding", Null)),
+        "mb_convert_encoding" => {
+            bp!(
+                ("string", Req),
+                ("to_encoding", Req),
+                ("from_encoding", Null)
+            )
+        }
+        "mb_detect_encoding" => {
+            bp!(
+                ("string", Req),
+                ("encodings", Null),
+                ("strict", Bool(false))
+            )
+        }
+        "mb_str_split" => bp!(("string", Req), ("length", Int(1)), ("encoding", Null)),
+        "mb_stripos" | "mb_strpos" | "mb_strripos" | "mb_strrpos" => bp!(
+            ("haystack", Req),
+            ("needle", Req),
+            ("offset", Int(0)),
+            ("encoding", Null)
+        ),
+        "mb_stristr" | "mb_strrchr" | "mb_strrichr" | "mb_strstr" => bp!(
+            ("haystack", Req),
+            ("needle", Req),
+            ("before_needle", Bool(false)),
+            ("encoding", Null)
+        ),
+        "mb_strlen" | "mb_strtolower" | "mb_strtoupper" => {
+            bp!(("string", Req), ("encoding", Null))
+        }
+        "mb_substr" => bp!(
+            ("string", Req),
+            ("start", Req),
+            ("length", Null),
+            ("encoding", Null)
+        ),
+        "mb_substr_count" => bp!(("haystack", Req), ("needle", Req), ("encoding", Null)),
+        "memory_get_peak_usage" | "memory_get_usage" => bp!(("real_usage", Bool(false))),
+        "metaphone" => bp!(("string", Req), ("max_phonemes", Int(0))),
+        "method_exists" => bp!(("object_or_class", Req), ("method", Req)),
+        "mt_rand" | "rand" => bp!(("min", OptReq), ("max", OptReq)),
+        "ob_get_status" => bp!(("full_status", Bool(false))),
+        "ob_implicit_flush" => bp!(("enable", Bool(true))),
+        "ob_start" => bp!(
+            ("callback", Null),
+            ("chunk_size", Int(0)),
+            ("flags", Int(112))
+        ),
+        "output_add_rewrite_var" => bp!(("name", Req), ("value", Req)),
+        "pow" => bp!(("num", Req), ("exponent", Req)),
+        "print_r" => bp!(("value", Req), ("return", Bool(false))),
+        "property_exists" => bp!(("object_or_class", Req), ("property", Req)),
+        "putenv" => bp!(("assignment", Req)),
+        "random_bytes" => bp!(("length", Req)),
+        "random_int" => bp!(("min", Req), ("max", Req)),
+        "set_error_handler" => bp!(("callback", Req), ("error_levels", Int(30719))),
+        "set_exception_handler" => bp!(("callback", Req)),
+        "set_include_path" => bp!(("include_path", Req)),
+        "set_time_limit" => bp!(("seconds", Req)),
+        "settype" => bp!(("var", Req), ("type", Req)),
+        "similar_text" => bp!(("string1", Req), ("string2", Req), ("percent", Null)),
+        "str_split" => bp!(("string", Req), ("length", Int(1))),
+        "str_word_count" => {
+            bp!(("string", Req), ("format", Int(0)), ("characters", Null))
+        }
+        "strchr" | "stristr" | "strstr" => bp!(
+            ("haystack", Req),
+            ("needle", Req),
+            ("before_needle", Bool(false))
+        ),
+        "strip_tags" => bp!(("string", Req), ("allowed_tags", Null)),
+        "strtr" => bp!(("string", Req), ("from", Req), ("to", Null)),
+        "substr_count" => bp!(
+            ("haystack", Req),
+            ("needle", Req),
+            ("offset", Int(0)),
+            ("length", Null)
+        ),
+        "time_nanosleep" => bp!(("seconds", Req), ("nanoseconds", Req)),
+        "time_sleep_until" => bp!(("timestamp", Req)),
+        "trait_exists" => bp!(("trait", Req), ("autoload", Bool(true))),
+        "trigger_error" | "user_error" => bp!(("message", Req), ("error_level", Int(1024))),
+        "uniqid" => bp!(("prefix", Str("")), ("more_entropy", Bool(false))),
+        "unserialize" => bp!(("data", Req), ("options", Arr)),
+        "unregister_tick_function" => bp!(("callback", Req)),
+        "var_dump" => bp!(("value", Req), ("values", Var)),
         _ => return None,
     })
 }

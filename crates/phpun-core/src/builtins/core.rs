@@ -133,8 +133,9 @@ pub(crate) fn dispatch(
                 None
             };
             // forward_static_call forwards the current called_scope —
-            // no scope, nothing to forward (zend_execute_API).
-            if name.starts_with("forward_static_call") && it.caller_scope_name().is_none() {
+            // no scope, nothing to forward (zend_execute_API). The
+            // *_array form does NOT require a scope (it runs top-level).
+            if name == "forward_static_call" && it.caller_scope_name().is_none() {
                 return err::<Option<Value>>(
                     "Error",
                     "Cannot call forward_static_call() when no class scope is active",
@@ -315,22 +316,24 @@ pub(crate) fn dispatch(
             let prev = it.ini.get(&k).cloned();
             let v = arg_str(it, args, 1);
             // Shrinking the limit under current usage refuses with a
-            // warning and leaves the old value (bug45392).
+            // warning and leaves the old value (bug45392). mem_total
+            // already carries zend's runtime baseline; the startup-time
+            // 2M bootstrap reserve refusal lives in phpun -d handling.
             if k == "memory_limit" {
                 it.ini.insert(k.clone(), v);
                 let lim = it.ini_bytes(&k);
-                if lim > 0 && (it.mem_used as i64) > lim {
+                let usage = it.mem_total();
+                if lim > 0 && usage > lim {
                     let _ = it
                         .ini
                         .insert(k.clone(), prev.clone().unwrap_or_else(|| "-1".into()));
                     it.warn_pub(&format!(
                         "Failed to set memory limit to {} bytes (Current memory usage is {} bytes)",
-                        lim, it.mem_used
+                        lim, usage
                     ))?;
-                    return Ok(Some(match prev {
-                        Some(p) => Value::str(p),
-                        None => Value::Bool(false),
-                    }));
+                    // Refused ini_set returns false (zend returns the
+                    // old value only on a successful set).
+                    return Ok(Some(Value::Bool(false)));
                 }
             } else {
                 it.ini.insert(k.clone(), v);
@@ -532,9 +535,18 @@ pub(crate) fn dispatch(
         "php_sapi_name" => Value::str("cli"),
         "phpversion" | "phpversion_strict" => Value::str("8.5.11-phpun"),
         "php_uname" => Value::str("Linux"),
-        "memory_get_usage" => Value::Int(2097152),
-        "memory_get_peak_usage" => Value::Int(2097152),
-        "memory_reset_peak_usage" => Value::Null,
+        // Runtime baseline + metered live bytes (obj shells, array
+        // tables, string payloads); emitted output is free.
+        "memory_get_usage" => Value::Int(it.mem_total()),
+        // High-water mark of the live total — zend's peak survives
+        // frees until memory_reset_peak_usage re-baselines it.
+        "memory_get_peak_usage" => {
+            Value::Int(crate::value::MEM_BASE_BYTES + crate::value::mem_peak_bytes())
+        }
+        "memory_reset_peak_usage" => {
+            crate::value::mem_peak_reset();
+            Value::Null
+        }
         "zend_version" => Value::str("8.5.11-phpun"),
         "getmypid" => Value::Int(std::process::id() as i64),
         "getmyuid" | "getmygid" | "getmyinode" => Value::Int(1000),
@@ -580,6 +592,35 @@ pub(crate) fn dispatch(
             Value::Array(Rc::new(RefCell::new(a)))
         }
         "get_extension_funcs" => Value::Array(Rc::new(RefCell::new(PhpArray::new()))),
+        "get_defined_functions" => {
+            // zend returns {internal: every registered internal fn,
+            // user: every userland decl} keyed lowercased. `it.functions`
+            // is already lowercased at insert; sort for deterministic
+            // output (zend emits insertion order we don't track).
+            // ponytail: internal list = BUILTIN_NAMES (sorted), so
+            // per-extension grouping/prepended aliases are flattened —
+            // a real fn-table would restore zend's registration order.
+            let mut internal = PhpArray::new();
+            for &n in crate::builtins::builtin_names() {
+                internal.push(Value::str(n));
+            }
+            let mut user_names: Vec<&String> = it.functions.keys().collect();
+            user_names.sort();
+            let mut user = PhpArray::new();
+            for n in user_names {
+                user.push(Value::str(n.clone()));
+            }
+            let mut out = PhpArray::new();
+            out.set(
+                ArrKey::Str("internal".into()),
+                Value::Array(Rc::new(RefCell::new(internal))),
+            );
+            out.set(
+                ArrKey::Str("user".into()),
+                Value::Array(Rc::new(RefCell::new(user))),
+            );
+            Value::Array(Rc::new(RefCell::new(out)))
+        }
         "dl" => Value::Bool(false),
         "assert" => {
             let v = arg(args, 0);

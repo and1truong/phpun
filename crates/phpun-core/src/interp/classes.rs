@@ -1443,11 +1443,14 @@ impl<'a> Interp<'a> {
             ));
         }
         let req = |ms: &MethodDecl| {
+            // Optional-before-required counts as required (zend's
+            // "implicitly required"), matching call-site arity.
             ms.decl
                 .params
                 .iter()
-                .filter(|p| p.default.is_none() && !p.variadic)
-                .count()
+                .rposition(|p| p.default.is_none() && !p.variadic)
+                .map(|i| i + 1)
+                .unwrap_or(0)
         };
         let (ir, ar) = (req(impl_m), req(abs_m));
         let count_ok = ir <= ar
@@ -3524,6 +3527,11 @@ impl<'a> Interp<'a> {
 
     /// Wrap a PhpObject in Rc and assign its handle id.
     pub fn alloc_obj(&mut self, o: PhpObject) -> Rc<RefCell<PhpObject>> {
+        // Object shells count toward memory_limit — a flat cost per
+        // allocation so a runaway `new` loop trips the limit even
+        // when nothing is emitted (new_oom). Drops decrement it like
+        // zend's arena, so GC churn doesn't accumulate.
+        crate::value::obj_charge();
         let rc = Rc::new(RefCell::new(o));
         let id = self.next_obj_id(&rc);
         rc.borrow_mut().id = id;
@@ -3674,7 +3682,7 @@ impl<'a> Interp<'a> {
         let cls = match cls {
             Some(c) => c,
             None => {
-                return Ok(Value::Object(Rc::new(RefCell::new(PhpObject {
+                return Ok(Value::Object(self.alloc_obj(PhpObject {
                     class: Rc::new(PhpClass {
                         decl: Rc::new(ClassDecl {
                             name: lname.into(),
@@ -3701,7 +3709,7 @@ impl<'a> Interp<'a> {
                     id: 0,
                     internal: None,
                     unset_props: std::collections::HashSet::new(),
-                }))))
+                })))
             }
         };
         // Collect decl chain (self + parents, parent-first for prop order).
@@ -3814,9 +3822,9 @@ impl<'a> Interp<'a> {
                 .unwrap_or_else(|| self.diag_file());
             Some(ObjectInternal::Exception {
                 file: exec_file,
-                line: self.cur_line as u32,
+                line: self.send_line.unwrap_or(self.cur_line) as u32,
                 trace: String::new(),
-                thrown: self.cur_line as u32,
+                thrown: self.send_line.unwrap_or(self.cur_line) as u32,
                 full_msg: String::new(),
                 eval_ctx: 0,
                 previous: None,

@@ -39,6 +39,7 @@ fn main() -> ExitCode {
 fn run_script(args: &[String]) -> ExitCode {
     let mut file: Option<&str> = None;
     let mut ini: Vec<String> = Vec::new();
+    let mut no_php_ini = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -58,6 +59,13 @@ fn run_script(args: &[String]) -> ExitCode {
                 continue;
             }
             "-f" | "-q" => {
+                i += 1;
+                continue;
+            }
+            "-n" | "--no-php-ini" => {
+                // `-n`/`--no-php-ini`: reference php skips ini files —
+                // the compiled-in defaults differ (log_errors=0).
+                no_php_ini = true;
                 i += 1;
                 continue;
             }
@@ -89,6 +97,12 @@ fn run_script(args: &[String]) -> ExitCode {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| file.to_string());
     let mut it = Interp::new(&abs);
+    if no_php_ini {
+        // The binary's compiled-in default is log_errors=0 — the dist
+        // php.ini turns it on, so -n leaves the `PHP Fatal error:`
+        // stderr copy off entirely (new_oom's merged 2>&1 stream).
+        it.ini.insert("log_errors".to_string(), "0".to_string());
+    }
     // CLI PHP sets the script-path SERVER vars to the path AS INVOKED
     // (`php console.php` shows "console.php"), unlike __FILE__ which is
     // always canonical.
@@ -98,16 +112,44 @@ fn run_script(args: &[String]) -> ExitCode {
     // Args after the script path become $argv[1..] like reference php;
     // argv[0] keeps the as-invoked path too.
     it.set_script_args(file, &args[(i + 1).min(args.len())..]);
+    // Stream output to the real fds so stderr notices interleave with
+    // stdout in PHP's order; `phpun test`/`serve` keep buffered capture.
+    // Set before -d application so a refused-limit warning streams
+    // ahead of the script's output like zend's does.
+    it.live_io = true;
     for kv in ini {
         if let Some((k, v)) = kv.split_once('=') {
-            it.ini.insert(k.trim().to_string(), v.trim().to_string());
+            if k.trim() == "memory_limit" {
+                // A -d limit under zend's 2M bootstrap floor refuses
+                // at startup: 'in Unknown on line 0' warning pair and
+                // the previous value stays in effect.
+                let prev = it.ini.get("memory_limit").cloned();
+                it.ini
+                    .insert("memory_limit".to_string(), v.trim().to_string());
+                let lim = it.ini_bytes("memory_limit");
+                if lim > 0 && lim <= 2097152 {
+                    let msg = format!(
+                        "Failed to set memory limit to {} bytes (Current memory usage is 2097152 bytes)",
+                        lim
+                    );
+                    eprintln!("PHP Warning:  {} in Unknown on line 0", msg);
+                    it.emit(&format!("Warning: {} in Unknown on line 0\n", msg));
+                    match prev {
+                        Some(p) => {
+                            it.ini.insert("memory_limit".to_string(), p);
+                        }
+                        None => {
+                            it.ini.remove("memory_limit");
+                        }
+                    }
+                }
+            } else {
+                it.ini.insert(k.trim().to_string(), v.trim().to_string());
+            }
         } else {
             it.ini.insert(kv, String::new());
         }
     }
-    // Stream output to the real fds so stderr notices interleave with
-    // stdout in PHP's order; `phpun test`/`serve` keep buffered capture.
-    it.live_io = true;
     let res = it.run_source(&src);
     let _ = std::io::Write::write_all(&mut std::io::stdout(), &it.out);
     eprint!("{}", it.err_buf);
