@@ -414,7 +414,14 @@ impl<'a> Interp<'a> {
                         // offsets' (and the str-key TypeError), not the
                         // generic scalar-as-array fatal.
                         let was = std::mem::replace(&mut self.dim_by_ref, true);
-                        let rc = self.eval_cell(expr);
+                        // `$this` can't sit behind IS_REFERENCE —
+                        // a by-ref param binds a plain value cell
+                        // (object still aliases via the handle).
+                        let rc = if matches!(expr_u, Expr::Var(n) if n == "this") {
+                            self.eval(expr).map(|v| cell(v))
+                        } else {
+                            self.eval_cell(expr)
+                        };
                         self.dim_by_ref = was;
                         // Cell-access errors (readonly/private prop,
                         // string offsets, undeclared static) are real
@@ -4262,6 +4269,10 @@ impl<'a> Interp<'a> {
                                 i + 1,
                                 p.name
                             ))?;
+                            // 'value given' passes a zval copy — the
+                            // param's writes stay local.
+                            binds.push((p.name.clone(), cell(v.borrow().clone())));
+                            continue;
                         }
                         // The callee's var becomes a Zend IS_REFERENCE
                         // over the caller's cell — write-through errors

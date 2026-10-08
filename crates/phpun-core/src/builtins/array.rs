@@ -2531,7 +2531,15 @@ fn copy_elem(it: &Interp, out: &mut PhpArray, k: &ArrKey, c: &Cell) {
     if it.is_ref_cell(c) && Rc::strong_count(c) > 1 {
         out.bind_cell(k.clone(), c.clone());
     } else {
-        out.set(k.clone(), c.borrow().clone());
+        // A collision overwrite installs a fresh bucket — zend's
+        // update separates, never writes into a cell the source
+        // array still shares.
+        match out.get_cell(k) {
+            Some(s) if it.is_ref_cell(&s) && Rc::strong_count(&s) > 1 => {
+                out.bind_cell(k.clone(), cell(c.borrow().clone()));
+            }
+            _ => out.set(k.clone(), c.borrow().clone()),
+        }
     }
 }
 
