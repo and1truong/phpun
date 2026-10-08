@@ -283,21 +283,19 @@ pub(crate) fn dispatch(
             }
         }
         "array_merge" | "array_merge_recursive" => {
-            // zend's HT_MAX_SIZE guard fires before any bucket copy —
-            // merging past it is a catchable Error, not an OOM.
-            let total: u64 = args
-                .iter()
-                .map(|a| match &*a.borrow() {
-                    Value::Array(m) => m.borrow().len() as u64,
-                    _ => 0,
-                })
-                .sum();
-            if total > 1073741824 {
-                return Err(PhpError::uncaught(
+            // zend sums arg elements up front and throws instead of
+            // building a hash past HASH_MAX_ELEMENTS (GHSA-h96m).
+            let mut total: u128 = 0;
+            for a in args {
+                if let Value::Array(m) = &*a.borrow() {
+                    total += m.borrow().len() as u128;
+                }
+            }
+            if total >= 1 << 30 {
+                return err(
                     "Error",
-                    "The total number of elements must be lower than 1073741824",
-                    it.cur_line,
-                ));
+                    "The total number of elements must be lower than 1073741824".to_string(),
+                );
             }
             let mut out = PhpArray::new();
             for a in args {
@@ -376,11 +374,55 @@ pub(crate) fn dispatch(
             let start = arg(args, 0).to_int();
             let n = arg(args, 1).to_int();
             let v = arg(args, 2);
-            let mut out = PhpArray::new();
-            for i in 0..n.max(0) {
-                out.set(ArrKey::Int(start + i), v.clone());
+            // zend's arg bound-checks land before any allocation:
+            // negative → ValueError, past the 32-bit table bound →
+            // ValueError 'too large', and past zend's safe_address
+            // bound (count*32+32 > 32GB) → 'Possible integer
+            // overflow' fatal instead of a host-OOM alloc.
+            if n < 0 {
+                return err(
+                    "ValueError",
+                    "array_fill(): Argument #2 ($count) must be greater than or equal to 0",
+                );
             }
-            Value::Array(Rc::new(RefCell::new(out)))
+            if n > i32::MAX as i64 {
+                return err(
+                    "ValueError",
+                    "array_fill(): Argument #2 ($count) is too large",
+                );
+            }
+            if n > 1_073_741_824 {
+                let mut e = PhpError::fatal(
+                    format!(
+                        "Possible integer overflow in memory allocation ({} * 32 + 32)",
+                        n
+                    ),
+                    it.cur_line,
+                );
+                e.trace = Some(it.fatal_frames());
+                return Err(e);
+            }
+            // zend allocates the packed arData up front — the emalloc
+            // limit check fires before the fill loop, so a legal-but-
+            // huge fill (n=2^30 is buildable) fatals here instead of
+            // exhausting host memory.
+            let want = Interp::ht_req(n as usize, true);
+            if it.mem_check(want).is_some() {
+                it.mem_exceeded = true;
+                return Err(it.oom_fatal());
+            }
+            let mut out = PhpArray::new();
+            // Keys are sequential and unique — append O(1) each
+            // instead of set()'s O(n) key search (a 2M fill was
+            // quadratic). zend packs it the same way.
+            out.entries.reserve(n as usize);
+            for i in 0..n {
+                out.entries.push((ArrKey::Int(start + i), cell(v.clone())));
+            }
+            out.next = start + n;
+            let rc = Rc::new(RefCell::new(out));
+            it.mem_track(&rc, want);
+            Value::Array(rc)
         }
         "array_fill_keys" => {
             let mut out = PhpArray::new();
@@ -512,6 +554,17 @@ pub(crate) fn dispatch(
                 }
                 arr.next = i;
                 arr.iter_pos = 0;
+                // The rebuild renumbers to sequential ints — packed
+                // iff no string key survived.
+                arr.packed = arr.entries.iter().all(|(k, _)| matches!(k, ArrKey::Int(_)));
+                let ins = (arr.len() as u64).saturating_sub((head.len() + tail2.len()) as u64);
+                let req = Interp::ht_req(arr.len(), arr.packed);
+                drop(arr);
+                // The table's arData realloc covers capacity; payloads
+                // live or die by their own tracked charges.
+                if ins > 0 {
+                    it.mem_realloc(&rc, req);
+                }
             }
             Value::Array(Rc::new(RefCell::new(removed)))
         }
@@ -522,6 +575,9 @@ pub(crate) fn dispatch(
                     arr.push(a.borrow().clone());
                 }
                 let n = arr.len() as i64;
+                let req = Interp::ht_req(arr.len(), arr.packed);
+                drop(arr);
+                it.mem_realloc(&rc, req);
                 return Ok(Some(Value::Int(n)));
             }
             Value::Null
@@ -547,6 +603,8 @@ pub(crate) fn dispatch(
                             }
                         }
                         arr.entries[f].0 = ArrKey::Tomb;
+                        drop(arr);
+                        it.mem_credit(&rc, 32);
                         return Ok(Some(c.borrow().clone()));
                     }
                     None => return Ok(Some(Value::Null)),
@@ -577,6 +635,8 @@ pub(crate) fn dispatch(
                             }
                         }
                         arr.next = ni;
+                        drop(arr);
+                        it.mem_credit(&rc, 32);
                         return Ok(Some(c.borrow().clone()));
                     }
                     None => return Ok(Some(Value::Null)),
@@ -611,7 +671,14 @@ pub(crate) fn dispatch(
                 // zend_hash_extend grows once for the prepend — one
                 // pow2 grow reported, not per-element grows.
                 arr.mem_note_extend(add as i64);
-                return Ok(Some(Value::Int(arr.len() as i64)));
+                // unshift rebuilds the table — packed iff no string
+                // key survived the renumber.
+                arr.packed = arr.entries.iter().all(|(k, _)| matches!(k, ArrKey::Int(_)));
+                let n = arr.len() as i64;
+                let req = Interp::ht_req(arr.len(), arr.packed);
+                drop(arr);
+                it.mem_realloc(&rc, req);
+                return Ok(Some(Value::Int(n)));
             }
             Value::Null
         }
@@ -948,6 +1015,14 @@ pub(crate) fn dispatch(
         "array_pad" => {
             let n = arg(args, 1).to_int();
             let v = arg(args, 2);
+            // zend_hash_check_size: |n| past HT_MAX_SIZE (1<<30)
+            // fatals as a ValueError before any arData alloc.
+            if n.unsigned_abs() > 1 << 30 {
+                return err(
+                    "ValueError",
+                    "array_pad(): Argument #2 ($length) must not exceed the maximum allowed array size",
+                );
+            }
             let mut out = PhpArray::new();
             if let Value::Array(a) = arg(args, 0) {
                 let b = a.borrow();
@@ -958,7 +1033,11 @@ pub(crate) fn dispatch(
                     for (k, c) in b.iter() {
                         copy_elem(it, &mut out, k, c);
                     }
-                    return Ok(Some(Value::Array(Rc::new(RefCell::new(out)))));
+                    let rc = Rc::new(RefCell::new(out));
+                    if !rc.borrow().entries.is_empty() {
+                        it.mem_track(&rc, Interp::ht_req(rc.borrow().len(), rc.borrow().packed));
+                    }
+                    return Ok(Some(Value::Array(rc)));
                 }
                 let pad = n.unsigned_abs() as i64 - len;
                 // zend_hash_init(nSize) commits the result's whole
@@ -967,12 +1046,11 @@ pub(crate) fn dispatch(
                 out.packed = b.packed;
                 // The arData alloc's emalloc guard fires before the
                 // fill loop runs — same order as zend.
-                let buckets = ((len + pad).max(8) as u64).next_power_of_two() as i64;
-                it.mem_check_alloc(if b.packed {
-                    buckets * 16 + 8
-                } else {
-                    buckets * 40
-                })?;
+                let want = Interp::ht_req((len + pad).max(1) as usize, b.packed);
+                if it.mem_check(want).is_some() {
+                    it.mem_exceeded = true;
+                    return Err(it.oom_fatal());
+                }
                 let mut next = 0i64;
                 if n < 0 {
                     for _ in 0..pad {
@@ -1013,7 +1091,12 @@ pub(crate) fn dispatch(
                 out.next = next;
                 out.mem_note_extend(len + pad);
             }
-            Value::Array(Rc::new(RefCell::new(out)))
+            let rc = Rc::new(RefCell::new(out));
+            // The committed arData stays live with the result table.
+            if !rc.borrow().entries.is_empty() {
+                it.mem_track(&rc, Interp::ht_req(rc.borrow().len(), rc.borrow().packed));
+            }
+            Value::Array(rc)
         }
         "array_is_list" => match arg(args, 0) {
             Value::Array(a) => {
@@ -1072,8 +1155,83 @@ pub(crate) fn dispatch(
         "range" => {
             let lo = arg(args, 0);
             let hi = arg(args, 1);
-            let step = arg(args, 2).to_float();
+            let step_arg = arg(args, 2);
+            // zend rejects non-finite float args before computing the
+            // size bound (the check also covers the char-range path).
+            for (i, (v, pname)) in [(&lo, "$start"), (&hi, "$end"), (&step_arg, "$step")]
+                .into_iter()
+                .enumerate()
+            {
+                if let Value::Float(f) = v {
+                    if !f.is_finite() {
+                        let shown = if f.is_nan() { "NAN" } else { "INF" };
+                        return err(
+                            "ValueError",
+                            format!(
+                                "range(): Argument #{} ({}) must be a finite number, {} provided",
+                                i + 1,
+                                pname,
+                                shown
+                            ),
+                        );
+                    }
+                }
+            }
+            let step = step_arg.to_float();
             let step = if step == 0.0 { 1.0 } else { step.abs() };
+            // zend bounds the element count before allocating
+            // (HASH_MAX_ELEMENTS = 1<<30): hostile inputs fatal with
+            // ValueError instead of exhausting host memory.
+            let char_range = matches!(
+                (&lo, &hi),
+                (Value::Str(a), Value::Str(b))
+                    if a.len() == 1 && b.len() == 1 && !a[0].is_ascii_digit()
+            );
+            if !char_range {
+                const RANGE_MAX: i128 = 1 << 30;
+                let (x, y) = (lo.to_float(), hi.to_float());
+                if matches!((&lo, &hi), (Value::Int(_), Value::Int(_)))
+                    && matches!(&step_arg, Value::Int(_) | Value::Null)
+                {
+                    let (li, hi_i, st_i) = (
+                        lo.to_int() as i128,
+                        hi.to_int() as i128,
+                        step_arg.to_int().abs() as i128,
+                    );
+                    let st_i = if st_i == 0 { 1 } else { st_i };
+                    let span = (hi_i - li).abs();
+                    let count = span / st_i + 1;
+                    if count > RANGE_MAX {
+                        return err(
+                            "ValueError",
+                            format!(
+                                "The supplied range exceeds the maximum array size by {} elements: start={}, end={}, step={}. Calculated size: {}. Maximum size: {}.",
+                                count - RANGE_MAX,
+                                li,
+                                hi_i,
+                                st_i,
+                                span / st_i,
+                                RANGE_MAX
+                            ),
+                        );
+                    }
+                } else {
+                    let count = (y - x).abs() / step + 1.0;
+                    if count > RANGE_MAX as f64 {
+                        return err(
+                            "ValueError",
+                            format!(
+                                "The supplied range exceeds the maximum array size by {:.1} elements: start={:.1}, end={:.1}, step={:.1}. Max size: {}",
+                                count - RANGE_MAX as f64,
+                                x,
+                                y,
+                                step,
+                                RANGE_MAX
+                            ),
+                        );
+                    }
+                }
+            }
             let mut out = PhpArray::new();
             match (&lo, &hi) {
                 (Value::Str(a), Value::Str(b))

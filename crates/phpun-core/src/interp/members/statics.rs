@@ -156,12 +156,10 @@ impl<'a> Interp<'a> {
         let (cls, _tname) = self.member_class_of(class)?;
         self.statics_init(&cls)?;
         self.static_prop_vis(&cls, name)?;
-        if !self.in_unset {
-            if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
-                if let Some(sv) = pd.set_vis {
-                    if self.set_vis_scope_denied(&dcls, sv) {
-                        return self.set_visibility_indirect_error(&dcls, &pd.name, sv);
-                    }
+        if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
+            if let Some(sv) = pd.set_vis {
+                if self.set_vis_scope_denied(&dcls, sv) {
+                    return self.set_visibility_indirect_error(&dcls, &pd.name, sv);
                 }
             }
         }
@@ -199,16 +197,14 @@ impl<'a> Interp<'a> {
         // private(set)/protected(set): gated by write kind — plain `=`
         // is gated in store() with 'Cannot modify' first, and unsets
         // carry their own 'Attempt to unset static property'.
-        if !self.in_unset {
-            if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
-                if let Some(sv) = pd.set_vis {
-                    if self.set_vis_scope_denied(&dcls, sv) {
-                        return if indirect {
-                            self.set_visibility_indirect_error(&dcls, &pd.name, sv)
-                        } else {
-                            self.set_visibility_error(&dcls, &pd.name, sv)
-                        };
-                    }
+        if let Some((pd, dcls)) = self.find_static_prop_decl(&cls, name) {
+            if let Some(sv) = pd.set_vis {
+                if self.set_vis_scope_denied(&dcls, sv) {
+                    return if indirect {
+                        self.set_visibility_indirect_error(&dcls, &pd.name, sv)
+                    } else {
+                        self.set_visibility_error(&dcls, &pd.name, sv)
+                    };
                 }
             }
         }
@@ -635,11 +631,7 @@ impl<'a> Interp<'a> {
                                 || self.is_throwable_name(&ob.class.decl.name)
                         };
                         if is_throwable {
-                            if name.eq_ignore_ascii_case("__construct") {
-                                if let Some(v) = self.throwable_ctor(o, &args)? {
-                                    return Ok(v);
-                                }
-                            } else if let Some(v) = self.throwable_method(o, name, &args.cells)? {
+                            if let Some(v) = self.throwable_method(o, name, &args)? {
                                 return Ok(v);
                             }
                         }
@@ -658,6 +650,7 @@ impl<'a> Interp<'a> {
                 }
                 self.pending_decl_class = Some(dc.clone());
                 self.pending_called_class = Some(called_class.clone().unwrap_or(cls.clone()));
+                self.pending_decl_site = Some(Rc::as_ptr(&m) as usize);
                 let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(dc));
                 self.pending_decl_class = None;
                 self.pending_called_class = None;
@@ -701,6 +694,7 @@ impl<'a> Interp<'a> {
                 if let Some((m, dc)) = self.find_method_in(&cls, "__callstatic") {
                     self.pending_decl_class = Some(dc.clone());
                     self.pending_called_class = Some(called_class.clone().unwrap_or(cls.clone()));
+                    self.pending_decl_site = Some(Rc::as_ptr(&m) as usize);
                     let r = self.invoke_fn(&Rc::new(m.decl.clone()), magic_args, None, Some(dc));
                     self.pending_decl_class = None;
                     self.pending_called_class = None;

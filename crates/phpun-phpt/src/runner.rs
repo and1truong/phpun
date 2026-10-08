@@ -451,7 +451,9 @@ pub fn run_one(path: &Path, opts: &RunOptions) -> TestResult {
         None => return mk(Status::Borked("cannot write .php file".into())),
     };
     let mut args = ini_args(&test);
-    args.push("-f".into());
+    // run-tests.php invokes `php FILE <ARGS>` — the file is a bare
+    // positional, so option-like ARGS stay script args (a `-f` would
+    // keep option-parsing live and eat them).
     args.push(php_file.display().to_string());
     args.extend(prog_args(&test));
 

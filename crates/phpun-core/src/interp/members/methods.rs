@@ -548,7 +548,11 @@ impl<'a> Interp<'a> {
                 // The evicted payload's last ref dies with the
                 // cell — held objects/gens destruct now. Drop the
                 // borrow before dtors run (bug65051).
+                let had = arr.borrow().get_cell(&k).is_some();
                 let evicted = arr.borrow_mut().unset(&k);
+                if had {
+                    self.mem_credit(&arr, 32);
+                }
                 if let Some(v) = evicted {
                     self.destruct_dying_value(&v)?;
                 }
@@ -567,8 +571,8 @@ impl<'a> Interp<'a> {
                                 src.borrow().internal,
                                 Some(ObjectInternal::ArrayIter { .. })
                             );
-                        if !spl_src {
-                            src.borrow_mut().props.remove(&pname);
+                        if !spl_src && src.borrow_mut().props.remove(&pname).is_some() {
+                            self.mem_credit(&src, 32);
                         }
                     }
                 }
@@ -1266,7 +1270,11 @@ impl<'a> Interp<'a> {
     /// prop "0"), so int buckets written by `[]=` stay unreachable.
     /// An SPL backing object resolves through its own storage table —
     /// canonical array keys again, not prop names.
-    fn ao_dim_key(&mut self, obj: &Rc<RefCell<PhpObject>>, kv: &Value) -> Result<ArrKey, PhpError> {
+    pub(in crate::interp) fn ao_dim_key(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        kv: &Value,
+    ) -> Result<ArrKey, PhpError> {
         let spl_src = self.ao_src_obj(obj).is_some_and(|src| {
             !Rc::ptr_eq(&src, obj)
                 && matches!(
@@ -1380,7 +1388,11 @@ impl<'a> Interp<'a> {
         drop(so);
         for k in stale {
             // Drop the borrow before the evicted payload's dtors run.
+            let had = arr.borrow().get_cell(&k).is_some();
             let evicted = arr.borrow_mut().unset(&k);
+            if had {
+                self.mem_credit(arr, 32);
+            }
             if let Some(v) = evicted {
                 let _ = self.destruct_dying_value(&v);
             }
@@ -1911,6 +1923,7 @@ impl<'a> Interp<'a> {
         let called = obj.borrow().class.clone();
         self.pending_decl_class = Some(dc.clone());
         self.pending_called_class = Some(called);
+        self.pending_decl_site = Some(Rc::as_ptr(m) as usize);
         let r = if m.is_static {
             self.invoke_fn(&Rc::new(m.decl.clone()), args, None, Some(dc))
         } else {
@@ -2012,6 +2025,7 @@ impl<'a> Interp<'a> {
             }
             self.pending_decl_class = Some(sc.clone());
             self.pending_called_class = Some(called_class.unwrap_or(cls.clone()));
+            self.pending_decl_site = Some(Rc::as_ptr(&m) as usize);
             let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, this_obj, Some(sc));
             self.pending_decl_class = None;
             self.pending_called_class = None;
@@ -2042,6 +2056,7 @@ impl<'a> Interp<'a> {
                     let arr = self.magic_args_array(&args);
                     self.pending_decl_class = Some(cdc.clone());
                     self.pending_called_class = Some(called_class.unwrap_or(cls.clone()));
+                    self.pending_decl_site = Some(Rc::as_ptr(&cm) as usize);
                     let r = self.invoke_fn(
                         &Rc::new(cm.decl.clone()),
                         CallArgs::positional(vec![
@@ -2256,11 +2271,7 @@ impl<'a> Interp<'a> {
                 .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
                 .unwrap_or(false);
             if stub {
-                if name.eq_ignore_ascii_case("__construct") {
-                    if let Some(v) = self.throwable_ctor(&obj, &args)? {
-                        return Ok(v);
-                    }
-                } else if let Some(v) = self.throwable_method(&obj, name, &args.cells)? {
+                if let Some(v) = self.throwable_method(&obj, name, &args)? {
                     return Ok(v);
                 }
             }
@@ -2688,12 +2699,118 @@ impl<'a> Interp<'a> {
         })
     }
 
-    /// Native implementations of Throwable methods.
+    /// Native implementations of Throwable methods. Internal calls
+    /// carry a backtrace frame — zend renders
+    /// `Exception->__construct(Array, '9')` in uncaught TypeError
+    /// traces (arg repr truncates via trace_arg).
     pub(in crate::interp) fn throwable_method(
         &mut self,
         obj: &Rc<RefCell<PhpObject>>,
         name: &str,
-        _args: &[Cell],
+        args: &CallArgs,
+    ) -> Result<Option<Value>, PhpError> {
+        // zend resolves internal-function named args in the CALLER's
+        // frame — 'Unknown named parameter' and 'overwrites previous
+        // argument' errors surface without the ->__construct() frame
+        // that the arity check and ZPP type errors raised afterwards
+        // carry.
+        let ctor_bound = if name.eq_ignore_ascii_case("__construct") {
+            Some(self.throwable_ctor_bind(obj, args)?)
+        } else {
+            None
+        };
+        // Zend renders a builtin's named args positionally in traces
+        // (`Exception->__construct(Array, '9')`) — fold them into the
+        // frame's arg list rather than `name: val` pairs.
+        let mut fargs = args.cells.clone();
+        fargs.extend(args.named.iter().map(|(_, c, ..)| c.clone()));
+        self.call_trace.push(TraceFrame {
+            file: self.diag_file(),
+            line: self.cur_line as u32,
+            function: name.to_string(),
+            class: Some(obj.borrow().class.name().to_string()),
+            ty: "->".into(),
+            args: fargs,
+            named_args: vec![],
+            internal: true,
+            visible: true,
+            named_dispatch: false,
+            gen_resume: false,
+            gen_body: false,
+        });
+        let r = self.throwable_method_inner(obj, name, args, ctor_bound);
+        self.call_trace.pop();
+        r
+    }
+
+    /// zend's "|SlO!" / "|SllS!l!O!" named-arg binding for builtin
+    /// throwable ctors: positional slots fill first, then named args
+    /// resolve against the declared names (unknown name / overwrite of
+    /// a filled slot errors). Run pre-frame in throwable_method so
+    /// binding errors carry no ctor trace frame. Returns the bound
+    /// slots plus whether the class descends from ErrorException.
+    fn throwable_ctor_bind(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        args: &CallArgs,
+    ) -> Result<(Vec<Option<Cell>>, bool), PhpError> {
+        let ee = self.is_a(&obj.borrow().class.clone(), "errorexception");
+        let pnames: &[&str] = if ee {
+            &[
+                "message", "code", "severity", "filename", "line", "previous",
+            ]
+        } else {
+            &["message", "code", "previous"]
+        };
+        let mut bound: Vec<Option<Cell>> = vec![None; pnames.len()];
+        for (i, c) in args.iter().enumerate().take(pnames.len()) {
+            bound[i] = Some(c.clone());
+        }
+        for (n, c, ..) in &args.named {
+            match pnames.iter().position(|p| *p == n.as_str()) {
+                Some(i) => {
+                    if bound[i].is_some() {
+                        return Err(self.spl_throw(
+                            "Error",
+                            format!("Named parameter ${} overwrites previous argument", n),
+                        ));
+                    }
+                    bound[i] = Some(c.clone());
+                }
+                None => {
+                    return Err(self.spl_throw("Error", format!("Unknown named parameter ${}", n)));
+                }
+            }
+        }
+        Ok((bound, ee))
+    }
+
+    /// zend's weak `string` zpp coercion for throwable ctor args:
+    /// scalars stringify (weak_ty_coerce); objects dispatch their
+    /// __toString; anything else (array, resource, object without
+    /// __toString) fails so the caller raises its TypeError.
+    fn weak_str_ctor(&mut self, v: &Value) -> Result<Option<String>, PhpError> {
+        if let Value::Object(o) = v {
+            if self
+                .find_method_in(&o.borrow().class, "__tostring")
+                .is_none()
+            {
+                return Ok(None);
+            }
+            return match self.method_invoke(o.clone(), "__toString", CallArgs::empty()) {
+                Ok(v) => Ok(Some(v.to_php_string())),
+                Err(e) => Err(e),
+            };
+        }
+        Ok(weak_ty_coerce(&["string".into()], v).map(|v| v.to_php_string()))
+    }
+
+    fn throwable_method_inner(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        name: &str,
+        args: &CallArgs,
+        ctor_bound: Option<(Vec<Option<Cell>>, bool)>,
     ) -> Result<Option<Value>, PhpError> {
         let ob = obj.borrow();
         let lname = name.to_lowercase();
@@ -2849,15 +2966,263 @@ impl<'a> Interp<'a> {
                 drop(ob);
                 Some(Value::str(out))
             }
-            // __construct is dispatched to throwable_ctor() ahead of
-            // this table — it needs arginfo errors (TypeError/
-            // ArgumentCountError/named args), not Option<Value>.
             "getseverity" => Some(
                 ob.props
                     .get("severity")
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Int(1)),
             ),
+            "__construct" => {
+                // Builtin throwable ctor: props from args. ErrorException's
+                // own signature is (message, code, severity, filename,
+                // line, previous) — zend declares it on ErrorException so
+                // the whole subtree inherits the 6-arg shape; every other
+                // throwable keeps (message, code, previous). Arg checks
+                // are zend's weak-mode ZPP coercions (non-coercible arg →
+                // TypeError naming it).
+                drop(ob);
+                let mut ob = obj.borrow_mut();
+                // Named args already bound pre-frame by
+                // throwable_method (zend reports unknown-name and
+                // overwrite errors in the caller's frame — no ctor
+                // frame — while the arity/type errors below carry it).
+                let (bound, ee) = ctor_bound.expect("throwable_method binds __construct pre-frame");
+                // zend names the ctor's DECLARING scope — the ROOT
+                // builtin throwable ancestor whose internal __construct
+                // stub the method descends from (Exception for the
+                // Exception tree, Error for the Error tree,
+                // ErrorException for its subtree). A userland override
+                // in the middle of the chain does not relabel it.
+                let mut cls_name = ob.class.name().to_string();
+                {
+                    let mut cur = Some(ob.class.clone());
+                    while let Some(c) = cur {
+                        let internal = c.decl.methods.iter().any(|m| {
+                            m.decl.name.eq_ignore_ascii_case("__construct")
+                                && m.decl.body.is_empty()
+                                && m.decl.line == 0
+                        });
+                        if internal {
+                            cls_name = c.name().to_string();
+                        }
+                        cur = c
+                            .decl
+                            .parent
+                            .as_ref()
+                            .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                    }
+                    if ee {
+                        cls_name = "ErrorException".into();
+                    }
+                }
+                macro_rules! arg_err {
+                    ($n:expr, $pname:expr, $ty:expr, $v:expr) => {{
+                        let tn = self.zval_type_name($v);
+                        return Err(self.spl_throw(
+                            "TypeError",
+                            format!(
+                                "{}::__construct(): Argument #{} (${}) must be of type {}, {} given",
+                                cls_name, $n, $pname, $ty, tn
+                            ),
+                        ));
+                    }};
+                }
+                // zend parses the ctor with "|SlO!" (throwables) or
+                // "|SllS!l!O!" (ErrorException); named args were bound
+                // pre-frame — only the max-arity check remains here.
+                if args.len() > bound.len() {
+                    return Err(self.spl_throw(
+                        "ArgumentCountError",
+                        format!(
+                            "{}::__construct() expects at most {} arguments, {} given",
+                            cls_name,
+                            bound.len(),
+                            args.len()
+                        ),
+                    ));
+                }
+                let getv = |i: usize| {
+                    bound
+                        .get(i)
+                        .and_then(|o| o.as_ref())
+                        .map(|c| c.borrow().clone())
+                };
+                let msg = match getv(0) {
+                    Some(v @ Value::Array(_)) => arg_err!(1, "message", "string", &v),
+                    Some(Value::Null) => {
+                        self.deprecated(&format!(
+                            "{cls_name}::__construct(): Passing null to parameter #1 ($message) of type string is deprecated"
+                        ))?;
+                        String::new()
+                    }
+                    Some(v) => {
+                        // The ctor's prop borrow must end before a
+                        // userland __toString runs — it may read the
+                        // object being constructed.
+                        drop(ob);
+                        let s = match self.weak_str_ctor(&v)? {
+                            Some(s) => s,
+                            None => arg_err!(1, "message", "string", &v),
+                        };
+                        ob = obj.borrow_mut();
+                        s
+                    }
+                    None => String::new(),
+                };
+                let code = match getv(1) {
+                    Some(Value::Int(i)) => i,
+                    Some(Value::Null) => {
+                        self.deprecated(&format!(
+                            "{cls_name}::__construct(): Passing null to parameter #2 ($code) of type int is deprecated"
+                        ))?;
+                        0
+                    }
+                    Some(Value::Float(f)) => {
+                        if f.fract() != 0.0 {
+                            self.deprecated(&format!(
+                                "Implicit conversion from float {} to int loses precision",
+                                crate::value::format_float(f)
+                            ))?;
+                        }
+                        match weak_ty_coerce(&["int".into()], &Value::Float(f)) {
+                            Some(Value::Int(i)) => i,
+                            _ => arg_err!(2, "code", "int", &Value::Float(f)),
+                        }
+                    }
+                    Some(v) => match weak_ty_coerce(&["int".into()], &v) {
+                        Some(Value::Int(i)) => i,
+                        _ => arg_err!(2, "code", "int", &v),
+                    },
+                    None => 0,
+                };
+                let (severity, filename, line, prev_arg) = if ee {
+                    let severity = match getv(2) {
+                        Some(Value::Int(i)) => i,
+                        Some(Value::Null) => {
+                            self.deprecated(&format!(
+                                "{cls_name}::__construct(): Passing null to parameter #3 ($severity) of type int is deprecated"
+                            ))?;
+                            0
+                        }
+                        Some(Value::Float(f)) => {
+                            if f.fract() != 0.0 {
+                                self.deprecated(&format!(
+                                    "Implicit conversion from float {} to int loses precision",
+                                    crate::value::format_float(f)
+                                ))?;
+                            }
+                            match weak_ty_coerce(&["int".into()], &Value::Float(f)) {
+                                Some(Value::Int(i)) => i,
+                                _ => arg_err!(3, "severity", "int", &Value::Float(f)),
+                            }
+                        }
+                        Some(v) => match weak_ty_coerce(&["int".into()], &v) {
+                            Some(Value::Int(i)) => i,
+                            _ => arg_err!(3, "severity", "int", &v),
+                        },
+                        None => 1, // E_ERROR
+                    };
+                    let filename = match getv(3) {
+                        Some(Value::Null) | None => None,
+                        Some(v) => {
+                            drop(ob);
+                            let s = match self.weak_str_ctor(&v)? {
+                                Some(s) => s,
+                                None => arg_err!(4, "filename", "?string", &v),
+                            };
+                            ob = obj.borrow_mut();
+                            Some(s)
+                        }
+                    };
+                    let line = match getv(4) {
+                        Some(Value::Null) | None => None,
+                        Some(Value::Int(i)) => Some(i),
+                        Some(Value::Float(f)) => {
+                            if f.fract() != 0.0 {
+                                self.deprecated(&format!(
+                                    "Implicit conversion from float {} to int loses precision",
+                                    crate::value::format_float(f)
+                                ))?;
+                            }
+                            match weak_ty_coerce(&["int".into()], &Value::Float(f)) {
+                                Some(Value::Int(i)) => Some(i),
+                                _ => arg_err!(5, "line", "?int", &Value::Float(f)),
+                            }
+                        }
+                        Some(v) => match weak_ty_coerce(&["int".into()], &v) {
+                            Some(Value::Int(i)) => Some(i),
+                            _ => arg_err!(5, "line", "?int", &v),
+                        },
+                    };
+                    (severity, filename, line, bound[5].clone())
+                } else {
+                    (1, None, None, bound[2].clone())
+                };
+                ob.props.insert("message".into(), cell(Value::str(msg)));
+                ob.props.insert("code".into(), cell(Value::Int(code)));
+                if !ob.prop_order.contains(&"message".into()) {
+                    ob.prop_order.push("message".into());
+                    ob.prop_order.push("code".into());
+                }
+                if ee {
+                    ob.props
+                        .insert("severity".into(), cell(Value::Int(severity)));
+                    if !ob.prop_order.contains(&"severity".into()) {
+                        ob.prop_order.push("severity".into());
+                    }
+                    // zend lets the ctor override the throw site's
+                    // file/line — both the props and getFile()/getLine()
+                    // report them. A filename override with a null or
+                    // omitted line forces line=0 (the `else if
+                    // (filename)` branch in zend_exceptions.c), while
+                    // no filename leaves the throw-site line alone.
+                    if let Some(f) = &filename {
+                        ob.props.insert("file".into(), cell(Value::str(f)));
+                        if let Some(ObjectInternal::Exception { file, .. }) = &mut ob.internal {
+                            *file = f.clone();
+                        }
+                    }
+                    if let Some(l) = line.or(filename.is_some().then_some(0)) {
+                        ob.props.insert("line".into(), cell(Value::Int(l)));
+                        if let Some(ObjectInternal::Exception { line: il, .. }) = &mut ob.internal {
+                            *il = l as u32;
+                        }
+                    }
+                }
+                // zend's ?Throwable check — arg #6 on ErrorException,
+                // #3 elsewhere. A Throwable lands in the private
+                // `\0{Root}\0previous` slot the internal state mirrors.
+                if let Some(c) = prev_arg {
+                    let pv = c.borrow().clone();
+                    let ok = match &pv {
+                        Value::Null => true,
+                        Value::Object(o) => {
+                            let cn = o.borrow().class.decl.name.clone();
+                            self.is_throwable_name(&cn)
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        arg_err!(if ee { 6 } else { 3 }, "previous", "?Throwable", &pv);
+                    }
+                    if let Value::Object(_) = &pv {
+                        if let Some(ObjectInternal::Exception { previous, .. }) = &mut ob.internal {
+                            *previous = Some(pv.clone());
+                        }
+                        let pscope = if self.is_a_str(ob.class.name(), "error") {
+                            "Error"
+                        } else {
+                            "Exception"
+                        };
+                        let pk = format!("\0{}\0previous", pscope);
+                        if !ob.prop_order.contains(&pk) {
+                            ob.prop_order.push(pk.clone());
+                        }
+                        ob.props.insert(pk, cell(pv));
+                    }
+                }
+                Some(Value::Null)
+            }
             _ => None,
         })
     }
@@ -2875,7 +3240,7 @@ impl<'a> Interp<'a> {
             }
         };
         let trace_v = self
-            .throwable_method(o, "getTrace", &[])
+            .throwable_method(o, "getTrace", &CallArgs::positional(vec![]))
             .ok()
             .flatten()
             .unwrap_or(Value::Null);
@@ -2898,280 +3263,6 @@ impl<'a> Interp<'a> {
         put(&mut ob, format!("\0{}\0string", scope), Value::str(""));
         put(&mut ob, format!("\0{}\0trace", scope), trace_v);
         // 'previous' slot exists with a Null cell from decl defaults.
-    }
-
-    /// `Ctor::__construct(): Argument #N` TypeError for throwable
-    /// arginfo checks — names the DECLARING class.
-    fn arg_tyerr(&self, dname: &str, n: usize, pname: &str, ty: &str, v: &Value) -> PhpError {
-        PhpError::uncaught(
-            "TypeError",
-            format!(
-                "{}::__construct(): Argument #{} (${}) must be of type {}, {} given",
-                dname,
-                n,
-                pname,
-                ty,
-                self.zval_type_name(v)
-            ),
-            0,
-        )
-    }
-
-    /// Deprecated 'Passing null to parameter #N' for non-nullable
-    /// throwable-ctor params.
-    fn arg_null_dep(
-        &mut self,
-        dname: &str,
-        n: usize,
-        pname: &str,
-        ty: &str,
-    ) -> Result<(), PhpError> {
-        self.deprecated(&format!(
-            "{}::__construct(): Passing null to parameter #{} (${}) of type {} is deprecated",
-            dname, n, pname, ty
-        ))
-    }
-
-    /// Builtin throwable ctor — zend exposes real arginfo here:
-    /// Exception/Error take `(string $message = "", int $code = 0,
-    /// ?Throwable $previous = null)`; ErrorException inserts
-    /// severity/filename/line before previous. Errors name the
-    /// DECLARING class (RuntimeException arg errors read
-    /// 'Exception::__construct()'; ErrorException overrides its own).
-    pub(in crate::interp) fn throwable_ctor(
-        &mut self,
-        obj: &Rc<RefCell<PhpObject>>,
-        args: &crate::interp::CallArgs,
-    ) -> Result<Option<Value>, PhpError> {
-        // Class-table checks only — callers may hold an object borrow.
-        let cname = {
-            let ob = obj.borrow();
-            ob.class.name().to_string()
-        };
-        let is_ee = self.is_a_str(&cname, "errorexception");
-        let dname = if is_ee {
-            "ErrorException"
-        } else if self.is_a_str(&cname, "error") {
-            "Error"
-        } else {
-            "Exception"
-        };
-        const EX_PARAMS: [(&str, &str); 3] = [
-            ("message", "string"),
-            ("code", "int"),
-            ("previous", "?Throwable"),
-        ];
-        const EE_PARAMS: [(&str, &str); 6] = [
-            ("message", "string"),
-            ("code", "int"),
-            ("severity", "int"),
-            ("filename", "?string"),
-            ("line", "?int"),
-            ("previous", "?Throwable"),
-        ];
-        let params: &[(&str, &str)] = if is_ee { &EE_PARAMS } else { &EX_PARAMS };
-        let total = args.cells.len() + args.named.len();
-        if total > params.len() {
-            return self.fail(PhpError::uncaught(
-                "ArgumentCountError",
-                format!(
-                    "{}::__construct() expects at most {} arguments, {} given",
-                    dname,
-                    params.len(),
-                    total
-                ),
-                0,
-            ));
-        }
-        let mut slots: Vec<Option<Cell>> = args.cells.iter().cloned().map(Some).collect();
-        slots.resize(params.len(), None);
-        for (n, c, _, _) in &args.named {
-            match params.iter().position(|(p, _)| p == n) {
-                Some(i) => {
-                    if slots[i].is_some() {
-                        return self.fail(PhpError::uncaught(
-                            "Error",
-                            format!("Named parameter ${} overwrites previous argument", n),
-                            0,
-                        ));
-                    }
-                    slots[i] = Some(c.clone());
-                }
-                None => {
-                    return self.fail(PhpError::uncaught(
-                        "Error",
-                        format!("Unknown named parameter ${}", n),
-                        0,
-                    ));
-                }
-            }
-        }
-        // Per-param zend type checks. Internal-fn coercion rules: array/
-        // object reject with a TypeError naming the DECLARING method;
-        // null into a non-nullable scalar is deprecated, not fatal;
-        // float->int truncates with a precision deprecation.
-        let mut bound: Vec<Value> = Vec::with_capacity(params.len());
-        for (i, (pname, pty)) in params.iter().enumerate() {
-            let v = match &slots[i] {
-                Some(c) => c.borrow().clone(),
-                None => {
-                    // zend defaults: message "", code 0, severity
-                    // E_ERROR, filename/line/previous null.
-                    bound.push(if *pname == "severity" {
-                        Value::Int(1)
-                    } else {
-                        Value::Null
-                    });
-                    continue;
-                }
-            };
-            let n = i + 1;
-            let bv = match *pty {
-                "string" => match &v {
-                    Value::Null => {
-                        self.arg_null_dep(dname, n, pname, "string")?;
-                        Value::str("")
-                    }
-                    Value::Array(_) | Value::Callable(_) | Value::Resource(_) => {
-                        return self.fail(self.arg_tyerr(dname, n, pname, "string", &v));
-                    }
-                    Value::Object(o) => {
-                        if self
-                            .find_method_in(&o.borrow().class.clone(), "__tostring")
-                            .is_some()
-                        {
-                            Value::str(self.conv_str(&v)?)
-                        } else {
-                            return self.fail(self.arg_tyerr(dname, n, pname, "string", &v));
-                        }
-                    }
-                    _ => Value::str(self.conv_str(&v)?),
-                },
-                "int" | "?int" => {
-                    let nullable = *pty == "?int";
-                    match &v {
-                        Value::Null if !nullable => {
-                            self.arg_null_dep(dname, n, pname, "int")?;
-                            Value::Int(0)
-                        }
-                        Value::Null => Value::Null,
-                        Value::Float(f) => {
-                            if f.fract() != 0.0 {
-                                self.deprecated(&format!(
-                                    "Implicit conversion from float {} to int loses precision",
-                                    crate::value::format_float(*f)
-                                ))?;
-                            }
-                            Value::Int(*f as i64)
-                        }
-                        Value::Str(s) => match crate::value::numeric(s) {
-                            crate::value::Numeric::Int(iv) => Value::Int(iv),
-                            crate::value::Numeric::Float(f) => {
-                                if f.fract() != 0.0 {
-                                    self.deprecated(&format!(
-                                        "Implicit conversion from float {} to int loses precision",
-                                        crate::value::format_float(f)
-                                    ))?;
-                                }
-                                Value::Int(f as i64)
-                            }
-                            crate::value::Numeric::Leading(f, _) => Value::Int(f as i64),
-                            crate::value::Numeric::NonNumeric => {
-                                return self.fail(self.arg_tyerr(dname, n, pname, pty, &v));
-                            }
-                        },
-                        Value::Int(_) | Value::Bool(_) => Value::Int(v.to_int()),
-                        _ => return self.fail(self.arg_tyerr(dname, n, pname, pty, &v)),
-                    }
-                }
-                "?string" => match &v {
-                    Value::Null => Value::Null,
-                    Value::Array(_) | Value::Callable(_) | Value::Resource(_) => {
-                        return self.fail(self.arg_tyerr(dname, n, pname, "?string", &v));
-                    }
-                    Value::Object(o) => {
-                        if self
-                            .find_method_in(&o.borrow().class.clone(), "__tostring")
-                            .is_some()
-                        {
-                            Value::str(self.conv_str(&v)?)
-                        } else {
-                            return self.fail(self.arg_tyerr(dname, n, pname, "?string", &v));
-                        }
-                    }
-                    _ => Value::str(self.conv_str(&v)?),
-                },
-                "?Throwable" => match &v {
-                    Value::Null => Value::Null,
-                    Value::Object(o) if self.is_throwable_name(&o.borrow().class.decl.name) => {
-                        v.clone()
-                    }
-                    _ => return self.fail(self.arg_tyerr(dname, n, pname, "?Throwable", &v)),
-                },
-                _ => v.clone(),
-            };
-            bound.push(bv);
-        }
-        drop(obj.borrow());
-        let mut ob = obj.borrow_mut();
-        let msg = bound[0].to_php_string();
-        let code = bound[1].to_int();
-        ob.props.insert("message".into(), cell(Value::str(msg)));
-        ob.props.insert("code".into(), cell(Value::Int(code)));
-        if !ob.prop_order.contains(&"message".into()) {
-            ob.prop_order.push("message".into());
-            ob.prop_order.push("code".into());
-        }
-        let (prev_i, file_v, line_v, sev_v) = if is_ee {
-            // severity/file/line live between code and previous.
-            let sev = bound[2].to_int();
-            let fv = bound[3].clone();
-            let lv = bound[4].clone();
-            (5, Some(fv), Some(lv), Some(sev))
-        } else {
-            (2, None, None, None)
-        };
-        if let Some(sev) = sev_v {
-            ob.props.insert("severity".into(), cell(Value::Int(sev)));
-            if !ob.prop_order.contains(&"severity".into()) {
-                ob.prop_order.push("severity".into());
-            }
-        }
-        if let Some(fv) = file_v {
-            if let Value::Str(_) = &fv {
-                if let Some(ObjectInternal::Exception { file, .. }) = &mut ob.internal {
-                    *file = fv.to_php_string();
-                }
-            }
-        }
-        if let Some(Value::Int(l)) = line_v {
-            if let Some(ObjectInternal::Exception { line, .. }) = &mut ob.internal {
-                *line = l as u32;
-            }
-        }
-        if let prev @ Value::Object(_) = bound[prev_i].clone() {
-            if let Some(ObjectInternal::Exception { previous, .. }) = &mut ob.internal {
-                *previous = Some(prev);
-            }
-        }
-        // Dump-visible props mirror the engine state — file/line pick
-        // up the ErrorException filename/line overrides; previous is
-        // a private slot on the root class.
-        let (fprop, lprop) = match &ob.internal {
-            Some(ObjectInternal::Exception { file, line, .. }) => (file.clone(), *line as i64),
-            _ => (String::new(), 0),
-        };
-        ob.props.insert("file".into(), cell(Value::str(fprop)));
-        ob.props.insert("line".into(), cell(Value::Int(lprop)));
-        let prev_v = bound[prev_i].clone();
-        let pscope = if self.is_a_str(&cname, "error") {
-            "Error"
-        } else {
-            "Exception"
-        };
-        ob.props
-            .insert(format!("\0{}\0previous", pscope), cell(prev_v));
-        Ok(Some(Value::Null))
     }
 
     /// `X::` member access where X may be a trait: traits resolve to a

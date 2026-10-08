@@ -323,7 +323,12 @@ pub(crate) fn dispatch(
             if k == "memory_limit" {
                 it.ini.insert(k.clone(), v);
                 let lim = it.ini_bytes(&k);
-                let usage = it.mem_real();
+                // zend refuses limits below committed heap usage;
+                // dead tracked charges sweep first so a freed 20MB
+                // string doesn't hold committed pages hostage
+                // (zend_mm's real usage drops on free).
+                it.mem_sweep();
+                let usage = it.mem_real() as i64;
                 if lim > 0 && usage > lim {
                     let _ = it
                         .ini
@@ -439,9 +444,11 @@ pub(crate) fn dispatch(
                 e.push(v);
             };
             let mut i = 0usize;
+            let mut dd = false;
             while i < argv.len() {
                 let a = &argv[i];
                 if a == "--" {
+                    dd = true;
                     break;
                 } else if let Some(body) = a.strip_prefix("--").filter(|b| !b.is_empty()) {
                     let (name, inline) = match body.find('=') {
@@ -468,9 +475,9 @@ pub(crate) fn dispatch(
                                     &mut vals,
                                     &mut order,
                                 );
-                            } else {
-                                put(name.to_string(), Value::Bool(false), &mut vals, &mut order);
                             }
+                            // A required-value option left valueless is
+                            // simply absent from zend's result.
                         }
                     }
                 } else if a.starts_with('-') && a.len() > 1 {
@@ -488,14 +495,18 @@ pub(crate) fn dispatch(
                                     let v: String = cs[j + 1..].iter().collect();
                                     let v = v.strip_prefix('=').unwrap_or(&v).to_string();
                                     put(cs[j].to_string(), Value::str(v), &mut vals, &mut order);
-                                } else if k == 1 && i + 1 < argv.len() {
-                                    i += 1;
-                                    put(
-                                        cs[j].to_string(),
-                                        Value::str(argv[i].clone()),
-                                        &mut vals,
-                                        &mut order,
-                                    );
+                                } else if k == 1 {
+                                    if i + 1 < argv.len() {
+                                        i += 1;
+                                        put(
+                                            cs[j].to_string(),
+                                            Value::str(argv[i].clone()),
+                                            &mut vals,
+                                            &mut order,
+                                        );
+                                    }
+                                    // Required value never arrived —
+                                    // zend omits the key entirely.
                                 } else {
                                     put(
                                         cs[j].to_string(),
@@ -514,7 +525,9 @@ pub(crate) fn dispatch(
                 i += 1;
             }
             if let Some(c) = args.get(2) {
-                *c.borrow_mut() = Value::Int(i as i64);
+                // zend's optind counts argv[0] (the script name) and
+                // skips a terminating `--` — our script_args has neither.
+                *c.borrow_mut() = Value::Int(i as i64 + 1 + dd as i64);
             }
             let mut out = PhpArray::new();
             for name in order {
@@ -529,29 +542,39 @@ pub(crate) fn dispatch(
                         Value::Array(Rc::new(RefCell::new(inner)))
                     }
                 };
-                out.set(ArrKey::Str(name.into()), v);
+                // Numeric option names normalize to int keys — zend's
+                // getopt result uses the array key rules (-1111 → [1]).
+                out.set(to_key(&Value::str(name)), v);
             }
             Value::Array(Rc::new(RefCell::new(out)))
         }
         "php_sapi_name" => Value::str("cli"),
         "phpversion" | "phpversion_strict" => Value::str("8.5.11-phpun"),
         "php_uname" => Value::str("Linux"),
-        // Runtime baseline + metered live bytes (obj shells, array
-        // tables, string payloads); emitted output is free. The
-        // $real_usage flag swaps live `size` for committed
-        // `real_size` — zend's 2MB-block high-water + huge chunks.
-        "memory_get_usage" => Value::Int(if arg(args, 0).is_truthy() {
-            it.mem_real()
-        } else {
-            it.mem_total()
-        }),
-        // High-water mark of the live total — zend's peak survives
-        // frees until memory_reset_peak_usage re-baselines it.
+        // zend's memory_get_usage reports the live emalloc usage —
+        // mem_used models it (charges up, credits down on efree);
+        // real_usage is heap->real_size (committed chunks + huge segs).
+        "memory_get_usage" => {
+            if arg(args, 0).is_truthy() {
+                it.mem_reconcile();
+                Value::Int(it.mem_real() as i64)
+            } else {
+                Value::Int(it.mem_reconcile() as i64)
+            }
+        }
         "memory_get_peak_usage" => {
-            Value::Int(crate::value::MEM_BASE_BYTES + crate::value::mem_peak_bytes())
+            if arg(args, 0).is_truthy() {
+                it.mem_reconcile();
+                Value::Int(it.mem_real_peak as i64)
+            } else {
+                it.mem_reconcile();
+                Value::Int(it.mem_peak as i64)
+            }
         }
         "memory_reset_peak_usage" => {
-            crate::value::mem_peak_reset();
+            it.mem_reconcile();
+            it.mem_peak = it.mem_used;
+            it.mem_real_peak = it.mem_real();
             Value::Null
         }
         "zend_version" => Value::str("8.5.11-phpun"),

@@ -91,18 +91,17 @@ impl PhpArray {
         // so the reported request is the grow alloc's size: packed
         // tables alloc nSize*16+8, mixed tables nSize*40 (oracle:
         // 1310720@nSize=32768, 5242880@131072 on 'k$i' loops).
-        let request = arr_req(self.mem_elems, self.packed);
-        let new = arr_foot(self.mem_elems, self.packed);
-        let old_req = arr_req(self.mem_elems - 1, self.packed);
-        // zend only emallocs when the grow crosses a pow2 bucket
-        // boundary — in-band appends reuse the committed arData.
-        // The guard reads real_size before this grow commits —
-        // captured ahead of the dedicated-chunk swap.
-        if request != old_req {
-            real_peak_note(mem_real_raw() + request);
-        }
-        arr_huge_note((old, old_req), (new, request));
-        mem_charge_raw(&ARR_LIVE, new - old, request);
+        let n = (self.mem_elems.max(8) as u64).next_power_of_two() as i64;
+        let request = if self.packed {
+            n * ARR_ELEM_BYTES + 8
+        } else {
+            n * ARR_ELEM_HASH_BYTES
+        };
+        mem_charge(
+            &ARR_LIVE,
+            arr_foot(self.mem_elems, self.packed) - old,
+            request,
+        );
     }
 
     /// Bulk-charge `n` appended slots — the mass-prepend path in
@@ -115,22 +114,23 @@ impl PhpArray {
         }
         let old = arr_foot(self.mem_elems, self.packed);
         self.mem_elems += n;
-        let request = arr_req(self.mem_elems, self.packed);
-        let new = arr_foot(self.mem_elems, self.packed);
-        let old_req = arr_req(self.mem_elems - n, self.packed);
-        // Same pow2-crossing rule as mem_note_append.
-        if request != old_req {
-            real_peak_note(mem_real_raw() + request);
-        }
-        arr_huge_note((old, old_req), (new, request));
-        mem_charge_raw(&ARR_LIVE, new - old, request);
+        let cap = (self.mem_elems.max(8) as u64).next_power_of_two() as i64;
+        let request = if self.packed {
+            cap * ARR_ELEM_BYTES + 8
+        } else {
+            cap * ARR_ELEM_HASH_BYTES
+        };
+        mem_charge(
+            &ARR_LIVE,
+            arr_foot(self.mem_elems, self.packed) - old,
+            request,
+        );
     }
 
     /// Key-side meter bookkeeping before a NEW entry is pushed: a
     /// non-sequential-int key flips the table to mixed (zend converts
-    /// once, permanently) and a string key is a live zend_string plus
-    /// one GC-root-buffer entry (zend tracks container member
-    /// zend_strings; a loose value string is never rooted).
+    /// once, permanently) and a string key is a live zend_string (not
+    /// a GC root — strings can't form cycles).
     /// Call with the key BEFORE the push so the packed check sees the
     /// pre-insert slot count.
     pub fn mem_note_key(&mut self, k: &ArrKey) {
@@ -140,26 +140,17 @@ impl PhpArray {
             ArrKey::Tomb => false,
         };
         if flip {
-            // Packed→mixed conversion rebuilds the whole arData as
-            // 40B buckets — the emalloc guard sees the new alloc while
-            // the old arData is still committed, then it's freed.
-            let n = self.mem_elems;
-            let req = arr_req(n + 1, false);
-            real_peak_note(mem_real_raw() + req);
-            arr_huge_note(
-                (arr_foot(n, true), arr_req(n, true)),
-                (arr_foot(n, false), req),
-            );
+            // Packed→mixed conversion rebuilds arData as 40B buckets.
+            self.packed = false;
             ARR_LIVE.fetch_add(
-                arr_foot(n, false) - arr_foot(n, true),
+                arr_foot(self.mem_elems, false) - arr_foot(self.mem_elems, true),
                 std::sync::atomic::Ordering::Relaxed,
             );
-            self.packed = false;
         }
         if let ArrKey::Str(s) = k {
             let c = key_charge(s.len());
             self.key_bytes += c;
-            str_mem_charge(c, c);
+            mem_charge(&STR_LIVE, c, c);
         }
     }
 
@@ -168,9 +159,10 @@ impl PhpArray {
     /// matching zend_hash_clean semantics under our element model).
     pub fn mem_clear(&mut self) {
         if self.mem_elems > 0 {
-            let foot = arr_foot(self.mem_elems, self.packed);
-            ARR_LIVE.fetch_sub(foot, std::sync::atomic::Ordering::Relaxed);
-            arr_huge_note((foot, arr_req(self.mem_elems, self.packed)), (0, 0));
+            ARR_LIVE.fetch_sub(
+                arr_foot(self.mem_elems, self.packed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             self.mem_elems = 0;
         }
         if self.key_bytes > 0 {
@@ -197,17 +189,19 @@ impl PhpArray {
                         self.packed = false;
                         let c = key_charge(s.len());
                         self.key_bytes += c;
-                        str_mem_charge(c, c);
+                        mem_charge(&STR_LIVE, c, c);
                     }
                     ArrKey::Tomb => {}
                 }
             }
             self.mem_elems = self.entries.len() as i64;
-            let request = arr_req(self.mem_elems, self.packed);
-            let new = arr_foot(self.mem_elems, self.packed);
-            real_peak_note(mem_real_raw() + request);
-            arr_huge_note((0, 0), (new, request));
-            mem_charge_raw(&ARR_LIVE, new, request);
+            let n = (self.mem_elems.max(8) as u64).next_power_of_two() as i64;
+            let request = if self.packed {
+                n * ARR_ELEM_BYTES + 8
+            } else {
+                n * ARR_ELEM_HASH_BYTES
+            };
+            mem_charge(&ARR_LIVE, arr_foot(self.mem_elems, self.packed), request);
         }
     }
 
@@ -1955,7 +1949,7 @@ impl PhpStr {
         // zend's reported request is the zend_string alloc — len + 32
         // (24B header + 8B emalloc header; oracle: 8000032 for 8MB).
         let req = bytes.len() as i64 + 32;
-        str_mem_charge(str_charge(bytes.len()), req);
+        mem_charge(&STR_LIVE, str_charge(bytes.len()), req);
         PhpStr { rc: bytes.into() }
     }
 
@@ -1964,7 +1958,7 @@ impl PhpStr {
     /// resurrection). Bytes that stay live stay charged.
     pub fn adopt(rc: Rc<[u8]>) -> Self {
         let req = rc.len() as i64 + 32;
-        str_mem_charge(str_charge(rc.len()), req);
+        mem_charge(&STR_LIVE, str_charge(rc.len()), req);
         PhpStr { rc }
     }
 }
@@ -1979,7 +1973,7 @@ impl std::ops::Deref for PhpStr {
 impl Drop for PhpStr {
     fn drop(&mut self) {
         if Rc::strong_count(&self.rc) == 1 {
-            str_mem_release(str_charge(self.len()), str_charge(self.len()));
+            STR_LIVE.fetch_sub(str_charge(self.len()), std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -2038,24 +2032,6 @@ static MEM_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::ne
 /// The most recent charge's request size — the OOM fatal's
 /// 'tried to allocate N' arg.
 static LAST_ALLOC: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-/// High-water of live bytes held in the small-pool chunks — zend
-/// never returns a 2MB block to the OS, so committed tracks the
-/// high-water even when live frees back down.
-pub(crate) static SMALL_HW: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-/// Live bytes held inside dedicated huge chunks (requests ≥ the
-/// 2MB block's usable ~2,093,056 bytes get their own page-aligned
-/// chunk — freed back to the OS when the value dies).
-pub(crate) static HUGE_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-/// Committed bytes of the live dedicated chunks (page-rounded).
-pub(crate) static HUGE_REAL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-/// High-water of zend's emalloc check value (real_size + request at
-/// each alloc) — the guard trips MID-expression when a commit would
-/// cross the limit even though the statement ends below it (a 200k
-/// range plus the table it feeds briefly coexist as two dedicated
-/// chunks).
-static MEM_REAL_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-/// Smallest request that can't sit in a 2MB block → dedicated chunk.
-const HUGE_MIN: i64 = 2_093_056;
 
 /// Add `bytes` to a live counter and keep the peak at the high-water
 /// of the live total. `request` stamps the OOM fatal's
@@ -2063,133 +2039,9 @@ const HUGE_MIN: i64 = 2_093_056;
 /// which for big allocs exceeds the charged footprint (a zend_string's
 /// request is len+32 while its bin-rounded footprint runs ~len+len/4+40).
 fn mem_charge(counter: &std::sync::atomic::AtomicI64, bytes: i64, request: i64) {
-    // zend's guard reads real_size BEFORE this alloc's commit.
-    real_peak_note(mem_real_raw() + request);
-    mem_charge_raw(counter, bytes, request);
-}
-
-/// The commit half of mem_charge for callers that already latched
-/// the pre-commit check value (mem_note_* note BEFORE arr_huge_note
-/// swaps a dedicated chunk — re-noting after the swap would see the
-/// new chunk and double it into the check).
-fn mem_charge_raw(counter: &std::sync::atomic::AtomicI64, bytes: i64, request: i64) {
     counter.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     LAST_ALLOC.store(request, std::sync::atomic::Ordering::Relaxed);
-    mem_note_hw();
-}
-
-pub(crate) fn real_peak_note(v: i64) {
-    MEM_REAL_PEAK.fetch_max(v, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn mem_note_hw() {
-    let live = mem_live_raw();
-    MEM_PEAK.fetch_max(live, std::sync::atomic::Ordering::Relaxed);
-    SMALL_HW.fetch_max(
-        live - HUGE_LIVE.load(std::sync::atomic::Ordering::Relaxed),
-        std::sync::atomic::Ordering::Relaxed,
-    );
-}
-
-/// A table moving into/out of a dedicated chunk: when its arbuckets
-/// request crosses the block's usable size zend mallocs them as a
-/// standalone page-aligned chunk (the bytes it used to occupy stay
-/// latched in SMALL_HW); a later huge grow releases the previous
-/// dedicated chunk like realloc, and the table's death returns it to
-/// the OS. `(foot, req)` — live is tracked in foot units, the chunk
-/// in page-rounded request units.
-fn arr_huge_note(old: (i64, i64), new: (i64, i64)) {
-    let rel = std::sync::atomic::Ordering::Relaxed;
-    if std::env::var_os("PHPUN_MEM_DEBUG").is_some() && (old.1 >= HUGE_MIN || new.1 >= HUGE_MIN) {
-        eprintln!(
-            "huge_note old_req={} new_req={} real_now={}",
-            old.1,
-            new.1,
-            mem_real_raw()
-        );
-    }
-    if old.1 >= HUGE_MIN {
-        HUGE_LIVE.fetch_sub(old.0, rel);
-        HUGE_REAL.fetch_sub(huge_chunk_bytes(old.1), rel);
-    }
-    if new.1 >= HUGE_MIN {
-        HUGE_LIVE.fetch_add(new.0, rel);
-        HUGE_REAL.fetch_add(huge_chunk_bytes(new.1), rel);
-    }
-}
-
-/// The arbuckets request for a table of `mem_elems` live slots —
-/// packed tables alloc nSize*16+8, mixed nSize*40 (pow2 buckets).
-fn arr_req(mem_elems: i64, packed: bool) -> i64 {
-    let n = (mem_elems.max(8) as u64).next_power_of_two() as i64;
-    if packed {
-        n * ARR_ELEM_BYTES + 8
-    } else {
-        n * ARR_ELEM_HASH_BYTES
-    }
-}
-
-/// Charge/release a zend_string — strings never share chunks, so a
-/// ≥HUGE_MIN request is itself the dedicated chunk.
-fn str_mem_charge(bytes: i64, request: i64) {
-    let rel = std::sync::atomic::Ordering::Relaxed;
-    real_peak_note(mem_real_raw() + request);
-    STR_LIVE.fetch_add(bytes, rel);
-    LAST_ALLOC.store(request, rel);
-    if request >= HUGE_MIN {
-        HUGE_LIVE.fetch_add(bytes, rel);
-        HUGE_REAL.fetch_add(huge_chunk_bytes(request), rel);
-    }
-    mem_note_hw();
-}
-
-fn str_mem_release(bytes: i64, request: i64) {
-    let rel = std::sync::atomic::Ordering::Relaxed;
-    STR_LIVE.fetch_sub(bytes, rel);
-    if request >= HUGE_MIN {
-        HUGE_LIVE.fetch_sub(bytes, rel);
-        HUGE_REAL.fetch_sub(huge_chunk_bytes(request), rel);
-    }
-}
-
-/// zend_mm_alloc_huge rounds the request up to whole 4KB pages.
-fn huge_chunk_bytes(request: i64) -> i64 {
-    (request + 4095) & !4095
-}
-
-/// Charge the caller's arg-stack pages — `...` unpacking commits
-/// zend_vm_stack segments (256KB pages) that stay live until the
-/// frame tears down (CallArgs teardown releases the charge). A
-/// ≥block-sized segment is itself a dedicated chunk.
-pub(crate) fn stack_charge(bytes: i64, request: i64) {
-    let rel = std::sync::atomic::Ordering::Relaxed;
-    if std::env::var_os("PHPUN_MEM_DEBUG").is_some() {
-        eprintln!("stack_charge {} real_before={}", request, mem_real_raw());
-    }
-    real_peak_note(mem_real_raw() + request);
-    ARR_LIVE.fetch_add(bytes, rel);
-    LAST_ALLOC.store(request, rel);
-    if bytes >= HUGE_MIN {
-        HUGE_LIVE.fetch_add(bytes, rel);
-        HUGE_REAL.fetch_add(huge_chunk_bytes(bytes), rel);
-    }
-    mem_note_hw();
-}
-
-/// Release a stack charge — the segment frees with its frame, and a
-/// ≥block-sized segment also returns its committed pages.
-pub(crate) fn stack_release(bytes: i64) {
-    if std::env::var_os("PHPUN_MEM_DEBUG").is_some() {
-        eprintln!("stack_release {} real_now={}", bytes, mem_real_raw());
-    }
-    ARR_LIVE.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
-    if bytes >= HUGE_MIN {
-        HUGE_LIVE.fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
-        HUGE_REAL.fetch_sub(
-            huge_chunk_bytes(bytes),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
+    MEM_PEAK.fetch_max(mem_live_raw(), std::sync::atomic::Ordering::Relaxed);
 }
 
 fn mem_live_raw() -> i64 {
@@ -2200,30 +2052,13 @@ fn mem_live_raw() -> i64 {
         + GC_PEAK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Committed bytes — zend's `real_size`: 2MB blocks at the small
-/// pool's high-water (blocks never uncommit) plus each live dedicated
-/// chunk's page-rounded size. The OOM check and ini_set(memory_limit)
-/// refusal compare this side; memory_get_usage reports the live one.
-pub fn mem_real_raw() -> i64 {
-    let small = (MEM_BASE_BYTES + SMALL_HW.load(std::sync::atomic::Ordering::Relaxed) + 2_097_151)
-        & !2_097_151i64;
-    small + HUGE_REAL.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// High-water committed bytes seen inside the current request — the
-/// between-statements OOM check compares against this (zend's
-/// per-emalloc guard), not just the still-committed tail.
-pub fn mem_real_peak() -> i64 {
-    MEM_REAL_PEAK.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Live cycle-capable entities — zend's GC root buffer only tracks
 /// HashTables/objects (zend_strings can't form cycles) and grows as
 /// pow2(count)*16B. The buffer never shrinks without a GC run (none
 /// under memory_limit probes), so the charge latches at its high-water
 /// mark.
 static GC_ROOTS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-pub(crate) static GC_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static GC_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// +1/-1 a live collectible entity; updates the GC-buffer high-water.
 pub(crate) fn gc_root_note(delta: i64) {
@@ -2263,8 +2098,10 @@ pub const MEM_BASE_BYTES: i64 = 465_304;
 
 /// Charge `delta` bytes of output-buffer contents (zend's arena
 /// holds ob buffers while open — flush/clean/pop releases them).
-pub fn ob_charge(delta: i64) {
-    mem_charge(&OB_LIVE, delta, delta.max(0));
+/// `request` is the alloc zend attempted — the fatal's 'tried to
+/// allocate' figure, which is the buffer alloc, not the delta.
+pub fn ob_charge(delta: i64, request: i64) {
+    mem_charge(&OB_LIVE, delta, request.max(0));
 }
 
 /// zend-arena live total: objects + array tables + strings + ob buffers.
@@ -2313,12 +2150,20 @@ impl Drop for PhpObject {
 impl Drop for PhpArray {
     fn drop(&mut self) {
         if self.mem_elems > 0 {
-            let foot = arr_foot(self.mem_elems, self.packed);
-            ARR_LIVE.fetch_sub(foot, std::sync::atomic::Ordering::Relaxed);
-            arr_huge_note((foot, arr_req(self.mem_elems, self.packed)), (0, 0));
+            ARR_LIVE.fetch_sub(
+                arr_foot(self.mem_elems, self.packed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         if self.key_bytes > 0 {
             STR_LIVE.fetch_sub(self.key_bytes, std::sync::atomic::Ordering::Relaxed);
+            gc_root_note(
+                -(self
+                    .entries
+                    .iter()
+                    .filter(|(k, _)| matches!(k, ArrKey::Str(_)))
+                    .count() as i64),
+            );
         }
         gc_root_note(-1);
     }
@@ -3070,8 +2915,12 @@ pub enum FilterState {
         pending: Vec<u8>,
         /// UTF-16/32's BOM already emitted (iconv emits it once).
         bom_done: bool,
-        /// to-charset carried //IGNORE — unrepresentable cps drop.
-        ignore: bool,
+        /// to-charset carried //TRANSLIT — unrepresentable cps
+        /// transliterate (é→e, €→EUR, unknown→'?') instead of
+        /// erroring. zend's stream filter ignores //IGNORE
+        /// (unrepresentable output still EILSEQ-fails), so only
+        /// TRANSLIT is modeled.
+        translit: bool,
     },
     /// convert.base64-encode / -decode — tail bytes carried between
     /// calls (3-in/4-out groupings).

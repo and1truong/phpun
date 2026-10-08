@@ -831,6 +831,7 @@ pub(crate) fn dispatch(
                     // with empty input + the closing flag, writes the
                     // trailing bytes, then calls onClose on every
                     // php_user_filter (userfilter_dtor).
+                    let mut close_err: Option<PhpError> = None;
                     if let Some(filters) = it.stream_filters.get(&id).cloned() {
                         if filters.iter().any(|f| f.write) {
                             drop(rb);
@@ -838,8 +839,13 @@ pub(crate) fn dispatch(
                             // stream zval is still live — ->stream is
                             // the real resource on this call (zend
                             // only NULLs it at request-shutdown frees).
+                            // A filter exception still frees the chain
+                            // (php_stream_free completes under a pending
+                            // exception): capture it, tear down below,
+                            // then re-raise so shutdown does not re-run
+                            // the close.
                             let sv = Value::Resource(r.clone());
-                            let (out, _) = run_filter_chain(
+                            match run_filter_chain(
                                 it,
                                 id,
                                 &sv,
@@ -848,9 +854,13 @@ pub(crate) fn dispatch(
                                 true,
                                 false,
                                 &mut None,
-                            )?;
-                            if !out.is_empty() {
-                                let _ = write_resource_raw(it, r, &out)?;
+                            ) {
+                                Ok((out, _)) => {
+                                    if !out.is_empty() {
+                                        let _ = write_resource_raw(it, r, &out);
+                                    }
+                                }
+                                Err(e) => close_err = Some(e),
                             }
                             rb = r.borrow_mut();
                         }
@@ -863,10 +873,15 @@ pub(crate) fn dispatch(
                             .collect();
                         // onClose is user code — it may call back into
                         // stream builtins, so the stream borrow must
-                        // not be held across it.
+                        // not be held across it. A close-time filter()
+                        // throw marks the error for re-raise but zend
+                        // skips every onClose hook on the chain
+                        // (userfilter_dtor never runs).
                         drop(rb);
-                        for obj in onclose {
-                            let _ = it.method_invoke(obj, "onClose", CallArgs::empty());
+                        if close_err.is_none() {
+                            for obj in onclose {
+                                let _ = it.method_invoke(obj, "onClose", CallArgs::empty());
+                            }
                         }
                         rb = r.borrow_mut();
                     }
@@ -891,6 +906,9 @@ pub(crate) fn dispatch(
                             let mut fb = fres.borrow_mut();
                             *fb = PhpResource::Closed { id: fid };
                         }
+                    }
+                    if let Some(e) = close_err {
+                        return Err(e);
                     }
                 }
             }
@@ -5396,7 +5414,7 @@ fn parse_iconv_spec(spec: &str) -> Option<FilterState> {
             disp: format!("\"{}\"=>\"{}\"", raw_from, raw_to),
             pending: Vec::new(),
             bom_done: false,
-            ignore: to_flags.iter().any(|f| f.eq_ignore_ascii_case("IGNORE")),
+            translit: to_flags.iter().any(|f| f.eq_ignore_ascii_case("TRANSLIT")),
         })
     } else {
         None
@@ -5516,29 +5534,19 @@ fn iconv_enc_known(enc: &str) -> bool {
 fn iconv_decode(enc: &str, bytes: &[u8]) -> (Vec<u32>, usize, bool) {
     match enc {
         "UTF8" => iconv_decode_utf8(bytes),
-        "UTF16LE" | "UCS2LE" | "UCS2LEINTERNAL" => {
-            let (c, u) = iconv_decode_u16(bytes, true);
-            (c, u, false)
+        "UTF16LE" => iconv_decode_u16(bytes, true, false),
+        "UTF16BE" => iconv_decode_u16(bytes, false, false),
+        "UCS2" | "UCS2INTERNAL" | "UCS2LE" | "UCS2LEINTERNAL" => {
+            iconv_decode_u16(bytes, true, true)
         }
-        "UTF16BE" | "UCS2" | "UCS2BE" | "UCS2INTERNAL" | "UCS2BEINTERNAL" => {
-            let (c, u) = iconv_decode_u16(bytes, false);
-            (c, u, false)
-        }
-        "UTF32LE" | "UCS4LE" | "UCS4INTERNAL" => {
-            let (c, u) = iconv_decode_u32(bytes, true);
-            (c, u, false)
-        }
-        "UTF32BE" | "UCS4BE" | "UCS4" => {
-            let (c, u) = iconv_decode_u32(bytes, false);
-            (c, u, false)
-        }
-        "UTF16" => {
-            let (c, u) = iconv_decode_u16_bom(bytes);
-            (c, u, false)
-        }
-        "UTF32" => {
-            let (c, u) = iconv_decode_u32_bom(bytes);
-            (c, u, false)
+        "UCS2BE" | "UCS2BEINTERNAL" => iconv_decode_u16(bytes, false, true),
+        "UTF32LE" | "UCS4LE" | "UCS4" | "UCS4INTERNAL" => iconv_decode_u32(bytes, true),
+        "UTF32BE" | "UCS4BE" => iconv_decode_u32(bytes, false),
+        "UTF16" => iconv_decode_u16_bom(bytes),
+        "UTF32" => iconv_decode_u32_bom(bytes),
+        "SJIS" | "SHIFTJIS" | "SHIFTJISX0213" | "EUCCN" | "GB2312" | "EUCKR" | "EUCJP"
+        | "EUCJISX0213" | "EUCTW" | "GBK" | "BIG5" | "BIG5HKSCS" => {
+            iconv_decode_structural(enc, bytes)
         }
         _ => (
             bytes.iter().map(|b| *b as u32).collect(),
@@ -5548,29 +5556,30 @@ fn iconv_decode(enc: &str, bytes: &[u8]) -> (Vec<u32>, usize, bool) {
     }
 }
 
-/// 'UTF-16' without LE/BE: BOM-tolerant, defaults BE (iconv semantics).
-fn iconv_decode_u16_bom(bytes: &[u8]) -> (Vec<u32>, usize) {
+/// 'UTF-16' without LE/BE: BOM-tolerant; absent a BOM glibc picks
+/// the host order — little-endian on the platforms phpun targets.
+fn iconv_decode_u16_bom(bytes: &[u8]) -> (Vec<u32>, usize, bool) {
     if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
-        let (cps, used) = iconv_decode_u16(&bytes[2..], true);
-        return (cps, used + 2.min(bytes.len()));
+        let (cps, used, invalid) = iconv_decode_u16(&bytes[2..], true, false);
+        return (cps, used + 2.min(bytes.len()), invalid);
     }
     if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
-        let (cps, used) = iconv_decode_u16(&bytes[2..], false);
-        return (cps, used + 2.min(bytes.len()));
+        let (cps, used, invalid) = iconv_decode_u16(&bytes[2..], false, false);
+        return (cps, used + 2.min(bytes.len()), invalid);
     }
-    iconv_decode_u16(bytes, false)
+    iconv_decode_u16(bytes, true, false)
 }
 
-fn iconv_decode_u32_bom(bytes: &[u8]) -> (Vec<u32>, usize) {
+fn iconv_decode_u32_bom(bytes: &[u8]) -> (Vec<u32>, usize, bool) {
     if bytes.len() >= 4 && bytes[..4] == [0xFF, 0xFE, 0, 0] {
-        let (cps, used) = iconv_decode_u32(&bytes[4..], true);
-        return (cps, used + 4.min(bytes.len()));
+        let (cps, used, invalid) = iconv_decode_u32(&bytes[4..], true);
+        return (cps, used + 4.min(bytes.len()), invalid);
     }
     if bytes.len() >= 4 && bytes[..4] == [0, 0, 0xFE, 0xFF] {
-        let (cps, used) = iconv_decode_u32(&bytes[4..], false);
-        return (cps, used + 4.min(bytes.len()));
+        let (cps, used, invalid) = iconv_decode_u32(&bytes[4..], false);
+        return (cps, used + 4.min(bytes.len()), invalid);
     }
-    iconv_decode_u32(bytes, false)
+    iconv_decode_u32(bytes, true)
 }
 
 /// UTF-8 → code points. An incomplete tail is left undecoded
@@ -5587,7 +5596,19 @@ fn iconv_decode_utf8(bytes: &[u8]) -> (Vec<u32>, usize, bool) {
             0x00..=0x7F => (1, 0),
             0xC0..=0xDF => (2, 0x80),
             0xE0..=0xEF => (3, 0x800),
-            _ => (4, 0x10000),
+            // Only F0-F4 are valid 4-byte leads, but F5-F7 flag via
+            // the cp > 0x10FFFF check once their continuation lands;
+            // at a buffer end they still park as "incomplete" like
+            // zend does — the EILSEQ surfaces on the next touch.
+            0xF0..=0xF7 => (4, 0x10000),
+            // Stray continuations (80-BF) and never-leads (F8-FF)
+            // are EILSEQ at any position — not an incomplete tail.
+            _ => {
+                cps.push(0xFFFD);
+                invalid = true;
+                i += 1;
+                continue;
+            }
         };
         if i + len > bytes.len() {
             break;
@@ -5615,17 +5636,32 @@ fn iconv_decode_utf8(bytes: &[u8]) -> (Vec<u32>, usize, bool) {
     (cps, i, invalid)
 }
 
-fn iconv_decode_u16(bytes: &[u8], le: bool) -> (Vec<u32>, usize) {
-    let units = bytes.len() / 2;
+/// `ucs2` marks the UCS-2 family: surrogate code units are illegal
+/// there (UCS-2 has no pairing), so D800-DFFF flags EILSEQ wherever
+/// it lands — including at a buffer end. UTF-16 instead parks a
+/// leading high surrogate waiting for its low half.
+fn iconv_decode_u16(bytes: &[u8], le: bool, ucs2: bool) -> (Vec<u32>, usize, bool) {
     let mut cps = Vec::new();
     let mut i = 0;
-    while i < units * 2 {
+    let mut invalid = false;
+    while i + 2 <= bytes.len() {
         let u = if le {
             u16::from_le_bytes([bytes[i], bytes[i + 1]])
         } else {
             u16::from_be_bytes([bytes[i], bytes[i + 1]])
         };
-        if (0xD800..0xDC00).contains(&u) && i + 4 <= bytes.len() {
+        if ucs2 && (0xD800..0xE000).contains(&u) {
+            cps.push(0xFFFD);
+            invalid = true;
+            i += 2;
+            continue;
+        }
+        if (0xD800..0xDC00).contains(&u) {
+            // High surrogate: park the whole pair when the low half
+            // hasn't arrived; a non-low follower is EILSEQ.
+            if i + 4 > bytes.len() {
+                break;
+            }
             let u2 = if le {
                 u16::from_le_bytes([bytes[i + 2], bytes[i + 3]])
             } else {
@@ -5636,33 +5672,131 @@ fn iconv_decode_u16(bytes: &[u8], le: bool) -> (Vec<u32>, usize) {
                 i += 4;
                 continue;
             }
+            cps.push(0xFFFD);
+            invalid = true;
+            i += 2;
+            continue;
+        }
+        if (0xDC00..0xE000).contains(&u) {
+            // Lone low surrogate — EILSEQ.
+            cps.push(0xFFFD);
+            invalid = true;
+            i += 2;
+            continue;
         }
         cps.push(u as u32);
         i += 2;
     }
-    (cps, i)
+    (cps, i, invalid)
 }
 
-fn iconv_decode_u32(bytes: &[u8], le: bool) -> (Vec<u32>, usize) {
-    let units = bytes.len() / 4;
-    let mut cps = Vec::with_capacity(units);
-    for i in 0..units {
-        let w = &bytes[i * 4..i * 4 + 4];
+/// Lead-byte ranges (lo, hi, sequence length) per CJK encoding.
+fn cjk_lead(enc: &str) -> &'static [(u8, u8, u8)] {
+    match enc {
+        "SJIS" | "SHIFTJIS" | "SHIFTJISX0213" => &[
+            (0x00, 0x7F, 1),
+            (0xA1, 0xDF, 1),
+            (0x81, 0x9F, 2),
+            (0xE0, 0xFC, 2),
+        ],
+        "EUCCN" | "GB2312" => &[(0x00, 0x7F, 1), (0xA1, 0xFE, 2)],
+        "GBK" | "EUCKR" | "BIG5" | "BIG5HKSCS" => &[(0x00, 0x7F, 1), (0x81, 0xFE, 2)],
+        "EUCJP" | "EUCJISX0213" => &[
+            (0x00, 0x7F, 1),
+            (0x8E, 0x8E, 2),
+            (0x8F, 0x8F, 3),
+            (0xA1, 0xFE, 2),
+        ],
+        "EUCTW" => &[(0x00, 0x7F, 1), (0x8E, 0x8E, 4), (0xA1, 0xFE, 2)],
+        _ => &[(0x00, 0xFF, 1)],
+    }
+}
+
+/// Structural validity for the CJK multibyte encodings we carry no
+/// mapping tables for: walks each encoding's lead/trail byte rules
+/// so malformed input flags EILSEQ like glibc. Valid sequences
+/// still decode byte-wise (their code-point mapping is a known
+/// divergence); an incomplete tail stays pending for the next call.
+fn iconv_decode_structural(enc: &str, bytes: &[u8]) -> (Vec<u32>, usize, bool) {
+    let lead = cjk_lead(enc);
+    let mut i = 0;
+    let mut invalid = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let len = lead
+            .iter()
+            .find(|(lo, hi, _)| (*lo..=*hi).contains(&b))
+            .map(|&(_, _, l)| l as usize)
+            .unwrap_or(0);
+        if len == 0 {
+            invalid = true;
+            i += 1;
+            continue;
+        }
+        if i + len > bytes.len() {
+            break;
+        }
+        let trail_ok = match (enc, len) {
+            ("SJIS" | "SHIFTJIS" | "SHIFTJISX0213", 2) => {
+                matches!(bytes[i + 1], 0x40..=0x7E | 0x80..=0xFC)
+            }
+            ("EUCCN" | "GB2312", 2) => matches!(bytes[i + 1], 0xA1..=0xFE),
+            ("GBK", 2) => matches!(bytes[i + 1], 0x40..=0xFE) && bytes[i + 1] != 0x7F,
+            ("EUCKR", 2) => matches!(bytes[i + 1], 0x41..=0x5A | 0x61..=0x7A | 0x81..=0xFE),
+            ("EUCJP" | "EUCJISX0213", 2) if b == 0x8E => matches!(bytes[i + 1], 0xA1..=0xDF),
+            ("EUCJP" | "EUCJISX0213", 2) => matches!(bytes[i + 1], 0xA1..=0xFE),
+            ("EUCJP" | "EUCJISX0213", 3) => {
+                matches!(bytes[i + 1], 0xA1..=0xFE) && matches!(bytes[i + 2], 0xA1..=0xFE)
+            }
+            ("EUCTW", 2) => matches!(bytes[i + 1], 0xA1..=0xFE),
+            ("EUCTW", 4) => {
+                matches!(bytes[i + 1], 0xA1..=0xB0)
+                    && matches!(bytes[i + 2], 0xA1..=0xFE)
+                    && matches!(bytes[i + 3], 0xA1..=0xFE)
+            }
+            ("BIG5" | "BIG5HKSCS", 2) => matches!(bytes[i + 1], 0x40..=0x7E | 0xA1..=0xFE),
+            _ => true,
+        };
+        if !trail_ok {
+            invalid = true;
+            i += 1;
+            continue;
+        }
+        i += len;
+    }
+    let cps: Vec<u32> = bytes[..i].iter().map(|b| *b as u32).collect();
+    (cps, i, invalid)
+}
+
+fn iconv_decode_u32(bytes: &[u8], le: bool) -> (Vec<u32>, usize, bool) {
+    let mut cps = Vec::new();
+    let mut i = 0;
+    let mut invalid = false;
+    while i + 4 <= bytes.len() {
+        let w = &bytes[i..i + 4];
         let u = if le {
             u32::from_le_bytes([w[0], w[1], w[2], w[3]])
         } else {
             u32::from_be_bytes([w[0], w[1], w[2], w[3]])
         };
-        cps.push(u);
+        if u > 0x10FFFF || (0xD800..=0xDFFF).contains(&u) {
+            cps.push(0xFFFD);
+            invalid = true;
+        } else {
+            cps.push(u);
+        }
+        i += 4;
     }
-    (cps, units * 4)
+    (cps, i, invalid)
 }
 
 /// Encode code points back to bytes in the target encoding. `bom`
 /// gates the UTF-16/32 byte-order mark (iconv emits it on the first
-/// call only); `ignore` is the to-charset's //IGNORE flag —
-/// unrepresentable code points drop instead of '?'-substituting.
-fn iconv_encode(enc: &str, cps: &[u32], bom: bool, ignore: bool) -> Vec<u8> {
+/// call only); `translit` is the to-charset's //TRANSLIT flag —
+/// unrepresentable code points transliterate (or '?'-fallback)
+/// instead of EILSEQ-failing the call. Returns None on EILSEQ:
+/// an unrepresentable code point in a non-translit target.
+fn iconv_encode(enc: &str, cps: &[u32], bom: bool, translit: bool) -> Option<Vec<u8>> {
     match enc {
         "UTF8" => {
             let mut out = Vec::new();
@@ -5671,43 +5805,76 @@ fn iconv_encode(enc: &str, cps: &[u32], bom: bool, ignore: bool) -> Vec<u8> {
                 let mut b = [0u8; 4];
                 out.extend_from_slice(ch.encode_utf8(&mut b).as_bytes());
             }
-            out
+            Some(out)
         }
         "UTF16" | "UTF16LE" | "UCS2LE" | "UCS2LEINTERNAL" => {
-            iconv_encode_u16(cps, true, bom && enc == "UTF16")
+            Some(iconv_encode_u16(cps, true, bom && enc == "UTF16"))
         }
         "UTF16BE" | "UCS2" | "UCS2BE" | "UCS2INTERNAL" | "UCS2BEINTERNAL" => {
-            iconv_encode_u16(cps, false, false)
+            Some(iconv_encode_u16(cps, false, false))
         }
         "UTF32" | "UTF32LE" | "UCS4LE" | "UCS4INTERNAL" => {
-            iconv_encode_u32(cps, true, bom && enc == "UTF32")
+            Some(iconv_encode_u32(cps, true, bom && enc == "UTF32"))
         }
-        "UTF32BE" | "UCS4BE" | "UCS4" => iconv_encode_u32(cps, false, false),
-        "ASCII" | "USASCII" | "ANSIX341968" => cps
-            .iter()
-            .filter_map(|&cp| {
-                if cp < 0x80 {
-                    Some(cp as u8)
-                } else if ignore {
-                    None
-                } else {
-                    Some(b'?')
-                }
-            })
-            .collect(),
-        _ => cps
-            .iter()
-            .filter_map(|&cp| {
-                if cp < 0x100 {
-                    Some(cp as u8)
-                } else if ignore {
-                    None
-                } else {
-                    Some(b'?')
-                }
-            })
-            .collect(),
+        "UTF32BE" | "UCS4BE" | "UCS4" => Some(iconv_encode_u32(cps, false, false)),
+        "ASCII" | "USASCII" | "ANSIX341968" => iconv_encode_narrow(cps, 0x80, translit),
+        _ => iconv_encode_narrow(cps, 0x100, translit),
     }
+}
+
+/// Single-byte target charset — cps beyond `limit` transliterate
+/// under //TRANSLIT (unknown → '?') or fail the whole call (None).
+fn iconv_encode_narrow(cps: &[u32], limit: u32, translit: bool) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(cps.len());
+    for &cp in cps {
+        if cp < limit {
+            out.push(cp as u8);
+        } else if translit {
+            out.extend_from_slice(iconv_translit(cp).unwrap_or("?").as_bytes());
+        } else {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// glibc iconv's //TRANSLIT approximations for the common cases;
+/// unmapped code points fall back to '?' in the caller.
+/// ponytail: only the latin ranges we observed in tests are mapped —
+/// the full glibc table (Greek, Cyrillic, CJK compat, ...) needs a
+/// transliteration crate (e.g. deunicode) if a test ever hits it.
+fn iconv_translit(cp: u32) -> Option<&'static str> {
+    Some(match cp {
+        0x00C0..=0x00C5 => "A",
+        0x00C6 => "AE",
+        0x00C7 => "C",
+        0x00C8..=0x00CB => "E",
+        0x00CC..=0x00CF => "I",
+        0x00D0 => "D",
+        0x00D1 => "N",
+        0x00D2..=0x00D6 | 0x00D8 => "O",
+        0x00D9..=0x00DC => "U",
+        0x00DD | 0x0178 => "Y",
+        0x00DE => "TH",
+        0x00DF => "ss",
+        0x00E0..=0x00E5 => "a",
+        0x00E6 => "ae",
+        0x00E7 => "c",
+        0x00E8..=0x00EB => "e",
+        0x00EC..=0x00EF => "i",
+        0x00F0 => "d",
+        0x00F1 => "n",
+        0x00F2..=0x00F6 | 0x00F8 => "o",
+        0x00F9..=0x00FC => "u",
+        0x00FD | 0x00FF => "y",
+        0x00FE => "th",
+        0x0152 => "OE",
+        0x0153 => "oe",
+        0x00A9 => "(C)",
+        0x00AE => "(R)",
+        0x20AC => "EUR",
+        _ => return None,
+    })
 }
 
 fn iconv_encode_u16(cps: &[u32], le: bool, bom: bool) -> Vec<u8> {
@@ -6368,31 +6535,54 @@ fn filter_apply_one(
             disp,
             pending,
             bom_done,
-            ignore,
+            translit,
         } => {
+            // zend keeps a leftover input buffer across calls
+            // (prevpent). On EILSEQ it holds the failed input only
+            // when that buffer was already occupied — a fresh call's
+            // bytes drop and the filter recovers, while a held
+            // incomplete tail poisons the concat and every later
+            // touch re-fails with the same warning.
+            let had_pending = !pending.is_empty();
             pending.extend_from_slice(&buf);
             let (cps, used, mut invalid) = iconv_decode(&from.clone(), pending.as_slice());
-            pending.drain(..used);
+            let mut encoded = None;
+            if !invalid {
+                encoded = iconv_encode(&to.clone(), &cps, !*bom_done, *translit);
+                if encoded.is_none() {
+                    // Unrepresentable output is EILSEQ too — zend
+                    // warns and discards the whole brigade.
+                    invalid = true;
+                }
+            }
+            if !invalid {
+                pending.drain(..used);
+                buf = encoded.unwrap_or_default();
+                if matches!(to.as_str(), "UTF16" | "UTF32") {
+                    *bom_done = true;
+                }
+            }
             // A partial multibyte sequence still pending when the
-            // chain closes is an invalid sequence too (zend EILSEQ).
-            if closing && !pending.is_empty() {
-                pending.clear();
+            // chain drains is an invalid sequence too (zend EILSEQ) —
+            // any flush op trips it: fclose (closing) plus the
+            // incremental brigade drains fflush() and rewind() send.
+            if !invalid && (closing || inc) && !pending.is_empty() {
                 invalid = true;
             }
             if invalid {
-                // zend's iconv filter warns + returns FEED_ME — the
-                // brigade is discarded and the fill retries/ends.
+                if !had_pending {
+                    pending.clear();
+                }
+                // zend's iconv filter warns + returns PSFS_ERR_FATAL —
+                // the brigade is discarded and the fill FAILS, so the
+                // read builtin reports false (the write path drops the
+                // brigade the same either way).
                 deferred_warn = Some(format!(
                     "{}(): iconv stream filter ({}): invalid multibyte sequence",
                     it.filter_warn_ctx, disp
                 ));
                 buf.clear();
-                status = 1;
-            } else {
-                buf = iconv_encode(&to.clone(), &cps, !*bom_done, *ignore);
-                if matches!(to.as_str(), "UTF16" | "UTF32") {
-                    *bom_done = true;
-                }
+                status = 0;
             }
         }
         FilterState::Base64 { decode, tail } => {
@@ -6432,16 +6622,24 @@ fn run_filter_chain(
     inc: bool,
     seek: &mut Option<FillSeek<'_>>,
 ) -> Result<(Vec<u8>, i64), PhpError> {
-    let n = it.stream_filters.get(&sid).map(|v| v.len()).unwrap_or(0);
     let mut data = raw;
-    for i in 0..n {
-        let applies = it
-            .stream_filters
-            .get(&sid)
-            .and_then(|v| v.get(i))
-            .map(|f| if read_dir { f.read } else { f.write })
-            .unwrap_or(false);
+    // zend walks the LIVE chain (php_stream_filter_flush iterates
+    // current->next): a user filter's filter() callback that attaches
+    // another filter mid-pass has the appended entry drain the
+    // remaining buckets, while a prepended one lands behind the
+    // cursor and is never visited. Relocate our cursor by filter id
+    // after each call so inserts/removes stay ordered like the
+    // linked list — a removed entry continues at whatever shifted
+    // into its slot.
+    let mut i = 0usize;
+    while let Some((fid, applies)) = it
+        .stream_filters
+        .get(&sid)
+        .and_then(|v| v.get(i))
+        .map(|f| (f.fid, if read_dir { f.read } else { f.write }))
+    {
         if !applies {
+            i += 1;
             continue;
         }
         let (out, status) = filter_apply_one(it, sid, i, stream_val, data, closing, inc, seek)?;
@@ -6449,6 +6647,15 @@ fn run_filter_chain(
             return Ok((Vec::new(), status));
         }
         data = out;
+        i = it
+            .stream_filters
+            .get(&sid)
+            .and_then(|v| {
+                v.iter()
+                    .position(|f| f.fid == fid && (if read_dir { f.read } else { f.write }))
+            })
+            .map(|p| p + 1)
+            .unwrap_or(i);
     }
     Ok((data, 2))
 }
@@ -7244,8 +7451,12 @@ pub(crate) fn stream_dtor_flush(
     let Some(filters) = it.stream_filters.get(&sid).cloned() else {
         return Ok(());
     };
+    // The closing flush's error must not bail before teardown —
+    // php_stream_free completes under a pending exception, and a
+    // half-torn chain re-runs the close at the next teardown pass.
+    let mut close_err: Option<PhpError> = None;
     if filters.iter().any(|f| f.write) {
-        let (out, _) = run_filter_chain(
+        match run_filter_chain(
             it,
             sid,
             &Value::Null,
@@ -7254,14 +7465,22 @@ pub(crate) fn stream_dtor_flush(
             true,
             false,
             &mut None,
-        )?;
-        if !out.is_empty() {
-            let _ = write_resource_raw(it, r, &out);
+        ) {
+            Ok((out, _)) => {
+                if !out.is_empty() {
+                    let _ = write_resource_raw(it, r, &out);
+                }
+            }
+            Err(e) => close_err = Some(e),
         }
     }
-    for f in &filters {
-        if let FilterState::User(obj) = &f.state {
-            let _ = it.method_invoke(obj.clone(), "onClose", CallArgs::empty());
+    // Same rule as explicit fclose: a close-time filter() throw skips
+    // every onClose hook on the chain.
+    if close_err.is_none() {
+        for f in &filters {
+            if let FilterState::User(obj) = &f.state {
+                let _ = it.method_invoke(obj.clone(), "onClose", CallArgs::empty());
+            }
         }
     }
     *r.borrow_mut() = PhpResource::Closed { id: sid };
@@ -7282,7 +7501,10 @@ pub(crate) fn stream_dtor_flush(
             *fb = PhpResource::Closed { id: fid };
         }
     }
-    Ok(())
+    match close_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Filtered fgets over an in-memory store (Mem/Input unspilled).

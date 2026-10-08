@@ -12,7 +12,7 @@ use crate::parser;
 use crate::value::{
     compare, format_backtrace_frames, format_float_repr, format_trace, identical, numeric, to_key,
     trace_arg, ArrKey, CallableKind, Cell, GenSetup, GenState, Numeric, ObjectInternal, PhpArray,
-    PhpCallable, PhpClass, PhpObject, PhpResource, TraceFrame, Value,
+    PhpCallable, PhpClass, PhpObject, PhpResource, PhpStr, TraceFrame, Value,
 };
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -104,14 +104,10 @@ pub struct CallArgs {
     pub end_line: usize,
 }
 
-/// One arg-stack page charge carried by a CallArgs — the drop
-/// releases the segment's committed bytes (see `arg_stack`).
+/// One arg-stack page charge carried by a CallArgs — registered via
+/// mem_track at build time, released by mem_sweep once the frame's
+/// last CallArgs clone dies (see `arg_stack`).
 pub struct ArgStack(pub i64);
-impl Drop for ArgStack {
-    fn drop(&mut self) {
-        crate::value::stack_release(self.0);
-    }
-}
 
 impl CallArgs {
     pub fn positional(cells: Vec<Cell>) -> Self {
@@ -184,6 +180,11 @@ pub struct Frame {
     /// op_array (and fresh static_variables) per eval/include call.
     /// None = the frame's own op_array, whose statics persist.
     statics_unit: Option<u64>,
+    /// Anchor identifying the fn/method DECL this frame executes —
+    /// `Rc::as_ptr` of the registered decl (stable across the per-call
+    /// `m.decl.clone()` method dispatch takes, so `static` site
+    /// identity survives cloned bodies).
+    decl_site: usize,
     /// This frame is a generator body invoked by the engine's resume —
     /// Zend renders it `[internal function]: fn(args)` in backtraces
     /// (the resume call, not a userland call, carries the visible frame).
@@ -209,6 +210,7 @@ impl Frame {
             closure_rc: None,
             call_alias: None,
             statics_unit: None,
+            decl_site: 0,
             gen_body: false,
         }
     }
@@ -222,6 +224,49 @@ pub(crate) type FilterBinding = (
     Rc<RefCell<PhpResource>>,
     Rc<RefCell<PhpResource>>,
 );
+
+/// Liveness probe for a charged allocation: weak ref to the owning
+/// Rc — returns false once every strong handle died (zend's efree).
+pub(crate) type MemProbe = Box<dyn Fn() -> bool>;
+
+/// A charge booked against a live Rc. `inner` is footprint inside
+/// committed chunks, `huge` footprint in dedicated huge segments
+/// (zend serves requests past ~2MB from their own mmap'ed segment),
+/// `table_req` remembers the last arData-capacity request so realloc
+/// accounting can retire it.
+struct MemCharge {
+    inner: u64,
+    huge: u64,
+    table_req: u64,
+    probe: MemProbe,
+}
+
+/// zend_mm chunk: ZEND_MM_CHUNK_SIZE (2MB, 512 pages).
+const MM_CHUNK: u64 = 2 * 1024 * 1024;
+/// zend_mm_max_large_size: largest request served from chunk page
+/// runs; bigger requests get a dedicated segment.
+const MM_MAX_LARGE: u64 = 2_093_056;
+/// zend_mm_max_small_size: largest bin-bucketed request.
+const MM_SMALL: u64 = 3072;
+/// Heap usage a fresh script observes under memory_get_usage()
+/// (~450-470KB of engine state) and its in-chunk share. ponytail:
+/// lumped constants — PR #88's canonical accounting models the true
+/// baseline from actual engine state.
+const MM_BASE_USED: u64 = 463_136;
+/// Page-space the engine state occupies inside the first chunk —
+/// small-bin usage fragments across page runs, so this exceeds the
+/// usage figure. Calibrated to the oracle boundary: a fresh ~1.43MB
+/// string still fits the first chunk, ~1.45MB forces a new one.
+const MM_BASE_CHUNK: u64 = 655_360;
+/// emalloc request for a new dynamic-property bucket in an object's
+/// slot table.
+pub(crate) const OBJ_SLOT_REQ: u64 = 32;
+
+/// `static` decl site registry: fn-statics key → var name → set of
+/// (compile-unit serial, decl-origin anchor, stmt line). See
+/// Stmt::Static for the duplicate-declaration rule it enforces.
+type StaticDeclSites =
+    HashMap<String, HashMap<String, std::collections::HashSet<(u64, usize, usize)>>>;
 
 pub struct Interp<'a> {
     pub file: &'a str,
@@ -451,11 +496,6 @@ pub struct Interp<'a> {
     /// write-reference bind (uninit non-nullable typed props error
     /// 'by reference'; uninit *nullable* statics report 'undeclared').
     foreach_by_ref: bool,
-    /// Inside a whole-target `unset($x)` root fetch — set-visibility
-    /// checks stand down so unset's own errors ('Cannot unset
-    /// private(set) property', 'Attempt to unset static property')
-    /// win over 'Cannot indirectly modify'.
-    in_unset: bool,
     /// Autoload/lookup error swallowed by the last `is_callable_value`
     /// probe — re-raised when a `callable` param type rejects the arg.
     callable_probe_err: Option<(Value, PhpError)>,
@@ -472,7 +512,7 @@ pub struct Interp<'a> {
     /// bumped at every parse boundary (include/eval/run) since Zend
     /// compiles each into a fresh op_array — a freed Vec may recycle
     /// the same stmt ptr across re-parses.
-    static_decls: HashMap<String, HashMap<String, std::collections::HashSet<(u64, usize)>>>,
+    static_decls: StaticDeclSites,
     /// Serial of the compile unit currently executing (see static_decls).
     cur_unit_id: u64,
     /// Next unit serial to hand out — bumps monotonically.
@@ -671,6 +711,11 @@ pub struct Interp<'a> {
     /// Called-scope (LSB) for the next invoke_fn frame — set by
     /// invoke_method/static_invoke, consumed like pending_decl_class.
     pending_called_class: Option<Rc<PhpClass>>,
+    /// Origin anchor for the next invoke_fn frame — set by method
+    /// dispatch sites that pass `Rc::new(m.decl.clone())` (whose
+    /// cloned bodies would otherwise get fresh `vars.as_ptr()` sites
+    /// per call). Consumed like pending_decl_class.
+    pending_decl_site: Option<usize>,
     /// (object id, prop, is_get, owner) whose hook is about to run —
     /// consumed by invoke_fn to fill Frame::hook_prop.
     pending_hook_prop: Option<(u64, String, bool, String)>,
@@ -855,6 +900,12 @@ pub struct Interp<'a> {
     /// yield-bearing closure's `use` vars bind when its generator body
     /// finally starts (iterable_003).
     pending_gen_captures: Vec<(String, Cell, bool)>,
+    /// zend heap->size: baseline plus the footprint (page/bucket
+    /// units, not raw request bytes) of live tracked and untracked
+    /// charges — memory_get_usage() input.
+    pub mem_used: u64,
+    /// 'tried to allocate N' figure of the charge that overflowed.
+    mem_last: u64,
     /// Set by gen_start so invoke_fn_run marks the gen-body frame —
     /// its TraceFrame sites `[internal function]` (Zend's resume
     /// isn't a userland call).
@@ -862,6 +913,33 @@ pub struct Interp<'a> {
     /// Raised once the memory_limit fatal fired — buffers are dropped
     /// at shutdown instead of flushed (bug45392).
     pub mem_exceeded: bool,
+    /// Call site (line + rendered backtrace) where the limit check
+    /// first failed — zend's OOM bailout reports the allocating call,
+    /// not the stmt boundary that raises the fatal.
+    oom_at: Option<(usize, Vec<String>)>,
+    /// heap->real_size's chunk share: zend commits whole 2MB chunks
+    /// up front; grows when the in-chunk footprint overflows.
+    mem_committed: u64,
+    /// Live footprint inside committed chunks. The memory_limit
+    /// check fires when a charge overflows it AND another chunk
+    /// would exceed the limit (zend's get_chunk branch).
+    mem_in_chunk: u64,
+    /// Page-aligned size of live huge allocs — each is its own
+    /// segment in real_size and is released when its owner dies.
+    mem_huge: u64,
+    /// High-water mark of real_size — memory_get_peak_usage(true).
+    pub(crate) mem_real_peak: u64,
+    /// Allocations whose charge is tied to a live Rc — data pointer
+    /// → charge. zend tracks emalloc/efree: when every strong ref to
+    /// a tracked alloc dies its footprint releases back into the
+    /// heap, so reclaimable churn never trips the limit while
+    /// genuinely-growing structures do.
+    mem_tracked: HashMap<usize, MemCharge>,
+    /// High-water mark of mem_used — memory_get_peak_usage().
+    pub(crate) mem_peak: u64,
+    /// Registry size that trips the next dead-entry sweep — bounds the
+    /// tracker footprint for alloc-churn loops.
+    mem_sweep_at: usize,
     /// Execution deadline set by set_time_limit/hard_timeout (045).
     deadline: Option<std::time::Instant>,
     /// Seconds figure for the 'Maximum execution time' message.
@@ -991,14 +1069,25 @@ pub struct RunResult {
 /// spliced ahead of the segment whose tag is >= its arrival cursor
 /// — the global stack's real write order across suspends.
 impl ObLevel {
-    /// Reconcile OB_LIVE with `buf`'s current len after a mutation
-    /// (zend charges the buffer's arena bytes; flush/clean paths
-    /// drain `buf` so the release falls out of the same diff).
+    /// Reconcile OB_LIVE with the buffer's zend-alloc size after a
+    /// mutation. zend's smart_string holds the whole alloc while the
+    /// level is open (doubling on each overrun, minimum 4K); a clean
+    /// drains `buf` and frees it, so the release falls out of the
+    /// same diff. `charged` tracks that alloc, not `buf.len()`.
+    /// ponytail: alloc chain is 2*prev but zend's own baseline is
+    /// not simulated, so an ob-grow OOM reports our alloc figure.
     pub(in crate::interp) fn mem_sync(&mut self) {
-        let want = self.buf.len() as i64;
+        let need = self.buf.len() as i64 + 25;
+        let want = if self.buf.is_empty() {
+            0
+        } else if need > self.charged {
+            (2 * self.charged).max(need).max(4096)
+        } else {
+            self.charged
+        };
         let d = want - self.charged;
         if d != 0 {
-            crate::value::ob_charge(d);
+            crate::value::ob_charge(d, want.max(0));
             self.charged = want;
         }
     }
@@ -1007,7 +1096,7 @@ impl ObLevel {
 impl Drop for ObLevel {
     fn drop(&mut self) {
         if self.charged != 0 {
-            crate::value::ob_charge(-self.charged);
+            crate::value::ob_charge(-self.charged, 0);
         }
     }
 }
@@ -1426,7 +1515,6 @@ impl<'a> Interp<'a> {
             globals_synced: std::collections::HashSet::new(),
             dim_by_ref: false,
             foreach_by_ref: false,
-            in_unset: false,
             anon_class_names: HashMap::new(),
             anon_class_seq: 0,
             callable_probe_err: None,
@@ -1506,7 +1594,7 @@ impl<'a> Interp<'a> {
             silence: 0,
             isset_quiet: 0,
             statics: HashMap::new(),
-            static_decls: HashMap::new(),
+            static_decls: StaticDeclSites::new(),
             cur_unit_id: 0,
             next_unit_id: 1,
             included: HashSet::new(),
@@ -1561,6 +1649,7 @@ impl<'a> Interp<'a> {
             live_gens: Vec::new(),
             pending_decl_class: None,
             pending_called_class: None,
+            pending_decl_site: None,
             pending_hook_prop: None,
             in_const_expr: 0,
             class_const_ctx: 0,
@@ -1609,7 +1698,18 @@ impl<'a> Interp<'a> {
             last_err_file: String::new(),
             loop_depth: 0,
             assert_src: String::new(),
+            mem_used: MM_BASE_USED,
+            mem_last: 0,
             mem_exceeded: false,
+            oom_at: None,
+            // zend_mm_init commits the first 2MB chunk eagerly.
+            mem_committed: MM_CHUNK,
+            mem_in_chunk: MM_BASE_CHUNK,
+            mem_huge: 0,
+            mem_real_peak: MM_CHUNK,
+            mem_tracked: HashMap::new(),
+            mem_peak: MM_BASE_USED,
+            mem_sweep_at: 4096,
             deadline: None,
             deadline_secs: 0,
             ini: HashMap::from([
@@ -2975,6 +3075,30 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `php -r <code>` mode: the source is tagless PHP parsed in-script
+    /// like eval()'d code — a `<?php`/`<?` sequence is a syntax error
+    /// (`unexpected token "<", expecting end of file`), never an open
+    /// tag; the pseudo-path "Command line code" stays the label.
+    pub fn run_code(&mut self, src: &str) -> RunResult {
+        if self.ini.contains_key("error_reporting") {
+            let lv = self.ini_error_level();
+            self.error_level = lv;
+        }
+        match parser::parse_eval(src, self.ini_on("short_open_tag")) {
+            Ok(stmts) => self.run(&stmts),
+            Err(e) => {
+                match e.kind {
+                    ErrorKind::Parse => self.print_parse(&e),
+                    _ => self.print_fatal(&e),
+                }
+                RunResult {
+                    exit_code: 255,
+                    fatal: Some(e),
+                }
+            }
+        }
+    }
+
     /// Like run_source but also returns the script's top-level `return`
     /// value — the boot phase of `phpun serve --worker` reads the app
     /// handler this way.
@@ -3449,15 +3573,372 @@ impl<'a> Interp<'a> {
         self.emit_bytes(s.as_bytes());
     }
 
+    /// zend_mm footprint of an emalloc request: bin slots for small
+    /// allocs (approximated as align8 — zend's bins step 8..3072),
+    /// whole 4KB pages for large/huge ones.
+    fn mem_fp(req: u64) -> u64 {
+        if req > MM_SMALL {
+            (req + 4095) & !4095
+        } else {
+            (req + 7) & !7
+        }
+    }
+
+    /// zend arData request for `len` live entries: next-pow2 capacity
+    /// — packed arrays cost 16B/slot + header, mixed HTs ~40B/slot
+    /// (32B bucket + hash/data overhead; calibrated to oracle 'tried
+    /// to allocate' reports, e.g. 1310720 = 32768*40).
+    pub(crate) fn ht_req(len: usize, packed: bool) -> u64 {
+        let cap = (len.max(1) as u64).next_power_of_two().max(8);
+        if packed {
+            cap * 16 + 8
+        } else {
+            cap * 40
+        }
+    }
+
+    /// heap->real_size: committed 2MB chunks + live huge segments —
+    /// memory_get_usage(true) input.
+    pub(crate) fn mem_real(&self) -> u64 {
+        self.mem_committed + self.mem_huge
+    }
+
+    /// Whether a charge already tripped the limit — callers simulating
+    /// multi-alloc sequences stop at the first failure like zend's
+    /// emalloc bailout (the stmt boundary raises the same fatal).
+    pub(crate) fn mem_tripped(&self) -> bool {
+        self.oom_at.is_some()
+    }
+
+    /// zend's memory_limit check runs inside the allocator where a
+    /// request forces newly committed memory: a huge alloc needs its
+    /// own segment (real_size + aligned request vs limit), anything
+    /// else needs a fresh 2MB chunk once the in-chunk footprint
+    /// overflows the committed span (get_chunk's branch). The first
+    /// failure records the allocating call site for the deferred
+    /// fatal and the 'tried to allocate' figure zend reports — the
+    /// raw request for huge allocs, page-aligned for chunk-served
+    /// ones. Returns that figure when the commit would overflow.
+    /// ponytail: chunk-granular — zend checks exact free page runs
+    /// per size class; the in-chunk counter conservatively assumes no
+    /// reusable runs, so fragmented heaps can trip a bit earlier.
+    /// PR #88 owns the canonical page-level model.
+    pub(crate) fn mem_check(&mut self, req: u64) -> Option<u64> {
+        let limit = self.ini_bytes("memory_limit");
+        if limit <= 0 {
+            return None;
+        }
+        let limit = limit as u64;
+        // Crossing a commit boundary — reclaim dead charges first
+        // (zend frees blocks at efree; the Weak probes catch up here
+        // so a just-died large alloc never trips the limit).
+        if ((req > MM_MAX_LARGE && self.mem_real().saturating_add(Self::mem_fp(req)) > limit)
+            || (req <= MM_MAX_LARGE
+                && self.mem_in_chunk.saturating_add(Self::mem_fp(req)) > self.mem_committed))
+            && !self.mem_tracked.is_empty()
+        {
+            self.mem_sweep();
+        }
+        let report = if req > MM_MAX_LARGE {
+            if self.mem_real().saturating_add(Self::mem_fp(req)) > limit {
+                // huge segments report the 8-aligned request (zend_mm
+                // safe_error gets the header-adjusted size).
+                Some((req + 7) & !7)
+            } else {
+                None
+            }
+        } else if self.mem_in_chunk.saturating_add(Self::mem_fp(req)) > self.mem_committed
+            && self.mem_committed.saturating_add(MM_CHUNK) > limit
+        {
+            Some(Self::mem_fp(req))
+        } else {
+            None
+        };
+        if let Some(report) = report {
+            self.mem_last = report;
+            if self.oom_at.is_none() {
+                self.oom_at = Some((self.cur_line, self.fatal_frames()));
+            }
+        }
+        report
+    }
+
+    /// Commit an emalloc request: run the limit check, then book the
+    /// footprint (the alloc exists until the deferred fatal raises).
+    /// Returns the booked footprint.
+    fn mem_commit(&mut self, req: u64) -> u64 {
+        // efree half of emalloc/efree: dead tracked allocs release
+        // their footprint before the fit check — the fatal must not
+        // fire on bytes whose owners already died (zend_mm_gc frees
+        // blocks first).
+        if self.mem_tracked.len() >= self.mem_sweep_at {
+            self.mem_sweep();
+        }
+        let fp = Self::mem_fp(req);
+        let _ = self.mem_check(req);
+        self.mem_used += fp;
+        if req > MM_MAX_LARGE {
+            self.mem_huge += fp;
+        } else {
+            self.mem_in_chunk += fp;
+            while self.mem_in_chunk > self.mem_committed {
+                self.mem_committed += MM_CHUNK;
+            }
+        }
+        if self.mem_used > self.mem_peak {
+            self.mem_peak = self.mem_used;
+        }
+        let real = self.mem_real();
+        if real > self.mem_real_peak {
+            self.mem_real_peak = real;
+        }
+        fp
+    }
+
+    /// Charge `req` bytes and tie the footprint to `rc`'s lifetime —
+    /// released when every strong ref dies (zend's efree).
+    pub(crate) fn mem_track<T: ?Sized + 'static>(&mut self, rc: &Rc<T>, req: u64) {
+        let fp = self.mem_commit(req);
+        let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
+        let key = Rc::as_ptr(rc) as *const u8 as usize;
+        match self.mem_tracked.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if !(e.get().probe)() {
+                    // Allocator recycled a dead owner's pointer —
+                    // release the stale charge, then re-register.
+                    self.mem_in_chunk = self.mem_in_chunk.saturating_sub(e.get().inner);
+                    self.mem_huge = self.mem_huge.saturating_sub(e.get().huge);
+                    self.mem_used = self.mem_used.saturating_sub(e.get().inner + e.get().huge);
+                    let c = e.get_mut();
+                    c.inner = 0;
+                    c.huge = 0;
+                    c.table_req = 0;
+                    let weak = Rc::downgrade(rc);
+                    c.probe = Box::new(move || weak.strong_count() > 0);
+                }
+                e.get_mut().inner += inner;
+                e.get_mut().huge += huge;
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let weak = Rc::downgrade(rc);
+                e.insert(MemCharge {
+                    inner,
+                    huge,
+                    table_req: 0,
+                    probe: Box::new(move || weak.strong_count() > 0),
+                });
+            }
+        }
+    }
+
+    /// arData realloc accounting for table growth: book the new
+    /// capacity request and retire the previous one's footprint —
+    /// zend's erealloc transiently holds both, so charge-then-credit.
+    /// A same-capacity call is a no-op (zend only reallocs when the
+    /// pow2 class advances).
+    pub(crate) fn mem_realloc<T: ?Sized + 'static>(&mut self, rc: &Rc<T>, req: u64) {
+        let key = Rc::as_ptr(rc) as *const u8 as usize;
+        if let Some(c) = self.mem_tracked.get(&key) {
+            if (c.probe)() && c.table_req == req {
+                return;
+            }
+        }
+        let fp = self.mem_commit(req);
+        let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
+        match self.mem_tracked.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let old = std::mem::replace(&mut e.get_mut().table_req, req);
+                if old > 0 {
+                    let ofp = Self::mem_fp(old);
+                    if old > MM_MAX_LARGE {
+                        e.get_mut().huge = e.get().huge.saturating_sub(ofp);
+                        self.mem_huge = self.mem_huge.saturating_sub(ofp);
+                    } else {
+                        e.get_mut().inner = e.get().inner.saturating_sub(ofp);
+                        self.mem_in_chunk = self.mem_in_chunk.saturating_sub(ofp);
+                    }
+                    self.mem_used = self.mem_used.saturating_sub(ofp);
+                }
+                e.get_mut().inner += inner;
+                e.get_mut().huge += huge;
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let weak = Rc::downgrade(rc);
+                e.insert(MemCharge {
+                    inner,
+                    huge,
+                    table_req: req,
+                    probe: Box::new(move || weak.strong_count() > 0),
+                });
+            }
+        }
+    }
+
+    /// Release charges whose owning Rc died — the efree counterpart
+    /// of the tracked charges.
+    pub(crate) fn mem_sweep(&mut self) {
+        let mut inner = 0u64;
+        let mut huge = 0u64;
+        self.mem_tracked.retain(|_, c| {
+            if (c.probe)() {
+                true
+            } else {
+                inner += c.inner;
+                huge += c.huge;
+                false
+            }
+        });
+        self.mem_in_chunk = self.mem_in_chunk.saturating_sub(inner);
+        self.mem_huge = self.mem_huge.saturating_sub(huge);
+        self.mem_used = self.mem_used.saturating_sub(inner + huge);
+        self.mem_sweep_at = self.mem_tracked.len() + 4096;
+    }
+
+    /// Partial efree inside a *living* container: zend frees a
+    /// bucket's payload on unset/evict while the table survives —
+    /// subtract `req`'s small footprint from the container's charge.
+    /// Entries for containers never charged through mem_track are
+    /// absent, so untracked owners neither pay nor get refunded.
+    pub(crate) fn mem_credit<T: ?Sized + 'static>(&mut self, rc: &Rc<T>, req: u64) {
+        let fp = Self::mem_fp(req);
+        let key = Rc::as_ptr(rc) as *const u8 as usize;
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.mem_tracked.entry(key) {
+            if !(e.get().probe)() {
+                // Stale entry of a dead owner at a recycled pointer —
+                // release it now; the caller's container was never
+                // charged for it.
+                let dead = e.remove();
+                self.mem_in_chunk = self.mem_in_chunk.saturating_sub(dead.inner);
+                self.mem_huge = self.mem_huge.saturating_sub(dead.huge);
+                self.mem_used = self.mem_used.saturating_sub(dead.inner + dead.huge);
+            } else {
+                let sub = fp.min(e.get().inner);
+                e.get_mut().inner -= sub;
+                self.mem_in_chunk = self.mem_in_chunk.saturating_sub(sub);
+                self.mem_used = self.mem_used.saturating_sub(sub);
+            }
+        }
+    }
+
+    /// Retire a still-live tracked alloc's charge — erealloc growth
+    /// semantics: zend replaces the old buffer's pages with the grown
+    /// request, so the peak must not double-count the pair.
+    pub(crate) fn mem_retire<T: ?Sized + 'static>(&mut self, rc: &Rc<T>) {
+        let key = Rc::as_ptr(rc) as *const u8 as usize;
+        if let Some(c) = self.mem_tracked.remove(&key) {
+            self.mem_in_chunk = self.mem_in_chunk.saturating_sub(c.inner);
+            self.mem_huge = self.mem_huge.saturating_sub(c.huge);
+            self.mem_used = self.mem_used.saturating_sub(c.inner + c.huge);
+        }
+    }
+
+    /// erealloc accounting for `.=` on an unshared string, mirroring
+    /// zend_mm_realloc: a huge segment mremaps (the old segment is
+    /// unmapped before the grown one is sized against the limit), a
+    /// page-run extends in place when it still fits the committed
+    /// span, and otherwise zend mallocs the grown run while the old
+    /// one is held — the limit check sees both.
+    /// ponytail: in-place extension uses a 7/8-of-chunk heuristic —
+    /// zend checks whether the pages immediately after the old run
+    /// are free, which needs the real page map PR #88 owns; without
+    /// it the boundary can land one growth step off.
+    pub(crate) fn mem_grow_str(&mut self, old: &Rc<[u8]>, new: &Rc<[u8]>, req: u64) {
+        // zend frees dead allocs before sizing the grow — sweep
+        // unconditionally so freed runs feed the extend test.
+        self.mem_sweep();
+        let fp = Self::mem_fp(req);
+        let old_inner = self
+            .mem_tracked
+            .get(&(Rc::as_ptr(old) as *const u8 as usize))
+            .map(|c| c.inner)
+            .unwrap_or(0);
+        let extend = req <= MM_MAX_LARGE
+            && old_inner > 0
+            && self
+                .mem_in_chunk
+                .saturating_sub(old_inner)
+                .saturating_add(fp)
+                <= self.mem_committed * 7 / 8;
+        if req > MM_MAX_LARGE {
+            // mremap unmaps the old segment before sizing the new one.
+            self.mem_retire(old);
+            let _ = self.mem_check(req);
+        } else if !extend {
+            let _ = self.mem_check(req);
+        }
+        self.mem_used += fp;
+        if req > MM_MAX_LARGE {
+            self.mem_huge += fp;
+        } else {
+            self.mem_in_chunk += fp;
+        }
+        if req <= MM_MAX_LARGE {
+            self.mem_retire(old);
+        }
+        while self.mem_in_chunk > self.mem_committed {
+            self.mem_committed += MM_CHUNK;
+        }
+        if self.mem_used > self.mem_peak {
+            self.mem_peak = self.mem_used;
+        }
+        let real = self.mem_real();
+        if real > self.mem_real_peak {
+            self.mem_real_peak = real;
+        }
+        let key = Rc::as_ptr(new) as *const u8 as usize;
+        if let Some(c) = self.mem_tracked.remove(&key) {
+            // Allocator recycled a dead owner's pointer — release the
+            // stale charge before re-registering.
+            self.mem_in_chunk = self.mem_in_chunk.saturating_sub(c.inner);
+            self.mem_huge = self.mem_huge.saturating_sub(c.huge);
+            self.mem_used = self.mem_used.saturating_sub(c.inner + c.huge);
+        }
+        let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
+        let weak = Rc::downgrade(new);
+        self.mem_tracked.insert(
+            key,
+            MemCharge {
+                inner,
+                huge,
+                table_req: 0,
+                probe: Box::new(move || weak.strong_count() > 0),
+            },
+        );
+    }
+
+    /// Reconcile then report the live usage — memory_get_usage()
+    /// reads it straight, so sweep dead tracked allocs first.
+    pub(crate) fn mem_reconcile(&mut self) -> u64 {
+        self.mem_sweep();
+        self.mem_used
+    }
+
+    /// The memory_limit fatal as raised mid-call by an oversized alloc
+    /// — zend bails out inside emalloc, so a builtin that cannot afford
+    /// the real allocation (huge result buffers) returns this itself
+    /// instead of waiting for the stmt boundary.
+    pub fn oom_fatal(&self) -> PhpError {
+        let limit = self.ini_bytes("memory_limit");
+        let (line, frames) = self
+            .oom_at
+            .clone()
+            .unwrap_or((self.cur_line, self.fatal_frames()));
+        let mut e = PhpError::fatal(
+            format!(
+                "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
+                limit, self.mem_last
+            ),
+            line,
+        );
+        e.trace = Some(frames);
+        e
+    }
+
     /// Byte-faithful emit — program output is bytes (echo of binary
     /// strings, file reads, preg results must not be UTF-8 validated).
     pub fn emit_bytes(&mut self, b: &[u8]) {
-        // Emitted output is free under memory_limit — zend's arena
-        // counts heap allocations, not bytes already on their way to
-        // stdout (only unflushed OB buffers hold memory, and those sit
-        // in `out`/`obs` Rust allocations we're not metering).
-        // ponytail: ob_start buffer contents aren't charged; upgrade
-        // path is a Vec-len-driven counter inside the ob stack.
+        // Emitted output is free — zend charges only ob-buffered
+        // bytes (the OB_LIVE arena charge in ObLevel::mem_sync).
         // Inside a generator run, output after a yield is deferred to
         // resume — `f(yield)` must not observe the call (nor its echo)
         // until the consumer advances past that yield.
@@ -3538,48 +4019,6 @@ impl<'a> Interp<'a> {
     /// reports this.
     pub(crate) fn mem_total(&self) -> i64 {
         crate::value::MEM_BASE_BYTES + crate::value::mem_live_bytes()
-    }
-
-    /// Zend-arena `real_size` — committed bytes (2MB blocks at the
-    /// small pool's high-water + dedicated huge chunks). The
-    /// memory_limit checks compare this side, matching zend_alloc's
-    /// `real_size + size > limit`.
-    pub(crate) fn mem_real(&self) -> i64 {
-        crate::value::mem_real_raw()
-    }
-
-    /// zend's emalloc guard inside C builtins: refuse when the request
-    /// would cross memory_limit — fires the OOM fatal mid-eval with
-    /// the request size as 'tried to allocate N' (str_repeat).
-    pub(crate) fn mem_check_alloc(&mut self, want: i64) -> Result<(), PhpError> {
-        let limit = self.ini_bytes("memory_limit");
-        if limit > 0 && self.mem_real() + want > limit {
-            if std::env::var_os("PHPUN_MEM_DEBUG").is_some() {
-                eprintln!(
-                    "OOM: real={} want={} limit={} small_hw={} huge_live={} huge_real={} peak={} live={} arr={} str={} gcpeak={}",
-                    self.mem_real(), want, limit,
-                    crate::value::SMALL_HW.load(std::sync::atomic::Ordering::Relaxed),
-                    crate::value::HUGE_LIVE.load(std::sync::atomic::Ordering::Relaxed),
-                    crate::value::HUGE_REAL.load(std::sync::atomic::Ordering::Relaxed),
-                    crate::value::mem_real_peak(),
-                    self.mem_total(),
-                    crate::value::arr_live_bytes(),
-                    crate::value::str_live_bytes(),
-                    crate::value::GC_PEAK.load(std::sync::atomic::Ordering::Relaxed),
-                );
-            }
-            self.mem_exceeded = true;
-            let mut e = PhpError::fatal(
-                format!(
-                    "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
-                    limit, want
-                ),
-                self.cur_line,
-            );
-            e.trace = Some(self.fatal_frames());
-            return Err(e);
-        }
-        Ok(())
     }
 
     /// Emit journaled/replayed bytes at their materialization point:
@@ -5526,7 +5965,22 @@ impl<'a> Interp<'a> {
             Some(b'G') | Some(b'g') => (&s[..s.len() - 1], 1i64 << 30),
             _ => (s, 1),
         };
-        num.trim().parse::<i64>().unwrap_or(-1) * mul
+        // zend's shorthand parse reads only the leading integer and
+        // ignores trailing junk before the suffix — '2.5M' behaves as
+        // '2M' (startup also warns; the value truncation is what
+        // callers observe) and 'abc' parses as 0.
+        let num = num.trim();
+        let mut end = 0;
+        for (i, c) in num.char_indices() {
+            if i == 0 && (c == '-' || c == '+') {
+                end = 1;
+            } else if c.is_ascii_digit() {
+                end = i + 1;
+            } else {
+                break;
+            }
+        }
+        num[..end].parse::<i64>().unwrap_or(0) * mul
     }
 
     /// Public wrapper so builtins can share PHP's float→int coercion.

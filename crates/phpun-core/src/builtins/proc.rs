@@ -1165,8 +1165,8 @@ fn php_exec(it: &mut Interp, fname: &str, args: &[Cell], ty: u8) -> Result<Value
                                 is_ref: a.borrow().is_ref,
                                 iter_pos: a.borrow().iter_pos,
                                 foreach_pos: Vec::new(),
-                                mem_elems: 0,
                                 packed: a.borrow().packed,
+                                mem_elems: 0,
                                 key_bytes: 0,
                             };
                             crate::value::gc_root_note(1);

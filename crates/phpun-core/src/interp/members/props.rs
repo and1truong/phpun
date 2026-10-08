@@ -1818,24 +1818,20 @@ impl<'a> Interp<'a> {
                         // then target it (`$foo->bar->baz = 42`), and
                         // dim/compound ops on the slot itself hit the
                         // object's own errors, not 'indirectly modify'.
-                        if !self.in_unset {
-                            if let Some(sv) = pd.set_vis {
-                                if !self.hook_scope_allows(&o, &dcls, &pn, sv) {
-                                    let dk = if pd.visibility == crate::ast::Visibility::Private {
-                                        format!("\0{}\0{}", dcls.name(), pd.name)
-                                    } else {
-                                        pd.name.clone()
-                                    };
-                                    let held = o.borrow().props.get(&dk).cloned();
-                                    return match held {
-                                        Some(c) if matches!(&*c.borrow(), Value::Object(_)) => {
-                                            Ok(cell(c.borrow().clone()))
-                                        }
-                                        _ => {
-                                            self.set_visibility_indirect_error(&dcls, &pd.name, sv)
-                                        }
-                                    };
-                                }
+                        if let Some(sv) = pd.set_vis {
+                            if !self.hook_scope_allows(&o, &dcls, &pn, sv) {
+                                let dk = if pd.visibility == crate::ast::Visibility::Private {
+                                    format!("\0{}\0{}", dcls.name(), pd.name)
+                                } else {
+                                    pd.name.clone()
+                                };
+                                let held = o.borrow().props.get(&dk).cloned();
+                                return match held {
+                                    Some(c) if matches!(&*c.borrow(), Value::Object(_)) => {
+                                        Ok(cell(c.borrow().clone()))
+                                    }
+                                    _ => self.set_visibility_indirect_error(&dcls, &pd.name, sv),
+                                };
                             }
                         }
                     }
@@ -2184,6 +2180,8 @@ impl<'a> Interp<'a> {
                     drop(ob);
                     if let Some(ptr) = prune {
                         self.prune_typed_slot(ptr);
+                        // efree the prop bucket — charged at insert.
+                        self.mem_credit(&o, OBJ_SLOT_REQ);
                     }
                 } else if let Some(e) = hidden {
                     // __unset overloads the invisible decl like a
@@ -2221,7 +2219,12 @@ impl<'a> Interp<'a> {
                     // ARRAY_AS_PROPS: undeclared unsets delete from the
                     // storage hash — zend never reaches __unset.
                     let arr = self.ao_state(&o).0;
-                    let evicted = arr.borrow_mut().unset(&ArrKey::Str(Rc::from(pn.as_str())));
+                    let kk = ArrKey::Str(Rc::from(pn.as_str()));
+                    let had = arr.borrow().get_cell(&kk).is_some();
+                    let evicted = arr.borrow_mut().unset(&kk);
+                    if had {
+                        self.mem_credit(&arr, OBJ_SLOT_REQ);
+                    }
                     if let Some(v) = evicted {
                         self.destruct_dying_value(&v)?;
                     }

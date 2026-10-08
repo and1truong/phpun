@@ -1,0 +1,22 @@
+ao-inc=int(6)
+ao-dec=int(5)
+ao-pre=int(6)
+
+Warning: Undefined array key "missing" in %s/crates/phpun-core/tests/fixtures/native_spl_incdec.php on line 9
+ao-miss=int(1)
+
+Deprecated: Increment on non-numeric string is deprecated, use str_increment() instead in %s/crates/phpun-core/tests/fixtures/native_spl_incdec.php on line 10
+ao-str=string(3) "abd"
+ai-inc=int(8)
+sub-dec=int(8)
+ao-cat=string(2) "1x"
+
+Warning: A non-numeric value encountered in %s/crates/phpun-core/tests/fixtures/native_spl_incdec.php on line 18
+ao-add=int(11)
+so-inc=int(2)
+
+Notice: Indirect modification of overloaded element of SplFixedArray has no effect in %s/crates/phpun-core/tests/fixtures/native_spl_incdec.php on line 23
+
+Deprecated: Increment on non-numeric string is deprecated, use str_increment() instead in %s/crates/phpun-core/tests/fixtures/native_spl_incdec.php on line 23
+fa-str=string(3) "abc"
+Error: Modification of ArrayObject during sorting is prohibited

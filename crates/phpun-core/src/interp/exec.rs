@@ -49,39 +49,34 @@ impl<'a> Interp<'a> {
         while i < stmts.len() {
             let s = &stmts[i];
             i += 1;
-            // memory_limit fires between statements (bug45392).
-            let limit = self.ini_bytes("memory_limit");
-            // zend's emalloc guard trips mid-expression: compare the
-            // committed high-water, not just the still-committed tail
-            // (transient dedicated chunks freed before the boundary
-            // already pushed real_size past the limit).
-            if limit > 0 && self.mem_real().max(crate::value::mem_real_peak()) > limit {
-                if std::env::var_os("PHPUN_MEM_DEBUG").is_some() {
-                    eprintln!(
-                        "OOM@boundary: real={} peak={} limit={} last={} live={} arr={} str={} obj={}",
-                        self.mem_real(),
-                        crate::value::mem_real_peak(),
-                        limit,
-                        crate::value::mem_last_alloc(),
-                        self.mem_total(),
-                        crate::value::arr_live_bytes(),
-                        crate::value::str_live_bytes(),
-                        crate::value::obj_live_bytes(),
-                    );
-                }
+            // memory_limit fires between statements (bug45392) once
+            // a charge recorded its overflowing call site in oom_at,
+            // or the live arena itself passed the limit (ob buffers —
+            // bytes the zend_mm sim doesn't own).
+            let lim = self.ini_bytes("memory_limit");
+            let arena_over = lim >= 0 && self.mem_total() > lim;
+            if self.oom_at.is_some() || arena_over {
                 self.mem_exceeded = true;
-                // Zend's OOM fatal always prints a Stack trace:
-                // block (`#0 {main}` at top level) — a plain E_ERROR
-                // wouldn't.
+                // zend's bailout backtraces the allocating call —
+                // oom_at captured it inside mem_charge. Arena trips
+                // report the last tracked request (no sim figure).
+                let (line, frames) = self
+                    .oom_at
+                    .clone()
+                    .unwrap_or((self.cur_line, self.fatal_frames()));
                 let mut e = PhpError::fatal(
                     format!(
                         "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
-                        limit,
-                        crate::value::mem_last_alloc()
+                        lim,
+                        if arena_over {
+                            crate::value::mem_last_alloc()
+                        } else {
+                            self.mem_last as i64
+                        }
                     ),
-                    self.cur_line,
+                    line,
                 );
-                e.trace = Some(self.fatal_frames());
+                e.trace = Some(frames);
                 return self.err_flow(e);
             }
             if let Some(d) = self.deadline {
@@ -102,10 +97,16 @@ impl<'a> Interp<'a> {
             // Rc clones — left over they keep a container externally
             // strong and gc_collect_cycles reads the dead cycle as
             // rooted (gc_006's `$a->a[0] =& $a` then `unset($a)`).
+            // `!in_handler` like every other clear site: a user error
+            // handler's own statements run through exec() mid-op and
+            // must not wipe the outer op's dim binds (bug79793 — the
+            // write pass's re-lookup would read post-handler values).
             self.last_prop_ov = None;
-            self.dim_key_conv.clear();
-            self.dim_cv_bound.clear();
-            self.dim_undef_cells.clear();
+            if !self.in_handler {
+                self.dim_key_conv.clear();
+                self.dim_cv_bound.clear();
+                self.dim_undef_cells.clear();
+            }
             match self.exec(s) {
                 Flow::Normal => {
                     // Generators that died at this statement (unset(),
@@ -617,7 +618,7 @@ impl<'a> Interp<'a> {
                 }
                 Flow::Normal
             }
-            Stmt::Static { vars, site, .. } => {
+            Stmt::Static { vars, .. } => {
                 let mut key = self.fn_statics_key();
                 // Static storage keys on the op_array the decl was
                 // compiled into: a function body's own table (bare key),
@@ -633,22 +634,31 @@ impl<'a> Interp<'a> {
                 if let Some(u) = unit {
                     key = format!("{}\u{0}u{}", key, u);
                 }
-                // Site identity: (compile unit, stmt node). A `static $a`
-                // redeclared at a different statement in the same scope
-                // and unit is a compile fatal — even on the same line
-                // (static_basic_002) — while re-executing the same
-                // statement (loops) or redeclaring in a different unit
-                // — a separate include/eval/run, which Zend compiles to
-                // a fresh op_array — is not. The unit serial (not the
-                // file string) keys the unit; the site key is the
-                // `static` keyword's token index —
-                // stable across the per-call FunctionDecl clones method
-                // dispatch makes (vars.as_ptr() ABA-flakes: a reallocated
-                // clone's address can alias a freed decl's, falsely
-                // deduping, or differ from itself across calls, falsely
-                // reporting 'Duplicate declaration').
-                let site = (self.cur_unit_id, *site);
+                // Site identity: (compile unit, decl origin, stmt line).
+                // A `static $a` redeclared at a different statement in the
+                // same scope and unit is a compile fatal — even on the
+                // same line (static_basic_002) — while re-executing the
+                // same statement (loops, repeated calls) or redeclaring
+                // in a different unit — a separate include/eval/run,
+                // which Zend compiles to a fresh op_array — is not. The
+                // serial (not the file string) keys the unit: a re-parsed
+                // unit may recycle the freed Vec's stmt ptr and must
+                // still count as new. The decl origin anchors the
+                // statement: method dispatch clones the decl body per
+                // call, so `vars.as_ptr()` differs between calls of the
+                // same method — the frame's decl_site (the registered
+                // decl Rc) stays stable. `var_line` separates
+                // statements inside that decl; same-line duplicates are
+                // already compile-time errors (flow_scan), so the
+                // line is sufficient stmt identity here.
+                let anchor = self
+                    .stack
+                    .last()
+                    .map(|f| f.decl_site)
+                    .filter(|a| *a != 0)
+                    .unwrap_or(0);
                 for (name, default, var_line) in vars {
+                    let site = (self.cur_unit_id, anchor, *var_line);
                     // Every site is kept: a decl in a different unit is
                     // legal AND must not erase the same-unit record a
                     // later duplicate checks against.
@@ -658,7 +668,9 @@ impl<'a> Interp<'a> {
                         .or_default()
                         .entry(name.clone())
                         .or_default();
-                    let dup = sites.iter().any(|(u, l)| u == &site.0 && *l != site.1);
+                    let dup = sites
+                        .iter()
+                        .any(|(u, a, l)| u == &site.0 && a == &site.1 && *l != site.2);
                     sites.insert(site);
                     if dup {
                         // A compile fatal in Zend — carry the compile-
@@ -825,7 +837,11 @@ impl<'a> Interp<'a> {
                                     // The borrow must end before the
                                     // evicted payload's dtors run.
                                     let ak = ArrKey::Str(Rc::from(n.as_str()));
+                                    let had = arr.borrow().get_cell(&ak).is_some();
                                     let evicted = arr.borrow_mut().unset(&ak);
+                                    if had {
+                                        self.mem_credit(&arr, 32);
+                                    }
                                     if let Some(v) = evicted {
                                         if let Err(e) = self.destruct_dying_value(&v) {
                                             return self.err_flow(e);

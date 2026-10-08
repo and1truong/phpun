@@ -375,8 +375,10 @@ impl<'a> Interp<'a> {
                 let n = (out.cells.len() + out.named.len() - stack0) as i64;
                 if n > 0 {
                     let seg = (n * 16 + 262_143) & !262_143;
-                    crate::value::stack_charge(seg, seg);
-                    out.arg_stack.push(Rc::new(ArgStack(seg)));
+                    let arc = Rc::new(ArgStack(seg));
+                    // Charged until the frame's last CallArgs clone dies.
+                    self.mem_track(&arc, seg as u64);
+                    out.arg_stack.push(arc);
                 }
                 continue;
             }
@@ -3538,6 +3540,7 @@ impl<'a> Interp<'a> {
                 Some(o) => {
                     self.pending_decl_class = Some(dc.clone());
                     self.pending_called_class = Some(o.borrow().class.clone());
+                    self.pending_decl_site = Some(Rc::as_ptr(&m) as usize);
                     let r = self.invoke_fn(&Rc::new(m.decl.clone()), args, Some(o), Some(dc));
                     self.pending_decl_class = None;
                     self.pending_called_class = None;
@@ -4653,6 +4656,10 @@ impl<'a> Interp<'a> {
         this_obj: Option<Rc<RefCell<PhpObject>>>,
         scope_class: Option<Rc<PhpClass>>,
     ) -> Result<Value, PhpError> {
+        // Consume any queued decl-origin anchor up front so early
+        // returns (stub dispatch, arity errors) cannot leak it into
+        // the next call's frame.
+        let decl_site = self.pending_decl_site.take();
         // Native SPL stubs (empty body, line 0) hit spl_method even on
         // paths that bypass method dispatch — parent:: calls reach here
         // with the stub decl directly.
@@ -4739,7 +4746,7 @@ impl<'a> Interp<'a> {
         }
         let dc = self.pending_decl_class.take();
         let cc = self.pending_called_class.take();
-        self.invoke_fn_run(decl, args, this_obj, scope_class, dc, cc, None)
+        self.invoke_fn_run(decl, args, this_obj, scope_class, dc, cc, None, decl_site)
     }
 
     /// Frame push + body run — the part of invoke_fn the Generator
@@ -4754,8 +4761,10 @@ impl<'a> Interp<'a> {
         decl_class: Option<Rc<PhpClass>>,
         called_class: Option<Rc<PhpClass>>,
         closure_rc: Option<Rc<PhpCallable>>,
+        decl_site: Option<usize>,
     ) -> Result<Value, PhpError> {
         let mut frame = Frame::new(decl.name.clone());
+        frame.decl_site = decl_site.unwrap_or(Rc::as_ptr(decl) as usize);
         frame.closure_rc = closure_rc;
         frame.fn_line = decl.line;
         frame.file = decl.file.clone();
@@ -4808,6 +4817,7 @@ fn builtin_byref(name: &str) -> Option<&'static [bool]> {
         | "str_ireplace" => &[false, false, false, false, true],
         "preg_replace_callback_array" => &[false, false, false, true],
         "parse_str" => &[false, true],
+        "getopt" => &[false, false, true],
         "is_callable" => &[false, false, true],
         "sscanf" | "fscanf" => &[false, false],
         "exec" => &[false, true, true],

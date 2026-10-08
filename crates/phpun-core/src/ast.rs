@@ -54,10 +54,6 @@ pub enum Stmt {
     Static {
         vars: Vec<(String, Option<Expr>, usize)>,
         line: usize,
-        /// Token index of the `static` keyword — the decl site's stable
-        /// identity within its parse unit (survives FunctionDecl clones,
-        /// unlike the vars Vec's heap address).
-        site: usize,
     },
     Switch {
         cond: Expr,

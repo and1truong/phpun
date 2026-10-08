@@ -6,7 +6,29 @@ use super::*;
 impl<'a> Interp<'a> {
     /// Builtin exception classes + interfaces needed by try/catch.
     pub(in crate::interp) fn register_builtin_classes(&mut self) {
+        fn param(name: &str, default: Expr, tys: &[&str]) -> Param {
+            Param {
+                name: name.into(),
+                default: Some(default),
+                by_ref: false,
+                variadic: false,
+                ty: Some(tys.iter().map(|t| t.to_string()).collect()),
+                promoted: false,
+                vis: None,
+                readonly: false,
+                is_final: false,
+                set_vis: None,
+                hooks: None,
+            }
+        }
         fn throwable_class(name: &str, parent: Option<&str>, props: &[&str]) -> ClassDecl {
+            // zend stub: `__construct(string $message = "", int $code = 0, ?Throwable $previous = null)`
+            let mut ctor = (*method("__construct", &[])).clone();
+            ctor.decl.params = vec![
+                param("message", Expr::Str("".into()), &["string"]),
+                param("code", Expr::Int(0), &["int"]),
+                param("previous", Expr::Null, &["Throwable", "null"]),
+            ];
             ClassDecl {
                 name: name.into(),
                 kind: ClassKind::Class,
@@ -19,7 +41,7 @@ impl<'a> Interp<'a> {
                 traits: vec![],
                 adaptations: vec![],
                 methods: vec![
-                    method("__construct", &["message", "code", "previous"]),
+                    Rc::new(ctor),
                     method("getMessage", &[]),
                     method("getCode", &[]),
                     method("getFile", &[]),
@@ -1292,7 +1314,7 @@ impl<'a> Interp<'a> {
                         is_static: false,
                         visibility: Visibility::Public,
                         readonly: false,
-                        ty: None,
+                        ty: Some(vec!["string".into()]),
                         is_abstract: false,
                         is_final: false,
                         set_vis: None,
@@ -1308,7 +1330,7 @@ impl<'a> Interp<'a> {
                         is_static: false,
                         visibility: Visibility::Public,
                         readonly: false,
-                        ty: None,
+                        ty: Some(vec!["mixed".into()]),
                         is_abstract: false,
                         is_final: false,
                         set_vis: None,
@@ -2393,6 +2415,19 @@ impl<'a> Interp<'a> {
                 Some("Exception"),
                 &["message", "code", "file", "line", "severity"],
             );
+            // zend stub: `__construct(string $message = "", int $code = 0,
+            // int $severity = E_ERROR, ?string $filename = null, ?int $line = null,
+            // ?Throwable $previous = null)`
+            let mut c = (*d.methods[0]).clone();
+            c.decl.params = vec![
+                param("message", Expr::Str("".into()), &["string"]),
+                param("code", Expr::Int(0), &["int"]),
+                param("severity", Expr::Const("E_ERROR".into()), &["int"]),
+                param("filename", Expr::Null, &["string", "null"]),
+                param("line", Expr::Null, &["int", "null"]),
+                param("previous", Expr::Null, &["Throwable", "null"]),
+            ];
+            d.methods[0] = Rc::new(c);
             d.methods.push(method("getSeverity", &[]));
             // zend gives ErrorException its own ctor arginfo:
             // (message, code, severity, filename, line, previous).
