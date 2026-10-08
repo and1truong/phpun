@@ -322,15 +322,19 @@ pub(crate) fn dispatch(
             if k == "memory_limit" {
                 it.ini.insert(k.clone(), v);
                 let lim = it.ini_bytes(&k);
-                // zend refuses limits below committed heap usage.
-                if lim > 0 && (it.mem_real() as i64) > lim {
+                // zend refuses limits below committed heap usage;
+                // dead tracked charges sweep first so a freed 20MB
+                // string doesn't hold committed pages hostage
+                // (zend_mm's real usage drops on free).
+                it.mem_sweep();
+                let usage = it.mem_real() as i64;
+                if lim > 0 && usage > lim {
                     let _ = it
                         .ini
                         .insert(k.clone(), prev.clone().unwrap_or_else(|| "-1".into()));
                     it.warn_pub(&format!(
                         "Failed to set memory limit to {} bytes (Current memory usage is {} bytes)",
-                        lim,
-                        it.mem_real()
+                        lim, usage
                     ))?;
                     // Refused ini_set returns false (zend returns the
                     // old value only on a successful set).

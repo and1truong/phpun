@@ -333,12 +333,16 @@ fn run_script(args: &[String]) -> ExitCode {
                 it.ini
                     .insert("memory_limit".to_string(), v.trim().to_string());
                 let lim = it.ini_bytes("memory_limit");
-                if lim > 0 && lim <= 2097152 {
+                // Refuse at-or-under the 2M bootstrap floor: 0 and a
+                // positive value below 2M both warn and keep the
+                // previous value (2M itself is accepted, negatives
+                // mean unlimited and pass silently).
+                if (0..2097152).contains(&lim) {
                     let msg = format!(
                         "Failed to set memory limit to {} bytes (Current memory usage is 2097152 bytes)",
                         lim
                     );
-                    eprintln!("PHP Warning:  {} in Unknown on line 0", msg);
+                    eprintln!("PHP Warning:  {} in Unknown on line 0\n", msg);
                     it.emit(&format!("Warning: {} in Unknown on line 0\n", msg));
                     match prev {
                         Some(p) => {

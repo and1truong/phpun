@@ -13,7 +13,31 @@ impl<'a> Interp<'a> {
     /// `exec_block` starting partway down the list — used when a
     /// `goto` lands on a label inside it (the label stmt itself is a
     /// no-op; control resumes at the stmt after it).
-    fn exec_block_from(&mut self, stmts: &[Stmt], mut i: usize) -> Flow {
+    fn exec_block_from(&mut self, stmts: &[Stmt], i: usize) -> Flow {
+        // The dim/prop write scratch is shared `Interp` state: a nested
+        // statement list — a callee, error-handler, eval/include, or
+        // destructor body — sees the enclosing op's caches, and its
+        // per-statement clears wipe them mid-op. The suspended outer
+        // write then re-reads live CVs (bug79793's handler flipping
+        // `$key` before the pending `[$key]++` write) and re-emits
+        // conversions the op already diagnosed. Park the outer scratch
+        // for this list's run; the in-list clears still drop each
+        // statement's own leftovers (gc_006).
+        let saved_key_conv = std::mem::take(&mut self.dim_key_conv);
+        let saved_cv_bound = std::mem::take(&mut self.dim_cv_bound);
+        let saved_undef = std::mem::take(&mut self.dim_undef_cells);
+        let saved_prop_ov = self.last_prop_ov.take();
+        let saved_dyn = std::mem::take(&mut self.fresh_dyn_props);
+        let out = self.exec_block_run(stmts, i);
+        self.dim_key_conv = saved_key_conv;
+        self.dim_cv_bound = saved_cv_bound;
+        self.dim_undef_cells = saved_undef;
+        self.last_prop_ov = saved_prop_ov;
+        self.fresh_dyn_props = saved_dyn;
+        out
+    }
+
+    fn exec_block_run(&mut self, stmts: &[Stmt], mut i: usize) -> Flow {
         // goto labels bind at the statement-list scope they appear in —
         // a goto bubbling up from nested control flow lands here.
         let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
@@ -26,11 +50,16 @@ impl<'a> Interp<'a> {
             let s = &stmts[i];
             i += 1;
             // memory_limit fires between statements (bug45392) once
-            // a charge recorded its overflowing call site in oom_at.
-            if self.oom_at.is_some() {
+            // a charge recorded its overflowing call site in oom_at,
+            // or the live arena itself passed the limit (ob buffers —
+            // bytes the zend_mm sim doesn't own).
+            let lim = self.ini_bytes("memory_limit");
+            let arena_over = lim >= 0 && self.mem_total() > lim;
+            if self.oom_at.is_some() || arena_over {
                 self.mem_exceeded = true;
                 // zend's bailout backtraces the allocating call —
-                // oom_at captured it inside mem_charge.
+                // oom_at captured it inside mem_charge. Arena trips
+                // report the last tracked request (no sim figure).
                 let (line, frames) = self
                     .oom_at
                     .clone()
@@ -38,8 +67,12 @@ impl<'a> Interp<'a> {
                 let mut e = PhpError::fatal(
                     format!(
                         "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
-                        self.ini_bytes("memory_limit"),
-                        self.mem_last
+                        lim,
+                        if arena_over {
+                            crate::value::mem_last_alloc()
+                        } else {
+                            self.mem_last as i64
+                        }
                     ),
                     line,
                 );
@@ -64,10 +97,16 @@ impl<'a> Interp<'a> {
             // Rc clones — left over they keep a container externally
             // strong and gc_collect_cycles reads the dead cycle as
             // rooted (gc_006's `$a->a[0] =& $a` then `unset($a)`).
+            // `!in_handler` like every other clear site: a user error
+            // handler's own statements run through exec() mid-op and
+            // must not wipe the outer op's dim binds (bug79793 — the
+            // write pass's re-lookup would read post-handler values).
             self.last_prop_ov = None;
-            self.dim_key_conv.clear();
-            self.dim_cv_bound.clear();
-            self.dim_undef_cells.clear();
+            if !self.in_handler {
+                self.dim_key_conv.clear();
+                self.dim_cv_bound.clear();
+                self.dim_undef_cells.clear();
+            }
             match self.exec(s) {
                 Flow::Normal => {
                     // Generators that died at this statement (unset(),

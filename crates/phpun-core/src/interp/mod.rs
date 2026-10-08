@@ -353,6 +353,12 @@ pub struct Interp<'a> {
     /// declaration site (zend reports the decl's own file+line, with
     /// the [constant expression] pseudo-frame pointing at resolution).
     const_decl_ctx: Option<(String, u32)>,
+    /// Resolution line of the const-expr currently evaluating — the
+    /// `[constant expression]` pseudo-frame sites here (the access that
+    /// triggered the lazy init), not inside the decl being evaluated
+    /// (gh8821: `#0 file(11): [constant expression]()` where 11 is the
+    /// `new` call, not the const decl).
+    const_init_site: Option<usize>,
     /// Headers queued by header()/setcookie() — `phpun serve` emits them
     /// into the HTTP response; CLI ignores them (like php-cli).
     pub out_headers: Vec<String>,
@@ -365,9 +371,10 @@ pub struct Interp<'a> {
     pub last_preg_error: i64,
     /// Zend's IS_STR_VALID_UTF8 flag: string storage (keyed by Rc
     /// pointer) proven fully valid UTF-8 — /u preg calls skip
-    /// re-validating it (bug72685). The Rcs stay in the map so the
-    /// pointer keys can't be recycled.
-    pub valid_utf8: std::collections::HashMap<usize, std::rc::Rc<[u8]>>,
+    /// re-validating it (bug72685). Weak keys drop when the storage
+    /// dies — a recycled pointer then fails upgrade() and re-validates,
+    /// so nothing stays pinned and the map can't grow without bound.
+    pub valid_utf8: std::collections::HashMap<usize, std::rc::Weak<[u8]>>,
     /// Raw request body for php://input — serve mode fills it.
     pub php_input: std::rc::Rc<Vec<u8>>,
     /// Real upload tmp paths created this request — is_uploaded_file()
@@ -472,11 +479,6 @@ pub struct Interp<'a> {
     /// write-reference bind (uninit non-nullable typed props error
     /// 'by reference'; uninit *nullable* statics report 'undeclared').
     foreach_by_ref: bool,
-    /// Inside a whole-target `unset($x)` root fetch — set-visibility
-    /// checks stand down so unset's own errors ('Cannot unset
-    /// private(set) property', 'Attempt to unset static property')
-    /// win over 'Cannot indirectly modify'.
-    in_unset: bool,
     /// Autoload/lookup error swallowed by the last `is_callable_value`
     /// probe — re-raised when a `callable` param type rejects the arg.
     callable_probe_err: Option<(Value, PhpError)>,
@@ -1050,14 +1052,25 @@ pub struct RunResult {
 /// spliced ahead of the segment whose tag is >= its arrival cursor
 /// — the global stack's real write order across suspends.
 impl ObLevel {
-    /// Reconcile OB_LIVE with `buf`'s current len after a mutation
-    /// (zend charges the buffer's arena bytes; flush/clean paths
-    /// drain `buf` so the release falls out of the same diff).
+    /// Reconcile OB_LIVE with the buffer's zend-alloc size after a
+    /// mutation. zend's smart_string holds the whole alloc while the
+    /// level is open (doubling on each overrun, minimum 4K); a clean
+    /// drains `buf` and frees it, so the release falls out of the
+    /// same diff. `charged` tracks that alloc, not `buf.len()`.
+    /// ponytail: alloc chain is 2*prev but zend's own baseline is
+    /// not simulated, so an ob-grow OOM reports our alloc figure.
     pub(in crate::interp) fn mem_sync(&mut self) {
-        let want = self.buf.len() as i64;
+        let need = self.buf.len() as i64 + 25;
+        let want = if self.buf.is_empty() {
+            0
+        } else if need > self.charged {
+            (2 * self.charged).max(need).max(4096)
+        } else {
+            self.charged
+        };
         let d = want - self.charged;
         if d != 0 {
-            crate::value::ob_charge(d);
+            crate::value::ob_charge(d, want.max(0));
             self.charged = want;
         }
     }
@@ -1066,7 +1079,7 @@ impl ObLevel {
 impl Drop for ObLevel {
     fn drop(&mut self) {
         if self.charged != 0 {
-            crate::value::ob_charge(-self.charged);
+            crate::value::ob_charge(-self.charged, 0);
         }
     }
 }
@@ -1485,7 +1498,6 @@ impl<'a> Interp<'a> {
             globals_synced: std::collections::HashSet::new(),
             dim_by_ref: false,
             foreach_by_ref: false,
-            in_unset: false,
             anon_class_names: HashMap::new(),
             anon_class_seq: 0,
             callable_probe_err: None,
@@ -1541,6 +1553,7 @@ impl<'a> Interp<'a> {
             live_io: false,
             decl_file_ctx: None,
             const_decl_ctx: None,
+            const_init_site: None,
             out_headers: Vec::new(),
             resp_code: 200,
             last_json_error: 0,
@@ -1803,8 +1816,12 @@ impl<'a> Interp<'a> {
         } else {
             None
         };
+        // Save the resolution line before the decl's own lines take over
+        // cur_line — a fail() mid-eval builds the pseudo-frame here.
+        let old_site = self.const_init_site.replace(self.cur_line);
         let r = self.eval_const(e);
         self.decl_file_ctx = old;
+        self.const_init_site = old_site;
         if decl_line > 0 {
             self.const_decl_ctx = old_ctx;
         }
@@ -3554,12 +3571,12 @@ impl<'a> Interp<'a> {
     /// — packed arrays cost 16B/slot + header, mixed HTs ~40B/slot
     /// (32B bucket + hash/data overhead; calibrated to oracle 'tried
     /// to allocate' reports, e.g. 1310720 = 32768*40).
-    pub(crate) fn ht_req(len: usize, mixed: bool) -> u64 {
+    pub(crate) fn ht_req(len: usize, packed: bool) -> u64 {
         let cap = (len.max(1) as u64).next_power_of_two().max(8);
-        if mixed {
-            cap * 40
-        } else {
+        if packed {
             cap * 16 + 8
+        } else {
+            cap * 40
         }
     }
 
@@ -3742,7 +3759,7 @@ impl<'a> Interp<'a> {
 
     /// Release charges whose owning Rc died — the efree counterpart
     /// of the tracked charges.
-    fn mem_sweep(&mut self) {
+    pub(crate) fn mem_sweep(&mut self) {
         let mut inner = 0u64;
         let mut huge = 0u64;
         self.mem_tracked.retain(|_, c| {
@@ -3872,28 +3889,6 @@ impl<'a> Interp<'a> {
         );
     }
 
-    /// Zend's emalloc charge for unowned bytes (emitted output):
-    /// counted 1:1 into the committed-chunk model so memory_limit
-    /// fires at the next statement boundary (bug45392).
-    pub fn mem_charge(&mut self, n: u64) {
-        if self.mem_tracked.len() >= self.mem_sweep_at {
-            self.mem_sweep();
-        }
-        let _ = self.mem_check(n);
-        self.mem_used += n;
-        self.mem_in_chunk += n;
-        while self.mem_in_chunk > self.mem_committed {
-            self.mem_committed += MM_CHUNK;
-        }
-        if self.mem_used > self.mem_peak {
-            self.mem_peak = self.mem_used;
-        }
-        let real = self.mem_real();
-        if real > self.mem_real_peak {
-            self.mem_real_peak = real;
-        }
-    }
-
     /// Reconcile then report the live usage — memory_get_usage()
     /// reads it straight, so sweep dead tracked allocs first.
     pub(crate) fn mem_reconcile(&mut self) -> u64 {
@@ -3925,9 +3920,8 @@ impl<'a> Interp<'a> {
     /// Byte-faithful emit — program output is bytes (echo of binary
     /// strings, file reads, preg results must not be UTF-8 validated).
     pub fn emit_bytes(&mut self, b: &[u8]) {
-        // memory_limit>0 turns into a deferred fatal once accumulated
-        // writes pass it (bug45392); checked at the next statement.
-        self.mem_charge(b.len() as u64);
+        // Emitted output is free — zend charges only ob-buffered
+        // bytes (the OB_LIVE arena charge in ObLevel::mem_sync).
         // Inside a generator run, output after a yield is deferred to
         // resume — `f(yield)` must not observe the call (nor its echo)
         // until the consumer advances past that yield.
@@ -5373,6 +5367,32 @@ impl<'a> Interp<'a> {
                 Self::gc_internal_prop(pname),
             );
         }
+        // ArrayIter's AoStore is zend's `intern->array` slot — a real
+        // counted hold of the object (raw edge), not a member zval.
+        // Without it a `=&`-bound store self-roots on its unaccounted
+        // clone and `$ao[0] =& $ao` never collects. `src` (the object an
+        // ArrayObject wraps) is the same kind of bare hold. Shared
+        // stores (getIterator siblings) contribute one edge each —
+        // reachability then keeps the array alive while any sharer is.
+        if let Some(crate::value::ObjectInternal::ArrayIter { store, .. }) = &ob.internal {
+            let st = store.borrow();
+            let v = Value::Array(st.arr.clone());
+            Self::gc_scan_held(&v, None, scan, out, depth - 1, visited, false);
+            if let Some(src) = &st.src {
+                let v = Value::Object(src.clone());
+                Self::gc_scan_held(&v, None, scan, out, depth - 1, visited, false);
+            }
+            return;
+        }
+        // A throwable's `previous` chain is a real member-zval hold —
+        // engine-chained Errors write the C-field without a prop
+        // mirror, so props alone don't cover the edge.
+        if let Some(crate::value::ObjectInternal::Exception { previous, .. }) = &ob.internal {
+            if let Some(v) = previous {
+                Self::gc_scan_held(v, None, scan, out, depth - 1, visited, false);
+            }
+            return;
+        }
         let Some(crate::value::ObjectInternal::Generator(st)) = &ob.internal else {
             return;
         };
@@ -6803,7 +6823,7 @@ impl<'a> Interp<'a> {
                     class: None,
                     ty: String::new(),
                     file: self.diag_file(),
-                    line: self.cur_line as u32,
+                    line: self.const_init_site.unwrap_or(self.cur_line) as u32,
                     args: Vec::new(),
                     named_args: Vec::new(),
                     internal: true,

@@ -101,6 +101,7 @@ fn apply_cb_pattern(
     let mut out: Vec<u8> = Vec::new();
     let mut last = 0usize;
     let mut n = 0i64;
+    let mut scratch: (Option<Rc<[u8]>>, usize) = (None, 0);
     let (caps, rc) = re.caps(cur, 0, true, None, it);
     if rc != 0 {
         it.last_preg_error = preg_rc_err(rc);
@@ -185,14 +186,69 @@ fn apply_cb_pattern(
                 break;
             }
         };
-        out.extend_from_slice(&r.to_php_bytes());
+        let rb = r.to_php_bytes();
+        // Same grow-on-demand scratch chain as the literal
+        // replacement path — zend doesn't care which branch filled
+        // the result string (preg_replace_callback fatals too).
+        preg_scratch_grow(it, &mut scratch, out.len() + rb.len())?;
+        out.extend_from_slice(&rb);
         last = *me;
     }
     if cb_failed {
         return Ok(None);
     }
     out.extend_from_slice(&cur[last..]);
+    preg_scratch_done(it, scratch, out.len())?;
     Ok(Some((out, n)))
+}
+
+/// Simulates one step of zend's preg result-string grow chain: when
+/// the needed length reaches the current alloc, zend ereallocs
+/// 2*needed — so memory_limit trips mid-chain on a smaller scratch
+/// figure than the final result. `scratch` is (dummy Rc, sim alloc).
+fn preg_scratch_grow(
+    it: &mut Interp,
+    scratch: &mut (Option<Rc<[u8]>>, usize),
+    new_len: usize,
+) -> Result<(), PhpError> {
+    if new_len >= scratch.1 {
+        scratch.1 = 2 * new_len;
+        let req = scratch.1 as u64 + 25;
+        let fresh: Rc<[u8]> = Rc::from(&b""[..]);
+        match &scratch.0 {
+            // erealloc — old run stays held until the grow commits.
+            Some(old) => it.mem_grow_str(old, &fresh, req),
+            None => it.mem_track(&fresh, req),
+        }
+        scratch.0 = Some(fresh);
+        // zend dies inside the first failed emalloc — later chain
+        // steps would overwrite mem_last with bigger reqs.
+        if it.mem_tripped() {
+            it.mem_exceeded = true;
+            return Err(it.oom_fatal());
+        }
+    }
+    Ok(())
+}
+
+/// After the last match zend reallocs the scratch to the exact final
+/// length, then the result's charge rebooks on the real Rc — retire
+/// the dummy so it isn't counted twice.
+fn preg_scratch_done(
+    it: &mut Interp,
+    scratch: (Option<Rc<[u8]>>, usize),
+    final_len: usize,
+) -> Result<(), PhpError> {
+    if let Some(old) = scratch.0 {
+        let prod: Rc<[u8]> = Rc::from(&b""[..]);
+        it.mem_grow_str(&old, &prod, final_len as u64 + 25);
+        if it.mem_tripped() {
+            it.mem_exceeded = true;
+            return Err(it.oom_fatal());
+        }
+        it.mem_retire(&prod);
+    }
+    Ok(())
 }
 
 /// Pattern element to string: Array warns, Object without __toString is Error.
@@ -823,8 +879,7 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                         // mid-chain on a smaller scratch figure, not the
                         // final result. Simulate the chain so the trip
                         // site and 'tried to allocate' figure match.
-                        let mut scratch: Option<Rc<[u8]>> = None;
-                        let mut sim_alloc = 0usize;
+                        let mut scratch: (Option<Rc<[u8]>>, usize) = (None, 0);
                         let (caps, rc) = re.caps(&src, 0, true, None, it);
                         if rc != 0 {
                             it.last_preg_error = preg_rc_err(rc);
@@ -898,45 +953,15 @@ fn preg_dispatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Ph
                             // zend's new_len = result_len + piece +
                             // expanded replacement — `out` already holds
                             // the piece, so new_len = out.len()+cleaned.
-                            let new_len = out.len() + cleaned.len();
-                            if new_len >= sim_alloc {
-                                sim_alloc = 2 * new_len;
-                                let req = sim_alloc as u64 + 25;
-                                let fresh: Rc<[u8]> = Rc::from(&b""[..]);
-                                match &scratch {
-                                    // erealloc — old run stays held
-                                    // until the grow commits.
-                                    Some(old) => it.mem_grow_str(old, &fresh, req),
-                                    None => it.mem_track(&fresh, req),
-                                }
-                                scratch = Some(fresh);
-                                // zend dies inside the first failed
-                                // emalloc — later chain steps would
-                                // overwrite mem_last with bigger reqs.
-                                if it.mem_tripped() {
-                                    it.mem_exceeded = true;
-                                    return Err(it.oom_fatal());
-                                }
-                            }
+                            preg_scratch_grow(it, &mut scratch, out.len() + cleaned.len())?;
                             out.extend_from_slice(&cleaned);
                             last = *b;
                         }
                         out.extend_from_slice(&src[last..]);
                         total += n;
-                        if let Some(old) = scratch.take() {
-                            // not_matched reallocs the scratch to the
-                            // exact final length.
-                            let prod: Rc<[u8]> = Rc::from(&b""[..]);
-                            it.mem_grow_str(&old, &prod, out.len() as u64 + 25);
-                            if it.mem_tripped() {
-                                it.mem_exceeded = true;
-                                return Err(it.oom_fatal());
-                            }
-                            // the result's charge rebooks on the real
-                            // Rc at conversion — retire the dummy so
-                            // it isn't counted twice.
-                            it.mem_retire(&prod);
-                        }
+                        // not_matched reallocs the scratch to the exact
+                        // final length.
+                        preg_scratch_done(it, scratch, out.len())?;
                         cur = out;
                     }
                 }
@@ -1271,8 +1296,18 @@ impl PhpRe {
                 // to preg error codes.
                 let known_valid = r.utf8
                     && subj_rc.as_ref().is_some_and(|rc| {
-                        it.valid_utf8
-                            .contains_key(&(Rc::as_ptr(&rc.rc) as *const u8 as usize))
+                        let ptr = Rc::as_ptr(&rc.rc) as *const u8 as usize;
+                        match it.valid_utf8.get(&ptr) {
+                            // Dead storage: evict and re-validate — a
+                            // recycled pointer must never skip the
+                            // check on another string's word.
+                            Some(w) if w.upgrade().is_none() => {
+                                it.valid_utf8.remove(&ptr);
+                                false
+                            }
+                            Some(_) => true,
+                            None => false,
+                        }
                     })
                     && (offset == s.len() || (s[offset] & 0xC0) != 0x80);
                 let (v, e) = r.match_all(
@@ -1294,8 +1329,10 @@ impl PhpRe {
                 // valid — later calls skip re-validation entirely.
                 if r.utf8 && e == 0 && offset == 0 && !known_valid {
                     if let Some(rc) = subj_rc {
-                        it.valid_utf8
-                            .insert(Rc::as_ptr(&rc.rc) as *const u8 as usize, rc.rc.clone());
+                        it.valid_utf8.insert(
+                            Rc::as_ptr(&rc.rc) as *const u8 as usize,
+                            Rc::downgrade(&rc.rc),
+                        );
                     }
                 }
                 (

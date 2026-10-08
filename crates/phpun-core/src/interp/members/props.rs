@@ -1115,6 +1115,72 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// The canonical prop key a serialized prop name resolves to, or
+    /// None when it stays a verbatim dynamic prop — zend's unserialize
+    /// writes straight into the props hash for a mangled declared name,
+    /// and `is_property_visibility_changed` resolves bare, `\0*\0`, and
+    /// own-class-mangled names through `properties_info[plain]` (a
+    /// subclass redeclaring the prop shadows the ancestor's decl).
+    /// phpun's canonical key mirrors zend's: plain for
+    /// public/protected, `\0DeclaringClass\0name` for private.
+    pub fn unserial_resolve_key(&self, o: &Rc<RefCell<PhpObject>>, key: &[u8]) -> Option<String> {
+        let (scope, name): (Option<&[u8]>, &[u8]) = if key.starts_with(&[0u8][..]) && key.len() > 2
+        {
+            let r = &key[1..];
+            let z = r.iter().position(|b| *b == 0)?;
+            (Some(&r[..z]), &r[z + 1..])
+        } else {
+            (None, key)
+        };
+        if name.is_empty() {
+            return None;
+        }
+        let name_s = String::from_utf8_lossy(name).into_owned();
+        let cls = o.borrow().class.clone();
+        if let Some(sc) = scope {
+            if sc != b"*" {
+                // An exact `\0Scope\0name` hits the props hash's
+                // INDIRECT entry: a class `sc` in the object's
+                // ancestry declaring `name` private. The scope match
+                // is case-SENSITIVE — a wrong-case ancestor name
+                // (`\0exception\0previous`) stays a verbatim dynamic
+                // prop, while a wrong-case OWN class still resolves
+                // through the bare-name path below.
+                let mut cur = Some(cls.clone());
+                while let Some(c) = cur {
+                    if c.name().as_bytes() == sc {
+                        if let Some(pd) = c
+                            .decl
+                            .props
+                            .iter()
+                            .find(|p| p.name == name_s && !p.is_static)
+                        {
+                            if pd.visibility == crate::ast::Visibility::Private {
+                                return Some(format!("\0{}\0{}", c.name(), pd.name));
+                            }
+                        }
+                        break;
+                    }
+                    cur = c
+                        .decl
+                        .parent
+                        .as_ref()
+                        .and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
+                }
+                // zend's visibility resolution only applies to the
+                // object's own class (and `*`, handled above).
+                if !sc.eq_ignore_ascii_case(cls.name().as_bytes()) {
+                    return None;
+                }
+            }
+        }
+        self.find_prop_decl(&cls, &name_s)
+            .map(|(pd, dcls)| match pd.visibility {
+                crate::ast::Visibility::Private => format!("\0{}\0{}", dcls.name(), pd.name),
+                _ => pd.name,
+            })
+    }
+
     /// `parent::$prop::get()/set()` inside a hook — runs the parent
     /// class's hook for the same prop+kind, or reads/writes the
     /// parent's plain prop (parent_property_hook tests).
@@ -1628,7 +1694,19 @@ impl<'a> Interp<'a> {
         self.last_prop_ov = None;
         let pn = self.prop_name(name)?;
         let ov = if Self::is_cv(obj_u) {
-            self.eval_cv_at(obj_u, member_end)?
+            // zend's _W prop fetch resolves an undef CV container to
+            // null SILENTLY — the 'Undefined variable' warn belongs to
+            // the enclosing op's own warn_undef gate, not this fetch
+            // (`$u->a->b = v`, `$u->a->a += v` warn at most once).
+            self.cur_line = member_end;
+            self.send_line = Some(member_end);
+            match obj_u {
+                Expr::Var(n) => self
+                    .var_lookup(n)
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null),
+                _ => self.eval(obj_u)?,
+            }
         } else {
             self.eval_lvalue_obj(obj)?
         };
@@ -1740,24 +1818,20 @@ impl<'a> Interp<'a> {
                         // then target it (`$foo->bar->baz = 42`), and
                         // dim/compound ops on the slot itself hit the
                         // object's own errors, not 'indirectly modify'.
-                        if !self.in_unset {
-                            if let Some(sv) = pd.set_vis {
-                                if !self.hook_scope_allows(&o, &dcls, &pn, sv) {
-                                    let dk = if pd.visibility == crate::ast::Visibility::Private {
-                                        format!("\0{}\0{}", dcls.name(), pd.name)
-                                    } else {
-                                        pd.name.clone()
-                                    };
-                                    let held = o.borrow().props.get(&dk).cloned();
-                                    return match held {
-                                        Some(c) if matches!(&*c.borrow(), Value::Object(_)) => {
-                                            Ok(cell(c.borrow().clone()))
-                                        }
-                                        _ => {
-                                            self.set_visibility_indirect_error(&dcls, &pd.name, sv)
-                                        }
-                                    };
-                                }
+                        if let Some(sv) = pd.set_vis {
+                            if !self.hook_scope_allows(&o, &dcls, &pn, sv) {
+                                let dk = if pd.visibility == crate::ast::Visibility::Private {
+                                    format!("\0{}\0{}", dcls.name(), pd.name)
+                                } else {
+                                    pd.name.clone()
+                                };
+                                let held = o.borrow().props.get(&dk).cloned();
+                                return match held {
+                                    Some(c) if matches!(&*c.borrow(), Value::Object(_)) => {
+                                        Ok(cell(c.borrow().clone()))
+                                    }
+                                    _ => self.set_visibility_indirect_error(&dcls, &pd.name, sv),
+                                };
                             }
                         }
                     }
