@@ -2246,6 +2246,11 @@ pub struct AoStore {
     /// storage hash. For a self-backed object (ctor arg `$this`) this
     /// is the object itself and flag bit 0x1000000 is set on `flags`.
     pub src: Option<Rc<RefCell<PhpObject>>>,
+    /// Storage-identity generation — bumped when `arr` is swapped or
+    /// replaced in place (`exchangeArray`), so a slot fetched before a
+    /// handler ran can tell its table from the dead one zend would
+    /// have written into.
+    pub gen: u64,
 }
 
 pub enum ObjectInternal {

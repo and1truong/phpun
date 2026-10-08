@@ -552,7 +552,11 @@ pub struct Interp<'a> {
     /// (offsetGet's own throw or its missing-key warn's handler) —
     /// zend's assign op keeps running with EG(exception) pending, so
     /// the write still lands before the throwable surfaces at op end.
-    dim_throw: Option<PhpError>,
+    /// `(thrown value, error, live)`: the value rides the pair so a
+    /// `?`-exit can't strand it in `pending_exception`; `live` marks a
+    /// defer from the write op's own last-dim read — anything earlier
+    /// means zend's opcode-boundary check already killed the write.
+    dim_throw: Option<(crate::value::Value, PhpError, bool)>,
     /// `++`/`--` overflow context while the pending dim write stores:
     /// a ref held by a typed-int prop reports `Cannot
     /// increment/decrement a reference held by property ... past its

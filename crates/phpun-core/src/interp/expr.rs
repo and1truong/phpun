@@ -2562,12 +2562,22 @@ impl<'a> Interp<'a> {
                             }
                         }
                         match &late {
-                            Late::Keyed { base, keys } => {
-                                self.compound_dim_read(base.clone(), keys, $quiet, $det.as_ref())?
-                            }
+                            Late::Keyed { base, keys } => self.compound_dim_read(
+                                base.clone(),
+                                keys,
+                                $quiet,
+                                $det.as_ref(),
+                                false,
+                            )?,
                             Late::Index { base, key, .. } => {
                                 let keys = [DimArg::from(key.clone())];
-                                self.compound_dim_read(base.clone(), &keys, $quiet, $det.as_ref())?
+                                self.compound_dim_read(
+                                    base.clone(),
+                                    &keys,
+                                    $quiet,
+                                    $det.as_ref(),
+                                    false,
+                                )?
                             }
                             // Prop targets read through the CACHED object
                             // (evaluated once, above) — re-evaluating
@@ -2990,6 +3000,13 @@ impl<'a> Interp<'a> {
             }
             v => v,
         };
+        // A throwable deferred from an intermediate dim fetch killed the
+        // whole write opcode — zend checks EG(exception) at the opcode
+        // boundary. A defer from the write op's own last-dim read leaves
+        // the write live: only the userland dispatch is suppressed.
+        if self.dim_throw.as_ref().is_some_and(|(_, _, live)| !*live) {
+            return self.dim_raise(newv);
+        }
         match late {
             Late::Prop { ov, name } => {
                 let pn = match name {
@@ -3023,13 +3040,25 @@ impl<'a> Interp<'a> {
                         .as_ref()
                         .map(|kc| kc.borrow().clone())
                         .unwrap_or_else(|| newv.clone());
-                    match self.method_invoke(
-                        o,
-                        "offsetSet",
-                        CallArgs::positional(vec![cell(kv), cell(newv.clone())]),
-                    ) {
-                        Ok(_) => {}
-                        Err(e) => return Err(e),
+                    // A pending throwable kills the userland
+                    // zend_call_method — spl's own write_dimension
+                    // (native stub) still lands; its own throw loses
+                    // to the already-pending first one (zend keeps
+                    // the earliest EG(exception)).
+                    if self.dim_throw.is_none() || self.is_native_offsetset(&o) {
+                        match self.method_invoke(
+                            o,
+                            "offsetSet",
+                            CallArgs::positional(vec![cell(kv), cell(newv.clone())]),
+                        ) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                if self.dim_throw.is_some() {
+                                    return self.dim_raise(newv);
+                                }
+                                return Err(e);
+                            }
+                        }
                     }
                     return self.dim_raise(newv);
                 }
@@ -4459,10 +4488,17 @@ impl<'a> Interp<'a> {
 
     /// Op-end drain for a deferred dim-fetch throwable — zend checks
     /// EG(exception) once the op's write has landed, so a pending
-    /// dim_throw outranks the op's own result value.
+    /// dim_throw outranks the op's own result value. The thrown value
+    /// rode the pair so `pending_exception` is whole again the moment
+    /// the throwable actually raises.
     fn dim_raise<T>(&mut self, v: T) -> Result<T, PhpError> {
         match self.dim_throw.take() {
-            Some(e) => Err(e),
+            Some((tv, e, _)) => {
+                if e.kind == ErrorKind::Throw {
+                    self.pending_exception = Some(tv);
+                }
+                Err(e)
+            }
             None => Ok(v),
         }
     }
@@ -5753,14 +5789,28 @@ impl<'a> Interp<'a> {
                         Some((e, s)) => self.eval_cv_at(e, s)?,
                         None => v,
                     };
-                    match self.method_invoke(
-                        o,
-                        "offsetSet",
-                        CallArgs::positional(vec![cell(kval), cell(v.clone())]),
-                    ) {
-                        Ok(_) => return Ok(v),
-                        Err(e) => return Err(e),
+                    // A pending throwable kills the userland
+                    // zend_call_method — spl's own write_dimension
+                    // (native stub) still lands.
+                    if self.dim_throw.is_none() || self.is_native_offsetset(&o) {
+                        match self.method_invoke(
+                            o,
+                            "offsetSet",
+                            CallArgs::positional(vec![cell(kval), cell(v.clone())]),
+                        ) {
+                            Ok(_) => return Ok(v),
+                            Err(e) => {
+                                // Under a pending throwable the first
+                                // EG(exception) wins — the write's own
+                                // throw is suppressed.
+                                if self.dim_throw.is_some() {
+                                    return Ok(v);
+                                }
+                                return Err(e);
+                            }
+                        }
                     }
+                    return Ok(v);
                 }
                 // Internal spl storage (ArrayObject & friends) hands back
                 // the real bucket cell — writes through it reach the
@@ -5783,8 +5833,12 @@ impl<'a> Interp<'a> {
                 // read_dimension zend runs: a `&offsetGet` hands the
                 // real storage cell back (writes through it reach the
                 // object); a value return yields a throwaway cell and
-                // notices only when it isn't an object.
-                c = self.index_cell_object(&c, k.clone())?;
+                // notices only when it isn't an object. A pending
+                // throwable kills the dispatch — zend reused the cell
+                // its own fetch left.
+                if self.dim_throw.is_none() {
+                    c = self.index_cell_object(&c, k.clone())?;
+                }
                 continue;
             }
             // OP_DATA belongs to the last dim — intermediate levels
@@ -6121,12 +6175,16 @@ impl<'a> Interp<'a> {
     /// whose write will throw (scalar, string, plain object, illegal
     /// key) yields Null silently — the error comes from the write path
     /// instead (bug29893). `quiet` is `??=`'s isset-style read.
+    /// `viv_last`: `++`/`--` fetch the last dim read-write — zend
+    /// materializes its miss bucket like an intermediate level's
+    /// (assign ops leave the last-dim slot to the write).
     fn compound_dim_read(
         &mut self,
         mut c: Cell,
         keys: &[DimArg],
         quiet: bool,
         det: Option<&DimDetach>,
+        viv_last: bool,
     ) -> Result<Value, PhpError> {
         // Hold the op-start container for the traversal — zend's
         // sentinel refcount-adds it across each diagnostic, so a
@@ -6321,23 +6379,74 @@ impl<'a> Interp<'a> {
                                 return Ok(Value::Null);
                             }
                         }
+                        // Op-start storage identity — a thrown handler
+                        // may have swapped the table underneath; zend's
+                        // read_dimension materializes the miss bucket
+                        // onto the table it actually fetched.
+                        let storage = if spl_iter {
+                            Some(self.ao_storage_id(&o))
+                        } else {
+                            None
+                        };
                         let iv = if let Some(kc) = k {
                             let kv = kc.borrow().clone();
                             match self.method_invoke(
-                                o,
+                                o.clone(),
                                 "offsetGet",
-                                CallArgs::positional(vec![cell(kv)]),
+                                CallArgs::positional(vec![cell(kv.clone())]),
                             ) {
                                 Ok(v) => v,
-                                // A compound op's throwing offsetGet leaves
-                                // zend's write to run — EG(exception) is
-                                // checked at op end, so the throwable defers
-                                // to dim_raise while the read yields Null.
-                                // `??=`'s isset read can't decide without
-                                // the value — its exception propagates now.
+                                // A compound op's throwing offsetGet
+                                // defers: EG(exception) is checked at
+                                // the opcode boundary, so the rest of
+                                // this fetch goes silent, remaining
+                                // dims are skipped, and the thrown
+                                // value rides the pair until dim_raise
+                                // restores pending_exception. spl's
+                                // native read still materializes the
+                                // miss bucket mechanically — onto the
+                                // pre-throw table only (a handler-side
+                                // swap leaves it dead; zend writes
+                                // there anyway, so skip). `??=`'s isset
+                                // read can't decide without the value —
+                                // its exception propagates now.
                                 Err(e) if !quiet && matches!(e.kind, ErrorKind::Throw) => {
-                                    self.dim_throw = Some(e);
-                                    Value::Null
+                                    let tv = self.pending_exception.take().unwrap_or(Value::Null);
+                                    let live = n + 1 == keys.len();
+                                    if (!live || viv_last)
+                                        && spl_iter
+                                        && self.is_native_offsetget(&o)
+                                        // zend creates the bucket only
+                                        // after the dim converted — an
+                                        // illegal key dies at conversion.
+                                        && Self::illegal_offset_ty(&kv).is_none()
+                                        && storage.is_some_and(|id| self.ao_storage_id(&o) == id)
+                                    {
+                                        // Conversion diagnostics ran
+                                        // inside offsetGet's own arg
+                                        // handling — re-key silently.
+                                        let was = std::mem::replace(&mut self.detached_dim, true);
+                                        let ak = self
+                                            .ao_dim_key(&o, &kv)
+                                            .unwrap_or_else(|_| to_key(&kv));
+                                        self.detached_dim = was;
+                                        let arr = self.ao_arr(&o);
+                                        match self.ao_src_obj(&o) {
+                                            Some(src) => self.ao_obj_dim_write(
+                                                &o,
+                                                &src,
+                                                &arr,
+                                                ak,
+                                                Value::Null,
+                                            ),
+                                            None => {
+                                                arr.borrow_mut().bind_cell(ak, cell(Value::Null));
+                                            }
+                                        }
+                                    }
+                                    self.dim_throw = Some((tv, e, live));
+                                    c = cell(Value::Null);
+                                    break;
                                 }
                                 Err(e) => return Err(e),
                             }
@@ -7284,6 +7393,14 @@ impl<'a> Interp<'a> {
     /// override takes the engine-call path instead.
     fn is_native_offsetget(&mut self, o: &Rc<RefCell<PhpObject>>) -> bool {
         self.find_method_in(&o.borrow().class, "offsetGet")
+            .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
+            .unwrap_or(true)
+    }
+
+    /// Native-stub spl offsetSet — a deferred throwable suppresses
+    /// userland zend_call_method but not zend's own write_dimension.
+    fn is_native_offsetset(&mut self, o: &Rc<RefCell<PhpObject>>) -> bool {
+        self.find_method_in(&o.borrow().class, "offsetSet")
             .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
             .unwrap_or(true)
     }
@@ -8967,7 +9084,7 @@ impl<'a> Interp<'a> {
                 None => keys.push(DimArg::Append),
             }
         }
-        let old = self.compound_dim_read(arr_cell.clone(), &keys, false, Some(&det))?;
+        let old = self.compound_dim_read(arr_cell.clone(), &keys, false, Some(&det), true)?;
         let new = self.incdec_value(&old, delta)?;
         // int-boundary overflow writes a float back — zend words the
         // typed-ref rejection `Cannot increment/decrement a reference
@@ -8993,7 +9110,14 @@ impl<'a> Interp<'a> {
             arr_cell
         };
         let was = std::mem::replace(&mut self.detached_dim, detached);
-        let r = self.assign_index_path(target, &keys, new.clone(), true, Some(&det), None);
+        // INC_DIM's store-write dies under a pending throwable — the
+        // slot the read side materialized stays NULL (oracle), so no
+        // write may run.
+        let r = if self.dim_throw.is_none() {
+            self.assign_index_path(target, &keys, new.clone(), true, Some(&det), None)
+        } else {
+            Ok(Value::Null)
+        };
         self.detached_dim = was;
         self.incdec_ref_ctx = saved_ctx;
         r?;
@@ -9024,6 +9148,10 @@ impl<'a> Interp<'a> {
         let r = if native {
             (|| -> Result<Value, PhpError> {
                 let arr = self.ao_arr(&o);
+                // Storage identity at fetch time — zend materializes
+                // the miss bucket onto the table it read, so a
+                // handler-side swap leaves the write on dead storage.
+                let id = self.ao_storage_id(&o);
                 let ak = self.ao_dim_key(&o, key.as_ref().unwrap())?;
                 if let Some(e) = self.ao_sorting_err(&o) {
                     return self.fail(e);
@@ -9040,15 +9168,21 @@ impl<'a> Interp<'a> {
                 // before the warn's error propagates — a handler that
                 // wrote the key is still overwritten by the NULL.
                 let w = self.list_missing_key(&ak);
-                match self.ao_src_obj(&o) {
-                    Some(src) => {
-                        self.ao_obj_dim_write(&o, &src, &arr, ak.clone(), Value::Null);
+                if self.ao_storage_id(&o) == id {
+                    match self.ao_src_obj(&o) {
+                        Some(src) => {
+                            self.ao_obj_dim_write(&o, &src, &arr, ak.clone(), Value::Null);
+                        }
+                        None => {
+                            arr.borrow_mut().bind_cell(ak.clone(), cell(Value::Null));
+                        }
                     }
-                    None => {
-                        arr.borrow_mut().bind_cell(ak.clone(), cell(Value::Null));
-                    }
+                    self.last_ret_cell = arr.borrow().get_cell(&ak);
+                } else {
+                    // The fetched table died — zend's bucket went with
+                    // it; the write-through only needs a scratch cell.
+                    self.last_ret_cell = Some(cell(Value::Null));
                 }
-                self.last_ret_cell = arr.borrow().get_cell(&ak);
                 w?;
                 Ok(Value::Null)
             })()
