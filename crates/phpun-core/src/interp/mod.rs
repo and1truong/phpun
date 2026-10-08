@@ -4803,6 +4803,15 @@ impl<'a> Interp<'a> {
             }
             return;
         }
+        // A throwable's `previous` chain is a real member-zval hold —
+        // engine-chained Errors write the C-field without a prop
+        // mirror, so props alone don't cover the edge.
+        if let Some(crate::value::ObjectInternal::Exception { previous, .. }) = &ob.internal {
+            if let Some(v) = previous {
+                Self::gc_scan_held(v, None, scan, out, depth - 1, visited, false);
+            }
+            return;
+        }
         let Some(crate::value::ObjectInternal::Generator(st)) = &ob.internal else {
             return;
         };

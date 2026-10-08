@@ -1134,14 +1134,19 @@ impl<'a> Interp<'a> {
             return None;
         }
         let name_s = String::from_utf8_lossy(name).into_owned();
+        let cls = o.borrow().class.clone();
         if let Some(sc) = scope {
             if sc != b"*" {
                 // An exact `\0Scope\0name` hits the props hash's
                 // INDIRECT entry: a class `sc` in the object's
-                // ancestry declaring `name` private.
-                let mut cur = Some(o.borrow().class.clone());
+                // ancestry declaring `name` private. The scope match
+                // is case-SENSITIVE — a wrong-case ancestor name
+                // (`\0exception\0previous`) stays a verbatim dynamic
+                // prop, while a wrong-case OWN class still resolves
+                // through the bare-name path below.
+                let mut cur = Some(cls.clone());
                 while let Some(c) = cur {
-                    if c.name().as_bytes().eq_ignore_ascii_case(sc) {
+                    if c.name().as_bytes() == sc {
                         if let Some(pd) = c
                             .decl
                             .props
@@ -1162,12 +1167,12 @@ impl<'a> Interp<'a> {
                 }
                 // zend's visibility resolution only applies to the
                 // object's own class (and `*`, handled above).
-                if !sc.eq_ignore_ascii_case(o.borrow().class.name().as_bytes()) {
+                if !sc.eq_ignore_ascii_case(cls.name().as_bytes()) {
                     return None;
                 }
             }
         }
-        self.find_prop_decl(&o.borrow().class, &name_s)
+        self.find_prop_decl(&cls, &name_s)
             .map(|(pd, dcls)| match pd.visibility {
                 crate::ast::Visibility::Private => format!("\0{}\0{}", dcls.name(), pd.name),
                 _ => pd.name,

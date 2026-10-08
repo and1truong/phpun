@@ -1332,19 +1332,12 @@ pub(crate) fn php_unserialize(
             // every prop-key form resolving to the base's declared
             // private `previous` into that C-field, enforcing
             // `?Throwable` (see unserial_resolve_key).
-            let prev_slot = format!(
-                "\0{}\0previous",
-                if it.obj_implements(&obj, "error") {
-                    "Error"
-                } else {
-                    "Exception"
-                }
-            );
             let prev_base = if it.obj_implements(&obj, "error") {
                 "Error"
             } else {
                 "Exception"
             };
+            let prev_slot = format!("\0{}\0previous", prev_base);
             for _ in 0..n {
                 let k = php_unserialize_key(s, pos)?;
                 // `i:` prop keys land as plain string-name props —
@@ -1393,31 +1386,48 @@ pub(crate) fn php_unserialize(
                 // declared-prop name (mangled or plain) before writing —
                 // mismatched scopes stay verbatim dynamic props.
                 let canon = it.unserial_resolve_key(&obj, ks.as_ref());
-                let mut ob = obj.borrow_mut();
-                if let Some(crate::value::ObjectInternal::Exception { previous, .. }) =
-                    &mut ob.internal
-                {
-                    if canon.as_deref() == Some(prev_slot.as_str()) {
-                        match &*v.borrow() {
-                            Value::Null => *previous = None,
-                            Value::Object(o) if it.obj_implements(o, "throwable") => {
-                                *previous = Some(Value::Object(o.clone()))
-                            }
-                            _ => {
-                                let tn = it.zval_type_name(&v.borrow());
-                                let mut e = PhpError::uncaught(
-                                    "TypeError",
-                                    format!(
-                                        "Cannot assign {} to property {}::$previous of type ?Throwable",
-                                        tn, prev_base
-                                    ),
-                                    it.cur_line,
-                                );
-                                e.thrown_line = Some(it.cur_line);
-                                *err = Some(e);
-                                return Err(());
-                            }
+                // A `previous` payload is classified BEFORE borrow_mut:
+                // an r:/R: backref to this very object makes
+                // obj_implements' o.borrow() panic under the mut borrow.
+                let prev = if canon.as_deref() == Some(prev_slot.as_str()) {
+                    match &*v.borrow() {
+                        Value::Null => Some(None),
+                        Value::Object(o) if it.obj_implements(o, "throwable") => {
+                            Some(Some(Value::Object(o.clone())))
                         }
+                        _ => {
+                            let tn = it.zval_type_name(&v.borrow());
+                            let mut e = PhpError::uncaught(
+                                "TypeError",
+                                format!(
+                                    "Cannot assign {} to property {}::$previous of type ?Throwable",
+                                    tn, prev_base
+                                ),
+                                it.cur_line,
+                            );
+                            e.thrown_line = Some(it.cur_line);
+                            *err = Some(e);
+                            return Err(());
+                        }
+                    }
+                } else {
+                    None
+                };
+                let mut ob = obj.borrow_mut();
+                if let Some(p) = prev {
+                    if let Some(crate::value::ObjectInternal::Exception { previous, .. }) =
+                        &mut ob.internal
+                    {
+                        *previous = p;
+                        // Mirror into the canonical slot too — zend's
+                        // prop table holds the unwrapped value (a
+                        // reference payload unwraps), so serialize and
+                        // (array) keep the chain.
+                        let m = cell(previous.clone().unwrap_or(Value::Null));
+                        if !ob.prop_order.contains(&prev_slot) {
+                            ob.prop_order.push(prev_slot.clone());
+                        }
+                        ob.props.insert(prev_slot.clone(), m);
                         continue;
                     }
                 }
