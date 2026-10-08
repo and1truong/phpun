@@ -2792,9 +2792,9 @@ impl<'a> Interp<'a> {
                                     let old = arr.borrow_mut().bind_cell(ak, src);
                                     if !had {
                                         let req = {
-                                        let b = arr.borrow();
-                                        Self::ht_req(b.entries.len(), b.mixed)
-                                    };
+                                            let b = arr.borrow();
+                                            Self::ht_req(b.entries.len(), b.mixed)
+                                        };
                                         self.mem_realloc(&arr, req);
                                     }
                                     return self.destruct_displaced(old);
@@ -2943,7 +2943,7 @@ impl<'a> Interp<'a> {
                         drop(ob);
                         if old.is_none() {
                             // zend: a new dynamic-prop bucket allocs.
-                            self.mem_track(o, 32);
+                            self.mem_track(o, OBJ_SLOT_REQ);
                         }
                         self.destruct_displaced(old)?;
                         if let (Some(m), Some((_, dcls))) = (merged, self.decl_prop(o, &pn)) {
@@ -3792,7 +3792,7 @@ impl<'a> Interp<'a> {
                         ob.props.insert(k, cell(v.clone()));
                         drop(ob);
                         // zend: a new declared-slot materialization allocs.
-                        self.mem_track(&o, 32);
+                        self.mem_track(&o, OBJ_SLOT_REQ);
                     }
                     Ok(v)
                 } else if self.find_method_in(&cls, "__set").is_some()
@@ -3857,7 +3857,7 @@ impl<'a> Interp<'a> {
                     drop(ob);
                     if is_new {
                         // zend: a new dynamic-prop bucket allocs.
-                        self.mem_track(&o, 32);
+                        self.mem_track(&o, OBJ_SLOT_REQ);
                     }
                     Ok(v)
                 }

@@ -230,6 +230,9 @@ const MM_BASE_USED: u64 = 463_136;
 /// usage figure. Calibrated to the oracle boundary: a fresh ~1.43MB
 /// string still fits the first chunk, ~1.45MB forces a new one.
 const MM_BASE_CHUNK: u64 = 655_360;
+/// emalloc request for a new dynamic-property bucket in an object's
+/// slot table.
+pub(crate) const OBJ_SLOT_REQ: u64 = 32;
 
 /// `static` decl site registry: fn-statics key → var name → set of
 /// (compile-unit serial, decl-origin anchor, stmt line). See
@@ -3516,13 +3519,12 @@ impl<'a> Interp<'a> {
         // Crossing a commit boundary — reclaim dead charges first
         // (zend frees blocks at efree; the Weak probes catch up here
         // so a just-died large alloc never trips the limit).
-        if (req > MM_MAX_LARGE && self.mem_real().saturating_add(Self::mem_fp(req)) > limit)
+        if ((req > MM_MAX_LARGE && self.mem_real().saturating_add(Self::mem_fp(req)) > limit)
             || (req <= MM_MAX_LARGE
-                && self.mem_in_chunk.saturating_add(Self::mem_fp(req)) > self.mem_committed)
+                && self.mem_in_chunk.saturating_add(Self::mem_fp(req)) > self.mem_committed))
+            && !self.mem_tracked.is_empty()
         {
-            if !self.mem_tracked.is_empty() {
-                self.mem_sweep();
-            }
+            self.mem_sweep();
         }
         let report = if req > MM_MAX_LARGE {
             if self.mem_real().saturating_add(Self::mem_fp(req)) > limit {
@@ -3593,8 +3595,7 @@ impl<'a> Interp<'a> {
                     // release the stale charge, then re-register.
                     self.mem_in_chunk = self.mem_in_chunk.saturating_sub(e.get().inner);
                     self.mem_huge = self.mem_huge.saturating_sub(e.get().huge);
-                    self.mem_used =
-                        self.mem_used.saturating_sub(e.get().inner + e.get().huge);
+                    self.mem_used = self.mem_used.saturating_sub(e.get().inner + e.get().huge);
                     let c = e.get_mut();
                     c.inner = 0;
                     c.huge = 0;

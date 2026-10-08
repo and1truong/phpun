@@ -116,6 +116,18 @@ fn opt_arg(args: &[String], i: usize) -> Result<(String, usize), ()> {
     }
 }
 
+/// opt_arg at argv `*i` — None on the getopt `no argument for
+/// option X` error (caller emits it, naming its own flag).
+fn want_opt(args: &[String], i: &mut usize) -> Option<String> {
+    match opt_arg(args, *i) {
+        Ok((v, n)) => {
+            *i += n;
+            Some(v)
+        }
+        Err(()) => None,
+    }
+}
+
 /// `phpun [-d k=v]* [-n] [-c PATH] [-q] [-f] <file.php> [args...]`
 /// `phpun [-d k=v]* [-n] -r <code> [args...]`
 ///
@@ -209,12 +221,8 @@ fn run_script(args: &[String]) -> ExitCode {
                 return opt_unimpl(&a)
             }
             _ if a.starts_with("-r") => {
-                let v = match opt_arg(args, i) {
-                    Ok((v, n)) => {
-                        i += n;
-                        v
-                    }
-                    Err(()) => return opt_err(i + 1, 2, "no argument for option r".to_string()),
+                let Some(v) = want_opt(args, &mut i) else {
+                    return opt_err(i + 1, 2, "no argument for option r".to_string());
                 };
                 if code.is_some() {
                     println!("You can use -r only once.");
@@ -223,12 +231,8 @@ fn run_script(args: &[String]) -> ExitCode {
                 code = Some(v);
             }
             _ if a.starts_with("-f") => {
-                let v = match opt_arg(args, i) {
-                    Ok((v, n)) => {
-                        i += n;
-                        v
-                    }
-                    Err(()) => return opt_err(i + 1, 2, "no argument for option f".to_string()),
+                let Some(v) = want_opt(args, &mut i) else {
+                    return opt_err(i + 1, 2, "no argument for option f".to_string());
                 };
                 if code.is_some() {
                     println!("Either execute direct code, process stdin or use a file.");
@@ -240,22 +244,18 @@ fn run_script(args: &[String]) -> ExitCode {
                 }
                 file = Some(v);
             }
-            _ if a.starts_with("-d") => match opt_arg(args, i) {
-                Ok((v, n)) => {
-                    ini.push(v);
-                    i += n;
-                }
-                Err(()) => {
+            _ if a.starts_with("-d") => {
+                let Some(v) = want_opt(args, &mut i) else {
                     return opt_err(i + 1, 2, "no argument for option d".to_string());
-                }
-            },
+                };
+                ini.push(v);
+            }
             // `-c`/`--php-ini` points at an ini path — ignored.
-            _ if a.starts_with("-c") => match opt_arg(args, i) {
-                Ok((_, n)) => i += n,
-                Err(()) => {
+            _ if a.starts_with("-c") => {
+                if want_opt(args, &mut i).is_none() {
                     return opt_err(i + 1, 2, "no argument for option c".to_string());
                 }
-            },
+            }
             _ => {
                 return opt_err(i + 1, 2, format!("option not found {}", &a[1..2]));
             }

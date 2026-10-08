@@ -5689,57 +5689,44 @@ fn iconv_decode_u16(bytes: &[u8], le: bool, ucs2: bool) -> (Vec<u32>, usize, boo
     (cps, i, invalid)
 }
 
+/// Lead-byte ranges (lo, hi, sequence length) per CJK encoding.
+fn cjk_lead(enc: &str) -> &'static [(u8, u8, u8)] {
+    match enc {
+        "SJIS" | "SHIFTJIS" | "SHIFTJISX0213" => &[
+            (0x00, 0x7F, 1),
+            (0xA1, 0xDF, 1),
+            (0x81, 0x9F, 2),
+            (0xE0, 0xFC, 2),
+        ],
+        "EUCCN" | "GB2312" => &[(0x00, 0x7F, 1), (0xA1, 0xFE, 2)],
+        "GBK" | "EUCKR" | "BIG5" | "BIG5HKSCS" => &[(0x00, 0x7F, 1), (0x81, 0xFE, 2)],
+        "EUCJP" | "EUCJISX0213" => &[
+            (0x00, 0x7F, 1),
+            (0x8E, 0x8E, 2),
+            (0x8F, 0x8F, 3),
+            (0xA1, 0xFE, 2),
+        ],
+        "EUCTW" => &[(0x00, 0x7F, 1), (0x8E, 0x8E, 4), (0xA1, 0xFE, 2)],
+        _ => &[(0x00, 0xFF, 1)],
+    }
+}
+
 /// Structural validity for the CJK multibyte encodings we carry no
 /// mapping tables for: walks each encoding's lead/trail byte rules
 /// so malformed input flags EILSEQ like glibc. Valid sequences
 /// still decode byte-wise (their code-point mapping is a known
 /// divergence); an incomplete tail stays pending for the next call.
 fn iconv_decode_structural(enc: &str, bytes: &[u8]) -> (Vec<u32>, usize, bool) {
+    let lead = cjk_lead(enc);
     let mut i = 0;
     let mut invalid = false;
     while i < bytes.len() {
         let b = bytes[i];
-        let len = match enc {
-            "SJIS" | "SHIFTJIS" | "SHIFTJISX0213" => match b {
-                0x00..=0x7F | 0xA1..=0xDF => 1,
-                0x81..=0x9F | 0xE0..=0xFC => 2,
-                _ => 0,
-            },
-            "EUCCN" | "GB2312" => match b {
-                0x00..=0x7F => 1,
-                0xA1..=0xFE => 2,
-                _ => 0,
-            },
-            "GBK" => match b {
-                0x00..=0x7F => 1,
-                0x81..=0xFE => 2,
-                _ => 0,
-            },
-            "EUCKR" => match b {
-                0x00..=0x7F => 1,
-                0x81..=0xFE => 2,
-                _ => 0,
-            },
-            "EUCJP" | "EUCJISX0213" => match b {
-                0x00..=0x7F => 1,
-                0x8E => 2,
-                0x8F => 3,
-                0xA1..=0xFE => 2,
-                _ => 0,
-            },
-            "EUCTW" => match b {
-                0x00..=0x7F => 1,
-                0x8E => 4,
-                0xA1..=0xFE => 2,
-                _ => 0,
-            },
-            "BIG5" | "BIG5HKSCS" => match b {
-                0x00..=0x7F => 1,
-                0x81..=0xFE => 2,
-                _ => 0,
-            },
-            _ => 1,
-        };
+        let len = lead
+            .iter()
+            .find(|(lo, hi, _)| (*lo..=*hi).contains(&b))
+            .map(|&(_, _, l)| l as usize)
+            .unwrap_or(0);
         if len == 0 {
             invalid = true;
             i += 1;
@@ -5852,6 +5839,9 @@ fn iconv_encode_narrow(cps: &[u32], limit: u32, translit: bool) -> Option<Vec<u8
 
 /// glibc iconv's //TRANSLIT approximations for the common cases;
 /// unmapped code points fall back to '?' in the caller.
+/// ponytail: only the latin ranges we observed in tests are mapped —
+/// the full glibc table (Greek, Cyrillic, CJK compat, ...) needs a
+/// transliteration crate (e.g. deunicode) if a test ever hits it.
 fn iconv_translit(cp: u32) -> Option<&'static str> {
     Some(match cp {
         0x00C0..=0x00C5 => "A",
