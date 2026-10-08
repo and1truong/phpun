@@ -304,6 +304,12 @@ pub struct Interp<'a> {
     /// declaration site (zend reports the decl's own file+line, with
     /// the [constant expression] pseudo-frame pointing at resolution).
     const_decl_ctx: Option<(String, u32)>,
+    /// Resolution line of the const-expr currently evaluating — the
+    /// `[constant expression]` pseudo-frame sites here (the access that
+    /// triggered the lazy init), not inside the decl being evaluated
+    /// (gh8821: `#0 file(11): [constant expression]()` where 11 is the
+    /// `new` call, not the const decl).
+    const_init_site: Option<usize>,
     /// Headers queued by header()/setcookie() — `phpun serve` emits them
     /// into the HTTP response; CLI ignores them (like php-cli).
     pub out_headers: Vec<String>,
@@ -316,9 +322,10 @@ pub struct Interp<'a> {
     pub last_preg_error: i64,
     /// Zend's IS_STR_VALID_UTF8 flag: string storage (keyed by Rc
     /// pointer) proven fully valid UTF-8 — /u preg calls skip
-    /// re-validating it (bug72685). The Rcs stay in the map so the
-    /// pointer keys can't be recycled.
-    pub valid_utf8: std::collections::HashMap<usize, std::rc::Rc<[u8]>>,
+    /// re-validating it (bug72685). Weak keys drop when the storage
+    /// dies — a recycled pointer then fails upgrade() and re-validates,
+    /// so nothing stays pinned and the map can't grow without bound.
+    pub valid_utf8: std::collections::HashMap<usize, std::rc::Weak<[u8]>>,
     /// Raw request body for php://input — serve mode fills it.
     pub php_input: std::rc::Rc<Vec<u8>>,
     /// Real upload tmp paths created this request — is_uploaded_file()
@@ -1454,6 +1461,7 @@ impl<'a> Interp<'a> {
             live_io: false,
             decl_file_ctx: None,
             const_decl_ctx: None,
+            const_init_site: None,
             out_headers: Vec::new(),
             resp_code: 200,
             last_json_error: 0,
@@ -1704,8 +1712,12 @@ impl<'a> Interp<'a> {
         } else {
             None
         };
+        // Save the resolution line before the decl's own lines take over
+        // cur_line — a fail() mid-eval builds the pseudo-frame here.
+        let old_site = self.const_init_site.replace(self.cur_line);
         let r = self.eval_const(e);
         self.decl_file_ctx = old;
+        self.const_init_site = old_site;
         if decl_line > 0 {
             self.const_decl_ctx = old_ctx;
         }
@@ -3505,6 +3517,26 @@ impl<'a> Interp<'a> {
     /// each counter, mirroring the arena returning freed memory).
     pub(crate) fn mem_total(&self) -> i64 {
         crate::value::MEM_BASE_BYTES + crate::value::mem_live_bytes()
+    }
+
+    /// zend's emalloc guard inside C builtins: refuse when the request
+    /// would cross memory_limit — fires the OOM fatal mid-eval with
+    /// the request size as 'tried to allocate N' (str_repeat).
+    pub(crate) fn mem_check_alloc(&mut self, want: i64) -> Result<(), PhpError> {
+        let limit = self.ini_bytes("memory_limit");
+        if limit > 0 && self.mem_total() + want > limit {
+            self.mem_exceeded = true;
+            let mut e = PhpError::fatal(
+                format!(
+                    "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
+                    limit, want
+                ),
+                self.cur_line,
+            );
+            e.trace = Some(self.fatal_frames());
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Emit journaled/replayed bytes at their materialization point:
@@ -6285,7 +6317,7 @@ impl<'a> Interp<'a> {
                     class: None,
                     ty: String::new(),
                     file: self.diag_file(),
-                    line: self.cur_line as u32,
+                    line: self.const_init_site.unwrap_or(self.cur_line) as u32,
                     args: Vec::new(),
                     named_args: Vec::new(),
                     internal: true,

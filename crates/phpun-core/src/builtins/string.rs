@@ -167,6 +167,9 @@ pub(crate) fn dispatch(
         "str_repeat" => {
             let s = arg_bs(it, args, 0);
             let n = arg(args, 1).to_int().max(0) as usize;
+            // zend_emalloc inside php_string_repeat — request is the
+            // zend_string's len + 32-byte header.
+            it.mem_check_alloc(s.len() as i64 * n as i64 + 32)?;
             Value::bytes(s.repeat(n))
         }
         "strrev" => Value::bytes({

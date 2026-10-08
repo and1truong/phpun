@@ -1628,7 +1628,19 @@ impl<'a> Interp<'a> {
         self.last_prop_ov = None;
         let pn = self.prop_name(name)?;
         let ov = if Self::is_cv(obj_u) {
-            self.eval_cv_at(obj_u, member_end)?
+            // zend's _W prop fetch resolves an undef CV container to
+            // null SILENTLY — the 'Undefined variable' warn belongs to
+            // the enclosing op's own warn_undef gate, not this fetch
+            // (`$u->a->b = v`, `$u->a->a += v` warn at most once).
+            self.cur_line = member_end;
+            self.send_line = Some(member_end);
+            match obj_u {
+                Expr::Var(n) => self
+                    .var_lookup(n)
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null),
+                _ => self.eval(obj_u)?,
+            }
         } else {
             self.eval_lvalue_obj(obj)?
         };

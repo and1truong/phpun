@@ -48,6 +48,14 @@ pub struct PhpArray {
     /// pub(crate) so literal constructions can init it; growth callers
     /// must go through mem_note_append/mem_note_seed, never this field.
     pub(crate) mem_elems: i64,
+    /// zend's HT_IS_PACKED: stays true while every stored key is the
+    /// next sequential int — mixed tables run a bigger stride (bucket
+    /// 32 + hash-index 8 = 40/elem) than packed zval tables (16/elem).
+    pub(crate) packed: bool,
+    /// Live zend_string charge held by string keys (each costs a
+    /// bin-rounded zend_string in the arena). Subtracted on unset and
+    /// wholesale at Drop/mem_clear.
+    pub(crate) key_bytes: i64,
 }
 
 impl Default for PhpArray {
@@ -58,6 +66,7 @@ impl Default for PhpArray {
 
 impl PhpArray {
     pub fn new() -> Self {
+        gc_root_note(1);
         Self {
             entries: Vec::new(),
             next: 0,
@@ -65,6 +74,8 @@ impl PhpArray {
             iter_pos: 0,
             foreach_pos: Vec::new(),
             mem_elems: 0,
+            packed: true,
+            key_bytes: 0,
         }
     }
 
@@ -74,15 +85,48 @@ impl PhpArray {
     /// Out-of-impl `entries.push` callers must go through here so the
     /// charge and Drop's decrement stay symmetric.
     pub fn mem_note_append(&mut self) {
-        let old = arr_foot(self.mem_elems);
+        let old = arr_foot(self.mem_elems, self.packed);
         self.mem_elems += 1;
         // Zend trips inside the arData grow — a pow2-bucket realloc —
-        // so the reported request is the live table's size (our meter
-        // uses the packed stride; zend's hashed arData runs 32/elem —
-        // oracle stamped 2097160 = 65536*32+8 on its mixed loop).
-        let request =
-            (self.mem_elems.max(8) as u64).next_power_of_two() as i64 * ARR_ELEM_BYTES + 8;
-        mem_charge(&ARR_LIVE, arr_foot(self.mem_elems) - old, request);
+        // so the reported request is the grow alloc's size: packed
+        // tables alloc nSize*16+8, mixed tables nSize*40 (oracle:
+        // 1310720@nSize=32768, 5242880@131072 on 'k$i' loops).
+        let n = (self.mem_elems.max(8) as u64).next_power_of_two() as i64;
+        let request = if self.packed {
+            n * ARR_ELEM_BYTES + 8
+        } else {
+            n * ARR_ELEM_HASH_BYTES
+        };
+        mem_charge(
+            &ARR_LIVE,
+            arr_foot(self.mem_elems, self.packed) - old,
+            request,
+        );
+    }
+
+    /// Key-side meter bookkeeping before a NEW entry is pushed: a
+    /// non-sequential-int key flips the table to mixed (zend converts
+    /// once, permanently) and a string key is a live zend_string plus
+    /// one GC-root-buffer entry (zend tracks container member
+    /// zend_strings; a loose value string is never rooted).
+    /// Call with the key BEFORE the push so the packed check sees the
+    /// pre-insert slot count.
+    pub fn mem_note_key(&mut self, k: &ArrKey) {
+        match k {
+            ArrKey::Str(s) => {
+                self.packed = false;
+                let c = key_charge(s.len());
+                self.key_bytes += c;
+                mem_charge(&STR_LIVE, c, c);
+                gc_root_note(1);
+            }
+            ArrKey::Int(i) => {
+                if *i != self.entries.len() as i64 {
+                    self.packed = false;
+                }
+            }
+            ArrKey::Tomb => {}
+        }
     }
 
     /// Release the charged slots alongside an `entries.clear()`
@@ -91,22 +135,56 @@ impl PhpArray {
     pub fn mem_clear(&mut self) {
         if self.mem_elems > 0 {
             ARR_LIVE.fetch_sub(
-                arr_foot(self.mem_elems),
+                arr_foot(self.mem_elems, self.packed),
                 std::sync::atomic::Ordering::Relaxed,
             );
             self.mem_elems = 0;
+        }
+        if self.key_bytes > 0 {
+            STR_LIVE.fetch_sub(self.key_bytes, std::sync::atomic::Ordering::Relaxed);
+            self.key_bytes = 0;
+            gc_root_note(
+                -(self
+                    .entries
+                    .iter()
+                    .filter(|(k, _)| matches!(k, ArrKey::Str(_)))
+                    .count() as i64),
+            );
         }
     }
 
     /// Charge a literal-built table's pre-populated entries at
     /// construction (dup_array copies, globals snapshots). No-op on an
-    /// empty table — matches zend's free `[]`.
+    /// empty table — matches zend's free `[]`. Keys are noted first so
+    /// `packed`/key_bytes reflect the literal's key mix.
     pub fn mem_note_seed(&mut self) {
         if self.mem_elems == 0 && !self.entries.is_empty() {
+            let keys: Vec<ArrKey> = self.entries.iter().map(|(k, _)| k.clone()).collect();
+            for (idx, k) in keys.iter().enumerate() {
+                match k {
+                    ArrKey::Int(i) => {
+                        if *i != idx as i64 {
+                            self.packed = false;
+                        }
+                    }
+                    ArrKey::Str(s) => {
+                        self.packed = false;
+                        let c = key_charge(s.len());
+                        self.key_bytes += c;
+                        mem_charge(&STR_LIVE, c, c);
+                        gc_root_note(1);
+                    }
+                    ArrKey::Tomb => {}
+                }
+            }
             self.mem_elems = self.entries.len() as i64;
-            let request =
-                (self.mem_elems.max(8) as u64).next_power_of_two() as i64 * ARR_ELEM_BYTES + 8;
-            mem_charge(&ARR_LIVE, arr_foot(self.mem_elems), request);
+            let n = (self.mem_elems.max(8) as u64).next_power_of_two() as i64;
+            let request = if self.packed {
+                n * ARR_ELEM_BYTES + 8
+            } else {
+                n * ARR_ELEM_HASH_BYTES
+            };
+            mem_charge(&ARR_LIVE, arr_foot(self.mem_elems, self.packed), request);
         }
     }
 
@@ -126,15 +204,18 @@ impl PhpArray {
     }
 
     pub fn push(&mut self, v: Value) {
-        self.entries
-            .push((ArrKey::Int(self.next), Rc::new(RefCell::new(v))));
+        let k = ArrKey::Int(self.next);
+        self.mem_note_key(&k);
+        self.entries.push((k, Rc::new(RefCell::new(v))));
         self.next += 1;
         self.mem_note_append();
     }
 
     /// Append an existing cell (by-ref variadics alias their args).
     pub fn push_cell(&mut self, c: Cell) {
-        self.entries.push((ArrKey::Int(self.next), c));
+        let k = ArrKey::Int(self.next);
+        self.mem_note_key(&k);
+        self.entries.push((k, c));
         self.next += 1;
         self.mem_note_append();
     }
@@ -164,6 +245,7 @@ impl PhpArray {
             }
             return;
         }
+        self.mem_note_key(&k);
         if let ArrKey::Int(i) = k {
             if i >= self.next {
                 self.next = i + 1;
@@ -188,6 +270,7 @@ impl PhpArray {
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
             Some(std::mem::replace(&mut slot.1, c))
         } else {
+            self.mem_note_key(&k);
             self.entries.push((k, c));
             self.mem_note_append();
             None
@@ -202,6 +285,14 @@ impl PhpArray {
     /// the table owned the cell outright.
     pub fn unset(&mut self, k: &ArrKey) -> Option<Value> {
         if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| ek == k) {
+            // Unset frees the key's zend_string (zend releases the
+            // bucket's key ref even though the bucket stays tombstoned).
+            if let ArrKey::Str(s) = &slot.0 {
+                let c = key_charge(s.len());
+                self.key_bytes -= c;
+                STR_LIVE.fetch_sub(c, std::sync::atomic::Ordering::Relaxed);
+                gc_root_note(-1);
+            }
             slot.0 = ArrKey::Tomb;
             let old = std::mem::replace(&mut slot.1, Rc::new(RefCell::new(Value::Null)));
             if Rc::strong_count(&old) == 1 {
@@ -366,6 +457,7 @@ impl PhpArray {
 impl Clone for PhpArray {
     fn clone(&self) -> Self {
         // Deep-clone cell contents (PHP copy-on-write: the copy is independent).
+        gc_root_note(1);
         let mut a = Self {
             entries: self
                 .entries
@@ -378,6 +470,8 @@ impl Clone for PhpArray {
             iter_pos: self.iter_pos,
             // A CoW copy does not inherit the source's live foreach loops.
             foreach_pos: Vec::new(),
+            packed: self.packed,
+            key_bytes: 0,
         };
         a.mem_note_seed();
         a
@@ -1775,24 +1869,51 @@ pub const OBJ_SHELL_BYTES: i64 = 72;
 /// elements ≈ 1M = 65536*16 + ~200, at 100000 ≈ 2.1M = 131072*16).
 /// Tombstoned slots stay charged — zend's arData never shrinks.
 pub const ARR_BASE_BYTES: i64 = 200;
+/// Packed (sequential-int) table: bare zval slots, 16/elem.
 pub const ARR_ELEM_BYTES: i64 = 16;
+/// Mixed table: bucket 32 + hash-index 8 = 40/elem (oracle's reported
+/// arData grows run exactly nSize*40: 1310720@32768, 5242880@131072).
+pub const ARR_ELEM_HASH_BYTES: i64 = 40;
 
 /// Charged footprint of a live table holding `n` slots.
-pub(crate) fn arr_foot(n: i64) -> i64 {
+pub(crate) fn arr_foot(n: i64, packed: bool) -> i64 {
     if n <= 0 {
         0
     } else {
-        ARR_BASE_BYTES + (n.max(8) as u64).next_power_of_two() as i64 * ARR_ELEM_BYTES
+        ARR_BASE_BYTES
+            + (n.max(8) as u64).next_power_of_two() as i64
+                * if packed {
+                    ARR_ELEM_BYTES
+                } else {
+                    ARR_ELEM_HASH_BYTES
+                }
     }
 }
 
-/// zend_string charge ≈ len + len/64 + 40: a 24B header plus
-/// zend_alloc's size-class rounding. Oracle: str10≈48B, str100≈112B,
-/// str1M≈1003520B. Mid-range sizes run to ~20% under zend's chunky
-/// octave bins (str1000 oracle 1290) — ponytail: a 10-line bin-ladder
-/// (steps doubling per octave: 8,16,32,...) would fit it exactly.
+/// zend_string cost of a string array key: 24B header + bytes + NUL,
+/// rounded to zend_mm's small-bin ladder ('kNNNN' len≤6 lands on 32B).
+fn key_charge(len: usize) -> i64 {
+    let n = 24 + len as i64 + 1;
+    match n {
+        n if n <= 64 => (n + 7) / 8 * 8,
+        n if n <= 256 => (n + 15) / 16 * 16,
+        n if n <= 512 => (n + 31) / 32 * 32,
+        n if n <= 1024 => (n + 63) / 64 * 64,
+        n => (n + 127) / 128 * 128,
+    }
+}
+
+/// zend_string charge: a 24B header + bytes + NUL through zend_mm's
+/// small-bin ladder below 512B (oracle deltas: len7→32, len100→128,
+/// len200→224), the fitted len + len/64 + 40 above it (str1M≈1003520B
+/// oracle, where pow2 page-chunks dominate).
 pub fn str_charge(len: usize) -> i64 {
-    (len + len / 64 + 40) as i64
+    let n = 24 + len as i64 + 1;
+    if n <= 512 {
+        key_charge(len)
+    } else {
+        (len + len / 64 + 40) as i64
+    }
 }
 
 /// PHP string payload: refcounted bytes carrying their memory_limit
@@ -1912,11 +2033,28 @@ fn mem_live_raw() -> i64 {
         + ARR_LIVE.load(std::sync::atomic::Ordering::Relaxed)
         + STR_LIVE.load(std::sync::atomic::Ordering::Relaxed)
         + OB_LIVE.load(std::sync::atomic::Ordering::Relaxed)
+        + GC_PEAK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Live cycle-capable entities — zend's GC root buffer only tracks
+/// HashTables/objects (zend_strings can't form cycles) and grows as
+/// pow2(count)*16B. The buffer never shrinks without a GC run (none
+/// under memory_limit probes), so the charge latches at its high-water
+/// mark.
+static GC_ROOTS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static GC_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// +1/-1 a live collectible entity; updates the GC-buffer high-water.
+pub(crate) fn gc_root_note(delta: i64) {
+    let n = GC_ROOTS.fetch_add(delta, std::sync::atomic::Ordering::Relaxed) + delta;
+    let cap = (n.max(1024) as u64).next_power_of_two() as i64 * 16;
+    GC_PEAK.fetch_max(cap, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Charge one live object shell (alloc_obj).
 pub fn obj_charge() {
     mem_charge(&OBJ_LIVE, OBJ_SHELL_BYTES, OBJ_SHELL_BYTES);
+    gc_root_note(1);
 }
 
 /// Live bytes held by object shells (clamped — objects wrapped before
@@ -1987,6 +2125,7 @@ pub struct PhpObject {
 impl Drop for PhpObject {
     fn drop(&mut self) {
         OBJ_LIVE.fetch_sub(OBJ_SHELL_BYTES, std::sync::atomic::Ordering::Relaxed);
+        gc_root_note(-1);
     }
 }
 
@@ -1994,10 +2133,21 @@ impl Drop for PhpArray {
     fn drop(&mut self) {
         if self.mem_elems > 0 {
             ARR_LIVE.fetch_sub(
-                arr_foot(self.mem_elems),
+                arr_foot(self.mem_elems, self.packed),
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+        if self.key_bytes > 0 {
+            STR_LIVE.fetch_sub(self.key_bytes, std::sync::atomic::Ordering::Relaxed);
+            gc_root_note(
+                -(self
+                    .entries
+                    .iter()
+                    .filter(|(k, _)| matches!(k, ArrKey::Str(_)))
+                    .count() as i64),
+            );
+        }
+        gc_root_note(-1);
     }
 }
 
