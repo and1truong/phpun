@@ -1429,6 +1429,12 @@ impl<'a> Interp<'a> {
             let was = std::mem::replace(&mut self.dim_by_ref, true);
             let br = self.bind_cell(target, src.clone());
             self.dim_by_ref = was;
+            // prop_cell's one-shot receiver stash is consumed by the
+            // typed-prop check above only for `Expr::Prop` sources —
+            // for any other source/target shape it would pin the
+            // object's Rc past the op and root a dead cycle
+            // (gc_006: `$a->a[0] =& $a` collects 0 instead of 2).
+            self.last_prop_ov = None;
             br?;
             return Ok(src.borrow().clone());
         }
@@ -1511,6 +1517,13 @@ impl<'a> Interp<'a> {
         self.last_fresh_cell = None;
         let target_cell = match target {
             Expr::Prop { obj, name, .. } => {
+                // A compound op's RW prop fetch warns 'Undefined
+                // variable' on an undef CV container — plain `=` and
+                // by-ref fetches resolve it to null silently instead
+                // (r($undef->p)).
+                if needs_read && op != "??=" {
+                    self.warn_undef_lvalue_obj(obj)?;
+                }
                 // zend fetches the object operand in write context —
                 // an intermediate readonly prop holding a non-object
                 // dies here, naming THAT prop (R3 finding 3).
@@ -1596,6 +1609,22 @@ impl<'a> Interp<'a> {
                         }
                     }
                 } else {
+                    // A compound op fetches the container for
+                    // read+write: an undef CV warns 'Undefined
+                    // variable' at the fetch, then zend's
+                    // unconditional ZVAL_ARR lands a fresh array on
+                    // the slot — even over a handler's mid-warn
+                    // rebind. `=`/`??=` keep silent fetch semantics.
+                    if needs_read {
+                        self.warn_undef_lvalue_obj(base)?;
+                        if let Expr::Var(n) = base {
+                            if self.var_lookup(n).is_none() {
+                                let c = self.var_cell(n);
+                                *c.borrow_mut() =
+                                    Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+                            }
+                        }
+                    }
                     let c = self.eval_cell(base)?;
                     if let Expr::Var(n) = base {
                         dim_root = Some((
@@ -1660,7 +1689,18 @@ impl<'a> Interp<'a> {
                 }
             }
             Expr::List(_) => None,
-            _ => self.eval_cell(target).ok(),
+            _ => {
+                // A plain-CV compound assign fetches BP_VAR_RW — zend
+                // warns the undef var at the fetch (`$undef += 1`).
+                if needs_read && op != "??=" {
+                    if let Expr::Var(n) = target {
+                        if self.var_lookup(n).is_none() {
+                            self.warn(&format!("Undefined variable ${}", n))?;
+                        }
+                    }
+                }
+                self.eval_cell(target).ok()
+            }
         };
         // Zend's ASSIGN_DIM_OP order: dim exprs eager (above) → the
         // RHS → the dim fetch (its `Undefined array key` warnings and
@@ -1790,7 +1830,52 @@ impl<'a> Interp<'a> {
                 return Ok(cur);
             }
         }
-        let rhs = self.eval(value)?;
+        // A compound op's CV keys bind before the RHS reads — zend's
+        // dim fetch runs its operand conversion ahead of op_data, and
+        // an error-handler rebind mid-conversion aborts the op on the
+        // dead slot (the RHS is never evaluated). Scalar/object
+        // containers skip the bind — their gate Errors outrank the key
+        // diagnostics (same ordering the write's `bad` check uses).
+        if needs_read && op != "??=" {
+            if let Late::Keyed { base, keys } = &late {
+                let bind_ok = {
+                    let b = base.borrow();
+                    match &*b {
+                        Value::Null | Value::Array(_) | Value::Str(_) | Value::Bool(false) => true,
+                        Value::Object(o) => self.obj_is_a(o, "ArrayAccess"),
+                        _ => false,
+                    }
+                };
+                if bind_ok {
+                    for k in keys {
+                        if let DimArg::Cv(n) = k {
+                            self.dim_var_key(n)?;
+                        }
+                    }
+                    if let Some((d, _)) = &dim_root {
+                        if self.dim_detached(d) {
+                            return Ok(Value::Null);
+                        }
+                    }
+                }
+            }
+        }
+        // A bare-CV RHS is the op's own operand — zend reads it inside
+        // the op, after the dim fetch's diagnostics (an expression
+        // compiles its own ops and keeps early eval). A rebound var is
+        // seen post-fetch either way, so only the warn position moves.
+        let rhs_var = {
+            let mut v = value;
+            while let Expr::Paren(inner) = v {
+                v = inner.as_ref();
+            }
+            matches!(v, Expr::Var(_))
+        };
+        let rhs = if needs_read && rhs_var {
+            Value::Null
+        } else {
+            self.eval(value)?
+        };
         if det.is_none() {
             // zend's ASSIGN_DIM materializes an undef/null container
             // slot to a fresh array AFTER the RHS but BEFORE the dim
@@ -1828,6 +1913,13 @@ impl<'a> Interp<'a> {
         } else {
             Value::Null
         };
+        // A diagnostic mid-fetch can still kill the container — zend's
+        // sentinel then aborts the op before its gate and its op_data
+        // read, so re-check after the read too.
+        let dim_det = dim_det
+            || det
+                .as_ref()
+                .is_some_and(|d| !d.coalesce && self.dim_detached(d));
         // A static-prop compound assign gates set-visibility on the
         // RW fetch — AFTER the RHS and the fetch proper (an uninit
         // typed static's 'must not be accessed' wins) but BEFORE the
@@ -1915,6 +2007,19 @@ impl<'a> Interp<'a> {
             }
         }
 
+        // The bare-CV RHS's own operand read — zend does it after the
+        // fetch's diagnostics and the container gate (an aborting gate
+        // or a detached fetch never reads op_data), before the operator
+        // applies.
+        let rhs = if needs_read && rhs_var {
+            if dim_det {
+                Value::Null
+            } else {
+                self.eval(value)?
+            }
+        } else {
+            rhs
+        };
         let newv = match op {
             "=" => rhs,
             "+=" => self.arith("+", cur, rhs)?,
@@ -2067,6 +2172,11 @@ impl<'a> Interp<'a> {
                     };
                     let kv = key.as_ref().map(|c| c.borrow().clone());
                     let off = self.str_offset_key(kv.as_ref())?;
+                    if self.detached_dim {
+                        // Dead string — zend bails before the
+                        // assign-op refusal and the byte splice.
+                        return Ok(Value::Null);
+                    }
                     // `??=` writes like `=` once the offset shows
                     // unset — only real compound ops are refused.
                     if op != "=" && op != "??=" {
@@ -2302,8 +2412,20 @@ impl<'a> Interp<'a> {
                 | Expr::Index { .. }
                 | Expr::StaticProp { .. }
                 | Expr::VarVar(_) => Ok(self.eval_cell(inner)?.borrow().clone()),
+                Expr::Var(n) => Ok(self
+                    .var_lookup(n)
+                    .map(|c| c.borrow().clone())
+                    .unwrap_or(Value::Null)),
                 _ => self.eval(obj),
             },
+            // zend's _W prop/dim fetches resolve an undef CV container to
+            // null silently — the access Error ('Attempt to modify
+            // property "p" on null') fires without a 'Undefined variable'
+            // warn (r($undef->p)).
+            Expr::Var(n) => Ok(self
+                .var_lookup(n)
+                .map(|c| c.borrow().clone())
+                .unwrap_or(Value::Null)),
             _ => self.eval(obj),
         }
     }
@@ -2503,11 +2625,18 @@ impl<'a> Interp<'a> {
                         };
                         *b = Value::Array(Rc::new(RefCell::new(arr)));
                     }
-                    Value::Array(rc) => {
+                    Value::Array(_) => {
+                        // `$b = $a; $b['k'] =& $r` — bind through a COW
+                        // split or the write corrupts the shared table.
+                        self.cow_split(&mut b);
+                        let rc = match &*b {
+                            Value::Array(rc) => rc.clone(),
+                            _ => unreachable!(),
+                        };
                         let is_globals = self
                             .globals_arr
                             .as_ref()
-                            .map(|g| Rc::ptr_eq(g, rc))
+                            .map(|g| Rc::ptr_eq(g, &rc))
                             .unwrap_or(false);
                         let bk = match &key {
                             Some(k) => Some(self.arr_key(k)?),
@@ -4185,6 +4314,13 @@ impl<'a> Interp<'a> {
                         self.cur_line,
                     ));
                 }
+                if self.detached_dim {
+                    // assign_to_string_offset's GC_DELREF bail: the
+                    // separated string died inside the offset's
+                    // diagnostics — value checks and the write never
+                    // run (str_offset_006's rebound-container NULL).
+                    return Ok(Value::Null);
+                }
                 let mut bytes = {
                     let b = c.borrow();
                     match &*b {
@@ -4711,6 +4847,13 @@ impl<'a> Interp<'a> {
                             }
                         }
                     }
+                    // zend's undefined-offset-write sentinel: the
+                    // array dying under the miss warn's handler aborts
+                    // the whole fetch — the op's remaining reads and
+                    // op_data go silent.
+                    if det.is_some_and(|d| !d.coalesce && self.dim_detached(d)) {
+                        self.detached_dim = true;
+                    }
                     c = cell(Value::Null);
                 }
                 Step::Stop => return Ok(Value::Null),
@@ -4951,9 +5094,13 @@ impl<'a> Interp<'a> {
                 // bad keys throw 'on string' TypeErrors or the []
                 // Error before the byte splice runs.
                 let off = self.str_offset_key(key.as_ref())?;
-                if let OffWrite::Stored(_) = self.str_offset_write(&mut bytes, off, &v)? {
-                    *arr_cell.borrow_mut() =
-                        Value::str(String::from_utf8_lossy(&bytes).into_owned());
+                // Dead separated string — bail after the key
+                // diagnostics like zend's GC_DELREF check.
+                if !self.detached_dim {
+                    if let OffWrite::Stored(_) = self.str_offset_write(&mut bytes, off, &v)? {
+                        *arr_cell.borrow_mut() =
+                            Value::str(String::from_utf8_lossy(&bytes).into_owned());
+                    }
                 }
             }
             _ => {
@@ -5210,12 +5357,14 @@ impl<'a> Interp<'a> {
                                 _ => Vec::new(),
                             };
                             let off = self.str_offset_key(key.as_ref())?;
-                            if let OffWrite::Stored(_) =
-                                self.str_offset_write(&mut bytes, off, &v)?
-                            {
-                                let mut b = bc.borrow_mut();
-                                if let Value::Str(s) = &mut *b {
-                                    *s = bytes.into();
+                            if !self.detached_dim {
+                                if let OffWrite::Stored(_) =
+                                    self.str_offset_write(&mut bytes, off, &v)?
+                                {
+                                    let mut b = bc.borrow_mut();
+                                    if let Value::Str(s) = &mut *b {
+                                        *s = bytes.into();
+                                    }
                                 }
                             }
                             Ok(())
@@ -5645,21 +5794,11 @@ impl<'a> Interp<'a> {
             cur = b;
         }
         idxs.reverse();
-        // UNSET_DIM snapshots the container at op entry — an array root
-        // the key-eval handler then rebinds unsets inside the STALE
-        // table (silent, invisible); a non-array root errors on the
-        // CURRENT type instead ('Cannot unset string offsets' on
-        // strings, 'Cannot unset offset in a non-array variable' for
-        // anything else refcounted — even a rebound-TO-array).
-        let det = match cur {
-            Expr::Var(n) => Some(self.dim_detach_var(n, false)),
-            _ => None,
-        };
         // `unset()` key conversions never warn 'Using null as an array
         // offset' — zend maps null offsets to "" without the
         // deprecation (float/resource/illegal still diagnose).
         let was_ctx = std::mem::replace(&mut self.unset_ctx, true);
-        let r = self.unset_index_inner(cur, &idxs, i, det.as_ref());
+        let r = self.unset_index_inner(cur, &idxs, i);
         self.unset_ctx = was_ctx;
         r
     }
@@ -5669,54 +5808,31 @@ impl<'a> Interp<'a> {
         cur: &Expr,
         idxs: &[Option<&Expr>],
         i: Option<&Expr>,
-        det: Option<&DimDetach>,
     ) -> Result<(), PhpError> {
+        // zend evaluates every dim key FIRST (source order — inner
+        // dims left to right, then the unset key), then resolves the
+        // container from the CURRENT value: a key-eval handler that
+        // rebinds the root redirects the unset onto the new array
+        // (unset($a[rb()]) unsets inside rb's result, not a stale
+        // snapshot). Eval errors surface as catchable throwables.
+        let mut keys = Vec::with_capacity(idxs.len());
+        for ix in idxs {
+            let kv = match ix {
+                Some(ie) => match self.eval(ie) {
+                    Ok(v) => v,
+                    Err(e) => return self.fail::<()>(e),
+                },
+                None => Value::Null,
+            };
+            keys.push(kv);
+        }
         let key = match i {
-            // eval errors surface as catchable throwables like zend's
-            // (an uncaught Error from the index expr is a `throw`).
             Some(ie) => match self.eval(ie) {
                 Ok(v) => Some(v),
                 Err(e) => return self.fail::<()>(e),
             },
             None => None,
         };
-        // The key eval's diagnostics ran — a handler that rebound the
-        // root detaches this unset: array roots silently walk the
-        // stale table, non-array roots take zend's error matrix on the
-        // CURRENT value.
-        let detached = det.is_some_and(|d| self.dim_detached(d));
-        if detached {
-            let d = det.unwrap();
-            if !matches!(
-                d.pre.value().as_ref(),
-                Some(Value::Array(_) | Value::Object(_))
-            ) {
-                let cur_v = self
-                    .var_cell_opt(&d.name)
-                    .map(|c| c.borrow().clone())
-                    .unwrap_or(Value::Null);
-                match &cur_v {
-                    // Objects take the normal dispatch below (offsetUnset
-                    // / 'Cannot use object as array' on CURRENT).
-                    Value::Object(_) => {}
-                    Value::Str(_) => {
-                        return self.fail(PhpError::uncaught(
-                            "Error",
-                            "Cannot unset string offsets",
-                            self.cur_line,
-                        ))
-                    }
-                    Value::Null | Value::Bool(false) => return Ok(()),
-                    _ => {
-                        return self.fail(PhpError::uncaught(
-                            "Error",
-                            "Cannot unset offset in a non-array variable",
-                            self.cur_line,
-                        ))
-                    }
-                }
-            }
-        }
         // Roots with real storage cells resolve once (prop_cell invokes
         // __get a single time for an overloaded prop); a missing plain
         // variable warns and no-ops (zend undefined-variable semantics).
@@ -5796,12 +5912,8 @@ impl<'a> Interp<'a> {
             if let Some((o, arr)) = ao {
                 let mut cur_arr = arr;
                 let mut ok = true;
-                for ix in idxs {
-                    let kv = match ix {
-                        Some(ie) => self.eval(ie)?,
-                        None => Value::Null,
-                    };
-                    let next = match cur_arr.borrow().get_cell(&self.arr_key(&kv)?) {
+                for kv in keys.iter() {
+                    let next = match cur_arr.borrow().get_cell(&self.arr_key(kv)?) {
                         Some(cc) => {
                             let mut b = cc.borrow_mut();
                             // The fetched array may alias other slots
@@ -5866,40 +5978,15 @@ impl<'a> Interp<'a> {
         // autovivify on unset); non-array containers throw zend's
         // catchable unset Errors ("Cannot unset offset in a non-array
         // variable" &c).
-        // A detached array root unsets inside the stale table — the
-        // key conversions stay silent and the removal is invisible.
-        let mut c = if detached {
-            cell(det.unwrap().pre.value().unwrap_or(Value::Null))
-        } else {
-            root_cell
-        };
-        let prev_det = std::mem::replace(&mut self.detached_dim, detached);
-        for ix in idxs.iter() {
-            let kv = match ix {
-                Some(ie) => match self.eval(ie) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        self.detached_dim = prev_det;
-                        return Err(e);
-                    }
-                },
-                None => Value::Null,
-            };
+        let mut c = root_cell;
+        for kv in keys {
             match self.unset_dim_cell(&c, kv) {
                 Ok(Some(nc)) => c = nc,
-                Ok(None) => {
-                    self.detached_dim = prev_det;
-                    return Ok(());
-                }
-                Err(e) => {
-                    self.detached_dim = prev_det;
-                    return Err(e);
-                }
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(e),
             }
         }
-        let r = self.unset_in_cell(c, key);
-        self.detached_dim = prev_det;
-        r
+        self.unset_in_cell(c, key)
     }
 
     /// One intermediate dim down for `unset`: plain arrays yield the
@@ -5963,9 +6050,16 @@ impl<'a> Interp<'a> {
             }
             Value::Str(_) => self.fail(PhpError::uncaught(
                 "Error",
-                "Cannot use string offset as an array",
+                "Cannot unset string offsets",
                 self.cur_line,
             )),
+            // zend's unset emits the false->array conversion deprecation
+            // then no-ops (the var stays false) — unlike reads/writes it
+            // never actually vivifies.
+            Value::Bool(false) => {
+                self.deprecated_ns("Automatic conversion of false to array is deprecated")?;
+                Ok(None)
+            }
             Value::Callable(_) => self.fail(PhpError::uncaught(
                 "Error",
                 "Cannot use object of type Closure as array",
@@ -6042,6 +6136,9 @@ impl<'a> Interp<'a> {
                 "Cannot unset string offsets",
                 self.cur_line,
             )),
+            Value::Bool(false) => {
+                self.deprecated_ns("Automatic conversion of false to array is deprecated")
+            }
             Value::Callable(_) => self.fail(PhpError::uncaught(
                 "Error",
                 "Cannot use object of type Closure as array",
@@ -6472,6 +6569,28 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Warn 'Undefined variable' once for the innermost CV of an
+    /// lvalue chain under zend's RW fetch — nested prop/dim links
+    /// evaluate in the same write context, so `$u->a->a += 1` and
+    /// `$u->p[k] += 1` warn $u (bug78531).
+    fn warn_undef_lvalue_obj(&mut self, obj: &Expr) -> Result<(), PhpError> {
+        let mut b: &Expr = obj;
+        loop {
+            match b {
+                Expr::Paren(i) => b = i.as_ref(),
+                Expr::Prop { obj: o, .. } => b = o.as_ref(),
+                Expr::Index { e, .. } => b = e.as_ref(),
+                _ => break,
+            }
+        }
+        if let Expr::Var(n) = b {
+            if self.var_lookup(n).is_none() {
+                self.warn(&format!("Undefined variable ${}", n))?;
+            }
+        }
+        Ok(())
+    }
+
     fn incdec(&mut self, target: &Expr, delta: i64, post: bool) -> Result<Value, PhpError> {
         // PHP warns on undefined vars/props/keys during ++/-- (bug25547).
         let mut ro_target: Option<(Rc<RefCell<PhpObject>>, String)> = None;
@@ -6527,6 +6646,11 @@ impl<'a> Interp<'a> {
             // ++/-- reads through __get first — its exceptions
             // propagate (the __set is never reached, bug38624).
             Expr::Prop { obj, name, .. } => {
+                // The RW prop fetch warns 'Undefined variable' on an
+                // undef CV container like a compound assign
+                // (bug78531) — eval_lvalue_obj stays silent for the
+                // _W callers (plain `=`, by-ref reads).
+                self.warn_undef_lvalue_obj(obj)?;
                 // `++`/`--` on a prop of a non-object dies with the
                 // incdec verb before the loose-read warn (probe4i).
                 let ov = self.eval_lvalue_obj(obj)?;
