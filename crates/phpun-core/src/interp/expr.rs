@@ -7272,6 +7272,11 @@ impl<'a> Interp<'a> {
         key: Value,
         last_ao: &mut Option<Rc<RefCell<PhpObject>>>,
     ) -> Result<(), PhpError> {
+        // Borrowed, not destructured: in the non-detached arm `held`'s
+        // pin must die BEFORE destruct_dying_value — its slot keeps the
+        // evicted payload looking still-shared and __destruct never
+        // runs (bug65051).
+        let pre = DimPre::of(&held);
         match held {
             Value::Array(rc) => {
                 if let Some(t) = Self::illegal_offset_ty(&key) {
@@ -7285,8 +7290,7 @@ impl<'a> Interp<'a> {
                 // a key-read handler rebind lands the delete on `rc`
                 // (stale) and converts silently; in-place edits stay
                 // visible.
-                let detached =
-                    !Self::same_container(&DimPre::of(&Value::Array(rc.clone())), &c.borrow());
+                let detached = !Self::same_container(&pre, &c.borrow());
                 // `unset()` maps null offsets to "" WITHOUT the 'Using
                 // null as an array offset' deprecation; every other
                 // cast still diagnoses. Scoped so conversions inside
@@ -7298,7 +7302,15 @@ impl<'a> Interp<'a> {
                 self.unset_ctx = was_ctx;
                 self.detached_dim = was_det;
                 let ak = ak_r?;
-                let c = if detached { cell(Value::Array(rc)) } else { c };
+                let c = if detached {
+                    cell(Value::Array(rc))
+                } else {
+                    // Drop the held pin before cow_split: its extra ref
+                    // would force a split and keep the dead table's
+                    // element slots alive past the payload eviction.
+                    drop(rc);
+                    c
+                };
                 // zend's spl_array_unset_dimension throws mid-sort.
                 if let Some(o) = last_ao {
                     if let Some(e) = self.ao_sorting_err(o) {

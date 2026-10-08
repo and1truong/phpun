@@ -61,10 +61,16 @@ impl<'a> Interp<'a> {
             // Rc clones — left over they keep a container externally
             // strong and gc_collect_cycles reads the dead cycle as
             // rooted (gc_006's `$a->a[0] =& $a` then `unset($a)`).
+            // `!in_handler` like every other clear site: a user error
+            // handler's own statements run through exec() mid-op and
+            // must not wipe the outer op's dim binds (bug79793 — the
+            // write pass's re-lookup would read post-handler values).
             self.last_prop_ov = None;
-            self.dim_key_conv.clear();
-            self.dim_cv_bound.clear();
-            self.dim_undef_cells.clear();
+            if !self.in_handler {
+                self.dim_key_conv.clear();
+                self.dim_cv_bound.clear();
+                self.dim_undef_cells.clear();
+            }
             match self.exec(s) {
                 Flow::Normal => {
                     // Generators that died at this statement (unset(),
