@@ -418,7 +418,7 @@ impl<'a> Interp<'a> {
                         // a by-ref param binds a plain value cell
                         // (object still aliases via the handle).
                         let rc = if matches!(expr_u, Expr::Var(n) if n == "this") {
-                            self.eval(expr).map(|v| cell(v))
+                            self.eval(expr).map(cell)
                         } else {
                             self.eval_cell(expr)
                         };
