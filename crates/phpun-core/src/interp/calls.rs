@@ -3948,10 +3948,33 @@ impl<'a> Interp<'a> {
             .unwrap_or(base)
     }
 
+    /// zend coerces the frame's own arg slot — a fresh cell — never
+    /// through the caller's (spread args share the source array's
+    /// cell, so `*cell.borrow_mut() = v` retypes caller state).
+    /// The send-time trace frame's arg IS that slot zend coerces
+    /// (`f(5, 'x')`, debug_backtrace args) — repoint it too.
+    fn coerce_arg_slot(
+        &mut self,
+        args: &mut CallArgs,
+        by_name: &mut [Option<(Cell, bool, bool)>],
+        i: usize,
+        cv: Value,
+    ) {
+        let c = cell(cv);
+        if let Some(slot) = args.cells.get_mut(i) {
+            *slot = c.clone();
+        } else if let Some(t) = by_name[i].as_mut() {
+            t.0 = c.clone();
+        }
+        if let Some(a) = self.call_trace.last_mut().and_then(|fr| fr.args.get_mut(i)) {
+            *a = c;
+        }
+    }
+
     fn bind_and_run_inner(
         &mut self,
         decl: &FunctionDecl,
-        args: CallArgs,
+        mut args: CallArgs,
         _unused: Vec<Cell>,
     ) -> Result<Value, PhpError> {
         // Required count runs to the last non-default param: an
@@ -4083,7 +4106,7 @@ impl<'a> Interp<'a> {
                     self.cur_line = decl.line;
                     self.deprecate_lossy_int(ty, &v, &cv);
                     self.cur_line = pl;
-                    *a.borrow_mut() = cv;
+                    self.coerce_arg_slot(&mut args, &mut by_name, i, cv);
                 }
             }
             // strict mode still allows the int->float widening stored
@@ -4093,8 +4116,8 @@ impl<'a> Interp<'a> {
                 && ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
                 && !self.ty_weak_exact(ty, &v)
             {
-                if let Value::Int(i) = v {
-                    *a.borrow_mut() = Value::Float(i as f64);
+                if let Value::Int(n) = v {
+                    self.coerce_arg_slot(&mut args, &mut by_name, i, Value::Float(n as f64));
                 }
             }
             if !ok {
