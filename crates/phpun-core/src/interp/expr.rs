@@ -1086,7 +1086,7 @@ impl<'a> Interp<'a> {
                         };
                         table.insert(n, cell(v));
                     }
-                    self.stack.pop();
+                    self.stack_pop();
                     self.cur_line = saved_line;
                     // Wholesale replace: a recycled handle id could
                     // otherwise expose a dead closure's stale table

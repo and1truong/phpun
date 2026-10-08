@@ -273,6 +273,10 @@ impl<'a> Interp<'a> {
         site: Option<usize>,
     ) -> Result<CallArgs, PhpError> {
         let mut out = CallArgs::empty();
+        // zend's INIT_FCALL pushes the frame's arena span before args
+        // evaluate — the push (or copy into a fresh segment) happens
+        // here, once.
+        self.vm_call_push(&mut out);
         // Position of the *next positional* arg for by-ref lookup — named
         // args don't advance it (they bind by name at call time).
         let mut pos = 0usize;
@@ -346,7 +350,6 @@ impl<'a> Interp<'a> {
                 }
                 let trav = matches!(&v, Value::Object(_));
                 let mut unpack_named = false;
-                let stack0 = out.cells.len() + out.named.len();
                 for (k, c) in self.unpack_items(&v, true)? {
                     match k {
                         Some(n) => {
@@ -370,32 +373,10 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                // zend's vm_stack is ONE request arena: copied args
-                // (n*16 each) accumulate across ALL live calls and it
-                // grows 256KB pages on the cumulative total — charge
-                // only the marginal pages this push crosses, not a
-                // page per frame. Committed while the source zval is
-                // still live (the emalloc guard sees the source table),
-                // released by mem_sweep once the frame's last CallArgs
-                // clone dies — unwinding is LIFO, so each site's
-                // marginal delta is exactly what zend frees.
-                let n = (out.cells.len() + out.named.len() - stack0) as i64;
-                if n > 0 {
-                    let bytes = n * 16;
-                    let live = self.arg_stack_bytes;
-                    let delta =
-                        ((live + bytes + 262_143) & !262_143) - ((live + 262_143) & !262_143);
-                    self.arg_stack_bytes = live + bytes;
-                    let arc = Rc::new(ArgStack(bytes));
-                    self.mem_track(&arc, delta as u64);
-                    if let Some(c) = self
-                        .mem_tracked
-                        .get_mut(&(Rc::as_ptr(&arc) as *const u8 as usize))
-                    {
-                        c.arg_bytes += bytes;
-                    }
-                    out.arg_stack.push(arc);
-                }
+                // SEND_UNPACK's extend_call_frame grows the arena by
+                // the call's whole arg span — the source zval is still
+                // live, so the emalloc guard sees its table charged.
+                self.vm_call_push(&mut out);
                 continue;
             }
             let by_ref = match &name {
@@ -550,6 +531,9 @@ impl<'a> Interp<'a> {
         // frame's site (nested calls inside the args set their own),
         // and post-eval call diagnostics (arity, dispatch failures)
         // site at the call itself, zend's DO_FCALL line.
+        // Plain/named args pushed by their own sends — catch up the
+        // call's arena span once, after the last arg op.
+        self.vm_call_push(&mut out);
         out.end_line = self.cur_line;
         self.cur_line = site.unwrap_or(saved_line);
         if let Some(s) = site {
@@ -3948,7 +3932,7 @@ impl<'a> Interp<'a> {
         // binding ("Argument #N ($x) not passed"); the count check below
         // is the positional-only form.
         if args.named.is_empty() && args.len() < required {
-            self.stack.pop();
+            self.stack_pop();
             let mut e = PhpError::uncaught(
                 "ArgumentCountError",
                 format!(
@@ -3980,7 +3964,7 @@ impl<'a> Interp<'a> {
         for (n, c, refable, trav) in &args.named {
             match decl.params.iter().position(|p| !p.variadic && p.name == *n) {
                 Some(j) if j < n_pos || by_name[j].is_some() => {
-                    self.stack.pop();
+                    self.stack_pop();
                     // Caller-side arg-verify error: the callee frame
                     // never existed (gh19653_2).
                     if self
@@ -4000,7 +3984,7 @@ impl<'a> Interp<'a> {
                 Some(j) => by_name[j] = Some((c.clone(), *refable, *trav)),
                 None if has_variadic => variadic_named.push((n.clone(), c.clone())),
                 None => {
-                    self.stack.pop();
+                    self.stack_pop();
                     if self
                         .call_trace
                         .last()
@@ -4084,7 +4068,7 @@ impl<'a> Interp<'a> {
                 // propagate (zend raises it, not the TypeError).
                 if ty.iter().any(|m| m.eq_ignore_ascii_case("callable")) {
                     if let Some(e) = self.take_callable_probe_err() {
-                        self.stack.pop();
+                        self.stack_pop();
                         return self.fail(e);
                     }
                 }
@@ -4201,7 +4185,7 @@ impl<'a> Interp<'a> {
                     }
                     frs.push(crate::value::trace_frame_str(fr));
                 }
-                self.stack.pop();
+                self.stack_pop();
                 let mut e = PhpError::uncaught("TypeError", msg, call_line);
                 e.trace = Some(frs);
                 e.thrown_line = Some(decl.line);
@@ -4350,7 +4334,7 @@ impl<'a> Interp<'a> {
                     let mut dv = match r {
                         Ok(v) => v,
                         Err(e) => {
-                            self.stack.pop();
+                            self.stack_pop();
                             return self.fail(e);
                         }
                     };
@@ -4381,7 +4365,7 @@ impl<'a> Interp<'a> {
                         let ok = (implicit_null && matches!(dv, Value::Null))
                             || ty.iter().any(|m| self.param_type_match(m, &dv));
                         if !ok {
-                            self.stack.pop();
+                            self.stack_pop();
                             let tyv: Vec<String> = if implicit_null {
                                 let mut t = ty.to_vec();
                                 t.push("null".into());
@@ -4414,7 +4398,7 @@ impl<'a> Interp<'a> {
                             let mut e = PhpError::uncaught("TypeError", msg, self.cur_line);
                             e.display_msg = Some(display);
                             e.thrown_line = Some(decl.line);
-                            self.stack.pop();
+                            self.stack_pop();
                             return self.fail(e);
                         }
                         if !self.caller_file_strict() && !self.ty_weak_exact(ty, &dv) {
@@ -4428,7 +4412,7 @@ impl<'a> Interp<'a> {
                     // Unbound required param — only reachable via named
                     // args (the positional count check runs earlier).
                     let fname = self.decl_fname(decl);
-                    self.stack.pop();
+                    self.stack_pop();
                     let mut e = PhpError::uncaught(
                         "ArgumentCountError",
                         format!("{}(): Argument #{} (${}) not passed", fname, i + 1, p.name),
@@ -4491,7 +4475,7 @@ impl<'a> Interp<'a> {
         // `static` resolves against THIS frame's called class — after
         // the pop, `stack.last()` is the caller (static_type_return).
         let resolved_ret = decl.ret.as_ref().map(|ty| self.resolve_static(ty));
-        let popped = self.stack.pop();
+        let popped = self.stack_pop();
         // Zend decrefs the frame's CVs at unwind — the popped frame
         // is handed to bind_and_run, which runs its __destruct pass
         // after the call-trace pop so the dtor's trace attributes to
@@ -4752,7 +4736,7 @@ impl<'a> Interp<'a> {
             let fr = self.call_site_frame(decl, &args);
             self.call_trace.push(fr);
             let fname = self.decl_fname(decl);
-            self.stack.pop();
+            self.stack_pop();
             let mut e = PhpError::uncaught(
                 "ArgumentCountError",
                 format!(

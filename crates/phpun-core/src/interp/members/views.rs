@@ -468,6 +468,7 @@ impl<'a> Interp<'a> {
                         end_line: args.end_line,
                         hold: Vec::new(),
                         arg_stack: Vec::new(),
+                        vm_slots: 0,
                     };
                     match target {
                         Value::Object(o) => Ok(Some(self.method_invoke(o, &mn, ca)?)),
@@ -504,6 +505,7 @@ impl<'a> Interp<'a> {
                         end_line: args.end_line,
                         hold: Vec::new(),
                         arg_stack: Vec::new(),
+                        vm_slots: 0,
                     };
                     Ok(Some(self.call_value(&cb, ca)?))
                 }
@@ -1753,6 +1755,7 @@ impl<'a> Interp<'a> {
                         end_line: 0,
                         hold: Vec::new(),
                         arg_stack: Vec::new(),
+                        vm_slots: 0,
                     };
                     return self.new_instance(&name, ca).map(Some);
                 }
@@ -1771,6 +1774,7 @@ impl<'a> Interp<'a> {
                         end_line: args.end_line,
                         hold: Vec::new(),
                         arg_stack: Vec::new(),
+                        vm_slots: 0,
                     }
                 };
                 let cn = obj

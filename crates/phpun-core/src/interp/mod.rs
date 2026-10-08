@@ -92,12 +92,16 @@ pub struct CallArgs {
     /// alive until the call returns, so its table stays charged
     /// through the builtin's own allocs).
     pub hold: Vec<Value>,
-    /// Arg-stack tokens — each `...` unpack site pushes `n*16` bytes
-    /// onto the request-scoped vm_stack arena (Interp::arg_stack_bytes)
-    /// and commits only the 256KB pages its push newly crosses. The
-    /// Rc dies with the frame's last CallArgs clone; mem_sweep then
-    /// releases the marginal pages and repays the arena counter.
+    /// Arg-stack tokens — one per vm_stack push this call made (the
+    /// frame push plus each `...` unpack site's arg span). Each token's
+    /// MemCharge carries the push's arena bookkeeping (see `vm_stack`),
+    /// repaid when the owning frame pops or a never-dispatched call's
+    /// tokens die at sweep.
     pub arg_stack: Vec<Rc<ArgStack>>,
+    /// Arena slots this call has pushed so far — frame overhead plus
+    /// args — used by `vm_call_push` to compute the extend delta and
+    /// the span a copy_call_frame moves.
+    pub vm_slots: u64,
     /// Diagnostic line of the last-evaluated argument — the deepest
     /// line marker reached while building this list. Zend sites the
     /// diagnostics of a compile-specialized literal call (sprintf rope)
@@ -105,11 +109,30 @@ pub struct CallArgs {
     pub end_line: usize,
 }
 
-/// Token for one `...` unpack site's push onto the shared vm_stack
-/// arena — the payload is its arg bytes (`n*16`); the marginal page
-/// charge lives in its MemCharge, released once the frame's last
-/// CallArgs clone dies (see `arg_stack`).
-pub struct ArgStack(pub i64);
+/// Token anchoring a vm_stack arena record — one per call push (on the
+/// CallArgs/Frame's arg_stack list) and one per live segment (on its
+/// VmSeg). The payload lives on the token's MemCharge.
+pub struct ArgStack;
+
+/// One live segment of zend's request-scoped vm_stack arena.
+struct VmSeg {
+    /// emalloc'd bytes — the request a limit trip on this segment
+    /// reports (256KB pages, aligned up for oversized calls).
+    size: u64,
+    /// Occupied bytes including the 32B segment header.
+    used: u64,
+    /// This segment's emalloc charge — dies with the segment (emptied
+    /// by a copy_call_frame, or freed at its owning frame's pop).
+    tok: Rc<ArgStack>,
+}
+
+/// ZEND_VM_STACK_PAGE_SIZE — zend vm_stack pages are 256KB.
+const VM_PAGE: u64 = 262_144;
+/// Arena slots one call frame costs — zend's ZEND_CALL_FRAME_SLOT plus
+/// the callee's op_array CV/TMP span. ponytail: flat estimate — the
+/// real span varies per decl, so a call landing near a page edge can
+/// cross a page one push late.
+const VM_FRAME_SLOTS: u64 = 5;
 
 impl CallArgs {
     pub fn positional(cells: Vec<Cell>) -> Self {
@@ -120,6 +143,7 @@ impl CallArgs {
             nonref_cells: Vec::new(),
             hold: Vec::new(),
             arg_stack: Vec::new(),
+            vm_slots: 0,
             end_line: 0,
         }
     }
@@ -246,9 +270,10 @@ struct MemCharge {
     inner: u64,
     huge: u64,
     table_req: u64,
-    /// vm_stack arg bytes this charge added to `arg_stack_bytes` —
-    /// ArgStack entries only; repaid to the arena counter at sweep.
-    arg_bytes: i64,
+    /// vm_stack rollback for a call's arena push — (segment token key,
+    /// slots pushed, minted-segment token key or 0). Applied when the
+    /// owning frame pops or the token dies.
+    vm: Option<(usize, u64, usize)>,
     probe: MemProbe,
 }
 
@@ -957,12 +982,12 @@ pub struct Interp<'a> {
     mem_tracked: HashMap<usize, MemCharge>,
     /// High-water mark of mem_used — memory_get_peak_usage().
     pub(crate) mem_peak: u64,
-    /// Live bytes on zend's ONE request-scoped vm_stack arena for
-    /// unpacked args — cumulative `n*16` across all live calls (NOT
-    /// per-frame pages); each unpack site commits only the 256KB
-    /// pages its push newly crosses, released at sweep when the
-    /// site's ArgStack dies (unwinding is LIFO ⇒ marginal = exact).
-    arg_stack_bytes: i64,
+    /// zend's ONE request-scoped vm_stack arena: 256KB-page segments
+    /// holding call frames' arg spans. A call that overflows the top
+    /// segment copies into a fresh one sized for its whole span — that
+    /// segment's emalloc is what a limit trip reports. Unwinding is
+    /// LIFO: a frame frees its minted segment at pop.
+    vm_stack: Vec<VmSeg>,
     /// Registry size that trips the next dead-entry sweep — bounds the
     /// tracker footprint for alloc-churn loops.
     mem_sweep_at: usize,
@@ -1721,7 +1746,12 @@ impl<'a> Interp<'a> {
             mem_in_chunk: MM_BASE_CHUNK,
             mem_huge: 0,
             mem_real_peak: MM_CHUNK,
-            arg_stack_bytes: 0,
+            // Seed: header + the top-level frame's span.
+            vm_stack: vec![VmSeg {
+                size: VM_PAGE,
+                used: 32 + VM_FRAME_SLOTS * 16,
+                tok: Rc::new(ArgStack),
+            }],
             mem_tracked: HashMap::new(),
             mem_peak: MM_BASE_USED,
             mem_sweep_at: 4096,
@@ -3741,12 +3771,14 @@ impl<'a> Interp<'a> {
                     self.mem_in_chunk = self.mem_in_chunk.saturating_sub(e.get().inner);
                     self.mem_huge = self.mem_huge.saturating_sub(e.get().huge);
                     self.mem_used = self.mem_used.saturating_sub(e.get().inner + e.get().huge);
-                    self.arg_stack_bytes -= e.get().arg_bytes;
+                    if let Some((seg, slots, own)) = e.get().vm {
+                        Self::vm_stack_apply(&mut self.vm_stack, seg, slots, own);
+                    }
                     let c = e.get_mut();
                     c.inner = 0;
                     c.huge = 0;
                     c.table_req = 0;
-                    c.arg_bytes = 0;
+                    c.vm = None;
                     let weak = Rc::downgrade(rc);
                     c.probe = Box::new(move || weak.strong_count() > 0);
                 }
@@ -3759,11 +3791,116 @@ impl<'a> Interp<'a> {
                     inner,
                     huge,
                     table_req: 0,
-                    arg_bytes: 0,
+                    vm: None,
                     probe: Box::new(move || weak.strong_count() > 0),
                 });
             }
         }
+    }
+
+    /// zend_vm_stack_extend_call_frame — grow the arena for a call
+    /// whose span is `out`'s current arg total plus the frame's
+    /// overhead. Fits: bump the top segment's used. Overflow: copy
+    /// the in-progress call into a fresh segment sized for its whole
+    /// span — zend_vm_stack_new_page emallocs it, and that request
+    /// is the figure zend's OOM reports.
+    fn vm_call_push(&mut self, out: &mut CallArgs) {
+        let want = VM_FRAME_SLOTS + (out.cells.len() + out.named.len()) as u64;
+        if want <= out.vm_slots {
+            return;
+        }
+        let extra_slots = want - out.vm_slots;
+        let extra = extra_slots * 16;
+        let top = self.vm_stack.last().unwrap();
+        if top.size.saturating_sub(top.used) < extra {
+            // zend_vm_stack_copy_call_frame: the whole in-progress
+            // call moves into the new segment; prev's top rolls back
+            // to the call's base and the segment frees when emptied —
+            // while the new segment's charge is already committed.
+            let used = want * 16;
+            let size = (used + 32 + VM_PAGE - 1) & !(VM_PAGE - 1);
+            let tok: Rc<ArgStack> = Rc::new(ArgStack);
+            self.mem_track(&tok, size);
+            let own = Rc::as_ptr(&tok) as *const u8 as usize;
+            let prev = self.vm_stack.len() - 1;
+            self.vm_stack[prev].used = self.vm_stack[prev]
+                .used
+                .saturating_sub(out.vm_slots * 16)
+                .max(32);
+            if self.vm_stack[prev].used <= 32 {
+                self.vm_stack.remove(prev);
+            }
+            self.vm_stack.push(VmSeg {
+                size,
+                used: 32 + used,
+                tok,
+            });
+            // The call's earlier pushes moved into the new segment —
+            // their rollbacks were settled by the prev rollback above.
+            for arc in &out.arg_stack {
+                let key = Rc::as_ptr(arc) as *const u8 as usize;
+                if let Some(c) = self.mem_tracked.get_mut(&key) {
+                    c.vm = None;
+                }
+            }
+            out.vm_slots = want;
+            self.vm_site(out, own, extra_slots, own);
+            return;
+        }
+        let seg_key = Rc::as_ptr(&top.tok) as *const u8 as usize;
+        self.vm_stack.last_mut().unwrap().used += extra;
+        out.vm_slots = want;
+        self.vm_site(out, seg_key, extra_slots, 0);
+    }
+
+    /// Record one arena push: the site token's MemCharge carries the
+    /// rollback — repaid at the owning frame's pop (vm_frame_free) or
+    /// at sweep once a never-dispatched call's token dies.
+    fn vm_site(&mut self, out: &mut CallArgs, seg: usize, slots: u64, own: usize) {
+        let site: Rc<ArgStack> = Rc::new(ArgStack);
+        self.mem_track(&site, 0);
+        let key = Rc::as_ptr(&site) as *const u8 as usize;
+        if let Some(c) = self.mem_tracked.get_mut(&key) {
+            c.vm = Some((seg, slots, own));
+        }
+        out.arg_stack.push(site);
+    }
+
+    /// Repay one pushed span's `used` and free its minted segment —
+    /// the frame pop frees the segment it extended (ZEND_CALL_
+    /// ALLOCATED); earlier segments freed by a copy are already gone,
+    /// so lookup misses are benign.
+    fn vm_stack_apply(stack: &mut Vec<VmSeg>, seg: usize, slots: u64, own: usize) {
+        let key_of = |s: &VmSeg| Rc::as_ptr(&s.tok) as *const u8 as usize;
+        if let Some(i) = stack.iter().rposition(|s| key_of(s) == seg) {
+            stack[i].used = stack[i].used.saturating_sub(slots * 16).max(32);
+        }
+        if own != 0 {
+            if let Some(i) = stack.iter().rposition(|s| key_of(s) == own) {
+                stack.remove(i);
+            }
+        }
+    }
+
+    /// Frame teardown frees the call's arena span — zend releases it
+    /// at pop, not when the next frame pops.
+    fn vm_frame_free(&mut self, sites: &[Rc<ArgStack>]) {
+        for arc in sites {
+            let key = Rc::as_ptr(arc) as *const u8 as usize;
+            let vm = self.mem_tracked.get_mut(&key).and_then(|c| c.vm.take());
+            if let Some((seg, slots, own)) = vm {
+                Self::vm_stack_apply(&mut self.vm_stack, seg, slots, own);
+            }
+        }
+    }
+
+    /// Pop a call frame and free its vm_stack span.
+    fn stack_pop(&mut self) -> Option<Frame> {
+        let f = self.stack.pop();
+        if let Some(f) = &f {
+            self.vm_frame_free(&f.arg_stack);
+        }
+        f
     }
 
     /// arData realloc accounting for table growth: book the new
@@ -3803,7 +3940,7 @@ impl<'a> Interp<'a> {
                     inner,
                     huge,
                     table_req: req,
-                    arg_bytes: 0,
+                    vm: None,
                     probe: Box::new(move || weak.strong_count() > 0),
                 });
             }
@@ -3846,21 +3983,25 @@ impl<'a> Interp<'a> {
     pub(crate) fn mem_sweep(&mut self) {
         let mut inner = 0u64;
         let mut huge = 0u64;
-        let mut arg_bytes = 0i64;
+        let mut freed = Vec::new();
         self.mem_tracked.retain(|_, c| {
             if (c.probe)() {
                 true
             } else {
                 inner += c.inner;
                 huge += c.huge;
-                arg_bytes += c.arg_bytes;
+                if let Some(v) = c.vm {
+                    freed.push(v);
+                }
                 false
             }
         });
         self.mem_in_chunk = self.mem_in_chunk.saturating_sub(inner);
         self.mem_huge = self.mem_huge.saturating_sub(huge);
         self.mem_used = self.mem_used.saturating_sub(inner + huge);
-        self.arg_stack_bytes -= arg_bytes;
+        for (seg, slots, own) in freed {
+            Self::vm_stack_apply(&mut self.vm_stack, seg, slots, own);
+        }
         self.mem_sweep_at = self.mem_tracked.len() + 4096;
     }
 
@@ -3899,7 +4040,9 @@ impl<'a> Interp<'a> {
             self.mem_in_chunk = self.mem_in_chunk.saturating_sub(c.inner);
             self.mem_huge = self.mem_huge.saturating_sub(c.huge);
             self.mem_used = self.mem_used.saturating_sub(c.inner + c.huge);
-            self.arg_stack_bytes -= c.arg_bytes;
+            if let Some((seg, slots, own)) = c.vm {
+                Self::vm_stack_apply(&mut self.vm_stack, seg, slots, own);
+            }
         }
     }
 
@@ -3972,7 +4115,7 @@ impl<'a> Interp<'a> {
                 inner,
                 huge,
                 table_req: 0,
-                arg_bytes: 0,
+                vm: None,
                 probe: Box::new(move || weak.strong_count() > 0),
             },
         );
@@ -6163,6 +6306,22 @@ impl<'a> Interp<'a> {
         args: &CallArgs,
         visible: bool,
     ) -> Result<Option<Value>, PhpError> {
+        // Builtins run without an interp Frame — free the call's
+        // vm_stack span at return like a frame pop. Ok(None) means a
+        // user function will consume the CallArgs — its frame owns it.
+        let r = self.call_builtin_inner(name, args, visible);
+        if !matches!(r, Ok(None)) {
+            self.vm_frame_free(&args.arg_stack);
+        }
+        r
+    }
+
+    fn call_builtin_inner(
+        &mut self,
+        name: &str,
+        args: &CallArgs,
+        visible: bool,
+    ) -> Result<Option<Value>, PhpError> {
         // A builtin frame pushed while dispatched from inside another
         // builtin's own machinery (internal_cb: sort/ob/array-callbacks)
         // reports `[internal function]` — Zend emits no file/line for a
@@ -6278,6 +6437,7 @@ impl<'a> Interp<'a> {
                     .collect(),
                 hold: args.hold.clone(),
                 arg_stack: args.arg_stack.clone(),
+                vm_slots: 0,
                 trav_cells: args
                     .trav_cells
                     .iter()
