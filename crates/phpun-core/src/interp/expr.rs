@@ -6734,6 +6734,28 @@ impl<'a> Interp<'a> {
             ));
         }
         let spl_iter = matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. }));
+        // A native-stub spl offsetGet returns the store's own cell —
+        // a named `&$o['k']` binds the bucket silently (zend's
+        // spl_array_read_dimension_ex never notices on this path; only
+        // `[]` falls to the overloaded-dim notice + Error below).
+        if spl_iter {
+            if let Some(kc) = &key {
+                let native = self
+                    .find_method_in(&o.borrow().class, "offsetGet")
+                    .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
+                    .unwrap_or(true);
+                if native {
+                    let arr = self.ao_arr(&o);
+                    let ak = self.arr_key(&kc.borrow())?;
+                    if let Some(cc) = arr.borrow().get_cell(&ak) {
+                        return Ok(cc);
+                    }
+                    let c = cell(Value::Null);
+                    arr.borrow_mut().set_cell(ak, c.clone());
+                    return Ok(c);
+                }
+            }
+        }
         self.last_ret_cell = None;
         // zend evaluates this read as BP_VAR_RW — a missing bucket is
         // created silently inside offsetGet.
