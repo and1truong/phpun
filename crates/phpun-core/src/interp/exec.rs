@@ -55,6 +55,15 @@ impl<'a> Interp<'a> {
                     ));
                 }
             }
+            // Per-op scratch tied to a statement's last write op: the
+            // prop-cell receiver stash and the dim operand caches hold
+            // Rc clones — left over they keep a container externally
+            // strong and gc_collect_cycles reads the dead cycle as
+            // rooted (gc_006's `$a->a[0] =& $a` then `unset($a)`).
+            self.last_prop_ov = None;
+            self.dim_key_conv.clear();
+            self.dim_cv_bound.clear();
+            self.dim_undef_cells.clear();
             match self.exec(s) {
                 Flow::Normal => {
                     // Generators that died at this statement (unset(),

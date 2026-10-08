@@ -1372,6 +1372,20 @@ pub(crate) fn php_unserialize(
                 }
                 let v = php_unserialize(it, s, pos, err, vhash)?;
                 let mut ob = obj.borrow_mut();
+                // A Throwable's `previous` lives in the exception
+                // internal (getPrevious reads it, not the prop slot)
+                // — zend's C-field mirrors the serialized
+                // `\0Exception\0previous` member.
+                if let Some(crate::value::ObjectInternal::Exception { previous, .. }) =
+                    &mut ob.internal
+                {
+                    if plain == b"previous" {
+                        *previous = match &*v.borrow() {
+                            Value::Object(o) => Some(Value::Object(o.clone())),
+                            _ => None,
+                        };
+                    }
+                }
                 let key = crate::value::lossy(&ks).into_owned();
                 if !ob.prop_order.contains(&key) {
                     ob.prop_order.push(key.clone());
