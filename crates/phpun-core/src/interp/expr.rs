@@ -6194,6 +6194,15 @@ impl<'a> Interp<'a> {
         // the very table this fetch is walking.
         let _hold = det.and_then(|d| d.pre.value());
         self.dim_throw = None;
+        // An append has no slot for `??=`'s isset read — zend's compiler
+        // rejects `[]` there ("Cannot use [] for reading"). Other compound
+        // ops read via ASSIGN_DIM_OP, where appending stays legal.
+        if quiet && keys.iter().any(|k| matches!(k, DimArg::Append)) {
+            return self.fail(PhpError::compile_fatal(
+                "Cannot use [] for reading",
+                self.cur_line,
+            ));
+        }
         for (n, ka) in keys.iter().enumerate() {
             // A diagnostic fired inside this fetch (CV bind, offset
             // conversion) may have rebound the root container — zend's
@@ -6468,7 +6477,7 @@ impl<'a> Interp<'a> {
                         // reaches its RHS or the write's dispatch
                         // (oracle dies inside the quiet read). Scalars
                         // quietly miss and keep walking.
-                        let bad = if quiet && det.map_or(true, |d| d.coalesce) {
+                        let bad = if quiet && det.is_none_or(|d| d.coalesce) {
                             match &*b {
                                 Value::Object(o) if !self.obj_is_a(o, "ArrayAccess") => {
                                     Some(format!(
@@ -6476,9 +6485,9 @@ impl<'a> Interp<'a> {
                                         o.borrow().class.name()
                                     ))
                                 }
-                                Value::Callable(_) => Some(
-                                    "Cannot use object of type Closure as array".to_string(),
-                                ),
+                                Value::Callable(_) => {
+                                    Some("Cannot use object of type Closure as array".to_string())
+                                }
                                 _ => None,
                             }
                         } else {
