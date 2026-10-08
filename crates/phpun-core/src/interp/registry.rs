@@ -53,12 +53,29 @@ impl<'a> Interp<'a> {
                 line: 0,
             }
         }
-        fn method(name: &str, _params: &[&str]) -> Rc<MethodDecl> {
+        fn method(name: &str, params: &[&str]) -> Rc<MethodDecl> {
             Rc::new(MethodDecl {
                 decl: FunctionDecl {
                     ret: None,
                     name: name.into(),
-                    params: vec![],
+                    // Throwable-family params are all optional in the
+                    // zend arginfo (the ctor ZPP reads decl.params).
+                    params: params
+                        .iter()
+                        .map(|n| Param {
+                            name: n.to_string(),
+                            default: Some(Expr::Null),
+                            by_ref: false,
+                            variadic: false,
+                            ty: None,
+                            promoted: false,
+                            vis: None,
+                            readonly: false,
+                            is_final: false,
+                            set_vis: None,
+                            hooks: None,
+                        })
+                        .collect(),
                     body: vec![],
                     attrs: vec![],
                     by_ref: false,
@@ -975,19 +992,34 @@ impl<'a> Interp<'a> {
                         decl: FunctionDecl {
                             ret: None,
                             name: "__construct".into(),
-                            params: vec![Param {
-                                name: "datetime".into(),
-                                default: Some(Expr::Str("now".into())),
-                                by_ref: false,
-                                variadic: false,
-                                ty: Some(vec!["string".into()]),
-                                promoted: false,
-                                vis: None,
-                                readonly: false,
-                                is_final: false,
-                                set_vis: None,
-                                hooks: None,
-                            }],
+                            params: vec![
+                                Param {
+                                    name: "datetime".into(),
+                                    default: Some(Expr::Str("now".into())),
+                                    by_ref: false,
+                                    variadic: false,
+                                    ty: Some(vec!["string".into()]),
+                                    promoted: false,
+                                    vis: None,
+                                    readonly: false,
+                                    is_final: false,
+                                    set_vis: None,
+                                    hooks: None,
+                                },
+                                Param {
+                                    name: "timezone".into(),
+                                    default: Some(Expr::Null),
+                                    by_ref: false,
+                                    variadic: false,
+                                    ty: Some(vec!["?DateTimeZone".into()]),
+                                    promoted: false,
+                                    vis: None,
+                                    readonly: false,
+                                    is_final: false,
+                                    set_vis: None,
+                                    hooks: None,
+                                },
+                            ],
                             body: vec![],
                             attrs: vec![],
                             by_ref: false,
@@ -1406,6 +1438,21 @@ impl<'a> Interp<'a> {
             set_vis: None,
             hooks: None,
         };
+        // Optional (nullable-default) arginfo param — ctor ZPP arity
+        // treats it as non-required.
+        let opt_param = |n: &str| Param {
+            name: n.into(),
+            default: Some(Expr::Null),
+            by_ref: false,
+            variadic: false,
+            ty: None,
+            promoted: false,
+            vis: None,
+            readonly: false,
+            is_final: false,
+            set_vis: None,
+            hooks: None,
+        };
         let mk_smethod = |name: &str, params: Vec<Param>| {
             let mut m = (*mk_method(name, params)).clone();
             m.is_static = true;
@@ -1424,7 +1471,7 @@ impl<'a> Interp<'a> {
                 traits: vec![],
                 adaptations: vec![],
                 methods: vec![
-                    mk_method("__construct", vec![any_param("class", false)]),
+                    mk_method("__construct", vec![any_param("objectOrClass", false)]),
                     mk_method("newInstanceWithoutConstructor", vec![]),
                     mk_method("newInstance", vec![any_param("args", true)]),
                     mk_method("newInstanceArgs", vec![any_param("args", false)]),
@@ -1521,7 +1568,7 @@ impl<'a> Interp<'a> {
                 methods: vec![
                     mk_method(
                         "__construct",
-                        vec![any_param("class", false), any_param("name", false)],
+                        vec![any_param("objectOrMethod", false), opt_param("method")],
                     ),
                     mk_method(
                         "invoke",
@@ -1601,12 +1648,24 @@ impl<'a> Interp<'a> {
                 traits: vec![],
                 adaptations: vec![],
                 methods: vec![
+                    mk_method(
+                        "__construct",
+                        vec![any_param("function", false), any_param("param", false)],
+                    ),
                     mk_method("isCallable", vec![]),
                     mk_method("isVariadic", vec![]),
                     mk_method("hasType", vec![]),
                     mk_method("getType", vec![]),
                     mk_method("getName", vec![]),
                     mk_method("getClass", vec![]),
+                    mk_method("getPosition", vec![]),
+                    mk_method("isOptional", vec![]),
+                    mk_method("isDefaultValueAvailable", vec![]),
+                    mk_method("getDefaultValue", vec![]),
+                    mk_method("isDefaultValueConstant", vec![]),
+                    mk_method("getDefaultValueConstantName", vec![]),
+                    mk_method("allowsNull", vec![]),
+                    mk_method("isPassedByReference", vec![]),
                     mk_method("getDefaultValue", vec![]),
                     mk_method("isDefaultValueAvailable", vec![]),
                 ],
@@ -1634,7 +1693,7 @@ impl<'a> Interp<'a> {
                 methods: vec![
                     mk_method(
                         "__construct",
-                        vec![any_param("class", false), any_param("name", false)],
+                        vec![any_param("class", false), any_param("constant", false)],
                     ),
                     mk_method("getName", vec![]),
                     mk_method("getValue", vec![]),
@@ -1670,6 +1729,14 @@ impl<'a> Interp<'a> {
                 traits: vec![],
                 adaptations: vec![],
                 methods: vec![
+                    {
+                        // zend's attribute reflector ctor is private —
+                        // `new ReflectionAttribute` fails access, not
+                        // arity.
+                        let mut m = (*mk_method("__construct", vec![])).clone();
+                        m.visibility = Visibility::Private;
+                        Rc::new(m)
+                    },
                     mk_method("getName", vec![]),
                     mk_method("getArguments", vec![]),
                     mk_method("newInstance", vec![]),
@@ -1950,7 +2017,7 @@ impl<'a> Interp<'a> {
                 traits: vec![],
                 adaptations: vec![],
                 methods: vec![
-                    mk_method("__construct", vec![any_param("class", false)]),
+                    mk_method("__construct", vec![any_param("objectOrClass", false)]),
                     mk_method("getCases", vec![]),
                     mk_method("getCase", vec![str_param("name")]),
                     mk_method("hasCase", vec![str_param("name")]),
@@ -2135,6 +2202,13 @@ impl<'a> Interp<'a> {
                 traits: vec![],
                 adaptations: vec![],
                 methods: vec![
+                    {
+                        // Private ctor like zend's — `new
+                        // ReflectionReference` is an access error.
+                        let mut m = (*mk_method("__construct", vec![])).clone();
+                        m.visibility = Visibility::Private;
+                        Rc::new(m)
+                    },
                     mk_smethod(
                         "fromArrayElement",
                         vec![any_param("array", false), any_param("key", false)],
@@ -2320,6 +2394,39 @@ impl<'a> Interp<'a> {
                 &["message", "code", "file", "line", "severity"],
             );
             d.methods.push(method("getSeverity", &[]));
+            // zend gives ErrorException its own ctor arginfo:
+            // (message, code, severity, filename, line, previous).
+            for m in d.methods.iter_mut() {
+                if m.decl.name == "__construct" {
+                    let mut decl = m.decl.clone();
+                    decl.params = [
+                        "message", "code", "severity", "filename", "line", "previous",
+                    ]
+                    .iter()
+                    .map(|n| Param {
+                        name: (*n).into(),
+                        default: Some(Expr::Null),
+                        by_ref: false,
+                        variadic: false,
+                        ty: None,
+                        promoted: false,
+                        vis: None,
+                        readonly: false,
+                        is_final: false,
+                        set_vis: None,
+                        hooks: None,
+                    })
+                    .collect();
+                    *m = Rc::new(MethodDecl {
+                        decl,
+                        is_static: m.is_static,
+                        is_abstract: m.is_abstract,
+                        is_final: m.is_final,
+                        visibility: m.visibility,
+                        trait_alias_of: None,
+                    });
+                }
+            }
             reg(d, false);
         }
 
@@ -2348,10 +2455,14 @@ impl<'a> Interp<'a> {
             ("UnhandledMatchError", "Error"),
             ("ReflectionException", "Exception"),
         ] {
-            reg(
-                throwable_class(name, Some(parent), &["message", "code", "file", "line"]),
-                false,
-            );
+            let mut d = throwable_class(name, Some(parent), &["message", "code", "file", "line"]);
+            // Only ErrorException has its own ctor in zend — every other
+            // subclass inherits Exception's/Error's so arginfo errors
+            // name the DECLARING class ("Exception::__construct()").
+            d.methods.retain(|m| {
+                !m.decl.name.eq_ignore_ascii_case("__construct") || name == "ErrorException"
+            });
+            reg(d, false);
         }
     }
 }

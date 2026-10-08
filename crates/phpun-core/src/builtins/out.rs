@@ -908,25 +908,11 @@ fn zval_str(it: &mut Interp, v: &Value) -> Result<Vec<u8>, PhpError> {
             Err(e) => {
                 if e.kind == crate::error::ErrorKind::Throw {
                     if let Some(x) = it.take_pending_exception() {
-                        // Zend's backtrace shows the innermost internal
-                        // frame (`#0 sprintf(...)`) but no deeper ones
-                        // — call_user_func_array's frame is gone once
-                        // it delegates. Keep every PHP frame plus only
-                        // the last internal frame.
-                        if let Value::Object(o) = &x {
-                            if let Some(crate::value::ObjectInternal::Exception {
-                                frames, ..
-                            }) = &mut o.borrow_mut().internal
-                            {
-                                if frames.last().map(|fr| fr.internal) == Some(true) {
-                                    let mut f = (**frames).clone();
-                                    let top = f.pop().unwrap();
-                                    f.retain(|fr| !fr.internal);
-                                    f.push(top);
-                                    *frames = Rc::new(f);
-                                }
-                            }
-                        }
+                        // A literal call Zend compile-specialized away
+                        // (const-format rope `sprintf`) left a `!visible`
+                        // frame on call_trace — the uniform
+                        // trace_frame_hidden filter drops it from every
+                        // render path, no snapshot fixup needed.
                         return Err(it.throw_value(x));
                     }
                 }

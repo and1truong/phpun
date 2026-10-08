@@ -69,8 +69,7 @@ pub(crate) fn dispatch(
             // fatals instead of OOMing (zend emalloc-check parity).
             let want = 32i128 + dec.max(0) as i128 + dp.len() as i128;
             let limit = it.ini_bytes("memory_limit");
-            if limit > 0 && (it.mem_used as i128) + want > limit as i128 {
-                it.mem_used = limit.max(0) as u64 + 1;
+            if limit > 0 && (it.mem_total() as i128) + want > limit as i128 {
                 it.mem_exceeded = true;
                 let mut e = PhpError::fatal(
                     format!(
@@ -89,7 +88,8 @@ pub(crate) fn dispatch(
                 let mut e = PhpError::fatal(
                     format!(
                         "Out of memory (allocated {} bytes) (tried to allocate {} bytes)",
-                        it.mem_used, want
+                        it.mem_total(),
+                        want
                     ),
                     it.cur_line,
                 );
@@ -517,6 +517,17 @@ pub(crate) fn dispatch(
             Value::Int(n as i64)
         }
         "soundex" => Value::str(soundex(&arg_str(it, args, 0))),
+        "metaphone" => {
+            let s = arg_bs(it, args, 0);
+            let max = arg(args, 1).to_int();
+            if args.len() > 1 && max < 0 {
+                return err(
+                    "ValueError",
+                    "metaphone(): Argument #2 ($max_phonemes) must be greater than or equal to 0",
+                );
+            }
+            Value::bytes(metaphone(&s, max))
+        }
         "quotemeta" => {
             let s = arg_bs(it, args, 0);
             let mut out = Vec::with_capacity(s.len());
@@ -1349,6 +1360,222 @@ fn soundex(s: &str) -> String {
     out.truncate(4);
     while out.len() < 4 {
         out.push('0');
+    }
+    out
+}
+
+/// Zend's metaphone port (ext/standard/metaphone.c, traditional=1):
+/// byte-oriented, 'X' encodes SH and '0' encodes TH in the output.
+fn metaphone(word: &[u8], max_phonemes: i64) -> Vec<u8> {
+    const CODES: [u8; 26] = [
+        1, 16, 4, 16, 9, 2, 4, 16, 9, 2, 0, 2, 2, 2, 1, 4, 0, 2, 4, 4, 1, 0, 0, 0, 8, 0,
+    ];
+    let isalpha = |c: u8| c.is_ascii_alphabetic();
+    let upper = |c: u8| c.to_ascii_uppercase();
+    let encode = |c: u8| {
+        if isalpha(c) {
+            CODES[(upper(c) - b'A') as usize]
+        } else {
+            0
+        }
+    };
+    let isvowel = |c: u8| encode(c) & 1 != 0;
+    let isbreak = |c: u8| !isalpha(c);
+    let affecth = |c: u8| encode(c) & 4 != 0;
+    let makesoft = |c: u8| encode(c) & 8 != 0;
+    let noghtof = |c: u8| encode(c) & 16 != 0;
+    let at = |i: usize| word.get(i).copied().unwrap_or(0);
+    let look_back = |w_idx: usize, n: usize| {
+        if w_idx >= n {
+            upper(at(w_idx - n))
+        } else {
+            0
+        }
+    };
+    let lookahead = |w_idx: usize, n: usize| {
+        let mut i = 0;
+        while i < n && at(w_idx + i) != 0 {
+            i += 1;
+        }
+        upper(at(w_idx + i))
+    };
+    let mut out: Vec<u8> = Vec::new();
+    let mut w_idx = 0usize;
+    // First letter phase — skip non-alphas, empty/garbage → "".
+    let mut curr_letter;
+    loop {
+        curr_letter = at(w_idx);
+        if isalpha(curr_letter) {
+            break;
+        }
+        if curr_letter == 0 {
+            return out;
+        }
+        w_idx += 1;
+    }
+    curr_letter = upper(curr_letter);
+    let next_letter = upper(at(w_idx + 1));
+    match curr_letter {
+        b'A' => {
+            if next_letter == b'E' {
+                out.push(b'E');
+                w_idx += 2;
+            } else {
+                out.push(b'A');
+                w_idx += 1;
+            }
+        }
+        b'G' | b'K' | b'P' => {
+            if next_letter == b'N' {
+                out.push(b'N');
+                w_idx += 2;
+            }
+        }
+        b'W' => {
+            if next_letter == b'R' {
+                out.push(b'R');
+                w_idx += 2;
+            } else if next_letter == b'H' || isvowel(next_letter) {
+                out.push(b'W');
+                w_idx += 2;
+            }
+        }
+        b'X' => {
+            out.push(b'S');
+            w_idx += 1;
+        }
+        b'E' | b'I' | b'O' | b'U' => {
+            out.push(curr_letter);
+            w_idx += 1;
+        }
+        _ => {}
+    }
+    loop {
+        curr_letter = at(w_idx);
+        if curr_letter == 0 || (max_phonemes != 0 && out.len() >= max_phonemes as usize) {
+            break;
+        }
+        if !isalpha(curr_letter) {
+            w_idx += 1;
+            continue;
+        }
+        curr_letter = upper(curr_letter);
+        let prev_letter = look_back(w_idx, 1);
+        // Drop duplicates, except CC.
+        if curr_letter == prev_letter && curr_letter != b'C' {
+            w_idx += 1;
+            continue;
+        }
+        let next_letter = upper(at(w_idx + 1));
+        let after_next = if at(w_idx + 1) != 0 {
+            upper(at(w_idx + 2))
+        } else {
+            0
+        };
+        let mut skip_letter = 0usize;
+        match curr_letter {
+            b'B' => {
+                if prev_letter != b'M' {
+                    out.push(b'B');
+                }
+            }
+            b'C' => {
+                if makesoft(next_letter) {
+                    if next_letter == b'I' && after_next == b'A' {
+                        out.push(b'X');
+                    } else if prev_letter != b'S' {
+                        out.push(b'S');
+                    }
+                } else if next_letter == b'H' {
+                    out.push(b'X');
+                    skip_letter += 1;
+                } else {
+                    out.push(b'K');
+                }
+            }
+            b'D' => {
+                if next_letter == b'G' && makesoft(after_next) {
+                    out.push(b'J');
+                    skip_letter += 1;
+                } else {
+                    out.push(b'T');
+                }
+            }
+            b'G' => {
+                if next_letter == b'H' {
+                    if !(noghtof(look_back(w_idx, 3)) || look_back(w_idx, 4) == b'H') {
+                        out.push(b'F');
+                        skip_letter += 1;
+                    }
+                } else if next_letter == b'N' {
+                    if !(isbreak(after_next) || (after_next == b'E' && lookahead(w_idx, 3) == b'D'))
+                    {
+                        out.push(b'K');
+                    }
+                } else if makesoft(next_letter) && prev_letter != b'G' {
+                    out.push(b'J');
+                } else {
+                    out.push(b'K');
+                }
+            }
+            b'H' => {
+                if isvowel(next_letter) && !affecth(prev_letter) {
+                    out.push(b'H');
+                }
+            }
+            b'K' => {
+                if prev_letter != b'C' {
+                    out.push(b'K');
+                }
+            }
+            b'P' => {
+                if next_letter == b'H' {
+                    out.push(b'F');
+                } else {
+                    out.push(b'P');
+                }
+            }
+            b'Q' => out.push(b'K'),
+            b'S' => {
+                if next_letter == b'I' && (after_next == b'O' || after_next == b'A') {
+                    out.push(b'X');
+                } else if next_letter == b'H' {
+                    out.push(b'X');
+                    skip_letter += 1;
+                } else {
+                    out.push(b'S');
+                }
+            }
+            b'T' => {
+                if next_letter == b'I' && (after_next == b'O' || after_next == b'A') {
+                    out.push(b'X');
+                } else if next_letter == b'H' {
+                    out.push(b'0');
+                    skip_letter += 1;
+                } else if !(next_letter == b'C' && after_next == b'H') {
+                    out.push(b'T');
+                }
+            }
+            b'V' => out.push(b'F'),
+            b'W' => {
+                if isvowel(next_letter) {
+                    out.push(b'W');
+                }
+            }
+            b'X' => {
+                out.push(b'K');
+                out.push(b'S');
+            }
+            b'Y' => {
+                if isvowel(next_letter) {
+                    out.push(b'Y');
+                }
+            }
+            b'Z' => out.push(b'S'),
+            b'F' | b'J' | b'L' | b'M' | b'N' | b'R' => out.push(curr_letter),
+            _ => {}
+        }
+        w_idx += skip_letter + 1;
     }
     out
 }
