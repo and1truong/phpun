@@ -363,9 +363,18 @@ impl<'a> Interp<'a> {
                             if let Expr::Unpack(e) = shape {
                                 let sv = self.eval(e)?;
                                 for (sk, c) in self.unpack_items(&sv, false)? {
+                                    // zend zval-copies elements — a live
+                                    // IS_REFERENCE one keeps its cell.
                                     match sk {
-                                        Some(s) => arr.set(ArrKey::Str(s), c.borrow().clone()),
-                                        None => arr.push(c.borrow().clone()),
+                                        Some(s) => crate::builtins::array::copy_elem(
+                                            self,
+                                            &mut arr,
+                                            &ArrKey::Str(s),
+                                            &c,
+                                        ),
+                                        None => {
+                                            crate::builtins::array::push_elem(self, &mut arr, &c)
+                                        }
                                     }
                                 }
                                 continue;

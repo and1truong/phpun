@@ -337,26 +337,35 @@ impl<'a> Interp<'a> {
                     if Rc::strong_count(a) > 1
                         && (decl.is_empty() || {
                             let b = a.borrow();
-                            let n_pos = b
-                                .entries
-                                .iter()
-                                .filter(|(k, _)| matches!(k, ArrKey::Int(_)))
-                                .count();
-                            decl.iter().enumerate().any(|(i, p)| {
-                                p.by_ref
-                                    && (i >= pos && i < pos + n_pos
-                                        || b.entries.iter().any(|(k, _)| {
-                                            matches!(k, ArrKey::Str(s) if &**s == p.name.as_str())
-                                        }))
+                            // zend binds each unpacked element like a
+                            // sent arg: int keys take the next positional
+                            // slots, string keys the same-named param —
+                            // overflow and unknown names land in the
+                            // variadic (the fallback the named-arg path
+                            // below uses).
+                            let vref = || decl.iter().any(|p| p.variadic && p.by_ref);
+                            let mut slot = pos;
+                            b.entries.iter().any(|(k, _)| match k {
+                                ArrKey::Int(_) => {
+                                    let hit =
+                                        decl.get(slot).map(|p| p.by_ref).unwrap_or_else(&vref);
+                                    slot += 1;
+                                    hit
+                                }
+                                ArrKey::Str(s) => decl
+                                    .iter()
+                                    .find(|p| !p.variadic && &**s == p.name.as_str())
+                                    .map(|p| p.by_ref)
+                                    .unwrap_or_else(&vref),
+                                ArrKey::Tomb => false,
                             })
                         })
                     {
-                        let mut na = a.borrow().clone();
-                        for (_, c) in na.entries.iter_mut() {
-                            let v = c.borrow().clone();
-                            *c = cell(v);
-                        }
-                        let nv = Value::Array(Rc::new(RefCell::new(na)));
+                        // zend separates the shared hash table before
+                        // binding — plain elements get fresh storage,
+                        // live IS_REFERENCE buckets stay shared (the
+                        // same split `=`-copies use).
+                        let nv = Value::Array(Rc::new(RefCell::new(self.dup_array(&a.borrow()))));
                         if let Ok(c) = self.eval_cell(e) {
                             *c.borrow_mut() = nv.clone();
                         }
@@ -517,15 +526,27 @@ impl<'a> Interp<'a> {
                                 .unwrap_or(pos + 1),
                             None => pos + 1,
                         };
+                        // zend names the landing param only for a
+                        // real (non-variadic) slot — `Argument #N
+                        // ($name)`; an arg landing on the variadic
+                        // prints bare `Argument #N`.
+                        let pname = match &name {
+                            Some(n) => decl
+                                .iter()
+                                .find(|p| !p.variadic && p.name == *n)
+                                .map(|p| p.name.as_str()),
+                            None => decl
+                                .get(pos)
+                                .filter(|p| !p.variadic)
+                                .map(|p| p.name.as_str()),
+                        };
                         return self.fail(PhpError::uncaught(
                             "Error",
                             format!(
-                                "{}: Argument #{} (${}) could not be passed by reference",
+                                "{}: Argument #{}{} could not be passed by reference",
                                 ctx,
                                 argno,
-                                name.as_deref()
-                                    .or_else(|| decl.get(pos).map(|p| p.name.as_str()))
-                                    .unwrap_or("")
+                                pname.map(|n| format!(" (${})", n)).unwrap_or_default()
                             ),
                             0,
                         ));
@@ -573,14 +594,9 @@ impl<'a> Interp<'a> {
     ) -> Result<SpreadItems, PhpError> {
         match v {
             Value::Array(a) => {
-                // Element cells are handed to the call as potential
-                // references — Zend separates the array first so a
-                // shared copy (e.g. `$ary2 = $ary`) keeps its own
-                // values (named_params/unpack).
-                for (_, c) in a.borrow_mut().entries.iter_mut() {
-                    let fresh = cell(c.borrow().clone());
-                    *c = fresh;
-                }
+                // Elements hand out their real cells — by-ref params
+                // bind them (a shared source is cow-separated at the
+                // call site first), by-value params read the value.
                 let mut out = Vec::new();
                 for (k, c) in a.borrow().iter() {
                     let n = match k {

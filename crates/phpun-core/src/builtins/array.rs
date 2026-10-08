@@ -2525,7 +2525,7 @@ fn array_assoc_match(
 /// `&` dumps, writes alias back); every other element copies by
 /// value. Bind-replaces on key collision the way an overwritten
 /// bucket does.
-fn copy_elem(it: &Interp, out: &mut PhpArray, k: &ArrKey, c: &Cell) {
+pub(crate) fn copy_elem(it: &Interp, out: &mut PhpArray, k: &ArrKey, c: &Cell) {
     // zend unwraps an IS_REFERENCE bucket whose refcount is 1 —
     // the cell is shared only while aliased elsewhere.
     if it.is_ref_cell(c) && Rc::strong_count(c) > 1 {
@@ -2544,7 +2544,7 @@ fn copy_elem(it: &Interp, out: &mut PhpArray, k: &ArrKey, c: &Cell) {
 }
 
 /// `copy_elem` for index-appended elements.
-fn push_elem(it: &Interp, out: &mut PhpArray, c: &Cell) {
+pub(crate) fn push_elem(it: &Interp, out: &mut PhpArray, c: &Cell) {
     if it.is_ref_cell(c) && Rc::strong_count(c) > 1 {
         out.push_cell(c.clone());
     } else {
