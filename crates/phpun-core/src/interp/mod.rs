@@ -279,6 +279,17 @@ const MM_BASE_CHUNK: u64 = 655_360;
 /// oracle's capacity curve (16384→32768 at len 16384, align4096
 /// beyond).
 const OB_INIT_CAP: u64 = 16384;
+/// Per open level's non-buffer bookkeeping (php_output_handler
+/// struct and friends) — folded into the boot charge so the level's
+/// erealloc figure stays the buffer's own request.
+const OB_LEVEL_STRUCT: u64 = 128;
+/// Request-lifetime ob machinery retained after the last level ends
+/// (the output stack, handler slots) — oracle keeps ~2-3K once ob
+/// has ever been used; the figure jitters ±1K across scripts with
+/// heap churn, so this is calibrated to the probe median (~2.6K).
+/// ponytail: lumped — per-script fragmentation residuals can't be
+/// reproduced byte-exactly without the real page map (PR #88 owns).
+const OB_RESID: u64 = 2640;
 /// emalloc request for a new dynamic-property bucket in an object's
 /// slot table.
 pub(crate) const OBJ_SLOT_REQ: u64 = 32;
@@ -477,6 +488,11 @@ pub struct Interp<'a> {
     /// rematerialize when the consumer's cursor passes each open tag
     /// (Zend's buffers are global across suspends).
     suspended_obs: Vec<ObLevel>,
+    /// One-time token for zend's retained ob machinery (the output
+    /// stack and per-level handler structs) — created on the first
+    /// real level, never released: oracle keeps ~2.6K after the last
+    /// pop.
+    ob_boot: Option<Rc<()>>,
     /// While >0, warnings are suppressed (implements `??`, `isset`,
     /// `empty`, `@`).
     silence: u32,
@@ -1635,6 +1651,7 @@ impl<'a> Interp<'a> {
             weakrefs: std::collections::HashMap::new(),
             ob_stack: Vec::new(),
             suspended_obs: Vec::new(),
+            ob_boot: None,
             silence: 0,
             isset_quiet: 0,
             statics: HashMap::new(),
@@ -3941,6 +3958,28 @@ impl<'a> Interp<'a> {
     /// the charge can't wait for the boundary.
     /// `mem_realloc`'s table_req dedupe makes unchanged levels free.
     pub(crate) fn ob_meter_sync(&mut self) {
+        // The request-lifetime ob stack: booted by the first real
+        // level, plus each open level's small handler struct. Never
+        // released — oracle retains ~2.6K after the last pop.
+        if self.ob_boot.is_none() {
+            let real = self
+                .ob_stack
+                .iter()
+                .chain(self.suspended_obs.iter())
+                .any(|l| l.pop_head.is_none());
+            if real {
+                self.ob_boot = Some(std::rc::Rc::new(()));
+            }
+        }
+        if let Some(boot) = self.ob_boot.clone() {
+            let n = self
+                .ob_stack
+                .iter()
+                .chain(self.suspended_obs.iter())
+                .filter(|l| l.pop_head.is_none())
+                .count() as u64;
+            self.ob_mem_apply(&boot, OB_RESID + OB_LEVEL_STRUCT * n);
+        }
         for i in 0..self.ob_stack.len() {
             let (tok, want) = (self.ob_stack[i].mem_tok.clone(), self.ob_stack[i].charged);
             self.ob_mem_apply(&tok, want.max(0) as u64);
