@@ -4786,6 +4786,23 @@ impl<'a> Interp<'a> {
                 Self::gc_internal_prop(pname),
             );
         }
+        // ArrayIter's AoStore is zend's `intern->array` slot — a real
+        // counted hold of the object (raw edge), not a member zval.
+        // Without it a `=&`-bound store self-roots on its unaccounted
+        // clone and `$ao[0] =& $ao` never collects. `src` (the object an
+        // ArrayObject wraps) is the same kind of bare hold. Shared
+        // stores (getIterator siblings) contribute one edge each —
+        // reachability then keeps the array alive while any sharer is.
+        if let Some(crate::value::ObjectInternal::ArrayIter { store, .. }) = &ob.internal {
+            let st = store.borrow();
+            let v = Value::Array(st.arr.clone());
+            Self::gc_scan_held(&v, None, scan, out, depth - 1, visited, false);
+            if let Some(src) = &st.src {
+                let v = Value::Object(src.clone());
+                Self::gc_scan_held(&v, None, scan, out, depth - 1, visited, false);
+            }
+            return;
+        }
         let Some(crate::value::ObjectInternal::Generator(st)) = &ob.internal else {
             return;
         };

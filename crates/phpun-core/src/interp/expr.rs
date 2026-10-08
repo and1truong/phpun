@@ -2597,23 +2597,99 @@ impl<'a> Interp<'a> {
                                 } else {
                                     None
                                 };
-                                if let (Some(arr), Some(k)) = (spl_arr, &key) {
-                                    let old = arr.borrow_mut().bind_cell(to_key(k), src);
-                                    return self.destruct_displaced(old);
+                                let is_spl = spl_arr.is_some();
+                                // zend routes `=&` dims on spl classes
+                                // through a userland offsetGet override
+                                // (the generic overloaded-dim flow);
+                                // only the native stub reads/writes the
+                                // backing store directly.
+                                let native_stub = is_spl
+                                    && self
+                                        .find_method_in(&o.borrow().class, "offsetGet")
+                                        .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
+                                        .unwrap_or(true);
+                                if native_stub {
+                                    if let (Some(arr), Some(k)) = (spl_arr, &key) {
+                                        let old = arr.borrow_mut().bind_cell(to_key(k), src);
+                                        // A `=&` element can close a
+                                        // cycle through the backing
+                                        // store — put it in the GC
+                                        // universe like the plain `=&`
+                                        // binds do (`$ao[0] =& $ao`
+                                        // collects 2).
+                                        self.arr_handles.push(std::rc::Rc::downgrade(&arr));
+                                        return self.destruct_displaced(old);
+                                    }
                                 }
                                 if self.obj_is_a(o, "ArrayAccess") {
-                                    let _ = self.method_invoke(
-                                        o.clone(),
-                                        "offsetGet",
-                                        CallArgs::positional(vec![cell(
-                                            key.clone().unwrap_or(Value::Null),
-                                        )]),
-                                    );
+                                    let mut res = Ok(Value::Null);
+                                    if !native_stub {
+                                        // Append supplies no dim: spl's
+                                        // handler calls the override
+                                        // with zero args, the generic
+                                        // ArrayAccess path passes NULL.
+                                        let given = usize::from(!(is_spl && key.is_none()));
+                                        // An engine-invoked method
+                                        // (`zend_call_method`) reports a
+                                        // missing required param via the
+                                        // per-param bind error "#N ($x)
+                                        // not passed", not the userland
+                                        // positional count check.
+                                        let missing = self
+                                            .find_method_in(&o.borrow().class, "offsetGet")
+                                            .and_then(|(m, _)| {
+                                                m.decl
+                                                    .params
+                                                    .iter()
+                                                    .enumerate()
+                                                    .find(|(i, p)| {
+                                                        *i >= given
+                                                            && p.default.is_none()
+                                                            && !p.variadic
+                                                    })
+                                                    .map(|(i, p)| (i, p.name.clone(), m.decl.line))
+                                            });
+                                        res = if let Some((i, pname, dline)) = missing {
+                                            let cn = o.borrow().class.name().to_string();
+                                            let mut e = PhpError::uncaught(
+                                                "ArgumentCountError",
+                                                format!(
+                                                    "{}::offsetGet(): Argument #{} (${}) not passed",
+                                                    cn,
+                                                    i + 1,
+                                                    pname
+                                                ),
+                                                self.cur_line,
+                                            );
+                                            e.thrown_line = Some(dline);
+                                            Err(e)
+                                        } else {
+                                            let args = if given == 0 {
+                                                CallArgs::empty()
+                                            } else {
+                                                CallArgs::positional(vec![cell(
+                                                    key.clone().unwrap_or(Value::Null),
+                                                )])
+                                            };
+                                            self.method_invoke(o.clone(), "offsetGet", args)
+                                        };
+                                    }
                                     let cn = o.borrow().class.name().to_string();
+                                    // zend emits the notice while the
+                                    // engine error is still pending —
+                                    // it lands before the caught
+                                    // message in the output.
                                     self.notice(&format!(
                                         "Indirect modification of overloaded element of {} has no effect",
                                         cn
                                     ))?;
+                                    // `fail` converts an uncaught-kind
+                                    // error into a real throwable so
+                                    // userland catch(Error) intercepts
+                                    // it (raw Err would be fatal).
+                                    if let Err(e) = res {
+                                        return self.fail(e);
+                                    }
                                     return self.fail(PhpError::uncaught(
                                         "Error",
                                         "Cannot assign by reference to an array dimension of an object",
