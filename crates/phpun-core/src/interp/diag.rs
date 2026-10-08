@@ -50,6 +50,16 @@ impl<'a> Interp<'a> {
                 self.cur_line = l;
             }
             match r {
+                // A diagnostic while a dim throwable is armed: zend's
+                // op keeps running with EG(exception) pending, so the
+                // handler's throw REPLACES the armed pair — it doesn't
+                // abort the op on the diagnostic's error path.
+                Err(e) if e.kind == ErrorKind::Throw && self.dim_throw.is_some() => {
+                    let tv = self.pending_exception.take().unwrap_or(Value::Null);
+                    let live = self.dim_throw.as_ref().is_some_and(|(_, _, l)| *l);
+                    self.dim_throw = Some((tv, e, live));
+                    return Ok(());
+                }
                 Err(e) => return Err(e),
                 Ok(v) if !matches!(v, Value::Bool(false)) => return Ok(()),
                 Ok(_) => {}
