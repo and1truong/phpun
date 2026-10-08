@@ -2565,6 +2565,7 @@ fn ucmp_cb(
     b: Value,
     pending: &mut Deferred,
     dep_thrown: &mut bool,
+    dep_ok: bool,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     if pending.is_some() {
@@ -2577,7 +2578,7 @@ fn ucmp_cb(
         Ok(r) => {
             // bool retval: zend_get_long gives 1/0 and one deprecation
             // per builtin call (the sort path's dep_thrown rule).
-            if matches!(r, Value::Bool(_)) && !*dep_thrown {
+            if dep_ok && matches!(r, Value::Bool(_)) && !*dep_thrown {
                 *dep_thrown = true;
                 let r = it.deprecated_pub(&format!(
                     "{}(): Returning bool from comparison function is deprecated, return an integer less than, equal to, or greater than zero",
@@ -2678,6 +2679,10 @@ fn array_umatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Php
     } else {
         None
     };
+    // zend emits the bool-comparator deprecation only on the shapes
+    // whose signature is `..., arrays, cb` — the internal-key-check
+    // assoc/ukey/uassoc-diff variants stay silent (oracle-probed).
+    let dep_ok = data_mode == 2 && key_mode != 1;
     let mut dep_thrown = false;
     let cmp = |it: &mut Interp,
                x: &(ArrKey, Cell),
@@ -2693,6 +2698,7 @@ fn array_umatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Php
                 y.1.clone(),
                 pending,
                 dep_thrown,
+                dep_ok,
             ),
             1 => zstr_cmp(it, &x.1.borrow(), &y.1, pending),
             _ => Ordering::Equal,
@@ -2707,6 +2713,7 @@ fn array_umatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Php
                     key_value(&y.0),
                     pending,
                     dep_thrown,
+                    dep_ok,
                 ),
                 // zend_hash_key_compare for the assoc variants is key
                 // EQUALITY (int×int by value, str×str bytewise) — not
