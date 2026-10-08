@@ -3070,7 +3070,13 @@ impl<'a> Interp<'a> {
                     // With a throwable pending the write dispatch dies
                     // on the container itself — zend reports 'Cannot
                     // use object of type C as array', not the defer.
-                    if self.dim_throw.is_some() && !self.is_native_offset(&o, "offsetSet") {
+                    // The gate is spl-dispatch, not offsetSet nativity:
+                    // a subclass's userland override still routes
+                    // through spl's write_dimension (EG(exception)
+                    // skips the method call itself below).
+                    if self.dim_throw.is_some()
+                        && !matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. }))
+                    {
                         return self.fail(PhpError::uncaught(
                             "Error",
                             format!(
@@ -5859,7 +5865,9 @@ impl<'a> Interp<'a> {
                     // With a throwable pending the write dispatch dies
                     // on the container itself — zend reports 'Cannot
                     // use object of type C as array', not the defer.
-                    if self.dim_throw.is_some() && !self.is_native_offset(&o, "offsetSet") {
+                    if self.dim_throw.is_some()
+                        && !matches!(o.borrow().internal, Some(ObjectInternal::ArrayIter { .. }))
+                    {
                         return self.fail(PhpError::uncaught(
                             "Error",
                             format!(
