@@ -308,7 +308,8 @@ pub(crate) fn dispatch(
             };
             Value::Int(it.error_reporting(lv))
         }
-        "ini_set" => {
+        "ini_set" | "ini_alter" => {
+            // ini_alter is zend's real alias of ini_set.
             // Stores into the INI table and returns the previous
             // value (false when unset) — memory_limit, html_errors,
             // docref_* etc. all read back through ini_get (bug45392).
