@@ -283,6 +283,20 @@ pub(crate) fn dispatch(
             }
         }
         "array_merge" | "array_merge_recursive" => {
+            // zend sums arg elements up front and throws instead of
+            // building a hash past HASH_MAX_ELEMENTS (GHSA-h96m).
+            let mut total: u128 = 0;
+            for a in args {
+                if let Value::Array(m) = &*a.borrow() {
+                    total += m.borrow().len() as u128;
+                }
+            }
+            if total >= 1 << 30 {
+                return err(
+                    "Error",
+                    "The total number of elements must be lower than 1073741824".to_string(),
+                );
+            }
             let mut out = PhpArray::new();
             for a in args {
                 if let Value::Array(m) = &*a.borrow() {
@@ -1062,8 +1076,62 @@ pub(crate) fn dispatch(
         "range" => {
             let lo = arg(args, 0);
             let hi = arg(args, 1);
-            let step = arg(args, 2).to_float();
+            let step_arg = arg(args, 2);
+            let step = step_arg.to_float();
             let step = if step == 0.0 { 1.0 } else { step.abs() };
+            // zend bounds the element count before allocating
+            // (HASH_MAX_ELEMENTS = 1<<30): hostile inputs fatal with
+            // ValueError instead of exhausting host memory.
+            let char_range = matches!(
+                (&lo, &hi),
+                (Value::Str(a), Value::Str(b))
+                    if a.len() == 1 && b.len() == 1 && !a[0].is_ascii_digit()
+            );
+            if !char_range {
+                const RANGE_MAX: i128 = 1 << 30;
+                let (x, y) = (lo.to_float(), hi.to_float());
+                if matches!((&lo, &hi), (Value::Int(_), Value::Int(_)))
+                    && matches!(&step_arg, Value::Int(_) | Value::Null)
+                {
+                    let (li, hi_i, st_i) = (
+                        lo.to_int() as i128,
+                        hi.to_int() as i128,
+                        step_arg.to_int().abs() as i128,
+                    );
+                    let st_i = if st_i == 0 { 1 } else { st_i };
+                    let span = (hi_i - li).abs();
+                    let count = span / st_i + 1;
+                    if count > RANGE_MAX {
+                        return err(
+                            "ValueError",
+                            format!(
+                                "The supplied range exceeds the maximum array size by {} elements: start={}, end={}, step={}. Calculated size: {}. Maximum size: {}.",
+                                count - RANGE_MAX,
+                                li,
+                                hi_i,
+                                st_i,
+                                span / st_i,
+                                RANGE_MAX
+                            ),
+                        );
+                    }
+                } else {
+                    let count = (y - x).abs() / step + 1.0;
+                    if count > RANGE_MAX as f64 {
+                        return err(
+                            "ValueError",
+                            format!(
+                                "The supplied range exceeds the maximum array size by {:.1} elements: start={:.1}, end={:.1}, step={:.1}. Max size: {}",
+                                count - RANGE_MAX as f64,
+                                x,
+                                y,
+                                step,
+                                RANGE_MAX
+                            ),
+                        );
+                    }
+                }
+            }
             let mut out = PhpArray::new();
             match (&lo, &hi) {
                 (Value::Str(a), Value::Str(b))
