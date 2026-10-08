@@ -8525,7 +8525,6 @@ impl<'a> Interp<'a> {
             _ => None,
         };
         if let Some(n) = name {
-            let c = self.var_cell_opt(&n);
             // A CV right operand fuses into the same op too — zend
             // reads op1 then op2 inside it, both at the op's line
             // (the right operand's first-token line).
@@ -8548,7 +8547,7 @@ impl<'a> Interp<'a> {
                 };
                 self.cur_line = op;
                 self.send_line = Some(op);
-                let lv = match c {
+                let lv = match self.var_cell_opt(&n) {
                     Some(c) => c.borrow().clone(),
                     None => self.var_get(&n)?,
                 };
@@ -8568,7 +8567,9 @@ impl<'a> Interp<'a> {
                     self.send_line = Some(l2);
                 }
             }
-            let lv = match c {
+            // Re-lookup AFTER the right operand — `&`-binds can swap
+            // the CV's cell (`$x == $x =& $z` reads $x post-bind).
+            let lv = match self.var_cell_opt(&n) {
                 Some(c) => c.borrow().clone(),
                 None => self.var_get(&n)?,
             };
