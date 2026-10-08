@@ -2975,9 +2975,7 @@ impl<'a> Interp<'a> {
                 // zend_call_function's EG(exception) gate: __toString
                 // can't run while a throwable is pending — the
                 // conversion fails, the op dies, the armed one raises.
-                if self.dim_throw.is_some()
-                    && (matches!(&cur, Value::Object(_)) || matches!(&rhs, Value::Object(_)))
-                {
+                if self.dim_throw.is_some() && matches!(&rhs, Value::Object(_)) {
                     return self.dim_raise(Value::Null);
                 }
                 let mut l = self.conv_bytes(&cur)?;
