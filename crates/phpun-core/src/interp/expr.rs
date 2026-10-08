@@ -2340,30 +2340,7 @@ impl<'a> Interp<'a> {
                         // vivifies. Objects/strings defer to the write
                         // arm; compound/coalesce fetch the key first.
                         if op == "=" && !self.detached_dim {
-                            let scalar = !matches!(
-                                &*c.borrow(),
-                                Value::Null
-                                    | Value::Array(_)
-                                    | Value::Str(_)
-                                    | Value::Bool(false)
-                                    | Value::Object(_)
-                                    | Value::Callable(_)
-                            );
-                            if scalar {
-                                return self.fail(PhpError::uncaught(
-                                    "Error",
-                                    "Cannot use a scalar value as an array",
-                                    self.cur_line,
-                                ));
-                            }
-                            if matches!(&*c.borrow(), Value::Bool(false)) {
-                                self.deprecated_ns(
-                                    "Automatic conversion of false to array is deprecated",
-                                )?;
-                                if let Ok(mut b) = c.try_borrow_mut() {
-                                    *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
-                                }
-                            }
+                            self.dim_prekey_container(&c, false, false)?;
                         }
                         // Same per-op cache reset as the plain Index arm —
                         // a stale entry keyed by a CV's stable cell ptr
@@ -5575,28 +5552,7 @@ impl<'a> Interp<'a> {
             if !self.detached_dim {
                 {
                     let _h = det.and_then(|d| d.pre.value());
-                    let scalar = !matches!(
-                        &*c.borrow(),
-                        Value::Null
-                            | Value::Array(_)
-                            | Value::Str(_)
-                            | Value::Bool(false)
-                            | Value::Object(_)
-                            | Value::Callable(_)
-                    );
-                    if scalar && !compound {
-                        return self.fail(PhpError::uncaught(
-                            "Error",
-                            "Cannot use a scalar value as an array",
-                            self.cur_line,
-                        ));
-                    }
-                    if matches!(&*c.borrow(), Value::Bool(false)) {
-                        self.deprecated_ns("Automatic conversion of false to array is deprecated")?;
-                        if let Ok(mut b) = c.try_borrow_mut() {
-                            *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
-                        }
-                    }
+                    self.dim_prekey_container(&c, compound, det.is_some_and(|d| d.coalesce))?;
                 }
                 if let Some(d) = det {
                     if !self.detached_dim && self.dim_detached(d) {
@@ -6007,6 +5963,65 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(v)
+    }
+
+    /// zend's dim-write dispatches the leaf container BEFORE its dim
+    /// operand reads: `=` dies on a scalar untouched (the key's
+    /// warns/conversions never run) and a false container warns then
+    /// vivifies. A compound op reads the dim before its own gate
+    /// (ASSIGN_DIM_OP checks the container after OP2), so `compound`
+    /// skips the scalar arm. `??=`'s ASSIGN_DIM is a second fetch —
+    /// zend checks the CURRENT container before re-reading the dim
+    /// operand, so `coalesce` additionally dies on a non-ArrayAccess
+    /// object leaf ahead of the key's second warn/conversion. Objects
+    /// under `=` and strings defer their Error to the write arms.
+    fn dim_prekey_container(
+        &mut self,
+        c: &Cell,
+        compound: bool,
+        coalesce: bool,
+    ) -> Result<(), PhpError> {
+        let scalar = !matches!(
+            &*c.borrow(),
+            Value::Null
+                | Value::Array(_)
+                | Value::Str(_)
+                | Value::Bool(false)
+                | Value::Object(_)
+                | Value::Callable(_)
+        );
+        if scalar && (!compound || coalesce) {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                "Cannot use a scalar value as an array",
+                self.cur_line,
+            ));
+        }
+        if matches!(&*c.borrow(), Value::Bool(false)) {
+            self.deprecated_ns("Automatic conversion of false to array is deprecated")?;
+            if let Ok(mut b) = c.try_borrow_mut() {
+                *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+            }
+        }
+        if coalesce {
+            let bad = {
+                let b = c.borrow();
+                match &*b {
+                    Value::Object(o) if !self.obj_is_a(o, "ArrayAccess") => Some(format!(
+                        "Cannot use object of type {} as array",
+                        o.borrow().class.name()
+                    )),
+                    Value::Callable(_) => {
+                        Some("Cannot use object of type Closure as array".to_string())
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(m) = bad {
+                return self.fail(PhpError::uncaught("Error", m, self.cur_line));
+            }
+        }
+        Ok(())
     }
 
     /// Zend's compound-assign write gate (`ASSIGN_DIM_OP`): the
