@@ -5299,6 +5299,11 @@ impl<'a> Interp<'a> {
         // hold is per-diagnostic (a whole-op hold would cow-split
         // every write).
         let last = keys.len() - 1;
+        // Each level's container cell — a `=` RHS aliasing an ancestor
+        // (`$b[0][0] = $b`) separates it on the final write, zend-style
+        // (bug38469).
+        let mut anc: Vec<Cell> = Vec::with_capacity(keys.len());
+        let mut level_k: Vec<Option<Cell>> = Vec::with_capacity(keys.len());
         for (n, ka) in keys.iter().enumerate() {
             // A deferred plain-$var key binds at ITS dim op: the
             // container's write check runs first (zend's FETCH_DIM_W
@@ -5397,6 +5402,8 @@ impl<'a> Interp<'a> {
                     Some(kc)
                 }
             };
+            anc.push(c.clone());
+            level_k.push(k.clone());
             // Auto-init gate: writing through a typed slot that is
             // null (or a just-materialized uninit slot) must produce
             // `Cannot auto-initialize an array inside property ...`
@@ -5545,25 +5552,41 @@ impl<'a> Interp<'a> {
                 c = self.index_cell_object(&c, k.clone())?;
                 continue;
             }
-            let rr = self.index_into_key(c.clone(), k.clone());
+            // OP_DATA belongs to the last dim — intermediate levels
+            // never see the deferred RHS.
+            let rr = self.index_into_key_last(
+                c.clone(),
+                k.clone(),
+                det,
+                if n == last { rhs_late } else { None },
+                &anc,
+                &level_k,
+            );
             match rr {
-                Ok(nc) => {
+                Ok((nc, ev)) => {
                     if n == last {
                         // zend's OP_DATA read sits between the fetch
                         // walk and the store — a deferred bare-CV RHS
-                        // evals now. A detached fetch aborts before
-                        // OP_DATA (a handler's rebind silences the RHS
-                        // read too) — EXCEPT an object op-start: zend's
-                        // detach check only covers non-object operands,
-                        // offsetSet still fires on the stale object.
-                        let v = match rhs_late {
-                            Some((e, s))
-                                if !self.detached_dim
-                                    || det.is_some_and(|d| matches!(&d.pre, DimPre::Obj(_))) =>
-                            {
-                                self.eval_cv_at(e, s)?
-                            }
-                            _ => v,
+                        // evals now (index_into_key_last may have run
+                        // it early: after key diagnostics, before the
+                        // write's separation — bug38469). A detached
+                        // fetch aborts before OP_DATA (a handler's
+                        // rebind silences the RHS read too) — EXCEPT an
+                        // object op-start: zend's detach check only
+                        // covers non-object operands, offsetSet still
+                        // fires on the stale object.
+                        let v = match ev {
+                            Some(v) => v,
+                            None => match rhs_late {
+                                Some((e, s))
+                                    if !self.detached_dim
+                                        || det
+                                            .is_some_and(|d| matches!(&d.pre, DimPre::Obj(_))) =>
+                                {
+                                    self.eval_cv_at(e, s)?
+                                }
+                                _ => v,
+                            },
                         };
                         // `$ref[k] = v` where the element cell is bound to
                         // a typed prop stays type-gated (064). The store
@@ -6783,6 +6806,150 @@ impl<'a> Interp<'a> {
                     self.cur_line,
                 ))
             }
+        }
+    }
+
+    /// Last-level dim of a `=` write, same contract as index_into_key
+    /// plus the deferred OP_DATA read: zend runs it after the dim's
+    /// key-side diagnostics (offset validation, conversion) and the
+    /// container's vivify diagnostics, but BEFORE the write's
+    /// separation — the read's extra ref is what makes `$a[0] = $a`
+    /// store a snapshot of the pre-write table (bug38469). A rebind
+    /// inside the read detaches: the write lands on the stale operand,
+    /// invisible (probe_rebind_rhs). Non-ArrayAccess objects are the
+    /// one container whose 'as array' Error follows the read; scalars
+    /// and string-offset checks die at fetch, before it (probe_rhs_err).
+    /// Returns the slot cell and the materialized RHS, if it ran.
+    /// `anc`/`level_k` carry the op's walked ancestor cells and keys —
+    /// a RHS whose table aliases an ancestor separates it (bug38469).
+    fn index_into_key_last(
+        &mut self,
+        c: Cell,
+        key: Option<Cell>,
+        det: Option<&DimDetach>,
+        rhs: Option<(&Expr, usize)>,
+        anc: &[Cell],
+        level_k: &[Option<Cell>],
+    ) -> Result<(Cell, Option<Value>), PhpError> {
+        let Some((e, s)) = rhs else {
+            return self.index_into_key(c, key).map(|c| (c, None));
+        };
+        if self.detached_dim {
+            // Detached non-object roots abort before OP_DATA — the
+            // deferred read never runs.
+            return self.index_into_key(c, key).map(|c| (c, None));
+        }
+        // The borrow must end before `c` moves into the delegate calls.
+        enum Shape {
+            ObjPlain,
+            Callable,
+            Arrish,
+            Other,
+        }
+        let shape = {
+            let b = c.borrow();
+            match &*b {
+                Value::Object(o) if !self.obj_is_a(o, "ArrayAccess") => Shape::ObjPlain,
+                Value::Callable(_) => Shape::Callable,
+                Value::Array(_) | Value::Null | Value::Bool(false) => Shape::Arrish,
+                _ => Shape::Other,
+            }
+        };
+        match shape {
+            Shape::ObjPlain | Shape::Callable => {
+                // 'Cannot use object as array' is a write-phase Error —
+                // OP_DATA reads first.
+                let v = self.eval_cv_at(e, s)?;
+                self.index_into_key(c, key).map(|cc| (cc, Some(v)))
+            }
+            Shape::Arrish => {
+                // Mirrors index_into_key's pre-separation sequence:
+                // offset-key validation, the false→array deprecation,
+                // vivify, key conversion — each ahead of OP_DATA.
+                if let Some(kc) = &key {
+                    self.check_offset_key(&kc.borrow())?;
+                }
+                let mut b = match c.try_borrow_mut() {
+                    Ok(b) => b,
+                    Err(_) => return Ok((cell(Value::Null), None)),
+                };
+                if matches!(*b, Value::Bool(false)) {
+                    drop(b);
+                    self.deprecated_ns("Automatic conversion of false to array is deprecated")?;
+                    b = match c.try_borrow_mut() {
+                        Ok(b) => b,
+                        Err(_) => return Ok((cell(Value::Null), None)),
+                    };
+                }
+                if matches!(*b, Value::Null | Value::Bool(false)) {
+                    *b = Value::Array(Rc::new(RefCell::new(PhpArray::new())));
+                }
+                let stale_rc = match &*b {
+                    Value::Array(r) => r.clone(),
+                    _ => unreachable!(),
+                };
+                drop(b);
+                if let Some(kc) = &key {
+                    // The dim_arr_key cache dedupes the inner call.
+                    self.dim_arr_key(kc)?;
+                }
+                let v = self.eval_cv_at(e, s)?;
+                let rebound = !matches!(&*c.borrow(), Value::Array(r) if Rc::ptr_eq(r, &stale_rc))
+                    || det.is_some_and(|d| self.dim_detached(d));
+                if rebound {
+                    // Land the write on the stale table — invisible to
+                    // the var, still real for other aliases of it.
+                    let ak = match &key {
+                        Some(kc) => Some(self.dim_arr_key(kc)?),
+                        None => None,
+                    };
+                    let mut arr = stale_rc.borrow_mut();
+                    let cc = match ak {
+                        Some(ak) => match arr.get_cell(&ak) {
+                            Some(cc) => cc,
+                            None => {
+                                let cc = cell(Value::Null);
+                                arr.bind_cell(ak, cc.clone());
+                                cc
+                            }
+                        },
+                        None => {
+                            let nx = arr.next;
+                            let cc = cell(Value::Null);
+                            arr.bind_cell(ArrKey::Int(nx), cc.clone());
+                            cc
+                        }
+                    };
+                    drop(arr);
+                    return Ok((cc, Some(v)));
+                }
+                // `$b[0][0] = $b`: op_data's read shares an ancestor's
+                // table — the write separates it, and every deeper
+                // fetch re-resolves on the fresh copies (each inner
+                // table shared with the old one separates in turn), so
+                // the snapshot stays free of this bind (bug38469). The
+                // last level itself is the normal path — its own
+                // cow_split sees the inflated ref.
+                if let Value::Array(vr) = &v {
+                    if let Some(pos) = anc.iter().position(
+                        |ac| matches!(&*ac.borrow(), Value::Array(r) if Rc::ptr_eq(r, vr)),
+                    ) {
+                        if pos < anc.len() - 1 {
+                            self.cow_split(&mut anc[pos].borrow_mut());
+                            let mut c2 = anc[pos].clone();
+                            for kj in level_k.iter().skip(pos) {
+                                c2 = self.index_into_key(c2, kj.clone())?;
+                            }
+                            return Ok((c2, Some(v)));
+                        }
+                    }
+                }
+                // The read's ref is now live on the table — the inner
+                // cow_split sees it and separates.
+                self.index_into_key(c, key).map(|cc| (cc, Some(v)))
+            }
+            // Scalars/strings die at fetch before OP_DATA.
+            Shape::Other => self.index_into_key(c, key).map(|cc| (cc, None)),
         }
     }
 
