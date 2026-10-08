@@ -831,10 +831,6 @@ pub struct Interp<'a> {
     /// its TraceFrame sites `[internal function]` (Zend's resume
     /// isn't a userland call).
     pending_gen_body: bool,
-    /// Bytes emitted so far — memory_limit bookkeeping.
-    pub mem_used: u64,
-    /// Size of the last emit — the 'tried to allocate' figure.
-    mem_last: u64,
     /// Raised once the memory_limit fatal fired — buffers are dropped
     /// at shutdown instead of flushed (bug45392).
     pub mem_exceeded: bool,
@@ -1558,8 +1554,6 @@ impl<'a> Interp<'a> {
             last_err_file: String::new(),
             loop_depth: 0,
             assert_src: String::new(),
-            mem_used: 0,
-            mem_last: 0,
             mem_exceeded: false,
             deadline: None,
             deadline_secs: 0,
@@ -3399,10 +3393,12 @@ impl<'a> Interp<'a> {
     /// Byte-faithful emit — program output is bytes (echo of binary
     /// strings, file reads, preg results must not be UTF-8 validated).
     pub fn emit_bytes(&mut self, b: &[u8]) {
-        // memory_limit>0 turns into a deferred fatal once accumulated
-        // writes pass it (bug45392); checked at the next statement.
-        self.mem_used += b.len() as u64;
-        self.mem_last = b.len() as u64;
+        // Emitted output is free under memory_limit — zend's arena
+        // counts heap allocations, not bytes already on their way to
+        // stdout (only unflushed OB buffers hold memory, and those sit
+        // in `out`/`obs` Rust allocations we're not metering).
+        // ponytail: ob_start buffer contents aren't charged; upgrade
+        // path is a Vec-len-driven counter inside the ob stack.
         // Inside a generator run, output after a yield is deferred to
         // resume — `f(yield)` must not observe the call (nor its echo)
         // until the consumer advances past that yield.
@@ -3478,11 +3474,11 @@ impl<'a> Interp<'a> {
         self.emit_routed(b);
     }
 
-    /// Zend-arena usage against memory_limit: emitted bytes plus live
-    /// object shells (PhpObject::drop decrements, mirroring the arena
-    /// returning freed memory to the pool).
+    /// Zend-arena usage against memory_limit: runtime baseline + live
+    /// object shells + array tables + string payloads (drops decrement
+    /// each counter, mirroring the arena returning freed memory).
     pub(crate) fn mem_total(&self) -> i64 {
-        self.mem_used as i64 + crate::value::obj_live_bytes()
+        crate::value::MEM_BASE_BYTES + crate::value::mem_live_bytes()
     }
 
     /// Emit journaled/replayed bytes at their materialization point:

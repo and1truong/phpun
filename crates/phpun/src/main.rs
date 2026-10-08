@@ -112,16 +112,44 @@ fn run_script(args: &[String]) -> ExitCode {
     // Args after the script path become $argv[1..] like reference php;
     // argv[0] keeps the as-invoked path too.
     it.set_script_args(file, &args[(i + 1).min(args.len())..]);
+    // Stream output to the real fds so stderr notices interleave with
+    // stdout in PHP's order; `phpun test`/`serve` keep buffered capture.
+    // Set before -d application so a refused-limit warning streams
+    // ahead of the script's output like zend's does.
+    it.live_io = true;
     for kv in ini {
         if let Some((k, v)) = kv.split_once('=') {
-            it.ini.insert(k.trim().to_string(), v.trim().to_string());
+            if k.trim() == "memory_limit" {
+                // A -d limit under zend's 2M bootstrap floor refuses
+                // at startup: 'in Unknown on line 0' warning pair and
+                // the previous value stays in effect.
+                let prev = it.ini.get("memory_limit").cloned();
+                it.ini
+                    .insert("memory_limit".to_string(), v.trim().to_string());
+                let lim = it.ini_bytes("memory_limit");
+                if lim > 0 && lim <= 2097152 {
+                    let msg = format!(
+                        "Failed to set memory limit to {} bytes (Current memory usage is 2097152 bytes)",
+                        lim
+                    );
+                    eprintln!("PHP Warning:  {} in Unknown on line 0", msg);
+                    it.emit(&format!("Warning: {} in Unknown on line 0\n", msg));
+                    match prev {
+                        Some(p) => {
+                            it.ini.insert("memory_limit".to_string(), p);
+                        }
+                        None => {
+                            it.ini.remove("memory_limit");
+                        }
+                    }
+                }
+            } else {
+                it.ini.insert(k.trim().to_string(), v.trim().to_string());
+            }
         } else {
             it.ini.insert(kv, String::new());
         }
     }
-    // Stream output to the real fds so stderr notices interleave with
-    // stdout in PHP's order; `phpun test`/`serve` keep buffered capture.
-    it.live_io = true;
     let res = it.run_source(&src);
     let _ = std::io::Write::write_all(&mut std::io::stdout(), &it.out);
     eprint!("{}", it.err_buf);

@@ -3532,7 +3532,6 @@ impl<'a> Interp<'a> {
         // when nothing is emitted (new_oom). Drops decrement it like
         // zend's arena, so GC churn doesn't accumulate.
         crate::value::obj_charge();
-        self.mem_last = crate::value::OBJ_SHELL_BYTES as u64;
         let rc = Rc::new(RefCell::new(o));
         let id = self.next_obj_id(&rc);
         rc.borrow_mut().id = id;

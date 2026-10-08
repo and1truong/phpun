@@ -116,7 +116,7 @@ impl DimPre {
         match v {
             Value::Array(rc) => Self::Arr(Rc::downgrade(rc)),
             Value::Object(rc) => Self::Obj(Rc::downgrade(rc)),
-            Value::Str(rc) => Self::Str(Rc::downgrade(rc)),
+            Value::Str(rc) => Self::Str(Rc::downgrade(&rc.rc)),
             Value::Callable(rc) => Self::Callable(Rc::downgrade(rc)),
             Value::Resource(rc) => Self::Res(Rc::downgrade(rc)),
             _ => Self::Scalar(v.clone()),
@@ -129,7 +129,9 @@ impl DimPre {
         match self {
             Self::Arr(w) => w.upgrade().map(Value::Array),
             Self::Obj(w) => w.upgrade().map(Value::Object),
-            Self::Str(w) => w.upgrade().map(Value::Str),
+            Self::Str(w) => w
+                .upgrade()
+                .map(|rc| Value::Str(crate::value::PhpStr::adopt(rc))),
             Self::Callable(w) => w.upgrade().map(Value::Callable),
             Self::Res(w) => w.upgrade().map(Value::Resource),
             Self::Scalar(v) => Some(v.clone()),
@@ -162,7 +164,7 @@ impl DimDetach {
         cell(match &self.pre {
             DimPre::Str(w) => w
                 .upgrade()
-                .map(Value::Str)
+                .map(|rc| Value::Str(crate::value::PhpStr::adopt(rc)))
                 .unwrap_or_else(|| Value::bytes(Vec::new())),
             _ => self.pre.value().unwrap_or(Value::Null),
         })
@@ -2833,16 +2835,21 @@ impl<'a> Interp<'a> {
                     .is_some_and(|g| Rc::ptr_eq(&rc, g)) =>
             {
                 let a = rc.borrow();
-                Value::Array(Rc::new(RefCell::new(PhpArray {
-                    entries: a
-                        .entries
-                        .iter()
-                        .map(|(k, c)| (k.clone(), cell(c.borrow().clone())))
-                        .collect(),
-                    next: a.next,
-                    is_ref: false,
-                    iter_pos: a.iter_pos,
-                    foreach_pos: Vec::new(),
+                Value::Array(Rc::new(RefCell::new({
+                    let mut pa = PhpArray {
+                        entries: a
+                            .entries
+                            .iter()
+                            .map(|(k, c)| (k.clone(), cell(c.borrow().clone())))
+                            .collect(),
+                        next: a.next,
+                        is_ref: false,
+                        iter_pos: a.iter_pos,
+                        foreach_pos: Vec::new(),
+                        mem_elems: 0,
+                    };
+                    pa.mem_note_seed();
+                    pa
                 })))
             }
             v => v,
@@ -4897,7 +4904,7 @@ impl<'a> Interp<'a> {
         match (pre, cur) {
             (DimPre::Arr(w), Value::Array(rc)) => w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, rc)),
             (DimPre::Obj(w), Value::Object(rc)) => w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, rc)),
-            (DimPre::Str(w), Value::Str(rc)) => w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, rc)),
+            (DimPre::Str(w), Value::Str(rc)) => w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, &rc.rc)),
             (DimPre::Callable(w), Value::Callable(rc)) => {
                 w.upgrade().is_some_and(|u| Rc::ptr_eq(&u, rc))
             }
@@ -6256,7 +6263,7 @@ impl<'a> Interp<'a> {
     /// Negative offsets wrap from the end in both paths.
     fn str_offset_dim(
         &mut self,
-        s: &Rc<[u8]>,
+        s: &crate::value::PhpStr,
         key: &Value,
         mode: u8,
     ) -> Result<Option<Value>, PhpError> {
@@ -6527,6 +6534,7 @@ impl<'a> Interp<'a> {
             is_ref: a.is_ref,
             iter_pos: a.iter_pos,
             foreach_pos: Vec::new(),
+            mem_elems: 0,
         };
         for (k, c) in &a.entries {
             // zend unwraps a refcount-1 IS_REFERENCE bucket on copy;
@@ -6538,6 +6546,7 @@ impl<'a> Interp<'a> {
                 cell(c.borrow().clone())
             };
             copy.entries.push((k.clone(), nc));
+            copy.mem_note_append();
         }
         copy
     }

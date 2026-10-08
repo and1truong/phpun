@@ -1151,6 +1151,7 @@ pub(crate) fn dispatch(
                 let mut arr = col.arr.borrow_mut();
                 let entries = &col_entries[ci];
                 arr.entries.clear();
+                arr.mem_clear();
                 arr.next = 0;
                 for (k, &pi) in perm.iter().enumerate() {
                     let (key, val) = &entries[pi];
@@ -1162,6 +1163,7 @@ pub(crate) fn dispatch(
                         arr.next = arr.next.max(x + 1);
                     }
                     arr.entries.push((new_key, val.clone()));
+                    arr.mem_note_append();
                 }
                 arr.iter_pos = arr.entries.len();
             }

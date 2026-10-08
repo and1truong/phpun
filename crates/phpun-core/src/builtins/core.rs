@@ -316,23 +316,24 @@ pub(crate) fn dispatch(
             let prev = it.ini.get(&k).cloned();
             let v = arg_str(it, args, 1);
             // Shrinking the limit under current usage refuses with a
-            // warning and leaves the old value (bug45392).
+            // warning and leaves the old value (bug45392). mem_total
+            // already carries zend's runtime baseline; the startup-time
+            // 2M bootstrap reserve refusal lives in phpun -d handling.
             if k == "memory_limit" {
                 it.ini.insert(k.clone(), v);
                 let lim = it.ini_bytes(&k);
-                if lim > 0 && it.mem_total() > lim {
+                let usage = it.mem_total();
+                if lim > 0 && usage > lim {
                     let _ = it
                         .ini
                         .insert(k.clone(), prev.clone().unwrap_or_else(|| "-1".into()));
                     it.warn_pub(&format!(
                         "Failed to set memory limit to {} bytes (Current memory usage is {} bytes)",
-                        lim,
-                        it.mem_total()
+                        lim, usage
                     ))?;
-                    return Ok(Some(match prev {
-                        Some(p) => Value::str(p),
-                        None => Value::Bool(false),
-                    }));
+                    // Refused ini_set returns false (zend returns the
+                    // old value only on a successful set).
+                    return Ok(Some(Value::Bool(false)));
                 }
             } else {
                 it.ini.insert(k.clone(), v);
@@ -534,11 +535,18 @@ pub(crate) fn dispatch(
         "php_sapi_name" => Value::str("cli"),
         "phpversion" | "phpversion_strict" => Value::str("8.5.11-phpun"),
         "php_uname" => Value::str("Linux"),
-        // 2M base (zend's post-boot floor) plus accounted use —
-        // emits and live object shells both count toward it.
-        "memory_get_usage" => Value::Int(2097152 + it.mem_total()),
-        "memory_get_peak_usage" => Value::Int(2097152 + it.mem_total()),
-        "memory_reset_peak_usage" => Value::Null,
+        // Runtime baseline + metered live bytes (obj shells, array
+        // tables, string payloads); emitted output is free.
+        "memory_get_usage" => Value::Int(it.mem_total()),
+        // High-water mark of the live total — zend's peak survives
+        // frees until memory_reset_peak_usage re-baselines it.
+        "memory_get_peak_usage" => {
+            Value::Int(crate::value::MEM_BASE_BYTES + crate::value::mem_peak_bytes())
+        }
+        "memory_reset_peak_usage" => {
+            crate::value::mem_peak_reset();
+            Value::Null
+        }
         "zend_version" => Value::str("8.5.11-phpun"),
         "getmypid" => Value::Int(std::process::id() as i64),
         "getmyuid" | "getmygid" | "getmyinode" => Value::Int(1000),

@@ -70,7 +70,6 @@ pub(crate) fn dispatch(
             let want = 32i128 + dec.max(0) as i128 + dp.len() as i128;
             let limit = it.ini_bytes("memory_limit");
             if limit > 0 && (it.mem_total() as i128) + want > limit as i128 {
-                it.mem_used = limit.max(0) as u64 + 1;
                 it.mem_exceeded = true;
                 let mut e = PhpError::fatal(
                     format!(

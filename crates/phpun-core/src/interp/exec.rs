@@ -35,7 +35,8 @@ impl<'a> Interp<'a> {
                 let mut e = PhpError::fatal(
                     format!(
                         "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
-                        limit, self.mem_last
+                        limit,
+                        crate::value::mem_last_alloc()
                     ),
                     self.cur_line,
                 );
