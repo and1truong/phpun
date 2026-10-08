@@ -2396,7 +2396,7 @@ impl<'a> Interp<'a> {
             }
             t
         };
-        let fr = self
+        let mut fr = self
             .stack
             .last()
             .map(|f| TraceFrame {
@@ -2459,6 +2459,16 @@ impl<'a> Interp<'a> {
                 gen_resume: false,
                 gen_body: false,
             });
+        // Zend runs FilterIterator's accept loop in internal C — its
+        // `fetch` frame never reaches a PHP trace.
+        if fr.function.eq_ignore_ascii_case("fetch")
+            && fr
+                .class
+                .as_deref()
+                .is_some_and(|c| self.is_a_str(c, "FilterIterator"))
+        {
+            fr.visible = false;
+        }
         fr
     }
 

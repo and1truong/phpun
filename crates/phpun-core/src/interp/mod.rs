@@ -322,9 +322,10 @@ pub struct Interp<'a> {
     pub last_preg_error: i64,
     /// Zend's IS_STR_VALID_UTF8 flag: string storage (keyed by Rc
     /// pointer) proven fully valid UTF-8 — /u preg calls skip
-    /// re-validating it (bug72685). The Rcs stay in the map so the
-    /// pointer keys can't be recycled.
-    pub valid_utf8: std::collections::HashMap<usize, std::rc::Rc<[u8]>>,
+    /// re-validating it (bug72685). Weak keys drop when the storage
+    /// dies — a recycled pointer then fails upgrade() and re-validates,
+    /// so nothing stays pinned and the map can't grow without bound.
+    pub valid_utf8: std::collections::HashMap<usize, std::rc::Weak<[u8]>>,
     /// Raw request body for php://input — serve mode fills it.
     pub php_input: std::rc::Rc<Vec<u8>>,
     /// Real upload tmp paths created this request — is_uploaded_file()

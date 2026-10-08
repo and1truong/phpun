@@ -1215,8 +1215,18 @@ impl PhpRe {
                 // to preg error codes.
                 let known_valid = r.utf8
                     && subj_rc.as_ref().is_some_and(|rc| {
-                        it.valid_utf8
-                            .contains_key(&(Rc::as_ptr(&rc.rc) as *const u8 as usize))
+                        let ptr = Rc::as_ptr(&rc.rc) as *const u8 as usize;
+                        match it.valid_utf8.get(&ptr) {
+                            // Dead storage: evict and re-validate — a
+                            // recycled pointer must never skip the
+                            // check on another string's word.
+                            Some(w) if w.upgrade().is_none() => {
+                                it.valid_utf8.remove(&ptr);
+                                false
+                            }
+                            Some(_) => true,
+                            None => false,
+                        }
                     })
                     && (offset == s.len() || (s[offset] & 0xC0) != 0x80);
                 let (v, e) = r.match_all(
@@ -1238,8 +1248,10 @@ impl PhpRe {
                 // valid — later calls skip re-validation entirely.
                 if r.utf8 && e == 0 && offset == 0 && !known_valid {
                     if let Some(rc) = subj_rc {
-                        it.valid_utf8
-                            .insert(Rc::as_ptr(&rc.rc) as *const u8 as usize, rc.rc.clone());
+                        it.valid_utf8.insert(
+                            Rc::as_ptr(&rc.rc) as *const u8 as usize,
+                            Rc::downgrade(&rc.rc),
+                        );
                     }
                 }
                 (
