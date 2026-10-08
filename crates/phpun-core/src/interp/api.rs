@@ -280,7 +280,9 @@ impl<'a> Interp<'a> {
         };
         self.ob_stack.push(ObLevel {
             buf: Vec::new(),
-            charged: 0,
+            // zend allocates the level's smart_string at ob_start —
+            // book the fresh buffer now, not on the first write.
+            charged: OB_INIT_CAP as i64,
             cap: OB_INIT_CAP,
             mem_tok: std::rc::Rc::new(()),
             handler,

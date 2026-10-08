@@ -165,8 +165,16 @@ pub(crate) fn dispatch(
         }
         "ob_get_clean" => it.ob_get_clean(),
         "ob_get_flush" => it.ob_get_flush()?,
-        "ob_get_contents" => match it.ob_top() {
-            Some(b) => Value::bytes(b.clone()),
+        "ob_get_contents" => match it.ob_top().cloned() {
+            Some(b) => {
+                let v = Value::bytes(b);
+                // zend wraps the contents in a zend_string — charge
+                // the copy like ob_get_clean does.
+                if let Value::Str(r) = &v {
+                    it.mem_track(&r.rc, r.len() as u64 + 32);
+                }
+                v
+            }
             None => Value::Bool(false),
         },
         "ob_get_length" => match it.ob_top() {
