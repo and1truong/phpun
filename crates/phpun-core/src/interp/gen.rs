@@ -253,9 +253,21 @@ impl<'a> Interp<'a> {
     }
 
     /// Build the deferred Generator object for a yielding call.
-    pub(in crate::interp) fn make_generator(&mut self, setup: GenSetup) -> Rc<RefCell<PhpObject>> {
-        let GenSetup::Invoke { decl, .. } = &setup;
+    pub(in crate::interp) fn make_generator(
+        &mut self,
+        mut setup: GenSetup,
+    ) -> Rc<RefCell<PhpObject>> {
+        let GenSetup::Invoke { decl, args, .. } = &mut setup;
         let by_ref = decl.by_ref;
+        // zend frees the call's vm_stack span at DO_FCALL — the
+        // suspended generator's execute_data is a separate exact-size
+        // emalloc, not the arena page its call may have minted. Repay
+        // the call sites here and charge the frame's real span on the
+        // gen state (retired when the body's run finishes or dies).
+        let span = args.vm_slots * 16;
+        let sites = std::mem::take(&mut args.arg_stack);
+        args.vm_slots = 0;
+        self.vm_frame_free(&sites);
         let fin_q = Rc::new(RefCell::new(crate::value::GenFinData {
             fn_name: decl.name.clone(),
             file: decl.file.clone(),
@@ -283,6 +295,9 @@ impl<'a> Interp<'a> {
             live: None,
             suppress_prefix: false,
         }));
+        if span > 0 {
+            self.mem_track(&state, span);
+        }
         // GC-time finally replay: the weak dies with the object —
         // unset()/overwrite then replays fin_q; unit end replays it
         // for gens still suspended (request shutdown).
@@ -479,6 +494,10 @@ impl<'a> Interp<'a> {
                 st.deferred_err = Some((e, throwable, raise_frames, run_fin_err));
                 st.dead = true;
                 st.fin_q.borrow_mut().finished = true;
+                drop(st);
+                // A body that died unwound its execute_data inside
+                // this resume — free the frame charge now.
+                self.mem_retire(state);
                 Ok(())
             }
         }
@@ -934,6 +953,8 @@ impl<'a> Interp<'a> {
         if !done {
             return Ok(());
         }
+        // Zend frees execute_data inside the exhausting resume.
+        self.mem_retire(state);
         let cells = {
             let st = state.borrow();
             let mut fin = st.fin_q.borrow_mut();
@@ -1538,6 +1559,8 @@ impl<'a> Interp<'a> {
                     st.items.clear();
                     st.pending_out.clear();
                     st.deferred_err = None;
+                    drop(st);
+                    self.mem_retire(&state);
                     return Err(self.throw(e));
                 }
                 {

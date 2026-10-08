@@ -4022,6 +4022,9 @@ impl<'a> Interp<'a> {
                 self.mem_in_chunk = self.mem_in_chunk.saturating_sub(dead.inner);
                 self.mem_huge = self.mem_huge.saturating_sub(dead.huge);
                 self.mem_used = self.mem_used.saturating_sub(dead.inner + dead.huge);
+                if let Some((seg, slots, own)) = dead.vm {
+                    Self::vm_stack_apply(&mut self.vm_stack, seg, slots, own);
+                }
             } else {
                 let sub = fp.min(e.get().inner);
                 e.get_mut().inner -= sub;
@@ -4106,6 +4109,9 @@ impl<'a> Interp<'a> {
             self.mem_in_chunk = self.mem_in_chunk.saturating_sub(c.inner);
             self.mem_huge = self.mem_huge.saturating_sub(c.huge);
             self.mem_used = self.mem_used.saturating_sub(c.inner + c.huge);
+            if let Some((seg, slots, own)) = c.vm {
+                Self::vm_stack_apply(&mut self.vm_stack, seg, slots, own);
+            }
         }
         let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
         let weak = Rc::downgrade(new);
