@@ -283,6 +283,22 @@ pub(crate) fn dispatch(
             }
         }
         "array_merge" | "array_merge_recursive" => {
+            // zend's HT_MAX_SIZE guard fires before any bucket copy —
+            // merging past it is a catchable Error, not an OOM.
+            let total: u64 = args
+                .iter()
+                .map(|a| match &*a.borrow() {
+                    Value::Array(m) => m.borrow().len() as u64,
+                    _ => 0,
+                })
+                .sum();
+            if total > 1073741824 {
+                return Err(PhpError::uncaught(
+                    "Error",
+                    "The total number of elements must be lower than 1073741824",
+                    it.cur_line,
+                ));
+            }
             let mut out = PhpArray::new();
             for a in args {
                 if let Value::Array(m) = &*a.borrow() {
