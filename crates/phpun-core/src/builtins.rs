@@ -236,6 +236,8 @@ pub(crate) const BUILTIN_NAMES: &[&str] = &[
     "array_diff",
     "array_diff_assoc",
     "array_diff_key",
+    "array_diff_uassoc",
+    "array_diff_ukey",
     "array_fill",
     "array_fill_keys",
     "array_filter",
@@ -244,6 +246,8 @@ pub(crate) const BUILTIN_NAMES: &[&str] = &[
     "array_intersect",
     "array_intersect_assoc",
     "array_intersect_key",
+    "array_intersect_uassoc",
+    "array_intersect_ukey",
     "array_is_list",
     "array_key_exists",
     "array_key_first",
@@ -267,6 +271,12 @@ pub(crate) const BUILTIN_NAMES: &[&str] = &[
     "array_slice",
     "array_splice",
     "array_sum",
+    "array_udiff",
+    "array_udiff_assoc",
+    "array_udiff_uassoc",
+    "array_uintersect",
+    "array_uintersect_assoc",
+    "array_uintersect_uassoc",
     "array_unique",
     "array_unshift",
     "array_values",
@@ -820,8 +830,9 @@ pub(crate) const BUILTIN_NAMES: &[&str] = &[
 ];
 
 pub(crate) fn is_builtin(n: &str) -> bool {
-    // `fastcgi_finish_request`/`print` are real function-table
-    // entries callable by name even though they aren't arity-typed.
+    // BUILTIN_NAMES is the declared internal function table — keep it
+    // in sync with the family dispatch arms when adding builtins
+    // (a dispatch arm without a name here is unreachable).
     BUILTIN_NAMES.binary_search(&n).is_ok()
 }
 

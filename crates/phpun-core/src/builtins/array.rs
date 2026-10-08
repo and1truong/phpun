@@ -283,6 +283,22 @@ pub(crate) fn dispatch(
             }
         }
         "array_merge" | "array_merge_recursive" => {
+            // zend's HT_MAX_SIZE guard fires before any bucket copy —
+            // merging past it is a catchable Error, not an OOM.
+            let total: u64 = args
+                .iter()
+                .map(|a| match &*a.borrow() {
+                    Value::Array(m) => m.borrow().len() as u64,
+                    _ => 0,
+                })
+                .sum();
+            if total > 1073741824 {
+                return Err(PhpError::uncaught(
+                    "Error",
+                    "The total number of elements must be lower than 1073741824",
+                    it.cur_line,
+                ));
+            }
             let mut out = PhpArray::new();
             for a in args {
                 if let Value::Array(m) = &*a.borrow() {
@@ -697,6 +713,16 @@ pub(crate) fn dispatch(
             _ => Value::Null,
         },
         "array_diff" => array_diff(it, args)?,
+        "array_udiff"
+        | "array_udiff_assoc"
+        | "array_udiff_uassoc"
+        | "array_diff_uassoc"
+        | "array_diff_ukey"
+        | "array_uintersect"
+        | "array_uintersect_assoc"
+        | "array_uintersect_uassoc"
+        | "array_intersect_uassoc"
+        | "array_intersect_ukey" => array_umatch(it, name, args)?,
         "array_diff_assoc" | "array_intersect_assoc" => {
             array_assoc_match(it, name, args, name == "array_diff_assoc")?
         }
@@ -1162,6 +1188,7 @@ pub(crate) fn dispatch(
                     if let ArrKey::Int(x) = new_key {
                         arr.next = arr.next.max(x + 1);
                     }
+                    arr.mem_note_key(&new_key);
                     arr.entries.push((new_key, val.clone()));
                     arr.mem_note_append();
                 }
@@ -2271,6 +2298,190 @@ fn array_assoc_match(
                         continue 'entry;
                     }
                 }
+            }
+        }
+        out.set(k.clone(), v.clone());
+    }
+    if let Some(e) = deferred_err(it, pending) {
+        return Err(e);
+    }
+    Ok(Value::Array(Rc::new(RefCell::new(out))))
+}
+
+/// `zval_get_long` on the callback's return + sign — zend compares
+/// user comparators by the retval's long value (bool false → 0 →
+/// Equal; no swapped retry the way usort does). A thrown comparator
+/// error defers the way a cast does: the walk stops calling and the
+/// first exception wins.
+fn ucmp_cb(
+    it: &mut Interp,
+    cb: &Value,
+    a: Value,
+    b: Value,
+    pending: &mut Deferred,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if pending.is_some() {
+        return Ordering::Equal;
+    }
+    match it.call_value(
+        cb,
+        crate::interp::CallArgs::positional(vec![cell(a), cell(b)]),
+    ) {
+        Ok(r) => match r.to_int() {
+            i if i > 0 => Ordering::Greater,
+            i if i < 0 => Ordering::Less,
+            _ => Ordering::Equal,
+        },
+        Err(e) => {
+            *pending = Some(DeferredErr::Raw(e));
+            Ordering::Equal
+        }
+    }
+}
+
+fn key_value(k: &ArrKey) -> Value {
+    match k {
+        ArrKey::Int(i) => Value::Int(*i),
+        ArrKey::Str(s) => Value::str(s.as_ref().to_string()),
+        ArrKey::Tomb => Value::Null,
+    }
+}
+
+/// `array_u{diff,intersect}[_assoc|_uassoc]` + `array_{diff,intersect}_ukey`:
+/// the user-comparator diff/intersect family. zend bucket-sorts each
+/// list by the comparator and merge-walks; scanning arg0's entries
+/// against every other array produces the same set (ponytail: a
+/// comparator that echoes may interleave differently than zend's
+/// merge — the returned elements are identical).
+fn array_umatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, PhpError> {
+    use std::cmp::Ordering;
+    let diff = !name.contains("intersect");
+    // (data cmp, key cmp) — 0 = not compared, 1 = internal, 2 = user cb.
+    // `diff_uassoc`/`intersect_uassoc` take the KEY comparator (data is
+    // internal); `udiff_assoc`/`uintersect_assoc` take the DATA
+    // comparator (keys internal); the `_uassoc` pair takes both.
+    let (data_mode, key_mode) = match name {
+        "array_udiff" | "array_uintersect" => (2u8, 0u8),
+        "array_udiff_assoc" | "array_uintersect_assoc" => (2, 1),
+        "array_diff_uassoc" | "array_intersect_uassoc" => (1, 2),
+        "array_udiff_uassoc" | "array_uintersect_uassoc" => (2, 2),
+        _ => (0, 2), // array_diff_ukey / array_intersect_ukey
+    };
+    let ncb = (data_mode == 2) as usize + (key_mode == 2) as usize;
+    if args.len() <= ncb {
+        return Err(PhpError::uncaught(
+            "ArgumentCountError",
+            format!(
+                "{}() expects at least {} arguments, {} given",
+                name,
+                ncb + 2,
+                args.len()
+            ),
+            0,
+        ));
+    }
+    let (arrs, cbs) = args.split_at(args.len() - ncb);
+    // zend's variadic-with-tail parse binds the trailing callable(s)
+    // BEFORE checking the middle args are arrays.
+    let mut cvals: Vec<Value> = Vec::with_capacity(ncb);
+    for (j, c) in cbs.iter().enumerate() {
+        let v = c.borrow().clone();
+        if !it.is_callable_value(&v) {
+            let detail = it.zpp_callback_detail(&v);
+            return Err(PhpError::uncaught(
+                "TypeError",
+                format!(
+                    "{}(): Argument #{} must be a valid callback, {}",
+                    name,
+                    arrs.len() + j + 1,
+                    detail
+                ),
+                0,
+            ));
+        }
+        cvals.push(v);
+    }
+    for (i, a) in arrs.iter().enumerate() {
+        if !matches!(&*a.borrow(), Value::Array(_)) {
+            return Err(need_array_arg(name, i + 1, &a.borrow()));
+        }
+    }
+    let data_cb = if data_mode == 2 {
+        Some(cvals[0].clone())
+    } else {
+        None
+    };
+    let key_cb = if key_mode == 2 {
+        cvals.last().cloned()
+    } else {
+        None
+    };
+    let cmp =
+        |it: &mut Interp, x: &(ArrKey, Value), y: &(ArrKey, Value), pending: &mut Deferred| {
+            let mut c = match data_mode {
+                2 => ucmp_cb(
+                    it,
+                    &data_cb.clone().unwrap(),
+                    x.1.clone(),
+                    y.1.clone(),
+                    pending,
+                ),
+                1 => zstr_cmp(it, &x.1, &y.1, pending),
+                _ => Ordering::Equal,
+            };
+            if c == Ordering::Equal && key_mode != 0 {
+                c = match &key_cb {
+                    Some(cb) => ucmp_cb(it, cb, key_value(&x.0), key_value(&y.0), pending),
+                    // zend_hash_key_compare for the assoc variants is key
+                    // EQUALITY (int×int by value, str×str bytewise) — not
+                    // the sort-order key_cmp above (its int arm never
+                    // reports equal by design for same-table keys).
+                    None => {
+                        if x.0 == y.0 {
+                            Ordering::Equal
+                        } else {
+                            Ordering::Less
+                        }
+                    }
+                };
+            }
+            c
+        };
+    // Snapshot arg0's entries; other lists stay borrowed per-scan.
+    let l0: Vec<(ArrKey, Value)> = match &*arrs[0].borrow() {
+        Value::Array(a) => a
+            .borrow()
+            .iter()
+            .map(|(k, c)| (k.clone(), c.borrow().clone()))
+            .collect(),
+        _ => unreachable!(),
+    };
+    let others: Vec<Vec<(ArrKey, Value)>> = arrs[1..]
+        .iter()
+        .map(|a| match &*a.borrow() {
+            Value::Array(oa) => oa
+                .borrow()
+                .iter()
+                .map(|(k, c)| (k.clone(), c.borrow().clone()))
+                .collect(),
+            _ => unreachable!(),
+        })
+        .collect();
+    let mut pending: Deferred = None;
+    let mut out = PhpArray::new();
+    'entry: for (k, v) in &l0 {
+        for ol in &others {
+            let mut found = false;
+            for oe in ol {
+                if cmp(it, &(k.clone(), v.clone()), oe, &mut pending) == Ordering::Equal {
+                    found = true;
+                    break;
+                }
+            }
+            if found == diff {
+                // diff: any match deletes; intersect: any miss deletes.
+                continue 'entry;
             }
         }
         out.set(k.clone(), v.clone());

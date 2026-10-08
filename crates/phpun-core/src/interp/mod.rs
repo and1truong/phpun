@@ -304,6 +304,12 @@ pub struct Interp<'a> {
     /// declaration site (zend reports the decl's own file+line, with
     /// the [constant expression] pseudo-frame pointing at resolution).
     const_decl_ctx: Option<(String, u32)>,
+    /// Resolution line of the const-expr currently evaluating — the
+    /// `[constant expression]` pseudo-frame sites here (the access that
+    /// triggered the lazy init), not inside the decl being evaluated
+    /// (gh8821: `#0 file(11): [constant expression]()` where 11 is the
+    /// `new` call, not the const decl).
+    const_init_site: Option<usize>,
     /// Headers queued by header()/setcookie() — `phpun serve` emits them
     /// into the HTTP response; CLI ignores them (like php-cli).
     pub out_headers: Vec<String>,
@@ -316,9 +322,10 @@ pub struct Interp<'a> {
     pub last_preg_error: i64,
     /// Zend's IS_STR_VALID_UTF8 flag: string storage (keyed by Rc
     /// pointer) proven fully valid UTF-8 — /u preg calls skip
-    /// re-validating it (bug72685). The Rcs stay in the map so the
-    /// pointer keys can't be recycled.
-    pub valid_utf8: std::collections::HashMap<usize, std::rc::Rc<[u8]>>,
+    /// re-validating it (bug72685). Weak keys drop when the storage
+    /// dies — a recycled pointer then fails upgrade() and re-validates,
+    /// so nothing stays pinned and the map can't grow without bound.
+    pub valid_utf8: std::collections::HashMap<usize, std::rc::Weak<[u8]>>,
     /// Raw request body for php://input — serve mode fills it.
     pub php_input: std::rc::Rc<Vec<u8>>,
     /// Real upload tmp paths created this request — is_uploaded_file()
@@ -1448,6 +1455,7 @@ impl<'a> Interp<'a> {
             live_io: false,
             decl_file_ctx: None,
             const_decl_ctx: None,
+            const_init_site: None,
             out_headers: Vec::new(),
             resp_code: 200,
             last_json_error: 0,
@@ -1698,8 +1706,12 @@ impl<'a> Interp<'a> {
         } else {
             None
         };
+        // Save the resolution line before the decl's own lines take over
+        // cur_line — a fail() mid-eval builds the pseudo-frame here.
+        let old_site = self.const_init_site.replace(self.cur_line);
         let r = self.eval_const(e);
         self.decl_file_ctx = old;
+        self.const_init_site = old_site;
         if decl_line > 0 {
             self.const_decl_ctx = old_ctx;
         }
@@ -3501,6 +3513,26 @@ impl<'a> Interp<'a> {
         crate::value::MEM_BASE_BYTES + crate::value::mem_live_bytes()
     }
 
+    /// zend's emalloc guard inside C builtins: refuse when the request
+    /// would cross memory_limit — fires the OOM fatal mid-eval with
+    /// the request size as 'tried to allocate N' (str_repeat).
+    pub(crate) fn mem_check_alloc(&mut self, want: i64) -> Result<(), PhpError> {
+        let limit = self.ini_bytes("memory_limit");
+        if limit > 0 && self.mem_total() + want > limit {
+            self.mem_exceeded = true;
+            let mut e = PhpError::fatal(
+                format!(
+                    "Allowed memory size of {} bytes exhausted (tried to allocate {} bytes)",
+                    limit, want
+                ),
+                self.cur_line,
+            );
+            e.trace = Some(self.fatal_frames());
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Emit journaled/replayed bytes at their materialization point:
     /// inside another gen's run they join its deferred journal (an
     /// inner's death bytes attribute to the outer's cursor window);
@@ -4863,6 +4895,32 @@ impl<'a> Interp<'a> {
                 visited,
                 Self::gc_internal_prop(pname),
             );
+        }
+        // ArrayIter's AoStore is zend's `intern->array` slot — a real
+        // counted hold of the object (raw edge), not a member zval.
+        // Without it a `=&`-bound store self-roots on its unaccounted
+        // clone and `$ao[0] =& $ao` never collects. `src` (the object an
+        // ArrayObject wraps) is the same kind of bare hold. Shared
+        // stores (getIterator siblings) contribute one edge each —
+        // reachability then keeps the array alive while any sharer is.
+        if let Some(crate::value::ObjectInternal::ArrayIter { store, .. }) = &ob.internal {
+            let st = store.borrow();
+            let v = Value::Array(st.arr.clone());
+            Self::gc_scan_held(&v, None, scan, out, depth - 1, visited, false);
+            if let Some(src) = &st.src {
+                let v = Value::Object(src.clone());
+                Self::gc_scan_held(&v, None, scan, out, depth - 1, visited, false);
+            }
+            return;
+        }
+        // A throwable's `previous` chain is a real member-zval hold —
+        // engine-chained Errors write the C-field without a prop
+        // mirror, so props alone don't cover the edge.
+        if let Some(crate::value::ObjectInternal::Exception { previous, .. }) = &ob.internal {
+            if let Some(v) = previous {
+                Self::gc_scan_held(v, None, scan, out, depth - 1, visited, false);
+            }
+            return;
         }
         let Some(crate::value::ObjectInternal::Generator(st)) = &ob.internal else {
             return;
@@ -6279,7 +6337,7 @@ impl<'a> Interp<'a> {
                     class: None,
                     ty: String::new(),
                     file: self.diag_file(),
-                    line: self.cur_line as u32,
+                    line: self.const_init_site.unwrap_or(self.cur_line) as u32,
                     args: Vec::new(),
                     named_args: Vec::new(),
                     internal: true,
