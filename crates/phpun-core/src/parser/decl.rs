@@ -332,28 +332,44 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn foreach_target(&mut self) -> Result<ForeachTarget, PhpError> {
-        self.foreach_target_in(false)
+        self.foreach_target_in(None)
     }
 
     /// `in_list` marks destructuring elements (`as [$a, $b]` /
     /// `as list($a, $b)`) — a `?->` chain there reports
     /// 'Assignments can only happen to writable values' while the
     /// direct target reports 'Can't use nullsafe operator in write
-    /// context' (p13 l6 vs fp2).
-    fn foreach_target_in(&mut self, in_list: bool) -> Result<ForeachTarget, PhpError> {
+    /// context' (p13 l6 vs fp2). `parent_kind` (Some(true) = a `list()`
+    /// destructure, Some(false) = `[]`, None = the target itself)
+    /// carries the enclosing destructure's syntax — a nested
+    /// destructure of the other syntax is zend's 'Cannot mix [] and
+    /// list()' compile fatal.
+    fn foreach_target_in(&mut self, parent_kind: Option<bool>) -> Result<ForeachTarget, PhpError> {
         if self.eat_op("&") {
             // `&$v`, `&$o->p`, `&$a[i]` — a write-context `new_variable`
             // chain (call roots and `?->` are compile fatals).
             return Ok(ForeachTarget::ByRef(Box::new(self.ref_variable(true)?)));
         }
         if self.at_op("[") {
+            if parent_kind == Some(true) {
+                return Err(PhpError::compile_fatal(
+                    "Cannot mix [] and list()",
+                    self.line(),
+                ));
+            }
             self.pos += 1;
-            return Ok(ForeachTarget::List(self.foreach_list_items("]")?));
+            return Ok(ForeachTarget::List(self.foreach_list_items("]", false)?));
         }
         if self.ident_is("list") && matches!(self.peek2(), Some(Token::Op("("))) {
+            if parent_kind == Some(false) {
+                return Err(PhpError::compile_fatal(
+                    "Cannot mix [] and list()",
+                    self.line(),
+                ));
+            }
             self.pos += 1;
             self.expect_op("(")?;
-            return Ok(ForeachTarget::List(self.foreach_list_items(")")?));
+            return Ok(ForeachTarget::List(self.foreach_list_items(")", true)?));
         }
         let l = self.line();
         match self.next() {
@@ -404,7 +420,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 if Self::has_nullsafe(&e) {
-                    if in_list {
+                    if parent_kind.is_some() {
                         self.write_ctx_errs.push((
                             "Assignments can only happen to writable values".to_string(),
                             self.line(),
@@ -435,7 +451,7 @@ impl<'a> Parser<'a> {
                 {
                     self.pos -= 1;
                     let e = self.expr()?;
-                    return self.expr_to_foreach_target(e);
+                    return self.expr_to_foreach_target(e, parent_kind);
                 }
                 Err(PhpError::parse(
                     format!(
@@ -452,7 +468,11 @@ impl<'a> Parser<'a> {
     /// positional elements, holes, and `expr => target` keyed pairs
     /// (zend-legal `as ['a' => $a]` / `as list('a' => $a)`); keyed and
     /// unkeyed entries can't mix.
-    fn foreach_list_items(&mut self, close: &str) -> Result<ListItems<ForeachTarget>, PhpError> {
+    fn foreach_list_items(
+        &mut self,
+        close: &str,
+        kind: bool,
+    ) -> Result<ListItems<ForeachTarget>, PhpError> {
         let mut items = Vec::new();
         let (mut keyed, mut unkeyed) = (false, false);
         while !self.at_op(close) {
@@ -462,15 +482,15 @@ impl<'a> Parser<'a> {
             }
             if self.at_op("&") {
                 unkeyed = true;
-                items.push(Some((None, self.foreach_target_in(true)?)));
+                items.push(Some((None, self.foreach_target_in(Some(kind))?)));
             } else {
                 let e = self.expr()?;
                 if self.eat_op("=>") {
                     keyed = true;
-                    items.push(Some((Some(e), self.foreach_target_in(true)?)));
+                    items.push(Some((Some(e), self.foreach_target_in(Some(kind))?)));
                 } else {
                     unkeyed = true;
-                    items.push(Some((None, self.expr_to_foreach_target(e)?)));
+                    items.push(Some((None, self.expr_to_foreach_target(e, Some(kind))?)));
                 }
             }
             if !self.eat_op(",") {
@@ -491,12 +511,22 @@ impl<'a> Parser<'a> {
     /// variables stay `Var`, nested array literals / `list()` calls
     /// recurse as lists, `&` elements stay ByRef, other writable
     /// chains are Lvalues; non-writable exprs die in list_writable.
-    fn expr_to_foreach_target(&mut self, e: Expr) -> Result<ForeachTarget, PhpError> {
+    fn expr_to_foreach_target(
+        &mut self,
+        e: Expr,
+        parent_kind: Option<bool>,
+    ) -> Result<ForeachTarget, PhpError> {
         let e = Self::unmark_argline(e);
         match e {
             Expr::Var(n) => Ok(ForeachTarget::Var(n)),
             Expr::ByRef(inner) => Ok(ForeachTarget::ByRef(inner)),
             Expr::ArrayLit(items) => {
+                if parent_kind == Some(true) {
+                    return Err(PhpError::compile_fatal(
+                        "Cannot mix [] and list()",
+                        self.line(),
+                    ));
+                }
                 let mut out = Vec::with_capacity(items.len());
                 let (mut keyed, mut unkeyed) = (false, false);
                 for (k, v) in items {
@@ -511,7 +541,7 @@ impl<'a> Parser<'a> {
                             } else {
                                 unkeyed = true;
                             }
-                            out.push(Some((k, self.expr_to_foreach_target(other)?)));
+                            out.push(Some((k, self.expr_to_foreach_target(other, Some(false))?)));
                         }
                     }
                 }
@@ -524,11 +554,17 @@ impl<'a> Parser<'a> {
                 Ok(ForeachTarget::List(out))
             }
             Expr::List(items) => {
+                if parent_kind == Some(false) {
+                    return Err(PhpError::compile_fatal(
+                        "Cannot mix [] and list()",
+                        self.line(),
+                    ));
+                }
                 let mut out = Vec::with_capacity(items.len());
                 for it in items {
                     out.push(match it {
                         None => None,
-                        Some((k, e)) => Some((k, self.expr_to_foreach_target(e)?)),
+                        Some((k, e)) => Some((k, self.expr_to_foreach_target(e, Some(true))?)),
                     });
                 }
                 Ok(ForeachTarget::List(out))

@@ -646,12 +646,18 @@ impl<'a> Parser<'a> {
     /// `[a, b]` / `list(a, b)` on the left of `=` is destructuring.
     /// Elements keep their `argline` marks — zend sites each
     /// element's own store op at the element's line.
+    ///
+    /// `list_kind` threads the OUTER destructure's syntax (true =
+    /// `list()`, false = `[]`): a nested destructure of the other
+    /// syntax is zend's compile fatal 'Cannot mix [] and list()' —
+    /// `list($c, [$d])`, `[$c, list($d)]`, `[$a, list($b, [$c])]` all
+    /// die at compile; `list($a, list($b))` and `[$a, [$b]]` compile.
     pub(in crate::parser) fn list_target(&mut self, e: Expr) -> Result<Expr, PhpError> {
         match e {
             Expr::ArrayLit(items) => Ok(Expr::List(
                 items
                     .into_iter()
-                    .map(|(k, v)| Self::list_elem_kv(k, v).map(|o| o.map(Self::list_keyed)))
+                    .map(|(k, v)| Self::list_elem_kv(k, v, false).map(|o| o.map(Self::list_keyed)))
                     .collect::<Result<_, _>>()?,
             )),
             Expr::Call {
@@ -662,7 +668,7 @@ impl<'a> Parser<'a> {
             } => match *name {
                 Expr::Str(n) if n.eq_ignore_ascii_case("list") => Ok(Expr::List(
                     args.into_iter()
-                        .map(|e| Self::list_elem(e).map(|o| o.map(Self::list_keyed)))
+                        .map(|e| Self::list_elem(e, true).map(|o| o.map(Self::list_keyed)))
                         .collect::<Result<_, _>>()?,
                 )),
                 other => Ok(Expr::Call {
@@ -677,7 +683,11 @@ impl<'a> Parser<'a> {
             Expr::List(items) => Ok(Expr::List(
                 items
                     .into_iter()
-                    .map(|v| v.map_or(Ok(None), |(k, e)| Self::list_elem_keyed(k, e).map(Some)))
+                    .map(|v| {
+                        v.map_or(Ok(None), |(k, e)| {
+                            Self::list_elem_keyed(k, e, true).map(Some)
+                        })
+                    })
                     .collect::<Result<_, _>>()?,
             )),
             // Lvalue targets can't carry the arg's line marker —
@@ -686,39 +696,56 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn list_mix_err(line: usize) -> PhpError {
+        PhpError::compile_fatal("Cannot mix [] and list()", line)
+    }
+
     /// One `list()`/`[]` destructure element: `Null` is a skipped
     /// slot; nested `[...]`/`list(...)` destructures recursively;
     /// the element's `argline` mark stays wrapped around the result
     /// (zend sites each element's own store op at the element's line).
-    fn list_elem(e: Expr) -> Result<Option<Expr>, PhpError> {
+    fn list_elem(e: Expr, list_kind: bool) -> Result<Option<Expr>, PhpError> {
+        let mix_line = crate::ast::start_line(&e).unwrap_or(0);
         match e {
             Expr::Binary {
                 op: "argline",
                 l,
                 r,
-            } => Ok(Self::list_elem(*r)?.map(|u| Expr::Binary {
+            } => Ok(Self::list_elem(*r, list_kind)?.map(|u| Expr::Binary {
                 op: "argline",
                 l,
                 r: Box::new(u),
             })),
             Expr::Null => Ok(None),
-            Expr::ArrayLit(items) => Ok(Some(Expr::List(
-                items
-                    .into_iter()
-                    .map(|(k, v)| Self::list_elem_kv(k, v).map(|o| o.map(Self::list_keyed)))
-                    .collect::<Result<_, _>>()?,
-            ))),
+            Expr::ArrayLit(items) => {
+                if list_kind {
+                    return Err(Self::list_mix_err(mix_line));
+                }
+                Ok(Some(Expr::List(
+                    items
+                        .into_iter()
+                        .map(|(k, v)| {
+                            Self::list_elem_kv(k, v, false).map(|o| o.map(Self::list_keyed))
+                        })
+                        .collect::<Result<_, _>>()?,
+                )))
+            }
             Expr::Call {
                 name,
                 args,
                 site,
                 callee,
             } => match *name {
-                Expr::Str(n) if n.eq_ignore_ascii_case("list") => Ok(Some(Expr::List(
-                    args.into_iter()
-                        .map(|e| Self::list_elem(e).map(|o| o.map(Self::list_keyed)))
-                        .collect::<Result<_, _>>()?,
-                ))),
+                Expr::Str(n) if n.eq_ignore_ascii_case("list") => {
+                    if !list_kind {
+                        return Err(Self::list_mix_err(mix_line));
+                    }
+                    Ok(Some(Expr::List(
+                        args.into_iter()
+                            .map(|e| Self::list_elem(e, true).map(|o| o.map(Self::list_keyed)))
+                            .collect::<Result<_, _>>()?,
+                    )))
+                }
                 other => Ok(Some(Expr::Call {
                     name: Box::new(other),
                     args,
@@ -726,6 +753,23 @@ impl<'a> Parser<'a> {
                     callee,
                 })),
             },
+            // A nested List node only ever comes from the `list(...)`
+            // primary — inside `[]` that's the other syntax.
+            Expr::List(items) => {
+                if !list_kind {
+                    return Err(Self::list_mix_err(mix_line));
+                }
+                Ok(Some(Expr::List(
+                    items
+                        .into_iter()
+                        .map(|v| {
+                            v.map_or(Ok(None), |(k, e)| {
+                                Self::list_elem_keyed(k, e, true).map(Some)
+                            })
+                        })
+                        .collect::<Result<_, _>>()?,
+                )))
+            }
             e => Ok(Some(e)),
         }
     }
@@ -734,8 +778,8 @@ impl<'a> Parser<'a> {
     /// around the element as a `listkey` marker: zend's keyed
     /// array_pair reads `rhs[k]` — dropping the key reads the
     /// positional index instead (silent wrong values).
-    fn list_elem_kv(k: Option<Expr>, v: Expr) -> Result<Option<Expr>, PhpError> {
-        Ok(match (k, Self::list_elem(v)?) {
+    fn list_elem_kv(k: Option<Expr>, v: Expr, list_kind: bool) -> Result<Option<Expr>, PhpError> {
+        Ok(match (k, Self::list_elem(v, list_kind)?) {
             (Some(key), Some(e)) => Some(Expr::Binary {
                 op: "listkey",
                 l: Box::new(key),
@@ -748,8 +792,12 @@ impl<'a> Parser<'a> {
     /// A re-entering List node's elements get normalized through
     /// list_elem then re-keyed (the primary path already carries
     /// key tuples).
-    fn list_elem_keyed(k: Option<Expr>, e: Expr) -> Result<(Option<Expr>, Expr), PhpError> {
-        match Self::list_elem(e)? {
+    fn list_elem_keyed(
+        k: Option<Expr>,
+        e: Expr,
+        list_kind: bool,
+    ) -> Result<(Option<Expr>, Expr), PhpError> {
+        match Self::list_elem(e, list_kind)? {
             Some(u) => Ok(Self::list_keyed(match k {
                 Some(k) => Expr::Binary {
                     op: "listkey",
