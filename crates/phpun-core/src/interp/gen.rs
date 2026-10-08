@@ -1117,25 +1117,23 @@ impl<'a> Interp<'a> {
         // driving the inner generator isn't a userland call either,
         // so it emits neither the resume frame nor its `eval()'d
         // code` pseudo-site.
-        const SPL_PRELUDE_CLASSES: &[&str] = &[
-            "OuterIterator",
-            "IteratorIterator",
-            "FilterIterator",
-            "RecursiveFilterIterator",
-            "CallbackFilterIterator",
-            "RecursiveIteratorIterator",
-            "AppendIterator",
-        ];
-        let caller_is_spl_stub = self
-            .stack
-            .last()
-            .and_then(|f| f.decl_class.as_ref())
-            .map(|c| {
-                SPL_PRELUDE_CLASSES
-                    .iter()
-                    .any(|n| c.name().eq_ignore_ascii_case(n))
-            })
-            .unwrap_or(false);
+        // Transitive provenance: SPL stub frames chain by DELEGATION —
+        // II-of-II/subclass/AppendIterator hops all run through another
+        // SPL-prelude frame as the immediate caller (is_a walks the
+        // parent chain, so userland SPL subclasses count too). Oracle:
+        // a resume initiated by a non-SPL frame inside an SPL call —
+        // e.g. CallbackFilterIterator's cb calling $gen->next() — IS a
+        // userland call and keeps its resume frame, so only the
+        // immediate caller's provenance gates this.
+        let caller_is_spl_stub = self.stack.last().is_some_and(|f| {
+            // Executing prelude code too — a userland override in
+            // an SPL subclass keeps real call sites.
+            f.file.contains("eval()'d code")
+                && f.decl_class
+                    .as_ref()
+                    .or(f.scope_class.as_ref())
+                    .is_some_and(|c| self.class_is_spl_prelude(c))
+        });
         let userland = self.iter_calls == 0 && self.gen_internal_resume == 0 && !caller_is_spl_stub;
         if userland {
             self.call_trace.push(TraceFrame {

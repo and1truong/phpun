@@ -213,14 +213,30 @@ impl<'a> Interp<'a> {
         file: String,
         fallback_line: usize,
     ) -> (String, u32) {
-        let from_builtin = self.internal_cb > 0
-            && self
-                .call_trace
-                .iter()
-                .rev()
-                .find(|f| !crate::value::trace_frame_hidden(f))
-                .map(|f| f.internal)
-                .unwrap_or(no_frame_internal);
+        // An SPL-prelude frame stands in for zend's C-level SPL
+        // delegation: calls it makes (gen resumes, inner-iterator
+        // hops, user callbacks) all site `[internal function]` —
+        // oracle II-of-II: `[internal function]: IteratorIterator->
+        // rewind()`, never an eval()'d-code site. Transitively covers
+        // SPL subclasses via is_a.
+        let caller_is_spl_stub = self.stack.iter().rev().nth(1).is_some_and(|f| {
+            // Executing prelude code too — a userland override in
+            // an SPL subclass keeps real call sites.
+            f.file.contains("eval()'d code")
+                && f.decl_class
+                    .as_ref()
+                    .or(f.scope_class.as_ref())
+                    .is_some_and(|c| self.class_is_spl_prelude(c))
+        });
+        let from_builtin = caller_is_spl_stub
+            || (self.internal_cb > 0
+                && self
+                    .call_trace
+                    .iter()
+                    .rev()
+                    .find(|f| !crate::value::trace_frame_hidden(f))
+                    .map(|f| f.internal)
+                    .unwrap_or(no_frame_internal));
         if from_builtin {
             ("[internal function]".to_string(), 0)
         } else {

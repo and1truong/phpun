@@ -6320,8 +6320,25 @@ impl<'a> Interp<'a> {
         Err(e)
     }
 
+    /// `cls` is-a an SPL-prelude delegation class (subclasses included)
+    /// — the PHP stand-ins for zend's C-level SPL delegation. A call
+    /// made FROM one of their frames sites `[internal function]` like
+    /// zend's internal SPL internals.
+    pub(in crate::interp) fn class_is_spl_prelude(&self, cls: &Rc<PhpClass>) -> bool {
+        const SPL_PRELUDE_CLASSES: &[&str] = &[
+            "OuterIterator",
+            "IteratorIterator",
+            "FilterIterator",
+            "RecursiveFilterIterator",
+            "CallbackFilterIterator",
+            "RecursiveIteratorIterator",
+            "AppendIterator",
+        ];
+        SPL_PRELUDE_CLASSES.iter().any(|n| self.is_a(cls, n))
+    }
+
     /// `class X` is-a `name` (name = class or interface), parents included.
-    fn is_a(&mut self, cls: &Rc<PhpClass>, name: &str) -> bool {
+    fn is_a(&self, cls: &Rc<PhpClass>, name: &str) -> bool {
         let lname = name.trim_start_matches('\\').to_lowercase();
         let mut cur = Some(cls.clone());
         while let Some(c) = cur {
