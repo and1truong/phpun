@@ -294,6 +294,7 @@ impl<'a> Interp<'a> {
             running: false,
             live: None,
             suppress_prefix: false,
+            vm_span: span,
         }));
         if span > 0 {
             self.mem_track(&state, span);
@@ -1408,6 +1409,12 @@ impl<'a> Interp<'a> {
                             }
                         }
                         st.deferred_err = None;
+                        // A dead body's death retired its frame —
+                        // the revived run lives again, so re-charge
+                        // the span.
+                        if st.dead && st.vm_span > 0 {
+                            self.mem_track(&state, st.vm_span);
+                        }
                         st.dead = false;
                         st.delegate_gens.clear();
                     }
@@ -1512,6 +1519,11 @@ impl<'a> Interp<'a> {
                         }
                     }
                     st.deferred_err = None;
+                    // A dead body's death retired its frame — the
+                    // revived run lives again, so re-charge the span.
+                    if st.dead && st.vm_span > 0 {
+                        self.mem_track(&state, st.vm_span);
+                    }
                     st.dead = false;
                     st.delegate_gens.clear();
                     prev
