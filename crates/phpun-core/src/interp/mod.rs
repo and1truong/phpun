@@ -87,12 +87,27 @@ pub struct CallArgs {
     /// references, so zend warns "must be passed by reference, value
     /// given" (closure_invoke_ref_warning).
     pub nonref_cells: Vec<usize>,
+    /// Temporaries that must outlive the call (an unpacked `...`
+    /// source array holds its elements' cells — zend keeps the zval
+    /// alive until the call returns, so its table stays charged
+    /// through the builtin's own allocs).
+    pub hold: Vec<Value>,
+    /// Arg-stack page charges — each `...` unpack commits a
+    /// roundup-256KB(n*16) zend_vm_stack segment, live until the
+    /// frame dies. Rc-shared through CallArgs clones so the release
+    /// fires once at the last clone's drop.
+    pub arg_stack: Vec<Rc<ArgStack>>,
     /// Diagnostic line of the last-evaluated argument — the deepest
     /// line marker reached while building this list. Zend sites the
     /// diagnostics of a compile-specialized literal call (sprintf rope)
     /// at the line of its final operand, not the call's first token.
     pub end_line: usize,
 }
+
+/// One arg-stack page charge carried by a CallArgs — registered via
+/// mem_track at build time, released by mem_sweep once the frame's
+/// last CallArgs clone dies (see `arg_stack`).
+pub struct ArgStack(pub i64);
 
 impl CallArgs {
     pub fn positional(cells: Vec<Cell>) -> Self {
@@ -101,6 +116,8 @@ impl CallArgs {
             named: Vec::new(),
             trav_cells: Vec::new(),
             nonref_cells: Vec::new(),
+            hold: Vec::new(),
+            arg_stack: Vec::new(),
             end_line: 0,
         }
     }
@@ -4003,9 +4020,9 @@ impl<'a> Interp<'a> {
         self.emit_routed(b);
     }
 
-    /// Zend-arena usage against memory_limit: runtime baseline + live
-    /// object shells + array tables + string payloads (drops decrement
-    /// each counter, mirroring the arena returning freed memory).
+    /// Zend-arena `size` — live bytes (runtime baseline + object
+    /// shells + array tables + string payloads). memory_get_usage
+    /// reports this.
     pub(crate) fn mem_total(&self) -> i64 {
         crate::value::MEM_BASE_BYTES + crate::value::mem_live_bytes()
     }
@@ -6190,6 +6207,8 @@ impl<'a> Interp<'a> {
                     .filter(|i| **i >= 1)
                     .map(|i| i - 1)
                     .collect(),
+                hold: args.hold.clone(),
+                arg_stack: args.arg_stack.clone(),
                 trav_cells: args
                     .trav_cells
                     .iter()

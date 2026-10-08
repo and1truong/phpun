@@ -342,6 +342,7 @@ impl<'a> Interp<'a> {
                 }
                 let trav = matches!(&v, Value::Object(_));
                 let mut unpack_named = false;
+                let stack0 = out.cells.len() + out.named.len();
                 for (k, c) in self.unpack_items(&v, true)? {
                     match k {
                         Some(n) => {
@@ -364,6 +365,20 @@ impl<'a> Interp<'a> {
                             pos += 1;
                         }
                     }
+                }
+                // zend's SEND_UNPACK commits vm_stack pages for the
+                // copied args (256KB segments over n*16) while the
+                // source zval is still live, then frees the zval —
+                // so the emalloc guard here sees the source table,
+                // and the stack pages stay charged until the frame
+                // dies (ArgStack drop at CallArgs teardown).
+                let n = (out.cells.len() + out.named.len() - stack0) as i64;
+                if n > 0 {
+                    let seg = (n * 16 + 262_143) & !262_143;
+                    let arc = Rc::new(ArgStack(seg));
+                    // Charged until the frame's last CallArgs clone dies.
+                    self.mem_track(&arc, seg as u64);
+                    out.arg_stack.push(arc);
                 }
                 continue;
             }
@@ -399,7 +414,14 @@ impl<'a> Interp<'a> {
                         // offsets' (and the str-key TypeError), not the
                         // generic scalar-as-array fatal.
                         let was = std::mem::replace(&mut self.dim_by_ref, true);
-                        let rc = self.eval_cell(expr);
+                        // `$this` can't sit behind IS_REFERENCE —
+                        // a by-ref param binds a plain value cell
+                        // (object still aliases via the handle).
+                        let rc = if matches!(expr_u, Expr::Var(n) if n == "this") {
+                            self.eval(expr).map(cell)
+                        } else {
+                            self.eval_cell(expr)
+                        };
                         self.dim_by_ref = was;
                         // Cell-access errors (readonly/private prop,
                         // string offsets, undeclared static) are real
@@ -4247,6 +4269,10 @@ impl<'a> Interp<'a> {
                                 i + 1,
                                 p.name
                             ))?;
+                            // 'value given' passes a zval copy — the
+                            // param's writes stay local.
+                            binds.push((p.name.clone(), cell(v.borrow().clone())));
+                            continue;
                         }
                         // The callee's var becomes a Zend IS_REFERENCE
                         // over the caller's cell — write-through errors

@@ -104,28 +104,53 @@ impl PhpArray {
         );
     }
 
+    /// Bulk-charge `n` appended slots — the mass-prepend path in
+    /// array_unshift grows the table once (zend_hash_extend), so the
+    /// reported request is the single final pow2 grow, not per-element
+    /// grows.
+    pub fn mem_note_extend(&mut self, n: i64) {
+        if n <= 0 {
+            return;
+        }
+        let old = arr_foot(self.mem_elems, self.packed);
+        self.mem_elems += n;
+        let cap = (self.mem_elems.max(8) as u64).next_power_of_two() as i64;
+        let request = if self.packed {
+            cap * ARR_ELEM_BYTES + 8
+        } else {
+            cap * ARR_ELEM_HASH_BYTES
+        };
+        mem_charge(
+            &ARR_LIVE,
+            arr_foot(self.mem_elems, self.packed) - old,
+            request,
+        );
+    }
+
     /// Key-side meter bookkeeping before a NEW entry is pushed: a
     /// non-sequential-int key flips the table to mixed (zend converts
-    /// once, permanently) and a string key is a live zend_string plus
-    /// one GC-root-buffer entry (zend tracks container member
-    /// zend_strings; a loose value string is never rooted).
+    /// once, permanently) and a string key is a live zend_string (not
+    /// a GC root — strings can't form cycles).
     /// Call with the key BEFORE the push so the packed check sees the
     /// pre-insert slot count.
     pub fn mem_note_key(&mut self, k: &ArrKey) {
-        match k {
-            ArrKey::Str(s) => {
-                self.packed = false;
-                let c = key_charge(s.len());
-                self.key_bytes += c;
-                mem_charge(&STR_LIVE, c, c);
-                gc_root_note(1);
-            }
-            ArrKey::Int(i) => {
-                if *i != self.entries.len() as i64 {
-                    self.packed = false;
-                }
-            }
-            ArrKey::Tomb => {}
+        let flip = match k {
+            ArrKey::Str(_) => self.packed,
+            ArrKey::Int(i) => self.packed && *i != self.entries.len() as i64,
+            ArrKey::Tomb => false,
+        };
+        if flip {
+            // Packed→mixed conversion rebuilds arData as 40B buckets.
+            self.packed = false;
+            ARR_LIVE.fetch_add(
+                arr_foot(self.mem_elems, false) - arr_foot(self.mem_elems, true),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        if let ArrKey::Str(s) = k {
+            let c = key_charge(s.len());
+            self.key_bytes += c;
+            mem_charge(&STR_LIVE, c, c);
         }
     }
 
@@ -143,13 +168,6 @@ impl PhpArray {
         if self.key_bytes > 0 {
             STR_LIVE.fetch_sub(self.key_bytes, std::sync::atomic::Ordering::Relaxed);
             self.key_bytes = 0;
-            gc_root_note(
-                -(self
-                    .entries
-                    .iter()
-                    .filter(|(k, _)| matches!(k, ArrKey::Str(_)))
-                    .count() as i64),
-            );
         }
     }
 
@@ -172,7 +190,6 @@ impl PhpArray {
                         let c = key_charge(s.len());
                         self.key_bytes += c;
                         mem_charge(&STR_LIVE, c, c);
-                        gc_root_note(1);
                     }
                     ArrKey::Tomb => {}
                 }
@@ -291,7 +308,6 @@ impl PhpArray {
                 let c = key_charge(s.len());
                 self.key_bytes -= c;
                 STR_LIVE.fetch_sub(c, std::sync::atomic::Ordering::Relaxed);
-                gc_root_note(-1);
             }
             slot.0 = ArrKey::Tomb;
             let old = std::mem::replace(&mut slot.1, Rc::new(RefCell::new(Value::Null)));

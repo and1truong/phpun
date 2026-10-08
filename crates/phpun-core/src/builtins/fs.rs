@@ -1685,7 +1685,8 @@ pub(crate) fn dispatch(
         "umask" => Value::Int(0o022),
         "chmod" | "chown" | "chgrp" | "touch" => Value::Bool(true),
         "link" | "symlink" | "readlink" | "linkinfo" => Value::Bool(false),
-        "disk_free_space" | "disk_total_space" => Value::Float(1e12),
+        // diskfreespace is zend's real alias of disk_free_space.
+        "disk_free_space" | "disk_total_space" | "diskfreespace" => Value::Float(1e12),
         "fnmatch" => Value::Bool(false),
         "stream_get_contents" => {
             stream_open_check(args, 0, name, 1, "stream")?;

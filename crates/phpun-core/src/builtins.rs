@@ -220,9 +220,17 @@ pub(crate) fn builtin_param_ty(f: &str, p: &str) -> Option<Vec<String>> {
     Some(ms.iter().map(|m| m.to_string()).collect())
 }
 
-/// Every dispatchable internal-function name — the table
+/// Every declared internal-function name — the table
 /// `get_defined_functions()['internal']` walks and `function_exists`
 /// probes (kept sorted; add a name here when a new family arm lands).
+///
+/// Sync rule: every name needs a dispatch arm in builtins/*.rs.
+/// Listed-but-undispatched (deliberate — the whole family is
+/// unimplemented and belongs to another ticket): fputcsv, fscanf,
+/// sscanf, get_meta_tags, output_add_rewrite_var, filegroup,
+/// fileinode, fileowner, filetype. function_exists stays true like
+/// zend (the functions are declared there too); calling one fatals
+/// "Call to undefined function" until that family lands.
 pub(crate) const BUILTIN_NAMES: &[&str] = &[
     "abs",
     "acos",

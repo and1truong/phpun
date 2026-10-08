@@ -320,6 +320,20 @@ impl<'a> Interp<'a> {
                     let shape = Self::unmark_rhs(v);
                     // `&$x` elements bind the source cell, not a copy.
                     if let Expr::ByRef(e) = shape {
+                        // `&$this` can never be IS_REFERENCE — the
+                        // element holds a plain copy of the object
+                        // handle (bug72598).
+                        if matches!(Self::unmark_rhs(e), Expr::Var(n) if n == "this") {
+                            let c = cell(self.eval(e)?);
+                            match k {
+                                Some(ke) => {
+                                    let kv = self.eval(ke)?;
+                                    arr.set_cell(self.arr_key(&kv)?, c);
+                                }
+                                None => arr.push_cell(c),
+                            }
+                            continue;
+                        }
                         let c = self.eval_cell(e)?;
                         self.mark_ref(&c);
                         self.reg_arr_ref(&c);
@@ -2109,6 +2123,14 @@ impl<'a> Interp<'a> {
                         "Cannot acquire reference to $GLOBALS",
                         self.cur_line,
                     ));
+                }
+                if n == "this" {
+                    // `$this` can never be IS_REFERENCE — `&$this`
+                    // degrades to `=`; the object still aliases via
+                    // its handle (bug72598).
+                    let v = self.eval(value)?;
+                    self.store(target, v.clone())?;
+                    return Ok(v);
                 }
             }
             // By-reference assignment: bind cells.

@@ -113,7 +113,7 @@ pub(crate) fn dispatch(
                 let mut e = PhpError::fatal(
                     format!(
                         "Out of memory (allocated {} bytes) (tried to allocate {} bytes)",
-                        it.mem_total(),
+                        it.mem_real(),
                         want
                     ),
                     it.cur_line,

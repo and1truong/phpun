@@ -302,8 +302,8 @@ pub(crate) fn dispatch(
                 if let Value::Array(m) = &*a.borrow() {
                     for (k, c) in m.borrow().iter() {
                         match k {
-                            ArrKey::Int(_) => out.push(c.borrow().clone()),
-                            _ => out.set(k.clone(), c.borrow().clone()),
+                            ArrKey::Int(_) => push_elem(it, &mut out, c),
+                            _ => copy_elem(it, &mut out, k, c),
                         }
                     }
                 }
@@ -315,14 +315,14 @@ pub(crate) fn dispatch(
             for a in args {
                 if let Value::Array(m) = &*a.borrow() {
                     for (k, c) in m.borrow().iter() {
-                        out.set(k.clone(), c.borrow().clone());
+                        copy_elem(it, &mut out, k, c);
                     }
                 }
             }
             Value::Array(Rc::new(RefCell::new(out)))
         }
         "array_replace_recursive" => {
-            fn rec(base: &mut PhpArray, over: &PhpArray) {
+            fn rec(it: &Interp, base: &mut PhpArray, over: &PhpArray) {
                 for (k, c) in over.iter() {
                     let v = c.borrow().clone();
                     let sub = base.get(k).and_then(|b| match b {
@@ -331,15 +331,15 @@ pub(crate) fn dispatch(
                     });
                     match (&v, sub) {
                         (Value::Array(oa), Some(mut sub_arr)) => {
-                            rec(&mut sub_arr, &oa.borrow());
+                            rec(it, &mut sub_arr, &oa.borrow());
                             base.set(k.clone(), Value::Array(Rc::new(RefCell::new(sub_arr))));
                         }
                         (Value::Array(oa), None) => {
                             let mut fresh = PhpArray::new();
-                            rec(&mut fresh, &oa.borrow());
+                            rec(it, &mut fresh, &oa.borrow());
                             base.set(k.clone(), Value::Array(Rc::new(RefCell::new(fresh))));
                         }
-                        _ => base.set(k.clone(), v),
+                        _ => copy_elem(it, base, k, c),
                     }
                 }
             }
@@ -349,7 +349,7 @@ pub(crate) fn dispatch(
             };
             for a in args.iter().skip(1) {
                 if let Value::Array(m) = &*a.borrow() {
-                    rec(&mut out, &m.borrow());
+                    rec(it, &mut out, &m.borrow());
                 }
             }
             Value::Array(Rc::new(RefCell::new(out)))
@@ -362,12 +362,10 @@ pub(crate) fn dispatch(
                 let kb = k.borrow();
                 let vb = v.borrow();
                 for (i, (kk, _)) in kb.iter().enumerate() {
-                    let vv = vb
-                        .entries
-                        .get(i)
-                        .map(|(_, c)| c.borrow().clone())
-                        .unwrap_or(Value::Null);
-                    out.set(kk.clone(), vv);
+                    match vb.entries.get(i) {
+                        Some((_, c)) => copy_elem(it, &mut out, kk, c),
+                        None => out.set(kk.clone(), Value::Null),
+                    }
                 }
             }
             Value::Array(Rc::new(RefCell::new(out)))
@@ -462,9 +460,9 @@ pub(crate) fn dispatch(
                     for i in off..off + len {
                         let (k, c) = &b.entries[i as usize];
                         if preserve || matches!(k, ArrKey::Str(_)) {
-                            out.set(k.clone(), c.borrow().clone());
+                            copy_elem(it, &mut out, k, c);
                         } else {
-                            out.push(c.borrow().clone());
+                            push_elem(it, &mut out, c);
                         }
                     }
                     Value::Array(Rc::new(RefCell::new(out)))
@@ -660,10 +658,19 @@ pub(crate) fn dispatch(
                 arr.next += add as i64;
                 let mut new_entries: Vec<(ArrKey, Cell)> = Vec::new();
                 for (i, a) in args[1..].iter().enumerate() {
-                    new_entries.push((ArrKey::Int(i as i64), cell(a.borrow().clone())));
+                    // zval_copy_ctor: a reference arg lands as its cell.
+                    let c = if it.is_ref_cell(a) && Rc::strong_count(a) > 1 {
+                        a.clone()
+                    } else {
+                        cell(a.borrow().clone())
+                    };
+                    new_entries.push((ArrKey::Int(i as i64), c));
                 }
                 new_entries.append(&mut arr.entries);
                 arr.entries = new_entries;
+                // zend_hash_extend grows once for the prepend — one
+                // pow2 grow reported, not per-element grows.
+                arr.mem_note_extend(add as i64);
                 // unshift rebuilds the table — packed iff no string
                 // key survived the renumber.
                 arr.packed = arr.entries.iter().all(|(k, _)| matches!(k, ArrKey::Int(_)));
@@ -681,9 +688,9 @@ pub(crate) fn dispatch(
                 let mut out = PhpArray::new();
                 for (k, c) in a.borrow().iter().rev() {
                     if preserve || matches!(k, ArrKey::Str(_)) {
-                        out.set(k.clone(), c.borrow().clone());
+                        copy_elem(it, &mut out, k, c);
                     } else {
-                        out.push(c.borrow().clone());
+                        push_elem(it, &mut out, c);
                     }
                 }
                 Value::Array(Rc::new(RefCell::new(out)))
@@ -698,7 +705,7 @@ pub(crate) fn dispatch(
                     let v = c.borrow().to_php_string();
                     if !seen.contains(&v) {
                         seen.push(v);
-                        out.set(k.clone(), c.borrow().clone());
+                        copy_elem(it, &mut out, k, c);
                     }
                 }
                 Value::Array(Rc::new(RefCell::new(out)))
@@ -807,7 +814,7 @@ pub(crate) fn dispatch(
                             }
                         }
                     }
-                    out.set(k.clone(), c.borrow().clone());
+                    copy_elem(it, &mut out, k, c);
                 }
             }
             Value::Array(Rc::new(RefCell::new(out)))
@@ -827,7 +834,7 @@ pub(crate) fn dispatch(
                             }
                         }
                     }
-                    out.set(k.clone(), c.borrow().clone());
+                    copy_elem(it, &mut out, k, c);
                 }
             }
             Value::Array(Rc::new(RefCell::new(out)))
@@ -849,7 +856,7 @@ pub(crate) fn dispatch(
                         None => v.is_truthy(),
                     };
                     if keep {
-                        out.set(k.clone(), v);
+                        copy_elem(it, &mut out, k, c);
                     }
                 }
             }
@@ -990,12 +997,14 @@ pub(crate) fn dispatch(
                 for (_, c) in a.borrow().iter() {
                     if let Value::Array(row) = &*c.borrow() {
                         let row = row.borrow();
-                        if let Some(v) = row.get(&colkey) {
+                        if let Some(rc) = row.get_cell(&colkey) {
+                            // zend's column extraction copies the
+                            // VALUE — references don't survive.
                             if has_idx {
                                 let k = row.get(&to_key(&idx)).unwrap_or(Value::Null);
-                                out.set(to_key(&k), v);
+                                out.set(to_key(&k), rc.borrow().clone());
                             } else {
-                                out.push(v);
+                                out.push(rc.borrow().clone());
                             }
                         }
                     }
@@ -1006,27 +1015,88 @@ pub(crate) fn dispatch(
         "array_pad" => {
             let n = arg(args, 1).to_int();
             let v = arg(args, 2);
+            // zend_hash_check_size: |n| past HT_MAX_SIZE (1<<30)
+            // fatals as a ValueError before any arData alloc.
+            if n.unsigned_abs() > 1 << 30 {
+                return err(
+                    "ValueError",
+                    "array_pad(): Argument #2 ($length) must not exceed the maximum allowed array size",
+                );
+            }
             let mut out = PhpArray::new();
             if let Value::Array(a) = arg(args, 0) {
-                for (k, c) in a.borrow().iter() {
-                    out.set(k.clone(), c.borrow().clone());
+                let b = a.borrow();
+                let len = b.iter().count() as i64;
+                if n.unsigned_abs() <= len as u64 {
+                    // No padding to do: zend zval-copies the input —
+                    // keys untouched, reference cells shared.
+                    for (k, c) in b.iter() {
+                        copy_elem(it, &mut out, k, c);
+                    }
+                    let rc = Rc::new(RefCell::new(out));
+                    if !rc.borrow().entries.is_empty() {
+                        it.mem_track(&rc, Interp::ht_req(rc.borrow().len(), rc.borrow().packed));
+                    }
+                    return Ok(Some(Value::Array(rc)));
                 }
-                while (out.len() as i64) < n.abs() {
-                    if n > 0 {
-                        out.push(v.clone());
-                    } else {
-                        out.entries.insert(0, (ArrKey::Int(0), cell(v.clone())));
-                        let mut i = 0;
-                        for (k, _) in out.entries.iter_mut() {
-                            if let ArrKey::Int(x) = k {
-                                *x = i;
-                                i += 1;
+                let pad = n.unsigned_abs() as i64 - len;
+                // zend_hash_init(nSize) commits the result's whole
+                // arData upfront and keeps the input's table layout —
+                // a mixed input yields a mixed (hashed) result.
+                out.packed = b.packed;
+                // The arData alloc's emalloc guard fires before the
+                // fill loop runs — same order as zend.
+                let want = Interp::ht_req((len + pad).max(1) as usize, b.packed);
+                if it.mem_check(want).is_some() {
+                    it.mem_exceeded = true;
+                    return Err(it.oom_fatal());
+                }
+                let mut next = 0i64;
+                if n < 0 {
+                    for _ in 0..pad {
+                        out.entries.push((ArrKey::Int(next), cell(v.clone())));
+                        next += 1;
+                    }
+                }
+                for (k, c) in b.iter() {
+                    match k {
+                        ArrKey::Int(_) => {
+                            let nk = ArrKey::Int(next);
+                            next += 1;
+                            // zend renumbers int keys; the zval-copy
+                            // keeps a reference element's cell.
+                            if it.is_ref_cell(c) && Rc::strong_count(c) > 1 {
+                                out.entries.push((nk, c.clone()));
+                            } else {
+                                out.entries.push((nk, cell(c.borrow().clone())));
+                            }
+                        }
+                        _ => {
+                            out.mem_note_key(k);
+                            if it.is_ref_cell(c) && Rc::strong_count(c) > 1 {
+                                out.entries.push((k.clone(), c.clone()));
+                            } else {
+                                out.entries.push((k.clone(), cell(c.borrow().clone())));
                             }
                         }
                     }
                 }
+                drop(b);
+                if n > 0 {
+                    for _ in 0..pad {
+                        out.entries.push((ArrKey::Int(next), cell(v.clone())));
+                        next += 1;
+                    }
+                }
+                out.next = next;
+                out.mem_note_extend(len + pad);
             }
-            Value::Array(Rc::new(RefCell::new(out)))
+            let rc = Rc::new(RefCell::new(out));
+            // The committed arData stays live with the result table.
+            if !rc.borrow().entries.is_empty() {
+                it.mem_track(&rc, Interp::ht_req(rc.borrow().len(), rc.borrow().packed));
+            }
+            Value::Array(rc)
         }
         "array_is_list" => match arg(args, 0) {
             Value::Array(a) => {
@@ -1440,7 +1510,7 @@ pub(crate) fn dispatch(
                         ),
                         _ => k.clone(),
                     };
-                    out.set(k2, c.borrow().clone());
+                    copy_elem(it, &mut out, &k2, c);
                 }
             }
             Value::Array(Rc::new(RefCell::new(out)))
@@ -1455,9 +1525,9 @@ pub(crate) fn dispatch(
                     let mut c = PhpArray::new();
                     for (k, v) in chunk {
                         if preserve || matches!(k, ArrKey::Str(_)) {
-                            c.set(k.clone(), v.borrow().clone());
+                            copy_elem(it, &mut c, k, v);
                         } else {
-                            c.push(v.borrow().clone());
+                            push_elem(it, &mut c, v);
                         }
                     }
                     out.push(Value::Array(Rc::new(RefCell::new(c))));
@@ -2289,7 +2359,7 @@ fn array_diff(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
     for (k, c) in &elems {
         let s = ztmp_str(it, &c.borrow(), &mut pending);
         if !exclude.contains(&s) {
-            out.set(k.clone(), c.borrow().clone());
+            copy_elem(it, &mut out, k, c);
         }
     }
     if let Some(e) = deferred_err(it, pending) {
@@ -2388,7 +2458,7 @@ fn array_intersect(it: &mut Interp, args: &[Cell]) -> Result<Value, PhpError> {
     if let Value::Array(a) = arg(args, 0) {
         for (k, cell_v) in a.borrow().iter() {
             if !deleted.contains(k) {
-                out.set(k.clone(), cell_v.borrow().clone());
+                copy_elem(it, &mut out, k, cell_v);
             }
         }
     }
@@ -2442,12 +2512,44 @@ fn array_assoc_match(
                 }
             }
         }
-        out.set(k.clone(), v.clone());
+        copy_elem(it, &mut out, k, c);
     }
     if let Some(e) = deferred_err(it, pending) {
         return Err(e);
     }
     Ok(Value::Array(Rc::new(RefCell::new(out))))
+}
+
+/// zend zval-copy of an input element into a result array: an
+/// IS_REFERENCE element keeps its cell (the reference is shared —
+/// `&` dumps, writes alias back); every other element copies by
+/// value. Bind-replaces on key collision the way an overwritten
+/// bucket does.
+fn copy_elem(it: &Interp, out: &mut PhpArray, k: &ArrKey, c: &Cell) {
+    // zend unwraps an IS_REFERENCE bucket whose refcount is 1 —
+    // the cell is shared only while aliased elsewhere.
+    if it.is_ref_cell(c) && Rc::strong_count(c) > 1 {
+        out.bind_cell(k.clone(), c.clone());
+    } else {
+        // A collision overwrite installs a fresh bucket — zend's
+        // update separates, never writes into a cell the source
+        // array still shares.
+        match out.get_cell(k) {
+            Some(s) if it.is_ref_cell(&s) && Rc::strong_count(&s) > 1 => {
+                out.bind_cell(k.clone(), cell(c.borrow().clone()));
+            }
+            _ => out.set(k.clone(), c.borrow().clone()),
+        }
+    }
+}
+
+/// `copy_elem` for index-appended elements.
+fn push_elem(it: &Interp, out: &mut PhpArray, c: &Cell) {
+    if it.is_ref_cell(c) && Rc::strong_count(c) > 1 {
+        out.push_cell(c.clone());
+    } else {
+        out.push(c.borrow().clone());
+    }
 }
 
 /// `zval_get_long` on the callback's return + sign — zend compares
@@ -2458,9 +2560,11 @@ fn array_assoc_match(
 fn ucmp_cb(
     it: &mut Interp,
     cb: &Value,
+    name: &str,
     a: Value,
     b: Value,
     pending: &mut Deferred,
+    dep_thrown: &mut bool,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     if pending.is_some() {
@@ -2470,11 +2574,26 @@ fn ucmp_cb(
         cb,
         crate::interp::CallArgs::positional(vec![cell(a), cell(b)]),
     ) {
-        Ok(r) => match r.to_int() {
-            i if i > 0 => Ordering::Greater,
-            i if i < 0 => Ordering::Less,
-            _ => Ordering::Equal,
-        },
+        Ok(r) => {
+            // bool retval: zend_get_long gives 1/0 and one deprecation
+            // per builtin call (the sort path's dep_thrown rule).
+            if matches!(r, Value::Bool(_)) && !*dep_thrown {
+                *dep_thrown = true;
+                let r = it.deprecated_pub(&format!(
+                    "{}(): Returning bool from comparison function is deprecated, return an integer less than, equal to, or greater than zero",
+                    name
+                ));
+                if let Err(e) = r {
+                    *pending = Some(DeferredErr::Raw(e));
+                    return Ordering::Equal;
+                }
+            }
+            match r.to_int() {
+                i if i > 0 => Ordering::Greater,
+                i if i < 0 => Ordering::Less,
+                _ => Ordering::Equal,
+            }
+        }
         Err(e) => {
             *pending = Some(DeferredErr::Raw(e));
             Ordering::Equal
@@ -2517,7 +2636,7 @@ fn array_umatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Php
             format!(
                 "{}() expects at least {} arguments, {} given",
                 name,
-                ncb + 2,
+                ncb + 1,
                 args.len()
             ),
             0,
@@ -2559,43 +2678,62 @@ fn array_umatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Php
     } else {
         None
     };
-    let cmp =
-        |it: &mut Interp, x: &(ArrKey, Value), y: &(ArrKey, Value), pending: &mut Deferred| {
-            let mut c = match data_mode {
-                2 => ucmp_cb(
-                    it,
-                    &data_cb.clone().unwrap(),
-                    x.1.clone(),
-                    y.1.clone(),
-                    pending,
-                ),
-                1 => zstr_cmp(it, &x.1, &y.1, pending),
-                _ => Ordering::Equal,
-            };
-            if c == Ordering::Equal && key_mode != 0 {
-                c = match &key_cb {
-                    Some(cb) => ucmp_cb(it, cb, key_value(&x.0), key_value(&y.0), pending),
-                    // zend_hash_key_compare for the assoc variants is key
-                    // EQUALITY (int×int by value, str×str bytewise) — not
-                    // the sort-order key_cmp above (its int arm never
-                    // reports equal by design for same-table keys).
-                    None => {
-                        if x.0 == y.0 {
-                            Ordering::Equal
-                        } else {
-                            Ordering::Less
-                        }
-                    }
-                };
-            }
-            c
+    // zend emits the bool-comparator deprecation only on the shapes
+    // whose signature is `..., arrays, cb` — the internal-key-check
+    // assoc/ukey/uassoc-diff variants stay silent (oracle-probed), so
+    // the flag starts pre-set on those.
+    let mut dep_thrown = !(data_mode == 2 && key_mode != 1);
+    let cmp = |it: &mut Interp,
+               x: &(ArrKey, Cell),
+               y: &(ArrKey, Value),
+               pending: &mut Deferred,
+               dep_thrown: &mut bool| {
+        let mut c = match data_mode {
+            2 => ucmp_cb(
+                it,
+                &data_cb.clone().unwrap(),
+                name,
+                x.1.borrow().clone(),
+                y.1.clone(),
+                pending,
+                dep_thrown,
+            ),
+            1 => zstr_cmp(it, &x.1.borrow(), &y.1, pending),
+            _ => Ordering::Equal,
         };
-    // Snapshot arg0's entries; other lists stay borrowed per-scan.
-    let l0: Vec<(ArrKey, Value)> = match &*arrs[0].borrow() {
+        if c == Ordering::Equal && key_mode != 0 {
+            c = match &key_cb {
+                Some(cb) => ucmp_cb(
+                    it,
+                    cb,
+                    name,
+                    key_value(&x.0),
+                    key_value(&y.0),
+                    pending,
+                    dep_thrown,
+                ),
+                // zend_hash_key_compare for the assoc variants is key
+                // EQUALITY (int×int by value, str×str bytewise) — not
+                // the sort-order key_cmp above (its int arm never
+                // reports equal by design for same-table keys).
+                None => {
+                    if x.0 == y.0 {
+                        Ordering::Equal
+                    } else {
+                        Ordering::Less
+                    }
+                }
+            };
+        }
+        c
+    };
+    // Snapshot arg0's cells — kept results share reference cells
+    // (zend zval-copies the bucket, IS_REFERENCE survives).
+    let l0: Vec<(ArrKey, Cell)> = match &*arrs[0].borrow() {
         Value::Array(a) => a
             .borrow()
             .iter()
-            .map(|(k, c)| (k.clone(), c.borrow().clone()))
+            .map(|(k, c)| (k.clone(), c.clone()))
             .collect(),
         _ => unreachable!(),
     };
@@ -2612,11 +2750,18 @@ fn array_umatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Php
         .collect();
     let mut pending: Deferred = None;
     let mut out = PhpArray::new();
-    'entry: for (k, v) in &l0 {
+    'entry: for (k, c) in &l0 {
         for ol in &others {
             let mut found = false;
             for oe in ol {
-                if cmp(it, &(k.clone(), v.clone()), oe, &mut pending) == Ordering::Equal {
+                if cmp(
+                    it,
+                    &(k.clone(), c.clone()),
+                    oe,
+                    &mut pending,
+                    &mut dep_thrown,
+                ) == Ordering::Equal
+                {
                     found = true;
                     break;
                 }
@@ -2626,7 +2771,7 @@ fn array_umatch(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Value, Php
                 continue 'entry;
             }
         }
-        out.set(k.clone(), v.clone());
+        copy_elem(it, &mut out, k, c);
     }
     if let Some(e) = deferred_err(it, pending) {
         return Err(e);
