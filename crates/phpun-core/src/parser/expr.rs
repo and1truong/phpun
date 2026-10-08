@@ -3275,6 +3275,22 @@ impl<'a> Parser<'a> {
                     l,
                 ));
             }
+            // `&static` alone: zend consumes `static` as a class
+            // reference then expects `::` — the error sites on the
+            // token after it ('unexpected token "]", expecting "::"').
+            Some(Token::Ident(n))
+                if n.eq_ignore_ascii_case("static")
+                    && !matches!(self.peek2(), Some(Token::Op("::"))) =>
+            {
+                self.pos += 1;
+                return Err(PhpError::parse(
+                    format!(
+                        "syntax error, unexpected {}, expecting \"::\"",
+                        crate::parser::desc_t(self.peek())
+                    ),
+                    self.line(),
+                ));
+            }
             Some(Token::Ident(n))
                 if crate::lexer::is_keyword(n)
                     && !matches!(
@@ -3282,7 +3298,11 @@ impl<'a> Parser<'a> {
                         // `new`/`array` start dereferencable bases;
                         // null/true/false parse as constants.
                         "new" | "array" | "null" | "true" | "false"
-                    ) =>
+                    )
+                    // `&static::*` is legal zend (by-ref bind to a
+                    // static prop).
+                    && !(n.eq_ignore_ascii_case("static")
+                        && matches!(self.peek2(), Some(Token::Op("::")))) =>
             {
                 return Err(PhpError::parse(
                     format!(
