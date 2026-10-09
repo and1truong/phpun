@@ -946,7 +946,11 @@ pub(crate) fn dispatch(
             stream_open_check(args, 0, name, 1, "stream")?;
             // Byte-faithful: PHP strings are byte arrays — binary data
             // must survive the write unchanged.
-            let data = arg_bs(it, args, 1);
+            let mut data = arg_bs(it, args, 1);
+            if args.len() > 2 && !matches!(arg(args, 2), Value::Null) {
+                let n = zpp_long(it, args, 2, name, 3, "$length", "?int")?;
+                data.truncate(n.max(0) as usize);
+            }
             match write_resource(it, args.first(), &data)? {
                 StreamWrite::Written => Value::Int(data.len() as i64),
                 StreamWrite::Partial(n) => Value::Int(n as i64),
@@ -2154,6 +2158,12 @@ pub(crate) fn dispatch(
         "stream_set_chunk_size" => {
             stream_open_check(args, 0, name, 1, "stream")?;
             let new = zpp_long_arg(it, args, 1, name, 2, "$size")?;
+            if new <= 0 {
+                return err(
+                    "ValueError",
+                    format!("{}(): Argument #2 ($size) must be greater than 0", name),
+                );
+            }
             // zend returns the PREVIOUS chunk size (default 8192) and
             // installs the new one per stream.
             let (id, prev) = match arg(args, 0) {

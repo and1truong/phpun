@@ -612,6 +612,9 @@ pub struct Interp<'a> {
     /// zend's read_dimension(BP_VAR_RW) silently creates missing
     /// buckets instead of warning.
     dim_by_ref: bool,
+    /// Compound-assign target read: eval_cell's varvar arm warns
+    /// `Undefined variable $n` on a missing named CV (`${'a'} += 1`).
+    vv_read_warn: bool,
     /// `foreach ($x as &$v)` source fetch — zend treats it as a
     /// write-reference bind (uninit non-nullable typed props error
     /// 'by reference'; uninit *nullable* statics report 'undeclared').
@@ -1725,6 +1728,7 @@ impl<'a> Interp<'a> {
             globals_arr: None,
             globals_synced: crate::value::FxSet::default(),
             dim_by_ref: false,
+            vv_read_warn: false,
             foreach_by_ref: false,
             anon_class_names: HashMap::new(),
             anon_class_seq: 0,
