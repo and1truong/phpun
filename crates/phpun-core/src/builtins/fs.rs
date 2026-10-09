@@ -357,8 +357,29 @@ pub(crate) fn dispatch(
         }
         "file_get_contents" => {
             let path = arg_str(it, args, 0);
-            if path == "php://input" {
+            let low = path.to_lowercase();
+            if low == "php://input" {
                 Value::str(String::from_utf8_lossy(&it.php_input).into_owned())
+            } else if let Some(body) = parse_data_uri(&path) {
+                Value::str(String::from_utf8_lossy(&body).into_owned())
+            } else if low.starts_with("php://") && !low.starts_with("php://filter") {
+                match low.as_str() {
+                    // read of a write-only stdio stream: notice + "".
+                    "php://stdout" | "php://stderr" => {
+                        it.emit_diag_pub(
+                            8,
+                            "file_get_contents(): Read of 8192 bytes failed with errno=9 Bad file descriptor",
+                        )?;
+                        Value::str("")
+                    }
+                    "php://stdin" | "php://memory" | "php://temp" | "php://output" => {
+                        Value::str("")
+                    }
+                    _ => {
+                        invalid_php_uri(it, "file_get_contents", &path)?;
+                        Value::Bool(false)
+                    }
+                }
             } else if let Some((segs, inner)) = php_filter_uri(&path) {
                 let Some(inner) = inner else {
                     return Err(PhpError::uncaught("Error", "No URL resource specified", 0));
@@ -377,6 +398,26 @@ pub(crate) fn dispatch(
                     }
                     _ => Value::Bool(false),
                 }
+            } else if let Some(scheme) = uri_scheme(&path) {
+                // `scheme://` with no registered wrapper — zend warns
+                // twice; a mis-cased registered name fails "operation
+                // failed" instead.
+                if scheme.eq_ignore_ascii_case("data") {
+                    it.warn_pub(&format!(
+                        "file_get_contents({}): Failed to open stream: operation failed",
+                        path
+                    ))?;
+                } else {
+                    it.warn_pub(&format!(
+                        "file_get_contents(): Unable to find the wrapper \"{}\" - did you forget to enable it when you configured PHP?",
+                        scheme
+                    ))?;
+                    it.warn_pub(&format!(
+                        "file_get_contents({}): Failed to open stream: No such file or directory",
+                        path
+                    ))?;
+                }
+                Value::Bool(false)
             } else {
                 match read_stream(&path) {
                     Ok(b) => Value::str(String::from_utf8_lossy(&b).into_owned()),
@@ -393,6 +434,47 @@ pub(crate) fn dispatch(
         "file_put_contents" => {
             let path = arg_str(it, args, 0);
             let data = arg(args, 1).to_php_string();
+            let low = path.to_lowercase();
+            let stdio = match low.as_str() {
+                "php://stdout" => Some(1u8),
+                "php://stderr" => Some(2u8),
+                "php://output" => Some(3u8),
+                _ => None,
+            };
+            if let Some(which) = stdio {
+                let res = cell(Value::Resource(Rc::new(RefCell::new(PhpResource::Stdio {
+                    id: it.next_res_id(),
+                    which,
+                    pos: 0,
+                }))));
+                return match write_resource(it, Some(&res), data.as_bytes())? {
+                    StreamWrite::Written => Ok(Some(Value::Int(data.len() as i64))),
+                    _ => Ok(Some(Value::Bool(false))),
+                };
+            }
+            if parse_data_uri(&path).is_some() {
+                it.emit_diag_pub(8, "file_put_contents(): Stream is not writable")?;
+                return Ok(Some(Value::Bool(false)));
+            }
+            if low.starts_with("php://") && !low.starts_with("php://filter") {
+                let r = match low.as_str() {
+                    "php://stdin" => {
+                        it.emit_diag_pub(8, &format!(
+                            "file_put_contents(): Write of {} bytes failed with errno=9 Bad file descriptor",
+                            data.len()
+                        ))?;
+                        Value::Bool(false)
+                    }
+                    "php://input" => Value::Bool(false),
+                    // a fresh temp stream each open — the bytes land nowhere
+                    "php://memory" | "php://temp" => Value::Int(data.len() as i64),
+                    _ => {
+                        invalid_php_uri(it, "file_put_contents", &path)?;
+                        Value::Bool(false)
+                    }
+                };
+                return Ok(Some(r));
+            }
             let append = arg(args, 2).to_int() & 8 != 0; // FILE_APPEND
             let r = if append {
                 use std::io::Write;
@@ -671,7 +753,7 @@ pub(crate) fn dispatch(
                     None => return Ok(Some(Value::Bool(false))),
                 }
             }
-            if path == "php://input" {
+            if path.eq_ignore_ascii_case("php://input") {
                 let id = it.next_res_id();
                 Value::Resource(Rc::new(RefCell::new(PhpResource::Input {
                     id,
@@ -757,7 +839,7 @@ pub(crate) fn dispatch(
                     rcap: 0,
                     fraw: 0,
                 })))
-            } else if let Some(which) = match path.as_str() {
+            } else if let Some(which) = match path.to_lowercase().as_str() {
                 "php://stdin" => Some(0u8),
                 "php://stdout" => Some(1u8),
                 "php://stderr" => Some(2u8),
@@ -772,6 +854,9 @@ pub(crate) fn dispatch(
                     which,
                     pos: 0,
                 })))
+            } else if path.to_lowercase().starts_with("php://") {
+                invalid_php_uri(it, "fopen", &path)?;
+                Value::Bool(false)
             } else {
                 match fopen_mode(&mode) {
                     None => {
@@ -2654,6 +2739,29 @@ fn percent_decode(b: &[u8]) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+/// `[A-Za-z][A-Za-z0-9.+-]*://` scheme prefix — `file://` and
+/// `php://` handled by their own wrappers never reach this.
+fn uri_scheme(path: &str) -> Option<&str> {
+    let (scheme, _) = path.split_once("://")?;
+    let mut it = scheme.chars();
+    if it.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && it.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+    {
+        Some(scheme)
+    } else {
+        None
+    }
+}
+
+/// `php://nope` on any open path: zend warns "Invalid php:// URL
+/// specified" then the "operation failed" open-stream line.
+fn invalid_php_uri(it: &mut Interp, f: &str, path: &str) -> Result<(), PhpError> {
+    it.warn_pub(&format!("{f}(): Invalid php:// URL specified"))?;
+    it.warn_pub(&format!(
+        "{f}({path}): Failed to open stream: operation failed"
+    ))
 }
 
 /// php_stream_parse_fopen_modes: `mode[0]` must be r/w/a/x/c

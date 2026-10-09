@@ -1542,6 +1542,8 @@ pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
         "strlen" | "strrev" | "strtoupper" | "strtolower" | "ucfirst" | "lcfirst" | "md5"
         | "sha1" | "str_rot13" | "nl2br" | "quotemeta" | "soundex" => &[str_p],
         "ord" => &[("character", "string")],
+        "defined" => &[("constant_name", "string")],
+        "constant" => &[("name", "string")],
         "chr" => &[("codepoint", "int")],
         "str_repeat" | "wordwrap" => &[("string", "string"), ("times", "int")],
         "substr" => &[("string", "string"), ("offset", "int"), ("length", "?int")],

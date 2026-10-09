@@ -1253,8 +1253,12 @@ impl<'a> Parser<'a> {
             let mut m_set_vis = None;
             loop {
                 if self.ident_is("public") {
-                    vis = Visibility::Public;
-                    self.pos += 1;
+                    if self.at_asym_set() {
+                        m_set_vis = Some(Visibility::Public);
+                    } else {
+                        vis = Visibility::Public;
+                        self.pos += 1;
+                    }
                 } else if self.ident_is("protected") {
                     if self.at_asym_set() {
                         m_set_vis = Some(Visibility::Protected);

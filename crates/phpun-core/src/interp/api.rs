@@ -810,14 +810,7 @@ impl<'a> Interp<'a> {
                     self.fail(e)
                 };
             }
-            1024 => ("Notice", 1024),
-            _ => {
-                return self.fail(PhpError::uncaught(
-                    "ValueError",
-                    "trigger_error(): Argument #2 ($error_level) must be one of E_USER_ERROR, E_USER_WARNING, E_USER_NOTICE, or E_USER_DEPRECATED",
-                    self.cur_line,
-                ))
-            }
+            _ => ("Notice", level),
         };
         self.emit_diag(name, errno, msg)
     }
