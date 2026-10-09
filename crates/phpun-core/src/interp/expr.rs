@@ -1127,13 +1127,14 @@ impl<'a> Interp<'a> {
                 // class is the catchable no-parent Error (traits/
                 // closures defer here — p10new/m45 vs oracle).
                 s.scope_kw_err(&name, lit)?;
-                let cls = s.classes.get(&name.to_lowercase()).cloned();
-                let found = cls
-                    .as_ref()
-                    .and_then(|c| s.find_method_in(c, "__construct"));
                 // `new X(...)` resolves the class before its args
-                // evaluate — a missing class dies before arg side
-                // effects (new NonExistent(se()) prints nothing).
+                // evaluate — autoload is part of that resolution; a
+                // missing class dies before arg side effects.
+                let mut cls = s.classes.get(&name.to_lowercase()).cloned();
+                if cls.is_none() {
+                    s.run_autoload(name.trim_start_matches('\\'))?;
+                    cls = s.classes.get(&name.to_lowercase()).cloned();
+                }
                 if cls.is_none() {
                     return s.fail(PhpError::uncaught(
                         "Error",
@@ -1141,6 +1142,9 @@ impl<'a> Interp<'a> {
                         *site,
                     ));
                 }
+                let found = cls
+                    .as_ref()
+                    .and_then(|c| s.find_method_in(c, "__construct"));
                 let params = found
                     .as_ref()
                     .map(|m| m.0.decl.params.clone())
@@ -9712,7 +9716,11 @@ impl<'a> Interp<'a> {
             }
             "@" => {
                 self.silence += 1;
+                // zend lowers error_reporting to the fatal-only mask
+                // inside @ — visible to a user error handler.
+                let saved_level = std::mem::replace(&mut self.error_level, 4437);
                 let v = self.eval(e);
+                self.error_level = saved_level;
                 self.silence -= 1;
                 v
             }

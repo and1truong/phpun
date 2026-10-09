@@ -769,15 +769,55 @@ impl<'a> Interp<'a> {
     /// Diagnostic at a caller-selected E_USER_* level (trigger_error).
     /// Respects error_reporting masking + the silence (@) counter.
     pub fn emit_diag_pub(&mut self, level: i64, msg: &str) -> Result<(), PhpError> {
-        if self.silence > 0 || self.error_level & level == 0 {
+        if self.silence > 0 {
+            // `@` still dispatches the user handler — only display is
+            // off. E_USER_ERROR escapes @ entirely and still fatals.
+            return if self.error_handler.is_some() || level == 256 {
+                self.emit_diag_for(level, msg)
+            } else {
+                Ok(())
+            };
+        }
+        if self.error_level & level == 0 {
             return Ok(());
         }
+        self.emit_diag_for(level, msg)
+    }
+
+    fn emit_diag_for(&mut self, level: i64, msg: &str) -> Result<(), PhpError> {
         let (name, errno) = match level {
             512 => ("Warning", 512),
             16384 => ("Deprecated", 16384),
-            // E_USER_ERROR=256 is uncatchable in PHP 8.4+ and aborts.
-            256 => return self.fail(PhpError::fatal(msg.to_string(), self.cur_line)),
-            _ => ("Notice", level),
+            // Deprecated since 8.4: the deprecation fires first, then
+            // the E_USER_ERROR itself — a user handler can swallow it;
+            // only when unhandled does the fatal land.
+            256 => {
+                self.emit_diag(
+                    "Deprecated",
+                    8192,
+                    "Passing E_USER_ERROR to trigger_error() is deprecated since 8.4, throw an exception or call exit with a string message instead",
+                )?;
+                // Dispatch-only: an unhandled E_USER_ERROR never shows
+                // the plain diag line — silence borrowed for one call.
+                self.silence += 1;
+                let handled = self.emit_diag_x("Error", 256, msg)?;
+                self.silence -= 1;
+                return if handled {
+                    Ok(())
+                } else {
+                    let mut e = PhpError::fatal(msg.to_string(), self.cur_line);
+                    e.trace = Some(self.fatal_frames());
+                    self.fail(e)
+                };
+            }
+            1024 => ("Notice", 1024),
+            _ => {
+                return self.fail(PhpError::uncaught(
+                    "ValueError",
+                    "trigger_error(): Argument #2 ($error_level) must be one of E_USER_ERROR, E_USER_WARNING, E_USER_NOTICE, or E_USER_DEPRECATED",
+                    self.cur_line,
+                ))
+            }
         };
         self.emit_diag(name, errno, msg)
     }
