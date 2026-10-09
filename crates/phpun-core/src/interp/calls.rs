@@ -103,7 +103,7 @@ impl<'a> Interp<'a> {
                     let vals = self.arg_cells(
                         args,
                         &params,
-                        &format!("{}::{}()", cls.name(), mn),
+                        &format!("{}::{}", cls.name(), mn),
                         false,
                         site,
                     )?;
@@ -119,7 +119,7 @@ impl<'a> Interp<'a> {
                     .find_method_in(&cls, &mn)
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
-                let vals = self.arg_cells(args, &params, &format!("{}()", mn), false, site)?;
+                let vals = self.arg_cells(args, &params, &mn, false, site)?;
                 let fwd = matches!(&**class, Expr::Const(_) | Expr::Str(_) | Expr::AnonClass(_));
                 return self.static_invoke_vis(cls, &mn, vals, None, fwd);
             }
@@ -131,7 +131,7 @@ impl<'a> Interp<'a> {
                 match &v {
                     Value::Callable(_) => {
                         let params = self.callable_params(&v);
-                        let ctx = format!("{}()", self.callable_ctx_name(&v));
+                        let ctx = self.callable_ctx_name(&v);
                         let vals = self.arg_cells(args, &params, &ctx, false, site)?;
                         return self.call_value(&v, vals);
                     }
@@ -153,7 +153,7 @@ impl<'a> Interp<'a> {
                             ));
                         }
                         let params = self.callable_params(&v);
-                        let ctx = format!("{}()", self.callable_ctx_name(&v));
+                        let ctx = self.callable_ctx_name(&v);
                         let vals = self.arg_cells(args, &params, &ctx, false, site)?;
                         return self.call_value(&v, vals);
                     }
@@ -168,7 +168,7 @@ impl<'a> Interp<'a> {
                             self.send_line = Some(s);
                         }
                         let params = self.callable_params(&c);
-                        let ctx = format!("{}()", self.callable_ctx_name(&c));
+                        let ctx = self.callable_ctx_name(&c);
                         let vals = self.arg_cells(args, &params, &ctx, false, site)?;
                         return self.call_value(&c, vals);
                     }
@@ -505,7 +505,7 @@ impl<'a> Interp<'a> {
                             pos += 1;
                         }
                     }
-                    _ if internal && matches!(ctx, "current()" | "pos()") => {
+                    _ if internal && matches!(ctx, "current" | "pos") => {
                         // current()/pos() declare pass-by-value in zend
                         // arginfo — literals are legal (bug55754).
                         let c = cell(self.eval(expr)?);
@@ -544,7 +544,7 @@ impl<'a> Interp<'a> {
                             "Error",
                             format!(
                                 "{}: Argument #{}{} could not be passed by reference",
-                                ctx,
+                                format!("{}()", ctx),
                                 argno,
                                 pname.map(|n| format!(" (${})", n)).unwrap_or_default()
                             ),
@@ -693,9 +693,20 @@ impl<'a> Interp<'a> {
         let res = callee.or(site);
         // `\u{1}f` marks a source-literal unqualified call — only it may
         // fall back `ns\f` -> `f`; dynamic names are fully qualified.
-        let (unqualified, lname) = match fname.strip_prefix('\u{1}') {
-            Some(n) => (true, n.to_lowercase()),
-            None => (false, fname.trim_start_matches('\\').to_lowercase()),
+        let (unqualified, raw_lname) = match fname.strip_prefix('\u{1}') {
+            Some(n) => (true, n),
+            None => (false, fname.trim_start_matches('\\')),
+        };
+        // ponytail: most call sites are already lowercase — borrow them
+        // and only pay the String alloc for mixed-case names.
+        let lname: std::borrow::Cow<str> = if raw_lname
+            .bytes()
+            .any(|b| b.is_ascii_uppercase())
+            || !raw_lname.is_ascii()
+        {
+            std::borrow::Cow::Owned(raw_lname.to_lowercase())
+        } else {
+            std::borrow::Cow::Borrowed(raw_lname)
         };
         // `__HALT_COMPILER()` stops execution of the file (ns_080).
         if lname == "__halt_compiler" {
@@ -731,7 +742,7 @@ impl<'a> Interp<'a> {
             let vals = self.arg_cells(
                 args,
                 &params,
-                &format!("{}::{}()", cls.name(), mn),
+                &format!("{}::{}", cls.name(), mn),
                 false,
                 site,
             )?;
@@ -741,47 +752,48 @@ impl<'a> Interp<'a> {
         // not come from a compile-time literal (the `\u{1}` marker or a
         // `\`-qualified name) — `$f()`, `($this->cb)()`, reflection and
         // call_user_func all hit 'Cannot call compact() dynamically'.
-        if lname == "compact" && !unqualified && !fname.starts_with('\\') {
+        if lname.as_ref() == "compact" && !unqualified && !fname.starts_with('\\') {
             return self.fail(PhpError::uncaught(
                 "Error",
                 "Cannot call compact() dynamically",
                 self.cur_line,
             ));
         }
-        let mut decl = self.functions.get(&lname).cloned();
+        let mut decl = self.functions.get(lname.as_ref()).cloned();
         // A namespaced user function outranks the global/builtin one for
         // unqualified calls (namespaces/ns_013).
         let mut ns_resolved = false;
         // When the ns\name fallback misses too, the undefined-function
-        // error names the ns-qualified candidate (bugs/77376).
-        let mut miss_name = fname
-            .trim_start_matches('\u{1}')
-            .trim_start_matches('\\')
-            .to_string();
+        // error names the ns-qualified candidate (bugs/77376). Lazy:
+        // only built on the error path — None means "use raw_name".
+        let mut miss_name: Option<String> = None;
         if decl.is_none() && unqualified {
             let ns = self.caller_ns();
             if !ns.is_empty() {
-                let cand = format!("{}\\{}", ns.to_lowercase(), lname);
+                let cand = format!("{}\\{}", ns.to_lowercase(), lname.as_ref());
                 decl = self.functions.get(&cand).cloned();
                 ns_resolved = decl.is_some();
                 if !ns_resolved {
-                    miss_name = format!("{}\\{}", ns, fname.trim_start_matches('\u{1}'));
+                    miss_name = Some(format!("{}\\{}", ns, fname.trim_start_matches('\u{1}')));
                 }
             }
         }
         // Zend resolves the callee at INIT — before any arg op — so an
         // unresolvable name aborts the call before args ever evaluate.
         if decl.is_none()
-            && !crate::builtins::is_builtin(&lname)
-            && crate::builtins::builtin_params(&lname).is_none()
-            && builtin_byref(&lname).is_none()
+            && !crate::builtins::is_builtin(lname.as_ref())
+            && crate::builtins::builtin_params(lname.as_ref()).is_none()
+            && builtin_byref(lname.as_ref()).is_none()
         {
             if let Some(l) = res {
                 self.send_line = Some(l);
             }
             return self.fail(PhpError::uncaught(
                 "Error",
-                format!("Call to undefined function {}()", miss_name),
+                format!(
+                    "Call to undefined function {}()",
+                    miss_name.as_deref().unwrap_or(raw_name)
+                ),
                 0,
             ));
         }
@@ -789,9 +801,9 @@ impl<'a> Interp<'a> {
         // by-ref slots emit "Only variables should be passed by reference"
         // (passByReference_012, array_shift(array_shift($a))).
         let builtin_params: Vec<Param> = if decl.is_none() {
-            let sig = crate::builtins::builtin_sig(&lname).unwrap_or_default();
-            let bparams = crate::builtins::builtin_params(&lname);
-            builtin_byref(&lname)
+            let sig = crate::builtins::builtin_sig(lname.as_ref()).unwrap_or_default();
+            let bparams = crate::builtins::builtin_params(lname.as_ref());
+            builtin_byref(lname.as_ref())
                 .map(|flags| {
                     flags
                         .iter()
@@ -826,10 +838,7 @@ impl<'a> Interp<'a> {
             decl.as_deref()
                 .map(|d| d.params.as_slice())
                 .unwrap_or(&builtin_params),
-            &format!(
-                "{}()",
-                fname.trim_start_matches('\u{1}').trim_start_matches('\\')
-            ),
+            raw_name,
             decl.is_none(),
             site,
         )?;
@@ -845,7 +854,7 @@ impl<'a> Interp<'a> {
             // `...` unpack compiles to SEND_UNPACK — a generic builtin
             // call, never the frameless path.
             if decl.is_none()
-                && matches!(lname.as_str(), "min" | "max")
+                && matches!(lname.as_ref(), "min" | "max")
                 && argvals.cells.len() == 2
                 && argvals.named.is_empty()
                 && !args
@@ -865,7 +874,7 @@ impl<'a> Interp<'a> {
                         self.cur_line,
                     ));
                 }
-                let pick_lhs = if lname == "min" {
+                let pick_lhs = if lname.as_ref() == "min" {
                     ord == std::cmp::Ordering::Less
                 } else {
                     ord != std::cmp::Ordering::Less
@@ -891,8 +900,8 @@ impl<'a> Interp<'a> {
             let visible = args
                 .iter()
                 .any(|a| matches!(Self::unmark_arg(a), Expr::Unpack(_)))
-                || !(literal && zend_literal_no_frame(&lname, args));
-            if let Some(v) = self.call_builtin(&lname, &argvals, visible)? {
+                || !(literal && zend_literal_no_frame(lname.as_ref(), args));
+            if let Some(v) = self.call_builtin(lname.as_ref(), &argvals, visible)? {
                 return Ok(v);
             }
         }
@@ -901,7 +910,10 @@ impl<'a> Interp<'a> {
             None => {
                 return self.fail(PhpError::uncaught(
                     "Error",
-                    format!("Call to undefined function {}()", miss_name),
+                    format!(
+                        "Call to undefined function {}()",
+                        miss_name.as_deref().unwrap_or(raw_name)
+                    ),
                     0,
                 ))
             }
@@ -3963,7 +3975,7 @@ impl<'a> Interp<'a> {
         let c = cell(cv);
         if let Some(slot) = args.cells.get_mut(i) {
             *slot = c.clone();
-        } else if let Some(t) = by_name[i].as_mut() {
+        } else if let Some(t) = by_name.get_mut(i).and_then(|s| s.as_mut()) {
             t.0 = c.clone();
         }
         if let Some(a) = self.call_trace.last_mut().and_then(|fr| fr.args.get_mut(i)) {
@@ -4016,7 +4028,14 @@ impl<'a> Interp<'a> {
         // parameter"; a name colliding with a positional or a prior
         // named arg is the "overwrites previous argument" Error.
         let n_pos = args.cells.len();
-        let mut by_name: Vec<Option<(Cell, bool, bool)>> = vec![None; decl.params.len()];
+        // ponytail: stays empty for positional-only calls (the common
+        // case) — all reads below go through .get/.get_mut so an empty
+        // vec means "no named args bound".
+        let mut by_name: Vec<Option<(Cell, bool, bool)>> = if args.named.is_empty() {
+            Vec::new()
+        } else {
+            vec![None; decl.params.len()]
+        };
         let mut variadic_named: Vec<(String, Cell)> = Vec::new();
         let has_variadic = decl.params.iter().any(|p| p.variadic);
         for (n, c, refable, trav) in &args.named {
@@ -4063,7 +4082,9 @@ impl<'a> Interp<'a> {
         for (i, p) in decl.params.iter().enumerate() {
             let (Some(ty), Some(a)) = (
                 &p.ty,
-                args.cells.get(i).or(by_name[i].as_ref().map(|t| &t.0)),
+                args.cells
+                    .get(i)
+                    .or(by_name.get(i).and_then(|s| s.as_ref()).map(|t| &t.0)),
             ) else {
                 continue;
             };
@@ -4326,7 +4347,10 @@ impl<'a> Interp<'a> {
                             args.trav_cells.contains(&i),
                         )
                     })
-                    .or(by_name[i].as_ref().map(|t| (&t.0, t.1, t.2)))
+                    .or(by_name
+                        .get(i)
+                        .and_then(|s| s.as_ref())
+                        .map(|t| (&t.0, t.1, t.2)))
                 {
                     if p.by_ref {
                         if trav {
@@ -4494,7 +4518,10 @@ impl<'a> Interp<'a> {
             // up to the highest bound param — `test(c:'C', a:'A')`
             // reports 3 args, not 2 (named_params/func_get_args).
             let max_bound = (0..n_fixed)
-                .filter(|i| args.cells.get(*i).is_some() || by_name[*i].is_some())
+                .filter(|i| {
+                    args.cells.get(*i).is_some()
+                        || by_name.get(*i).is_some_and(|s| s.is_some())
+                })
                 .max();
             let mut fa: Vec<Cell> = Vec::new();
             if let Some(max_i) = max_bound {

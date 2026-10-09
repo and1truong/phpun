@@ -1137,7 +1137,7 @@ impl<'a> Interp<'a> {
                 let argvals = s.arg_cells(
                     args,
                     &params,
-                    &format!("{}::__construct()", name),
+                    &name,
                     false,
                     Some(*site),
                 )?;
@@ -1216,7 +1216,7 @@ impl<'a> Interp<'a> {
                 let argvals = s.arg_cells(
                     args,
                     &[],
-                    &format!("{}::{{closure}}()", cls.name()),
+                    &format!("{}::{{closure}}", cls.name()),
                     false,
                     Some(*site),
                 )?;

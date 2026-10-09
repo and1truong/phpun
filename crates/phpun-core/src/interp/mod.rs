@@ -1019,6 +1019,10 @@ pub struct Interp<'a> {
     pub mem_used: u64,
     /// 'tried to allocate N' figure of the charge that overflowed.
     mem_last: u64,
+    /// Cached ini_bytes("memory_limit"): reparsed only when the raw
+    /// ini string changes, since ini_set writes land in self.ini and
+    /// this read runs on every tracked alloc.
+    mem_limit_ck: (i64, Option<String>),
     /// Set by gen_start so invoke_fn_run marks the gen-body frame —
     /// its TraceFrame sites `[internal function]` (Zend's resume
     /// isn't a userland call).
@@ -1857,6 +1861,7 @@ impl<'a> Interp<'a> {
             assert_src: String::new(),
             mem_used: MM_BASE_USED,
             mem_last: 0,
+            mem_limit_ck: (0, None),
             mem_exceeded: false,
             oom_at: None,
             // zend_mm_init commits the first 2MB chunk eagerly.
@@ -3794,7 +3799,12 @@ impl<'a> Interp<'a> {
     /// reusable runs, so fragmented heaps can trip a bit earlier.
     /// PR #88 owns the canonical page-level model.
     pub(crate) fn mem_check(&mut self, req: u64) -> Option<u64> {
-        let limit = self.ini_bytes("memory_limit");
+        let raw = self.ini.get("memory_limit").map(String::as_str);
+        if raw != self.mem_limit_ck.1.as_deref() {
+            let v = self.ini_bytes("memory_limit");
+            self.mem_limit_ck = (v, raw.map(str::to_string));
+        }
+        let limit = self.mem_limit_ck.0;
         if limit <= 0 {
             return None;
         }

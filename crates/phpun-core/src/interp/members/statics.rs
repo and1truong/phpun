@@ -424,7 +424,7 @@ impl<'a> Interp<'a> {
             .find_method_in(&cls, name)
             .map(|m| m.0.decl.params.clone())
             .unwrap_or_default();
-        let argvals = self.arg_cells(args, &params, &format!("{}()", name), false, site)?;
+        let argvals = self.arg_cells(args, &params, &name, false, site)?;
         // Only a syntactic class ref (self/parent/static/Foo) is a
         // forwarding call; `$x::m()` is not (bug48533).
         let fwd = matches!(class, Expr::Const(_) | Expr::Str(_) | Expr::AnonClass(_));
