@@ -4073,15 +4073,13 @@ impl<'a> Interp<'a> {
     /// runway is just the trim tail — the leftover of the stolen span
     /// stays a hole below it.
     fn seg_place(&mut self, key: usize, fp: u64) -> u64 {
-        self.seg_place_held(key, fp, usize::MAX).1
+        self.seg_place_at(key, fp).1
     }
 
-    /// seg_place with one slot kept as if still mapped — the
-    /// relocated predecessor, freed only after the new segment lands
-    /// (zend allocs while the old segment is held). `held` is a slot
-    /// index; returns the placed index too so callers can free the
-    /// predecessor slot by position when the key repeats.
-    fn seg_place_held(&mut self, key: usize, fp: u64, held: usize) -> (usize, u64) {
+    /// seg_place that also returns the placed index, so a reloc
+    /// caller can free the predecessor slot by position when the new
+    /// segment's key repeats the old one's.
+    fn seg_place_at(&mut self, key: usize, fp: u64) -> (usize, u64) {
         // The gap must hold the whole reservation: zend mmaps
         // size + alignment - page before trimming — an exactly
         // fitting gap does not qualify.
@@ -4095,11 +4093,7 @@ impl<'a> Interp<'a> {
             let mut total = 0u64;
             let mut j = i;
             while j < self.mem_seg_order.len() {
-                let span = if j == held {
-                    0
-                } else {
-                    self.slot_span(self.mem_seg_order[j])
-                };
+                let span = self.slot_span(self.mem_seg_order[j]);
                 if span == 0 {
                     break;
                 }
@@ -4482,7 +4476,7 @@ impl<'a> Interp<'a> {
                     // The old slot's charge is still live — it can't
                     // be a steal target; the new segment lands
                     // elsewhere and the old span frees in place.
-                    let (at, n) = self.seg_place_held(key, fp, usize::MAX);
+                    let (at, n) = self.seg_place_at(key, fp);
                     let old = self.mem_tracked.get(&key).map(|c| c.seg_cap).unwrap_or(0);
                     if old > 0 {
                         self.seg_free_except(key, old, at);
@@ -4986,18 +4980,12 @@ impl<'a> Interp<'a> {
         if req > MM_MAX_LARGE {
             if reloc {
                 // The grown segment lands at the bottom of the
-                // address space while the old one is still held;
-                // the old span frees in place as a hole for the
+                // address space while the old one is still held —
+                // its slot can't host placement (the retired charge
+                // is untracked, so the slot still reads occupied) —
+                // then the old span frees in place as a hole for the
                 // segment below it to drain at its grow.
-                // Placement runs while the old segment is still
-                // held — it can't host — then the old span frees in
-                // place as a hole for the segment below to drain.
-                let held = self
-                    .mem_seg_order
-                    .iter()
-                    .position(|s| s.key == old_key && s.hole == 0)
-                    .unwrap_or(usize::MAX);
-                self.seg_place_held(key, fp, held);
+                self.seg_place_at(key, fp);
                 self.seg_free(old_key, old_seg.unwrap_or(0));
                 new_seg_cap = Self::seg_stretch(fp, 0);
             } else if let Some(p) = self
