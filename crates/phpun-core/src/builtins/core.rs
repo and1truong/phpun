@@ -21,8 +21,7 @@ pub(crate) fn dispatch(
                 );
             }
             let v = arg(args, 1);
-            it.define_const(&n, v);
-            Value::Bool(true)
+            Value::Bool(it.define_const(&n, v)?)
         }
         "defined" => {
             let n = arg_str(it, args, 0);
@@ -39,7 +38,7 @@ pub(crate) fn dispatch(
             }
             match it.const_get(&n) {
                 Some(v) => v,
-                None => return err("Error", format!("Undefined constant {}", n)),
+                None => return err("Error", format!("Undefined constant \"{}\"", n)),
             }
         }
         "function_exists" => {
@@ -105,6 +104,7 @@ pub(crate) fn dispatch(
                         return Err(pe);
                     }
                 }
+                it.exc_frameless = name.starts_with("call_user_func");
                 return err(
                     "TypeError",
                     format!(
@@ -253,6 +253,12 @@ pub(crate) fn dispatch(
             // 16384 select the diagnostic label + errno seen by the handler
             // (error_2_exception_001, bug21094). Default is E_USER_NOTICE.
             let level = args.get(1).map(|c| c.borrow().to_int()).unwrap_or(1024);
+            if !matches!(level, 256 | 512 | 1024 | 16384) {
+                return err(
+                    "ValueError",
+                    "trigger_error(): Argument #2 ($error_level) must be one of E_USER_ERROR, E_USER_WARNING, E_USER_NOTICE, or E_USER_DEPRECATED",
+                );
+            }
             it.emit_diag_pub(level, &msg)?;
             Value::Bool(true)
         }

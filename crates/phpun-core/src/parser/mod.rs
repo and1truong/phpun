@@ -623,6 +623,20 @@ impl<'a> Parser<'a> {
             Some(Token::Variable(s)) => format!("variable \"${}\"", s),
             Some(Token::Int(v)) => format!("integer \"{}\"", v),
             Some(Token::Float(v)) => format!("floating-point number \"{}\"", v),
+            Some(Token::SimpleString(v)) => format!("single-quoted string \"{}\"", v),
+            Some(Token::InterpString(parts)) => {
+                let s: String = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        crate::lexer::StringPart::Lit(b) => {
+                            Some(String::from_utf8_lossy(b).into_owned())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                format!("double-quoted string \"{}\"", s)
+            }
             Some(Token::Op(o)) => format!("token \"{}\"", o),
             Some(_) => "token".to_string(),
         }
@@ -803,6 +817,14 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn stmt(&mut self) -> Result<Stmt, PhpError> {
+        let s = self.stmt_parsed()?;
+        // `[]` append slots outside a write target are zend's compile
+        // fatal; run it per statement (dead code still compiles).
+        self.check_dim_reads_stmt(&s)?;
+        Ok(s)
+    }
+
+    fn stmt_parsed(&mut self) -> Result<Stmt, PhpError> {
         // The first-statement slot is consumed by whichever stmt
         // parses it — a nested `declare` can't reach it (strict_nested).
         self.strict_slot = self.first_stmt_slot;
@@ -1141,6 +1163,20 @@ pub(in crate::parser) fn desc_t(t: Option<&Token>) -> String {
         Some(Token::Op(o)) => format!("token \"{}\"", o),
         Some(Token::Int(v)) => format!("integer \"{}\"", v),
         Some(Token::Float(v)) => format!("floating-point number \"{}\"", v),
+        Some(Token::SimpleString(v)) => format!("single-quoted string \"{}\"", v),
+        Some(Token::InterpString(parts)) => {
+            let s: String = parts
+                .iter()
+                .filter_map(|p| match p {
+                    crate::lexer::StringPart::Lit(b) => {
+                        Some(String::from_utf8_lossy(b).into_owned())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            format!("double-quoted string \"{}\"", s)
+        }
         _ => "token".to_string(),
     }
 }

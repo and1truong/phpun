@@ -565,6 +565,11 @@ pub struct Interp<'a> {
     /// real level, never released: oracle keeps ~128 after the last
     /// pop.
     ob_boot: Option<Rc<()>>,
+    /// Zend's opcode-style builtins (strlen/count/sizeof/
+    /// array_key_exists/call_user_func*) raise arg errors with the
+    /// callee frame still off the trace — exception() skips it.
+    pub(crate) exc_frameless: bool,
+
     /// One-time token for the output machinery zend retains once
     /// bytes reach the real stdout sink — EMIT_RESID, never released.
     emit_boot: Option<Rc<()>>,
@@ -1380,6 +1385,38 @@ impl<'a> Interp<'a> {
     pub fn new(file: &'a str) -> Self {
         let mut constants = crate::value::FxMap::default();
         constants.insert("PHP_EOL".into(), Value::str("\n"));
+        for (n, v) in [
+            ("STREAM_PF_UNIX", 1),
+            ("STREAM_PF_INET", 2),
+            ("STREAM_PF_INET6", 10),
+            ("STREAM_SOCK_STREAM", 1),
+            ("STREAM_SOCK_DGRAM", 2),
+            ("STREAM_SOCK_RAW", 3),
+            ("STREAM_SOCK_RDM", 4),
+            ("STREAM_SOCK_SEQPACKET", 5),
+            ("STREAM_IPPROTO_IP", 0),
+            ("STREAM_IPPROTO_TCP", 6),
+            ("STREAM_IPPROTO_UDP", 17),
+            ("STREAM_IPPROTO_ICMP", 1),
+            ("STREAM_IPPROTO_RAW", 255),
+            ("STREAM_IS_URL", 1),
+            ("STREAM_MUST_SEEK", 16),
+            ("STREAM_URL_STAT_LINK", 1),
+            ("STREAM_URL_STAT_QUIET", 2),
+            ("STREAM_MKDIR_RECURSIVE", 1),
+            ("STREAM_FILTER_READ", 1),
+            ("STREAM_FILTER_WRITE", 2),
+            ("STREAM_FILTER_ALL", 3),
+            ("STREAM_SHUT_RD", 0),
+            ("STREAM_SHUT_WR", 1),
+            ("STREAM_SHUT_RDWR", 2),
+            ("STREAM_CAST_FOR_SELECT", 3),
+            ("STREAM_CAST_AS_STREAM", 0),
+            ("STREAM_CRYPTO_METHOD_ANY_CLIENT", 127),
+            ("STREAM_CRYPTO_METHOD_TLS_CLIENT", 121),
+        ] {
+            constants.insert(n.into(), Value::Int(v));
+        }
         constants.insert("PHP_VERSION".into(), Value::str("8.5.11-phpun"));
         constants.insert("PHP_MAJOR_VERSION".into(), Value::Int(8));
         constants.insert("PHP_MINOR_VERSION".into(), Value::Int(5));
@@ -1790,6 +1827,7 @@ impl<'a> Interp<'a> {
             shutdown_fns: Vec::new(),
             error_handler: None,
             error_handler_stack: Vec::new(),
+            exc_frameless: false,
             exception_handler_stack: Vec::new(),
             error_level: 30719,
             env_overrides: HashMap::new(),
@@ -7272,7 +7310,13 @@ impl<'a> Interp<'a> {
                 thrown: self.send_line.unwrap_or(self.cur_line) as u32,
                 full_msg: String::new(),
                 eval_ctx: 0,
-                frames: Rc::new(self.call_trace.clone()),
+                frames: {
+                    let mut fr = self.call_trace.clone();
+                    if std::mem::take(&mut self.exc_frameless) {
+                        fr.pop();
+                    }
+                    Rc::new(fr)
+                },
                 previous: None,
             });
             if !o.prop_order.contains(&"message".into()) {
@@ -7465,6 +7509,7 @@ impl<'a> Interp<'a> {
                     name,
                     self.zpp_callback_detail(&cb)
                 );
+                self.exc_frameless = matches!(name, "call_user_func" | "call_user_func_array");
                 let e = self.exception("TypeError", &msg);
                 let te = self.throw(e);
                 let r = self.fail(te);
@@ -7519,6 +7564,15 @@ impl<'a> Interp<'a> {
         // (Zend's `f` ZPP flag) with the callback-specific messages.
         if args.named.is_empty() {
             if let Some(sig) = builtins::strict_sig(name) {
+                let zf = matches!(
+                    name,
+                    "strlen"
+                        | "count"
+                        | "sizeof"
+                        | "array_key_exists"
+                        | "call_user_func"
+                        | "call_user_func_array"
+                );
                 let strict = self.caller_file_strict();
                 // Zend verifies arity before per-arg types — an
                 // under-arity call reports "expects exactly/at least N
@@ -7573,6 +7627,7 @@ impl<'a> Interp<'a> {
                                 null,
                                 self.zpp_callback_detail(&v),
                             );
+                            self.exc_frameless = zf;
                             let e = self.exception("TypeError", &msg);
                             let te = self.throw(e);
                             let r = self.fail(te);
@@ -7611,13 +7666,14 @@ impl<'a> Interp<'a> {
                         } else {
                             // Zend omits the name for variadic args.
                             let variadic = builtins::builtin_params(name)
-                                .map(|ps| ps.iter().any(|(_, d)| matches!(*d, builtins::BDef::Var)))
+                                .map(|ps| matches!(ps.get(i), Some((_, builtins::BDef::Var))))
                                 .unwrap_or(false);
                             let pname_txt = if variadic {
                                 String::new()
                             } else {
                                 format!(" (${pname})")
                             };
+                            self.exc_frameless = zf;
                             let e = self.exception(
                                 "TypeError",
                                 &format!(
@@ -7630,6 +7686,38 @@ impl<'a> Interp<'a> {
                             self.call_trace.pop();
                             return r;
                         }
+                    } else if !strict
+                        && !matches!(v, Value::Null)
+                        && arg_checks
+                        && !pty.trim_start_matches('?').split('|').any(|t| {
+                            t == "resource" && matches!(v, Value::Resource(_))
+                                || t != "resource" && self.param_type_match(t, &v)
+                        })
+                    {
+                        // Weak mode coerces scalars, but non-coercible
+                        // arg types still TypeError (strlen([1]);
+                        // sort("x") — the by-ref arm errors earlier).
+                        let variadic = builtins::builtin_params(name)
+                            .map(|ps| matches!(ps.get(i), Some((_, builtins::BDef::Var))))
+                            .unwrap_or(false);
+                        let pname_txt = if variadic {
+                            String::new()
+                        } else {
+                            format!(" (${pname})")
+                        };
+                        let msg = format!(
+                            "{}(): Argument #{}{pname_txt} must be of type {}, {} given",
+                            name,
+                            i + 1,
+                            pty,
+                            self.zval_type_name(&v),
+                        );
+                        self.exc_frameless = zf;
+                        let e = self.exception("TypeError", &msg);
+                        let te = self.throw(e);
+                        let r = self.fail(te);
+                        self.call_trace.pop();
+                        return r;
                     } else if strict && !self.zpp_strict_ok(pty, &v) {
                         let msg = format!(
                             "{}(): Argument #{} (${}) must be of type {}, {} given",
@@ -7639,6 +7727,7 @@ impl<'a> Interp<'a> {
                             pty,
                             self.zval_type_name(&v),
                         );
+                        self.exc_frameless = zf;
                         let e = self.exception("TypeError", &msg);
                         let te = self.throw(e);
                         let r = self.fail(te);
@@ -8621,6 +8710,45 @@ class SplObjectStorage implements Countable, Iterator, ArrayAccess {
         }
         foreach (($pairs[1] ?? []) as $k => $v) { $this->$k = $v; }
     }
+}
+// ponytail: strong refs, not real weak refs — entries survive the
+// key's own destruction until removed. Iterating yields object keys.
+class WeakMap implements Countable, Iterator, ArrayAccess {
+    private array $objs = [];
+    private array $data = [];
+    private int $idx = 0;
+    private function hashOf($obj) {
+        if (!is_object($obj)) {
+            throw new TypeError('WeakMap key must be an object');
+        }
+        return spl_object_id($obj);
+    }
+    public function offsetExists($obj): bool {
+        return isset($this->objs[$this->hashOf($obj)]);
+    }
+    public function offsetGet($obj) {
+        $h = $this->hashOf($obj);
+        if (!isset($this->objs[$h])) {
+            throw new Error('Object ' . get_class($obj) . '#' . spl_object_id($obj) . ' not contained in WeakMap');
+        }
+        return $this->data[$h];
+    }
+    public function offsetSet($obj, $data = null): void {
+        $h = $this->hashOf($obj);
+        if (!isset($this->objs[$h])) {
+            $this->objs[$h] = $obj;
+        }
+        $this->data[$h] = $data;
+    }
+    public function offsetUnset($obj): void {
+        unset($this->objs[$this->hashOf($obj)], $this->data[$this->hashOf($obj)]);
+    }
+    public function count(): int { return count($this->objs); }
+    public function rewind(): void { $this->idx = 0; }
+    public function valid(): bool { return $this->idx < count($this->objs); }
+    public function current() { return $this->data[array_keys($this->objs)[$this->idx]]; }
+    public function key() { return array_values($this->objs)[$this->idx]; }
+    public function next(): void { $this->idx++; }
 }
 class SplFixedArray implements ArrayAccess, Iterator, Countable {
     private array $data;

@@ -749,7 +749,25 @@ pub fn trace_frame_str(fr: &TraceFrame) -> String {
         Some(c) => format!("{}{}{}", c, fr.ty, fr.function),
         None => fr.function.clone(),
     };
-    let mut arg_strs: Vec<String> = fr.args.iter().map(|c| trace_arg(&c.borrow())).collect();
+    let mut arg_strs: Vec<String> = fr
+        .args
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            // zend's #[SensitiveParameter] params render as an opaque
+            // SensitiveParameterValue object in backtraces.
+            let sensitive = match fr.function.as_str() {
+                "hash_pbkdf2" => i == 1,
+                "password_hash" | "password_verify" | "password_needs_rehash" => i == 0,
+                _ => false,
+            };
+            if sensitive {
+                "Object(SensitiveParameterValue)".to_string()
+            } else {
+                trace_arg(&c.borrow())
+            }
+        })
+        .collect();
     for (n, c) in &fr.named_args {
         arg_strs.push(format!("{}: {}", n, trace_arg(&c.borrow())));
     }

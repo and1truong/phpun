@@ -25,6 +25,26 @@ impl<'a> Interp<'a> {
         } else {
             msg
         };
+        self.emit_diag_x(level, errno, msg).map(|_| ())
+    }
+
+    /// emit_diag + reports whether a user handler swallowed it —
+    /// trigger_error(E_USER_ERROR) fatals only when unhandled.
+    pub(in crate::interp) fn emit_diag_x(
+        &mut self,
+        level: &str,
+        errno: i64,
+        msg: &str,
+    ) -> Result<bool, PhpError> {
+        // \u{1} in a compile-time diagnostic is the source file — the
+        // parser doesn't know it (`{closure:\u{1}:L}`).
+        let owned;
+        let msg = if msg.contains('\u{1}') {
+            owned = msg.replace('\u{1}', &self.diag_file());
+            owned.as_str()
+        } else {
+            msg
+        };
         if self.error_handler.is_some() && !self.in_handler {
             let h = self.error_handler.clone().unwrap();
             let args: Vec<Cell> = vec![
@@ -62,25 +82,39 @@ impl<'a> Interp<'a> {
                         .map(|(_, _, l, g)| (*l, *g))
                         .unwrap_or((false, false));
                     self.dim_throw = Some((tv, e, live, gate));
-                    return Ok(());
+                    return Ok(true);
                 }
                 Err(e) => return Err(e),
-                Ok(v) if !matches!(v, Value::Bool(false)) => return Ok(()),
+                Ok(v) if !matches!(v, Value::Bool(false)) => return Ok(true),
                 Ok(_) => {}
             }
         }
-        self.diag(level, msg);
-        Ok(())
+        // `@` silences the built-in display, never the handler —
+        // PHP 8 dispatches it with a reduced error_reporting mask.
+        if self.silence == 0 {
+            self.diag(level, msg);
+        }
+        Ok(false)
     }
 
     /// Any active suppression: `@`'s silence or an isset/empty/??
     /// quiet read.
     pub(in crate::interp) fn is_quiet(&self) -> bool {
-        self.silence > 0 || self.isset_quiet > 0
+        self.isset_quiet > 0 || (self.silence > 0 && self.error_handler.is_none())
     }
 
     pub(in crate::interp) fn warn(&mut self, msg: &str) -> Result<(), PhpError> {
-        if self.is_quiet() || self.error_level & 2 == 0 {
+        if self.isset_quiet > 0 {
+            return Ok(());
+        }
+        if self.silence > 0 {
+            return if self.error_handler.is_some() {
+                self.emit_diag("Warning", 2, msg)
+            } else {
+                Ok(())
+            };
+        }
+        if self.error_level & 2 == 0 {
             return Ok(());
         }
         self.emit_diag("Warning", 2, msg)
@@ -89,7 +123,14 @@ impl<'a> Interp<'a> {
     /// Bypass isset/empty/?? quiet — zend still surfaces offset-key
     /// cast warnings there; only `@` silences them.
     pub(in crate::interp) fn warn_ns(&mut self, msg: &str) -> Result<(), PhpError> {
-        if self.silence > 0 || self.error_level & 2 == 0 {
+        if self.silence > 0 {
+            return if self.error_handler.is_some() {
+                self.emit_diag("Warning", 2, msg)
+            } else {
+                Ok(())
+            };
+        }
+        if self.error_level & 2 == 0 {
             return Ok(());
         }
         self.emit_diag("Warning", 2, msg)
@@ -209,7 +250,17 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn notice(&mut self, msg: &str) -> Result<(), PhpError> {
-        if self.is_quiet() || self.error_level & 8 == 0 {
+        if self.isset_quiet > 0 {
+            return Ok(());
+        }
+        if self.silence > 0 {
+            return if self.error_handler.is_some() {
+                self.emit_diag("Notice", 8, msg)
+            } else {
+                Ok(())
+            };
+        }
+        if self.error_level & 8 == 0 {
             return Ok(());
         }
         self.emit_diag("Notice", 8, msg)
@@ -225,7 +276,17 @@ impl<'a> Interp<'a> {
     }
 
     pub(in crate::interp) fn deprecated(&mut self, msg: &str) -> Result<(), PhpError> {
-        if self.is_quiet() || self.error_level & 8192 == 0 {
+        if self.isset_quiet > 0 {
+            return Ok(());
+        }
+        if self.silence > 0 {
+            return if self.error_handler.is_some() {
+                self.emit_diag("Deprecated", 8192, msg)
+            } else {
+                Ok(())
+            };
+        }
+        if self.error_level & 8192 == 0 {
             return Ok(());
         }
         self.emit_diag("Deprecated", 8192, msg)
@@ -233,7 +294,14 @@ impl<'a> Interp<'a> {
 
     /// Bypass isset/empty/?? quiet — offset-key casts still emit.
     pub(in crate::interp) fn deprecated_ns(&mut self, msg: &str) -> Result<(), PhpError> {
-        if self.silence > 0 || self.error_level & 8192 == 0 {
+        if self.silence > 0 {
+            return if self.error_handler.is_some() {
+                self.emit_diag("Deprecated", 8192, msg)
+            } else {
+                Ok(())
+            };
+        }
+        if self.error_level & 8192 == 0 {
             return Ok(());
         }
         self.emit_diag("Deprecated", 8192, msg)

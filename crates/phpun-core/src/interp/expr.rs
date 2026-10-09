@@ -1127,7 +1127,21 @@ impl<'a> Interp<'a> {
                 // class is the catchable no-parent Error (traits/
                 // closures defer here — p10new/m45 vs oracle).
                 s.scope_kw_err(&name, lit)?;
-                let cls = s.classes.get(&name.to_lowercase()).cloned();
+                // `new X(...)` resolves the class before its args
+                // evaluate — autoload is part of that resolution; a
+                // missing class dies before arg side effects.
+                let mut cls = s.classes.get(&name.to_lowercase()).cloned();
+                if cls.is_none() {
+                    s.run_autoload(name.trim_start_matches('\\'))?;
+                    cls = s.classes.get(&name.to_lowercase()).cloned();
+                }
+                if cls.is_none() {
+                    return s.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Class \"{name}\" not found"),
+                        *site,
+                    ));
+                }
                 let found = cls
                     .as_ref()
                     .and_then(|c| s.find_method_in(c, "__construct"));
@@ -1154,7 +1168,7 @@ impl<'a> Interp<'a> {
                 } else {
                     format!("{base}::__construct")
                 };
-                let argvals = s.arg_cells(args, &params, &ctx, false, Some(*site))?;
+                let argvals = s.arg_cells(args, &params, &ctx, false, Some(*site), true)?;
                 s.new_instance(&name, argvals)
             }),
             Expr::Prop {
@@ -1233,10 +1247,33 @@ impl<'a> Interp<'a> {
                     &format!("{}::{{closure}}", cls.name()),
                     false,
                     Some(*site),
+                    false,
                 )?;
                 s.static_invoke_vis(cls, &n, argvals, None, fwd)
             }),
             Expr::ClassConst { class, name } => self.class_const(class, name),
+            Expr::ClassConstDyn { class, name } => {
+                let nv = self.eval(name)?;
+                match nv {
+                    Value::Str(n) => {
+                        let n = String::from_utf8_lossy(&n).into_owned();
+                        // A dynamic name is a literal lookup — `::{"class"}`
+                        // reads a const literally, no ::class magic.
+                        let lit = Self::is_lit_class_ref(class);
+                        let cname = self.class_name_of(class)?;
+                        self.scope_kw_err(&cname, lit)?;
+                        self.class_const_lookup(&cname, &n)
+                    }
+                    v => Err(PhpError::uncaught(
+                        "TypeError",
+                        format!(
+                            "Cannot use value of type {} as class constant name",
+                            self.zval_type_name(&v)
+                        ),
+                        self.cur_line,
+                    )),
+                }
+            }
             Expr::Clone(e) => {
                 let v = self.eval(e)?;
                 self.builtin_clone(&v, None)
@@ -7841,6 +7878,21 @@ impl<'a> Interp<'a> {
     }
 
     fn index_read(&mut self, e: &Expr, i: Option<&Expr>) -> Result<Value, PhpError> {
+        // `$GLOBALS['x']` reads the global slot by name — a miss warns
+        // `Undefined global variable $x`, not the array-key wording.
+        if let Expr::Var(n) = Self::unmark_rhs(e) {
+            if n == "GLOBALS" {
+                if let Some(ie) = i {
+                    let k = self.eval(ie)?;
+                    let kn = k.to_php_string();
+                    if let Some(c) = self.global_var_cell(&kn) {
+                        return Ok(c.borrow().clone());
+                    }
+                    self.warn(&format!("Undefined global variable ${kn}"))?;
+                    return Ok(Value::Null);
+                }
+            }
+        }
         // zend_compile_dim emits the dim expression's ops BEFORE the
         // container's for delayed containers — a CV (or varnode: varvar/
         // prop/static-prop) base binds inside the FETCH_DIM op, so its
@@ -7865,7 +7917,10 @@ impl<'a> Interp<'a> {
             let key = match i {
                 Some(ie) => self.eval(ie)?,
                 None => {
-                    return self.fail(PhpError::fatal("[] used in read context", 0));
+                    return self.fail(PhpError::compile_fatal(
+                        "Cannot use [] for reading",
+                        self.cur_line,
+                    ));
                 }
             };
             let prev_vv = self.vv_rhs_site;
@@ -7918,7 +7973,10 @@ impl<'a> Interp<'a> {
         let key = match i {
             Some(ie) => self.eval(ie)?,
             None => {
-                return self.fail(PhpError::fatal("[] used in read context", 0));
+                return self.fail(PhpError::compile_fatal(
+                    "Cannot use [] for reading",
+                    self.cur_line,
+                ));
             }
         };
         self.index_read_base(base, key)
@@ -7929,7 +7987,10 @@ impl<'a> Interp<'a> {
         let base = self.eval(e)?;
         match key {
             Some(k) => self.index_read_base(base, k),
-            None => self.fail(PhpError::fatal("[] used in read context", 0)),
+            None => self.fail(PhpError::compile_fatal(
+                "Cannot use [] for reading",
+                self.cur_line,
+            )),
         }
     }
 
@@ -8949,7 +9010,10 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let Some(key) = key else {
-                    return self.fail(PhpError::fatal("[] used in read context", 0));
+                    return self.fail(PhpError::compile_fatal(
+                        "Cannot use [] for reading",
+                        self.cur_line,
+                    ));
                 };
                 // `++`/`--` never lands on a string offset — zend
                 // validates the key, then the catchable Error beats
@@ -9246,6 +9310,11 @@ impl<'a> Interp<'a> {
             self.dim_cv_bound.clear();
             self.dim_undef_cells.clear();
         }
+        // zend fetches the container AFTER the dim operands eval: a
+        // throwing key (`$a[k]++`, k undef) wins over the fresh-var
+        // 'Undefined variable' warning, which fires between them
+        // ($a['k']++ warns $a then the missing key).
+        let root_fresh = self.var_lookup(root).is_none();
         let arr_cell = self.var_cell(root);
         let det = DimDetach {
             name: root.to_string(),
@@ -9272,7 +9341,12 @@ impl<'a> Interp<'a> {
                     // engine's dim machinery like `+=` — not a fatal
                     // (the temp result just can't write back).
                     [None] => None,
-                    _ => return self.fail(PhpError::fatal("[] used in read context", 0)),
+                    _ => {
+                        return self.fail(PhpError::compile_fatal(
+                            "Cannot use [] for reading",
+                            self.cur_line,
+                        ))
+                    }
                 };
                 return self.incdec_aa(o, key, delta, post);
             }
@@ -9296,6 +9370,9 @@ impl<'a> Interp<'a> {
                 },
                 None => keys.push(DimArg::Append),
             }
+        }
+        if root_fresh && !self.is_quiet() {
+            self.warn(&format!("Undefined variable ${root}"))?;
         }
         let old = self.compound_dim_read(arr_cell.clone(), &keys, false, Some(&det), true)?;
         // zend's EG(exception) check at the fetch's end kills the
@@ -9613,13 +9690,30 @@ impl<'a> Interp<'a> {
                             ));
                         }
                     },
-                    _ => Value::Float(-v.to_float()),
+                    // `-x` lowers to `x * -1`: bools/null coerce to
+                    // int; arrays, objects and resources TypeError.
+                    Value::Null => Value::Int(0),
+                    Value::Bool(b) => Value::Int(-(b as i64)),
+                    other => {
+                        return self.fail(PhpError::uncaught(
+                            "TypeError",
+                            format!(
+                                "Unsupported operand types: {} * int",
+                                other.operand_type_name()
+                            ),
+                            0,
+                        ))
+                    }
                 })
             }
             "+" => {
                 let v = self.eval(e)?;
                 Ok(match v {
                     Value::Int(_) | Value::Float(_) => v,
+                    // `+x` lowers to `x + 0`/`x * 1`: bools and null
+                    // coerce to int before the numeric-string path.
+                    Value::Null => Value::Int(0),
+                    Value::Bool(b) => Value::Int(b as i64),
                     other => match numeric(&other.to_php_bytes()) {
                         Numeric::Int(i) => Value::Int(i),
                         Numeric::Float(f) => Value::Float(f),
@@ -9661,7 +9755,11 @@ impl<'a> Interp<'a> {
             }
             "@" => {
                 self.silence += 1;
+                // zend lowers error_reporting to the fatal-only mask
+                // inside @ — visible to a user error handler.
+                let saved_level = std::mem::replace(&mut self.error_level, 4437);
                 let v = self.eval(e);
+                self.error_level = saved_level;
                 self.silence -= 1;
                 v
             }

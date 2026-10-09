@@ -762,6 +762,10 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
             Expr::ClassConst { class, .. } => self.flow_expr(class, sc),
+            Expr::ClassConstDyn { class, name } => {
+                self.flow_expr(class, sc)?;
+                self.flow_expr(name, sc)
+            }
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)

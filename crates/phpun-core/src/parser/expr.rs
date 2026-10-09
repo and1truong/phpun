@@ -459,21 +459,17 @@ impl<'a> Parser<'a> {
                 }
                 Ok((e, Vec::new()))
             }
-            Some(Token::Op("{")) => {
-                self.pos += 1;
-                let e = self.expr()?;
-                self.expect_op("}")?;
-                Ok((e, Vec::new()))
-            }
             Some(Token::Op("(")) => {
                 self.pos += 1;
                 let e = self.expr()?;
                 self.expect_op(")")?;
                 Ok((e, Vec::new()))
             }
+            // `new ${expr}` / `new $$v` — class name by indirection.
+            Some(Token::Op("$")) => Ok((self.primary()?, Vec::new())),
             t => Err(PhpError::parse(
                 format!(
-                    "syntax error, unexpected {}, expecting class name",
+                    "syntax error, unexpected {}, expecting \"class\"",
                     desc_t(t.as_ref())
                 ),
                 self.line(),
@@ -1422,6 +1418,14 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 let fl = self.line();
                 let f = self.assign()?;
+                // An unparenthesized `b ? c : d` in Elvis' false arm is
+                // non-associative too; Elvis `?:` chains are legal.
+                if matches!(&f, Expr::Ternary { t: Some(_), .. }) {
+                    return Err(PhpError::compile_fatal(
+                        "Unparenthesized `a ?: b ? c : d` is not supported. Use either `(a ?: b) ? c : d` or `a ?: (b ? c : d)`",
+                        cline,
+                    ));
+                }
                 return Ok(Expr::Ternary {
                     c: Box::new(c),
                     t: None,
@@ -1436,6 +1440,17 @@ impl<'a> Parser<'a> {
             self.expect_op(":")?;
             let fl = self.line();
             let f = self.ternary()?;
+            // `? :` is non-associative: an unparenthesized ternary
+            // (either flavour) in the false arm is a compile fatal;
+            // the middle arm is exempt (grammar-unambiguous).
+            if let Expr::Ternary { t: inner, .. } = &f {
+                let msg = if inner.is_some() {
+                    "Unparenthesized `a ? b : c ? d : e` is not supported. Use either `(a ? b : c) ? d : e` or `a ? b : (c ? d : e)`"
+                } else {
+                    "Unparenthesized `a ? b : c ?: d` is not supported. Use either `(a ? b : c) ?: d` or `a ? b : (c ?: d)`"
+                };
+                return Err(PhpError::compile_fatal(msg, cline));
+            }
             return Ok(Expr::Ternary {
                 c: Box::new(c),
                 t: Some(Box::new(Self::markline(t, tl))),
@@ -2318,21 +2333,23 @@ impl<'a> Parser<'a> {
                         self.expect_op("}")?;
                         if self.at_op("(") {
                             self.pos += 1;
-                            // `Cls::{expr}(...)` keeps per-arg send
-                            // lines — zend treats the `::{` member
-                            // call like a named static call.
-                            let args = self.args()?;
-                            e = Expr::MethodCall {
-                                obj: Box::new(e),
-                                name: PropName::Expr(Box::new(inner)),
-                                args,
-                                nullsafe: false,
-                                site,
-                            };
-                        } else {
-                            e = Expr::StaticProp {
+                            // `Cls::{expr}(...)` is zend's
+                            // INIT_DYNAMIC_CALL — a static call whose
+                            // member name comes from the inner expr.
+                            let mut args = self.args()?;
+                            Self::dyn_arglines(&mut args);
+                            e = Self::fcc_wrap(Expr::StaticCallDyn {
                                 class: Box::new(e),
-                                name: PropName::Expr(Box::new(inner)),
+                                name: Box::new(inner),
+                                args,
+                                site,
+                            })?;
+                        } else {
+                            // `Cls::{expr}` fetches a class CONSTANT
+                            // named by the expr, not a static prop.
+                            e = Expr::ClassConstDyn {
+                                class: Box::new(e),
+                                name: Box::new(inner),
                             };
                         }
                     }
@@ -2390,6 +2407,19 @@ impl<'a> Parser<'a> {
                 let eq_pos = self.pos;
                 self.pos += 2;
                 let rhs = self.ref_variable(false)?;
+                // `=& builtin(...)` is a compile fatal; a userland
+                // call defers to the runtime 'Only variables should
+                // be assigned by reference' Notice.
+                if let Expr::Call { name, .. } = &rhs {
+                    if let Expr::Str(n) = name.as_ref() {
+                        if crate::builtins::is_builtin(&n.to_lowercase()) {
+                            return Err(PhpError::compile_fatal(
+                                "Cannot use result of built-in function in write context",
+                                callee_line,
+                            ));
+                        }
+                    }
+                }
                 let target = self.list_target(e)?;
                 // Non-lvalue =& targets are zend's parse error at the
                 // `=` (`($c ? $a : $b) =& $x`) — the gate normalizes
@@ -2404,6 +2434,265 @@ impl<'a> Parser<'a> {
             } else {
                 return Ok(e);
             }
+        }
+    }
+
+    /// `[]` append syntax is only legal as a write target — in a read
+    /// position zend compile-fatals `Cannot use [] for reading`
+    /// (`Cannot use [] for unsetting` inside `unset()`). The one defer:
+    /// nested under a dim/prop link inside a call arg compiles to a
+    /// runtime `Error` instead (zend_delayed_compile_args).
+    /// `in_target` — inside an assign/foreach/list target (legal);
+    /// `delayed` — inside a call-arg slot, where zend defers the
+    /// error to call time (a missing callee wins; a defined callee
+    /// still dies with the same wording — the interp's dim-read
+    /// sites emit it). By-ref params bind the slot as a target.
+    fn cdr(&mut self, e: &Expr, in_target: bool, delayed: bool) -> Result<(), PhpError> {
+        use crate::ast::Expr::*;
+        match e {
+            Index { e: c, i: None } => {
+                if in_target {
+                    self.cdr(c, true, false)
+                } else if delayed {
+                    self.cdr(c, false, delayed)
+                } else {
+                    Err(PhpError::compile_fatal(
+                        "Cannot use [] for reading",
+                        crate::ast::end_line(c).unwrap_or_else(|| self.prev_line()),
+                    ))
+                }
+            }
+            Index { e: c, i: Some(k) } => {
+                self.cdr(c, in_target, delayed)?;
+                self.cdr(k, false, false)
+            }
+            Prop { obj, name, .. } => {
+                self.cdr(obj, in_target, delayed)?;
+                if let PropName::Expr(x) = name {
+                    self.cdr(x, false, false)?;
+                }
+                Ok(())
+            }
+            StaticProp { class, name } => {
+                self.cdr(class, in_target, delayed)?;
+                if let PropName::Expr(x) = name {
+                    self.cdr(x, false, false)?;
+                }
+                Ok(())
+            }
+            MethodCall {
+                obj, name, args, ..
+            } => {
+                self.cdr(obj, in_target, delayed)?;
+                if let PropName::Expr(x) = name {
+                    self.cdr(x, false, false)?;
+                }
+                for a in args {
+                    self.cdr(a, false, true)?;
+                }
+                Ok(())
+            }
+            StaticCall { class, args, .. } | StaticCallDyn { class, args, .. } => {
+                self.cdr(class, false, false)?;
+                for a in args {
+                    self.cdr(a, false, true)?;
+                }
+                Ok(())
+            }
+            Call { name, args, .. } => {
+                self.cdr(name, false, false)?;
+                for a in args {
+                    self.cdr(a, false, true)?;
+                }
+                Ok(())
+            }
+            New { class, args, .. } => {
+                self.cdr(class, false, false)?;
+                for a in args {
+                    self.cdr(a, false, true)?;
+                }
+                Ok(())
+            }
+            Assign {
+                target, value, op, ..
+            } => {
+                // `??=` reads its target — append slots fatal there
+                // like any other read; `=`/`+=`/`.=` etc write-append.
+                let t_target = *op != "??=";
+                self.cdr(target, t_target, false)?;
+                self.cdr(value, false, false)
+            }
+            List(items) => {
+                for (k, v) in items.iter().flatten() {
+                    if let Some(k) = k {
+                        self.cdr(k, false, false)?;
+                    }
+                    self.cdr(v, in_target, delayed)?;
+                }
+                Ok(())
+            }
+            Unary { e: x, .. }
+            | Cast { e: x, .. }
+            | Paren(x)
+            | Unpack(x)
+            | Clone(x)
+            | Empty(x)
+            | Print(x)
+            | Throw(x)
+            | YieldFrom(x)
+            | VarVar(x, _) => self.cdr(x, false, delayed),
+            // A `&`-wrapped element and `++`/`--` operands are write
+            // targets — append slots stay legal there (`$a[]++`).
+            ByRef(x) | PreInc(x) | PreDec(x) | PostInc(x) | PostDec(x) => {
+                self.cdr(x, true, delayed)
+            }
+            Binary { l, r, .. } | Instanceof { obj: l, class: r } => {
+                self.cdr(l, false, delayed)?;
+                self.cdr(r, false, delayed)
+            }
+            Ternary { c, t, f } => {
+                self.cdr(c, false, delayed)?;
+                if let Some(t) = t {
+                    self.cdr(t, false, delayed)?;
+                }
+                self.cdr(f, false, delayed)
+            }
+            Isset(args) => {
+                for a in args {
+                    self.cdr(a, false, delayed)?;
+                }
+                Ok(())
+            }
+            ArrayLit(items) => {
+                for (k, v) in items {
+                    if let Some(k) = k {
+                        self.cdr(k, false, delayed)?;
+                    }
+                    self.cdr(v, false, delayed)?;
+                }
+                Ok(())
+            }
+            Yield { key, val } => {
+                if let Some(k) = key {
+                    self.cdr(k, false, delayed)?;
+                }
+                if let Some(v) = val {
+                    self.cdr(v, false, delayed)?;
+                }
+                Ok(())
+            }
+            Exit(x) => {
+                if let Some(x) = x {
+                    self.cdr(x, false, delayed)?;
+                }
+                Ok(())
+            }
+            Include { e: x, .. } => self.cdr(x, false, delayed),
+            Match { subject, arms, .. } => {
+                self.cdr(subject, false, delayed)?;
+                for a in arms {
+                    for c in &a.conds {
+                        self.cdr(c, false, delayed)?;
+                    }
+                    self.cdr(&a.result, false, delayed)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Statement-level dim-read gate — nested bodies were each checked
+    /// at their own stmt() parse, so only this stmt's own exprs and
+    /// decl-carried defaults need walking here.
+    pub(in crate::parser) fn check_dim_reads_stmt(&mut self, s: &Stmt) -> Result<(), PhpError> {
+        use crate::ast::Stmt::*;
+        let read = |p: &mut Self, e: &crate::ast::Expr| p.cdr(e, false, false);
+        match s {
+            Echo(args) => args.iter().try_for_each(|a| read(self, a)),
+            Expr(e) => read(self, e),
+            If { cond, .. } | While { cond, .. } | DoWhile { cond, .. } | Switch { cond, .. } => {
+                read(self, cond)
+            }
+            For {
+                init, cond, inc, ..
+            } => {
+                for e in init.iter().chain(cond).chain(inc) {
+                    read(self, e)?;
+                }
+                Ok(())
+            }
+            Return(e) | Break(e) | Continue(e) => {
+                if let Some(e) = e {
+                    read(self, e)?;
+                }
+                Ok(())
+            }
+            Global(args) => args.iter().try_for_each(|a| read(self, a)),
+            Static { vars, .. } => vars
+                .iter()
+                .try_for_each(|(_, d, _)| d.as_ref().map(|e| read(self, e)).unwrap_or(Ok(()))),
+            Foreach { arr, val, .. } => {
+                read(self, arr)?;
+                self.cdr_foreach_target(val)
+            }
+            Unset(args) => {
+                for a in args {
+                    // A bare `[]` target gets zend's unsetting wording;
+                    // appends nested any deeper stay 'for reading'.
+                    if let crate::ast::Expr::Index { e: c, i: None } = Self::unmark_lval(a) {
+                        return Err(PhpError::compile_fatal(
+                            "Cannot use [] for unsetting",
+                            crate::ast::end_line(c).unwrap_or_else(|| self.prev_line()),
+                        ));
+                    }
+                    read(self, a)?;
+                }
+                Ok(())
+            }
+            ConstDecl(defs) => defs.iter().try_for_each(|(_, e)| read(self, e)),
+            Declare { value, .. } => read(self, value),
+            Function(decl) => {
+                for p in &decl.params {
+                    if let Some(d) = &p.default {
+                        read(self, d)?;
+                    }
+                }
+                Ok(())
+            }
+            Class(decl) => {
+                for p in &decl.props {
+                    if let Some(d) = &p.default {
+                        read(self, d)?;
+                    }
+                }
+                for c in &decl.consts {
+                    read(self, &c.value)?;
+                }
+                for m in &decl.methods {
+                    for p in &m.decl.params {
+                        if let Some(d) = &p.default {
+                            read(self, d)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn cdr_foreach_target(&mut self, t: &crate::ast::ForeachTarget) -> Result<(), PhpError> {
+        use crate::ast::ForeachTarget::*;
+        match t {
+            Lvalue(e) => self.cdr(e, true, false),
+            List(items) => items.iter().flatten().try_for_each(|(k, v)| {
+                if let Some(k) = k {
+                    self.cdr(k, false, false)?;
+                }
+                self.cdr_foreach_target(v)
+            }),
+            _ => Ok(()),
         }
     }
 

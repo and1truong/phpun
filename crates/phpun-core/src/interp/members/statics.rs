@@ -424,7 +424,7 @@ impl<'a> Interp<'a> {
             .find_method_in(&cls, name)
             .map(|m| m.0.decl.params.clone())
             .unwrap_or_default();
-        let argvals = self.arg_cells(args, &params, name, false, site)?;
+        let argvals = self.arg_cells(args, &params, name, false, site, false)?;
         // Only a syntactic class ref (self/parent/static/Foo) is a
         // forwarding call; `$x::m()` is not (bug48533).
         let fwd = matches!(class, Expr::Const(_) | Expr::Str(_) | Expr::AnonClass(_));
@@ -657,6 +657,20 @@ impl<'a> Interp<'a> {
                 r
             }
             None => {
+                // `E::cases()` — the enum built-in: every `case` in
+                // declaration order, as its singleton case object.
+                if name.eq_ignore_ascii_case("cases")
+                    && cls.decl.kind == crate::ast::ClassKind::Enum
+                {
+                    let mut arr = PhpArray::new();
+                    for cd in cls.decl.consts.clone() {
+                        if cd.enum_case {
+                            let v = self.enum_case_value(cls.name(), &cd.name, &cd)?;
+                            arr.push(v);
+                        }
+                    }
+                    return Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(arr))));
+                }
                 // A missing __construct never reaches magic —
                 // `Foo::__construct()` is "Cannot call constructor"
                 // (call_static_006). __destruct etc. dispatch normally.
@@ -961,6 +975,18 @@ impl<'a> Interp<'a> {
         if name == "class" {
             return Ok(Value::str(cname));
         }
+        self.class_const_lookup(&cname, name)
+    }
+
+    /// The plain const walk — `Cls::{expr}` looks up "class"
+    /// literally (zend's dynamic-name FETCH_CLASS_CONSTANT has no
+    /// ::class magic).
+    pub(in crate::interp) fn class_const_lookup(
+        &mut self,
+        cname: &str,
+        name: &str,
+    ) -> Result<Value, PhpError> {
+        let cname = cname.to_string();
         // `X::CONST` on an unloaded class runs the autoloaders (real
         // psr-4 code hits this constantly — e.g. `Language::ENGLISH`).
         let resolved = self.resolve_class(&cname).unwrap_or_else(|| cname.clone());

@@ -112,6 +112,7 @@ fn zpp_gate(it: &mut Interp, name: &str, args: &[Cell]) -> Option<PhpError> {
                     _ => false,
                 };
                 if !ok {
+                    it.exc_frameless = true;
                     return Some(type_err(1, Some("value"), "Countable|array", &c.borrow()));
                 }
             }
@@ -134,6 +135,7 @@ fn zpp_gate(it: &mut Interp, name: &str, args: &[Cell]) -> Option<PhpError> {
         "array_key_exists" | "key_exists" => {
             if let Some(c) = args.get(1) {
                 if !is_arr(c) {
+                    it.exc_frameless = name == "array_key_exists";
                     return Some(type_err(2, Some("array"), "array", &c.borrow()));
                 }
             }

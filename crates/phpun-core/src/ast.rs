@@ -506,6 +506,12 @@ pub enum Expr {
         class: Box<Expr>,
         name: String,
     },
+    /// `Cls::{expr}` — class-constant fetch with a dynamic name
+    /// (FETCH_CLASS_CONSTANT, not a static prop).
+    ClassConstDyn {
+        class: Box<Expr>,
+        name: Box<Expr>,
+    },
     /// `clone $obj`
     Clone(Box<Expr>),
     /// `(int)`/`(string)`/... cast.

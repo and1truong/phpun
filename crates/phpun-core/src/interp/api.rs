@@ -622,8 +622,28 @@ impl<'a> Interp<'a> {
     pub fn frame_args(&self) -> &[Cell] {
         self.stack.last().map(|f| f.args.as_slice()).unwrap_or(&[])
     }
-    pub fn define_const(&mut self, name: &str, v: Value) {
+    pub fn define_const(&mut self, name: &str, v: Value) -> Result<bool, PhpError> {
+        // 8.5: a duplicate `const`/`define` keeps the first value and
+        // warns — PHP 9 turns this into a hard Error.
+        if self.constants.contains_key(name) {
+            // zend lowercases the namespace part of the name in this
+            // warning (`foo\A`, not `Foo\A`).
+            let (ns, short) = match name.rsplit_once('\\') {
+                Some((ns, s)) => (ns.to_lowercase(), s.to_string()),
+                None => (String::new(), name.to_string()),
+            };
+            let disp = if ns.is_empty() {
+                short
+            } else {
+                format!("{ns}\\{short}")
+            };
+            self.warn(&format!(
+                "Constant {disp} already defined, this will be an error in PHP 9"
+            ))?;
+            return Ok(false);
+        }
         self.constants.insert(name.to_string(), v);
+        Ok(true)
     }
     pub fn const_defined(&self, name: &str) -> bool {
         self.constants.contains_key(name)
@@ -638,6 +658,15 @@ impl<'a> Interp<'a> {
     pub fn next_res_id(&mut self) -> u64 {
         self.res_counter += 1;
         self.res_counter
+    }
+
+    /// Bulk-reserve `n` resource ids returning the FIRST — used by
+    /// stream_socket_pair(), whose two stream resources zend registers
+    /// starting one slot below a normal stream's id.
+    pub fn next_res_ids(&mut self, n: u64) -> u64 {
+        let base = self.res_counter;
+        self.res_counter += n;
+        base
     }
     pub fn set_resource(&mut self, _r: PhpResource) {}
     pub fn lookup_class(&self, name: &str) -> Option<Rc<PhpClass>> {
@@ -749,14 +778,47 @@ impl<'a> Interp<'a> {
     /// Diagnostic at a caller-selected E_USER_* level (trigger_error).
     /// Respects error_reporting masking + the silence (@) counter.
     pub fn emit_diag_pub(&mut self, level: i64, msg: &str) -> Result<(), PhpError> {
-        if self.silence > 0 || self.error_level & level == 0 {
+        if self.silence > 0 {
+            // `@` still dispatches the user handler — only display is
+            // off. E_USER_ERROR escapes @ entirely and still fatals.
+            return if self.error_handler.is_some() || level == 256 {
+                self.emit_diag_for(level, msg)
+            } else {
+                Ok(())
+            };
+        }
+        if self.error_level & level == 0 {
             return Ok(());
         }
+        self.emit_diag_for(level, msg)
+    }
+
+    fn emit_diag_for(&mut self, level: i64, msg: &str) -> Result<(), PhpError> {
         let (name, errno) = match level {
             512 => ("Warning", 512),
             16384 => ("Deprecated", 16384),
-            // E_USER_ERROR=256 is uncatchable in PHP 8.4+ and aborts.
-            256 => return self.fail(PhpError::fatal(msg.to_string(), self.cur_line)),
+            // Deprecated since 8.4: the deprecation fires first, then
+            // the E_USER_ERROR itself — a user handler can swallow it;
+            // only when unhandled does the fatal land.
+            256 => {
+                self.emit_diag(
+                    "Deprecated",
+                    8192,
+                    "Passing E_USER_ERROR to trigger_error() is deprecated since 8.4, throw an exception or call exit with a string message instead",
+                )?;
+                // Dispatch-only: an unhandled E_USER_ERROR never shows
+                // the plain diag line — silence borrowed for one call.
+                self.silence += 1;
+                let handled = self.emit_diag_x("Error", 256, msg)?;
+                self.silence -= 1;
+                return if handled {
+                    Ok(())
+                } else {
+                    let mut e = PhpError::fatal(msg.to_string(), self.cur_line);
+                    e.trace = Some(self.fatal_frames());
+                    self.fail(e)
+                };
+            }
             _ => ("Notice", level),
         };
         self.emit_diag(name, errno, msg)
