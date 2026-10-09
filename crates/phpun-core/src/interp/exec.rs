@@ -577,6 +577,17 @@ impl<'a> Interp<'a> {
                         return self.err_flow(e);
                     }
                 }
+                // A global decl claiming a builtin name is the same
+                // fatal (oracle: "Cannot redeclare function strlen()")
+                // — namespaced decls stay legal (X\strlen shadows
+                // nothing; only the global table is contested).
+                if !self_decl && d.ns.is_empty() && crate::builtins::is_builtin(&key) {
+                    let e = self.decl_fatal_ctx(PhpError::fatal(
+                        format!("Cannot redeclare function {}()", d.name),
+                        self.cur_line,
+                    ));
+                    return self.err_flow(e);
+                }
                 let mut d = d.clone();
                 d.file = self.diag_file();
                 self.functions.insert(key, Rc::new(d));

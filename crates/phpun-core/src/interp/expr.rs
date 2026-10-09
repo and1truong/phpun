@@ -1127,14 +1127,26 @@ impl<'a> Interp<'a> {
                 // class is the catchable no-parent Error (traits/
                 // closures defer here — p10new/m45 vs oracle).
                 s.scope_kw_err(&name, lit)?;
-                let params = s
-                    .classes
-                    .get(&name.to_lowercase())
-                    .cloned()
-                    .and_then(|c| s.find_method_in(&c, "__construct"))
+                let cls = s.classes.get(&name.to_lowercase()).cloned();
+                let params = cls
+                    .as_ref()
+                    .and_then(|c| s.find_method_in(c, "__construct"))
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
-                let argvals = s.arg_cells(args, &params, &name, false, Some(*site))?;
+                // ctx is the ctor's diagnostic name — arg_cells wraps
+                // it as "{ctx}()" for arg errors. PHP reports
+                // `Foo::__construct():` for named classes (canonical
+                // declared case, not the source spelling) and
+                // `class@anonymous():` for anon classes (oracle-pinned).
+                let canon = cls
+                    .map(|c| c.decl.name.clone())
+                    .unwrap_or_else(|| name.clone());
+                let ctx = if canon.starts_with("class@anonymous") {
+                    "class@anonymous".to_string()
+                } else {
+                    format!("{canon}::__construct")
+                };
+                let argvals = s.arg_cells(args, &params, &ctx, false, Some(*site))?;
                 s.new_instance(&name, argvals)
             }),
             Expr::Prop {

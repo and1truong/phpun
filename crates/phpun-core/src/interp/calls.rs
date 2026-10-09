@@ -274,9 +274,11 @@ impl<'a> Interp<'a> {
     ) -> Result<CallArgs, PhpError> {
         let mut out = CallArgs::empty();
         // zend's INIT_FCALL pushes the frame's arena span before args
-        // evaluate — the push (or copy into a fresh segment) happens
-        // here, once.
-        self.vm_call_push(&mut out);
+        // evaluate. Reserve the whole call span now (VM_FRAME_SLOTS +
+        // one slot per arg): the end-of-args catch-up then no-ops for
+        // the common no-unpack call, and unpack overshoot still extends
+        // through the post-eval push.
+        self.vm_call_reserve(&mut out, args.len() as u64);
         // Position of the *next positional* arg for by-ref lookup — named
         // args don't advance it (they bind by name at call time).
         let mut pos = 0usize;
@@ -392,6 +394,7 @@ impl<'a> Interp<'a> {
                             if trav {
                                 out.trav_cells.push(out.cells.len());
                             }
+                            crate::interp::util::alloc_hit(6);
                             out.cells.push(c);
                             pos += 1;
                         }
@@ -453,6 +456,7 @@ impl<'a> Interp<'a> {
                             out.named.push((n, c, true, false));
                             seen_named = true;
                         } else {
+                            crate::interp::util::alloc_hit(6);
                             out.cells.push(c);
                             pos += 1;
                         }
@@ -468,6 +472,7 @@ impl<'a> Interp<'a> {
                             out.named.push((n, c, true, false));
                             seen_named = true;
                         } else {
+                            crate::interp::util::alloc_hit(6);
                             out.cells.push(c);
                             pos += 1;
                         }
@@ -486,6 +491,7 @@ impl<'a> Interp<'a> {
                             out.named.push((n, c, was_ref, false));
                             seen_named = true;
                         } else {
+                            crate::interp::util::alloc_hit(6);
                             out.cells.push(c);
                             pos += 1;
                         }
@@ -501,6 +507,7 @@ impl<'a> Interp<'a> {
                             out.named.push((n, c, true, false));
                             seen_named = true;
                         } else {
+                            crate::interp::util::alloc_hit(6);
                             out.cells.push(c);
                             pos += 1;
                         }
@@ -513,6 +520,7 @@ impl<'a> Interp<'a> {
                             out.named.push((n, c, true, false));
                             seen_named = true;
                         } else {
+                            crate::interp::util::alloc_hit(6);
                             out.cells.push(c);
                             pos += 1;
                         }
@@ -558,6 +566,7 @@ impl<'a> Interp<'a> {
                     out.named.push((n, cell(v), false, false));
                     seen_named = true;
                 } else {
+                    crate::interp::util::alloc_hit(6);
                     out.cells.push(cell(v));
                     pos += 1;
                 }
@@ -892,14 +901,20 @@ impl<'a> Interp<'a> {
             // alias (ns_resolve already rewrote it to `\target`).
             // Unqualified calls inside a namespace bind at runtime, so
             // Zend can't specialize them — the frame is real.
-            let literal = fname.starts_with('\\')
-                || (fname.starts_with('\u{1}') && self.caller_ns().is_empty());
-            let visible = args
-                .iter()
-                .any(|a| matches!(Self::unmark_arg(a), Expr::Unpack(_)))
-                || !(literal && zend_literal_no_frame(lname.as_ref(), args));
-            if let Some(v) = self.call_builtin(lname.as_ref(), &argvals, visible)? {
-                return Ok(v);
+            // decl.is_some() = a userland function owns this name (a
+            // builtin can't share it), so the builtin probe is a pure
+            // waste: call_builtin_inner would push+pop a trace frame
+            // and clone the arg cells for nothing.
+            if decl.is_none() {
+                let literal = fname.starts_with('\\')
+                    || (fname.starts_with('\u{1}') && self.caller_ns().is_empty());
+                let visible = args
+                    .iter()
+                    .any(|a| matches!(Self::unmark_arg(a), Expr::Unpack(_)))
+                    || !(literal && zend_literal_no_frame(lname.as_ref(), args));
+                if let Some(v) = self.call_builtin(lname.as_ref(), &argvals, visible)? {
+                    return Ok(v);
+                }
             }
         }
         let decl = match decl {
@@ -2378,6 +2393,7 @@ impl<'a> Interp<'a> {
     /// Arity/binding failures reuse this so a callee that never ran a
     /// body still appears in the exception's trace (probe11).
     fn call_site_frame(&mut self, decl: &FunctionDecl, args: &CallArgs) -> TraceFrame {
+        crate::interp::util::alloc_hit(3);
         // The callee's argline markers overwrite `send_line`; after
         // the call returns the enclosing op's own line is the pending
         // site again — engine checks running post-call (getIterator
@@ -4817,6 +4833,7 @@ impl<'a> Interp<'a> {
                 .pending_decl_class
                 .clone()
                 .or_else(|| scope_class.clone());
+            crate::interp::util::alloc_hit(4);
             self.stack.push(frame);
             let fr = self.call_site_frame(decl, &args);
             self.call_trace.push(fr);

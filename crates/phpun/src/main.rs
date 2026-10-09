@@ -4,8 +4,51 @@ mod semver_lite;
 use phpun_core::Interp;
 use std::process::ExitCode;
 
+/// Dev-only alloc counter: `PHPUN_ALLOC=1 phpun x.php` prints
+/// malloc count/bytes to stderr. One relaxed atomic read per alloc
+/// when off.
+static ALLOC_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ALLOC_B: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ALLOC_ON: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct Counting;
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if ALLOC_ON.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            ALLOC_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ALLOC_B.fetch_add(l.size(), std::sync::atomic::Ordering::Relaxed);
+        }
+        unsafe { std::alloc::System.alloc(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, l) }
+    }
+}
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if std::env::var_os("PHPUN_ALLOC").is_some() {
+        ALLOC_ON.store(1, std::sync::atomic::Ordering::Relaxed);
+        phpun_core::set_alloc_counting();
+    }
+    let rc = dispatch(args);
+    if ALLOC_ON.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        eprintln!(
+            "allocs: {} bytes: {}",
+            ALLOC_N.load(std::sync::atomic::Ordering::Relaxed),
+            ALLOC_B.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        for (n, c) in phpun_core::alloc_sites_dump() {
+            if c > 0 {
+                eprintln!("  {n}: {c}");
+            }
+        }
+    }
+    rc
+}
+
+fn dispatch(args: Vec<String>) -> ExitCode {
     match args.first().map(|s| s.as_str()) {
         Some("phpt") => phpun_phpt::cli(args[1..].to_vec()),
         Some("install") => install::cli(&args[1..]),

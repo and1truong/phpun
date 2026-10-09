@@ -2418,6 +2418,15 @@ impl<'a> Interp<'a> {
                 d.line,
             ));
         }
+        if d.ns.is_empty() && crate::builtins::is_builtin(&key) {
+            // Global decl claiming a builtin name dies at the same
+            // compile phase (oracle: "Cannot redeclare function
+            // strlen()"); namespaced decls stay legal.
+            return Err(PhpError::compile_fatal(
+                format!("Cannot redeclare function {}()", d.name),
+                d.line,
+            ));
+        }
         let site = std::ptr::from_ref(d) as usize;
         let mut d = d.clone();
         d.file = self.cur_file.clone();
@@ -3699,6 +3708,7 @@ impl<'a> Interp<'a> {
                 self.destruct_dying_value(&old)
             }
             None => {
+                crate::interp::util::alloc_hit(5);
                 self.cur()
                     .vars
                     .insert(name.to_string(), Rc::new(RefCell::new(v)));
@@ -4212,6 +4222,7 @@ impl<'a> Interp<'a> {
     /// Charge `req` bytes and tie the footprint to `rc`'s lifetime —
     /// released when every strong ref dies (zend's efree).
     pub(crate) fn mem_track<T: ?Sized + 'static>(&mut self, rc: &Rc<T>, req: u64) {
+        crate::interp::util::alloc_hit(2);
         let (fp, chunk) = self.mem_commit(req);
         let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
         let key = Rc::as_ptr(rc) as *const u8 as usize;
@@ -4312,7 +4323,16 @@ impl<'a> Interp<'a> {
     /// span — zend_vm_stack_new_page emallocs it, and that request
     /// is the figure zend's OOM reports.
     fn vm_call_push(&mut self, out: &mut CallArgs) {
-        let want = VM_FRAME_SLOTS + (out.cells.len() + out.named.len()) as u64;
+        let n = (out.cells.len() + out.named.len()) as u64;
+        self.vm_call_reserve(out, n);
+    }
+
+    /// Reserve `VM_FRAME_SLOTS + slots` on the call's arena span once —
+    /// arg_cells calls it upfront with the arg count so the end-of-args
+    /// catch-up (and one VmSite token + mem_track pair) drops away for
+    /// the common no-unpack call.
+    fn vm_call_reserve(&mut self, out: &mut CallArgs, slots: u64) {
+        let want = VM_FRAME_SLOTS + slots;
         if want <= out.vm_slots {
             return;
         }
@@ -4364,6 +4384,7 @@ impl<'a> Interp<'a> {
     /// rollback — repaid at the owning frame's pop (vm_frame_free) or
     /// at sweep once a never-dispatched call's token dies.
     fn vm_site(&mut self, out: &mut CallArgs, seg: usize, slots: u64, own: usize) {
+        crate::interp::util::alloc_hit(1);
         let site: Rc<VmSite> = Rc::new(VmSite);
         self.mem_track(&site, 0);
         let key = Rc::as_ptr(&site) as *const u8 as usize;
