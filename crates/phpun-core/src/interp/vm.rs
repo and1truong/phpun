@@ -74,6 +74,13 @@ enum Op {
     /// protocol `compare_op` runs.
     Binary(&'static str),
     Not,
+    /// Pop a value, push `Bool(is_truthy)` — the `&&`/`||` result
+    /// for the evaluated (non-short-circuited) operand.
+    Boolify,
+    /// Like `Binary` but the left operand is the slot's CURRENT
+    /// value, bound at op-exec — zend binds the left CV of a binary
+    /// when the op runs, so `$a . ($a = 'B')` yields "BB" not "AB".
+    BinaryCv(&'static str, u16),
     Jump(usize),
     JumpIfFalse(usize),
     JumpIfTrue(usize),
@@ -91,6 +98,9 @@ enum Op {
         argc: u16,
         site: usize,
         callee: usize,
+        /// Per-arg caller-CV slot (`u16::MAX` = not a plain CV) — the
+        /// only channel a by-ref callee param has back to the caller.
+        arg_slots: Box<[u16]>,
         cache: std::cell::RefCell<Option<CachedFn>>,
     },
     /// Statement boundary: decref the temps this statement left in
@@ -499,6 +509,9 @@ impl Compiler {
                 let Expr::Var(n) = &**target else {
                     return None;
                 };
+                if n == "this" {
+                    return None; // AST path emits the canonical fatal
+                }
                 let slot = self.slot(n);
                 if *op == "=" {
                     self.expr(value)?;
@@ -523,6 +536,9 @@ impl Compiler {
                 let Expr::Var(n) = &**t else {
                     return None;
                 };
+                if n == "this" {
+                    return None;
+                }
                 let delta = if matches!(e, Expr::PreInc(_) | Expr::PostInc(_)) {
                     1
                 } else {
@@ -568,23 +584,44 @@ impl Compiler {
             }
             Expr::Binary { op, l, r } => match *op {
                 "&&" => {
+                    // `a && b`: JMPZ pops the lhs — short path pushes
+                    // false, long path pushes bool(b), so both leave
+                    // exactly one value (PHP &&/|| always yield bool).
                     self.expr(l)?;
                     let jf = self.emit(Op::JumpIfFalse(usize::MAX));
                     self.expr(r)?;
-                    self.emit(Op::Binary("&&"));
+                    self.emit(Op::Boolify);
+                    let j = self.emit(Op::Jump(usize::MAX));
+                    let f_at = self.ops.len();
+                    self.emit(Op::Const(Value::Bool(false)));
                     let end = self.ops.len();
-                    self.patch(jf, end);
+                    self.patch(jf, f_at);
+                    self.patch(j, end);
                 }
                 "||" => {
                     self.expr(l)?;
                     let jt = self.emit(Op::JumpIfTrue(usize::MAX));
                     self.expr(r)?;
-                    self.emit(Op::Binary("||"));
+                    self.emit(Op::Boolify);
+                    let j = self.emit(Op::Jump(usize::MAX));
+                    let t_at = self.ops.len();
+                    self.emit(Op::Const(Value::Bool(true)));
                     let end = self.ops.len();
-                    self.patch(jt, end);
+                    self.patch(jt, t_at);
+                    self.patch(j, end);
                 }
                 "+" | "-" | "*" | "/" | "%" | "**" | "." | "&" | "|" | "^" | "<<" | ">>" | "=="
                 | "!=" | "===" | "!==" | "<" | "<=" | ">" | ">=" | "<=>" => {
+                    // A plain-CV lhs binds at op-exec like zend —
+                    // the rhs may have just re-assigned it.
+                    if let Expr::Var(n) = Interp::unmark_rhs(l) {
+                        if n != "this" && self.assigned.contains(n.as_str()) {
+                            self.expr(r)?;
+                            let sl = self.slot(n);
+                            self.emit(Op::BinaryCv(op, sl));
+                            return Some(());
+                        }
+                    }
                     self.expr(l)?;
                     self.expr(r)?;
                     self.emit(Op::Binary(op));
@@ -606,6 +643,17 @@ impl Compiler {
                 if raw.contains("::") || raw.starts_with('\\') {
                     return None;
                 }
+                // Reads the caller's var table — VM frames keep vars
+                // in slots, not `f.vars` (compact_one's lookup_var
+                // would see an empty scope).
+                if raw
+                    .trim_start_matches('\u{1}')
+                    .rsplit('\\')
+                    .next()
+                    .is_some_and(|seg| seg.eq_ignore_ascii_case("compact"))
+                {
+                    return None;
+                }
                 for a in args {
                     match Interp::unmark_arg(a) {
                         Expr::Unpack(_) => return None,
@@ -615,12 +663,20 @@ impl Compiler {
                     self.expr(Interp::unmark_arg(a))?;
                 }
                 let lname: Rc<str> = Rc::from(raw.trim_start_matches('\u{1}').to_lowercase());
+                let arg_slots: Vec<u16> = args
+                    .iter()
+                    .map(|a| match Interp::unmark_arg(a) {
+                        Expr::Var(n) => self.slots.get(n.as_str()).copied().unwrap_or(u16::MAX),
+                        _ => u16::MAX,
+                    })
+                    .collect();
                 self.emit(Op::Call {
                     lname,
                     raw: Rc::from(raw.trim_start_matches('\u{1}')),
                     argc: args.len() as u16,
                     site: *site,
                     callee: *callee,
+                    arg_slots: arg_slots.into_boxed_slice(),
                     cache: std::cell::RefCell::new(None),
                 });
             }
@@ -876,6 +932,110 @@ impl<'a> Interp<'a> {
         r
     }
 
+    /// Shared `Op::Binary`/`Op::BinaryCv` eval: Int×Int scalars bypass
+    /// the arith/compare machinery — no type dispatch, no cmp-depth or
+    /// notices protocol (scalar-scalar can't trigger either).
+    /// Overflow-to-float, div/mod-by-zero and the INT_MIN/-1 edges drop
+    /// to the general path (`self.arith`) so their zend errors stay
+    /// exact.
+    fn vm_binary(&mut self, op: &'static str, lv: Value, rv: Value) -> Result<Value, PhpError> {
+        // Int×Int scalars bypass the arith/compare
+        // machinery — no type dispatch, no cmp-depth or
+        // notices protocol (scalar-scalar can't trigger
+        // either). Overflow-to-float, div/mod-by-zero and
+        // the INT_MIN/-1 edges drop to the general path
+        // (`self.arith`) so their zend errors stay exact.
+        let fast = if let (Value::Int(a), Value::Int(b)) = (&lv, &rv) {
+            let (a, b) = (*a, *b);
+            match op {
+                "+" => Some(match a.checked_add(b) {
+                    Some(i) => Value::Int(i),
+                    None => Value::Float(a as f64 + b as f64),
+                }),
+                "-" => Some(match a.checked_sub(b) {
+                    Some(i) => Value::Int(i),
+                    None => Value::Float(a as f64 - b as f64),
+                }),
+                "*" => Some(match a.checked_mul(b) {
+                    Some(i) => Value::Int(i),
+                    None => Value::Float(a as f64 * b as f64),
+                }),
+                "/" if b != 0 && !(a == i64::MIN && b == -1) => Some(if a % b == 0 {
+                    Value::Int(a / b)
+                } else {
+                    Value::Float(a as f64 / b as f64)
+                }),
+                "%" if b != 0 && b != -1 => Some(Value::Int(a % b)),
+                "==" | "===" => Some(Value::Bool(a == b)),
+                "!=" | "!==" => Some(Value::Bool(a != b)),
+                "<=>" => Some(Value::Int(match a.cmp(&b) {
+                    Ordering::Less => -1,
+                    Ordering::Equal => 0,
+                    Ordering::Greater => 1,
+                })),
+                "<" => Some(Value::Bool(a < b)),
+                "<=" => Some(Value::Bool(a <= b)),
+                ">" => Some(Value::Bool(a > b)),
+                ">=" => Some(Value::Bool(a >= b)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Ok(match fast {
+            Some(v) => v,
+            None => match op {
+                "&&" => Value::Bool(rv.is_truthy()),
+                "||" => Value::Bool(rv.is_truthy()),
+                "." => {
+                    let grow = matches!(&lv, Value::Str(s) if Rc::strong_count(&s.rc) == 1);
+                    let mut ls = self.conv_bytes(&lv)?;
+                    let rs = self.conv_bytes(&rv)?;
+                    ls.extend_from_slice(&rs);
+                    let nv = Value::bytes(ls);
+                    if let Value::Str(s) = &nv {
+                        match &lv {
+                            Value::Str(os) if grow => {
+                                self.mem_grow_str(&os.rc, &s.rc, s.len() as u64 + 25)
+                            }
+                            _ => self.mem_track(&s.rc, s.len() as u64 + 25),
+                        }
+                    }
+                    nv
+                }
+                "===" | "!==" | "==" | "!=" | "<=>" | "<" | "<=" | ">" | ">=" => {
+                    crate::value::clear_cmp_depth_err();
+                    let (a, b) = (&lv, &rv);
+                    let v = match op {
+                        "===" => Value::Bool(identical(a, b)),
+                        "!==" => Value::Bool(!identical(a, b)),
+                        "==" => Value::Bool(compare(a, b) == Ordering::Equal),
+                        "!=" => Value::Bool(compare(a, b) != Ordering::Equal),
+                        "<=>" => Value::Int(match compare(a, b) {
+                            Ordering::Less => -1,
+                            Ordering::Equal => 0,
+                            Ordering::Greater => 1,
+                        }),
+                        "<" => Value::Bool(compare(a, b) == Ordering::Less),
+                        "<=" => Value::Bool(compare(a, b) != Ordering::Greater),
+                        ">" => Value::Bool(compare(b, a) == Ordering::Less),
+                        _ => Value::Bool(compare(b, a) != Ordering::Greater),
+                    };
+                    self.emit_cmp_notices()?;
+                    if crate::value::cmp_depth_err() {
+                        return self.fail(PhpError::uncaught(
+                            "Error",
+                            "Nesting level too deep - recursive dependency?",
+                            self.cur_line,
+                        ));
+                    }
+                    v
+                }
+                _ => self.arith(op, lv, rv)?,
+            },
+        })
+    }
+
     fn vm_exec_ops(
         &mut self,
         comp: &Compiled,
@@ -919,103 +1079,23 @@ impl<'a> Interp<'a> {
                 Op::Binary(op) => {
                     let rv = vs.pop().unwrap();
                     let lv = vs.pop().unwrap();
-                    // Int×Int scalars bypass the arith/compare
-                    // machinery — no type dispatch, no cmp-depth or
-                    // notices protocol (scalar-scalar can't trigger
-                    // either). Overflow-to-float, div/mod-by-zero and
-                    // the INT_MIN/-1 edges drop to the general path
-                    // (`self.arith`) so their zend errors stay exact.
-                    let fast = if let (Value::Int(a), Value::Int(b)) = (&lv, &rv) {
-                        let (a, b) = (*a, *b);
-                        match *op {
-                            "+" => Some(match a.checked_add(b) {
-                                Some(i) => Value::Int(i),
-                                None => Value::Float(a as f64 + b as f64),
-                            }),
-                            "-" => Some(match a.checked_sub(b) {
-                                Some(i) => Value::Int(i),
-                                None => Value::Float(a as f64 - b as f64),
-                            }),
-                            "*" => Some(match a.checked_mul(b) {
-                                Some(i) => Value::Int(i),
-                                None => Value::Float(a as f64 * b as f64),
-                            }),
-                            "/" if b != 0 && !(a == i64::MIN && b == -1) => Some(if a % b == 0 {
-                                Value::Int(a / b)
-                            } else {
-                                Value::Float(a as f64 / b as f64)
-                            }),
-                            "%" if b != 0 && b != -1 => Some(Value::Int(a % b)),
-                            "==" | "===" => Some(Value::Bool(a == b)),
-                            "!=" | "!==" => Some(Value::Bool(a != b)),
-                            "<=>" => Some(Value::Int(match a.cmp(&b) {
-                                Ordering::Less => -1,
-                                Ordering::Equal => 0,
-                                Ordering::Greater => 1,
-                            })),
-                            "<" => Some(Value::Bool(a < b)),
-                            "<=" => Some(Value::Bool(a <= b)),
-                            ">" => Some(Value::Bool(a > b)),
-                            ">=" => Some(Value::Bool(a >= b)),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                    let v = match fast {
-                        Some(v) => v,
-                        None => match *op {
-                            "&&" => Value::Bool(rv.is_truthy()),
-                            "||" => Value::Bool(rv.is_truthy()),
-                            "." => {
-                                let grow =
-                                    matches!(&lv, Value::Str(s) if Rc::strong_count(&s.rc) == 1);
-                                let mut ls = self.conv_bytes(&lv)?;
-                                let rs = self.conv_bytes(&rv)?;
-                                ls.extend_from_slice(&rs);
-                                let nv = Value::bytes(ls);
-                                if let Value::Str(s) = &nv {
-                                    match &lv {
-                                        Value::Str(os) if grow => {
-                                            self.mem_grow_str(&os.rc, &s.rc, s.len() as u64 + 25)
-                                        }
-                                        _ => self.mem_track(&s.rc, s.len() as u64 + 25),
-                                    }
-                                }
-                                nv
-                            }
-                            "===" | "!==" | "==" | "!=" | "<=>" | "<" | "<=" | ">" | ">=" => {
-                                crate::value::clear_cmp_depth_err();
-                                let (a, b) = (&lv, &rv);
-                                let v = match *op {
-                                    "===" => Value::Bool(identical(a, b)),
-                                    "!==" => Value::Bool(!identical(a, b)),
-                                    "==" => Value::Bool(compare(a, b) == Ordering::Equal),
-                                    "!=" => Value::Bool(compare(a, b) != Ordering::Equal),
-                                    "<=>" => Value::Int(match compare(a, b) {
-                                        Ordering::Less => -1,
-                                        Ordering::Equal => 0,
-                                        Ordering::Greater => 1,
-                                    }),
-                                    "<" => Value::Bool(compare(a, b) == Ordering::Less),
-                                    "<=" => Value::Bool(compare(a, b) != Ordering::Greater),
-                                    ">" => Value::Bool(compare(b, a) == Ordering::Less),
-                                    _ => Value::Bool(compare(b, a) != Ordering::Greater),
-                                };
-                                self.emit_cmp_notices()?;
-                                if crate::value::cmp_depth_err() {
-                                    return self.fail(PhpError::uncaught(
-                                        "Error",
-                                        "Nesting level too deep - recursive dependency?",
-                                        self.cur_line,
-                                    ));
-                                }
-                                v
-                            }
-                            _ => self.arith(op, lv, rv)?,
-                        },
-                    };
+                    let v = self.vm_binary(op, lv, rv)?;
                     vs.push(v);
+                }
+                Op::BinaryCv(op, sl) => {
+                    let rv = vs.pop().unwrap();
+                    // The left CV binds here — zend fetches it at the
+                    // binary op, after the rhs ran.
+                    let lv = match &slots[*sl as usize] {
+                        Slot::V(v) => v.clone(),
+                        Slot::C(c) => c.borrow().clone(),
+                    };
+                    let v = self.vm_binary(op, lv, rv)?;
+                    vs.push(v);
+                }
+                Op::Boolify => {
+                    let v = vs.pop().unwrap();
+                    vs.push(Value::Bool(v.is_truthy()));
                 }
                 Op::Not => {
                     let v = vs.pop().unwrap();
@@ -1085,6 +1165,7 @@ impl<'a> Interp<'a> {
                     argc,
                     site,
                     callee,
+                    arg_slots,
                     cache,
                 } => {
                     let n = *argc as usize;
@@ -1101,7 +1182,14 @@ impl<'a> Interp<'a> {
                         self.send_line = Some(*site);
                         self.vm_run_direct(d, c, &mut argv)?
                     } else {
-                        self.vm_call(lname, raw, &mut argv, *site, *callee, cache)?
+                        self.vm_call(
+                            lname,
+                            raw,
+                            &mut argv,
+                            (*site, *callee),
+                            (slots, arg_slots),
+                            cache,
+                        )?
                     };
                     argv.clear();
                     if self.vm_val_pool.len() < 64 {
@@ -1444,8 +1532,8 @@ impl<'a> Interp<'a> {
         lname: &str,
         raw: &str,
         argv: &mut Vec<Value>,
-        site: usize,
-        callee: usize,
+        (site, callee): (usize, usize),
+        (slots, arg_slots): (&mut [Slot], &[u16]),
         cache: &std::cell::RefCell<Option<CachedFn>>,
     ) -> Result<Value, PhpError> {
         self.send_line = Some(site);
@@ -1518,6 +1606,30 @@ impl<'a> Interp<'a> {
         }
         let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
         cells.extend(argv.drain(..).map(cell));
+        // By-ref callee params bind the caller's own zval — a plain-CV
+        // arg must hand over its slot cell (a Slot::V local upgrades to
+        // Slot::C, zend's separate-into-reference), or the callee's
+        // writes die on a throwaway cell.
+        if let Some(d) = &decl {
+            for (i, p) in d.params.iter().enumerate() {
+                if !p.by_ref || p.variadic {
+                    continue;
+                }
+                let Some(&sl) = arg_slots.get(i) else { break };
+                if sl == u16::MAX || i >= cells.len() {
+                    continue;
+                }
+                let sl = sl as usize;
+                match &mut slots[sl] {
+                    Slot::C(c) => cells[i] = c.clone(),
+                    Slot::V(v) => {
+                        let c = cell(std::mem::replace(v, Value::Null));
+                        slots[sl] = Slot::C(c.clone());
+                        cells[i] = c;
+                    }
+                }
+            }
+        }
         let mut args = super::CallArgs::empty();
         args.cells = cells;
         let n = args.cells.len() as u64;
