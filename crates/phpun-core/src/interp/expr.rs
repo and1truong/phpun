@@ -9506,7 +9506,11 @@ impl<'a> Interp<'a> {
 
     /// PHP inc/dec semantics: null++ = 1, null-- = null, strings increment
     /// alphanumerically (Perl-style), numeric strings go numeric.
-    fn incdec_value(&mut self, v: &Value, delta: i64) -> Result<Value, PhpError> {
+    pub(in crate::interp) fn incdec_value(
+        &mut self,
+        v: &Value,
+        delta: i64,
+    ) -> Result<Value, PhpError> {
         Ok(match v {
             Value::Null => {
                 if delta > 0 {
@@ -9894,7 +9898,12 @@ impl<'a> Interp<'a> {
     }
 
     /// Arithmetic / bitwise with PHP numeric-string coercion.
-    fn arith(&mut self, op: &str, l: Value, r: Value) -> Result<Value, PhpError> {
+    pub(in crate::interp) fn arith(
+        &mut self,
+        op: &str,
+        l: Value,
+        r: Value,
+    ) -> Result<Value, PhpError> {
         match op {
             "&" | "|" | "^" => {
                 if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
