@@ -803,6 +803,14 @@ impl<'a> Parser<'a> {
     }
 
     pub(in crate::parser) fn stmt(&mut self) -> Result<Stmt, PhpError> {
+        let s = self.stmt_parsed()?;
+        // `[]` append slots outside a write target are zend's compile
+        // fatal; run it per statement (dead code still compiles).
+        self.check_dim_reads_stmt(&s)?;
+        Ok(s)
+    }
+
+    fn stmt_parsed(&mut self) -> Result<Stmt, PhpError> {
         // The first-statement slot is consumed by whichever stmt
         // parses it — a nested `declare` can't reach it (strict_nested).
         self.strict_slot = self.first_stmt_slot;

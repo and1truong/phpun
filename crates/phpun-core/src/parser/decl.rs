@@ -626,9 +626,25 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let name = self.ident().unwrap_or_default();
         self.expect_op("=")?;
-        let value = self.const_expr()?;
+        let value = self.const_expr_raw()?;
         self.expect_op(")")?;
         let is_strict = name.eq_ignore_ascii_case("strict_types");
+        // Directive values must be scalar literals — `true`/`$x`/
+        // `1+0`/`FOO` fatal (encoding's message differs).
+        if !matches!(value, Expr::Int(_) | Expr::Float(_) | Expr::Str(_)) {
+            let msg = if name.eq_ignore_ascii_case("encoding") {
+                "Encoding must be a literal".to_string()
+            } else {
+                format!("declare({name}) value must be a literal")
+            };
+            return Err(PhpError::compile_fatal(&msg, self.line()));
+        }
+        if is_strict && !matches!(value, Expr::Int(0) | Expr::Int(1)) {
+            return Err(PhpError::compile_fatal(
+                "strict_types declaration must have 0 or 1 as its value",
+                self.line(),
+            ));
+        }
         // `declare(strict_types=1)` is legal only as the very first
         // top-level statement — nowhere nested, nothing before it
         // (scalar_strict_declaration_placement_*, strict_nested).
@@ -1827,10 +1843,121 @@ impl<'a> Parser<'a> {
     /// while `static` stays the compile fatal
     /// '"static::" is not allowed in compile-time constants'.
     pub(in crate::parser) fn const_expr(&mut self) -> Result<Expr, PhpError> {
+        let e = self.const_expr_raw()?;
+        // zend_is_allowed_in_const_expr: calls and closures die at
+        // compile; `new`/FCC/const-fetch are legal (new-args still
+        // checked). `declare` uses the raw parse — its literal check
+        // is its own wording.
+        if Self::const_expr_has_call(&e) {
+            return Err(PhpError::compile_fatal(
+                "Constant expression contains invalid operations",
+                self.line(),
+            ));
+        }
+        Ok(e)
+    }
+
+    /// The raw const-slot parse (no call gate) — `declare`'s value
+    /// check is 'must be a literal', not 'invalid operations'.
+    pub(in crate::parser) fn const_expr_raw(&mut self) -> Result<Expr, PhpError> {
         let saved = std::mem::replace(&mut self.const_ctx, ConstCtx::Slot);
         let r = self.expr();
         self.const_ctx = saved;
         r
+    }
+
+    /// Any call or closure anywhere inside a const expr — FCC is legal
+    /// (its inner call-shaped node is not descended into).
+    fn const_expr_has_call(e: &Expr) -> bool {
+        match e {
+            Expr::Call { .. }
+            | Expr::MethodCall { .. }
+            | Expr::StaticCall { .. }
+            | Expr::StaticCallDyn { .. }
+            | Expr::Closure(_) => true,
+            Expr::Fcc(_) => false,
+            Expr::ArrayLit(items) => items.iter().any(|(k, v)| {
+                k.as_ref().is_some_and(Self::const_expr_has_call) || Self::const_expr_has_call(v)
+            }),
+            Expr::List(items) => items.iter().flatten().any(|(k, v)| {
+                k.as_ref().is_some_and(Self::const_expr_has_call) || Self::const_expr_has_call(v)
+            }),
+            Expr::Unary { e: x, .. }
+            | Expr::Cast { e: x, .. }
+            | Expr::Paren(x)
+            | Expr::ByRef(x)
+            | Expr::Unpack(x)
+            | Expr::Clone(x)
+            | Expr::Empty(x)
+            | Expr::Print(x)
+            | Expr::Throw(x)
+            | Expr::YieldFrom(x)
+            | Expr::PreInc(x)
+            | Expr::PreDec(x)
+            | Expr::PostInc(x)
+            | Expr::PostDec(x)
+            | Expr::VarVar(x, _) => Self::const_expr_has_call(x),
+            Expr::Binary { l, r, .. } => {
+                Self::const_expr_has_call(l) || Self::const_expr_has_call(r)
+            }
+            Expr::Ternary { c, t, f } => {
+                Self::const_expr_has_call(c)
+                    || t.as_ref()
+                        .map(|x| Self::const_expr_has_call(x))
+                        .unwrap_or(false)
+                    || Self::const_expr_has_call(f)
+            }
+            Expr::Index { e: x, i, .. } => {
+                Self::const_expr_has_call(x)
+                    || i.as_ref()
+                        .map(|x| Self::const_expr_has_call(x))
+                        .unwrap_or(false)
+            }
+            Expr::Prop { obj, name, .. } => {
+                Self::const_expr_has_call(obj)
+                    || matches!(name, PropName::Expr(x) if Self::const_expr_has_call(x))
+            }
+            Expr::StaticProp { class, name } => {
+                Self::const_expr_has_call(class)
+                    || matches!(name, PropName::Expr(x) if Self::const_expr_has_call(x))
+            }
+            Expr::ClassConst { class, .. } => Self::const_expr_has_call(class),
+            Expr::New { class, args, .. } => {
+                Self::const_expr_has_call(class) || args.iter().any(Self::const_expr_has_call)
+            }
+            Expr::Assign { target, value, .. } => {
+                Self::const_expr_has_call(target) || Self::const_expr_has_call(value)
+            }
+            Expr::Isset(args) => args.iter().any(Self::const_expr_has_call),
+            Expr::Exit(x) => x
+                .as_ref()
+                .map(|x| Self::const_expr_has_call(x))
+                .unwrap_or(false),
+            Expr::Include { e: x, .. } => Self::const_expr_has_call(x),
+            Expr::Yield { key, val } => {
+                key.as_ref()
+                    .map(|x| Self::const_expr_has_call(x))
+                    .unwrap_or(false)
+                    || val
+                        .as_ref()
+                        .map(|x| Self::const_expr_has_call(x))
+                        .unwrap_or(false)
+            }
+            Expr::Match { subject, arms, .. } => {
+                Self::const_expr_has_call(subject)
+                    || arms.iter().any(|a| {
+                        a.conds.iter().any(Self::const_expr_has_call)
+                            || Self::const_expr_has_call(&a.result)
+                    })
+            }
+            Expr::Instanceof { obj, class } => {
+                Self::const_expr_has_call(obj) || Self::const_expr_has_call(class)
+            }
+            // `"{expr}"` interpolation keeps source text (re-lexed
+            // lazily) — a call hiding inside it isn't reachable here.
+            Expr::Interp(_) => false,
+            _ => false,
+        }
     }
 
     /// Clear the const-slot flag around a runtime body (closure/method/

@@ -7618,6 +7618,37 @@ impl<'a> Interp<'a> {
                             self.call_trace.pop();
                             return r;
                         }
+                    } else if !strict
+                        && !matches!(v, Value::Null)
+                        && arg_checks
+                        && !pty.trim_start_matches('?').split('|').any(|t| {
+                            t == "resource" && matches!(v, Value::Resource(_))
+                                || t != "resource" && self.param_type_match(t, &v)
+                        })
+                    {
+                        // Weak mode coerces scalars, but non-coercible
+                        // arg types still TypeError (strlen([1]);
+                        // sort("x") — the by-ref arm errors earlier).
+                        let variadic = builtins::builtin_params(name)
+                            .map(|ps| ps.iter().any(|(_, d)| matches!(*d, builtins::BDef::Var)))
+                            .unwrap_or(false);
+                        let pname_txt = if variadic {
+                            String::new()
+                        } else {
+                            format!(" (${pname})")
+                        };
+                        let msg = format!(
+                            "{}(): Argument #{}{pname_txt} must be of type {}, {} given",
+                            name,
+                            i + 1,
+                            pty,
+                            self.zval_type_name(&v),
+                        );
+                        let e = self.exception("TypeError", &msg);
+                        let te = self.throw(e);
+                        let r = self.fail(te);
+                        self.call_trace.pop();
+                        return r;
                     } else if strict && !self.zpp_strict_ok(pty, &v) {
                         let msg = format!(
                             "{}(): Argument #{} (${}) must be of type {}, {} given",

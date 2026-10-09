@@ -1154,7 +1154,7 @@ impl<'a> Interp<'a> {
                 } else {
                     format!("{base}::__construct")
                 };
-                let argvals = s.arg_cells(args, &params, &ctx, false, Some(*site))?;
+                let argvals = s.arg_cells(args, &params, &ctx, false, Some(*site), true)?;
                 s.new_instance(&name, argvals)
             }),
             Expr::Prop {
@@ -1233,6 +1233,7 @@ impl<'a> Interp<'a> {
                     &format!("{}::{{closure}}", cls.name()),
                     false,
                     Some(*site),
+                    false,
                 )?;
                 s.static_invoke_vis(cls, &n, argvals, None, fwd)
             }),
@@ -7865,7 +7866,10 @@ impl<'a> Interp<'a> {
             let key = match i {
                 Some(ie) => self.eval(ie)?,
                 None => {
-                    return self.fail(PhpError::fatal("[] used in read context", 0));
+                    return self.fail(PhpError::compile_fatal(
+                        "Cannot use [] for reading",
+                        self.cur_line,
+                    ));
                 }
             };
             let prev_vv = self.vv_rhs_site;
@@ -7918,7 +7922,10 @@ impl<'a> Interp<'a> {
         let key = match i {
             Some(ie) => self.eval(ie)?,
             None => {
-                return self.fail(PhpError::fatal("[] used in read context", 0));
+                return self.fail(PhpError::compile_fatal(
+                    "Cannot use [] for reading",
+                    self.cur_line,
+                ));
             }
         };
         self.index_read_base(base, key)
@@ -7929,7 +7936,10 @@ impl<'a> Interp<'a> {
         let base = self.eval(e)?;
         match key {
             Some(k) => self.index_read_base(base, k),
-            None => self.fail(PhpError::fatal("[] used in read context", 0)),
+            None => self.fail(PhpError::compile_fatal(
+                "Cannot use [] for reading",
+                self.cur_line,
+            )),
         }
     }
 
@@ -8949,7 +8959,10 @@ impl<'a> Interp<'a> {
                     }
                 }
                 let Some(key) = key else {
-                    return self.fail(PhpError::fatal("[] used in read context", 0));
+                    return self.fail(PhpError::compile_fatal(
+                        "Cannot use [] for reading",
+                        self.cur_line,
+                    ));
                 };
                 // `++`/`--` never lands on a string offset — zend
                 // validates the key, then the catchable Error beats
@@ -9246,6 +9259,11 @@ impl<'a> Interp<'a> {
             self.dim_cv_bound.clear();
             self.dim_undef_cells.clear();
         }
+        // zend fetches the container AFTER the dim operands eval: a
+        // throwing key (`$a[k]++`, k undef) wins over the fresh-var
+        // 'Undefined variable' warning, which fires between them
+        // ($a['k']++ warns $a then the missing key).
+        let root_fresh = self.var_lookup(root).is_none();
         let arr_cell = self.var_cell(root);
         let det = DimDetach {
             name: root.to_string(),
@@ -9272,7 +9290,12 @@ impl<'a> Interp<'a> {
                     // engine's dim machinery like `+=` — not a fatal
                     // (the temp result just can't write back).
                     [None] => None,
-                    _ => return self.fail(PhpError::fatal("[] used in read context", 0)),
+                    _ => {
+                        return self.fail(PhpError::compile_fatal(
+                            "Cannot use [] for reading",
+                            self.cur_line,
+                        ))
+                    }
                 };
                 return self.incdec_aa(o, key, delta, post);
             }
@@ -9296,6 +9319,9 @@ impl<'a> Interp<'a> {
                 },
                 None => keys.push(DimArg::Append),
             }
+        }
+        if root_fresh && !self.is_quiet() {
+            self.warn(&format!("Undefined variable ${root}"))?;
         }
         let old = self.compound_dim_read(arr_cell.clone(), &keys, false, Some(&det), true)?;
         // zend's EG(exception) check at the fetch's end kills the

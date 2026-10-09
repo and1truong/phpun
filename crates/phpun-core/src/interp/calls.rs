@@ -106,6 +106,7 @@ impl<'a> Interp<'a> {
                         &format!("{}::{}", cls.name(), mn),
                         false,
                         site,
+                        false,
                     )?;
                     return self.static_invoke_vis(cls, mn, vals, None, true);
                 }
@@ -119,7 +120,7 @@ impl<'a> Interp<'a> {
                     .find_method_in(&cls, &mn)
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
-                let vals = self.arg_cells(args, &params, &mn, false, site)?;
+                let vals = self.arg_cells(args, &params, &mn, false, site, false)?;
                 let fwd = matches!(&**class, Expr::Const(_) | Expr::Str(_) | Expr::AnonClass(_));
                 return self.static_invoke_vis(cls, &mn, vals, None, fwd);
             }
@@ -132,7 +133,7 @@ impl<'a> Interp<'a> {
                     Value::Callable(_) => {
                         let params = self.callable_params(&v);
                         let ctx = self.callable_ctx_name(&v);
-                        let vals = self.arg_cells(args, &params, &ctx, false, site)?;
+                        let vals = self.arg_cells(args, &params, &ctx, false, site, false)?;
                         return self.call_value(&v, vals);
                     }
                     Value::Object(o) => {
@@ -154,7 +155,7 @@ impl<'a> Interp<'a> {
                         }
                         let params = self.callable_params(&v);
                         let ctx = self.callable_ctx_name(&v);
-                        let vals = self.arg_cells(args, &params, &ctx, false, site)?;
+                        let vals = self.arg_cells(args, &params, &ctx, false, site, false)?;
                         return self.call_value(&v, vals);
                     }
                     Value::Array(_) => {
@@ -169,7 +170,7 @@ impl<'a> Interp<'a> {
                         }
                         let params = self.callable_params(&c);
                         let ctx = self.callable_ctx_name(&c);
-                        let vals = self.arg_cells(args, &params, &ctx, false, site)?;
+                        let vals = self.arg_cells(args, &params, &ctx, false, site, false)?;
                         return self.call_value(&c, vals);
                     }
                     Value::Str(_) => self.conv_str(&v).unwrap_or_default(),
@@ -264,6 +265,147 @@ impl<'a> Interp<'a> {
     /// `named` params collected as (name, cell) too. `site` is the
     /// call's own source line — recorded as the frame's call site once
     /// arg evaluation (which may push nested frames) has finished.
+    /// `[]` append in a read position inside an arg — zend defers
+    /// that compile error to call time (zend_delayed_compile_args).
+    /// `target` tracks write-context slots (assign targets, `&`/`++`
+    /// operands) where append stays legal.
+    fn arg_has_append(e: &Expr, target: bool) -> bool {
+        use crate::ast::Expr::*;
+        match e {
+            Index { e: c, i: None } => {
+                if target {
+                    Self::arg_has_append(c, true)
+                } else {
+                    true
+                }
+            }
+            Index { e: c, i: Some(k) } => {
+                Self::arg_has_append(c, target) || Self::arg_has_append(k, false)
+            }
+            Prop { obj, name, .. } | StaticProp { class: obj, name } => {
+                Self::arg_has_append(obj, target)
+                    || matches!(name, PropName::Expr(x) if Self::arg_has_append(x, false))
+            }
+            MethodCall {
+                obj, name, args, ..
+            } => {
+                Self::arg_has_append(obj, target)
+                    || matches!(name, PropName::Expr(x) if Self::arg_has_append(x, false))
+                    || args.iter().any(|a| Self::arg_has_append(a, false))
+            }
+            StaticCall { class, args, .. }
+            | StaticCallDyn { class, args, .. }
+            | New { class, args, .. } => {
+                Self::arg_has_append(class, false)
+                    || args.iter().any(|a| Self::arg_has_append(a, false))
+            }
+            Call { name, args, .. } => {
+                Self::arg_has_append(name, false)
+                    || args.iter().any(|a| Self::arg_has_append(a, false))
+            }
+            Assign {
+                target: t,
+                value,
+                op,
+                ..
+            } => {
+                Self::arg_has_append(value, false)
+                    || (*op == "??=" && Self::arg_has_append(t, false))
+            }
+            List(items) => items.iter().flatten().any(|(k, v)| {
+                k.as_ref()
+                    .map(|k| Self::arg_has_append(k, false))
+                    .unwrap_or(false)
+                    || Self::arg_has_append(v, target)
+            }),
+            ByRef(x) | PreInc(x) | PreDec(x) | PostInc(x) | PostDec(x) => {
+                Self::arg_has_append(x, true)
+            }
+            Unary { e: x, .. }
+            | Cast { e: x, .. }
+            | Paren(x)
+            | Unpack(x)
+            | Clone(x)
+            | Empty(x)
+            | Print(x)
+            | Throw(x)
+            | YieldFrom(x)
+            | VarVar(x, _)
+            | Include { e: x, .. } => Self::arg_has_append(x, false),
+            Binary { l, r, .. } | Instanceof { obj: l, class: r } => {
+                Self::arg_has_append(l, false) || Self::arg_has_append(r, false)
+            }
+            Ternary { c, t, f } => {
+                Self::arg_has_append(c, false)
+                    || t.as_ref()
+                        .map(|t| Self::arg_has_append(t, false))
+                        .unwrap_or(false)
+                    || Self::arg_has_append(f, false)
+            }
+            Isset(xs) => xs.iter().any(|x| Self::arg_has_append(x, false)),
+            ArrayLit(items) => items.iter().any(|(k, v)| {
+                k.as_ref()
+                    .map(|k| Self::arg_has_append(k, false))
+                    .unwrap_or(false)
+                    || Self::arg_has_append(v, false)
+            }),
+            Yield { key, val } => {
+                key.as_ref()
+                    .map(|k| Self::arg_has_append(k, false))
+                    .unwrap_or(false)
+                    || val
+                        .as_ref()
+                        .map(|v| Self::arg_has_append(v, false))
+                        .unwrap_or(false)
+            }
+            Exit(x) => x
+                .as_ref()
+                .map(|x| Self::arg_has_append(x, false))
+                .unwrap_or(false),
+            Match { subject, arms, .. } => {
+                Self::arg_has_append(subject, false)
+                    || arms.iter().any(|a| {
+                        a.conds.iter().any(|c| Self::arg_has_append(c, false))
+                            || Self::arg_has_append(&a.result, false)
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// By-ref slot lookup for arg `i`/named — the delayed-append gate
+    /// skips args a by-ref param binds as write targets.
+    fn arg_by_ref(decl: &[Param], name: &Option<String>, pos: usize) -> bool {
+        match name {
+            Some(n) => decl
+                .iter()
+                .find(|p| !p.variadic && p.name == *n)
+                .map(|p| p.by_ref)
+                .unwrap_or_else(|| decl.iter().any(|p| p.variadic && p.by_ref)),
+            None => decl
+                .get(pos)
+                .map(|p| p.by_ref)
+                .unwrap_or_else(|| decl.iter().any(|p| p.variadic && p.by_ref)),
+        }
+    }
+
+    /// Named-arg name without evaluating `expr` (delayed-append prescan
+    /// runs before any arg evals — no side effects allowed).
+    fn arg_name(a: &Expr) -> (Option<String>, &Expr) {
+        match Self::unmark_arg(a) {
+            Expr::Binary {
+                op: "named", l, r, ..
+            } => (
+                match l.as_ref() {
+                    Expr::Str(s) => Some(s.clone()),
+                    _ => None,
+                },
+                r.as_ref(),
+            ),
+            e => (None, e),
+        }
+    }
+
     pub(in crate::interp) fn arg_cells(
         &mut self,
         args: &[Expr],
@@ -271,7 +413,27 @@ impl<'a> Interp<'a> {
         ctx: &str,
         internal: bool,
         site: Option<usize>,
+        delayed_catchable: bool,
     ) -> Result<CallArgs, PhpError> {
+        // `[]` append reads inside call args are zend's delayed
+        // compile error: raised after callee resolution but before any
+        // arg evaluates (plain fatal). `new` args differ — the error
+        // is a catchable Error raised when that arg's turn comes
+        // (earlier args' side effects still run) — handled in-loop.
+        if !delayed_catchable {
+            let mut pos = 0usize;
+            for a in args {
+                let (name, expr) = Self::arg_name(a);
+                let by_ref = Self::arg_by_ref(decl, &name, pos);
+                if name.is_none() {
+                    pos += 1;
+                }
+                if !by_ref && Self::arg_has_append(expr, false) {
+                    let l = site.unwrap_or(self.cur_line);
+                    return self.fail(PhpError::compile_fatal("Cannot use [] for reading", l));
+                }
+            }
+        }
         let mut out = CallArgs::empty();
         // zend's INIT_FCALL pushes the frame's arena span before args
         // evaluate. Reserve the whole call span now (VM_FRAME_SLOTS +
@@ -313,6 +475,16 @@ impl<'a> Interp<'a> {
                 }
                 _ => (None, a),
             };
+            if delayed_catchable
+                && !Self::arg_by_ref(decl, &name, pos)
+                && Self::arg_has_append(expr, false)
+            {
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    "Cannot use [] for reading",
+                    self.cur_line,
+                ));
+            }
             if let Expr::Unpack(e) = expr {
                 // `...$arr`: int-keyed entries become positionals (in
                 // iteration order), string-keyed become named args
@@ -751,6 +923,7 @@ impl<'a> Interp<'a> {
                 &format!("{}::{}", cls.name(), mn),
                 false,
                 site,
+                false,
             )?;
             return self.static_invoke_vis(cls, mn, vals, None, false);
         }
@@ -847,6 +1020,7 @@ impl<'a> Interp<'a> {
             raw_name,
             decl.is_none(),
             site,
+            false,
         )?;
         if !ns_resolved {
             // zend's ZEND_FRAMELESS_FUNCTION for a compile-time-bound
