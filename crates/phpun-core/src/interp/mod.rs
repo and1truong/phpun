@@ -2412,6 +2412,15 @@ impl<'a> Interp<'a> {
                 d.line,
             ));
         }
+        if d.ns.is_empty() && crate::builtins::is_builtin(&key) {
+            // Global decl claiming a builtin name dies at the same
+            // compile phase (oracle: "Cannot redeclare function
+            // strlen()"); namespaced decls stay legal.
+            return Err(PhpError::compile_fatal(
+                format!("Cannot redeclare function {}()", d.name),
+                d.line,
+            ));
+        }
         let site = std::ptr::from_ref(d) as usize;
         let mut d = d.clone();
         d.file = self.cur_file.clone();
