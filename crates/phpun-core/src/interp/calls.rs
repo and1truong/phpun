@@ -2392,7 +2392,11 @@ impl<'a> Interp<'a> {
     /// call_user_func lend their own site) plus trace-format args.
     /// Arity/binding failures reuse this so a callee that never ran a
     /// body still appears in the exception's trace (probe11).
-    fn call_site_frame(&mut self, decl: &FunctionDecl, args: &CallArgs) -> TraceFrame {
+    pub(in crate::interp) fn call_site_frame(
+        &mut self,
+        decl: &FunctionDecl,
+        args: &CallArgs,
+    ) -> TraceFrame {
         crate::interp::util::alloc_hit(3);
         // The callee's argline markers overwrite `send_line`; after
         // the call returns the enclosing op's own line is the pending
@@ -4929,6 +4933,14 @@ impl<'a> Interp<'a> {
                 top.vars.insert(n, c2);
             }
         }
+        let comp = if args.named.is_empty() {
+            self.vm_compiled(decl)
+        } else {
+            None
+        };
+        if let Some(c) = comp {
+            return self.vm_run(decl, &c, args);
+        }
         self.bind_and_run(decl, args, Vec::new())
     }
 }
@@ -4936,7 +4948,7 @@ impl<'a> Interp<'a> {
 /// By-ref flags for builtin parameters (only slots that accept references are
 /// `true`). Used to warn on non-variable args in by-ref positions and to alias
 /// real cells for mutating builtins like array_pop/sort/preg_match.
-fn builtin_byref(name: &str) -> Option<&'static [bool]> {
+pub(in crate::interp) fn builtin_byref(name: &str) -> Option<&'static [bool]> {
     Some(match name {
         "array_pop" | "array_shift" | "array_walk" | "sort" | "rsort" | "asort" | "arsort"
         | "ksort" | "krsort" | "usort" | "uasort" | "uksort" | "natsort" | "natcasesort"

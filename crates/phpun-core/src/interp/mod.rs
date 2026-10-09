@@ -31,6 +31,7 @@ mod include;
 mod members;
 mod registry;
 pub(crate) mod util;
+mod vm;
 
 use util::*;
 
@@ -365,6 +366,9 @@ pub struct Interp<'a> {
     globals: Frame,
     stack: Vec<Frame>,
     pub functions: crate::value::FxMap<String, Rc<FunctionDecl>>,
+    /// VM spike (#39): compiled function bodies keyed by decl Rc ptr;
+    /// the stored Rc keeps the decl alive so the pointer can't recycle.
+    compiled_fns: crate::value::FxMap<usize, (Rc<FunctionDecl>, Option<Rc<vm::Compiled>>)>,
     classes: crate::value::FxMap<String, Rc<PhpClass>>,
     /// Traits by name — their methods are copied into using classes.
     pub traits: HashMap<String, Rc<ClassDecl>>,
@@ -1683,6 +1687,7 @@ impl<'a> Interp<'a> {
             cast_err: None,
             stack: Vec::new(),
             functions: crate::value::FxMap::default(),
+            compiled_fns: crate::value::FxMap::default(),
             classes: crate::value::FxMap::default(),
             traits: HashMap::new(),
             trait_statics: HashMap::new(),
@@ -7286,7 +7291,7 @@ impl<'a> Interp<'a> {
     /// `visible` marks frames Zend keeps in exception traces — every
     /// real call, literal or dynamic; false only for literal calls
     /// compile-specialized into dedicated opcodes (sprintf rope).
-    fn call_builtin(
+    pub(in crate::interp) fn call_builtin(
         &mut self,
         name: &str,
         args: &CallArgs,
