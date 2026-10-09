@@ -4770,10 +4770,13 @@ impl<'a> Interp<'a> {
             .map(|c| c.seg_cap);
         let reloc = old_seg.is_none_or(|cap| fp > cap);
         let mut new_seg_cap = if req > MM_MAX_LARGE {
-            // Relocation frees the old segment's whole span — its
-            // footprint plus the runway it had left — into the hole
-            // the grown placement extends into.
-            Self::seg_stretch(fp, old_seg.unwrap_or(0))
+            // Relocation lands the grown segment at the stack
+            // bottom — erealloc's alloc-before-free keeps the old
+            // span mapped through placement, so it can't host — and
+            // its runway there is just its own stretch. The freed
+            // span stays a hole in the old slot, inherited lazily
+            // by whatever segment grows directly below it.
+            Self::seg_stretch(fp, 0)
         } else {
             0
         };
@@ -4851,13 +4854,20 @@ impl<'a> Interp<'a> {
             self.chunk_release(c.chunk, c.inner);
         }
         if req > MM_MAX_LARGE {
-            // The grown segment stands where its predecessor stood
-            // in the placement order.
-            if let Some(p) = self
+            if reloc {
+                // The grown segment mapped below every live
+                // segment — it takes the bottom slot. The old span
+                // frees in place as a hole for the segment
+                // directly below it to drain at its grow.
+                self.seg_free(old_key, old_seg.unwrap_or(0));
+                self.mem_seg_order.push(SegSlot { key, hole: 0 });
+            } else if let Some(p) = self
                 .mem_seg_order
                 .iter()
                 .position(|s| s.key == old_key && s.hole == 0)
             {
+                // In-place extension stands where its predecessor
+                // stood in the placement order.
                 self.mem_seg_order[p].key = key;
             } else {
                 self.mem_seg_order.push(SegSlot { key, hole: 0 });
