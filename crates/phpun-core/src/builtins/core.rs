@@ -21,8 +21,7 @@ pub(crate) fn dispatch(
                 );
             }
             let v = arg(args, 1);
-            it.define_const(&n, v);
-            Value::Bool(true)
+            Value::Bool(it.define_const(&n, v)?)
         }
         "defined" => {
             let n = arg_str(it, args, 0);

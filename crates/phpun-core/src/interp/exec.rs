@@ -997,7 +997,11 @@ impl<'a> Interp<'a> {
                     // exprs (prop/static/class-const), not here.
                     let v = self.eval_const(e);
                     match v {
-                        Ok(v) => self.define_const(n, v),
+                        Ok(v) => {
+                            if let Err(e) = self.define_const(n, v) {
+                                return self.err_flow(e);
+                            }
+                        }
                         Err(e) => return self.err_flow(e),
                     }
                 }

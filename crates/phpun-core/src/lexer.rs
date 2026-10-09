@@ -418,6 +418,14 @@ fn lex_php(
                 pos += n;
             }
             _ => {
+                if matches!(c, b'b' | b'B')
+                    && matches!(src.as_bytes().get(pos + 1), Some(b'"' | b'\''))
+                {
+                    // `b"..."`/`b'...'` binary-string prefix — byte
+                    // strings are the only kind here; skip the `b`.
+                    pos += 1;
+                    continue;
+                }
                 if src[pos..].starts_with("b<<<") {
                     // `b` binary-string prefix: accepted and ignored
                     // (heredoc_002, nowdoc_002).

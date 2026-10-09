@@ -622,8 +622,28 @@ impl<'a> Interp<'a> {
     pub fn frame_args(&self) -> &[Cell] {
         self.stack.last().map(|f| f.args.as_slice()).unwrap_or(&[])
     }
-    pub fn define_const(&mut self, name: &str, v: Value) {
+    pub fn define_const(&mut self, name: &str, v: Value) -> Result<bool, PhpError> {
+        // 8.5: a duplicate `const`/`define` keeps the first value and
+        // warns — PHP 9 turns this into a hard Error.
+        if self.constants.contains_key(name) {
+            // zend lowercases the namespace part of the name in this
+            // warning (`foo\A`, not `Foo\A`).
+            let (ns, short) = match name.rsplit_once('\\') {
+                Some((ns, s)) => (ns.to_lowercase(), s.to_string()),
+                None => (String::new(), name.to_string()),
+            };
+            let disp = if ns.is_empty() {
+                short
+            } else {
+                format!("{ns}\\{short}")
+            };
+            self.warn(&format!(
+                "Constant {disp} already defined, this will be an error in PHP 9"
+            ))?;
+            return Ok(false);
+        }
         self.constants.insert(name.to_string(), v);
+        Ok(true)
     }
     pub fn const_defined(&self, name: &str) -> bool {
         self.constants.contains_key(name)
