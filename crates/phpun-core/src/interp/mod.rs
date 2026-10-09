@@ -7655,7 +7655,9 @@ impl<'a> Interp<'a> {
                         } else {
                             // Zend omits the name for variadic args.
                             let variadic = builtins::builtin_params(name)
-                                .map(|ps| ps.iter().any(|(_, d)| matches!(*d, builtins::BDef::Var)))
+                                .map(|ps| {
+                                    matches!(ps.get(i), Some((_, builtins::BDef::Var)))
+                                })
                                 .unwrap_or(false);
                             let pname_txt = if variadic {
                                 String::new()
@@ -7687,7 +7689,7 @@ impl<'a> Interp<'a> {
                         // arg types still TypeError (strlen([1]);
                         // sort("x") — the by-ref arm errors earlier).
                         let variadic = builtins::builtin_params(name)
-                            .map(|ps| ps.iter().any(|(_, d)| matches!(*d, builtins::BDef::Var)))
+                            .map(|ps| matches!(ps.get(i), Some((_, builtins::BDef::Var))))
                             .unwrap_or(false);
                         let pname_txt = if variadic {
                             String::new()
