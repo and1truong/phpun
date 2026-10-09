@@ -3977,7 +3977,9 @@ impl<'a> Interp<'a> {
             self.mem_seg_order.remove(p);
             if cap > 0 {
                 let heir = self.mem_seg_order[p..].iter().copied().find(|&k| {
-                    self.mem_tracked.get(&k).is_some_and(|c| (c.probe)() && c.huge > 0)
+                    self.mem_tracked
+                        .get(&k)
+                        .is_some_and(|c| (c.probe)() && c.huge > 0)
                 });
                 if let Some(heir) = heir {
                     if let Some(c) = self.mem_tracked.get_mut(&heir) {
