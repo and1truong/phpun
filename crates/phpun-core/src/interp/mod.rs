@@ -4481,9 +4481,9 @@ impl<'a> Interp<'a> {
                     if old > 0 {
                         self.seg_free_except(key, old, at);
                     }
-                    n
+                    Some(n)
                 } else {
-                    cap
+                    None
                 };
                 if !reloc && !failed {
                     // In-place: the extent eats `fp - ofp` of the free
@@ -4498,7 +4498,7 @@ impl<'a> Interp<'a> {
                     c.huge = fp;
                     c.table_req = req;
                     if !failed {
-                        c.seg_cap = fp.max(if reloc { ncap } else { c.seg_cap });
+                        c.seg_cap = fp.max(ncap.unwrap_or(c.seg_cap));
                     }
                 }
                 if self.mem_used > self.mem_peak {
