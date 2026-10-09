@@ -3927,6 +3927,10 @@ impl<'a> Interp<'a> {
         if let Some(i) = self.mem_cached.pop() {
             debug_assert_eq!(self.mem_chunks[i], 0);
             self.mem_chunks[i] = fp;
+            // zend_mm_chunk_init runs on the cached-pop path too —
+            // the chunk gets a fresh ->num like a new commit.
+            self.mem_chunk_nums[i] = self.mem_chunk_num_next;
+            self.mem_chunk_num_next += 1;
             return i;
         }
         // Fresh 2MB commit — reuse a dead slot or append.
@@ -4060,47 +4064,131 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Place a fresh huge segment: top-down mmap drops it into the
-    /// topmost free span that still fits — hole or zombie slot — or
-    /// below every live segment. The placement's extend runway is the
-    /// stolen span whole, or a fresh stretch's alignment gap.
+    /// Place a fresh huge segment: the kernel's top-down mmap drops
+    /// it at the top of the highest free span big enough for the
+    /// placement (footprint + alignment tail — the maps-verified
+    /// stretch), interior holes included; a smaller hole means the
+    /// segment stacks at the bottom canyon below every live segment.
+    /// The landing sits adjacent below the mapping above, so its own
+    /// runway is just the trim tail — the leftover of the stolen span
+    /// stays a hole below it.
     fn seg_place(&mut self, key: usize, fp: u64) -> u64 {
-        for i in 0..self.mem_seg_order.len() {
-            let span = self.slot_span(self.mem_seg_order[i]);
-            if span >= fp {
-                self.mem_seg_order[i] = SegSlot { key, hole: 0 };
-                return span;
-            }
-        }
-        self.mem_seg_order.push(SegSlot { key, hole: 0 });
-        Self::seg_stretch(fp, 0)
+        self.seg_place_at(key, fp).1
     }
 
-    /// Merge every still-free slot directly above a live segment into
-    /// its extend runway — the mremap headroom zend extends into at
-    /// grow time. Runs where a grow decision reads seg_cap so a span
-    /// a later alloc already reoccupied never credits the heir.
-    fn seg_drain(&mut self, key: usize) {
-        let Some(mut q) = self
+    /// seg_place that also returns the placed index, so a reloc
+    /// caller can free the predecessor slot by position when the new
+    /// segment's key repeats the old one's.
+    fn seg_place_at(&mut self, key: usize, fp: u64) -> (usize, u64) {
+        // The gap must hold the whole reservation: zend mmaps
+        // size + alignment - page before trimming — an exactly
+        // fitting gap does not qualify.
+        let need = fp + MM_CHUNK - 4096;
+        // Topmost contiguous free run big enough for the placement —
+        // the kernel's gap is every contiguous free span, interior
+        // holes included. The landing sits at the run's top, adjacent
+        // below the mapping that bounds it.
+        let mut i = 0;
+        while i < self.mem_seg_order.len() {
+            let mut total = 0u64;
+            let mut j = i;
+            while j < self.mem_seg_order.len() {
+                let span = self.slot_span(self.mem_seg_order[j]);
+                if span == 0 {
+                    break;
+                }
+                total = total.saturating_add(span);
+                j += 1;
+            }
+            if total > need {
+                // Consume the run top-down; leftovers stay below.
+                let mut left = need;
+                while left > 0 {
+                    let span = self.slot_span(self.mem_seg_order[i]);
+                    if span <= left {
+                        left -= span;
+                        self.mem_seg_order.remove(i);
+                    } else {
+                        self.mem_seg_order[i].hole = span - left;
+                        break;
+                    }
+                }
+                self.mem_seg_order.insert(i, SegSlot { key, hole: 0 });
+                return (i, Self::seg_stretch(fp, 0));
+            }
+            i = if j > i { j } else { i + 1 };
+        }
+        self.mem_seg_order.push(SegSlot { key, hole: 0 });
+        (self.mem_seg_order.len() - 1, Self::seg_stretch(fp, 0))
+    }
+
+    /// seg_free variant keyed by position — the relocated charge keeps
+    /// its key, so the predecessor slot is whichever match is NOT `at`.
+    fn seg_free_except(&mut self, key: usize, span: u64, at: usize) {
+        if let Some((i, _)) = self
+            .mem_seg_order
+            .iter()
+            .enumerate()
+            .find(|(i, s)| *i != at && s.key == key && s.hole == 0)
+        {
+            self.mem_seg_order[i] = SegSlot {
+                key: usize::MAX,
+                hole: span,
+            };
+        }
+    }
+
+    /// Free space directly above a live segment — the contiguous run
+    /// of still-free slots ending right on top of it. This is the
+    /// mremap headroom zend can extend into; it is shared with fresh
+    /// placement (seg_place steals from the same runs), so it is
+    /// recomputed rather than merged: a span a temp reoccupied in the
+    /// meantime never counts.
+    fn seg_above(&self, key: usize) -> u64 {
+        let Some(q) = self
+            .mem_seg_order
+            .iter()
+            .position(|s| s.key == key && s.hole == 0)
+        else {
+            return 0;
+        };
+        let mut span = 0u64;
+        for i in (0..q).rev() {
+            let s = self.slot_span(self.mem_seg_order[i]);
+            if s == 0 {
+                break;
+            }
+            span = span.saturating_add(s);
+        }
+        span
+    }
+
+    /// Consume `need` bytes of the free space directly above a segment
+    /// — the mremap extension eats its own tail first (inside seg_cap)
+    /// then the contiguous run from the nearest slot up.
+    fn seg_consume_above(&mut self, key: usize, need: u64) {
+        let Some(q) = self
             .mem_seg_order
             .iter()
             .position(|s| s.key == key && s.hole == 0)
         else {
             return;
         };
-        let mut gain = 0u64;
-        while q > 0 {
-            let span = self.slot_span(self.mem_seg_order[q - 1]);
+        let mut left = need;
+        for i in (0..q).rev() {
+            if left == 0 {
+                break;
+            }
+            let span = self.slot_span(self.mem_seg_order[i]);
             if span == 0 {
                 break;
             }
-            gain = gain.saturating_add(span);
-            self.mem_seg_order.remove(q - 1);
-            q -= 1;
-        }
-        if gain > 0 {
-            if let Some(c) = self.mem_tracked.get_mut(&key) {
-                c.seg_cap = c.seg_cap.saturating_add(gain);
+            if span <= left {
+                left -= span;
+                self.mem_seg_order.remove(i);
+            } else {
+                self.mem_seg_order[i].hole = span - left;
+                break;
             }
         }
     }
@@ -4349,11 +4437,11 @@ impl<'a> Interp<'a> {
                     }
                     return;
                 }
-                // Read the cap lazily: still-free holes directly
-                // above merge only now — a span a transient temp
-                // reoccupied in the meantime never credited it.
-                self.seg_drain(key);
-                let cap = self.mem_tracked.get(&key).map(|c| c.seg_cap).unwrap_or(0);
+                // The extendable bound is the seg's own extent plus
+                // the free space still directly above it — recomputed
+                // so a span a temp reoccupied meanwhile never counts.
+                let cap = self.mem_tracked.get(&key).map(|c| c.seg_cap).unwrap_or(0)
+                    + self.seg_above(key);
                 let reloc = fp > cap;
                 let limit = self.ini_bytes("memory_limit");
                 let over = |s: &Self| -> bool {
@@ -4380,14 +4468,37 @@ impl<'a> Interp<'a> {
                 }
                 self.mem_huge += fp - ofp;
                 self.mem_used += fp - ofp;
+                // Relocated: the new segment lands at the bottom of
+                // the address space while the old one is still held;
+                // the old span frees in place for the segment below
+                // to drain at its grow — same as mem_grow_str.
+                let ncap = if reloc && !failed {
+                    // The old slot's charge is still live — it can't
+                    // be a steal target; the new segment lands
+                    // elsewhere and the old span frees in place.
+                    let (at, n) = self.seg_place_at(key, fp);
+                    let old = self.mem_tracked.get(&key).map(|c| c.seg_cap).unwrap_or(0);
+                    if old > 0 {
+                        self.seg_free_except(key, old, at);
+                    }
+                    Some(n)
+                } else {
+                    None
+                };
+                if !reloc && !failed {
+                    // In-place: the extent eats `fp - ofp` of the free
+                    // space above — its own tail first, then the run.
+                    let tail = cap.saturating_sub(ofp).saturating_sub(self.seg_above(key));
+                    let on_chain = (fp - ofp).saturating_sub(tail);
+                    if on_chain > 0 {
+                        self.seg_consume_above(key, on_chain);
+                    }
+                }
                 if let Some(c) = self.mem_tracked.get_mut(&key) {
                     c.huge = fp;
                     c.table_req = req;
-                    if reloc && !failed {
-                        // Relocated — the freed old segment's whole
-                        // span (footprint + leftover runway) becomes
-                        // the new placement's hole above it.
-                        c.seg_cap = Self::seg_stretch(fp, cap);
+                    if !failed {
+                        c.seg_cap = fp.max(ncap.unwrap_or(c.seg_cap));
                     }
                 }
                 if self.mem_used > self.mem_peak {
@@ -4760,7 +4871,7 @@ impl<'a> Interp<'a> {
         // unconditionally so freed runs feed the extend test.
         self.mem_sweep();
         let fp = Self::mem_fp(req);
-        let (old_inner, _, old_chunk) = self
+        let (old_inner, old_huge, old_chunk) = self
             .mem_tracked
             .get(&(Rc::as_ptr(old) as *const u8 as usize))
             .map(|c| (c.inner, c.huge, c.chunk))
@@ -4779,27 +4890,20 @@ impl<'a> Interp<'a> {
         // check). Otherwise the old segment unmaps and only the
         // growth delta is checked. Untracked/dead olds relocate.
         let old_key = Rc::as_ptr(old) as *const u8 as usize;
-        // Drain still-free holes above the grown segment into its
-        // runway first — a span a later alloc reoccupied meanwhile
-        // never credited it.
-        self.seg_drain(old_key);
+        // The extendable bound is the seg's own extent plus the free
+        // space still directly above it — recomputed, so a span a
+        // temp reoccupied meanwhile never counts.
         let old_seg = self
             .mem_tracked
             .get(&old_key)
             .filter(|c| (c.probe)())
             .map(|c| c.seg_cap);
-        let reloc = old_seg.is_none_or(|cap| fp > cap);
-        let mut new_seg_cap = if req > MM_MAX_LARGE {
-            // Relocation lands the grown segment at the stack
-            // bottom — erealloc's alloc-before-free keeps the old
-            // span mapped through placement, so it can't host — and
-            // its runway there is just its own stretch. The freed
-            // span stays a hole in the old slot, inherited lazily
-            // by whatever segment grows directly below it.
-            Self::seg_stretch(fp, 0)
-        } else {
-            0
-        };
+        // ponytail: slot spans approximate the freed region each seg
+        // leaves (extent + its own tail); slack between slots (head
+        // frags, neighbor tails) isn't tracked, so the boundary can
+        // drift ±1 grow step past ~4 extents of runway.
+        let reloc = old_seg.is_none_or(|cap| fp > cap + self.seg_above(old_key));
+        let mut new_seg_cap = 0u64;
         if req > MM_MAX_LARGE {
             if reloc {
                 // alloc+copy+free: size the new segment with old held.
@@ -4875,20 +4979,34 @@ impl<'a> Interp<'a> {
         }
         if req > MM_MAX_LARGE {
             if reloc {
-                // The grown segment mapped below every live
-                // segment — it takes the bottom slot. The old span
-                // frees in place as a hole for the segment
-                // directly below it to drain at its grow.
+                // The grown segment lands at the bottom of the
+                // address space while the old one is still held —
+                // its slot can't host placement (the retired charge
+                // is untracked, so the slot still reads occupied) —
+                // then the old span frees in place as a hole for the
+                // segment below it to drain at its grow.
+                self.seg_place_at(key, fp);
                 self.seg_free(old_key, old_seg.unwrap_or(0));
-                self.mem_seg_order.push(SegSlot { key, hole: 0 });
+                new_seg_cap = Self::seg_stretch(fp, 0);
             } else if let Some(p) = self
                 .mem_seg_order
                 .iter()
                 .position(|s| s.key == old_key && s.hole == 0)
             {
                 // In-place extension stands where its predecessor
-                // stood in the placement order.
+                // stood in the placement order; it eats the delta
+                // of free space above — its own tail first, then
+                // the contiguous run from the nearest slot up.
                 self.mem_seg_order[p].key = key;
+                let cap = old_seg.unwrap_or(0);
+                let tail = cap.saturating_sub(old_huge);
+                let delta = fp.saturating_sub(old_huge);
+                let on_tail = tail.min(delta);
+                let on_chain = delta - on_tail;
+                new_seg_cap = fp + (tail - on_tail);
+                if on_chain > 0 {
+                    self.seg_consume_above(key, on_chain);
+                }
             } else {
                 self.mem_seg_order.push(SegSlot { key, hole: 0 });
             }
