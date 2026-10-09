@@ -303,6 +303,8 @@ struct MemCharge {
 /// merge at the heir's own grow.
 #[derive(Clone, Copy)]
 struct SegSlot {
+    /// The owning charge's tracked key — `usize::MAX` marks a hole
+    /// slot (no live owner).
     key: usize,
     hole: u64,
 }
