@@ -3,12 +3,62 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::rc::Rc;
 
+/// rustc-hash-style multiply-rotate hasher — SipHash's 5x+ speed on the
+/// short keys that dominate our tables (var names, function names,
+/// array keys). Deterministic across runs: all table iteration already
+/// goes through `entries`, not map order.
+#[derive(Default)]
+pub struct FxHasher {
+    hash: u64,
+}
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+const FX_K: u64 = 0x517cc1b727220a95;
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.hash = (self.hash.rotate_left(5) ^ b as u64).wrapping_mul(FX_K);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.hash = (self.hash.rotate_left(5) ^ i as u64).wrapping_mul(FX_K);
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.hash = (self.hash.rotate_left(5) ^ i as u64).wrapping_mul(FX_K);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(FX_K);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.hash = (self.hash.rotate_left(5) ^ i as u64).wrapping_mul(FX_K);
+    }
+    #[inline]
+    fn write_i64(&mut self, i: i64) {
+        self.hash = (self.hash.rotate_left(5) ^ i as u64).wrapping_mul(FX_K);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash ^ FX_SEED
+    }
+}
+
+pub type FxBuild = std::hash::BuildHasherDefault<FxHasher>;
+/// HashMap on FxHasher — drop-in for the hot lookup tables.
+pub type FxMap<K, V> = std::collections::HashMap<K, V, FxBuild>;
+pub type FxSet<K> = std::collections::HashSet<K, FxBuild>;
+
 /// PHP arrays are insertion-ordered maps. Keys normalize per PHP rules:
 /// `"8"` → 8, `"08"` stays string, `8.5` → 8, `true` → 1, `null` → "".
 ///
 /// Stored as a Vec of entries (PHP tests exercise small arrays); existing
 /// keys update in place so iteration order is insertion order.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ArrKey {
     Int(i64),
     Str(Rc<str>),
@@ -19,6 +69,9 @@ pub enum ArrKey {
 }
 
 pub type Cell = Rc<RefCell<Value>>;
+
+/// Below this bucket count a linear scan beats hashing the key.
+const IDX_MIN: usize = 48;
 
 #[derive(Debug)]
 pub struct PhpArray {
@@ -56,6 +109,15 @@ pub struct PhpArray {
     /// bin-rounded zend_string in the arena). Subtracted on unset and
     /// wholesale at Drop/mem_clear.
     pub(crate) key_bytes: i64,
+    /// Lazily-built key → `entries` position index — zend's
+    /// arHash/ht_hash analog. Never authoritative: every hit is
+    /// verified (`entries[idx].0 == k`) and a miss heals by scanning
+    /// once, because ~200 call sites mutate `entries` directly
+    /// (sorts, splices, unshift) with no index maintenance.
+    /// Populated only past IDX_MIN so small arrays stay scan-cheap.
+    /// pub(crate) so literal constructions can init it (never read
+    /// directly — all key lookups go through `pos_of`).
+    pub(crate) idx: RefCell<FxMap<ArrKey, usize>>,
 }
 
 impl Default for PhpArray {
@@ -76,6 +138,7 @@ impl PhpArray {
             mem_elems: 0,
             packed: true,
             key_bytes: 0,
+            idx: RefCell::new(FxMap::default()),
         }
     }
 
@@ -205,19 +268,42 @@ impl PhpArray {
         }
     }
 
+    /// Position of `k` in `entries`: O(1) for dense int keys (slot `i`
+    /// holds `Int(i)` in a sequential-append table), hash-indexed past
+    /// `IDX_MIN`, linear scan below it or when the hint is stale.
+    fn pos_of(&self, k: &ArrKey) -> Option<usize> {
+        if let ArrKey::Int(i) = k {
+            if *i >= 0 && (*i as usize) < self.entries.len() {
+                let p = *i as usize;
+                if self.entries[p].0 == *k {
+                    return Some(p);
+                }
+            }
+        }
+        if self.entries.len() <= IDX_MIN {
+            return self.entries.iter().position(|(ek, _)| ek == k);
+        }
+        let mut idx = self.idx.borrow_mut();
+        if let Some(&p) = idx.get(k) {
+            if p < self.entries.len() && self.entries[p].0 == *k {
+                return Some(p);
+            }
+            idx.remove(k);
+        }
+        let found = self.entries.iter().position(|(ek, _)| ek == k);
+        if let Some(p) = found {
+            idx.insert(k.clone(), p);
+        }
+        found
+    }
+
     pub fn get(&self, k: &ArrKey) -> Option<Value> {
-        self.entries
-            .iter()
-            .find(|(ek, _)| ek == k)
-            .map(|(_, v)| v.borrow().clone())
+        self.pos_of(k).map(|p| self.entries[p].1.borrow().clone())
     }
 
     /// The cell holding an element (for by-ref binding).
     pub fn get_cell(&self, k: &ArrKey) -> Option<Cell> {
-        self.entries
-            .iter()
-            .find(|(ek, _)| ek == k)
-            .map(|(_, v)| v.clone())
+        self.pos_of(k).map(|p| self.entries[p].1.clone())
     }
 
     pub fn push(&mut self, v: Value) {
@@ -244,7 +330,8 @@ impl PhpArray {
     /// Insert or update. An existing key's cell is replaced with the new
     /// value (so aliases bound to the cell see it); a missing key appends.
     pub fn set_cell(&mut self, k: ArrKey, c: Cell) {
-        if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
+        if let Some(p) = self.pos_of(&k) {
+            let slot = &mut self.entries[p];
             // Same cell on both sides (a $GLOBALS sync can alias the slot to
             // its own global) — writing it would borrow_mut+borrow itself.
             if Rc::ptr_eq(&slot.1, &c) {
@@ -284,8 +371,8 @@ impl PhpArray {
                 self.next = i + 1;
             }
         }
-        if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| *ek == k) {
-            Some(std::mem::replace(&mut slot.1, c))
+        if let Some(p) = self.pos_of(&k) {
+            Some(std::mem::replace(&mut self.entries[p].1, c))
         } else {
             self.mem_note_key(&k);
             self.entries.push((k, c));
@@ -301,7 +388,8 @@ impl PhpArray {
     /// the eager-destruct refcount. Returns the evicted payload when
     /// the table owned the cell outright.
     pub fn unset(&mut self, k: &ArrKey) -> Option<Value> {
-        if let Some(slot) = self.entries.iter_mut().find(|(ek, _)| ek == k) {
+        if let Some(p) = self.pos_of(k) {
+            let slot = &mut self.entries[p];
             // Unset frees the key's zend_string (zend releases the
             // bucket's key ref even though the bucket stays tombstoned).
             if let ArrKey::Str(s) = &slot.0 {
@@ -488,6 +576,7 @@ impl Clone for PhpArray {
             foreach_pos: Vec::new(),
             packed: self.packed,
             key_bytes: 0,
+            idx: RefCell::new(FxMap::default()),
         };
         a.mem_note_seed();
         a

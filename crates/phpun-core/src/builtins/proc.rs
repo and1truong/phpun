@@ -1168,6 +1168,7 @@ fn php_exec(it: &mut Interp, fname: &str, args: &[Cell], ty: u8) -> Result<Value
                                 packed: a.borrow().packed,
                                 mem_elems: 0,
                                 key_bytes: 0,
+                                idx: Default::default(),
                             };
                             crate::value::gc_root_note(1);
                             na.mem_note_seed();

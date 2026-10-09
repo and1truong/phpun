@@ -169,7 +169,7 @@ impl std::ops::Deref for CallArgs {
 }
 
 pub struct Frame {
-    vars: HashMap<String, Cell>,
+    vars: crate::value::FxMap<String, Cell>,
     /// Actual call args for func_get_args().
     args: Vec<Cell>,
     /// Enclosing function name (for `static`/`__FUNCTION__`).
@@ -233,7 +233,7 @@ pub struct Frame {
 impl Frame {
     fn new(fn_name: String) -> Self {
         Self {
-            vars: HashMap::new(),
+            vars: crate::value::FxMap::default(),
             args: Vec::new(),
             fn_name,
             this_obj: None,
@@ -364,8 +364,8 @@ pub struct Interp<'a> {
     pub file: &'a str,
     globals: Frame,
     stack: Vec<Frame>,
-    pub functions: HashMap<String, Rc<FunctionDecl>>,
-    classes: HashMap<String, Rc<PhpClass>>,
+    pub functions: crate::value::FxMap<String, Rc<FunctionDecl>>,
+    classes: crate::value::FxMap<String, Rc<PhpClass>>,
     /// Traits by name — their methods are copied into using classes.
     pub traits: HashMap<String, Rc<ClassDecl>>,
     /// Synthesized classes for direct `T::$s`/`T::m()` trait member
@@ -442,7 +442,7 @@ pub struct Interp<'a> {
     /// ITS top-level code, not the calling frame's (php-parser's
     /// conditional-decl inside a function-context require).
     pub(crate) include_ns: Vec<(usize, String)>,
-    constants: HashMap<String, Value>,
+    constants: crate::value::FxMap<String, Value>,
     /// Accumulated program output (display_errors prints to stdout under
     /// CLI, and the PHPT harness merges streams via 2>&1).
     pub out: Vec<u8>,
@@ -590,7 +590,7 @@ pub struct Interp<'a> {
     /// Var names the $GLOBALS table currently manages — a name whose
     /// array entry was tombstoned (unset($GLOBALS['x'])) unsets the
     /// global var on next lookup.
-    globals_synced: std::collections::HashSet<String>,
+    globals_synced: crate::value::FxSet<String>,
     /// Set while a dim-read runs in a by-ref context (`$x =& $o['k']`):
     /// zend's read_dimension(BP_VAR_RW) silently creates missing
     /// buckets instead of warning.
@@ -608,7 +608,7 @@ pub struct Interp<'a> {
     /// unit gets a fresh table, and top-level code uses the executing
     /// unit under the global scope key (Zend: static vars live in the
     /// op_array that declared them).
-    pub(crate) statics: HashMap<String, HashMap<String, Cell>>,
+    pub(crate) statics: crate::value::FxMap<String, crate::value::FxMap<String, Cell>>,
     /// static-decl sites per function scope (fn key → var → decl
     /// (unit serial, stmt ptr)) — PHP fatals on a same-unit
     /// redeclaration at a different statement site. The unit serial is
@@ -678,17 +678,17 @@ pub struct Interp<'a> {
     /// Per-dim-op cache of each operand cell's offset conversion —
     /// `(cell, ArrKey)` keeps the Rc alive so a dropped cell's address
     /// can't be reused and mis-key a later conversion (ABA).
-    dim_key_conv: std::collections::HashMap<usize, (Cell, ArrKey)>,
+    dim_key_conv: crate::value::FxMap<usize, (Cell, ArrKey)>,
     /// Per-dim-op CV-key bindings — zend reads each CV operand once
     /// per op, so `$a[$u] += v` warns 'Undefined variable' once even
     /// though the bound cell feeds both the read and the write
     /// (`??=` is two ops: its assign pass re-reads the CV).
-    dim_cv_bound: HashMap<String, Cell>,
+    dim_cv_bound: crate::value::FxMap<String, Cell>,
     /// Dim operand cells bound to a fresh Null by an UNDEFINED var —
     /// zend keeps them IS_UNDEF so a later fetch's CV re-read warns
     /// again (`??=`'s ASSIGN_DIM is a second fetch). Reset with the
     /// other dim-op caches.
-    dim_undef_cells: std::collections::HashSet<usize>,
+    dim_undef_cells: crate::value::FxSet<usize>,
     /// Current line estimate for error messages (best-effort).
     pub cur_line: usize,
     /// Site a pending `=`'s folded `${expr}` value reads at — zend's
@@ -934,7 +934,7 @@ pub struct Interp<'a> {
     cur_file: String,
     /// Files that ran `declare(strict_types=1)` — scalar arg/prop/return
     /// coercion is off for code executing inside them.
-    strict_files: std::collections::HashSet<String>,
+    strict_files: crate::value::FxSet<String>,
     /// Cells backing declared-typed props, keyed by their Rc pointer —
     /// writes *through a reference* to a typed slot stay checked
     /// (typed_properties_045). The stored clone keeps the slot alive so
@@ -1019,6 +1019,10 @@ pub struct Interp<'a> {
     pub mem_used: u64,
     /// 'tried to allocate N' figure of the charge that overflowed.
     mem_last: u64,
+    /// Cached ini_bytes("memory_limit"): reparsed only when the raw
+    /// ini string changes, since ini_set writes land in self.ini and
+    /// this read runs on every tracked alloc.
+    mem_limit_ck: (i64, Option<String>),
     /// Set by gen_start so invoke_fn_run marks the gen-body frame —
     /// its TraceFrame sites `[internal function]` (Zend's resume
     /// isn't a userland call).
@@ -1082,7 +1086,7 @@ pub struct Interp<'a> {
     /// a tracked alloc dies its footprint releases back into the
     /// heap, so reclaimable churn never trips the limit while
     /// genuinely-growing structures do.
-    mem_tracked: HashMap<usize, MemCharge>,
+    mem_tracked: crate::value::FxMap<usize, MemCharge>,
     /// High-water mark of mem_used — memory_get_peak_usage().
     pub(crate) mem_peak: u64,
     /// zend's ONE request-scoped vm_stack arena: 256KB-page segments
@@ -1357,7 +1361,7 @@ struct GcScan {
 
 impl<'a> Interp<'a> {
     pub fn new(file: &'a str) -> Self {
-        let mut constants = HashMap::new();
+        let mut constants = crate::value::FxMap::default();
         constants.insert("PHP_EOL".into(), Value::str("\n"));
         constants.insert("PHP_VERSION".into(), Value::str("8.5.11-phpun"));
         constants.insert("PHP_MAJOR_VERSION".into(), Value::Int(8));
@@ -1665,15 +1669,15 @@ impl<'a> Interp<'a> {
             pending_call_alias: None,
             globals_order: Vec::new(),
             globals_arr: None,
-            globals_synced: std::collections::HashSet::new(),
+            globals_synced: crate::value::FxSet::default(),
             dim_by_ref: false,
             foreach_by_ref: false,
             anon_class_names: HashMap::new(),
             anon_class_seq: 0,
             callable_probe_err: None,
             stack: Vec::new(),
-            functions: HashMap::new(),
-            classes: HashMap::new(),
+            functions: crate::value::FxMap::default(),
+            classes: crate::value::FxMap::default(),
             traits: HashMap::new(),
             trait_statics: HashMap::new(),
             linking: Vec::new(),
@@ -1749,7 +1753,7 @@ impl<'a> Interp<'a> {
             emit_seen: false,
             silence: 0,
             isset_quiet: 0,
-            statics: HashMap::new(),
+            statics: crate::value::FxMap::default(),
             static_decls: StaticDeclSites::new(),
             cur_unit_id: 0,
             next_unit_id: 1,
@@ -1773,9 +1777,9 @@ impl<'a> Interp<'a> {
             detached_dim: false,
             dim_throw: None,
             unset_ctx: false,
-            dim_key_conv: std::collections::HashMap::new(),
-            dim_undef_cells: std::collections::HashSet::new(),
-            dim_cv_bound: HashMap::new(),
+            dim_key_conv: crate::value::FxMap::default(),
+            dim_undef_cells: crate::value::FxSet::default(),
+            dim_cv_bound: crate::value::FxMap::default(),
             cur_line: 1,
             vv_rhs_site: None,
             scan_stamp: None,
@@ -1837,7 +1841,7 @@ impl<'a> Interp<'a> {
             dump_stack: std::collections::HashSet::new(),
             internal_cb: 0,
             cur_file: file.to_string(),
-            strict_files: std::collections::HashSet::new(),
+            strict_files: crate::value::FxSet::default(),
             typed_slots: std::collections::HashMap::new(),
             slot_owners: std::collections::HashMap::new(),
             slot_merged: std::collections::HashMap::new(),
@@ -1857,6 +1861,7 @@ impl<'a> Interp<'a> {
             assert_src: String::new(),
             mem_used: MM_BASE_USED,
             mem_last: 0,
+            mem_limit_ck: (0, None),
             mem_exceeded: false,
             oom_at: None,
             // zend_mm_init commits the first 2MB chunk eagerly.
@@ -1877,7 +1882,7 @@ impl<'a> Interp<'a> {
                 used: 32 + VM_FRAME_SLOTS * 16,
                 tok: Rc::new(VmSite),
             }],
-            mem_tracked: HashMap::new(),
+            mem_tracked: crate::value::FxMap::default(),
             mem_peak: MM_BASE_USED,
             mem_sweep_at: 4096,
             deadline: None,
@@ -3794,7 +3799,12 @@ impl<'a> Interp<'a> {
     /// reusable runs, so fragmented heaps can trip a bit earlier.
     /// PR #88 owns the canonical page-level model.
     pub(crate) fn mem_check(&mut self, req: u64) -> Option<u64> {
-        let limit = self.ini_bytes("memory_limit");
+        let raw = self.ini.get("memory_limit").map(String::as_str);
+        if raw != self.mem_limit_ck.1.as_deref() {
+            let v = self.ini_bytes("memory_limit");
+            self.mem_limit_ck = (v, raw.map(str::to_string));
+        }
+        let limit = self.mem_limit_ck.0;
         if limit <= 0 {
             return None;
         }
