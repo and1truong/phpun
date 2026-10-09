@@ -2442,9 +2442,9 @@ impl<'a> Interp<'a> {
         res
     }
     /// Params binding + body run for a pushed frame context (closures).
-    fn bind_and_run(
+    pub(in crate::interp) fn bind_and_run(
         &mut self,
-        decl: &FunctionDecl,
+        decl: &Rc<FunctionDecl>,
         mut args: CallArgs,
         unused: Vec<Cell>,
     ) -> Result<Value, PhpError> {
@@ -3207,7 +3207,7 @@ impl<'a> Interp<'a> {
     /// `static` members resolve to the called class for checks and
     /// messages; unbound (unscoped closure) stays literal `static`
     /// (static_type_return).
-    fn resolve_static(&self, ty: &[String]) -> Vec<String> {
+    pub(in crate::interp) fn resolve_static(&self, ty: &[String]) -> Vec<String> {
         if !ty.iter().any(|m| m.eq_ignore_ascii_case("static")) {
             return ty.to_vec();
         }
@@ -3320,7 +3320,7 @@ impl<'a> Interp<'a> {
     /// Weak-mode scalar coercion for typed params/returns: returns the
     /// coerced value, or None when no scalar member applies (objects
     /// pass through unchanged).
-    fn coerce_scalar(&mut self, ty: &[String], v: &Value) -> Option<Value> {
+    pub(in crate::interp) fn coerce_scalar(&mut self, ty: &[String], v: &Value) -> Option<Value> {
         // A null value is never coerced to a scalar — `?T` params keep
         // null (scalar_null). The caller's `ok` check gates the member.
         if matches!(v, Value::Null) {
@@ -3426,7 +3426,7 @@ impl<'a> Interp<'a> {
     /// int(1) (union_types/type_checking_weak, legal_default_values).
     /// Unlike `ty_exact` (strict boundary), an int is NOT exact for
     /// `float` — it still widens through coercion.
-    fn ty_weak_exact(&mut self, ty: &[String], v: &Value) -> bool {
+    pub(in crate::interp) fn ty_weak_exact(&mut self, ty: &[String], v: &Value) -> bool {
         ty.iter().any(|m| {
             let l = m.to_lowercase();
             match l.as_str() {
@@ -4134,7 +4134,7 @@ impl<'a> Interp<'a> {
 
     /// ZPP-style type display: `iterable` expands to `Traversable|array`
     /// in param/return TypeErrors and default-value fatals (iterable_*).
-    fn zpp_ty_disp(ty: &[String]) -> Vec<String> {
+    pub(in crate::interp) fn zpp_ty_disp(ty: &[String]) -> Vec<String> {
         ty.iter()
             .flat_map(|m| {
                 if m.eq_ignore_ascii_case("iterable") {
@@ -4159,7 +4159,7 @@ impl<'a> Interp<'a> {
 
     /// Display name for a decl in diagnostics — closures are named
     /// `{closure:FILE:LINE}` like Zend (named_params/call_user_func).
-    fn decl_fname(&self, decl: &FunctionDecl) -> String {
+    pub(in crate::interp) fn decl_fname(&self, decl: &FunctionDecl) -> String {
         let base = if decl.name.is_empty() {
             format!("{{closure:{}:{}}}", decl.file, decl.line)
         } else {
@@ -4197,7 +4197,7 @@ impl<'a> Interp<'a> {
 
     fn bind_and_run_inner(
         &mut self,
-        decl: &FunctionDecl,
+        decl: &Rc<FunctionDecl>,
         mut args: CallArgs,
         _unused: Vec<Cell>,
     ) -> Result<Value, PhpError> {
@@ -4769,7 +4769,16 @@ impl<'a> Interp<'a> {
         // The body is its own compile unit — loop/switch depth for
         // `break N` operand checks restarts here, not at the caller's.
         let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
-        let flow = self.exec_block(&decl.body);
+        // Bound + type-checked already: if the body compiled, run it
+        // on the slot frame — slots alias the bound var cells by name
+        // and Flow::Return still flows through the ret-type checks.
+        let flow = match self.vm_compiled(decl) {
+            Some(c) => match self.vm_bound_exec(&c) {
+                Ok(f) => f,
+                Err(e) => self.err_flow(e),
+            },
+            None => self.exec_block(&decl.body),
+        };
         self.loop_depth = saved_depth;
         let ret_fname = self.decl_fname(decl);
         // `static` resolves against THIS frame's called class — after
@@ -5128,13 +5137,16 @@ impl<'a> Interp<'a> {
                 top.vars.insert(n, c2);
             }
         }
-        let comp = if args.named.is_empty() {
-            self.vm_compiled(decl)
-        } else {
-            None
-        };
-        if let Some(c) = comp {
-            return self.vm_run(decl, &c, args);
+        // Only bind-free bodies take the slot-frame shortcut; typed/
+        // variadic/declared-return decls still compile but must flow
+        // through bind_and_run for the zend check machinery (it runs
+        // the body compiled itself once bound).
+        if args.named.is_empty() {
+            if let Some(c) = self.vm_compiled(decl) {
+                if !c.needs_bind {
+                    return self.vm_run(decl, &c, args);
+                }
+            }
         }
         self.bind_and_run(decl, args, Vec::new())
     }

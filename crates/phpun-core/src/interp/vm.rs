@@ -18,12 +18,12 @@ use std::rc::Rc;
 
 use super::calls::builtin_byref;
 use super::util::cell;
-use crate::ast::{Expr, FunctionDecl, Stmt};
+use crate::ast::{Expr, FunctionDecl, Param, Stmt};
 use crate::builtins;
 use crate::error::PhpError;
-use crate::value::{compare, identical, Cell, FxMap, Value};
+use crate::value::{compare, identical, Cell, FxMap, PhpArray, Value};
 
-use super::Interp;
+use super::{Flow, Interp};
 
 /// A local slot: plain Value for body-assigned locals; params share
 /// the call's arg Cell so `$a = v` writes through to what
@@ -39,10 +39,25 @@ pub(crate) struct Compiled {
     ops: Vec<Op>,
     /// Slot count — params occupy the first `decl.params.len()` slots.
     nslots: usize,
+    /// Param name → slot index — the bound (typed/variadic/named-arg)
+    /// path maps the frame's bound var cells onto slots by name.
+    names: FxMap<String, u16>,
     /// Const-folded param defaults for args the caller omitted
-    /// (`None` entry = the param is required — unreachable past the
-    /// arity check `invoke_fn` already ran).
+    /// (`None` entry = required param). Populated only when
+    /// `bind_free` — the bound path evals defaults itself.
     defaults: Vec<Option<Value>>,
+    /// Params+return are check-free: the fast path skips the zend
+    /// param/return checks entirely. False when any param carries a
+    /// type, &/variadic/promotion, or a non-literal default, or the
+    /// decl declares a return type — vm_run then runs a miniature of
+    /// bind's check prelude, delegating failures to invoke_fn.
+    pub(in crate::interp) bind_free: bool,
+    /// What the slot path genuinely can't bind: by-ref params (must
+    /// alias the caller's cell — argv carries owned Values) and
+    /// ctor-promoted params (`$this` writes). Those decls still
+    /// compile — they flow through bind_and_run, which runs the body
+    /// via vm_bound_exec.
+    pub(in crate::interp) needs_bind: bool,
 }
 
 enum Op {
@@ -112,6 +127,14 @@ impl Clone for CachedFn {
     }
 }
 
+/// Saved Interp state around a vm_run — bundled so the rebind
+/// rollback stays one argument.
+struct VmSaved {
+    line: usize,
+    prop_ov: Option<Value>,
+    dim_by_ref: bool,
+}
+
 struct Compiler {
     ops: Vec<Op>,
     slots: FxMap<String, u16>,
@@ -125,24 +148,31 @@ struct Compiler {
 
 impl Compiled {
     pub(crate) fn compile(decl: &FunctionDecl) -> Option<Rc<Compiled>> {
-        // Return-type checks, by-ref return, by-ref/variadic/promoted/
-        // typed params and non-literal defaults all keep the AST path —
-        // they need machinery the slot frame doesn't carry.
-        if decl.ret.is_some()
-            || decl.by_ref
-            || decl
-                .params
-                .iter()
-                .any(|p| p.by_ref || p.variadic || p.promoted || p.ty.is_some())
-        {
+        // A by-ref return needs cell plumbing on Flow::Return — AST
+        // keeps it. Everything else still compiles: typed/variadic/
+        // promoted params, declared returns and expr defaults get
+        // bound + checked by bind_and_run and only the body runs here.
+        if decl.by_ref {
             return None;
         }
-        let mut defaults: Vec<Option<Value>> = Vec::with_capacity(decl.params.len());
-        for p in &decl.params {
-            defaults.push(match &p.default {
-                Some(e) => Some(const_val(e)?),
-                None => None,
-            });
+        let needs_bind = decl.params.iter().any(|p| p.by_ref || p.promoted);
+        let mut bind_free = !needs_bind
+            && decl.ret.is_none()
+            && decl.params.iter().all(|p| p.ty.is_none() && !p.variadic);
+        let mut defaults: Vec<Option<Value>> = Vec::new();
+        if !needs_bind {
+            for p in &decl.params {
+                match &p.default {
+                    Some(e) => match const_val(e) {
+                        Some(v) => defaults.push(Some(v)),
+                        None => {
+                            bind_free = false;
+                            defaults.push(None);
+                        }
+                    },
+                    None => defaults.push(None),
+                }
+            }
         }
 
         let mut assigned: std::collections::HashSet<String> =
@@ -159,12 +189,16 @@ impl Compiled {
             c.slots.insert(p.name.clone(), i as u16);
         }
         c.stmts(&decl.body)?;
-        c.ops.push(Op::Const(Value::Null));
-        c.ops.push(Op::Return);
+        // No trailing Const+Return: pc exhausting the stream is
+        // Flow::Normal — the bound path's `Flow::Return` arm treats
+        // an explicit `return` differently from fall-off-the-end.
         Some(Rc::new(Compiled {
             nslots: c.slots.len(),
+            names: c.slots,
             ops: c.ops,
             defaults,
+            bind_free,
+            needs_bind,
         }))
     }
 }
@@ -618,16 +652,20 @@ impl<'a> Interp<'a> {
 
     /// The bind_and_run shell for a compiled body: identical
     /// save/trace/teardown order, with slots in place of vars-map
-    /// binds and no return-type tail (compile gates `decl.ret`).
+    /// binds. Non-bind_free decls run the zend param/return checks
+    /// inline (delegating failures to invoke_fn) — typed, variadic
+    /// and declared-return fns still execute on the slot frame.
     pub(in crate::interp) fn vm_run(
         &mut self,
-        decl: &FunctionDecl,
+        decl: &Rc<FunctionDecl>,
         comp: &Compiled,
         mut args: super::CallArgs,
     ) -> Result<Value, PhpError> {
-        let saved_line = self.cur_line;
-        let saved_prop_ov = self.last_prop_ov.take();
-        let saved_dim_by_ref = std::mem::replace(&mut self.dim_by_ref, false);
+        let saved = VmSaved {
+            line: self.cur_line,
+            prop_ov: self.last_prop_ov.take(),
+            dim_by_ref: std::mem::replace(&mut self.dim_by_ref, false),
+        };
         let fr = self.call_site_frame(decl, &args);
         self.call_trace.push(fr);
         self.last_call_by_ref = decl.by_ref;
@@ -636,23 +674,109 @@ impl<'a> Interp<'a> {
         // Positional extras beyond the params ride frame.args too.
         // fa is the frame's arg list — positional args already in
         // order, so the caller's cells vec moves wholesale (one clone
-        // per slot, zero per-arg vec copy); missing params append
-        // their folded default cells.
+        // per slot, zero per-arg vec copy). Missing params never join
+        // fa: func_num_args counts provided args only (zend's CV fill
+        // stops at the highest bound slot).
         let mut fa: Vec<Cell> = std::mem::take(&mut args.cells);
         let mut slots: Vec<Slot> = self
             .vm_slot_pool
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(comp.nslots));
-        for (i, _) in decl.params.iter().enumerate() {
-            let c = match fa.get(i) {
-                Some(c) => c.clone(),
-                None => {
-                    let c = cell(comp.defaults[i].clone().unwrap_or(Value::Null));
-                    fa.push(c.clone());
-                    c
+        if comp.bind_free {
+            for (i, _) in decl.params.iter().enumerate() {
+                let c = match fa.get(i) {
+                    Some(c) => c.clone(),
+                    None => cell(comp.defaults[i].clone().unwrap_or(Value::Null)),
+                };
+                slots.push(Slot::C(c));
+            }
+        } else {
+            // Typed/variadic prelude — zend's arg-check semantics from
+            // bind_and_run_inner in miniature. Any failure rolls this
+            // call's pushes back and delegates to invoke_fn so the
+            // canonical TypeError (arg trace, "and defined" display)
+            // exists in exactly one place.
+            for (i, p) in decl.params.iter().enumerate() {
+                if p.variadic {
+                    // Extras pack into a fresh arData the callee owns.
+                    let mut arr = PhpArray::new();
+                    for j in i..fa.len() {
+                        let v = fa[j].borrow().clone();
+                        if let Some(ty) = &p.ty {
+                            if let Some(e) = self.vm_param_gate(decl, p, ty, &v) {
+                                return self.vm_rebind(e, decl, args, &mut fa, saved);
+                            }
+                        }
+                        arr.push(v);
+                    }
+                    slots.push(Slot::C(cell(Value::Array(Rc::new(
+                        std::cell::RefCell::new(arr),
+                    )))));
+                    break;
                 }
-            };
-            slots.push(Slot::C(c));
+                let c = match fa.get(i) {
+                    Some(c) => c.clone(),
+                    None => {
+                        if p.default.is_some() {
+                            match &comp.defaults[i] {
+                                Some(dv) => {
+                                    // `float $f = 0` widens at bind —
+                                    // the int default coerces even
+                                    // under strict_types.
+                                    let mut dv = dv.clone();
+                                    if let Some(ty) = &p.ty {
+                                        if ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                                            && !ty.iter().any(|m| m.eq_ignore_ascii_case("int"))
+                                        {
+                                            if let Value::Int(n) = dv {
+                                                dv = Value::Float(n as f64);
+                                            }
+                                        }
+                                    }
+                                    cell(dv)
+                                }
+                                // Non-literal default — bind evals it.
+                                None => {
+                                    return self.vm_rebind(None, decl, args, &mut fa, saved);
+                                }
+                            }
+                        } else {
+                            cell(Value::Null) // arity-guarded unreachable
+                        }
+                    }
+                };
+                if let Some(ty) = &p.ty {
+                    // Probe errors belong to THIS param's check only.
+                    self.callable_probe_err = None;
+                    let v = c.borrow().clone();
+                    if let Some(e) = self.vm_param_gate(decl, p, ty, &v) {
+                        return self.vm_rebind(e, decl, args, &mut fa, saved);
+                    }
+                    let strict = self.caller_file_strict();
+                    if !strict && !self.ty_weak_exact(ty, &v) {
+                        if let Some(cv) = self.coerce_scalar(ty, &v) {
+                            // Arg-coercion deprecations attribute to
+                            // the callee's decl line (scalar_basic).
+                            let pl = self.cur_line;
+                            self.cur_line = decl.line;
+                            self.deprecate_lossy_int(ty, &v, &cv);
+                            self.cur_line = pl;
+                            *c.borrow_mut() = cv;
+                        }
+                    }
+                    // Strict mode still allows int->float widening
+                    // stored back for callee visibility.
+                    if strict
+                        && ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
+                        && !self.ty_weak_exact(ty, &v)
+                    {
+                        if let Value::Int(n) = v {
+                            *c.borrow_mut() = Value::Float(n as f64);
+                        }
+                    }
+                }
+                slots.push(Slot::C(c));
+            }
         }
         slots.resize_with(comp.nslots, || Slot::V(Value::Null));
         if let Some(f) = self.stack.last_mut() {
@@ -663,12 +787,20 @@ impl<'a> Interp<'a> {
         let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
         let r = self.vm_exec(comp, &mut slots, temps_base);
         self.loop_depth = saved_depth;
+        // The return-type tail runs while the callee's frame, class
+        // context and trace frame are still live — `static` resolves
+        // against the callee and the TypeError's backtrace must list
+        // it (zend checks between exec and the teardown).
+        let r = match r {
+            Ok(fl) => self.vm_ret_apply(decl, comp, fl),
+            Err(e) => Err(e),
+        };
         let popped = self.stack_pop();
         self.last_popped_frame = popped;
         self.last_call_by_ref = decl.by_ref;
         self.call_trace.pop();
-        self.cur_line = saved_line;
-        self.send_line = Some(saved_line);
+        self.cur_line = saved.line;
+        self.send_line = Some(saved.line);
         let sweep_err = self.sweep_expr_temps(temps_base).err();
         let out = if let Some(mut f) = self.last_popped_frame.take() {
             // Slot-held objects die with the frame too — a call-returned
@@ -718,8 +850,8 @@ impl<'a> Interp<'a> {
                 (r, _) => r,
             }
         };
-        self.last_prop_ov = saved_prop_ov;
-        self.dim_by_ref = saved_dim_by_ref;
+        self.last_prop_ov = saved.prop_ov;
+        self.dim_by_ref = saved.dim_by_ref;
         out
     }
 
@@ -728,7 +860,7 @@ impl<'a> Interp<'a> {
         comp: &Compiled,
         slots: &mut [Slot],
         tmark: usize,
-    ) -> Result<Value, PhpError> {
+    ) -> Result<Flow, PhpError> {
         // Value-stack/argv vecs come from a per-Interp pool — a call
         // costs no malloc here (cap bounds retention under deep
         // recursion; each live frame holds its own vec anyway).
@@ -750,9 +882,9 @@ impl<'a> Interp<'a> {
         slots: &mut [Slot],
         mut tmark: usize,
         vs: &mut Vec<Value>,
-    ) -> Result<Value, PhpError> {
+    ) -> Result<Flow, PhpError> {
         let mut pc = 0usize;
-        loop {
+        while pc < comp.ops.len() {
             match &comp.ops[pc] {
                 Op::Const(v) => vs.push(v.clone()),
                 Op::Load(s) => vs.push(match &slots[*s as usize] {
@@ -940,8 +1072,13 @@ impl<'a> Interp<'a> {
                     let s = self.conv_bytes(&v)?;
                     self.emit_bytes(&s);
                 }
-                Op::Line(l) => self.cur_line = *l,
-                Op::Return => return Ok(vs.pop().unwrap_or(Value::Null)),
+                Op::Line(l) => {
+                    self.cur_line = *l;
+                    // Statement boundary like exec's Stmt::Line — the
+                    // caller's pending send_line dies with the stmt.
+                    self.send_line = None;
+                }
+                Op::Return => return Ok(Flow::Return(vs.pop().unwrap_or(Value::Null))),
                 Op::Call {
                     lname,
                     raw,
@@ -954,9 +1091,14 @@ impl<'a> Interp<'a> {
                     let mut argv = self.vm_val_pool.pop().unwrap_or_default();
                     argv.extend(vs.drain(vs.len() - n..));
                     // Direct hits bypass invoke_fn — arg values become
-                    // the frame's cells inside vm_run_direct.
+                    // the frame's cells inside vm_run_direct. send_line
+                    // still pins this call site: call_site() reads it
+                    // for the callee's trace-frame line (review
+                    // finding: skipped it attributed callee traces to
+                    // the previous call's site).
                     let hit = cache.borrow().clone();
                     let v = if let Some(CachedFn::Direct(d, c)) = &hit {
+                        self.send_line = Some(*site);
                         self.vm_run_direct(d, c, &mut argv)?
                     } else {
                         self.vm_call(lname, raw, &mut argv, *site, *callee, cache)?
@@ -969,6 +1111,220 @@ impl<'a> Interp<'a> {
                 }
             }
             pc += 1;
+        }
+        Ok(Flow::Normal)
+    }
+
+    /// Body exec under bind_and_run's shell: binds already sit in the
+    /// frame's vars — slots alias those cells by name (by-ref params
+    /// write through them like a zend CV), non-param locals stay
+    /// Slot::V. Caller converts Err through err_flow, exactly like
+    /// exec_block's stmt-level failures.
+    pub(in crate::interp) fn vm_bound_exec(&mut self, comp: &Compiled) -> Result<Flow, PhpError> {
+        let mut slots = self
+            .vm_slot_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(comp.nslots));
+        slots.resize_with(comp.nslots, || Slot::V(Value::Null));
+        if let Some(f) = self.stack.last() {
+            for (name, idx) in &comp.names {
+                if let Some(c) = f.vars.get(name) {
+                    slots[*idx as usize] = Slot::C(c.clone());
+                }
+            }
+        }
+        let r = self.vm_exec(comp, &mut slots, self.expr_temps.len());
+        // Slot-V objects die with the frame like a CV decref (Slot::C
+        // cells are f.vars — bind's own frame teardown owns those).
+        let mut dying = Vec::new();
+        for sl in &mut slots {
+            if let Slot::V(v) = sl {
+                if matches!(v, Value::Object(_)) {
+                    dying.push(cell(std::mem::replace(v, Value::Null)));
+                }
+            }
+        }
+        let derr = self.destruct_cells(&dying).err();
+        slots.clear();
+        if self.vm_slot_pool.len() < 64 {
+            self.vm_slot_pool.push(slots);
+        }
+        match (r, derr) {
+            (Ok(_), Some(e)) => Err(e),
+            (r, _) => r,
+        }
+    }
+
+    /// zend param-type gate (ok-path only): implicit_null, strict
+    /// ty_exact, weak param_type_match. On a miss the canonical
+    /// TypeError lives in bind_and_run — this returns `Some(err)`
+    /// only when a `callable` probe raised (autoloader threw: zend
+    /// propagates THAT exception, not a TypeError); the caller then
+    /// fails with it instead of rebinding. `Some(None)` = rebind.
+    fn vm_param_gate(
+        &mut self,
+        _decl: &FunctionDecl,
+        p: &Param,
+        ty: &[String],
+        v: &Value,
+    ) -> Option<Option<PhpError>> {
+        let implicit_null = !ty.iter().any(|m| m.eq_ignore_ascii_case("null"))
+            && match &p.default {
+                Some(Expr::Null) => true,
+                Some(Expr::Const(c)) => c.eq_ignore_ascii_case("null"),
+                _ => false,
+            };
+        let ok = (implicit_null && matches!(v, Value::Null))
+            || if self.caller_file_strict() {
+                self.ty_exact(ty, v)
+            } else {
+                ty.iter().any(|m| self.param_type_match(m, v))
+            };
+        if ok {
+            return None;
+        }
+        if ty.iter().any(|m| m.eq_ignore_ascii_case("callable")) {
+            if let Some(e) = self.take_callable_probe_err() {
+                return Some(Some(e));
+            }
+        }
+        Some(None)
+    }
+
+    /// Cold-path rollback: undo this call's trace push and hand the
+    /// arg cells to bind_and_run so the canonical TypeError (arg
+    /// trace, "and defined" display) builds in exactly one place.
+    /// The callee frame STAYS pushed — bind_and_run_inner expects it
+    /// at stack top. Only reachable before any body op ran — side
+    /// effects can't double. `Some(e)` fails directly (a thrown
+    /// autoloader probe propagates, it doesn't rebind).
+    fn vm_rebind(
+        &mut self,
+        probe: Option<PhpError>,
+        decl: &Rc<FunctionDecl>,
+        mut args: super::CallArgs,
+        fa: &mut Vec<Cell>,
+        saved: VmSaved,
+    ) -> Result<Value, PhpError> {
+        self.call_trace.pop();
+        self.cur_line = saved.line;
+        self.send_line = Some(saved.line);
+        self.last_prop_ov = saved.prop_ov;
+        self.dim_by_ref = saved.dim_by_ref;
+        if let Some(e) = probe {
+            self.stack_pop();
+            return self.fail(e);
+        }
+        args.cells = std::mem::take(fa);
+        self.bind_and_run(decl, args, Vec::new())
+    }
+
+    /// Flow→value for a compiled body — bind_free maps directly; the
+    /// bound kinds run bind_and_run_inner's Flow::Return/Normal
+    /// return-type arms verbatim (weak coerce + deprecate, strict
+    /// ty_exact, `must be of type`/`none returned` TypeErrors).
+    /// ponytail: the `__tostring` implicit-contract arm isn't copied —
+    /// a free function can't carry the magic-method name into a
+    /// literal call site.
+    fn vm_ret_apply(
+        &mut self,
+        decl: &Rc<FunctionDecl>,
+        comp: &Compiled,
+        flow: Flow,
+    ) -> Result<Value, PhpError> {
+        if comp.bind_free {
+            return Ok(match flow {
+                Flow::Return(v) => v,
+                _ => Value::Null,
+            });
+        }
+        let ret_fname = self.decl_fname(decl);
+        let resolved_ret = decl.ret.as_ref().map(|ty| self.resolve_static(ty));
+        match flow {
+            Flow::Return(v) => {
+                if let Some(ty) = &resolved_ret {
+                    let ret_strict = self.strict_files.contains(&decl.file);
+                    let ok = ty
+                        .iter()
+                        .any(|m| self.param_type_match(m, &v) || m.eq_ignore_ascii_case("void"))
+                        && (!ret_strict || self.ty_exact(ty, &v));
+                    if ok {
+                        if !ret_strict && !self.ty_weak_exact(ty, &v) {
+                            match self.coerce_scalar(ty, &v) {
+                                Some(cv) => {
+                                    let pl = self.cur_line;
+                                    self.cur_line = decl.line;
+                                    self.deprecate_lossy_int(ty, &v, &cv);
+                                    self.cur_line = pl;
+                                    Ok(cv)
+                                }
+                                None => Ok(v),
+                            }
+                        } else {
+                            Ok(v)
+                        }
+                    } else {
+                        let mut disp: Vec<String> = Self::zpp_ty_disp(&self.resolve_static(ty));
+                        disp.retain(|m| !m.eq_ignore_ascii_case("null"));
+                        if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) {
+                            if disp.len() == 1 && !disp[0].contains('&') {
+                                disp[0] = format!("?{}", disp[0]);
+                            } else {
+                                disp.push("null".into());
+                            }
+                        }
+                        let given = self.zval_type_name(&v);
+                        let msg = format!(
+                            "{}(): Return value must be of type {}, {} returned",
+                            ret_fname,
+                            disp.join("|"),
+                            given
+                        );
+                        self.fail(PhpError::uncaught("TypeError", msg, self.cur_line))
+                    }
+                } else {
+                    Ok(v)
+                }
+            }
+            Flow::Normal => {
+                // Falling off a typed fn still checks: `none returned`
+                // TypeError for real types, `must not implicitly
+                // return` for `never` (typed_return*_without_value).
+                if let Some(ty) = &resolved_ret {
+                    let never = ty.iter().any(|m| m.eq_ignore_ascii_case("never"));
+                    let void = ty.iter().all(|m| m.eq_ignore_ascii_case("void"));
+                    if never {
+                        let msg = format!(
+                            "{}: never-returning function must not implicitly return",
+                            ret_fname
+                        );
+                        let mut e = PhpError::uncaught("TypeError", msg, self.cur_line);
+                        e.thrown_line = Some(decl.line);
+                        return self.fail(e);
+                    }
+                    if !void {
+                        let mut disp_v = Self::zpp_ty_disp(&self.resolve_static(ty));
+                        disp_v.retain(|m| !m.eq_ignore_ascii_case("null"));
+                        if ty.iter().any(|m| m.eq_ignore_ascii_case("null")) {
+                            if disp_v.len() == 1 && !disp_v[0].contains('&') {
+                                disp_v[0] = format!("?{}", disp_v[0]);
+                            } else {
+                                disp_v.push("null".into());
+                            }
+                        }
+                        let msg = format!(
+                            "{}(): Return value must be of type {}, none returned",
+                            ret_fname,
+                            disp_v.join("|")
+                        );
+                        let mut e = PhpError::uncaught("TypeError", msg, self.cur_line);
+                        e.thrown_line = Some(decl.end_line);
+                        return self.fail(e);
+                    }
+                }
+                Ok(Value::Null)
+            }
+            _ => Ok(Value::Null),
         }
     }
 
@@ -1148,8 +1504,8 @@ impl<'a> Interp<'a> {
             // ns-fallback decls and namespaced builtin hits re-resolve.
             let stable = if let Some(d) = direct {
                 match self.vm_compiled(&d) {
-                    Some(c) => Some(CachedFn::Direct(d, c)),
-                    None => Some(CachedFn::Decl(d)),
+                    Some(c) if !c.needs_bind => Some(CachedFn::Direct(d, c)),
+                    _ => Some(CachedFn::Decl(d)),
                 }
             } else if decl.is_none() && self.caller_ns().is_empty() {
                 Some(CachedFn::Builtin)
