@@ -1944,6 +1944,27 @@ impl<'a> Interp<'a> {
                     let a = a.borrow();
                     (a.get(&ArrKey::Int(0)), a.get(&ArrKey::Int(1)))
                 };
+                // zend validates both members before the class
+                // lookup: member 1 must be a string or object, member
+                // 2 a string (["C", 5] dies on the second member
+                // even with C missing).
+                if !matches!(
+                    t,
+                    Some(Value::Object(_)) | Some(Value::Callable(_)) | Some(Value::Str(_))
+                ) {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        "First array member is not a valid class name or object",
+                        0,
+                    ));
+                }
+                if !matches!(m, Some(Value::Str(_))) {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        "Second array member is not a valid method",
+                        0,
+                    ));
+                }
                 match (t, m) {
                     (Some(Value::Object(o)), Some(mv)) => {
                         let mn = mv.to_php_string();

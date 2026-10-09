@@ -3709,6 +3709,13 @@ impl<'a> Interp<'a> {
                 0,
             ));
         }
+        if cls.decl.kind == ClassKind::Enum {
+            return self.fail(PhpError::uncaught(
+                "Error",
+                format!("Cannot instantiate enum {}", cls.name()),
+                0,
+            ));
+        }
         self.link_const_inits(&cls)?;
         let has_ctor = self.find_method_in(&cls, "__construct").is_some();
         if !has_ctor {

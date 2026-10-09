@@ -1131,6 +1131,16 @@ impl<'a> Interp<'a> {
                 let found = cls
                     .as_ref()
                     .and_then(|c| s.find_method_in(c, "__construct"));
+                // `new X(...)` resolves the class before its args
+                // evaluate — a missing class dies before arg side
+                // effects (new NonExistent(se()) prints nothing).
+                if cls.is_none() {
+                    return s.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Class \"{name}\" not found"),
+                        *site,
+                    ));
+                }
                 let params = found
                     .as_ref()
                     .map(|m| m.0.decl.params.clone())
