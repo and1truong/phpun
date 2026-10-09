@@ -307,18 +307,24 @@ impl<'a> Interp<'a> {
                 );
                 let opt = has
                     || var
-                    || matches!(d, crate::builtins::BDef::Unk | crate::builtins::BDef::OptReq);
+                    || matches!(
+                        d,
+                        crate::builtins::BDef::Unk | crate::builtins::BDef::OptReq
+                    );
                 // Zend types every arginfo param; strict_sig carries
                 // the subset we model. allow_null follows a `?`/union
                 // with null or a `mixed` member.
                 let tys = sig
                     .as_ref()
                     .and_then(|s| {
-                        s.iter().find(|(n, _)| n == pn).map(|(_, t)| sig_ty_members(t))
+                        s.iter()
+                            .find(|(n, _)| n == pn)
+                            .map(|(_, t)| sig_ty_members(t))
                     })
                     .unwrap_or_default();
-                let allow_null =
-                    tys.iter().any(|t| t == "null" || t.eq_ignore_ascii_case("mixed"));
+                let allow_null = tys
+                    .iter()
+                    .any(|t| t == "null" || t.eq_ignore_ascii_case("mixed"));
                 prs.push(RParam {
                     name: pn.to_string(),
                     variadic: var,
@@ -438,8 +444,7 @@ impl<'a> Interp<'a> {
     /// ReflectionNamedType, otherwise a ReflectionUnionType (members
     /// arrive in zend's canonical order from the parser).
     fn refl_type_of(&mut self, members: &[String]) -> Result<Value, PhpError> {
-        let nonnull: Vec<&String> =
-            members.iter().filter(|m| m.as_str() != "null").collect();
+        let nonnull: Vec<&String> = members.iter().filter(|m| m.as_str() != "null").collect();
         if nonnull.len() == 1 {
             // `T`, `?T`, `T|null` (and standalone `null`/`mixed`)
             // -> ReflectionNamedType carrying a nullable flag.
@@ -464,7 +469,8 @@ impl<'a> Interp<'a> {
                 let mut ob = o.borrow_mut();
                 ob.props
                     .insert("name".into(), cell(Value::str(members[0].clone())));
-                ob.props.insert("\0rt\0null".into(), cell(Value::Bool(true)));
+                ob.props
+                    .insert("\0rt\0null".into(), cell(Value::Bool(true)));
             }
             return Ok(nt);
         }
@@ -474,9 +480,10 @@ impl<'a> Interp<'a> {
             for m in members {
                 ta.push(Value::str(m));
             }
-            o.borrow_mut()
-                .props
-                .insert("\0rt\0types".into(), cell(Value::Array(Rc::new(RefCell::new(ta)))));
+            o.borrow_mut().props.insert(
+                "\0rt\0types".into(),
+                cell(Value::Array(Rc::new(RefCell::new(ta)))),
+            );
         }
         Ok(ut)
     }
@@ -546,17 +553,13 @@ impl<'a> Interp<'a> {
             "\0rp\0ty".into(),
             cell(Value::Array(Rc::new(RefCell::new(ta)))),
         );
-        ob.props.insert(
-            "\0rp\0internal".into(),
-            cell(Value::Bool(rp_decl.internal)),
-        );
+        ob.props
+            .insert("\0rp\0internal".into(), cell(Value::Bool(rp_decl.internal)));
         if let Some(f) = fn_name {
-            ob.props
-                .insert("\0rp\0fn".into(), cell(Value::str(f)));
+            ob.props.insert("\0rp\0fn".into(), cell(Value::str(f)));
         }
         if let Some(c) = cls_name {
-            ob.props
-                .insert("\0rc\0class".into(), cell(Value::str(c)));
+            ob.props.insert("\0rc\0class".into(), cell(Value::str(c)));
         }
     }
 
@@ -687,7 +690,7 @@ impl<'a> Interp<'a> {
                 self.deprecated(
                     "ReflectionParameter::__construct(): Passing null to parameter #2 ($param) of type string|int is deprecated",
                 )?;
-                Some(0).filter(|_| !prs.is_empty())
+                (!prs.is_empty()).then_some(0)
             }
             Value::Float(f) => {
                 self.deprecated(&format!(
@@ -819,7 +822,7 @@ impl<'a> Interp<'a> {
                 // zpp TypeErrors on a non-object before resolving.
                 if obj.borrow().class.name().to_lowercase().as_str() == "reflectionobject" {
                     match args.first().map(|c| c.borrow().clone()) {
-                        Some(Value::Object(_)) | None => {}
+                        Some(Value::Object(_)) | Some(Value::Callable(_)) | None => {}
                         Some(other) => {
                             return self.fail(PhpError::uncaught(
                                 "TypeError",
@@ -1477,27 +1480,28 @@ impl<'a> Interp<'a> {
                     self.callable_decl(&cb)
                 };
                 let _decl_file = decl.as_ref().map(|d| d.file.clone()).unwrap_or_default();
-                let bp: Option<(String, &'static [(&'static str, crate::builtins::BDef)])> = if is_method {
-                    None
-                } else {
-                    match obj
-                        .borrow()
-                        .props
-                        .get("\0rc\0class")
-                        .map(|c| c.borrow().clone())
-                        .unwrap_or(Value::Null)
-                    {
-                        Value::Str(s) => {
-                            let n = String::from_utf8_lossy(&s).to_lowercase();
-                            if !self.functions.contains_key(&n) {
-                                crate::builtins::builtin_params(&n).map(|p| (n, p))
-                            } else {
-                                None
+                let bp: Option<(String, &'static [(&'static str, crate::builtins::BDef)])> =
+                    if is_method {
+                        None
+                    } else {
+                        match obj
+                            .borrow()
+                            .props
+                            .get("\0rc\0class")
+                            .map(|c| c.borrow().clone())
+                            .unwrap_or(Value::Null)
+                        {
+                            Value::Str(s) => {
+                                let n = String::from_utf8_lossy(&s).to_lowercase();
+                                if !self.functions.contains_key(&n) {
+                                    crate::builtins::builtin_params(&n).map(|p| (n, p))
+                                } else {
+                                    None
+                                }
                             }
+                            _ => None,
                         }
-                        _ => None,
-                    }
-                };
+                    };
                 let fn_name = decl
                     .as_ref()
                     .map(|d| d.name.clone())
@@ -1539,19 +1543,19 @@ impl<'a> Interp<'a> {
                     ))),
                     // ReflectionUnionType/IntersectionType — nullable
                     // iff a "null" member was stored.
-                    "reflectionuniontype" | "reflectionintersectiontype" => {
-                        Ok(Some(Value::Bool(
-                            obj.borrow()
-                                .props
-                                .get("\0rt\0types")
-                                .is_some_and(|c| match &*c.borrow() {
-                                    Value::Array(a) => a.borrow().entries.iter().any(|(_, c)| {
-                                        c.borrow().to_php_string() == "null"
-                                    }),
-                                    _ => false,
-                                }),
-                        )))
-                    }
+                    "reflectionuniontype" | "reflectionintersectiontype" => Ok(Some(Value::Bool(
+                        obj.borrow()
+                            .props
+                            .get("\0rt\0types")
+                            .is_some_and(|c| match &*c.borrow() {
+                                Value::Array(a) => a
+                                    .borrow()
+                                    .entries
+                                    .iter()
+                                    .any(|(_, c)| c.borrow().to_php_string() == "null"),
+                                _ => false,
+                            }),
+                    ))),
                     // ReflectionParameter/Property/others.
                     _ => Ok(Some(Value::Bool(
                         obj.borrow()
@@ -1572,9 +1576,25 @@ impl<'a> Interp<'a> {
                     .unwrap_or_default();
                 Ok(Some(Value::Bool(matches!(
                     n.as_str(),
-                    "int" | "float" | "string" | "bool" | "array" | "callable" | "iterable"
-                        | "object" | "mixed" | "null" | "false" | "true" | "void" | "never"
-                        | "self" | "static" | "parent" | "resource" | "numeric"
+                    "int"
+                        | "float"
+                        | "string"
+                        | "bool"
+                        | "array"
+                        | "callable"
+                        | "iterable"
+                        | "object"
+                        | "mixed"
+                        | "null"
+                        | "false"
+                        | "true"
+                        | "void"
+                        | "never"
+                        | "self"
+                        | "static"
+                        | "parent"
+                        | "resource"
+                        | "numeric"
                 ))))
             }
             // ReflectionParameter::getDeclaringFunction() — the
@@ -1626,12 +1646,14 @@ impl<'a> Interp<'a> {
                     "reflectionparameter" => {
                         let (name, pos, opt, var, byref, hasdef, internal) = {
                             let b = obj.borrow();
-                            let g = |k: &str| {
-                                b.props.get(k).map(|c| c.borrow().clone())
-                            };
+                            let g = |k: &str| b.props.get(k).map(|c| c.borrow().clone());
                             (
-                                g("\0rp\0name").map(|v| v.to_php_string()).unwrap_or_default(),
-                                g("\0rp\0pos").map(|v| v.to_php_string()).unwrap_or_else(|| "0".into()),
+                                g("\0rp\0name")
+                                    .map(|v| v.to_php_string())
+                                    .unwrap_or_default(),
+                                g("\0rp\0pos")
+                                    .map(|v| v.to_php_string())
+                                    .unwrap_or_else(|| "0".into()),
                                 g("\0rp\0opt").is_some_and(|v| v.is_truthy()),
                                 g("\0rp\0variadic").is_some_and(|v| v.is_truthy()),
                                 g("\0rp\0byref").is_some_and(|v| v.is_truthy()),
@@ -1674,7 +1696,11 @@ impl<'a> Interp<'a> {
                             String::new()
                         };
                         let req = if opt || var { "optional" } else { "required" };
-                        let tys = if ty.is_empty() { String::new() } else { format!("{ty} ") };
+                        let tys = if ty.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{ty} ")
+                        };
                         let sig = format!(
                             "{}{}${}{}",
                             if byref { "&" } else { "" },
@@ -1687,7 +1713,11 @@ impl<'a> Interp<'a> {
                         ))))
                     }
                     "reflectionuniontype" | "reflectionintersectiontype" => {
-                        let sep = if cn == "reflectionintersectiontype" { "&" } else { "|" };
+                        let sep = if cn == "reflectionintersectiontype" {
+                            "&"
+                        } else {
+                            "|"
+                        };
                         let ms: Vec<String> = match obj.borrow().props.get("\0rt\0types") {
                             Some(c) => match &*c.borrow() {
                                 Value::Array(a) => a
@@ -3434,11 +3464,25 @@ fn internal_param_byref(f: &str, p: &str) -> bool {
     match f {
         "preg_match" | "preg_match_all" => p == "matches",
         "preg_replace_callback_array" | "str_replace" | "str_ireplace" => p == "count",
-        "sort" | "rsort" | "asort" | "arsort" | "ksort" | "krsort" | "usort" | "uasort"
-        | "uksort" | "natsort" | "natcasesort" | "shuffle" | "array_multisort"
-        | "array_walk" | "array_walk_recursive" | "end" | "reset" | "next" | "prev" => {
-            p == "array"
-        }
+        "sort"
+        | "rsort"
+        | "asort"
+        | "arsort"
+        | "ksort"
+        | "krsort"
+        | "usort"
+        | "uasort"
+        | "uksort"
+        | "natsort"
+        | "natcasesort"
+        | "shuffle"
+        | "array_multisort"
+        | "array_walk"
+        | "array_walk_recursive"
+        | "end"
+        | "reset"
+        | "next"
+        | "prev" => p == "array",
         "parse_str" => p == "result",
         _ => false,
     }
@@ -3458,8 +3502,10 @@ fn internal_param_defconst(f: &str, p: &str) -> Option<&'static str> {
         ("fseek", "whence") => "SEEK_SET",
         ("pathinfo", "flags") => "PATHINFO_ALL",
         ("round", "mode") => "RoundingMode::HalfAwayFromZero",
-        ("htmlentities" | "htmlspecialchars" | "html_entity_decode"
-        | "htmlspecialchars_decode", "flags") => "ENT_QUOTES | ENT_SUBSTITUTE | ENT_HTML401",
+        (
+            "htmlentities" | "htmlspecialchars" | "html_entity_decode" | "htmlspecialchars_decode",
+            "flags",
+        ) => "ENT_QUOTES | ENT_SUBSTITUTE | ENT_HTML401",
         _ => return None,
     })
 }
@@ -3526,10 +3572,9 @@ fn rp_def_txt(v: &Value, internal: bool) -> String {
                             el
                         }
                         ArrKey::Int(i) => format!("{i} => {el}"),
-                        ArrKey::Str(s) => format!(
-                            "'{}' => {el}",
-                            s.replace('\\', "\\\\").replace('\'', "\\'")
-                        ),
+                        ArrKey::Str(s) => {
+                            format!("'{}' => {el}", s.replace('\\', "\\\\").replace('\'', "\\'"))
+                        }
                         _ => el,
                     }
                 })

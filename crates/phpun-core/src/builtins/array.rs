@@ -864,6 +864,9 @@ pub(crate) fn dispatch(
         }
         "array_map" => {
             let cb = arg(args, 0);
+            // A null callback is the identity (zend's array_map calls
+            // the null callback as a pass-through zip).
+            let null_cb = matches!(cb, Value::Null);
             let mut out = PhpArray::new();
             if args.len() == 2 {
                 if let Value::Array(a) = arg(args, 1) {
@@ -871,10 +874,14 @@ pub(crate) fn dispatch(
                     // autoload_files.php fileIdentifiers rely on it);
                     // multi-array zips renumber — PHP semantics.
                     for (k, c) in a.borrow().iter() {
-                        let v = it.call_value(
-                            &cb,
-                            crate::interp::CallArgs::positional(vec![cell(c.borrow().clone())]),
-                        )?;
+                        let v = if null_cb {
+                            c.borrow().clone()
+                        } else {
+                            it.call_value(
+                                &cb,
+                                crate::interp::CallArgs::positional(vec![cell(c.borrow().clone())]),
+                            )?
+                        };
                         out.set(k.clone(), v);
                     }
                 }
@@ -898,7 +905,15 @@ pub(crate) fn dispatch(
                         .iter()
                         .map(|a| cell(a.get(i).cloned().unwrap_or(Value::Null)))
                         .collect();
-                    let v = it.call_value(&cb, crate::interp::CallArgs::positional(call_args))?;
+                    let v = if null_cb {
+                        let mut t = PhpArray::new();
+                        for c in call_args {
+                            t.push(c.borrow().clone());
+                        }
+                        Value::Array(Rc::new(RefCell::new(t)))
+                    } else {
+                        it.call_value(&cb, crate::interp::CallArgs::positional(call_args))?
+                    };
                     out.push(v);
                 }
             }

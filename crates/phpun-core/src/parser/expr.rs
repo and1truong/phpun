@@ -3394,6 +3394,28 @@ impl<'a> Parser<'a> {
                     self.expect_op("(")?;
                     let args = self.expr_list()?;
                     self.expect_op(")")?;
+                    // zend_compile_isset: only variable-ish targets
+                    // (var, dim, prop — nullsafe included) are legal;
+                    // every other shape is a compile fatal.
+                    for a in &args {
+                        let mut e = a;
+                        while let Expr::Paren(inner) = e {
+                            e = inner;
+                        }
+                        if !matches!(
+                            e,
+                            Expr::Var(_)
+                                | Expr::VarVar(..)
+                                | Expr::Index { .. }
+                                | Expr::Prop { .. }
+                                | Expr::StaticProp { .. }
+                        ) {
+                            return Err(PhpError::compile_fatal(
+                                "Cannot use isset() on the result of an expression (you can use \"null !== expression\" instead)",
+                                self.prev_line(),
+                            ));
+                        }
+                    }
                     Ok(Expr::Isset(args))
                 } else if self.ident_is("empty") {
                     self.pos += 1;

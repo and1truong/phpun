@@ -9629,7 +9629,14 @@ impl<'a> Interp<'a> {
                 match &v {
                     // ~"abc" negates bytes.
                     Value::Str(s) => Ok(Value::bytes(s.iter().map(|b| !b).collect::<Vec<u8>>())),
-                    _ => Ok(Value::Int(!self.coerce_int(&v))),
+                    Value::Int(_) | Value::Float(_) => Ok(Value::Int(!self.coerce_int(&v))),
+                    // Zend throws a TypeError for non-int/string
+                    // operands (unary_operators), not a coercion.
+                    _ => self.fail(PhpError::uncaught(
+                        "TypeError",
+                        format!("Cannot perform bitwise not on {}", self.zval_type_name(&v)),
+                        0,
+                    )),
                 }
             }
             "@" => {

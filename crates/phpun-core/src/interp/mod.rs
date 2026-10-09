@@ -7439,6 +7439,19 @@ impl<'a> Interp<'a> {
         if args.named.is_empty() {
             if let Some(sig) = builtins::strict_sig(name) {
                 let strict = self.caller_file_strict();
+                // Zend verifies arity before per-arg types — an
+                // under-arity call reports "expects exactly/at least N
+                // arguments", never a null-param TypeError.
+                let min = builtins::builtin_params(name)
+                    .map(|ps| {
+                        ps.iter()
+                            .take_while(|(_, d)| {
+                                matches!(*d, builtins::BDef::Req | builtins::BDef::OptReq)
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let arg_checks = args.cells.len() >= min;
                 for (i, (pname, pty)) in sig.iter().enumerate() {
                     if i >= args.cells.len() {
                         break;
@@ -7480,6 +7493,57 @@ impl<'a> Interp<'a> {
                                 self.zpp_callback_detail(&v),
                             );
                             let e = self.exception("TypeError", &msg);
+                            let te = self.throw(e);
+                            let r = self.fail(te);
+                            self.call_trace.pop();
+                            return r;
+                        }
+                    } else if matches!(v, Value::Null)
+                        && arg_checks
+                        && !pty.starts_with('?')
+                        && !pty.split('|').any(|t| matches!(t, "null" | "mixed"))
+                        && !strict
+                    {
+                        // Weak-mode null on a non-nullable arginfo
+                        // param: scalar (or scalar-membered union)
+                        // params coerce with a Deprecated notice; the
+                        // rest are a catchable TypeError
+                        // (deprecations_nullable).
+                        let scal = pty
+                            .split('|')
+                            .any(|t| matches!(t, "string" | "int" | "float" | "bool"));
+                        // Functions with their own null-specialised
+                        // notice (array_key_exists says "use an empty
+                        // string instead") emit only that one.
+                        let special = matches!(name, "array_key_exists" | "key_exists");
+                        if scal {
+                            if !special {
+                                let d = self.deprecated(&format!(
+                                    "{name}(): Passing null to parameter #{} (${pname}) of type {pty} is deprecated",
+                                    i + 1
+                                ));
+                                if let Err(e) = d {
+                                    self.call_trace.pop();
+                                    return self.fail(e);
+                                }
+                            }
+                        } else {
+                            // Zend omits the name for variadic args.
+                            let variadic = builtins::builtin_params(name)
+                                .map(|ps| ps.iter().any(|(_, d)| matches!(*d, builtins::BDef::Var)))
+                                .unwrap_or(false);
+                            let pname_txt = if variadic {
+                                String::new()
+                            } else {
+                                format!(" (${pname})")
+                            };
+                            let e = self.exception(
+                                "TypeError",
+                                &format!(
+                                    "{name}(): Argument #{}{pname_txt} must be of type {pty}, null given",
+                                    i + 1
+                                ),
+                            );
                             let te = self.throw(e);
                             let r = self.fail(te);
                             self.call_trace.pop();
