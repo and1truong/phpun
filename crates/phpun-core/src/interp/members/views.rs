@@ -280,6 +280,448 @@ impl<'a> Interp<'a> {
         out
     }
 
+    /// One reflected parameter — the shape `\0rp\0*` props carry on a
+    /// ReflectionParameter instance.
+    /// zend evaluates the default lazily inside getDefaultValue(); a
+    /// failing const expr stashes its throwable (class, message) in
+    /// `dmsg` until then.
+    fn collect_rparams(
+        &mut self,
+        decl: Option<Rc<crate::ast::FunctionDecl>>,
+        scope_cls: Option<Rc<PhpClass>>,
+        bp: Option<(String, &'static [(&'static str, crate::builtins::BDef)])>,
+    ) -> Result<Vec<RParam>, PhpError> {
+        let mut prs: Vec<RParam> = Vec::new();
+        if let Some((fname, params)) = bp {
+            let sig = crate::builtins::strict_sig(&fname);
+            for (pn, d) in params.iter() {
+                let var = matches!(d, crate::builtins::BDef::Var);
+                // Unk/OptReq params are optional but carry no
+                // default (Zend arginfo opt/dva flags).
+                let has = !matches!(
+                    d,
+                    crate::builtins::BDef::Req
+                        | crate::builtins::BDef::Unk
+                        | crate::builtins::BDef::OptReq
+                        | crate::builtins::BDef::Var
+                );
+                let opt = has
+                    || var
+                    || matches!(d, crate::builtins::BDef::Unk | crate::builtins::BDef::OptReq);
+                // Zend types every arginfo param; strict_sig carries
+                // the subset we model. allow_null follows a `?`/union
+                // with null or a `mixed` member.
+                let tys = sig
+                    .as_ref()
+                    .and_then(|s| {
+                        s.iter().find(|(n, _)| n == pn).map(|(_, t)| sig_ty_members(t))
+                    })
+                    .unwrap_or_default();
+                let allow_null =
+                    tys.iter().any(|t| t == "null" || t.eq_ignore_ascii_case("mixed"));
+                prs.push(RParam {
+                    name: pn.to_string(),
+                    variadic: var,
+                    has_def: has,
+                    def: d.val(),
+                    ty: tys,
+                    hasty: true,
+                    opt,
+                    by_ref: internal_param_byref(&fname, pn),
+                    allow_null,
+                    const_name: internal_param_defconst(&fname, pn).map(|s| s.to_string()),
+                    dmsg: None,
+                    internal: true,
+                });
+            }
+        } else if let Some(d) = &decl {
+            let req = d
+                .params
+                .iter()
+                .rposition(|p| p.default.is_none() && !p.variadic)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            for (i, p) in d.params.iter().enumerate() {
+                // Zend erases the default on a param its
+                // optional-before-required rule makes required.
+                let has = p.default.is_some() && i >= req;
+                let (dv, dmsg) = if has {
+                    let de = p.default.as_ref().unwrap();
+                    let old = match &scope_cls {
+                        Some(sc) => self.const_self.replace(sc.clone()),
+                        None => self.const_self.take(),
+                    };
+                    let r = self.eval_decl_const(de, &d.file, 0);
+                    self.const_self = old;
+                    match r {
+                        Ok(v) => (v, None),
+                        Err(pe) => {
+                            // A Throw-kind error carries the real
+                            // throwable in pending_exception — its
+                            // class/message are what getDefaultValue()
+                            // rethrows.
+                            let thrown = self.pending_exception.take();
+                            let (cls, msg) = match &thrown {
+                                Some(Value::Object(o)) => {
+                                    let b = o.borrow();
+                                    let m = b
+                                        .props
+                                        .get("message")
+                                        .map(|c| c.borrow().to_php_string())
+                                        .unwrap_or_else(|| pe.message.clone());
+                                    (b.class.name().to_string(), m.to_string())
+                                }
+                                _ => {
+                                    let cls = match &pe.kind {
+                                        crate::error::ErrorKind::Uncaught { class } => *class,
+                                        _ => "Error",
+                                    };
+                                    (cls.to_string(), pe.message.clone())
+                                }
+                            };
+                            (Value::Null, Some((cls, msg)))
+                        }
+                    }
+                } else {
+                    (Value::Null, None)
+                };
+                let tys = p.ty.clone().unwrap_or_default();
+                // allowsNull: untyped, explicit ?T/T|null, mixed,
+                // or the (deprecated) implicit-nullable
+                // `T $a = null` form.
+                let allow_null = tys.is_empty()
+                    || tys
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("mixed"))
+                    || (has && matches!(dv, Value::Null));
+                // zend's isDefaultValueConstant flags literal
+                // constant refs (CONST, self::C) — not constant
+                // expressions like `1+2` or `'a'.'b'`.
+                let const_name = if has {
+                    match p.default.as_ref().unwrap() {
+                        Expr::Const(n) => Some(n.clone()),
+                        Expr::ClassConst { class, name }
+                            if matches!(class.as_ref(), Expr::Const(_)) =>
+                        {
+                            let cn = match class.as_ref() {
+                                Expr::Const(cn) => cn.clone(),
+                                _ => unreachable!(),
+                            };
+                            Some(format!("{}::{}", cn, name))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                prs.push(RParam {
+                    name: p.name.clone(),
+                    variadic: p.variadic,
+                    has_def: has,
+                    def: dv,
+                    hasty: !tys.is_empty(),
+                    ty: tys,
+                    opt: has || p.variadic,
+                    by_ref: p.by_ref,
+                    allow_null,
+                    const_name,
+                    dmsg,
+                    internal: false,
+                });
+            }
+        }
+        Ok(prs)
+    }
+
+    /// Build the ReflectionType object a reflected member list maps
+    /// to: `T|null`/`?T` and single members collapse to a
+    /// ReflectionNamedType, otherwise a ReflectionUnionType (members
+    /// arrive in zend's canonical order from the parser).
+    fn refl_type_of(&mut self, members: &[String]) -> Result<Value, PhpError> {
+        let nonnull: Vec<&String> =
+            members.iter().filter(|m| m.as_str() != "null").collect();
+        if nonnull.len() == 1 {
+            // `T`, `?T`, `T|null` (and standalone `null`/`mixed`)
+            // -> ReflectionNamedType carrying a nullable flag.
+            let nt = self.instantiate("reflectionnamedtype", &[])?;
+            if let Value::Object(o) = &nt {
+                let mut ob = o.borrow_mut();
+                ob.props
+                    .insert("name".into(), cell(Value::str((*nonnull[0]).clone())));
+                ob.props.insert(
+                    "\0rt\0null".into(),
+                    cell(Value::Bool(
+                        members.len() > 1 || nonnull[0].as_str() == "mixed",
+                    )),
+                );
+            }
+            return Ok(nt);
+        }
+        if members.len() == 1 {
+            // standalone `null`
+            let nt = self.instantiate("reflectionnamedtype", &[])?;
+            if let Value::Object(o) = &nt {
+                let mut ob = o.borrow_mut();
+                ob.props
+                    .insert("name".into(), cell(Value::str(members[0].clone())));
+                ob.props.insert("\0rt\0null".into(), cell(Value::Bool(true)));
+            }
+            return Ok(nt);
+        }
+        let ut = self.instantiate("reflectionuniontype", &[])?;
+        if let Value::Object(o) = &ut {
+            let mut ta = PhpArray::default();
+            for m in members {
+                ta.push(Value::str(m));
+            }
+            o.borrow_mut()
+                .props
+                .insert("\0rt\0types".into(), cell(Value::Array(Rc::new(RefCell::new(ta)))));
+        }
+        Ok(ut)
+    }
+
+    /// Stamp one RParam's `\0rp\*` props (plus the public `name`
+    /// ReflectionParameter renders) onto a fresh instance. `fn_name`
+    /// and `cls_name` record the reflected subject for
+    /// getDeclaringFunction()/getDeclaringClass().
+    fn stamp_rp(
+        &mut self,
+        o: &Rc<RefCell<PhpObject>>,
+        rp_decl: &RParam,
+        pos: usize,
+        fn_name: Option<&str>,
+        cls_name: Option<&str>,
+    ) {
+        o.borrow_mut()
+            .props
+            .insert("\0rp\0name".into(), cell(Value::str(&rp_decl.name)));
+        // Zend's ReflectionParameter exposes the name
+        // as a public prop rendered by var_dump.
+        let mut ob = o.borrow_mut();
+        ob.props
+            .insert("name".into(), cell(Value::str(&rp_decl.name)));
+        if !ob.prop_order.contains(&"name".into()) {
+            ob.prop_order.push("name".into());
+        }
+        drop(ob);
+        let mut ob = o.borrow_mut();
+        ob.props
+            .insert("\0rp\0variadic".into(), cell(Value::Bool(rp_decl.variadic)));
+        ob.props
+            .insert("\0rp\0pos".into(), cell(Value::Int(pos as i64)));
+        ob.props
+            .insert("\0rp\0hasdef".into(), cell(Value::Bool(rp_decl.has_def)));
+        ob.props
+            .insert("\0rp\0opt".into(), cell(Value::Bool(rp_decl.opt)));
+        ob.props
+            .insert("\0rp\0def".into(), cell(rp_decl.def.clone()));
+        ob.props
+            .insert("\0rp\0byref".into(), cell(Value::Bool(rp_decl.by_ref)));
+        ob.props
+            .insert("\0rp\0hasty".into(), cell(Value::Bool(rp_decl.hasty)));
+        ob.props.insert(
+            "\0rp\0allownull".into(),
+            cell(Value::Bool(rp_decl.allow_null)),
+        );
+        if let Some(cn) = &rp_decl.const_name {
+            ob.props
+                .insert("\0rp\0defconst".into(), cell(Value::str(cn.clone())));
+        }
+        if rp_decl.has_def && rp_decl.dmsg.is_none() {
+            ob.props
+                .insert("\0rp\0default".into(), cell(rp_decl.def.clone()));
+        }
+        if let Some((cls, msg)) = &rp_decl.dmsg {
+            ob.props
+                .insert("\0rp\0dmsg".into(), cell(Value::str(msg.clone())));
+            ob.props
+                .insert("\0rp\0dcls".into(), cell(Value::str(cls.clone())));
+        }
+        let mut ta = PhpArray::default();
+        for m in &rp_decl.ty {
+            ta.push(Value::str(m));
+        }
+        ob.props.insert(
+            "\0rp\0ty".into(),
+            cell(Value::Array(Rc::new(RefCell::new(ta)))),
+        );
+        ob.props.insert(
+            "\0rp\0internal".into(),
+            cell(Value::Bool(rp_decl.internal)),
+        );
+        if let Some(f) = fn_name {
+            ob.props
+                .insert("\0rp\0fn".into(), cell(Value::str(f)));
+        }
+        if let Some(c) = cls_name {
+            ob.props
+                .insert("\0rc\0class".into(), cell(Value::str(c)));
+        }
+    }
+
+    /// `new ReflectionParameter($function, $param)` — resolve the
+    /// subject like zend's ctor: 'name' string / closure /
+    /// array($class_or_object, 'method'), then a param picked by int
+    /// offset or string name. Stamp the found param's \0rp\* props.
+    fn rp_construct(
+        &mut self,
+        obj: &Rc<RefCell<PhpObject>>,
+        args: &CallArgs,
+    ) -> Result<Option<Value>, PhpError> {
+        if args.len() != 2 {
+            return self.fail(PhpError::uncaught(
+                "ArgumentCountError",
+                format!(
+                    "ReflectionParameter::__construct() expects exactly 2 arguments, {} given",
+                    args.len()
+                ),
+                0,
+            ));
+        }
+        let subj = args[0].borrow().clone();
+        let parg = args[1].borrow().clone();
+        let mut scope_cls: Option<Rc<PhpClass>> = None;
+        let mut bp: Option<(String, &'static [(&'static str, crate::builtins::BDef)])> = None;
+        // every surviving match arm assigns fn_name
+        let fn_name: Option<String>;
+        let mut cls_name: Option<String> = None;
+        let decl: Option<Rc<crate::ast::FunctionDecl>> = match &subj {
+            Value::Str(s) => {
+                let n = String::from_utf8_lossy(s).to_string();
+                let key = n.trim_start_matches('\\').to_lowercase();
+                if let Some(d) = self.functions.get(&key) {
+                    fn_name = Some(d.name.clone());
+                    Some(d.clone())
+                } else if let Some(p) = crate::builtins::builtin_params(&key) {
+                    fn_name = Some(key.clone());
+                    bp = Some((key, p));
+                    None
+                } else if crate::builtins::is_builtin(&key) {
+                    // Known internal with no arginfo table yet —
+                    // zend still reflects it; params are unknown.
+                    fn_name = Some(key.clone());
+                    bp = Some((key, &[]));
+                    None
+                } else {
+                    return self.fail(PhpError::uncaught(
+                        "ReflectionException",
+                        format!("Function {}() does not exist", n),
+                        0,
+                    ));
+                }
+            }
+            Value::Callable(_) => {
+                let d = self.callable_decl(&subj);
+                fn_name = d.as_ref().map(|d| d.name.clone());
+                d
+            }
+            Value::Array(a) => {
+                let elems: Vec<Value> = a
+                    .borrow()
+                    .entries
+                    .iter()
+                    .map(|(_, c)| c.borrow().clone())
+                    .collect();
+                // zend reads [0] as the class first — a missing class
+                // errors before the array-shape check.
+                let cn = match elems.first() {
+                    Some(Value::Object(o)) => o.borrow().class.name().to_string(),
+                    Some(v) => self.conv_str(v)?.to_string(),
+                    None => String::new(),
+                };
+                let c = self
+                    .classes
+                    .get(&cn.trim_start_matches('\\').to_lowercase())
+                    .cloned();
+                let Some(c) = c else {
+                    return self.fail(PhpError::uncaught(
+                        "ReflectionException",
+                        format!("Class \"{}\" does not exist", cn),
+                        0,
+                    ));
+                };
+                if elems.len() != 2 {
+                    return self.fail(PhpError::uncaught(
+                        "ReflectionException",
+                        "Expected array($object, $method) or array($classname, $method)",
+                        0,
+                    ));
+                }
+                let mn = self.conv_str(&elems[1])?.to_string();
+                match self.find_method_in(&c, &mn) {
+                    Some((m, sc)) => {
+                        cls_name = Some(c.decl.name.clone());
+                        fn_name = Some(m.decl.name.clone());
+                        scope_cls = Some(sc);
+                        Some(Rc::new(m.decl.clone()))
+                    }
+                    None => {
+                        return self.fail(PhpError::uncaught(
+                            "ReflectionException",
+                            format!("Method {}::{}() does not exist", c.decl.name, mn),
+                            0,
+                        ))
+                    }
+                }
+            }
+            other => {
+                return self.fail(PhpError::uncaught(
+                    "ReflectionException",
+                    format!(
+                        "ReflectionParameter::__construct(): Argument #1 ($function) must be a string, an array(class, method), or a callable object, {} given",
+                        crate::builtins::zval_word(other)
+                    ),
+                    0,
+                ))
+            }
+        };
+        let prs = self.collect_rparams(decl, scope_cls, bp)?;
+        let pick: Option<usize> = match &parg {
+            Value::Int(i) => Some(*i as usize).filter(|i| *i < prs.len()),
+            Value::Str(s) => {
+                let want = String::from_utf8_lossy(s).to_string();
+                prs.iter().position(|p| p.name == want)
+            }
+            Value::Null => {
+                self.deprecated(
+                    "ReflectionParameter::__construct(): Passing null to parameter #2 ($param) of type string|int is deprecated",
+                )?;
+                Some(0).filter(|_| !prs.is_empty())
+            }
+            Value::Float(f) => {
+                self.deprecated(&format!(
+                    "Implicit conversion from float {} to int loses precision",
+                    crate::value::format_float_prec(*f, 14)
+                ))?;
+                Some(*f as i64 as usize).filter(|i| *i < prs.len())
+            }
+            Value::Bool(b) => Some(*b as usize).filter(|i| *i < prs.len()),
+            other => {
+                return self.fail(PhpError::uncaught(
+                    "TypeError",
+                    format!(
+                        "ReflectionParameter::__construct(): Argument #2 ($param) must be of type string|int, {} given",
+                        crate::builtins::zval_word(other)
+                    ),
+                    0,
+                ))
+            }
+        };
+        let Some(i) = pick else {
+            return self.fail(PhpError::uncaught(
+                "ReflectionException",
+                match &parg {
+                    Value::Str(_) => "The parameter specified by its name could not be found",
+                    _ => "The parameter specified by its offset could not be found",
+                },
+                0,
+            ));
+        };
+        self.stamp_rp(obj, &prs[i], i, fn_name.as_deref(), cls_name.as_deref());
+        Ok(Some(Value::Null))
+    }
+
     /// Native bodies for the Reflection* stubs. The reflected
     /// class/function/prop names live under `\0rc\0` prop keys.
     pub(in crate::interp) fn reflection_method(
@@ -369,6 +811,26 @@ impl<'a> Interp<'a> {
                     }
                     // Callable arg falls through to the generic prop
                     // setup, which derives `name` from its kind.
+                }
+                if obj.borrow().class.name().to_lowercase().as_str() == "reflectionparameter" {
+                    return self.rp_construct(obj, args);
+                }
+                // ReflectionObject's arg is `object $object` — zend
+                // zpp TypeErrors on a non-object before resolving.
+                if obj.borrow().class.name().to_lowercase().as_str() == "reflectionobject" {
+                    match args.first().map(|c| c.borrow().clone()) {
+                        Some(Value::Object(_)) | None => {}
+                        Some(other) => {
+                            return self.fail(PhpError::uncaught(
+                                "TypeError",
+                                format!(
+                                    "ReflectionObject::__construct(): Argument #1 ($object) must be of type object, {} given",
+                                    self.zval_type_name(&other)
+                                ),
+                                0,
+                            ))
+                        }
+                    }
                 }
                 let mut ob = obj.borrow_mut();
                 let cls = args
@@ -856,23 +1318,7 @@ impl<'a> Interp<'a> {
                         .and_then(|c| self.find_prop_decl(&c, &pn))
                         .and_then(|(pd, _)| pd.ty);
                     match ty {
-                        Some(tys) => {
-                            let nt = self.instantiate("reflectionnamedtype", &[])?;
-                            if let Value::Object(o) = &nt {
-                                let mut ta = PhpArray::default();
-                                for m in &tys {
-                                    ta.push(Value::str(m));
-                                }
-                                let mut ob = o.borrow_mut();
-                                ob.props.insert(
-                                    "\0rp\0ty".into(),
-                                    cell(Value::Array(Rc::new(RefCell::new(ta)))),
-                                );
-                                ob.props
-                                    .insert("name".into(), cell(Value::str(tys.first().unwrap())));
-                            }
-                            Ok(Some(nt))
-                        }
+                        Some(tys) => Ok(Some(self.refl_type_of(&tys)?)),
                         None => Ok(Some(Value::Null)),
                     }
                 } else {
@@ -914,17 +1360,13 @@ impl<'a> Interp<'a> {
                                 .iter()
                                 .map(|(_, c)| c.borrow().to_php_string())
                                 .collect();
-                            let nt = self.instantiate("reflectionnamedtype", &[])?;
-                            if let Value::Object(o) = &nt {
-                                let mut ob = o.borrow_mut();
-                                ob.props
-                                    .insert("\0rp\0ty".into(), cell(Value::Array(ta.clone())));
-                                if let Some(first) = members.first() {
-                                    ob.props
-                                        .insert("name".into(), cell(Value::str(first.clone())));
-                                }
+                            if members.is_empty() {
+                                // arginfo types the param but this
+                                // table carries no member names.
+                                Ok(Some(Value::Null))
+                            } else {
+                                Ok(Some(self.refl_type_of(&members)?))
                             }
-                            Ok(Some(nt))
                         }
                         _ => Ok(Some(Value::Null)),
                     }
@@ -1035,26 +1477,7 @@ impl<'a> Interp<'a> {
                     self.callable_decl(&cb)
                 };
                 let _decl_file = decl.as_ref().map(|d| d.file.clone()).unwrap_or_default();
-                // userland decls read Param; internal functions
-                // synthesize from arginfo (builtin_params).
-                struct RParam {
-                    name: String,
-                    variadic: bool,
-                    has_def: bool,
-                    def: Value,
-                    ty: Vec<String>,
-                    hasty: bool,
-                    opt: bool,
-                    by_ref: bool,
-                    allow_null: bool,
-                    const_name: Option<String>,
-                    /// zend evaluates the default lazily inside
-                    /// getDefaultValue(); a failing const expr stashes
-                    /// its throwable (class, message) until then.
-                    dmsg: Option<(String, String)>,
-                }
-                let mut prs: Vec<RParam> = Vec::new();
-                let bp: Option<&'static [(&'static str, crate::builtins::BDef)]> = if is_method {
+                let bp: Option<(String, &'static [(&'static str, crate::builtins::BDef)])> = if is_method {
                     None
                 } else {
                     match obj
@@ -1067,7 +1490,7 @@ impl<'a> Interp<'a> {
                         Value::Str(s) => {
                             let n = String::from_utf8_lossy(&s).to_lowercase();
                             if !self.functions.contains_key(&n) {
-                                crate::builtins::builtin_params(&n)
+                                crate::builtins::builtin_params(&n).map(|p| (n, p))
                             } else {
                                 None
                             }
@@ -1075,196 +1498,17 @@ impl<'a> Interp<'a> {
                         _ => None,
                     }
                 };
-                if let Some(params) = bp {
-                    for (pn, d) in params.iter() {
-                        let var = matches!(d, crate::builtins::BDef::Var);
-                        // Unk/OptReq params are optional but carry no
-                        // default (Zend arginfo opt/dva flags).
-                        let has = !matches!(
-                            d,
-                            crate::builtins::BDef::Req
-                                | crate::builtins::BDef::Unk
-                                | crate::builtins::BDef::OptReq
-                                | crate::builtins::BDef::Var
-                        );
-                        let opt = has
-                            || var
-                            || matches!(
-                                d,
-                                crate::builtins::BDef::Unk | crate::builtins::BDef::OptReq
-                            );
-                        // arginfo carries no type/nullable info here —
-                        // zend marks internal params non-nullable
-                        // unless arginfo says otherwise (strlen $string),
-                        // but every arginfo param does have a type.
-                        prs.push(RParam {
-                            name: pn.to_string(),
-                            variadic: var,
-                            has_def: has,
-                            def: d.val(),
-                            ty: Vec::new(),
-                            hasty: true,
-                            opt,
-                            by_ref: false,
-                            allow_null: false,
-                            const_name: None,
-                            dmsg: None,
-                        });
-                    }
-                } else if let Some(d) = &decl {
-                    let req = d
-                        .params
-                        .iter()
-                        .rposition(|p| p.default.is_none() && !p.variadic)
-                        .map(|i| i + 1)
-                        .unwrap_or(0);
-                    for (i, p) in d.params.iter().enumerate() {
-                        // Zend erases the default on a param its
-                        // optional-before-required rule makes required.
-                        let has = p.default.is_some() && i >= req;
-                        let (dv, dmsg) = if has {
-                            let de = p.default.as_ref().unwrap();
-                            let old = match &scope_cls {
-                                Some(sc) => self.const_self.replace(sc.clone()),
-                                None => self.const_self.take(),
-                            };
-                            let r = self.eval_decl_const(de, &d.file, 0);
-                            self.const_self = old;
-                            match r {
-                                Ok(v) => (v, None),
-                                Err(pe) => {
-                                    // A Throw-kind error carries the real
-                                    // throwable in pending_exception — its
-                                    // class/message are what getDefaultValue()
-                                    // rethrows.
-                                    let thrown = self.pending_exception.take();
-                                    let (cls, msg) = match &thrown {
-                                        Some(Value::Object(o)) => {
-                                            let b = o.borrow();
-                                            let m = b
-                                                .props
-                                                .get("message")
-                                                .map(|c| c.borrow().to_php_string())
-                                                .unwrap_or_else(|| pe.message.clone());
-                                            (b.class.name().to_string(), m.to_string())
-                                        }
-                                        _ => {
-                                            let cls = match &pe.kind {
-                                                crate::error::ErrorKind::Uncaught { class } => {
-                                                    *class
-                                                }
-                                                _ => "Error",
-                                            };
-                                            (cls.to_string(), pe.message.clone())
-                                        }
-                                    };
-                                    (Value::Null, Some((cls, msg)))
-                                }
-                            }
-                        } else {
-                            (Value::Null, None)
-                        };
-                        let tys = p.ty.clone().unwrap_or_default();
-                        // allowsNull: untyped, explicit ?T/T|null, mixed,
-                        // or the (deprecated) implicit-nullable
-                        // `T $a = null` form.
-                        let allow_null = tys.is_empty()
-                            || tys.iter().any(|t| {
-                                t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("mixed")
-                            })
-                            || (has && matches!(dv, Value::Null));
-                        // zend's isDefaultValueConstant flags literal
-                        // constant refs (CONST, self::C) — not constant
-                        // expressions like `1+2` or `'a'.'b'`.
-                        let const_name = if has {
-                            match p.default.as_ref().unwrap() {
-                                Expr::Const(n) => Some(n.clone()),
-                                Expr::ClassConst { class, name }
-                                    if matches!(class.as_ref(), Expr::Const(_)) =>
-                                {
-                                    let cn = match class.as_ref() {
-                                        Expr::Const(cn) => cn.clone(),
-                                        _ => unreachable!(),
-                                    };
-                                    Some(format!("{}::{}", cn, name))
-                                }
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
-                        prs.push(RParam {
-                            name: p.name.clone(),
-                            variadic: p.variadic,
-                            has_def: has,
-                            def: dv,
-                            hasty: !tys.is_empty(),
-                            ty: tys,
-                            opt: has || p.variadic,
-                            by_ref: p.by_ref,
-                            allow_null,
-                            const_name,
-                            dmsg,
-                        });
-                    }
-                }
+                let fn_name = decl
+                    .as_ref()
+                    .map(|d| d.name.clone())
+                    .or_else(|| bp.as_ref().map(|(n, _)| n.clone()));
+                let cls_name = scope_cls.as_ref().map(|c| c.decl.name.clone());
+                let prs = self.collect_rparams(decl, scope_cls, bp)?;
                 let mut arr = PhpArray::default();
                 for (pos, rp_decl) in prs.iter().enumerate() {
                     let rp = self.instantiate("reflectionparameter", &[])?;
                     if let Value::Object(o) = &rp {
-                        o.borrow_mut()
-                            .props
-                            .insert("\0rp\0name".into(), cell(Value::str(&rp_decl.name)));
-                        // Zend's ReflectionParameter exposes the name
-                        // as a public prop rendered by var_dump.
-                        let mut ob = o.borrow_mut();
-                        ob.props
-                            .insert("name".into(), cell(Value::str(&rp_decl.name)));
-                        if !ob.prop_order.contains(&"name".into()) {
-                            ob.prop_order.push("name".into());
-                        }
-                        drop(ob);
-                        let mut ob = o.borrow_mut();
-                        ob.props
-                            .insert("\0rp\0variadic".into(), cell(Value::Bool(rp_decl.variadic)));
-                        ob.props
-                            .insert("\0rp\0pos".into(), cell(Value::Int(pos as i64)));
-                        ob.props
-                            .insert("\0rp\0hasdef".into(), cell(Value::Bool(rp_decl.has_def)));
-                        ob.props
-                            .insert("\0rp\0opt".into(), cell(Value::Bool(rp_decl.opt)));
-                        ob.props
-                            .insert("\0rp\0def".into(), cell(rp_decl.def.clone()));
-                        ob.props
-                            .insert("\0rp\0byref".into(), cell(Value::Bool(rp_decl.by_ref)));
-                        ob.props
-                            .insert("\0rp\0hasty".into(), cell(Value::Bool(rp_decl.hasty)));
-                        ob.props.insert(
-                            "\0rp\0allownull".into(),
-                            cell(Value::Bool(rp_decl.allow_null)),
-                        );
-                        if let Some(cn) = &rp_decl.const_name {
-                            ob.props
-                                .insert("\0rp\0defconst".into(), cell(Value::str(cn.clone())));
-                        }
-                        if rp_decl.has_def && rp_decl.dmsg.is_none() {
-                            ob.props
-                                .insert("\0rp\0default".into(), cell(rp_decl.def.clone()));
-                        }
-                        if let Some((cls, msg)) = &rp_decl.dmsg {
-                            ob.props
-                                .insert("\0rp\0dmsg".into(), cell(Value::str(msg.clone())));
-                            ob.props
-                                .insert("\0rp\0dcls".into(), cell(Value::str(cls.clone())));
-                        }
-                        let mut ta = PhpArray::default();
-                        for m in &rp_decl.ty {
-                            ta.push(Value::str(m));
-                        }
-                        ob.props.insert(
-                            "\0rp\0ty".into(),
-                            cell(Value::Array(Rc::new(RefCell::new(ta)))),
-                        );
+                        self.stamp_rp(o, rp_decl, pos, fn_name.as_deref(), cls_name.as_deref());
                     }
                     arr.push(rp);
                 }
@@ -1282,12 +1526,236 @@ impl<'a> Interp<'a> {
                     .get("\0rp\0byref")
                     .is_some_and(|c| c.borrow().is_truthy()),
             ))),
-            "allowsnull" => Ok(Some(Value::Bool(
-                obj.borrow()
+            "allowsnull" => {
+                let cn = obj.borrow().class.name().to_lowercase();
+                match cn.as_str() {
+                    // ReflectionNamedType — refl_type_of stashes the
+                    // nullable flag on \0rt\0null.
+                    "reflectionnamedtype" => Ok(Some(Value::Bool(
+                        obj.borrow()
+                            .props
+                            .get("\0rt\0null")
+                            .is_some_and(|c| c.borrow().is_truthy()),
+                    ))),
+                    // ReflectionUnionType/IntersectionType — nullable
+                    // iff a "null" member was stored.
+                    "reflectionuniontype" | "reflectionintersectiontype" => {
+                        Ok(Some(Value::Bool(
+                            obj.borrow()
+                                .props
+                                .get("\0rt\0types")
+                                .is_some_and(|c| match &*c.borrow() {
+                                    Value::Array(a) => a.borrow().entries.iter().any(|(_, c)| {
+                                        c.borrow().to_php_string() == "null"
+                                    }),
+                                    _ => false,
+                                }),
+                        )))
+                    }
+                    // ReflectionParameter/Property/others.
+                    _ => Ok(Some(Value::Bool(
+                        obj.borrow()
+                            .props
+                            .get("\0rp\0allownull")
+                            .is_some_and(|c| c.borrow().is_truthy()),
+                    ))),
+                }
+            }
+            // ReflectionNamedType::isBuiltin() — the name is a builtin
+            // type keyword (classes/interfaces are not).
+            "isbuiltin" => {
+                let n = obj
+                    .borrow()
                     .props
-                    .get("\0rp\0allownull")
-                    .is_some_and(|c| c.borrow().is_truthy()),
-            ))),
+                    .get("name")
+                    .map(|c| c.borrow().to_php_string().to_lowercase())
+                    .unwrap_or_default();
+                Ok(Some(Value::Bool(matches!(
+                    n.as_str(),
+                    "int" | "float" | "string" | "bool" | "array" | "callable" | "iterable"
+                        | "object" | "mixed" | "null" | "false" | "true" | "void" | "never"
+                        | "self" | "static" | "parent" | "resource" | "numeric"
+                ))))
+            }
+            // ReflectionParameter::getDeclaringFunction() — the
+            // function/method the param belongs to, from \0rp\0fn +
+            // \0rc\0class stamped at ctor/getParameters time.
+            "getdeclaringfunction" => {
+                let f = obj
+                    .borrow()
+                    .props
+                    .get("\0rp\0fn")
+                    .map(|c| c.borrow().to_php_string())
+                    .unwrap_or_default();
+                if f.is_empty() {
+                    return Ok(Some(Value::Null));
+                }
+                let c = obj
+                    .borrow()
+                    .props
+                    .get("\0rc\0class")
+                    .map(|c| c.borrow().to_php_string())
+                    .unwrap_or_default();
+                let cls = if c.is_empty() {
+                    "reflectionfunction"
+                } else {
+                    "reflectionmethod"
+                };
+                let v = self.instantiate(cls, &[])?;
+                if let Value::Object(o) = &v {
+                    let mut ob = o.borrow_mut();
+                    if !c.is_empty() {
+                        ob.props
+                            .insert("\0rc\0class".into(), cell(Value::str(c.clone())));
+                    } else {
+                        ob.props
+                            .insert("\0rc\0class".into(), cell(Value::str(f.clone())));
+                    }
+                    ob.props
+                        .insert("\0rc\0prop".into(), cell(Value::str(f.clone())));
+                    ob.props.insert("name".into(), cell(Value::str(f)));
+                }
+                Ok(Some(v))
+            }
+            // ReflectionType::__toString() — "?name" for a nullable
+            // named type, members joined "|" ("&" intersection) else.
+            // ReflectionParameter prints `Parameter #N [ <required> T $p = def ]`.
+            "__tostring" => {
+                let cn = obj.borrow().class.name().to_lowercase();
+                match cn.as_str() {
+                    "reflectionparameter" => {
+                        let (name, pos, opt, var, byref, hasdef, internal) = {
+                            let b = obj.borrow();
+                            let g = |k: &str| {
+                                b.props.get(k).map(|c| c.borrow().clone())
+                            };
+                            (
+                                g("\0rp\0name").map(|v| v.to_php_string()).unwrap_or_default(),
+                                g("\0rp\0pos").map(|v| v.to_php_string()).unwrap_or_else(|| "0".into()),
+                                g("\0rp\0opt").is_some_and(|v| v.is_truthy()),
+                                g("\0rp\0variadic").is_some_and(|v| v.is_truthy()),
+                                g("\0rp\0byref").is_some_and(|v| v.is_truthy()),
+                                g("\0rp\0hasdef").is_some_and(|v| v.is_truthy()),
+                                g("\0rp\0internal").is_some_and(|v| v.is_truthy()),
+                            )
+                        };
+                        let ms: Vec<String> = match obj.borrow().props.get("\0rp\0ty") {
+                            Some(c) => match &*c.borrow() {
+                                Value::Array(a) => a
+                                    .borrow()
+                                    .entries
+                                    .iter()
+                                    .map(|(_, c)| c.borrow().to_php_string())
+                                    .collect(),
+                                _ => Vec::new(),
+                            },
+                            None => Vec::new(),
+                        };
+                        let ty = rp_type_txt(&ms);
+                        let dc = obj
+                            .borrow()
+                            .props
+                            .get("\0rp\0defconst")
+                            .map(|c| c.borrow().to_php_string());
+                        let def = if hasdef {
+                            match dc {
+                                Some(d) => format!(" = {d}"),
+                                None => {
+                                    let v = obj
+                                        .borrow()
+                                        .props
+                                        .get("\0rp\0def")
+                                        .map(|c| c.borrow().clone())
+                                        .unwrap_or(Value::Null);
+                                    format!(" = {}", rp_def_txt(&v, internal))
+                                }
+                            }
+                        } else {
+                            String::new()
+                        };
+                        let req = if opt || var { "optional" } else { "required" };
+                        let tys = if ty.is_empty() { String::new() } else { format!("{ty} ") };
+                        let sig = format!(
+                            "{}{}${}{}",
+                            if byref { "&" } else { "" },
+                            if var { "..." } else { "" },
+                            name,
+                            def,
+                        );
+                        Ok(Some(Value::str(format!(
+                            "Parameter #{pos} [ <{req}> {tys}{sig} ]"
+                        ))))
+                    }
+                    "reflectionuniontype" | "reflectionintersectiontype" => {
+                        let sep = if cn == "reflectionintersectiontype" { "&" } else { "|" };
+                        let ms: Vec<String> = match obj.borrow().props.get("\0rt\0types") {
+                            Some(c) => match &*c.borrow() {
+                                Value::Array(a) => a
+                                    .borrow()
+                                    .entries
+                                    .iter()
+                                    .map(|(_, c)| c.borrow().to_php_string())
+                                    .collect(),
+                                _ => Vec::new(),
+                            },
+                            None => Vec::new(),
+                        };
+                        Ok(Some(Value::str(ms.join(sep))))
+                    }
+                    _ => {
+                        let (name, null) = {
+                            let b = obj.borrow();
+                            (
+                                b.props
+                                    .get("name")
+                                    .map(|c| c.borrow().to_php_string())
+                                    .unwrap_or_default(),
+                                b.props
+                                    .get("\0rt\0null")
+                                    .is_some_and(|c| c.borrow().is_truthy()),
+                            )
+                        };
+                        // mixed/null print bare; other nullable named
+                        // types take the "?" prefix.
+                        let pfx = if null && !matches!(name.as_str(), "mixed" | "null") {
+                            "?"
+                        } else {
+                            ""
+                        };
+                        Ok(Some(Value::str(format!("{pfx}{name}"))))
+                    }
+                }
+            }
+            // ReflectionUnionType/IntersectionType::getTypes() — each
+            // member as its own ReflectionNamedType.
+            "gettypes" => {
+                let ms: Vec<String> = match obj.borrow().props.get("\0rt\0types") {
+                    Some(c) => match &*c.borrow() {
+                        Value::Array(a) => a
+                            .borrow()
+                            .entries
+                            .iter()
+                            .map(|(_, c)| c.borrow().to_php_string())
+                            .collect(),
+                        _ => Vec::new(),
+                    },
+                    None => Vec::new(),
+                };
+                let mut arr = PhpArray::default();
+                for m in ms {
+                    let nt = self.instantiate("reflectionnamedtype", &[])?;
+                    if let Value::Object(o) = &nt {
+                        let mut ob = o.borrow_mut();
+                        ob.props.insert("name".into(), cell(Value::str(m.clone())));
+                        ob.props.insert(
+                            "\0rt\0null".into(),
+                            cell(Value::Bool(m == "null" || m == "mixed")),
+                        );
+                    }
+                    arr.push(nt);
+                }
+                Ok(Some(Value::Array(Rc::new(RefCell::new(arr)))))
+            }
             // zend throws ReflectionException when the param carries
             // no default at all — a non-const default answers false
             // for is* / NULL for get*Name.
@@ -2365,24 +2833,7 @@ impl<'a> Interp<'a> {
                     .and_then(|m| m.decl.ret.clone());
                 match (lname.as_str(), tys) {
                     ("hasreturntype", t) => Ok(Some(Value::Bool(t.is_some()))),
-                    (_, Some(tys)) => {
-                        let nt = self.instantiate("reflectionnamedtype", &[])?;
-                        if let Value::Object(o) = &nt {
-                            let mut ta = PhpArray::default();
-                            for m in &tys {
-                                ta.push(Value::str(m));
-                            }
-                            let mut ob = o.borrow_mut();
-                            ob.props.insert(
-                                "\0rp\0ty".into(),
-                                cell(Value::Array(Rc::new(RefCell::new(ta)))),
-                            );
-                            if let Some(first) = tys.first() {
-                                ob.props.insert("name".into(), cell(Value::str(first)));
-                            }
-                        }
-                        Ok(Some(nt))
-                    }
+                    (_, Some(tys)) => Ok(Some(self.refl_type_of(&tys)?)),
                     _ => Ok(Some(Value::Null)),
                 }
             }
@@ -2583,6 +3034,11 @@ impl<'a> Interp<'a> {
                     .map(|c| c.borrow().clone())
                     .unwrap_or(Value::Null);
                 let cn = self.conv_str(&cn)?.to_string();
+                // a function-level ReflectionParameter has no
+                // declaring class
+                if cn.is_empty() {
+                    return Ok(Some(Value::Null));
+                }
                 let v = self.instantiate("reflectionclass", &[])?;
                 if let Value::Object(o) = &v {
                     o.borrow_mut()
@@ -2948,6 +3404,155 @@ impl Interp<'_> {
         }
         None
     }
+}
+
+/// One reflected parameter — the shape `\0rp\0*` props carry on a
+/// ReflectionParameter instance.
+struct RParam {
+    name: String,
+    variadic: bool,
+    has_def: bool,
+    def: Value,
+    ty: Vec<String>,
+    hasty: bool,
+    opt: bool,
+    by_ref: bool,
+    allow_null: bool,
+    const_name: Option<String>,
+    /// zend evaluates the default lazily inside getDefaultValue(); a
+    /// failing const expr stashes its throwable (class, message) here.
+    dmsg: Option<(String, String)>,
+    /// arginfo (internal) param — zend renders its default lowercase
+    /// in __toString, userland echoes the decl text.
+    internal: bool,
+}
+
+/// Arginfo-level by-reference flags for the internal functions this
+/// table covers — zend marks a param `&$x` so isPassedByReference()
+/// and __toString report it.
+fn internal_param_byref(f: &str, p: &str) -> bool {
+    match f {
+        "preg_match" | "preg_match_all" => p == "matches",
+        "preg_replace_callback_array" | "str_replace" | "str_ireplace" => p == "count",
+        "sort" | "rsort" | "asort" | "arsort" | "ksort" | "krsort" | "usort" | "uasort"
+        | "uksort" | "natsort" | "natcasesort" | "shuffle" | "array_multisort"
+        | "array_walk" | "array_walk_recursive" | "end" | "reset" | "next" | "prev" => {
+            p == "array"
+        }
+        "parse_str" => p == "result",
+        _ => false,
+    }
+}
+
+/// Arginfo defaults that are CONSTANT names, not literals — zend
+/// renders `PHP_INT_MAX`, `STR_PAD_RIGHT` for these params in
+/// __toString and answers them from getDefaultValueConstantName().
+fn internal_param_defconst(f: &str, p: &str) -> Option<&'static str> {
+    Some(match (f, p) {
+        ("explode", "limit") => "PHP_INT_MAX",
+        ("str_pad", "pad_type") => "STR_PAD_RIGHT",
+        ("count" | "sizeof", "mode") => "COUNT_NORMAL",
+        ("sort" | "rsort" | "asort" | "arsort" | "ksort" | "krsort", "flags") => "SORT_REGULAR",
+        ("array_change_key_case", "case") => "CASE_LOWER",
+        ("array_unique", "flags") => "SORT_STRING",
+        ("fseek", "whence") => "SEEK_SET",
+        ("pathinfo", "flags") => "PATHINFO_ALL",
+        ("round", "mode") => "RoundingMode::HalfAwayFromZero",
+        ("htmlentities" | "htmlspecialchars" | "html_entity_decode"
+        | "htmlspecialchars_decode", "flags") => "ENT_QUOTES | ENT_SUBSTITUTE | ENT_HTML401",
+        _ => return None,
+    })
+}
+
+/// `\0rp\0ty` member list → the type text __toString prints:
+/// "?T", "A|B", bare "mixed"/"null", or "" when untyped.
+fn rp_type_txt(ms: &[String]) -> String {
+    let nonnull: Vec<&String> = ms.iter().filter(|m| m.as_str() != "null").collect();
+    match nonnull.len() {
+        0 if ms.len() == 1 => "null".into(),
+        0 => String::new(),
+        1 if ms.len() > 1 && nonnull[0].as_str() != "mixed" => format!("?{}", nonnull[0]),
+        1 => nonnull[0].to_string(),
+        _ => ms.join("|"),
+    }
+}
+
+/// Default-value text in ReflectionParameter::__toString: arginfo
+/// defaults render the zval C-style (lowercase null, `"..."`),
+/// userland echoes decl text (uppercase NULL, `'...'`).
+fn rp_def_txt(v: &Value, internal: bool) -> String {
+    match v {
+        Value::Null => if internal { "null" } else { "NULL" }.into(),
+        Value::Bool(b) => if *b { "true" } else { "false" }.into(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => crate::value::format_float_prec(*f, 14).to_string(),
+        Value::Str(s) => {
+            let s = String::from_utf8_lossy(s);
+            if internal {
+                // C-style escapes: control chars become \n \r \t \v
+                // or \xHH, `"` and `\` escaped.
+                let mut out = String::from("\"");
+                for &b in s.as_bytes() {
+                    match b {
+                        b'\n' => out.push_str("\\n"),
+                        b'\r' => out.push_str("\\r"),
+                        b'\t' => out.push_str("\\t"),
+                        0x0b => out.push_str("\\v"),
+                        b'\\' => out.push_str("\\\\"),
+                        b'"' => out.push_str("\\\""),
+                        0x20..=0x7e => out.push(b as char),
+                        _ => out.push_str(&format!("\\x{b:02x}")),
+                    }
+                }
+                out.push('"');
+                out
+            } else {
+                format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+            }
+        }
+        Value::Array(a) => {
+            let mut seq = 0i64;
+            let entries: Vec<String> = a
+                .borrow()
+                .entries
+                .iter()
+                .map(|(k, c)| {
+                    let el = rp_def_txt(&c.borrow(), internal);
+                    match k {
+                        // sequential int keys are implicit in the
+                        // literal echo
+                        ArrKey::Int(i) if *i == seq => {
+                            seq += 1;
+                            el
+                        }
+                        ArrKey::Int(i) => format!("{i} => {el}"),
+                        ArrKey::Str(s) => format!(
+                            "'{}' => {el}",
+                            s.replace('\\', "\\\\").replace('\'', "\\'")
+                        ),
+                        _ => el,
+                    }
+                })
+                .collect();
+            format!("[{}]", entries.join(", "))
+        }
+        other => other.to_php_string().to_string(),
+    }
+}
+
+/// strict_sig's zpp-style type string (`"?int"`, `"string|array"`) →
+/// the member list `\0rp\0ty` carries: `?` appends a "null" member,
+/// `|` splits a union.
+fn sig_ty_members(t: &str) -> Vec<String> {
+    let (nul, t) = match t.strip_prefix('?') {
+        Some(t) => (true, t),
+        None => (false, t),
+    };
+    let mut ms: Vec<String> = t.split('|').map(|m| m.to_string()).collect();
+    if nul {
+        ms.push("null".into());
+    }
+    ms
 }
 
 /// Total and required param counts for a function/method decl — a

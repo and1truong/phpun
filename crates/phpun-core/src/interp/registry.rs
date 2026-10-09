@@ -1159,11 +1159,64 @@ impl<'a> Interp<'a> {
                 attrs: vec![],
                 traits: vec![],
                 adaptations: vec![],
-                methods: vec![Rc::new(MethodDecl {
-                    decl: FunctionDecl {
-                        ret: Some(vec!["array".into()]),
-                        name: "listIdentifiers".into(),
-                        params: vec![
+                methods: vec![
+                    Rc::new(MethodDecl {
+                        decl: FunctionDecl {
+                            ret: None,
+                            name: "__construct".into(),
+                            params: vec![Param {
+                                name: "timezone".into(),
+                                default: None,
+                                by_ref: false,
+                                variadic: false,
+                                ty: Some(vec!["string".into()]),
+                                promoted: false,
+                                vis: None,
+                                readonly: false,
+                                is_final: false,
+                                set_vis: None,
+                                hooks: None,
+                            }],
+                            body: vec![],
+                            attrs: vec![],
+                            by_ref: false,
+                            line: 0,
+                            end_line: 0,
+                            file: String::new(),
+                            ns: String::new(),
+                            decl_in: None,
+                        },
+                        is_static: false,
+                        is_abstract: false,
+                        is_final: false,
+                        visibility: Visibility::Public,
+                        trait_alias_of: None,
+                    }),
+                    Rc::new(MethodDecl {
+                        decl: FunctionDecl {
+                            ret: Some(vec!["string".into()]),
+                            name: "getName".into(),
+                            params: vec![],
+                            body: vec![],
+                            attrs: vec![],
+                            by_ref: false,
+                            line: 0,
+                            end_line: 0,
+                            file: String::new(),
+                            ns: String::new(),
+                            decl_in: None,
+                        },
+                        is_static: false,
+                        is_abstract: false,
+                        is_final: false,
+                        visibility: Visibility::Public,
+                        trait_alias_of: None,
+                    }),
+                    Rc::new(MethodDecl {
+                        decl: FunctionDecl {
+                            ret: Some(vec!["array".into()]),
+                            name: "listIdentifiers".into(),
+                            params: vec![
                             Param {
                                 name: "timezoneGroup".into(),
                                 default: Some(Expr::Const("DateTimeZone::ALL".into())),
@@ -1690,6 +1743,9 @@ impl<'a> Interp<'a> {
                     mk_method("isPassedByReference", vec![]),
                     mk_method("getDefaultValue", vec![]),
                     mk_method("isDefaultValueAvailable", vec![]),
+                    mk_method("getDeclaringFunction", vec![]),
+                    mk_method("getDeclaringClass", vec![]),
+                    mk_method("__toString", vec![]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -2096,7 +2152,10 @@ impl<'a> Interp<'a> {
                 attrs: vec![],
                 traits: vec![],
                 adaptations: vec![],
-                methods: vec![mk_method("allowsNull", vec![])],
+                methods: vec![
+                    mk_method("allowsNull", vec![]),
+                    mk_method("__toString", vec![]),
+                ],
                 props: vec![],
                 consts: vec![],
                 file: String::new(),
@@ -2489,6 +2548,8 @@ impl<'a> Interp<'a> {
             ("AssertionError", "Error"),
             ("UnhandledMatchError", "Error"),
             ("ReflectionException", "Exception"),
+            ("DateException", "Exception"),
+            ("DateInvalidTimeZoneException", "DateException"),
         ] {
             let mut d = throwable_class(name, Some(parent), &["message", "code", "file", "line"]);
             // Only ErrorException has its own ctor in zend — every other
