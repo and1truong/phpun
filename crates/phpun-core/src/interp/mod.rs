@@ -557,6 +557,11 @@ pub struct Interp<'a> {
     /// real level, never released: oracle keeps ~128 after the last
     /// pop.
     ob_boot: Option<Rc<()>>,
+    /// Zend's opcode-style builtins (strlen/count/sizeof/
+    /// array_key_exists/call_user_func*) raise arg errors with the
+    /// callee frame still off the trace — exception() skips it.
+    pub(crate) exc_frameless: bool,
+
     /// One-time token for the output machinery zend retains once
     /// bytes reach the real stdout sink — EMIT_RESID, never released.
     emit_boot: Option<Rc<()>>,
@@ -1778,6 +1783,7 @@ impl<'a> Interp<'a> {
             shutdown_fns: Vec::new(),
             error_handler: None,
             error_handler_stack: Vec::new(),
+            exc_frameless: false,
             exception_handler_stack: Vec::new(),
             error_level: 30719,
             env_overrides: HashMap::new(),
@@ -7260,7 +7266,13 @@ impl<'a> Interp<'a> {
                 thrown: self.send_line.unwrap_or(self.cur_line) as u32,
                 full_msg: String::new(),
                 eval_ctx: 0,
-                frames: Rc::new(self.call_trace.clone()),
+                frames: {
+                    let mut fr = self.call_trace.clone();
+                    if std::mem::take(&mut self.exc_frameless) {
+                        fr.pop();
+                    }
+                    Rc::new(fr)
+                },
                 previous: None,
             });
             if !o.prop_order.contains(&"message".into()) {
@@ -7453,6 +7465,7 @@ impl<'a> Interp<'a> {
                     name,
                     self.zpp_callback_detail(&cb)
                 );
+                self.exc_frameless = matches!(name, "call_user_func" | "call_user_func_array");
                 let e = self.exception("TypeError", &msg);
                 let te = self.throw(e);
                 let r = self.fail(te);
@@ -7507,6 +7520,16 @@ impl<'a> Interp<'a> {
         // (Zend's `f` ZPP flag) with the callback-specific messages.
         if args.named.is_empty() {
             if let Some(sig) = builtins::strict_sig(name) {
+                let zf = matches!(
+                    name,
+                    "strlen"
+                        | "count"
+                        | "sizeof"
+                        | "array_key_exists"
+                        | "call_user_func"
+                        | "call_user_func_array"
+                );
+                let _ = zf;
                 let strict = self.caller_file_strict();
                 // Zend verifies arity before per-arg types — an
                 // under-arity call reports "expects exactly/at least N
@@ -7561,6 +7584,7 @@ impl<'a> Interp<'a> {
                                 null,
                                 self.zpp_callback_detail(&v),
                             );
+                            self.exc_frameless = zf;
                             let e = self.exception("TypeError", &msg);
                             let te = self.throw(e);
                             let r = self.fail(te);
@@ -7606,6 +7630,7 @@ impl<'a> Interp<'a> {
                             } else {
                                 format!(" (${pname})")
                             };
+                            self.exc_frameless = zf;
                             let e = self.exception(
                                 "TypeError",
                                 &format!(
@@ -7644,6 +7669,7 @@ impl<'a> Interp<'a> {
                             pty,
                             self.zval_type_name(&v),
                         );
+                        self.exc_frameless = zf;
                         let e = self.exception("TypeError", &msg);
                         let te = self.throw(e);
                         let r = self.fail(te);
@@ -7658,6 +7684,7 @@ impl<'a> Interp<'a> {
                             pty,
                             self.zval_type_name(&v),
                         );
+                        self.exc_frameless = zf;
                         let e = self.exception("TypeError", &msg);
                         let te = self.throw(e);
                         let r = self.fail(te);

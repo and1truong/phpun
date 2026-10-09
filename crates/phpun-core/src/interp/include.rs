@@ -150,13 +150,16 @@ impl<'a> Interp<'a> {
         if let Some(f) = self.call_trace.last_mut() {
             f.args = vec![cell(Value::str(canon.display().to_string()))];
         }
-        if matches!(kind, IncludeKind::IncludeOnce | IncludeKind::RequireOnce) {
-            if self.included.contains(&canon) {
-                inc_pop(self);
-                return Ok(Value::Bool(true));
-            }
-            self.included.insert(canon.clone());
+        // The *_once dedup registry covers EVERY opened file — a
+        // plain require registers its path too, so a later _once call
+        // on it skips (zend shares one included-files table).
+        if matches!(kind, IncludeKind::IncludeOnce | IncludeKind::RequireOnce)
+            && self.included.contains(&canon)
+        {
+            inc_pop(self);
+            return Ok(Value::Bool(true));
         }
+        self.included.insert(canon.clone());
         let src = match std::fs::read_to_string(&canon) {
             Ok(s) => s,
             Err(e) => {

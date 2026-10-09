@@ -104,6 +104,7 @@ pub(crate) fn dispatch(
                         return Err(pe);
                     }
                 }
+                it.exc_frameless = name.starts_with("call_user_func");
                 return err(
                     "TypeError",
                     format!(
