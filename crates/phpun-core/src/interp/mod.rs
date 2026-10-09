@@ -1044,10 +1044,16 @@ pub struct Interp<'a> {
     /// treated as contiguous, so a badly fragmented tail can pin a
     /// chunk the sim thinks reusable.
     mem_chunks: Vec<u64>,
-    /// Index of the emptied non-main chunk zend keeps mapped on its
-    /// cached_chunks list (delay deletion — get_chunk pops it back
-    /// without running the limit check). usize::MAX = none cached.
-    mem_cached: usize,
+    /// Emptied non-main chunks zend keeps mapped on cached_chunks
+    /// (delay deletion — get_chunk pops one back without running the
+    /// limit check). LIFO stack of `mem_chunks` indices; zend holds at
+    /// most a couple intra-request.
+    mem_cached: Vec<usize>,
+    /// zend_mm_delete_chunk hysteresis: chunks_count at the last real
+    /// unmap and the consecutive unmaps at that same boundary — the
+    /// 4th+ deletion at one boundary caches instead of unmapping.
+    chunks_del_boundary: usize,
+    chunks_del_count: usize,
     /// Page-aligned size of live huge allocs — each is its own
     /// segment in real_size and is released when its owner dies.
     mem_huge: u64,
@@ -1849,7 +1855,9 @@ impl<'a> Interp<'a> {
             mem_committed: MM_CHUNK,
             mem_in_chunk: MM_BASE_CHUNK,
             mem_chunks: vec![MM_BASE_CHUNK],
-            mem_cached: usize::MAX,
+            mem_cached: Vec::new(),
+            chunks_del_boundary: 0,
+            chunks_del_count: 0,
             mem_huge: 0,
             mem_seg_order: Vec::new(),
             mem_real_peak: MM_CHUNK,
@@ -3814,7 +3822,7 @@ impl<'a> Interp<'a> {
         } else if needs_chunk(self)
             // get_chunk pops the cached chunk first — that path skips
             // the limit check entirely (zend_mm_get_chunk).
-            && self.mem_cached == usize::MAX
+            && self.mem_cached.is_empty()
             && self.mem_real().saturating_add(MM_CHUNK) > limit
         {
             Some(fp)
@@ -3906,8 +3914,7 @@ impl<'a> Interp<'a> {
                 return i;
             }
         }
-        if self.mem_cached != usize::MAX {
-            let i = std::mem::replace(&mut self.mem_cached, usize::MAX);
+        if let Some(i) = self.mem_cached.pop() {
             debug_assert_eq!(self.mem_chunks[i], 0);
             self.mem_chunks[i] = fp;
             return i;
@@ -3926,39 +3933,57 @@ impl<'a> Interp<'a> {
     }
 
     /// zend_mm_delete_chunk: an emptied non-main chunk leaves the
-    /// committed list. The last surviving non-main chunk is pushed
-    /// onto cached_chunks and stays mapped (avg_chunks_count is ~1
-    /// intra-request — zend only updates it at shutdown); anything
-    /// else unmaps one chunk — the newly emptied one, or the older
-    /// cached chunk it replaces (chunk->num ordering). Caller has
-    /// already zeroed the occupancy. Field-level args keep this
-    /// callable while a mem_tracked entry borrow is outstanding.
-    /// Returns true when the chunk stays mapped (it became cached).
+    /// committed list. It goes onto cached_chunks — stays mapped and
+    /// get_chunk pops it back skipping the limit check — while the
+    /// heap is collapsing (chunks+cached < avg+0.1, and zend only
+    /// recomputes avg at request end so it is ~1 intra-request) or
+    /// once 4+ consecutive unmaps hit the same chunks_count boundary
+    /// (last_chunks_delete_count hysteresis). Otherwise a chunk
+    /// unmaps: the emptied one when it is newer than the cached head,
+    /// else the head (chunk->num ordering — the slot index stands in
+    /// for num). The boundary/count update runs only with an empty
+    /// cache, like zend. Caller has already zeroed the occupancy.
+    /// Field-level args keep this callable while a mem_tracked entry
+    /// borrow is outstanding. Returns true when the emptied chunk
+    /// stays mapped (cached directly, or swapped in for the head).
     fn chunk_vacate(
         chunks: &mut [u64],
         committed: &mut u64,
-        cached: &mut usize,
+        cached: &mut Vec<usize>,
+        del_boundary: &mut usize,
+        del_count: &mut usize,
         idx: usize,
     ) -> bool {
-        let has_cached = (*cached != usize::MAX) as usize;
         let live = chunks
             .iter()
             .enumerate()
-            .filter(|(j, &u)| *j != idx && *j != *cached && (u > 0 || *j == 0))
+            .filter(|(j, &u)| *j != idx && !cached.contains(j) && (u > 0 || *j == 0))
             .count();
-        if live + has_cached <= 1 {
-            *cached = idx;
+        if live + cached.len() <= 1 || (live == *del_boundary && *del_count >= 4) {
+            cached.push(idx);
             return true;
         }
         *committed = committed.saturating_sub(MM_CHUNK);
-        if *cached != usize::MAX && idx < *cached {
-            // The emptied chunk is older than the cached one — zend
-            // unmaps the cached head and caches this instead (its
-            // span stays committed).
-            *cached = idx;
-            return true;
+        if cached.is_empty() {
+            if live != *del_boundary {
+                *del_boundary = live;
+                *del_count = 0;
+            } else {
+                *del_count += 1;
+            }
         }
-        false
+        match cached.last() {
+            // Emptied is older than the cached head — zend unmaps the
+            // head and caches this one instead (its span stays
+            // committed).
+            Some(&head) if idx < head => {
+                *cached.last_mut().unwrap() = idx;
+                true
+            }
+            // Nothing cached, or the emptied chunk is the newer one
+            // — it unmaps itself.
+            _ => false,
+        }
     }
 
     /// Return fp bytes to the recorded chunk. Occupancy is
@@ -3975,6 +4000,8 @@ impl<'a> Interp<'a> {
                     &mut self.mem_chunks,
                     &mut self.mem_committed,
                     &mut self.mem_cached,
+                    &mut self.chunks_del_boundary,
+                    &mut self.chunks_del_count,
                     idx,
                 );
             }
@@ -4103,6 +4130,8 @@ impl<'a> Interp<'a> {
                             &mut self.mem_chunks,
                             &mut self.mem_committed,
                             &mut self.mem_cached,
+                            &mut self.chunks_del_boundary,
+                            &mut self.chunks_del_count,
                             dead_chunk,
                         );
                     }
@@ -4412,6 +4441,8 @@ impl<'a> Interp<'a> {
                                 &mut self.mem_chunks,
                                 &mut self.mem_committed,
                                 &mut self.mem_cached,
+                                &mut self.chunks_del_boundary,
+                                &mut self.chunks_del_count,
                                 ci,
                             )
                         {
@@ -4615,6 +4646,8 @@ impl<'a> Interp<'a> {
                 &mut self.mem_chunks,
                 &mut self.mem_committed,
                 &mut self.mem_cached,
+                &mut self.chunks_del_boundary,
+                &mut self.chunks_del_count,
                 ci,
             );
         }
