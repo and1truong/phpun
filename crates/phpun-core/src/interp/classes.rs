@@ -3389,7 +3389,38 @@ impl<'a> Interp<'a> {
                     // postfixes like `(new class)::K` need the mangled
                     // `class@anonymous\0FILE:LINE$SEQ`).
                     Value::Object(o) => Ok(o.borrow().class.decl.name.clone()),
-                    other => Ok(other.to_php_string().trim_start_matches('\\').to_string()),
+                    Value::Str(s) => Ok(String::from_utf8_lossy(&s)
+                        .trim_start_matches('\\')
+                        .to_string()),
+                    _ => {
+                        // A variable-origin operand (`new $x`, `new
+                        // $x[i]`) throws the catchable Error; a folded
+                        // expr (`new (5)`, `(5)::f()`) is zend's plain
+                        // `Illegal class name` fatal.
+                        let mut ce = e;
+                        while let Expr::Binary {
+                            op: "argline", r, ..
+                        } = ce
+                        {
+                            ce = r;
+                        }
+                        if matches!(
+                            ce,
+                            Expr::Var(_)
+                                | Expr::VarVar(..)
+                                | Expr::Index { .. }
+                                | Expr::Prop { .. }
+                                | Expr::StaticProp { .. }
+                        ) {
+                            Err(PhpError::uncaught(
+                                "Error",
+                                "Class name must be a valid object or a string".to_string(),
+                                self.cur_line,
+                            ))
+                        } else {
+                            Err(PhpError::compile_fatal("Illegal class name", self.cur_line))
+                        }
+                    }
                 }
             }
         }

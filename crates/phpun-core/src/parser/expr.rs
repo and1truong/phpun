@@ -459,21 +459,17 @@ impl<'a> Parser<'a> {
                 }
                 Ok((e, Vec::new()))
             }
-            Some(Token::Op("{")) => {
-                self.pos += 1;
-                let e = self.expr()?;
-                self.expect_op("}")?;
-                Ok((e, Vec::new()))
-            }
             Some(Token::Op("(")) => {
                 self.pos += 1;
                 let e = self.expr()?;
                 self.expect_op(")")?;
                 Ok((e, Vec::new()))
             }
+            // `new ${expr}` / `new $$v` — class name by indirection.
+            Some(Token::Op("$")) => Ok((self.primary()?, Vec::new())),
             t => Err(PhpError::parse(
                 format!(
-                    "syntax error, unexpected {}, expecting class name",
+                    "syntax error, unexpected {}, expecting \"class\"",
                     desc_t(t.as_ref())
                 ),
                 self.line(),
@@ -2337,21 +2333,23 @@ impl<'a> Parser<'a> {
                         self.expect_op("}")?;
                         if self.at_op("(") {
                             self.pos += 1;
-                            // `Cls::{expr}(...)` keeps per-arg send
-                            // lines — zend treats the `::{` member
-                            // call like a named static call.
-                            let args = self.args()?;
-                            e = Expr::MethodCall {
-                                obj: Box::new(e),
-                                name: PropName::Expr(Box::new(inner)),
-                                args,
-                                nullsafe: false,
-                                site,
-                            };
-                        } else {
-                            e = Expr::StaticProp {
+                            // `Cls::{expr}(...)` is zend's
+                            // INIT_DYNAMIC_CALL — a static call whose
+                            // member name comes from the inner expr.
+                            let mut args = self.args()?;
+                            Self::dyn_arglines(&mut args);
+                            e = Self::fcc_wrap(Expr::StaticCallDyn {
                                 class: Box::new(e),
-                                name: PropName::Expr(Box::new(inner)),
+                                name: Box::new(inner),
+                                args,
+                                site,
+                            })?;
+                        } else {
+                            // `Cls::{expr}` fetches a class CONSTANT
+                            // named by the expr, not a static prop.
+                            e = Expr::ClassConstDyn {
+                                class: Box::new(e),
+                                name: Box::new(inner),
                             };
                         }
                     }

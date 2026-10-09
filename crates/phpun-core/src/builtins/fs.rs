@@ -357,78 +357,21 @@ pub(crate) fn dispatch(
         }
         "file_get_contents" => {
             let path = arg_str(it, args, 0);
-            let low = path.to_lowercase();
-            if low == "php://input" {
-                Value::str(String::from_utf8_lossy(&it.php_input).into_owned())
-            } else if let Some(body) = parse_data_uri(&path) {
-                Value::str(String::from_utf8_lossy(&body).into_owned())
-            } else if low.starts_with("php://") && !low.starts_with("php://filter") {
-                match low.as_str() {
-                    // read of a write-only stdio stream: notice + "".
-                    "php://stdout" | "php://stderr" => {
-                        it.emit_diag_pub(
-                            8,
-                            "file_get_contents(): Read of 8192 bytes failed with errno=9 Bad file descriptor",
-                        )?;
-                        Value::str("")
-                    }
-                    "php://stdin" | "php://memory" | "php://temp" | "php://output" => {
-                        Value::str("")
-                    }
-                    _ => {
-                        invalid_php_uri(it, "file_get_contents", &path)?;
-                        Value::Bool(false)
-                    }
-                }
-            } else if let Some((segs, inner)) = php_filter_uri(&path) {
-                let Some(inner) = inner else {
-                    return Err(PhpError::uncaught("Error", "No URL resource specified", 0));
-                };
-                match open_filter_resource(it, &segs, &inner, "rb", "file_get_contents", &path)? {
-                    Some(Value::Resource(r)) => {
-                        let c = cell(Value::Resource(r));
-                        let mut out = Vec::new();
-                        loop {
-                            match read_resource(it, Some(&c), 8192)? {
-                                StreamRead::Data(b) if !b.is_empty() => out.extend(b),
-                                _ => break,
-                            }
-                        }
-                        Value::str(String::from_utf8_lossy(&out).into_owned())
-                    }
-                    _ => Value::Bool(false),
-                }
-            } else if let Some(scheme) = uri_scheme(&path) {
-                // `scheme://` with no registered wrapper — zend warns
-                // twice; a mis-cased registered name fails "operation
-                // failed" instead.
-                if scheme.eq_ignore_ascii_case("data") {
-                    it.warn_pub(&format!(
-                        "file_get_contents({}): Failed to open stream: operation failed",
-                        path
-                    ))?;
-                } else {
-                    it.warn_pub(&format!(
-                        "file_get_contents(): Unable to find the wrapper \"{}\" - did you forget to enable it when you configured PHP?",
-                        scheme
-                    ))?;
-                    it.warn_pub(&format!(
-                        "file_get_contents({}): Failed to open stream: No such file or directory",
-                        path
-                    ))?;
-                }
-                Value::Bool(false)
-            } else {
-                match read_stream(&path) {
+            match uri_read(it, "file_get_contents", &path)? {
+                Some(UriRead::Body(b)) => Value::str(String::from_utf8_lossy(&b).into_owned()),
+                Some(UriRead::ReadErr) => Value::str(""),
+                Some(UriRead::Fail) => Value::Bool(false),
+                None => match read_stream(&path) {
                     Ok(b) => Value::str(String::from_utf8_lossy(&b).into_owned()),
                     Err(e) => {
                         it.warn_pub(&format!(
                             "file_get_contents({}): Failed to open stream: {}",
-                            path, e
+                            path,
+                            io_errno_str(&e).1
                         ))?;
                         Value::Bool(false)
                     }
-                }
+                },
             }
         }
         "file_put_contents" => {
@@ -1695,38 +1638,59 @@ pub(crate) fn dispatch(
         }
         "file" => {
             let path = arg_str(it, args, 0);
-            match std::fs::read_to_string(&path) {
-                Ok(s) => {
+            let body = match uri_read(it, "file", &path)? {
+                Some(UriRead::Body(b)) => Some(b),
+                // ReadErr = opened but unreadable — an empty array.
+                Some(UriRead::ReadErr) => Some(Vec::new()),
+                Some(UriRead::Fail) => None,
+                None => match std::fs::read(&fs_path(&path)) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        it.warn_pub(&format!(
+                            "file({}): Failed to open stream: {}",
+                            path,
+                            io_errno_str(&e).1
+                        ))?;
+                        None
+                    }
+                },
+            };
+            match body {
+                Some(b) => {
                     let mut a = PhpArray::new();
-                    for l in s.split_inclusive('\n') {
-                        a.push(Value::str(l.to_string()));
+                    for l in b.split_inclusive(|&c| c == b'\n') {
+                        a.push(Value::str(String::from_utf8_lossy(l).into_owned()));
                     }
                     Value::Array(Rc::new(RefCell::new(a)))
                 }
-                Err(_) => {
-                    it.warn_pub(&format!("file({}): Failed to open stream", path))?;
-                    Value::Bool(false)
-                }
+                None => Value::Bool(false),
             }
         }
         "readfile" => {
             let path = arg_str(it, args, 0);
-            if path == "php://input" {
-                let body = it.php_input.clone();
-                it.emit(&String::from_utf8_lossy(&body));
-                Value::Int(body.len() as i64)
-            } else {
-                match std::fs::read(&path) {
+            match uri_read(it, "readfile", &path)? {
+                Some(UriRead::Body(b)) => {
+                    it.emit(&String::from_utf8_lossy(&b));
+                    Value::Int(b.len() as i64)
+                }
+                // Read failed after a successful open (php://output
+                // and the write-only stdio streams) — zend returns -1.
+                Some(UriRead::ReadErr) => Value::Int(-1),
+                Some(UriRead::Fail) => Value::Bool(false),
+                None => match std::fs::read(fs_path(&path)) {
                     Ok(b) => {
-                        let s = String::from_utf8_lossy(&b);
-                        it.emit(&s);
+                        it.emit(&String::from_utf8_lossy(&b));
                         Value::Int(b.len() as i64)
                     }
-                    Err(_) => {
-                        it.warn_pub(&format!("readfile({}): Failed to open stream", path))?;
+                    Err(e) => {
+                        it.warn_pub(&format!(
+                            "readfile({}): Failed to open stream: {}",
+                            path,
+                            io_errno_str(&e).1
+                        ))?;
                         Value::Bool(false)
                     }
-                }
+                },
             }
         }
         "parse_ini_file" | "parse_ini_string" => {
@@ -2652,9 +2616,15 @@ fn read_stream(path: &str) -> Result<Vec<u8>, std::io::Error> {
 /// Strips the `file://` stream wrapper — PHP treats `file:///abs/path`
 /// (and `file://localhost/...`) as a plain local path.
 fn fs_path(p: &str) -> &str {
-    match p.strip_prefix("file://") {
-        Some(rest) => rest.strip_prefix("localhost").unwrap_or(rest),
-        None => p,
+    let rest = if p.len() >= 7 && p[..7].eq_ignore_ascii_case("file://") {
+        &p[7..]
+    } else {
+        p
+    };
+    if rest.len() >= 9 && rest[..9].eq_ignore_ascii_case("localhost") {
+        &rest[9..]
+    } else {
+        rest
     }
 }
 
@@ -2707,6 +2677,106 @@ fn data_uri_meta(path: &str) -> (Option<String>, Vec<(String, String)>, bool) {
 /// `data:[mediatype][;base64],payload` wrapper — returns the decoded
 /// payload bytes, or None when the path isn't a data: URI.
 /// `data:` and `data://` forms both work (scalar_* tests).
+/// Stream-URI read shared by file_get_contents/file/readfile:
+/// resolves `php://`, `data:` and `scheme://` paths, emitting zend's
+/// wrapper diagnostics along the way. `None` = not a URI — the
+/// caller falls through to plain filesystem.
+enum UriRead {
+    /// Stream opened and read; may be empty.
+    Body(Vec<u8>),
+    /// Opened but the read failed (write-only stdio streams); the
+    /// EBADF notice, when any, is already emitted.
+    ReadErr,
+    /// Diagnostics emitted; the builtin returns false.
+    Fail,
+}
+
+fn uri_read(it: &mut Interp, f: &str, path: &str) -> Result<Option<UriRead>, PhpError> {
+    let low = path.to_lowercase();
+    let v = if low == "php://input" {
+        UriRead::Body(it.php_input.as_ref().clone())
+    } else if let Some(rest) = path.strip_prefix("data:") {
+        // rfc2397 — a comma is required; zend's wrapper names it in
+        // the open-stream warning.
+        let rest = rest.strip_prefix("//").unwrap_or(rest);
+        if rest.contains(',') {
+            match parse_data_uri(path) {
+                Some(b) => UriRead::Body(b),
+                None => UriRead::Fail,
+            }
+        } else {
+            it.warn_pub(&format!(
+                "{f}({path}): Failed to open stream: rfc2397: no comma in URL"
+            ))?;
+            UriRead::Fail
+        }
+    } else if low.starts_with("php://") {
+        if let Some((segs, inner)) = php_filter_uri(path) {
+            let Some(inner) = inner else {
+                return Err(PhpError::uncaught("Error", "No URL resource specified", 0));
+            };
+            match open_filter_resource(it, &segs, &inner, "rb", f, path)? {
+                Some(Value::Resource(r)) => {
+                    let c = cell(Value::Resource(r));
+                    let mut out = Vec::new();
+                    loop {
+                        match read_resource(it, Some(&c), 8192)? {
+                            StreamRead::Data(b) if !b.is_empty() => out.extend(b),
+                            _ => break,
+                        }
+                    }
+                    UriRead::Body(out)
+                }
+                _ => UriRead::Fail,
+            }
+        } else {
+            match low.as_str() {
+                // Read of a write-only stdio stream: EBADF notice,
+                // then the failed read.
+                "php://stdout" | "php://stderr" => {
+                    it.emit_diag_pub(
+                        8,
+                        &format!(
+                            "{f}(): Read of 8192 bytes failed with errno=9 Bad file descriptor"
+                        ),
+                    )?;
+                    UriRead::ReadErr
+                }
+                // php://output reads fail silently.
+                "php://output" => UriRead::ReadErr,
+                "php://stdin" | "php://memory" | "php://temp" => UriRead::Body(Vec::new()),
+                _ => {
+                    invalid_php_uri(it, f, path)?;
+                    UriRead::Fail
+                }
+            }
+        }
+    } else if let Some(scheme) = uri_scheme(path) {
+        if scheme.eq_ignore_ascii_case("file") {
+            // `file://` strips to a plain local path (case-insensitive).
+            return Ok(None);
+        }
+        // `scheme://` with no registered wrapper — zend warns twice;
+        // a mis-cased registered name fails "operation failed" instead.
+        if scheme.eq_ignore_ascii_case("data") {
+            it.warn_pub(&format!(
+                "{f}({path}): Failed to open stream: operation failed"
+            ))?;
+        } else {
+            it.warn_pub(&format!(
+                "{f}(): Unable to find the wrapper \"{scheme}\" - did you forget to enable it when you configured PHP?"
+            ))?;
+            it.warn_pub(&format!(
+                "{f}({path}): Failed to open stream: No such file or directory"
+            ))?;
+        }
+        UriRead::Fail
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(v))
+}
+
 fn parse_data_uri(path: &str) -> Option<Vec<u8>> {
     let rest = path
         .strip_prefix("data:")

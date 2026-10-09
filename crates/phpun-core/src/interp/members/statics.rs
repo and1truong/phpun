@@ -975,6 +975,18 @@ impl<'a> Interp<'a> {
         if name == "class" {
             return Ok(Value::str(cname));
         }
+        self.class_const_lookup(&cname, name)
+    }
+
+    /// The plain const walk — `Cls::{expr}` looks up "class"
+    /// literally (zend's dynamic-name FETCH_CLASS_CONSTANT has no
+    /// ::class magic).
+    pub(in crate::interp) fn class_const_lookup(
+        &mut self,
+        cname: &str,
+        name: &str,
+    ) -> Result<Value, PhpError> {
+        let cname = cname.to_string();
         // `X::CONST` on an unloaded class runs the autoloaders (real
         // psr-4 code hits this constantly — e.g. `Language::ENGLISH`).
         let resolved = self.resolve_class(&cname).unwrap_or_else(|| cname.clone());

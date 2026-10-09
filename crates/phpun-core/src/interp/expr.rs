@@ -1252,6 +1252,28 @@ impl<'a> Interp<'a> {
                 s.static_invoke_vis(cls, &n, argvals, None, fwd)
             }),
             Expr::ClassConst { class, name } => self.class_const(class, name),
+            Expr::ClassConstDyn { class, name } => {
+                let nv = self.eval(name)?;
+                match nv {
+                    Value::Str(n) => {
+                        let n = String::from_utf8_lossy(&n).into_owned();
+                        // A dynamic name is a literal lookup — `::{"class"}`
+                        // reads a const literally, no ::class magic.
+                        let lit = Self::is_lit_class_ref(class);
+                        let cname = self.class_name_of(class)?;
+                        self.scope_kw_err(&cname, lit)?;
+                        self.class_const_lookup(&cname, &n)
+                    }
+                    v => Err(PhpError::uncaught(
+                        "TypeError",
+                        format!(
+                            "Cannot use value of type {} as class constant name",
+                            self.zval_type_name(&v)
+                        ),
+                        self.cur_line,
+                    )),
+                }
+            }
             Expr::Clone(e) => {
                 let v = self.eval(e)?;
                 self.builtin_clone(&v, None)
@@ -9668,13 +9690,30 @@ impl<'a> Interp<'a> {
                             ));
                         }
                     },
-                    _ => Value::Float(-v.to_float()),
+                    // `-x` lowers to `x * -1`: bools/null coerce to
+                    // int; arrays, objects and resources TypeError.
+                    Value::Null => Value::Int(0),
+                    Value::Bool(b) => Value::Int(-(b as i64)),
+                    other => {
+                        return self.fail(PhpError::uncaught(
+                            "TypeError",
+                            format!(
+                                "Unsupported operand types: {} * int",
+                                other.operand_type_name()
+                            ),
+                            0,
+                        ))
+                    }
                 })
             }
             "+" => {
                 let v = self.eval(e)?;
                 Ok(match v {
                     Value::Int(_) | Value::Float(_) => v,
+                    // `+x` lowers to `x + 0`/`x * 1`: bools and null
+                    // coerce to int before the numeric-string path.
+                    Value::Null => Value::Int(0),
+                    Value::Bool(b) => Value::Int(b as i64),
                     other => match numeric(&other.to_php_bytes()) {
                         Numeric::Int(i) => Value::Int(i),
                         Numeric::Float(f) => Value::Float(f),
