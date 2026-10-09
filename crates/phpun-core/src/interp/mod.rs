@@ -294,6 +294,19 @@ struct MemCharge {
     probe: MemProbe,
 }
 
+/// A slot in `mem_seg_order`: either a live huge segment (`hole` = 0,
+/// `key` = its charge's tracked key) or the still-free span a freed
+/// segment left at that placement (`hole` > 0). The credit is lazy —
+/// zend's top-down mmap reoccupies a fitting hole with the next fresh
+/// segment before the segment below can ever extend into it — so a
+/// hole waits in its slot for seg_place to steal or seg_drain to
+/// merge at the heir's own grow.
+#[derive(Clone, Copy)]
+struct SegSlot {
+    key: usize,
+    hole: u64,
+}
+
 /// zend_mm chunk: ZEND_MM_CHUNK_SIZE (2MB, 512 pages).
 const MM_CHUNK: u64 = 2 * 1024 * 1024;
 /// zend_mm_max_large_size: largest request served from chunk page
@@ -1038,14 +1051,16 @@ pub struct Interp<'a> {
     /// Page-aligned size of live huge allocs — each is its own
     /// segment in real_size and is released when its owner dies.
     mem_huge: u64,
-    /// Live huge-segment charge keys in placement order — kernel
-    /// top-down mmap lands each new segment below the previous
-    /// lowest VMA, so position order approximates the VA stack
-    /// (highest first). ponytail: a freed segment's span extends the
-    /// runway of the live segment directly below it — needed for
-    /// the oracle's alloc/free/grow boundaries; interleaved chunks
-    /// and non-zend VMAs break the ordering assumption.
-    mem_seg_order: Vec<usize>,
+    /// Huge-segment placement order — kernel top-down mmap lands each
+    /// new segment below the previous lowest VMA, so position order
+    /// approximates the VA stack (highest first). A freed segment's
+    /// span stays a hole in its slot until a fitting placement steals
+    /// it or the live segment below drains it at grow time — eager
+    /// credit to the heir was wrong: a transient temp reoccupies the
+    /// same span every iteration and the heir never sees it.
+    /// ponytail: interleaved chunks and non-zend VMAs break the
+    /// ordering assumption.
+    mem_seg_order: Vec<SegSlot>,
     /// High-water mark of real_size — memory_get_peak_usage(true).
     pub(crate) mem_real_peak: u64,
     /// Allocations whose charge is tied to a live Rc — data pointer
@@ -3966,26 +3981,82 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// A huge segment's VA release: its freed span (footprint plus
-    /// whatever runway was left — its whole cap) extends the live
-    /// segment directly below it in the VA stack, the next entry
-    /// after it in placement order. A freed lowest segment's span
-    /// only feeds later placements, which the cap model already
-    /// gives the standard alignment gap — nothing to inherit.
-    fn seg_release(&mut self, key: usize, cap: u64) {
-        if let Some(p) = self.mem_seg_order.iter().position(|&k| k == key) {
-            self.mem_seg_order.remove(p);
-            if cap > 0 {
-                let heir = self.mem_seg_order[p..].iter().copied().find(|&k| {
-                    self.mem_tracked
-                        .get(&k)
-                        .is_some_and(|c| (c.probe)() && c.huge > 0)
-                });
-                if let Some(heir) = heir {
-                    if let Some(c) = self.mem_tracked.get_mut(&heir) {
-                        c.seg_cap = c.seg_cap.saturating_add(cap);
-                    }
-                }
+    /// Free VA a placement slot currently offers — a marked hole's
+    /// span, or a zombie's: a slot still keyed by a dead charge is
+    /// already unmapped in zend (efree munmaps at the free, ahead of
+    /// the sim's lazy probe sweep), so its range is fair game for
+    /// both fresh placement and a neighbor's extension.
+    fn slot_span(&self, s: SegSlot) -> u64 {
+        if s.hole > 0 {
+            return s.hole;
+        }
+        match self.mem_tracked.get(&s.key) {
+            Some(c) if !(c.probe)() => c.seg_cap,
+            _ => 0,
+        }
+    }
+
+    /// A freed huge segment's span stays a hole in its placement
+    /// slot — never eager credit to the segment below: the kernel's
+    /// top-down mmap reoccupies a fitting span with the next fresh
+    /// segment (a same-size temp cycles through its predecessor's
+    /// range every iteration), so the credit lands lazily — seg_place
+    /// steals a fitting hole, seg_drain merges what is still free
+    /// into the segment below at its own grow.
+    fn seg_free(&mut self, key: usize, span: u64) {
+        if let Some(s) = self
+            .mem_seg_order
+            .iter_mut()
+            .find(|s| s.key == key && s.hole == 0)
+        {
+            *s = SegSlot {
+                key: usize::MAX,
+                hole: span,
+            };
+        }
+    }
+
+    /// Place a fresh huge segment: top-down mmap drops it into the
+    /// topmost free span that still fits — hole or zombie slot — or
+    /// below every live segment. The placement's extend runway is the
+    /// stolen span whole, or a fresh stretch's alignment gap.
+    fn seg_place(&mut self, key: usize, fp: u64) -> u64 {
+        for i in 0..self.mem_seg_order.len() {
+            let span = self.slot_span(self.mem_seg_order[i]);
+            if span >= fp {
+                self.mem_seg_order[i] = SegSlot { key, hole: 0 };
+                return span;
+            }
+        }
+        self.mem_seg_order.push(SegSlot { key, hole: 0 });
+        Self::seg_stretch(fp, 0)
+    }
+
+    /// Merge every still-free slot directly above a live segment into
+    /// its extend runway — the mremap headroom zend extends into at
+    /// grow time. Runs where a grow decision reads seg_cap so a span
+    /// a later alloc already reoccupied never credits the heir.
+    fn seg_drain(&mut self, key: usize) {
+        let Some(mut q) = self
+            .mem_seg_order
+            .iter()
+            .position(|s| s.key == key && s.hole == 0)
+        else {
+            return;
+        };
+        let mut gain = 0u64;
+        while q > 0 {
+            let span = self.slot_span(self.mem_seg_order[q - 1]);
+            if span == 0 {
+                break;
+            }
+            gain = gain.saturating_add(span);
+            self.mem_seg_order.remove(q - 1);
+            q -= 1;
+        }
+        if gain > 0 {
+            if let Some(c) = self.mem_tracked.get_mut(&key) {
+                c.seg_cap = c.seg_cap.saturating_add(gain);
             }
         }
     }
@@ -4065,12 +4136,21 @@ impl<'a> Interp<'a> {
             }
         }
         if stale_cap > 0 {
-            // The recycled pointer's dead segment frees its span to
-            // the segment below before this key rejoins the stack.
-            self.seg_release(key, stale_cap);
+            // The recycled pointer's dead segment frees its span —
+            // a hole the fresh placement below reoccupies when it
+            // fits (a same-size temp cycles through the range).
+            self.seg_free(key, stale_cap);
         }
-        if huge > 0 && !self.mem_seg_order.contains(&key) {
-            self.mem_seg_order.push(key);
+        if huge > 0
+            && !self
+                .mem_seg_order
+                .iter()
+                .any(|s| s.key == key && s.hole == 0)
+        {
+            let cap = self.seg_place(key, fp);
+            if let Some(c) = self.mem_tracked.get_mut(&key) {
+                c.seg_cap = cap;
+            }
         }
     }
 
@@ -4222,6 +4302,10 @@ impl<'a> Interp<'a> {
                     }
                     return;
                 }
+                // Read the cap lazily: still-free holes directly
+                // above merge only now — a span a transient temp
+                // reoccupied in the meantime never credited it.
+                self.seg_drain(key);
                 let cap = self.mem_tracked.get(&key).map(|c| c.seg_cap).unwrap_or(0);
                 let reloc = fp > cap;
                 let limit = self.ini_bytes("memory_limit");
@@ -4376,18 +4460,29 @@ impl<'a> Interp<'a> {
         }
         if old_seg_cap > 0 {
             // The retired table was a huge segment — its freed span
-            // extends the live segment directly below it.
-            self.seg_release(key, old_seg_cap);
+            // becomes a hole in its slot (lazy credit: whoever below
+            // grows into it while it stays free takes it).
+            self.seg_free(key, old_seg_cap);
         }
         if top_credit > 0 {
-            if let Some(&top) = self.mem_seg_order.first() {
+            let top = self
+                .mem_seg_order
+                .iter()
+                .find(|&s| self.slot_span(*s) == 0)
+                .map(|s| s.key);
+            if let Some(top) = top {
                 if let Some(c) = self.mem_tracked.get_mut(&top) {
                     c.seg_cap = c.seg_cap.saturating_add(top_credit);
                 }
             }
         }
-        if huge > 0 && !self.mem_seg_order.contains(&key) {
-            self.mem_seg_order.push(key);
+        if huge > 0
+            && !self
+                .mem_seg_order
+                .iter()
+                .any(|s| s.key == key && s.hole == 0)
+        {
+            self.mem_seg_order.push(SegSlot { key, hole: 0 });
         }
     }
 
@@ -4469,26 +4564,25 @@ impl<'a> Interp<'a> {
         let mut inner = 0u64;
         let mut huge = 0u64;
         let mut freed = Vec::new();
-        // Freed segments hand their whole span (footprint + leftover
-        // runway = cap) to the live segment directly below them in
-        // placement order — contiguous freed ranges merge, so the
-        // pending span accumulates onto the next live entry.
-        let mut pending = 0u64;
+        // Freed segments leave their span as a hole in their
+        // placement slot — the credit stays lazy: seg_place steals a
+        // fitting hole, seg_drain merges what is still free into the
+        // segment below at its own grow.
         let mut order = std::mem::take(&mut self.mem_seg_order);
         let tracked = &mut self.mem_tracked;
-        order.retain(|&k| match tracked.get(&k) {
-            Some(c) if (c.probe)() && c.huge > 0 => {
-                if pending > 0 {
-                    tracked.get_mut(&k).unwrap().seg_cap += pending;
-                    pending = 0;
+        order.retain_mut(|s| {
+            if s.hole > 0 {
+                return true;
+            }
+            match tracked.get(&s.key) {
+                Some(c) if (c.probe)() && c.huge > 0 => true,
+                Some(c) => {
+                    s.key = usize::MAX;
+                    s.hole = c.seg_cap;
+                    s.hole > 0
                 }
-                true
+                None => false,
             }
-            Some(c) => {
-                pending += c.seg_cap;
-                false
-            }
-            None => false,
         });
         self.mem_seg_order = order;
         // Releases land on each charge's recorded chunk — a chunk
@@ -4554,7 +4648,7 @@ impl<'a> Interp<'a> {
                     Self::vm_stack_apply(&mut self.vm_stack, seg, slots, own);
                 }
                 if dead.huge > 0 {
-                    self.seg_release(key, dead.seg_cap);
+                    self.seg_free(key, dead.seg_cap);
                 }
             } else {
                 let sub = fp.min(e.get().inner);
@@ -4589,9 +4683,9 @@ impl<'a> Interp<'a> {
             }
             if c.huge > 0 {
                 if inherit {
-                    self.seg_release(key, c.seg_cap);
+                    self.seg_free(key, c.seg_cap);
                 } else {
-                    self.mem_seg_order.retain(|&k| k != key);
+                    self.mem_seg_order.retain(|s| s.key != key);
                 }
             }
             self.chunk_release(c.chunk, c.inner);
@@ -4632,6 +4726,10 @@ impl<'a> Interp<'a> {
         // check). Otherwise the old segment unmaps and only the
         // growth delta is checked. Untracked/dead olds relocate.
         let old_key = Rc::as_ptr(old) as *const u8 as usize;
+        // Drain still-free holes above the grown segment into its
+        // runway first — a span a later alloc reoccupied meanwhile
+        // never credited it.
+        self.seg_drain(old_key);
         let old_seg = self
             .mem_tracked
             .get(&old_key)
@@ -4715,17 +4813,21 @@ impl<'a> Interp<'a> {
                 Self::vm_stack_apply(&mut self.vm_stack, seg, slots, own);
             }
             if c.huge > 0 {
-                self.seg_release(key, c.seg_cap);
+                self.seg_free(key, c.seg_cap);
             }
             self.chunk_release(c.chunk, c.inner);
         }
         if req > MM_MAX_LARGE {
             // The grown segment stands where its predecessor stood
             // in the placement order.
-            if let Some(p) = self.mem_seg_order.iter().position(|&k| k == old_key) {
-                self.mem_seg_order[p] = key;
+            if let Some(p) = self
+                .mem_seg_order
+                .iter()
+                .position(|s| s.key == old_key && s.hole == 0)
+            {
+                self.mem_seg_order[p].key = key;
             } else {
-                self.mem_seg_order.push(key);
+                self.mem_seg_order.push(SegSlot { key, hole: 0 });
             }
         }
         let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
