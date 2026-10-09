@@ -543,8 +543,8 @@ impl<'a> Interp<'a> {
                         return self.fail(PhpError::uncaught(
                             "Error",
                             format!(
-                                "{}: Argument #{}{} could not be passed by reference",
-                                format!("{}()", ctx),
+                                "{}(): Argument #{}{} could not be passed by reference",
+                                ctx,
                                 argno,
                                 pname.map(|n| format!(" (${})", n)).unwrap_or_default()
                             ),
@@ -699,15 +699,12 @@ impl<'a> Interp<'a> {
         };
         // ponytail: most call sites are already lowercase — borrow them
         // and only pay the String alloc for mixed-case names.
-        let lname: std::borrow::Cow<str> = if raw_lname
-            .bytes()
-            .any(|b| b.is_ascii_uppercase())
-            || !raw_lname.is_ascii()
-        {
-            std::borrow::Cow::Owned(raw_lname.to_lowercase())
-        } else {
-            std::borrow::Cow::Borrowed(raw_lname)
-        };
+        let lname: std::borrow::Cow<str> =
+            if raw_lname.bytes().any(|b| b.is_ascii_uppercase()) || !raw_lname.is_ascii() {
+                std::borrow::Cow::Owned(raw_lname.to_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(raw_lname)
+            };
         // `__HALT_COMPILER()` stops execution of the file (ns_080).
         if lname == "__halt_compiler" {
             return Err(PhpError {
@@ -4519,8 +4516,7 @@ impl<'a> Interp<'a> {
             // reports 3 args, not 2 (named_params/func_get_args).
             let max_bound = (0..n_fixed)
                 .filter(|i| {
-                    args.cells.get(*i).is_some()
-                        || by_name.get(*i).is_some_and(|s| s.is_some())
+                    args.cells.get(*i).is_some() || by_name.get(*i).is_some_and(|s| s.is_some())
                 })
                 .max();
             let mut fa: Vec<Cell> = Vec::new();

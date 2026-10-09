@@ -1134,13 +1134,7 @@ impl<'a> Interp<'a> {
                     .and_then(|c| s.find_method_in(&c, "__construct"))
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
-                let argvals = s.arg_cells(
-                    args,
-                    &params,
-                    &name,
-                    false,
-                    Some(*site),
-                )?;
+                let argvals = s.arg_cells(args, &params, &name, false, Some(*site))?;
                 s.new_instance(&name, argvals)
             }),
             Expr::Prop {
