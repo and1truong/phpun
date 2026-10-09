@@ -1778,11 +1778,11 @@ impl<'a> Interp<'a> {
         if let Some(s) = site {
             self.send_line = Some(s);
         }
-        let mn = Self::nul_trunc(&self.prop_name(name)?);
         // A CV obj (bare or folded varvar) binds inside the
         // INIT_METHOD_CALL op at the member's end — the name token's
         // line for `->m`, the name expr's last line for `->{e}()`.
-        // `?->` keeps the obj's own line.
+        // `?->` keeps the obj's own line. Zend evaluates the object
+        // BEFORE the method-name expression for `->{e}()`.
         let obj_u = Self::unmark_rhs(obj);
         let ov = if !nullsafe && Self::is_cv(obj_u) {
             let mline = match name {
@@ -1794,11 +1794,26 @@ impl<'a> Interp<'a> {
         } else {
             self.eval(obj)?
         };
+        let mn = Self::nul_trunc(&self.prop_name(name)?);
         match ov {
             Value::Null if nullsafe => Ok(Value::Null),
             Value::Object(o) => {
+                let cls = o.borrow().class.clone();
+                // Zend binds the method at INIT_METHOD_CALL — before
+                // argument evaluation — so a missing method with no
+                // __call fallback fatals before any argument runs.
+                if self.find_method_in(&cls, &mn).is_none()
+                    && self.scope_private_method(&mn).is_none()
+                    && self.find_method_in(&cls, "__call").is_none()
+                {
+                    return self.fail(PhpError::uncaught(
+                        "Error",
+                        format!("Call to undefined method {}::{}()", cls.name(), mn),
+                        0,
+                    ));
+                }
                 let params = self
-                    .find_method_in(&o.borrow().class.clone(), &mn)
+                    .find_method_in(&cls, &mn)
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
                 let argvals = self.arg_cells(args, &params, &mn, false, site)?;
@@ -2418,6 +2433,40 @@ impl<'a> Interp<'a> {
                 _ => {}
             }
         }
+        // DateTimeZone: the ctor validates the identifier against zend's
+        // accepted shapes — unknown names throw
+        // DateInvalidTimeZoneException.
+        if cls.name().eq_ignore_ascii_case("datetimezone") {
+            match name.to_lowercase().as_str() {
+                "__construct" => {
+                    let tz = args
+                        .first()
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null);
+                    let tz = self.conv_str(&tz)?.to_string();
+                    if !tz_name_ok(&tz) {
+                        return self.fail(PhpError::uncaught(
+                            "DateInvalidTimeZoneException",
+                            format!("DateTimeZone::__construct(): Unknown or bad timezone ({tz})"),
+                            0,
+                        ));
+                    }
+                    obj.borrow_mut()
+                        .props
+                        .insert("\0tz\0name".into(), cell(Value::str(tz)));
+                    return Ok(Value::Null);
+                }
+                "getname" => {
+                    return Ok(obj
+                        .borrow()
+                        .props
+                        .get("\0tz\0name")
+                        .map(|c| c.borrow().clone())
+                        .unwrap_or(Value::Null));
+                }
+                _ => {}
+            }
+        }
         // DateTime: minimal native clock — the ctor stores the parsed
         // timestamp so getTimestamp/diff can read it back
         // (closure_call_internal).
@@ -2546,6 +2595,7 @@ impl<'a> Interp<'a> {
         // is_a walks the object's own decl chain — classes.get on the
         // name would miss synthesized names like anonymous classes.
         let gated = cn.starts_with("reflection")
+            || cn == "datetimezone"
             || self.is_a(cls, "throwable")
             || self.is_a(cls, "datetime")
             || self.is_a(cls, "datetimeimmutable")
@@ -3385,4 +3435,102 @@ impl<'a> Interp<'a> {
             None => false,
         }
     }
+}
+
+/// Whether `s` names a timezone zend would accept — UTC, ±HH:MM
+/// offsets, the legacy zone names, and Continent/City paths under a
+/// real continent.
+/// ponytail: accepts any city name under a known continent; only the
+/// shape is checked, not the ~600-entry tz db.
+fn tz_name_ok(s: &str) -> bool {
+    if s.eq_ignore_ascii_case("utc") {
+        return true;
+    }
+    let b = s.as_bytes();
+    if b.len() == 6
+        && matches!(b[0], b'+' | b'-')
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+        && b[3] == b':'
+        && b[4].is_ascii_digit()
+        && b[5].is_ascii_digit()
+    {
+        return true;
+    }
+    const LEGACY: &[&str] = &[
+        "GMT",
+        "UCT",
+        "UNIVERSAL",
+        "ZULU",
+        "GREENWICH",
+        "CET",
+        "EET",
+        "MET",
+        "WET",
+        "EST",
+        "EDT",
+        "CST",
+        "CDT",
+        "MST",
+        "MDT",
+        "PST",
+        "PDT",
+        "HST",
+        "CST6CDT",
+        "EST5EDT",
+        "MST7MDT",
+        "PST8PDT",
+        "CUBA",
+        "EGYPT",
+        "EIRE",
+        "GB",
+        "GB-EIRE",
+        "HONGKONG",
+        "ICELAND",
+        "IRAN",
+        "ISRAEL",
+        "JAMAICA",
+        "JAPAN",
+        "KWAJALEIN",
+        "LIBYA",
+        "NAVAJO",
+        "NZ",
+        "NZ-CHAT",
+        "POLAND",
+        "PORTUGAL",
+        "PRC",
+        "ROC",
+        "ROK",
+        "SINGAPORE",
+        "TURKEY",
+        "W-SU",
+        "FACTORY",
+    ];
+    if LEGACY.iter().any(|n| s.eq_ignore_ascii_case(n)) {
+        return true;
+    }
+    const CONTINENTS: &[&str] = &[
+        "AFRICA",
+        "AMERICA",
+        "ANTARCTICA",
+        "ARCTIC",
+        "ASIA",
+        "ATLANTIC",
+        "AUSTRALIA",
+        "EUROPE",
+        "INDIAN",
+        "PACIFIC",
+        "ETC",
+        "US",
+        "CANADA",
+        "BRAZIL",
+        "CHILE",
+        "MEXICO",
+        "MIDEAST",
+    ];
+    s.split('/')
+        .next()
+        .is_some_and(|c| CONTINENTS.iter().any(|k| c.eq_ignore_ascii_case(k)))
+        && s.contains('/')
+        && !s.ends_with('/')
 }

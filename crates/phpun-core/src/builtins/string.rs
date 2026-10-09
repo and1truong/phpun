@@ -435,13 +435,6 @@ pub(crate) fn dispatch(
             Value::bytes(trim_set(&s, &chars, true, false))
         }
         "rtrim" | "chop" => {
-            if matches!(arg(args, 0), Value::Null) {
-                // Non-nullable internal param receiving null (bug43201).
-                it.deprecated_pub(&format!(
-                    "{}(): Passing null to parameter #1 ($string) of type string is deprecated",
-                    name
-                ))?;
-            }
             let s = arg_bs(it, args, 0);
             let chars = if args.len() > 1 {
                 arg_bs(it, args, 1)
@@ -492,46 +485,51 @@ pub(crate) fn dispatch(
             // implode($scalar) binds it to $separator — whose
             // 'of type string' check passes after coercion — leaving
             // $array null, which ZPP then rejects.
-            if args.len() == 1 && !matches!(&*args[0].borrow(), Value::Array(_)) {
+            let sep_v = arg(args, 0);
+            // 8.5 dropped the legacy swapped order: a separator that
+            // is itself an array only flies in the 1-arg form.
+            if matches!(sep_v, Value::Array(_)) && args.len() > 1 {
                 return err(
                     "TypeError",
                     format!(
-                        "{}(): If argument #1 ($separator) is of type string, argument #2 ($array) must be of type array, null given",
+                        "{}(): Argument #1 ($separator) must be of type string, array given",
                         name
                     ),
                 );
             }
-            // `implode(null, $a)` — separator is `array|string`,
-            // so null deprecates rather than TypeErrors.
-            if args.len() > 1 && matches!(&*args[0].borrow(), Value::Null) {
-                it.deprecated_pub(&format!(
-                    "{}(): Passing null to parameter #1 ($separator) of type array|string is deprecated",
-                    name
-                ))?;
-            }
-            if args.len() > 1 && !matches!(&*args[1].borrow(), Value::Array(_) | Value::Null) {
+            if !matches!(sep_v, Value::Array(_))
+                && !matches!(
+                    args.get(1).map(|c| c.borrow().clone()),
+                    Some(Value::Array(_))
+                )
+            {
                 return err(
                     "TypeError",
                     format!(
-                        "{}(): Argument #2 ($array) must be of type ?array, {} given",
+                        "{}(): If argument #1 ($separator) is of type string, argument #2 ($array) must be of type array, {} given",
                         name,
-                        zval_word(&args[1].borrow())
+                        args.get(1)
+                            .map(|c| zval_word(&c.borrow()))
+                            .unwrap_or_else(|| "null".into())
                     ),
                 );
             }
-            let (sep, arr) = if args.len() == 1 {
-                (Vec::new(), arg(args, 0))
+            let (sep, arr) = if matches!(sep_v, Value::Array(_)) {
+                (Vec::new(), sep_v)
             } else {
-                (arg(args, 0).to_php_bytes(), arg(args, 1))
+                (it.to_bytes_of(&sep_v), arg(args, 1))
             };
             match arr {
                 Value::Array(a) => {
-                    let parts: Vec<Vec<u8>> = a
+                    // Convert off-borrow: an element's __toString is
+                    // userland and could mutate the array.
+                    let elems: Vec<Value> = a
                         .borrow()
                         .entries
                         .iter()
-                        .map(|(_, c)| c.borrow().to_php_bytes())
+                        .map(|(_, c)| c.borrow().clone())
                         .collect();
+                    let parts: Vec<Vec<u8>> = elems.iter().map(|v| it.to_bytes_of(v)).collect();
                     let mut out = Vec::new();
                     for (i, p) in parts.iter().enumerate() {
                         if i > 0 {

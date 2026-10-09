@@ -308,13 +308,7 @@ fn intdiv_int(it: &mut Interp, v: &Value, n: usize, name: &str) -> Result<i64, P
             }
             _ => Err(te("string")),
         },
-        Value::Null => {
-            it.deprecated_pub(&format!(
-                "intdiv(): Passing null to parameter #{} (${}) of type int is deprecated",
-                n, name
-            ))?;
-            Ok(0)
-        }
+        Value::Null => Ok(0),
         Value::Int(i) => Ok(*i),
         Value::Bool(b) => Ok(*b as i64),
         other => Err(te(&other.operand_type_name())),

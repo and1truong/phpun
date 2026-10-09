@@ -144,8 +144,18 @@ const FAMILIES: &[Dispatch] = &[
 
 pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>, PhpError> {
     for f in FAMILIES {
-        if let Some(v) = f(it, name, args)? {
-            return Ok(Some(v));
+        match f(it, name, args) {
+            Ok(None) => continue,
+            r => {
+                // A string conversion that failed mid-builtin aborts
+                // the call — zend dies at the Z_PARAM_* before the
+                // builtin would have run, so the deferred error wins
+                // over whatever it went on to return.
+                if let Some(e) = it.take_cast_err() {
+                    return Err(e);
+                }
+                return r;
+            }
         }
     }
     Ok(None)
@@ -1546,6 +1556,12 @@ pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
         "strcmp" | "strcasecmp" | "strnatcmp" | "strnatcasecmp" => {
             &[("string1", "string"), ("string2", "string")]
         }
+        "substr_replace" => &[
+            ("string", "array|string"),
+            ("replace", "string"),
+            ("offset", "array|int"),
+            ("length", "array|int|null"),
+        ],
         "strncmp" | "strncasecmp" => &[
             ("string1", "string"),
             ("string2", "string"),
@@ -1557,19 +1573,19 @@ pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
             ("pad_string", "string"),
             ("pad_type", "int"),
         ],
-        "trim" | "ltrim" | "rtrim" => &[("string", "string"), ("characters", "string")],
+        "trim" | "ltrim" | "rtrim" | "chop" => &[("string", "string"), ("characters", "string")],
         "str_split" => &[("string", "string"), ("length", "int")],
         "str_replace" | "str_ireplace" => &[
-            ("search", "string|array"),
-            ("replace", "string|array"),
-            ("subject", "string|array"),
+            ("search", "array|string"),
+            ("replace", "array|string"),
+            ("subject", "array|string"),
         ],
         "explode" => &[
             ("separator", "string"),
             ("string", "string"),
             ("limit", "int"),
         ],
-        "implode" | "join" => &[("separator", "?string"), ("array", "?array")],
+        "implode" | "join" => &[("separator", "array|string"), ("array", "?array")],
         "array_map" => &[("callback", "?callable"), ("array", "array")],
         "array_filter" => &[("array", "array"), ("callback", "?callable")],
         "array_reduce" => &[
@@ -1581,7 +1597,7 @@ pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
             &[("array", "array|object"), ("callback", "callable")]
         }
         "usort" | "uasort" | "uksort" => &[("array", "array"), ("callback", "callable")],
-        "count" | "sizeof" => &[("value", "array|object"), ("mode", "int")],
+        "count" | "sizeof" => &[("value", "Countable|array"), ("mode", "int")],
         "in_array" => &[
             ("needle", "mixed"),
             ("haystack", "array"),
