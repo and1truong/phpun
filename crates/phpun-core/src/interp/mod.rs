@@ -294,19 +294,26 @@ struct MemCharge {
     probe: MemProbe,
 }
 
+/// A slot in `mem_seg_order`: either a live huge segment (`hole` = 0,
+/// `key` = its charge's tracked key) or the still-free span a freed
+/// segment left at that placement (`hole` > 0). The credit is lazy —
+/// zend's top-down mmap reoccupies a fitting hole with the next fresh
+/// segment before the segment below can ever extend into it — so a
+/// hole waits in its slot for seg_place to steal or seg_drain to
+/// merge at the heir's own grow.
+#[derive(Clone, Copy)]
+struct SegSlot {
+    /// The owning charge's tracked key — `usize::MAX` marks a hole
+    /// slot (no live owner).
+    key: usize,
+    hole: u64,
+}
+
 /// zend_mm chunk: ZEND_MM_CHUNK_SIZE (2MB, 512 pages).
 const MM_CHUNK: u64 = 2 * 1024 * 1024;
 /// zend_mm_max_large_size: largest request served from chunk page
 /// runs; bigger requests get a dedicated segment.
 const MM_MAX_LARGE: u64 = 2_093_056;
-/// Slack of free address space a freshly-placed huge segment may
-/// extend into before mremap is blocked and zend's erealloc
-/// relocates. Kernel top-down placement lands a new mapping just
-/// below the lowest VMA, so a relocated segment's runway is the
-/// freed predecessor's hole plus up to a chunk of gap; oracle walls
-/// put the gap at ~3/4 chunk. ponytail: the true ceiling is the
-/// next VMA's address — the real page map PR #88 owns.
-const MM_SEG_SLACK: u64 = MM_CHUNK * 3 / 4;
 /// zend_mm_max_small_size: largest bin-bucketed request.
 const MM_SMALL: u64 = 3072;
 /// Heap usage a fresh script observes under memory_get_usage()
@@ -1032,16 +1039,42 @@ pub struct Interp<'a> {
     /// zend_mm's committed chunk list — used bytes per 2MB chunk.
     /// A run first-fits the oldest chunk with room; a freed run's
     /// pages stay committed for reuse (chunks only unmap once the
-    /// whole chunk is empty — ponytail: approximated as never, which
-    /// matches oracle on the ob realloc sequences; only huge
-    /// segments munmap on free). Chunk-level fidelity, not
-    /// page-run-level: freed space is treated as contiguous, so a
-    /// badly fragmented tail can pin a chunk the sim thinks
-    /// reusable.
+    /// whole chunk is empty — zend_mm_delete_chunk, except the last
+    /// non-main chunk which zend keeps mapped on its cached list).
+    /// An entry at 0 bytes is a dead slot unless it is `mem_cached`.
+    /// Chunk-level fidelity, not page-run-level: freed space is
+    /// treated as contiguous, so a badly fragmented tail can pin a
+    /// chunk the sim thinks reusable.
     mem_chunks: Vec<u64>,
+    /// zend_mm chunk->num per `mem_chunks` slot — a monotonically
+    /// increasing identity assigned at each fresh commit: a reused
+    /// slot is a NEWER chunk than its index suggests, so the
+    /// emptied-vs-cached ordering can't key on position.
+    mem_chunk_nums: Vec<u64>,
+    mem_chunk_num_next: u64,
+    /// Emptied non-main chunks zend keeps mapped on cached_chunks
+    /// (delay deletion — get_chunk pops one back without running the
+    /// limit check). LIFO stack of `mem_chunks` indices; zend holds at
+    /// most a couple intra-request.
+    mem_cached: Vec<usize>,
+    /// zend_mm_delete_chunk hysteresis: chunks_count at the last real
+    /// unmap and the consecutive unmaps at that same boundary — the
+    /// 4th+ deletion at one boundary caches instead of unmapping.
+    chunks_del_boundary: usize,
+    chunks_del_count: usize,
     /// Page-aligned size of live huge allocs — each is its own
     /// segment in real_size and is released when its owner dies.
     mem_huge: u64,
+    /// Huge-segment placement order — kernel top-down mmap lands each
+    /// new segment below the previous lowest VMA, so position order
+    /// approximates the VA stack (highest first). A freed segment's
+    /// span stays a hole in its slot until a fitting placement steals
+    /// it or the live segment below drains it at grow time — eager
+    /// credit to the heir was wrong: a transient temp reoccupies the
+    /// same span every iteration and the heir never sees it.
+    /// ponytail: interleaved chunks and non-zend VMAs break the
+    /// ordering assumption.
+    mem_seg_order: Vec<SegSlot>,
     /// High-water mark of real_size — memory_get_peak_usage(true).
     pub(crate) mem_real_peak: u64,
     /// Allocations whose charge is tied to a live Rc — data pointer
@@ -1830,7 +1863,13 @@ impl<'a> Interp<'a> {
             mem_committed: MM_CHUNK,
             mem_in_chunk: MM_BASE_CHUNK,
             mem_chunks: vec![MM_BASE_CHUNK],
+            mem_chunk_nums: vec![0],
+            mem_chunk_num_next: 1,
+            mem_cached: Vec::new(),
+            chunks_del_boundary: 0,
+            chunks_del_count: 0,
             mem_huge: 0,
+            mem_seg_order: Vec::new(),
             mem_real_peak: MM_CHUNK,
             // Seed: header + the top-level frame's span.
             vm_stack: vec![VmSeg {
@@ -3761,11 +3800,19 @@ impl<'a> Interp<'a> {
         }
         let limit = limit as u64;
         let fp = Self::mem_fp(req);
-        // A run needs a fresh chunk when no committed chunk can host
+        // A run needs a fresh chunk when no in-list chunk can host
         // it — zend then commits another 2MB, and the limit check is
-        // that commit's overflow, not the run's own bytes.
-        let needs_chunk =
-            |s: &Self| req <= MM_MAX_LARGE && !s.mem_chunks.iter().any(|&u| u + fp <= MM_CHUNK);
+        // that commit's overflow, not the run's own bytes. Cached
+        // and unmapped slots aren't in zend's chunk list, so only
+        // occupied runs (and the always-mapped main chunk) host.
+        let needs_chunk = |s: &Self| {
+            req <= MM_MAX_LARGE
+                && !s
+                    .mem_chunks
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &u)| (u > 0 || i == 0) && u + fp <= MM_CHUNK)
+        };
         // Crossing a commit boundary — reclaim dead charges first
         // (zend frees blocks at efree; the Weak probes catch up here
         // so a just-died large alloc never trips the limit).
@@ -3782,7 +3829,12 @@ impl<'a> Interp<'a> {
             } else {
                 None
             }
-        } else if needs_chunk(self) && self.mem_real().saturating_add(MM_CHUNK) > limit {
+        } else if needs_chunk(self)
+            // get_chunk pops the cached chunk first — that path skips
+            // the limit check entirely (zend_mm_get_chunk).
+            && self.mem_cached.is_empty()
+            && self.mem_real().saturating_add(MM_CHUNK) > limit
+        {
             Some(fp)
         } else {
             None
@@ -3804,10 +3856,14 @@ impl<'a> Interp<'a> {
     }
 
     /// Extend runway of a freshly (re)placed huge segment — its own
-    /// footprint plus the freed predecessor's hole (`hole`, 0 for a
-    /// brand-new alloc) and the placement slack.
+    /// footprint, the freed predecessor's span above it (`hole`:
+    /// the old segment's whole cap on reloc — footprint plus
+    /// leftover runway — an emptied chunk's 2MB, or 0), and the
+    /// alignment gap the kernel's 2MB-aligned top-down placement
+    /// leaves below the predecessor's base. Verified against
+    /// /proc/self/maps on the oracle: gap = (-fp) mod MM_CHUNK.
     fn seg_stretch(fp: u64, hole: u64) -> u64 {
-        fp + hole + MM_SEG_SLACK
+        fp + (MM_CHUNK - fp % MM_CHUNK) % MM_CHUNK + hole
     }
 
     /// mem_check for flat emalloc results: zend reports the raw
@@ -3856,37 +3912,196 @@ impl<'a> Interp<'a> {
         (fp, chunk)
     }
 
-    /// First-fit an in-chunk run: the oldest chunk with room takes
-    /// it, else a fresh 2MB chunk commits (zend scans its chunk list
-    /// the same way — this is what makes a 1M temp pack into
-    /// chunk0's tail while a 2MB buffer run needs its own chunk).
+    /// First-fit an in-chunk run: the oldest in-list chunk with room
+    /// takes it (zend scans committed chunks for a free page run —
+    /// dead and cached slots aren't in that list); on a miss,
+    /// get_chunk pops the cached chunk back into service before
+    /// committing a fresh one.
     fn chunk_place(&mut self, fp: u64) -> usize {
         for (i, u) in self.mem_chunks.iter_mut().enumerate() {
-            if *u + fp <= MM_CHUNK {
-                if *u == 0 {
-                    // Recommitting a span zend had unmapped empty.
-                    self.mem_committed += MM_CHUNK;
-                }
+            if (*u > 0 || i == 0) && *u + fp <= MM_CHUNK {
                 *u += fp;
                 return i;
             }
         }
+        if let Some(i) = self.mem_cached.pop() {
+            debug_assert_eq!(self.mem_chunks[i], 0);
+            self.mem_chunks[i] = fp;
+            return i;
+        }
+        // Fresh 2MB commit — reuse a dead slot or append.
+        for (i, u) in self.mem_chunks.iter_mut().enumerate() {
+            if *u == 0 && i != 0 {
+                *u = fp;
+                self.mem_chunk_nums[i] = self.mem_chunk_num_next;
+                self.mem_chunk_num_next += 1;
+                self.mem_committed += MM_CHUNK;
+                return i;
+            }
+        }
         self.mem_chunks.push(fp);
+        self.mem_chunk_nums.push(self.mem_chunk_num_next);
+        self.mem_chunk_num_next += 1;
         self.mem_committed += MM_CHUNK;
         self.mem_chunks.len() - 1
     }
 
+    /// zend_mm_delete_chunk: an emptied non-main chunk leaves the
+    /// committed list. It goes onto cached_chunks — stays mapped and
+    /// get_chunk pops it back skipping the limit check — while the
+    /// heap is collapsing (chunks+cached < avg+0.1, and zend only
+    /// recomputes avg at request end so it is ~1 intra-request) or
+    /// once 4+ consecutive unmaps hit the same chunks_count boundary
+    /// (last_chunks_delete_count hysteresis). Otherwise a chunk
+    /// unmaps: the emptied one when it is newer than the cached head,
+    /// else the head (zend_mm chunk->num ordering — `nums` tracks it,
+    /// the slot index can't: a reused slot is newer than it looks).
+    /// The boundary/count update runs only with an empty
+    /// cache, like zend. Caller has already zeroed the occupancy.
+    /// Field-level args keep this callable while a mem_tracked entry
+    /// borrow is outstanding. Returns true when the emptied chunk
+    /// stays mapped (cached directly, or swapped in for the head).
+    fn chunk_vacate(
+        chunks: &mut [u64],
+        nums: &[u64],
+        committed: &mut u64,
+        cached: &mut Vec<usize>,
+        del_boundary: &mut usize,
+        del_count: &mut usize,
+        idx: usize,
+    ) -> bool {
+        let live = chunks
+            .iter()
+            .enumerate()
+            .filter(|(j, &u)| *j != idx && !cached.contains(j) && (u > 0 || *j == 0))
+            .count();
+        if live + cached.len() <= 1 || (live == *del_boundary && *del_count >= 4) {
+            cached.push(idx);
+            return true;
+        }
+        *committed = committed.saturating_sub(MM_CHUNK);
+        if cached.is_empty() {
+            if live != *del_boundary {
+                *del_boundary = live;
+                *del_count = 0;
+            } else {
+                *del_count += 1;
+            }
+        }
+        match cached.last() {
+            // Emptied is older than the cached head — zend unmaps the
+            // head and caches this one instead (its span stays
+            // committed).
+            Some(&head) if nums[idx] < nums[head] => {
+                *cached.last_mut().unwrap() = idx;
+                true
+            }
+            // Nothing cached, or the emptied chunk is the newer one
+            // — it unmaps itself.
+            _ => false,
+        }
+    }
+
     /// Return fp bytes to the recorded chunk. Occupancy is
     /// chunk-level, so a release just lowers the tally; a chunk that
-    /// hits zero unmaps outright (zend frees fully-empty chunks —
-    /// only the main chunk, index 0 here, survives).
+    /// hits zero goes through chunk_vacate (zend frees fully-empty
+    /// chunks — only the main chunk, index 0 here, survives).
     fn chunk_release(&mut self, idx: usize, fp: u64) {
         if let Some(u) = self.mem_chunks.get_mut(idx) {
             let nu = u.saturating_sub(fp);
-            if nu == 0 && *u != 0 && idx != 0 {
-                self.mem_committed = self.mem_committed.saturating_sub(MM_CHUNK);
-            }
+            let was = *u;
             *u = nu;
+            if nu == 0 && was != 0 && idx != 0 {
+                Self::chunk_vacate(
+                    &mut self.mem_chunks,
+                    &self.mem_chunk_nums,
+                    &mut self.mem_committed,
+                    &mut self.mem_cached,
+                    &mut self.chunks_del_boundary,
+                    &mut self.chunks_del_count,
+                    idx,
+                );
+            }
+        }
+    }
+
+    /// Free VA a placement slot currently offers — a marked hole's
+    /// span, or a zombie's: a slot still keyed by a dead charge is
+    /// already unmapped in zend (efree munmaps at the free, ahead of
+    /// the sim's lazy probe sweep), so its range is fair game for
+    /// both fresh placement and a neighbor's extension.
+    fn slot_span(&self, s: SegSlot) -> u64 {
+        if s.hole > 0 {
+            return s.hole;
+        }
+        match self.mem_tracked.get(&s.key) {
+            Some(c) if !(c.probe)() => c.seg_cap,
+            _ => 0,
+        }
+    }
+
+    /// A freed huge segment's span stays a hole in its placement
+    /// slot — never eager credit to the segment below: the kernel's
+    /// top-down mmap reoccupies a fitting span with the next fresh
+    /// segment (a same-size temp cycles through its predecessor's
+    /// range every iteration), so the credit lands lazily — seg_place
+    /// steals a fitting hole, seg_drain merges what is still free
+    /// into the segment below at its own grow.
+    fn seg_free(&mut self, key: usize, span: u64) {
+        if let Some(s) = self
+            .mem_seg_order
+            .iter_mut()
+            .find(|s| s.key == key && s.hole == 0)
+        {
+            *s = SegSlot {
+                key: usize::MAX,
+                hole: span,
+            };
+        }
+    }
+
+    /// Place a fresh huge segment: top-down mmap drops it into the
+    /// topmost free span that still fits — hole or zombie slot — or
+    /// below every live segment. The placement's extend runway is the
+    /// stolen span whole, or a fresh stretch's alignment gap.
+    fn seg_place(&mut self, key: usize, fp: u64) -> u64 {
+        for i in 0..self.mem_seg_order.len() {
+            let span = self.slot_span(self.mem_seg_order[i]);
+            if span >= fp {
+                self.mem_seg_order[i] = SegSlot { key, hole: 0 };
+                return span;
+            }
+        }
+        self.mem_seg_order.push(SegSlot { key, hole: 0 });
+        Self::seg_stretch(fp, 0)
+    }
+
+    /// Merge every still-free slot directly above a live segment into
+    /// its extend runway — the mremap headroom zend extends into at
+    /// grow time. Runs where a grow decision reads seg_cap so a span
+    /// a later alloc already reoccupied never credits the heir.
+    fn seg_drain(&mut self, key: usize) {
+        let Some(mut q) = self
+            .mem_seg_order
+            .iter()
+            .position(|s| s.key == key && s.hole == 0)
+        else {
+            return;
+        };
+        let mut gain = 0u64;
+        while q > 0 {
+            let span = self.slot_span(self.mem_seg_order[q - 1]);
+            if span == 0 {
+                break;
+            }
+            gain = gain.saturating_add(span);
+            self.mem_seg_order.remove(q - 1);
+            q -= 1;
+        }
+        if gain > 0 {
+            if let Some(c) = self.mem_tracked.get_mut(&key) {
+                c.seg_cap = c.seg_cap.saturating_add(gain);
+            }
         }
     }
 
@@ -3896,6 +4111,7 @@ impl<'a> Interp<'a> {
         let (fp, chunk) = self.mem_commit(req);
         let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
         let key = Rc::as_ptr(rc) as *const u8 as usize;
+        let mut stale_cap = 0u64;
         match self.mem_tracked.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 if !(e.get().probe)() {
@@ -3910,6 +4126,9 @@ impl<'a> Interp<'a> {
                     }
                     let dead_chunk = dead.chunk;
                     let dead_inner = dead.inner;
+                    if dead.huge > 0 {
+                        stale_cap = dead.seg_cap;
+                    }
                     let c = e.get_mut();
                     c.inner = 0;
                     c.huge = 0;
@@ -3917,18 +4136,31 @@ impl<'a> Interp<'a> {
                     c.vm = None;
                     c.seg_cap = 0;
                     c.chunk = usize::MAX;
-                    if let Some(u) = self.mem_chunks.get_mut(dead_chunk) {
+                    let emptied = self.mem_chunks.get_mut(dead_chunk).is_some_and(|u| {
                         let nu = u.saturating_sub(dead_inner);
-                        if nu == 0 && *u != 0 && dead_chunk != 0 {
-                            self.mem_committed = self.mem_committed.saturating_sub(MM_CHUNK);
-                        }
+                        let emptied = nu == 0 && *u != 0 && dead_chunk != 0;
                         *u = nu;
+                        emptied
+                    });
+                    if emptied {
+                        Self::chunk_vacate(
+                            &mut self.mem_chunks,
+                            &self.mem_chunk_nums,
+                            &mut self.mem_committed,
+                            &mut self.mem_cached,
+                            &mut self.chunks_del_boundary,
+                            &mut self.chunks_del_count,
+                            dead_chunk,
+                        );
                     }
                     let weak = Rc::downgrade(rc);
                     c.probe = Box::new(move || weak.strong_count() > 0);
                 }
                 if inner > 0 {
                     e.get_mut().chunk = chunk;
+                }
+                if huge > 0 {
+                    e.get_mut().seg_cap = Self::seg_stretch(fp, 0);
                 }
                 e.get_mut().inner += inner;
                 e.get_mut().huge += huge;
@@ -3948,6 +4180,23 @@ impl<'a> Interp<'a> {
                     chunk: if inner > 0 { chunk } else { usize::MAX },
                     probe: Box::new(move || weak.strong_count() > 0),
                 });
+            }
+        }
+        if stale_cap > 0 {
+            // The recycled pointer's dead segment frees its span —
+            // a hole the fresh placement below reoccupies when it
+            // fits (a same-size temp cycles through the range).
+            self.seg_free(key, stale_cap);
+        }
+        if huge > 0
+            && !self
+                .mem_seg_order
+                .iter()
+                .any(|s| s.key == key && s.hole == 0)
+        {
+            let cap = self.seg_place(key, fp);
+            if let Some(c) = self.mem_tracked.get_mut(&key) {
+                c.seg_cap = cap;
             }
         }
     }
@@ -4100,6 +4349,10 @@ impl<'a> Interp<'a> {
                     }
                     return;
                 }
+                // Read the cap lazily: still-free holes directly
+                // above merge only now — a span a transient temp
+                // reoccupied in the meantime never credited it.
+                self.seg_drain(key);
                 let cap = self.mem_tracked.get(&key).map(|c| c.seg_cap).unwrap_or(0);
                 let reloc = fp > cap;
                 let limit = self.ini_bytes("memory_limit");
@@ -4131,9 +4384,10 @@ impl<'a> Interp<'a> {
                     c.huge = fp;
                     c.table_req = req;
                     if reloc && !failed {
-                        // Relocated — the new placement's runway is
-                        // the old segment's hole plus slack.
-                        c.seg_cap = Self::seg_stretch(fp, ofp);
+                        // Relocated — the freed old segment's whole
+                        // span (footprint + leftover runway) becomes
+                        // the new placement's hole above it.
+                        c.seg_cap = Self::seg_stretch(fp, cap);
                     }
                 }
                 if self.mem_used > self.mem_peak {
@@ -4177,6 +4431,8 @@ impl<'a> Interp<'a> {
         }
         let (fp, chunk) = self.mem_commit(req);
         let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
+        let mut top_credit = 0u64;
+        let mut old_seg_cap = 0u64;
         match self.mem_tracked.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 let old = std::mem::replace(&mut e.get_mut().table_req, req);
@@ -4184,20 +4440,42 @@ impl<'a> Interp<'a> {
                 if old > 0 {
                     let ofp = Self::mem_fp(old);
                     if old > MM_MAX_LARGE {
+                        old_seg_cap = e.get().seg_cap;
                         e.get_mut().huge = e.get().huge.saturating_sub(ofp);
                         self.mem_huge = self.mem_huge.saturating_sub(ofp);
-                        hole = ofp;
+                        hole = old_seg_cap;
                     } else {
                         let ci = e.get().chunk;
                         e.get_mut().inner = e.get().inner.saturating_sub(ofp);
                         self.mem_in_chunk = self.mem_in_chunk.saturating_sub(ofp);
-                        if let Some(u) = self.mem_chunks.get_mut(ci) {
+                        let emptied = self.mem_chunks.get_mut(ci).is_some_and(|u| {
                             let nu = u.saturating_sub(ofp);
-                            if nu == 0 && *u != 0 && ci != 0 {
-                                self.mem_committed = self.mem_committed.saturating_sub(MM_CHUNK);
-                                hole = MM_CHUNK;
-                            }
+                            let emptied = nu == 0 && *u != 0 && ci != 0;
                             *u = nu;
+                            emptied
+                        });
+                        if emptied
+                            && !Self::chunk_vacate(
+                                &mut self.mem_chunks,
+                                &self.mem_chunk_nums,
+                                &mut self.mem_committed,
+                                &mut self.mem_cached,
+                                &mut self.chunks_del_boundary,
+                                &mut self.chunks_del_count,
+                                ci,
+                            )
+                        {
+                            // Unmapped — the freed span extends the
+                            // segment directly below it: this new
+                            // segment when nothing stood between
+                            // (the ob buffer's first huge
+                            // transition), else the topmost live
+                            // segment.
+                            if self.mem_seg_order.is_empty() {
+                                hole = MM_CHUNK;
+                            } else {
+                                top_credit = MM_CHUNK;
+                            }
                         }
                     }
                     self.mem_used = self.mem_used.saturating_sub(ofp);
@@ -4229,6 +4507,32 @@ impl<'a> Interp<'a> {
                     probe: Box::new(move || weak.strong_count() > 0),
                 });
             }
+        }
+        if old_seg_cap > 0 {
+            // The retired table was a huge segment — its freed span
+            // becomes a hole in its slot (lazy credit: whoever below
+            // grows into it while it stays free takes it).
+            self.seg_free(key, old_seg_cap);
+        }
+        if top_credit > 0 {
+            let top = self
+                .mem_seg_order
+                .iter()
+                .find(|&s| self.slot_span(*s) == 0)
+                .map(|s| s.key);
+            if let Some(top) = top {
+                if let Some(c) = self.mem_tracked.get_mut(&top) {
+                    c.seg_cap = c.seg_cap.saturating_add(top_credit);
+                }
+            }
+        }
+        if huge > 0
+            && !self
+                .mem_seg_order
+                .iter()
+                .any(|s| s.key == key && s.hole == 0)
+        {
+            self.mem_seg_order.push(SegSlot { key, hole: 0 });
         }
     }
 
@@ -4310,10 +4614,32 @@ impl<'a> Interp<'a> {
         let mut inner = 0u64;
         let mut huge = 0u64;
         let mut freed = Vec::new();
+        // Freed segments leave their span as a hole in their
+        // placement slot — the credit stays lazy: seg_place steals a
+        // fitting hole, seg_drain merges what is still free into the
+        // segment below at its own grow.
+        let mut order = std::mem::take(&mut self.mem_seg_order);
+        let tracked = &mut self.mem_tracked;
+        order.retain_mut(|s| {
+            if s.hole > 0 {
+                return true;
+            }
+            match tracked.get(&s.key) {
+                Some(c) if (c.probe)() && c.huge > 0 => true,
+                Some(c) => {
+                    s.key = usize::MAX;
+                    s.hole = c.seg_cap;
+                    s.hole > 0
+                }
+                None => false,
+            }
+        });
+        self.mem_seg_order = order;
         // Releases land on each charge's recorded chunk — a chunk
-        // the release empties unmaps (zend frees non-main chunks).
+        // the release empties goes through chunk_vacate (zend frees
+        // fully-empty non-main chunks, caching the last one).
         let chunks = &mut self.mem_chunks;
-        let mut emptied = 0u64;
+        let mut vacate = Vec::new();
         self.mem_tracked.retain(|_, c| {
             if (c.probe)() {
                 true
@@ -4325,17 +4651,26 @@ impl<'a> Interp<'a> {
                 }
                 if let Some(u) = chunks.get_mut(c.chunk) {
                     let nu = u.saturating_sub(c.inner);
-                    // A chunk emptied by this release unmaps (zend
-                    // frees fully-empty non-main chunks).
-                    if nu == 0 && *u != 0 && c.chunk != 0 {
-                        emptied += 1;
-                    }
+                    let was = *u;
                     *u = nu;
+                    if nu == 0 && was != 0 && c.chunk != 0 {
+                        vacate.push(c.chunk);
+                    }
                 }
                 false
             }
         });
-        self.mem_committed = self.mem_committed.saturating_sub(emptied * MM_CHUNK);
+        for ci in vacate {
+            Self::chunk_vacate(
+                &mut self.mem_chunks,
+                &self.mem_chunk_nums,
+                &mut self.mem_committed,
+                &mut self.mem_cached,
+                &mut self.chunks_del_boundary,
+                &mut self.chunks_del_count,
+                ci,
+            );
+        }
         self.mem_in_chunk = self.mem_in_chunk.saturating_sub(inner);
         self.mem_huge = self.mem_huge.saturating_sub(huge);
         self.mem_used = self.mem_used.saturating_sub(inner + huge);
@@ -4365,6 +4700,9 @@ impl<'a> Interp<'a> {
                 if let Some((seg, slots, own)) = dead.vm {
                     Self::vm_stack_apply(&mut self.vm_stack, seg, slots, own);
                 }
+                if dead.huge > 0 {
+                    self.seg_free(key, dead.seg_cap);
+                }
             } else {
                 let sub = fp.min(e.get().inner);
                 let ci = e.get().chunk;
@@ -4381,12 +4719,27 @@ impl<'a> Interp<'a> {
     /// request, so the peak must not double-count the pair.
     pub(crate) fn mem_retire<T: ?Sized + 'static>(&mut self, rc: &Rc<T>) {
         let key = Rc::as_ptr(rc) as *const u8 as usize;
+        self.mem_retire_key(key, true);
+    }
+
+    /// Drop a tracked charge by key. `inherit` feeds a freed
+    /// segment's span to the segment directly below it — false when
+    /// the caller replaces the segment in place (a `.=`/erealloc
+    /// grow books the hole into its own new cap instead).
+    fn mem_retire_key(&mut self, key: usize, inherit: bool) {
         if let Some(c) = self.mem_tracked.remove(&key) {
             self.mem_in_chunk = self.mem_in_chunk.saturating_sub(c.inner);
             self.mem_huge = self.mem_huge.saturating_sub(c.huge);
             self.mem_used = self.mem_used.saturating_sub(c.inner + c.huge);
             if let Some((seg, slots, own)) = c.vm {
                 Self::vm_stack_apply(&mut self.vm_stack, seg, slots, own);
+            }
+            if c.huge > 0 {
+                if inherit {
+                    self.seg_free(key, c.seg_cap);
+                } else {
+                    self.mem_seg_order.retain(|s| s.key != key);
+                }
             }
             self.chunk_release(c.chunk, c.inner);
         }
@@ -4407,7 +4760,7 @@ impl<'a> Interp<'a> {
         // unconditionally so freed runs feed the extend test.
         self.mem_sweep();
         let fp = Self::mem_fp(req);
-        let (old_inner, old_huge, old_chunk) = self
+        let (old_inner, _, old_chunk) = self
             .mem_tracked
             .get(&(Rc::as_ptr(old) as *const u8 as usize))
             .map(|c| (c.inner, c.huge, c.chunk))
@@ -4425,16 +4778,25 @@ impl<'a> Interp<'a> {
         // new segment while the old one is still held (the stricter
         // check). Otherwise the old segment unmaps and only the
         // growth delta is checked. Untracked/dead olds relocate.
+        let old_key = Rc::as_ptr(old) as *const u8 as usize;
+        // Drain still-free holes above the grown segment into its
+        // runway first — a span a later alloc reoccupied meanwhile
+        // never credited it.
+        self.seg_drain(old_key);
         let old_seg = self
             .mem_tracked
-            .get(&(Rc::as_ptr(old) as *const u8 as usize))
+            .get(&old_key)
             .filter(|c| (c.probe)())
             .map(|c| c.seg_cap);
         let reloc = old_seg.is_none_or(|cap| fp > cap);
         let mut new_seg_cap = if req > MM_MAX_LARGE {
-            // Only a huge predecessor leaves a VA hole — a freed
-            // in-chunk run stays inside its chunk's mapping.
-            Self::seg_stretch(fp, old_huge)
+            // Relocation lands the grown segment at the stack
+            // bottom — erealloc's alloc-before-free keeps the old
+            // span mapped through placement, so it can't host — and
+            // its runway there is just its own stretch. The freed
+            // span stays a hole in the old slot, inherited lazily
+            // by whatever segment grows directly below it.
+            Self::seg_stretch(fp, 0)
         } else {
             0
         };
@@ -4442,10 +4804,23 @@ impl<'a> Interp<'a> {
             if reloc {
                 // alloc+copy+free: size the new segment with old held.
                 let _ = self.mem_check(req);
-                self.mem_retire(old);
-            } else {
+            }
+            // Retire the old charge without freeing its placement —
+            // the grown segment takes over the slot (reloc lands it
+            // directly below the old base, in-place keeps the
+            // mapping), so its span is booked in new_seg_cap, not
+            // inherited by the segment below.
+            if let Some(c) = self.mem_tracked.remove(&old_key) {
+                self.mem_in_chunk = self.mem_in_chunk.saturating_sub(c.inner);
+                self.mem_huge = self.mem_huge.saturating_sub(c.huge);
+                self.mem_used = self.mem_used.saturating_sub(c.inner + c.huge);
+                if let Some((seg, slots, own)) = c.vm {
+                    Self::vm_stack_apply(&mut self.vm_stack, seg, slots, own);
+                }
+                self.chunk_release(c.chunk, c.inner);
+            }
+            if !reloc {
                 // in-place extend: old unmaps → delta-only check.
-                self.mem_retire(old);
                 let _ = self.mem_check(req);
                 new_seg_cap = old_seg.unwrap_or(0);
             }
@@ -4493,7 +4868,30 @@ impl<'a> Interp<'a> {
             if let Some((seg, slots, own)) = c.vm {
                 Self::vm_stack_apply(&mut self.vm_stack, seg, slots, own);
             }
+            if c.huge > 0 {
+                self.seg_free(key, c.seg_cap);
+            }
             self.chunk_release(c.chunk, c.inner);
+        }
+        if req > MM_MAX_LARGE {
+            if reloc {
+                // The grown segment mapped below every live
+                // segment — it takes the bottom slot. The old span
+                // frees in place as a hole for the segment
+                // directly below it to drain at its grow.
+                self.seg_free(old_key, old_seg.unwrap_or(0));
+                self.mem_seg_order.push(SegSlot { key, hole: 0 });
+            } else if let Some(p) = self
+                .mem_seg_order
+                .iter()
+                .position(|s| s.key == old_key && s.hole == 0)
+            {
+                // In-place extension stands where its predecessor
+                // stood in the placement order.
+                self.mem_seg_order[p].key = key;
+            } else {
+                self.mem_seg_order.push(SegSlot { key, hole: 0 });
+            }
         }
         let (inner, huge) = if req > MM_MAX_LARGE { (0, fp) } else { (fp, 0) };
         let weak = Rc::downgrade(new);
