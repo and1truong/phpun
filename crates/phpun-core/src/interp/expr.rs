@@ -7842,6 +7842,21 @@ impl<'a> Interp<'a> {
     }
 
     fn index_read(&mut self, e: &Expr, i: Option<&Expr>) -> Result<Value, PhpError> {
+        // `$GLOBALS['x']` reads the global slot by name — a miss warns
+        // `Undefined global variable $x`, not the array-key wording.
+        if let Expr::Var(n) = Self::unmark_rhs(e) {
+            if n == "GLOBALS" {
+                if let Some(ie) = i {
+                    let k = self.eval(ie)?;
+                    let kn = k.to_php_string();
+                    if let Some(c) = self.global_var_cell(&kn) {
+                        return Ok(c.borrow().clone());
+                    }
+                    self.warn(&format!("Undefined global variable ${kn}"))?;
+                    return Ok(Value::Null);
+                }
+            }
+        }
         // zend_compile_dim emits the dim expression's ops BEFORE the
         // container's for delayed containers — a CV (or varnode: varvar/
         // prop/static-prop) base binds inside the FETCH_DIM op, so its

@@ -657,6 +657,20 @@ impl<'a> Interp<'a> {
                 r
             }
             None => {
+                // `E::cases()` — the enum built-in: every `case` in
+                // declaration order, as its singleton case object.
+                if name.eq_ignore_ascii_case("cases")
+                    && cls.decl.kind == crate::ast::ClassKind::Enum
+                {
+                    let mut arr = PhpArray::new();
+                    for cd in cls.decl.consts.clone() {
+                        if cd.enum_case {
+                            let v = self.enum_case_value(cls.name(), &cd.name, &cd)?;
+                            arr.push(v);
+                        }
+                    }
+                    return Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(arr))));
+                }
                 // A missing __construct never reaches magic —
                 // `Foo::__construct()` is "Cannot call constructor"
                 // (call_static_006). __destruct etc. dispatch normally.

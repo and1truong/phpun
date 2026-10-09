@@ -8641,6 +8641,45 @@ class SplObjectStorage implements Countable, Iterator, ArrayAccess {
         foreach (($pairs[1] ?? []) as $k => $v) { $this->$k = $v; }
     }
 }
+// ponytail: strong refs, not real weak refs — entries survive the
+// key's own destruction until removed. Iterating yields object keys.
+class WeakMap implements Countable, Iterator, ArrayAccess {
+    private array $objs = [];
+    private array $data = [];
+    private int $idx = 0;
+    private function hashOf($obj) {
+        if (!is_object($obj)) {
+            throw new TypeError('WeakMap key must be an object');
+        }
+        return spl_object_id($obj);
+    }
+    public function offsetExists($obj): bool {
+        return isset($this->objs[$this->hashOf($obj)]);
+    }
+    public function offsetGet($obj) {
+        $h = $this->hashOf($obj);
+        if (!isset($this->objs[$h])) {
+            throw new Error('Object ' . get_class($obj) . '#' . spl_object_id($obj) . ' not contained in WeakMap');
+        }
+        return $this->data[$h];
+    }
+    public function offsetSet($obj, $data = null): void {
+        $h = $this->hashOf($obj);
+        if (!isset($this->objs[$h])) {
+            $this->objs[$h] = $obj;
+        }
+        $this->data[$h] = $data;
+    }
+    public function offsetUnset($obj): void {
+        unset($this->objs[$this->hashOf($obj)], $this->data[$this->hashOf($obj)]);
+    }
+    public function count(): int { return count($this->objs); }
+    public function rewind(): void { $this->idx = 0; }
+    public function valid(): bool { return $this->idx < count($this->objs); }
+    public function current() { return $this->data[array_keys($this->objs)[$this->idx]]; }
+    public function key() { return array_values($this->objs)[$this->idx]; }
+    public function next(): void { $this->idx++; }
+}
 class SplFixedArray implements ArrayAccess, Iterator, Countable {
     private array $data;
     private int $pos = 0;
