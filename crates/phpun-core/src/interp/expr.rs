@@ -5689,7 +5689,21 @@ impl<'a> Interp<'a> {
                         // LAST level — intermediate levels still chain
                         // offsetGet to descend (bug71731); ??/empty
                         // chain offsetGet at every level (bug31683).
-                        Ok(v) if v.is_truthy() && mode == 0 && last => Ok(Some(Value::Bool(true))),
+                        // isset() consults offsetExists alone — but on
+                        // native spl storage zend's has_dimension is an
+                        // offsetGet + null check, so `isset($ao['n'])` on
+                        // an explicit null bucket reports false.
+                        Ok(v)
+                            if v.is_truthy()
+                                && mode == 0
+                                && last
+                                && !matches!(
+                                    &o.borrow().internal,
+                                    Some(ObjectInternal::ArrayIter { .. })
+                                ) =>
+                        {
+                            Ok(Some(Value::Bool(true)))
+                        }
                         Ok(v) if v.is_truthy() => {
                             match self.method_invoke(
                                 o,
