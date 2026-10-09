@@ -2418,14 +2418,13 @@ impl<'a> Interp<'a> {
                 d.line,
             ));
         }
-        if d.ns.is_empty() && crate::builtins::is_builtin(&key) {
-            // Global decl claiming a builtin name dies at the same
-            // compile phase (oracle: "Cannot redeclare function
-            // strlen()"); namespaced decls stay legal.
-            return Err(PhpError::compile_fatal(
-                format!("Cannot redeclare function {}()", d.name),
-                d.line,
-            ));
+        // Global decl claiming a builtin name dies at the same
+        // compile phase (oracle: "Cannot redeclare function strlen()");
+        // namespaced decls stay legal.
+        if d.ns.is_empty() {
+            if let Some(msg) = Self::builtin_redecl_msg(&key, &d.name) {
+                return Err(PhpError::compile_fatal(msg, d.line));
+            }
         }
         let site = std::ptr::from_ref(d) as usize;
         let mut d = d.clone();
@@ -2446,8 +2445,42 @@ impl<'a> Interp<'a> {
         r
     }
 
+    /// Message for a global `function <name>()` decl that collides
+    /// with a builtin — None when the name is free. Namespaced decls
+    /// are legal and never reach here (gated on `d.ns.is_empty()`).
+    /// `preg_jit`/`pathinfo_dirname`/`fastcgi_finish_request` are
+    /// phpun-internal or FPM-only dispatch entries, not oracle-visible
+    /// functions — declaring them is legal, so they're exempt.
+    /// `assert` is zend_compile-special-cased ahead of the generic
+    /// redeclare text.
+    fn builtin_redecl_msg(key: &str, dname: &str) -> Option<String> {
+        if matches!(
+            key,
+            "preg_jit" | "pathinfo_dirname" | "fastcgi_finish_request"
+        ) || !crate::builtins::is_builtin(key)
+        {
+            return None;
+        }
+        if key == "assert" {
+            return Some(
+                "Defining a custom assert() function is not allowed, as the function has special semantics"
+                    .to_string(),
+            );
+        }
+        Some(format!("Cannot redeclare function {dname}()"))
+    }
+
     fn hoist_funcs_pass(&mut self, stmts: &[Stmt]) -> Result<(), PhpError> {
         for s in stmts {
+            // `__halt_compiler()` ends compilation — post-halt code is
+            // never compiled in Zend, so its decls must not register
+            // (they'd leak into function_exists and trip the
+            // builtin-name fatal).
+            if matches!(s, Stmt::Expr(Expr::Call { name, .. })
+                if matches!(&**name, Expr::Str(n) if n.trim_start_matches('\u{1}').eq_ignore_ascii_case("__halt_compiler")))
+            {
+                break;
+            }
             match s {
                 // `namespace X { stmts }` parses as
                 // Block[Namespace, Block[stmts]] — decls inside are still

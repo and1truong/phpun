@@ -1128,23 +1128,31 @@ impl<'a> Interp<'a> {
                 // closures defer here — p10new/m45 vs oracle).
                 s.scope_kw_err(&name, lit)?;
                 let cls = s.classes.get(&name.to_lowercase()).cloned();
-                let params = cls
+                let found = cls
                     .as_ref()
-                    .and_then(|c| s.find_method_in(c, "__construct"))
+                    .and_then(|c| s.find_method_in(c, "__construct"));
+                let params = found
+                    .as_ref()
                     .map(|m| m.0.decl.params.clone())
                     .unwrap_or_default();
                 // ctx is the ctor's diagnostic name — arg_cells wraps
-                // it as "{ctx}()" for arg errors. PHP reports
-                // `Foo::__construct():` for named classes (canonical
-                // declared case, not the source spelling) and
-                // `class@anonymous():` for anon classes (oracle-pinned).
-                let canon = cls
-                    .map(|c| c.decl.name.clone())
+                // it as "{ctx}()" for arg errors. Oracle prints the
+                // ctor's DECLARING class (`P::__construct():` when C
+                // inherits P's ctor), canonical declared case (not the
+                // source spelling), and `X@anonymous():` for anon
+                // classes — anon names carry a `\0FILE:LINE$seq`
+                // suffix that must be truncated. A class with no ctor
+                // has no arg diagnostics to name, so the fallback is
+                // only for the not-found/unresolved edge.
+                let owner = found
+                    .map(|(_, o)| o.decl.name.clone())
+                    .or_else(|| cls.map(|c| c.decl.name.clone()))
                     .unwrap_or_else(|| name.clone());
-                let ctx = if canon.starts_with("class@anonymous") {
-                    "class@anonymous".to_string()
+                let base = owner.split('\0').next().unwrap_or(&owner).to_string();
+                let ctx = if base.contains("@anonymous") {
+                    base
                 } else {
-                    format!("{canon}::__construct")
+                    format!("{base}::__construct")
                 };
                 let argvals = s.arg_cells(args, &params, &ctx, false, Some(*site))?;
                 s.new_instance(&name, argvals)
