@@ -581,12 +581,11 @@ impl<'a> Interp<'a> {
                 // fatal (oracle: "Cannot redeclare function strlen()")
                 // — namespaced decls stay legal (X\strlen shadows
                 // nothing; only the global table is contested).
-                if !self_decl && d.ns.is_empty() && crate::builtins::is_builtin(&key) {
-                    let e = self.decl_fatal_ctx(PhpError::fatal(
-                        format!("Cannot redeclare function {}()", d.name),
-                        self.cur_line,
-                    ));
-                    return self.err_flow(e);
+                if !self_decl && d.ns.is_empty() {
+                    if let Some(msg) = Self::builtin_redecl_msg(&key, &d.name) {
+                        let e = self.decl_fatal_ctx(PhpError::fatal(msg, self.cur_line));
+                        return self.err_flow(e);
+                    }
                 }
                 let mut d = d.clone();
                 d.file = self.diag_file();

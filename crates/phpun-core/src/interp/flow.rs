@@ -46,6 +46,10 @@ struct ScanScope {
     gotos: Vec<GotoSite>,
     /// static var name → first decl line (dup-decl detection).
     statics: HashMap<String, usize>,
+    /// `__halt_compiler()` seen in this unit — post-halt stmts never
+    /// compile in Zend, so the scan (and its function early-binds)
+    /// stops at the marker, across nested namespace blocks too.
+    halt: bool,
     /// Current source line from the last `Stmt::Line` marker — kept on
     /// the scope so it carries across the top-level per-stmt scans.
     line: usize,
@@ -175,6 +179,15 @@ impl<'a> Interp<'a> {
     /// hoist_funcs (`class A{} class A{} break` reports the break).
     fn flow_unit(&mut self, stmts: &[Stmt], sc: &mut ScanScope) -> Result<(), PhpError> {
         for s in stmts {
+            if sc.halt {
+                break;
+            }
+            if matches!(s, Stmt::Expr(Expr::Call { name, .. })
+                if matches!(&**name, Expr::Str(n) if n.trim_start_matches('\u{1}').eq_ignore_ascii_case("__halt_compiler")))
+            {
+                sc.halt = true;
+                break;
+            }
             if let Stmt::Function(d) = s {
                 self.hoist_func(d)?;
             }
