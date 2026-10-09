@@ -1137,8 +1137,13 @@ impl<'a> Interp<'a> {
                 // ctx is the ctor's diagnostic name — arg_cells wraps
                 // it as "{ctx}()" for arg errors, and PHP reports them
                 // as `Foo::__construct():` (oracle-pinned).
-                let argvals =
-                    s.arg_cells(args, &params, &format!("{name}::__construct"), false, Some(*site))?;
+                let argvals = s.arg_cells(
+                    args,
+                    &params,
+                    &format!("{name}::__construct"),
+                    false,
+                    Some(*site),
+                )?;
                 s.new_instance(&name, argvals)
             }),
             Expr::Prop {
