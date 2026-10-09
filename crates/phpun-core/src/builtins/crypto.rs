@@ -202,7 +202,11 @@ fn pbkdf2(algo: &str, pass: &[u8], salt: &[u8], iters: i64, need: usize) -> Vec<
     where
         F: FnMut(&[u8]) -> Vec<u8>,
     {
-        let mut k = if key.len() > block { h(key) } else { key.to_vec() };
+        let mut k = if key.len() > block {
+            h(key)
+        } else {
+            key.to_vec()
+        };
         k.resize(block, 0);
         let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
         let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
@@ -214,24 +218,13 @@ fn pbkdf2(algo: &str, pass: &[u8], salt: &[u8], iters: i64, need: usize) -> Vec<
         h(&outer)
     }
     use sha1::Digest as _;
-    let (h, block): (Box<dyn Fn(&[u8]) -> Vec<u8>>, usize) = match algo {
+    type DigestFn = Box<dyn Fn(&[u8]) -> Vec<u8>>;
+    let (h, block): (DigestFn, usize) = match algo {
         "md5" => (Box::new(|m| md5::compute(m).0.to_vec()), 64),
-        "sha1" => (
-            Box::new(|m| sha1::Sha1::digest(m).to_vec()),
-            64,
-        ),
-        "sha256" => (
-            Box::new(|m| sha2::Sha256::digest(m).to_vec()),
-            64,
-        ),
-        "sha384" => (
-            Box::new(|m| sha2::Sha384::digest(m).to_vec()),
-            128,
-        ),
-        "sha512" => (
-            Box::new(|m| sha2::Sha512::digest(m).to_vec()),
-            128,
-        ),
+        "sha1" => (Box::new(|m| sha1::Sha1::digest(m).to_vec()), 64),
+        "sha256" => (Box::new(|m| sha2::Sha256::digest(m).to_vec()), 64),
+        "sha384" => (Box::new(|m| sha2::Sha384::digest(m).to_vec()), 128),
+        "sha512" => (Box::new(|m| sha2::Sha512::digest(m).to_vec()), 128),
         _ => unreachable!(),
     };
     // T_i = U1 ^ U2 ^ ... ^ Uiters for each block counter i.

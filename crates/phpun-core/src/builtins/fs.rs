@@ -1643,7 +1643,7 @@ pub(crate) fn dispatch(
                 // ReadErr = opened but unreadable — an empty array.
                 Some(UriRead::ReadErr) => Some(Vec::new()),
                 Some(UriRead::Fail) => None,
-                None => match std::fs::read(&fs_path(&path)) {
+                None => match std::fs::read(fs_path(&path)) {
                     Ok(b) => Some(b),
                     Err(e) => {
                         it.warn_pub(&format!(
@@ -2117,7 +2117,7 @@ pub(crate) fn dispatch(
                 arr.push(mk(fds[1], base + 1));
                 Value::Array(Rc::new(RefCell::new(arr)))
             }
-        },
+        }
         "stream_set_timeout" => {
             stream_open_check(args, 0, name, 1, "stream")?;
             if args.len() > 1 {

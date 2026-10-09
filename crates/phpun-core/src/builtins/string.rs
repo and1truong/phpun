@@ -862,7 +862,10 @@ pub(crate) fn dispatch(
         "wordwrap" => {
             let s0 = arg_bs(it, args, 0);
             let width = arg(args, 1).to_int();
-            let br = args.get(2).map(|c| c.borrow().to_php_string()).unwrap_or_else(|| "\n".to_string());
+            let br = args
+                .get(2)
+                .map(|c| c.borrow().to_php_string())
+                .unwrap_or_else(|| "\n".to_string());
             let cut = args.get(3).map(|c| c.borrow().is_truthy()).unwrap_or(false);
             Value::bytes(wordwrap(&s0, width, br.as_bytes(), cut))
         }
