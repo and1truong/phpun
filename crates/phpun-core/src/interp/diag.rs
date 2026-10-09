@@ -400,6 +400,10 @@ impl<'a> Interp<'a> {
             // Plain fatals (E_ERROR) print no trace; compile fatals
             // (duplicate named args, positional-after-named, ...) carry a
             // `Stack trace:\n#0 {main}` block like the engine's.
+            // A lazy re-parse (the {$...} interp chain) can raise a
+            // syntax error mid-run — zend renders its plain
+            // `Parse error:` form, not a fatal block.
+            ErrorKind::Parse => self.print_parse(e),
             _ => {
                 let ef = if self.last_err_file.is_empty() {
                     self.file.to_string()

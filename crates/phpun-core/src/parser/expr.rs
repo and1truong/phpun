@@ -1775,6 +1775,10 @@ impl<'a> Parser<'a> {
                     "bool" | "boolean" => Some(CastKind::Bool),
                     "array" => Some(CastKind::Array),
                     "object" => Some(CastKind::Object),
+                    // `(unset)` is a T_UNSET_CAST token in zend — kept
+                    // as a stub production that fatals at EVAL time
+                    // ("The (unset) cast is no longer supported"), not a
+                    // parse error. `f(unset)`-site errors live in args().
                     "unset" => Some(CastKind::Unset),
                     _ => None,
                 };
@@ -1982,7 +1986,17 @@ impl<'a> Parser<'a> {
                 let i = if self.at_op("]") {
                     None
                 } else {
-                    Some(Box::new(Self::markline(self.expr()?, il)))
+                    // `$a[unset` — zend reports the unset token inside
+                    // its `]`-expecting state.
+                    Some(Box::new(Self::markline(
+                        self.expr().map_err(|mut e| {
+                            if e.message == "syntax error, unexpected token \"unset\"" {
+                                e.message.push_str(", expecting \"]\"");
+                            }
+                            e
+                        })?,
+                        il,
+                    )))
                 };
                 self.expect_op("]")?;
                 e = Expr::Index { e: Box::new(e), i };
@@ -3161,6 +3175,30 @@ impl<'a> Parser<'a> {
                 ));
                 seen_named = true;
             } else {
+                if self.ident_is("unset") {
+                    // `unset` at arg start is a named-arg LABEL — zend
+                    // shifts it and demands `:`. `(`+`unset`+`)` is the
+                    // T_UNSET_CAST token instead: `f(unset)` errors on
+                    // the whole cast token.
+                    let cast = matches!(
+                        self.toks.get(self.pos.wrapping_sub(1)).map(|l| &l.token),
+                        Some(Token::Op("("))
+                    ) && matches!(self.peek2(), Some(Token::Op(")")));
+                    return Err(PhpError::parse(
+                        if cast {
+                            "syntax error, unexpected token \"(unset)\"".to_string()
+                        } else {
+                            format!(
+                                "syntax error, unexpected {}, expecting \":\"",
+                                desc_t(self.peek2())
+                            )
+                        },
+                        self.toks
+                            .get(self.pos + 1)
+                            .map(|l| l.line)
+                            .unwrap_or_else(|| self.line()),
+                    ));
+                }
                 if seen_named {
                     return Err(PhpError::compile_fatal(
                         "Cannot use positional argument after named argument",
@@ -3660,7 +3698,11 @@ impl<'a> Parser<'a> {
                 // position — Zend lexes them as distinct tokens the
                 // expr grammar rejects outright (`$x ??= break`,
                 // `fn() => break`, even `break()`/`break::X`).
-                if self.ident_is("break") || self.ident_is("continue") || self.ident_is("goto") {
+                if self.ident_is("break")
+                    || self.ident_is("continue")
+                    || self.ident_is("goto")
+                    || self.ident_is("unset")
+                {
                     return Err(PhpError::parse(
                         format!(
                             "syntax error, unexpected token \"{}\"",

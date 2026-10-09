@@ -580,7 +580,15 @@ impl<'a> Parser<'a> {
     pub(in crate::parser) fn expr_semi_operand(&mut self) -> Result<Expr, PhpError> {
         let start = self.pos;
         self.expr().map_err(|mut e| {
-            if self.pos == start
+            // `return unset` — the unset keyword fails expr() at its
+            // own token; zend's state then reports `expecting ";"`.
+            let unset_start = self
+                .toks
+                .get(start)
+                .map(|l| matches!(&l.token, Token::Ident(i) if i == "unset"))
+                .unwrap_or(false)
+                && e.message == "syntax error, unexpected token \"unset\"";
+            if (self.pos == start || unset_start)
                 && e.message.starts_with("syntax error, unexpected ")
                 && !e.message.contains(", expecting ")
             {
@@ -1155,7 +1163,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-pub(in crate::parser) fn desc_t(t: Option<&Token>) -> String {
+pub(crate) fn desc_t(t: Option<&Token>) -> String {
     match t {
         None => "end of file".to_string(),
         Some(Token::Ident(s)) => format!("identifier \"{}\"", s),

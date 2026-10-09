@@ -239,6 +239,13 @@ impl<'a> Interp<'a> {
                         StringPart::Expr(src, base) => {
                             self.cur_line = *base;
                             self.send_line = Some(*base);
+                            // zend's `{$...}` grammar takes only a
+                            // variable chain — `$a`, `->p`, `?->p`,
+                            // `[k]`; anything else errors at the stray
+                            // token (`{$a + 1}` → unexpected "+").
+                            if let Some(e) = Self::curly_chain_err(src, *base) {
+                                return Err(e);
+                            }
                             let (expr, _) = parser::parse_expr_src(src, *base)
                                 .map_err(|e| PhpError::parse(e.message, e.line))?;
                             let v = self.eval(&expr)?;
@@ -1890,6 +1897,107 @@ impl<'a> Interp<'a> {
     /// The literal name a folded `${...}` resolves to — zend's
     /// zend_is_assign_to_self requires a VAR+ZVAL child (a scalar
     /// literal); a folded expression never self-assigns.
+    /// `{$...}` interp chain grammar — a var/varvar root followed by
+    /// `->p` / `?->p` / `[k]` links only. Returns the zend parse error
+    /// for the first token that can't continue the chain.
+    fn curly_chain_err(src: &str, base: usize) -> Option<PhpError> {
+        let toks = crate::lexer::lex(&format!("<?php {};", src)).ok()?;
+        let t: Vec<&crate::lexer::Lexed> = toks
+            .iter()
+            .filter(|l| !matches!(l.token, crate::lexer::Token::Diag(..)))
+            .collect();
+        let mut i = 0;
+        // root: `$a` or a `${...}` / `$$a` varvar.
+        match t.first().map(|l| &l.token) {
+            Some(crate::lexer::Token::Variable(_)) => i += 1,
+            Some(crate::lexer::Token::Op("$")) => {
+                i += 1;
+                while matches!(
+                    t.get(i).map(|l| &l.token),
+                    Some(crate::lexer::Token::Op("$"))
+                ) {
+                    i += 1;
+                }
+                match t.get(i).map(|l| &l.token) {
+                    Some(crate::lexer::Token::Variable(_)) => i += 1,
+                    Some(crate::lexer::Token::Op("{")) => {
+                        let mut d = 1;
+                        i += 1;
+                        while d > 0 && i < t.len() {
+                            match &t[i].token {
+                                crate::lexer::Token::Op("{") => d += 1,
+                                crate::lexer::Token::Op("}") => d -= 1,
+                                _ => {}
+                            }
+                            i += 1;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+        // links: `->`/`?->`/`::` + member (optionally a call `(...)`),
+        // `[` … `]`, and `(` … `)` call groups. First other token errs.
+        while i < t.len() {
+            match &t[i].token {
+                crate::lexer::Token::Op("->")
+                | crate::lexer::Token::Op("?->")
+                | crate::lexer::Token::Op("::") => {
+                    i += 1;
+                    match t.get(i).map(|l| &l.token) {
+                        Some(crate::lexer::Token::Ident(_))
+                        | Some(crate::lexer::Token::Variable(_)) => i += 1,
+                        Some(crate::lexer::Token::Op("{")) => {
+                            let mut d = 1;
+                            i += 1;
+                            while d > 0 && i < t.len() {
+                                match &t[i].token {
+                                    crate::lexer::Token::Op("{") => d += 1,
+                                    crate::lexer::Token::Op("}") => d -= 1,
+                                    _ => {}
+                                }
+                                i += 1;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                crate::lexer::Token::Op("[") | crate::lexer::Token::Op("(") => {
+                    let close = if matches!(&t[i].token, crate::lexer::Token::Op("[")) {
+                        "]"
+                    } else {
+                        ")"
+                    };
+                    let open = &t[i].token;
+                    let mut d = 1;
+                    i += 1;
+                    while d > 0 && i < t.len() {
+                        if t[i].token == *open {
+                            d += 1;
+                        } else if t[i].token == crate::lexer::Token::Op(close) {
+                            d -= 1;
+                        }
+                        i += 1;
+                    }
+                }
+                crate::lexer::Token::Op(";") => break,
+                _ => break,
+            }
+        }
+        if i < t.len() && !matches!(t[i].token, crate::lexer::Token::Op(";")) {
+            let line = t[i].line + base - 1;
+            return Some(PhpError::parse(
+                format!(
+                    "syntax error, unexpected {}, expecting \"->\" or \"?->\" or \"[\"",
+                    crate::parser::desc_t(Some(&t[i].token))
+                ),
+                line,
+            ));
+        }
+        None
+    }
+
     fn lit_var_name(e: &Expr) -> Option<String> {
         match Self::unmark_rhs(e) {
             Expr::Str(s) => Some(s.clone()),
@@ -2593,7 +2701,13 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                self.eval_cell(target).ok()
+                // `${'a'} += 1` / `${$k} += 1` — zend's compound fetch
+                // warns the undef named CV at the read; eval_cell's
+                // varvar arm emits it under the flag (inner evals once).
+                let was = std::mem::replace(&mut self.vv_read_warn, needs_read && op != "??=");
+                let c = self.eval_cell(target).ok();
+                self.vv_read_warn = was;
+                c
             }
         };
         // zend's delayed-compile RHS binds the DIRECT (paren/marker-
@@ -3615,6 +3729,9 @@ impl<'a> Interp<'a> {
             Expr::VarVar(inner, _) => {
                 let n = self.eval(inner)?;
                 let name = self.conv_str(&n)?;
+                if self.vv_read_warn && self.var_lookup(&name).is_none() {
+                    self.warn(&format!("Undefined variable ${}", name))?;
+                }
                 Ok(self.var_cell(&name))
             }
             Expr::StaticProp { class, name } => self.static_prop_cell(class, name),
@@ -10303,11 +10420,19 @@ impl<'a> Interp<'a> {
 
     /// `(type)expr` cast.
     fn cast(&mut self, kind: CastKind, v: Value) -> Result<Value, PhpError> {
+        if matches!(kind, CastKind::Unset) {
+            // zend kept a stub production for the removed cast: it
+            // parses, then fatals at eval.
+            return Err(PhpError::compile_fatal(
+                "The (unset) cast is no longer supported",
+                self.cur_line,
+            ));
+        }
         Ok(match kind {
             CastKind::Int => Value::Int(self.coerce_int(&v)),
             CastKind::Float => Value::Float(v.to_float()),
             CastKind::Bool => Value::Bool(v.is_truthy()),
-            CastKind::Unset => Value::Null,
+            CastKind::Unset => unreachable!(),
             CastKind::String => match &v {
                 // Identity on strings — conv_str's UTF-8 decode would
                 // mangle non-UTF-8 bytes.
