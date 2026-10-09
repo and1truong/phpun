@@ -137,13 +137,46 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// String conversion for builtins (__toString-aware, never errors → "" on failure).
+    /// String conversion for builtins (__toString-aware). A userland
+    /// throw from __toString is not silent: zend aborts the call at
+    /// the failed conversion, so the error defers to `cast_err` for
+    /// `builtins::call` to re-raise over the builtin's result. A plain
+    /// cast failure (`message == "cast"` — no __toString) still falls
+    /// back like before, its stale pending exception drained.
     pub fn to_string_of(&mut self, v: &Value) -> String {
-        self.conv_str(v).unwrap_or_else(|_| v.to_php_string())
+        match self.conv_str(v) {
+            Ok(s) => s,
+            Err(e) => {
+                let x = self.pending_exception.take().unwrap_or(Value::Null);
+                if e.message != "cast" && self.cast_err.is_none() {
+                    self.cast_err = Some((x, e));
+                }
+                v.to_php_string()
+            }
+        }
     }
     /// Byte-faithful variant — for binary-safe builtins.
     pub fn to_bytes_of(&mut self, v: &Value) -> Vec<u8> {
-        self.conv_bytes(v).unwrap_or_else(|_| v.to_php_bytes())
+        match self.conv_bytes(v) {
+            Ok(b) => b,
+            Err(e) => {
+                let x = self.pending_exception.take().unwrap_or(Value::Null);
+                if e.message != "cast" && self.cast_err.is_none() {
+                    self.cast_err = Some((x, e));
+                }
+                v.to_php_bytes()
+            }
+        }
+    }
+    /// Drain the conversion error a `to_string_of`/`to_bytes_of`
+    /// caller deferred. A Throw-kind error re-arms `pending_exception`
+    /// so `fail()` hands the object to the throw channel.
+    pub fn take_cast_err(&mut self) -> Option<PhpError> {
+        let (v, e) = self.cast_err.take()?;
+        if e.kind == ErrorKind::Throw {
+            self.pending_exception = Some(v);
+        }
+        Some(e)
     }
     /// Fallible byte cast — array_diff/intersect emulate Zend's
     /// `zval_get_tmp_string`, which yields "" with the cast Error left

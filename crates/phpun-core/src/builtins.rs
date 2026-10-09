@@ -144,8 +144,18 @@ const FAMILIES: &[Dispatch] = &[
 
 pub fn call(it: &mut Interp, name: &str, args: &[Cell]) -> Result<Option<Value>, PhpError> {
     for f in FAMILIES {
-        if let Some(v) = f(it, name, args)? {
-            return Ok(Some(v));
+        match f(it, name, args) {
+            Ok(None) => continue,
+            r => {
+                // A string conversion that failed mid-builtin aborts
+                // the call — zend dies at the Z_PARAM_* before the
+                // builtin would have run, so the deferred error wins
+                // over whatever it went on to return.
+                if let Some(e) = it.take_cast_err() {
+                    return Err(e);
+                }
+                return r;
+            }
         }
     }
     Ok(None)

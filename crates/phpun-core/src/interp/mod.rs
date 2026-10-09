@@ -602,6 +602,11 @@ pub struct Interp<'a> {
     /// Autoload/lookup error swallowed by the last `is_callable_value`
     /// probe — re-raised when a `callable` param type rejects the arg.
     callable_probe_err: Option<(Value, PhpError)>,
+    /// String-conversion error deferred by `to_string_of`/`to_bytes_of`
+    /// inside a builtin — zend aborts the call at the failed
+    /// Z_PARAM_*, so `builtins::call` re-raises it over the builtin's
+    /// own result. `(thrown value, error)` rides like callable_probe_err.
+    cast_err: Option<(Value, PhpError)>,
     /// Function-scoped static storage: scope key → var → cell. The key
     /// is fn_statics_key() for a function's own op_array; eval/include
     /// unit code executing inside a frame suffixes `\0u{unit}` so each
@@ -1671,6 +1676,7 @@ impl<'a> Interp<'a> {
             anon_class_names: HashMap::new(),
             anon_class_seq: 0,
             callable_probe_err: None,
+            cast_err: None,
             stack: Vec::new(),
             functions: HashMap::new(),
             classes: HashMap::new(),

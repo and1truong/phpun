@@ -522,16 +522,16 @@ pub(crate) fn dispatch(
             let (sep, arr) = if args.len() == 1 {
                 (Vec::new(), arg(args, 0))
             } else {
-                (arg(args, 0).to_php_bytes(), arg(args, 1))
+                (it.to_bytes_of(&arg(args, 0)), arg(args, 1))
             };
             match arr {
                 Value::Array(a) => {
-                    let parts: Vec<Vec<u8>> = a
-                        .borrow()
-                        .entries
-                        .iter()
-                        .map(|(_, c)| c.borrow().to_php_bytes())
-                        .collect();
+                    // Convert off-borrow: an element's __toString is
+                    // userland and could mutate the array.
+                    let elems: Vec<Value> =
+                        a.borrow().entries.iter().map(|(_, c)| c.borrow().clone()).collect();
+                    let parts: Vec<Vec<u8>> =
+                        elems.iter().map(|v| it.to_bytes_of(v)).collect();
                     let mut out = Vec::new();
                     for (i, p) in parts.iter().enumerate() {
                         if i > 0 {
