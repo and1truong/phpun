@@ -7561,7 +7561,6 @@ impl<'a> Interp<'a> {
                         | "call_user_func"
                         | "call_user_func_array"
                 );
-                let _ = zf;
                 let strict = self.caller_file_strict();
                 // Zend verifies arity before per-arg types — an
                 // under-arity call reports "expects exactly/at least N
@@ -7655,9 +7654,7 @@ impl<'a> Interp<'a> {
                         } else {
                             // Zend omits the name for variadic args.
                             let variadic = builtins::builtin_params(name)
-                                .map(|ps| {
-                                    matches!(ps.get(i), Some((_, builtins::BDef::Var)))
-                                })
+                                .map(|ps| matches!(ps.get(i), Some((_, builtins::BDef::Var))))
                                 .unwrap_or(false);
                             let pname_txt = if variadic {
                                 String::new()
