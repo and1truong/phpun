@@ -4997,8 +4997,7 @@ impl<'a> Interp<'a> {
                     .iter()
                     .position(|s| s.key == old_key && s.hole == 0)
                     .unwrap_or(usize::MAX);
-                let (at, _) = self.seg_place_held(key, fp, held);
-                let _ = at;
+                self.seg_place_held(key, fp, held);
                 self.seg_free(old_key, old_seg.unwrap_or(0));
                 new_seg_cap = Self::seg_stretch(fp, 0);
             } else if let Some(p) = self
