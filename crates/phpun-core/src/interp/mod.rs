@@ -3927,6 +3927,10 @@ impl<'a> Interp<'a> {
         if let Some(i) = self.mem_cached.pop() {
             debug_assert_eq!(self.mem_chunks[i], 0);
             self.mem_chunks[i] = fp;
+            // zend_mm_chunk_init runs on the cached-pop path too —
+            // the chunk gets a fresh ->num like a new commit.
+            self.mem_chunk_nums[i] = self.mem_chunk_num_next;
+            self.mem_chunk_num_next += 1;
             return i;
         }
         // Fresh 2MB commit — reuse a dead slot or append.
