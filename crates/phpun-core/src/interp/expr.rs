@@ -1079,7 +1079,7 @@ impl<'a> Interp<'a> {
                 });
                 if !sv.is_empty() {
                     let key = format!("{}\u{0}c{}", fname, callable.id.get());
-                    let mut table = std::collections::HashMap::new();
+                    let mut table = crate::value::FxMap::default();
                     // The seeded defaults compile against the CLOSURE's
                     // own scope: __FUNCTION__/__METHOD__ name it and
                     // __CLASS__ sees its bound scope — evaluating in
@@ -3063,6 +3063,7 @@ impl<'a> Interp<'a> {
                         foreach_pos: Vec::new(),
                         mem_elems: 0,
                         key_bytes: 0,
+                        idx: Default::default(),
                     };
                     crate::value::gc_root_note(1);
                     pa.mem_note_seed();
@@ -7299,6 +7300,7 @@ impl<'a> Interp<'a> {
             packed: a.packed,
             mem_elems: 0,
             key_bytes: 0,
+            idx: Default::default(),
         };
         crate::value::gc_root_note(1);
         for (k, c) in &a.entries {

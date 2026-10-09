@@ -1519,7 +1519,7 @@ impl<'a> Interp<'a> {
             if let CallableKind::Closure(d) = &nc_rc.kind {
                 let src_key = format!("{}\u{0}c{}", d.name, c.id.get());
                 if let Some(src) = self.statics.get(&src_key).cloned() {
-                    let mut snap = std::collections::HashMap::new();
+                    let mut snap = crate::value::FxMap::default();
                     for (n, sc) in &src {
                         let cc = cell(sc.borrow().clone());
                         if self.is_ref_cell(sc) {
