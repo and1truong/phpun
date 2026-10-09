@@ -1044,6 +1044,12 @@ pub struct Interp<'a> {
     /// treated as contiguous, so a badly fragmented tail can pin a
     /// chunk the sim thinks reusable.
     mem_chunks: Vec<u64>,
+    /// zend_mm chunk->num per `mem_chunks` slot — a monotonically
+    /// increasing identity assigned at each fresh commit: a reused
+    /// slot is a NEWER chunk than its index suggests, so the
+    /// emptied-vs-cached ordering can't key on position.
+    mem_chunk_nums: Vec<u64>,
+    mem_chunk_num_next: u64,
     /// Emptied non-main chunks zend keeps mapped on cached_chunks
     /// (delay deletion — get_chunk pops one back without running the
     /// limit check). LIFO stack of `mem_chunks` indices; zend holds at
@@ -1855,6 +1861,8 @@ impl<'a> Interp<'a> {
             mem_committed: MM_CHUNK,
             mem_in_chunk: MM_BASE_CHUNK,
             mem_chunks: vec![MM_BASE_CHUNK],
+            mem_chunk_nums: vec![0],
+            mem_chunk_num_next: 1,
             mem_cached: Vec::new(),
             chunks_del_boundary: 0,
             chunks_del_count: 0,
@@ -3923,11 +3931,15 @@ impl<'a> Interp<'a> {
         for (i, u) in self.mem_chunks.iter_mut().enumerate() {
             if *u == 0 && i != 0 {
                 *u = fp;
+                self.mem_chunk_nums[i] = self.mem_chunk_num_next;
+                self.mem_chunk_num_next += 1;
                 self.mem_committed += MM_CHUNK;
                 return i;
             }
         }
         self.mem_chunks.push(fp);
+        self.mem_chunk_nums.push(self.mem_chunk_num_next);
+        self.mem_chunk_num_next += 1;
         self.mem_committed += MM_CHUNK;
         self.mem_chunks.len() - 1
     }
@@ -3940,14 +3952,16 @@ impl<'a> Interp<'a> {
     /// once 4+ consecutive unmaps hit the same chunks_count boundary
     /// (last_chunks_delete_count hysteresis). Otherwise a chunk
     /// unmaps: the emptied one when it is newer than the cached head,
-    /// else the head (chunk->num ordering — the slot index stands in
-    /// for num). The boundary/count update runs only with an empty
+    /// else the head (zend_mm chunk->num ordering — `nums` tracks it,
+    /// the slot index can't: a reused slot is newer than it looks).
+    /// The boundary/count update runs only with an empty
     /// cache, like zend. Caller has already zeroed the occupancy.
     /// Field-level args keep this callable while a mem_tracked entry
     /// borrow is outstanding. Returns true when the emptied chunk
     /// stays mapped (cached directly, or swapped in for the head).
     fn chunk_vacate(
         chunks: &mut [u64],
+        nums: &[u64],
         committed: &mut u64,
         cached: &mut Vec<usize>,
         del_boundary: &mut usize,
@@ -3976,7 +3990,7 @@ impl<'a> Interp<'a> {
             // Emptied is older than the cached head — zend unmaps the
             // head and caches this one instead (its span stays
             // committed).
-            Some(&head) if idx < head => {
+            Some(&head) if nums[idx] < nums[head] => {
                 *cached.last_mut().unwrap() = idx;
                 true
             }
@@ -3998,6 +4012,7 @@ impl<'a> Interp<'a> {
             if nu == 0 && was != 0 && idx != 0 {
                 Self::chunk_vacate(
                     &mut self.mem_chunks,
+                    &self.mem_chunk_nums,
                     &mut self.mem_committed,
                     &mut self.mem_cached,
                     &mut self.chunks_del_boundary,
@@ -4128,6 +4143,7 @@ impl<'a> Interp<'a> {
                     if emptied {
                         Self::chunk_vacate(
                             &mut self.mem_chunks,
+                            &self.mem_chunk_nums,
                             &mut self.mem_committed,
                             &mut self.mem_cached,
                             &mut self.chunks_del_boundary,
@@ -4439,6 +4455,7 @@ impl<'a> Interp<'a> {
                         if emptied
                             && !Self::chunk_vacate(
                                 &mut self.mem_chunks,
+                                &self.mem_chunk_nums,
                                 &mut self.mem_committed,
                                 &mut self.mem_cached,
                                 &mut self.chunks_del_boundary,
@@ -4644,6 +4661,7 @@ impl<'a> Interp<'a> {
         for ci in vacate {
             Self::chunk_vacate(
                 &mut self.mem_chunks,
+                &self.mem_chunk_nums,
                 &mut self.mem_committed,
                 &mut self.mem_cached,
                 &mut self.chunks_del_boundary,
