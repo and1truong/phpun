@@ -2083,6 +2083,41 @@ pub(crate) fn dispatch(
             }
         }
         "stream_select" => return stream_select(it, name, args),
+        "stream_socket_pair" => {
+            let domain = arg(args, 0).to_int() as libc::c_int;
+            let typ = arg(args, 1).to_int() as libc::c_int;
+            let proto = arg(args, 2).to_int() as libc::c_int;
+            let mut fds = [0 as libc::c_int; 2];
+            if unsafe { libc::socketpair(domain, typ, proto, fds.as_mut_ptr()) } < 0 {
+                let (n, m) = io_errno_str(&std::io::Error::last_os_error());
+                it.warn_pub(&format!(
+                    "stream_socket_pair(): Failed to create sockets: [{}]: {}",
+                    n, m
+                ))?;
+                Value::Bool(false)
+            } else {
+                use std::os::unix::io::FromRawFd;
+                let base = it.next_res_ids(2);
+                let mk = |fd: libc::c_int, id: u64| {
+                    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+                    Value::Resource(Rc::new(RefCell::new(PhpResource::Pipe {
+                        id,
+                        file,
+                        write: true,
+                        socket: true,
+                        pty: false,
+                        nonblock: false,
+                        pos: 0,
+                        eof: false,
+                        rbuf: std::collections::VecDeque::new(),
+                    })))
+                };
+                let mut arr = PhpArray::new();
+                arr.push(mk(fds[0], base));
+                arr.push(mk(fds[1], base + 1));
+                Value::Array(Rc::new(RefCell::new(arr)))
+            }
+        },
         "stream_set_timeout" => {
             stream_open_check(args, 0, name, 1, "stream")?;
             if args.len() > 1 {

@@ -1377,6 +1377,25 @@ impl<'a> Interp<'a> {
     pub fn new(file: &'a str) -> Self {
         let mut constants = crate::value::FxMap::default();
         constants.insert("PHP_EOL".into(), Value::str("\n"));
+        for (n, v) in [
+            ("STREAM_PF_UNIX", 1), ("STREAM_PF_INET", 2), ("STREAM_PF_INET6", 10),
+            ("STREAM_SOCK_STREAM", 1), ("STREAM_SOCK_DGRAM", 2),
+            ("STREAM_SOCK_RAW", 3), ("STREAM_SOCK_RDM", 4),
+            ("STREAM_SOCK_SEQPACKET", 5), ("STREAM_IPPROTO_IP", 0),
+            ("STREAM_IPPROTO_TCP", 6), ("STREAM_IPPROTO_UDP", 17),
+            ("STREAM_IPPROTO_ICMP", 1), ("STREAM_IPPROTO_RAW", 255),
+            ("STREAM_IS_URL", 1), ("STREAM_MUST_SEEK", 16),
+            ("STREAM_URL_STAT_LINK", 1), ("STREAM_URL_STAT_QUIET", 2),
+            ("STREAM_MKDIR_RECURSIVE", 1), ("STREAM_FILTER_READ", 1),
+            ("STREAM_FILTER_WRITE", 2), ("STREAM_FILTER_ALL", 3),
+            ("STREAM_SHUT_RD", 0), ("STREAM_SHUT_WR", 1),
+            ("STREAM_SHUT_RDWR", 2), ("STREAM_CAST_FOR_SELECT", 3),
+            ("STREAM_CAST_AS_STREAM", 0),
+            ("STREAM_CRYPTO_METHOD_ANY_CLIENT", 127),
+            ("STREAM_CRYPTO_METHOD_TLS_CLIENT", 121),
+        ] {
+            constants.insert(n.into(), Value::Int(v));
+        }
         constants.insert("PHP_VERSION".into(), Value::str("8.5.11-phpun"));
         constants.insert("PHP_MAJOR_VERSION".into(), Value::Int(8));
         constants.insert("PHP_MINOR_VERSION".into(), Value::Int(5));

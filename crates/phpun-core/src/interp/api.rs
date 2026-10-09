@@ -659,6 +659,15 @@ impl<'a> Interp<'a> {
         self.res_counter += 1;
         self.res_counter
     }
+
+    /// Bulk-reserve `n` resource ids returning the FIRST — used by
+    /// stream_socket_pair(), whose two stream resources zend registers
+    /// starting one slot below a normal stream's id.
+    pub fn next_res_ids(&mut self, n: u64) -> u64 {
+        let base = self.res_counter;
+        self.res_counter += n;
+        base
+    }
     pub fn set_resource(&mut self, _r: PhpResource) {}
     pub fn lookup_class(&self, name: &str) -> Option<Rc<PhpClass>> {
         self.classes

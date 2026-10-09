@@ -859,9 +859,82 @@ pub(crate) fn dispatch(
                 }
             }
         }
-        "wordwrap" => Value::str(arg_str(it, args, 0)), // minimal passthrough
+        "wordwrap" => {
+            let s0 = arg_bs(it, args, 0);
+            let width = arg(args, 1).to_int();
+            let br = args.get(2).map(|c| c.borrow().to_php_string()).unwrap_or_else(|| "\n".to_string());
+            let cut = args.get(3).map(|c| c.borrow().is_truthy()).unwrap_or(false);
+            Value::bytes(wordwrap(&s0, width, br.as_bytes(), cut))
+        }
         _ => return Ok(None),
     }))
+}
+
+/// wordwrap(): zend's greedy linewrap — at most `width` columns
+/// per line, preferring to break at the last space inside the span.
+/// `cut` allows mid-word breaks; a space that would sit at the break
+/// point is swallowed (replaced by the break string).
+fn wordwrap(s: &[u8], width: i64, brk: &[u8], cut: bool) -> Vec<u8> {
+    if s.is_empty() {
+        return s.to_vec();
+    }
+    if width <= 0 {
+        // width<=0: no column limit — every space becomes a break.
+        let mut out = Vec::with_capacity(s.len());
+        for (i, &c) in s.iter().enumerate() {
+            if c == b' ' && i > 0 {
+                out.extend_from_slice(brk);
+            } else {
+                out.push(c);
+            }
+        }
+        return out;
+    }
+    let width = width as usize;
+    let mut out = Vec::with_capacity(s.len());
+    let mut start = 0usize;
+    while s.len() - start > width {
+        let end = start + width;
+        // Last space within (start, end]; a space exactly at end also
+        // counts (it's the natural wrap point, not cut).
+        let sp = s[start..=end.min(s.len() - 1)]
+            .iter()
+            .rposition(|&c| c == b' ')
+            .map(|i| start + i);
+        match sp {
+            Some(sp) if sp > start => {
+                out.extend_from_slice(&s[start..sp]);
+                out.extend_from_slice(brk);
+                start = sp + 1;
+            }
+            _ if cut => {
+                out.extend_from_slice(&s[start..end]);
+                out.extend_from_slice(brk);
+                start = end;
+            }
+            _ => {
+                // No space inside the span and no cut: break at the
+                // NEXT space past width, if any (zend keeps the word).
+                let nx = s[end.min(s.len())..]
+                    .iter()
+                    .position(|&c| c == b' ')
+                    .map(|i| end + i);
+                match nx {
+                    Some(nx) => {
+                        out.extend_from_slice(&s[start..nx]);
+                        out.extend_from_slice(brk);
+                        start = nx + 1;
+                    }
+                    None => {
+                        out.extend_from_slice(&s[start..]);
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out.extend_from_slice(&s[start..]);
+    out
 }
 
 // ----- helpers -----

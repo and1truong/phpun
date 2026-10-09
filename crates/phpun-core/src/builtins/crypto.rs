@@ -23,6 +23,51 @@ pub(crate) fn dispatch(
             }
         }
         "hash_equals" => Value::Bool(arg_str(it, args, 0) == arg_str(it, args, 1)),
+        "hash_pbkdf2" => {
+            let algo = arg_str(it, args, 0).to_lowercase();
+            let pass = arg_bs(it, args, 1);
+            let salt = arg_bs(it, args, 2);
+            let iters = arg(args, 3).to_int();
+            let length = args.get(4).map(|c| c.borrow().to_int()).unwrap_or(0);
+            let raw = args.get(5).map(|c| c.borrow().is_truthy()).unwrap_or(false);
+            let digest_len = match algo.as_str() {
+                "md5" => 16,
+                "sha1" => 20,
+                "sha256" => 32,
+                "sha384" => 48,
+                "sha512" => 64,
+                _ => {
+                    return err(
+                        "ValueError",
+                        "hash_pbkdf2(): Argument #1 ($algo) must be a valid cryptographic hashing algorithm",
+                    )
+                }
+            };
+            if iters <= 0 {
+                return err(
+                    "ValueError",
+                    "hash_pbkdf2(): Argument #4 ($iterations) must be greater than 0",
+                );
+            }
+            // zend: length is the OUTPUT-string length (hex chars
+            // unless raw); length<=0 → one full digest.
+            let out_bytes = if length > 0 {
+                ((length + 1) / 2) as usize
+            } else {
+                digest_len as usize
+            };
+            let dk = pbkdf2(&algo, &pass, &salt, iters, out_bytes);
+            if raw {
+                Value::bytes(dk)
+            } else {
+                let hex = dk.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                Value::str(if length > 0 {
+                    hex.chars().take(length as usize).collect()
+                } else {
+                    hex
+                })
+            }
+        }
         "crc32_combine" => Value::Int(0),
 
         // ----- encoding -----
@@ -148,4 +193,64 @@ pub(in crate::builtins) fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// PBKDF2-HMAC. `algo` keys into the registered digests; unknown
+/// algos return None (zend emits its algo-validation warning first).
+fn pbkdf2(algo: &str, pass: &[u8], salt: &[u8], iters: i64, need: usize) -> Vec<u8> {
+    fn hmac<F>(key: &[u8], block: usize, mut h: F, msg: &[u8]) -> Vec<u8>
+    where
+        F: FnMut(&[u8]) -> Vec<u8>,
+    {
+        let mut k = if key.len() > block { h(key) } else { key.to_vec() };
+        k.resize(block, 0);
+        let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+        let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+        let mut inner = ipad;
+        inner.extend_from_slice(msg);
+        let ih = h(&inner);
+        let mut outer = opad;
+        outer.extend_from_slice(&ih);
+        h(&outer)
+    }
+    use sha1::Digest as _;
+    let (h, block): (Box<dyn Fn(&[u8]) -> Vec<u8>>, usize) = match algo {
+        "md5" => (Box::new(|m| md5::compute(m).0.to_vec()), 64),
+        "sha1" => (
+            Box::new(|m| sha1::Sha1::digest(m).to_vec()),
+            64,
+        ),
+        "sha256" => (
+            Box::new(|m| sha2::Sha256::digest(m).to_vec()),
+            64,
+        ),
+        "sha384" => (
+            Box::new(|m| sha2::Sha384::digest(m).to_vec()),
+            128,
+        ),
+        "sha512" => (
+            Box::new(|m| sha2::Sha512::digest(m).to_vec()),
+            128,
+        ),
+        _ => unreachable!(),
+    };
+    // T_i = U1 ^ U2 ^ ... ^ Uiters for each block counter i.
+    let mut out = Vec::new();
+    let mut i = 1u32;
+    while out.len() < need {
+        let mut msg = salt.to_vec();
+        msg.extend_from_slice(&i.to_be_bytes());
+        let mut u = hmac(pass, block, &*h, &msg);
+        let mut t = u.clone();
+        for _ in 1..iters {
+            u = hmac(pass, block, &*h, &u);
+            for (x, y) in t.iter_mut().zip(&u) {
+                *x ^= y;
+            }
+        }
+        out.extend_from_slice(&t);
+        i += 1;
+    }
+    out.truncate(need);
+    out
 }
