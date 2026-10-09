@@ -17,7 +17,39 @@ pub type SerialEntry = (String, String, Option<(PropDecl, Rc<PhpClass>)>);
 /// could never unwrap the way zend's dup does.
 pub type SpreadItems = Vec<(Option<Rc<str>>, Cell, bool)>;
 
+/// Dev-only per-site alloc counters (PHPUN_ALLOC=1 prints them).
+/// Index names in `ALLOC_SITE_NAMES`.
+pub static ALLOC_SITES: [std::sync::atomic::AtomicUsize; 12] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 12];
+pub static ALLOC_SITE_NAMES: [&str; 12] = [
+    "cell",
+    "vm_site",
+    "mem_track",
+    "trace_frame",
+    "frame_push",
+    "vars_insert",
+    "call_args",
+    "to_string",
+    "expr_temp",
+    "array_new",
+    "obj_new",
+    "other",
+];
+
+/// One switch for all alloc_hit sites: the phpun binary sets it when
+/// PHPUN_ALLOC=1, so the counters stay zero-cost (one relaxed load) in
+/// normal runs.
+pub static ALLOC_ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[inline]
+pub fn alloc_hit(i: usize) {
+    if ALLOC_ON.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        ALLOC_SITES[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub(in crate::interp) fn cell(v: Value) -> Cell {
+    alloc_hit(0);
     Rc::new(RefCell::new(v))
 }
 
