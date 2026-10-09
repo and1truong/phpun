@@ -369,6 +369,14 @@ pub struct Interp<'a> {
     /// VM spike (#39): compiled function bodies keyed by decl Rc ptr;
     /// the stored Rc keeps the decl alive so the pointer can't recycle.
     compiled_fns: crate::value::FxMap<usize, (Rc<FunctionDecl>, Option<Rc<vm::Compiled>>)>,
+    /// Recycled value vecs for VM frames (exec stacks + call argv) —
+    /// a call mallocs zero vecs once warm. Bounded by vm_exec's cap.
+    vm_val_pool: Vec<Vec<Value>>,
+    /// Recycled slot frames + arg-cell vecs for the same reason.
+    vm_slot_pool: Vec<Vec<crate::interp::vm::Slot>>,
+    vm_cell_pool: Vec<Vec<Cell>>,
+    /// Popped VM frames — Frame::new/vars-map alloc per call avoided.
+    vm_frame_pool: Vec<Frame>,
     classes: crate::value::FxMap<String, Rc<PhpClass>>,
     /// Traits by name — their methods are copied into using classes.
     pub traits: HashMap<String, Rc<ClassDecl>>,
@@ -1688,6 +1696,10 @@ impl<'a> Interp<'a> {
             stack: Vec::new(),
             functions: crate::value::FxMap::default(),
             compiled_fns: crate::value::FxMap::default(),
+            vm_val_pool: Vec::new(),
+            vm_slot_pool: Vec::new(),
+            vm_cell_pool: Vec::new(),
+            vm_frame_pool: Vec::new(),
             classes: crate::value::FxMap::default(),
             traits: HashMap::new(),
             trait_statics: HashMap::new(),

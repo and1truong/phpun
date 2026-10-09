@@ -29,7 +29,7 @@ use super::Interp;
 /// the call's arg Cell so `$a = v` writes through to what
 /// func_get_arg()/func_get_args() report — Zend's CV *is* the arg
 /// slot, not a copy.
-enum Slot {
+pub(in crate::interp) enum Slot {
     V(Value),
     C(Cell),
 }
@@ -64,13 +64,19 @@ enum Op {
     JumpIfTrue(usize),
     /// Direct literal name call. `lname` is the lowercase,
     /// `\u{1}`-stripped lookup name; `raw` is the spelling for
-    /// diagnostics and `ns\name` fallback candidates.
+    /// diagnostics and `ns\name` fallback candidates. `cache` is the
+    /// inline cache: a resolution that can never change is pinned —
+    /// a userland decl (functions can't be redeclared) or a builtin
+    /// in an empty caller ns (no `ns\name` can appear later to win
+    /// the fallback). Late-definable resolutions stay uncached and
+    /// re-resolve each call.
     Call {
         lname: Rc<str>,
         raw: Rc<str>,
         argc: u16,
         site: usize,
         callee: usize,
+        cache: std::cell::RefCell<Option<CachedFn>>,
     },
     /// Statement boundary: decref the temps this statement left in
     /// expr_temps — the AST's Stmt::Expr-end sweep, which object
@@ -85,6 +91,25 @@ enum Op {
     Echo,
     Line(usize),
     Return,
+}
+
+/// Per-call-site resolution (zend's INIT_FCALL cache slot). `Direct`
+/// skips not just the name lookup but the whole `invoke_fn` preamble
+/// — the compiled callee is run straight from the op.
+enum CachedFn {
+    Direct(Rc<FunctionDecl>, Rc<Compiled>),
+    Decl(Rc<FunctionDecl>),
+    Builtin,
+}
+
+impl Clone for CachedFn {
+    fn clone(&self) -> Self {
+        match self {
+            CachedFn::Direct(d, c) => CachedFn::Direct(d.clone(), c.clone()),
+            CachedFn::Decl(d) => CachedFn::Decl(d.clone()),
+            CachedFn::Builtin => CachedFn::Builtin,
+        }
+    }
 }
 
 struct Compiler {
@@ -562,6 +587,7 @@ impl Compiler {
                     argc: args.len() as u16,
                     site: *site,
                     callee: *callee,
+                    cache: std::cell::RefCell::new(None),
                 });
             }
             _ => return None,
@@ -608,26 +634,30 @@ impl<'a> Interp<'a> {
         // Param slots SHARE the arg cells: func_get_arg(i) reads them,
         // and a CV overwrite is the arg write like Zend's shared slot.
         // Positional extras beyond the params ride frame.args too.
-        let mut fa: Vec<Cell> = Vec::with_capacity(args.cells.len());
-        let mut slots: Vec<Slot> = Vec::with_capacity(comp.nslots);
+        // fa is the frame's arg list — positional args already in
+        // order, so the caller's cells vec moves wholesale (one clone
+        // per slot, zero per-arg vec copy); missing params append
+        // their folded default cells.
+        let mut fa: Vec<Cell> = std::mem::take(&mut args.cells);
+        let mut slots: Vec<Slot> = self
+            .vm_slot_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(comp.nslots));
         for (i, _) in decl.params.iter().enumerate() {
-            let c = match args.cells.get(i) {
+            let c = match fa.get(i) {
                 Some(c) => c.clone(),
-                None => cell(comp.defaults[i].clone().unwrap_or(Value::Null)),
+                None => {
+                    let c = cell(comp.defaults[i].clone().unwrap_or(Value::Null));
+                    fa.push(c.clone());
+                    c
+                }
             };
-            fa.push(c.clone());
             slots.push(Slot::C(c));
         }
-        fa.extend(
-            args.cells[decl.params.len().min(args.cells.len())..]
-                .iter()
-                .cloned(),
-        );
         slots.resize_with(comp.nslots, || Slot::V(Value::Null));
         if let Some(f) = self.stack.last_mut() {
             f.vm_sites.append(&mut args.vm_sites);
             f.args = fa;
-            args.cells.clear();
         }
         let temps_base = self.expr_temps.len();
         let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
@@ -640,7 +670,7 @@ impl<'a> Interp<'a> {
         self.cur_line = saved_line;
         self.send_line = Some(saved_line);
         let sweep_err = self.sweep_expr_temps(temps_base).err();
-        let out = if let Some(f) = self.last_popped_frame.take() {
+        let out = if let Some(mut f) = self.last_popped_frame.take() {
             // Slot-held objects die with the frame too — a call-returned
             // object stored in a local decrefs here like a CV decref.
             let mut dying: Vec<Cell> = Vec::new();
@@ -663,6 +693,21 @@ impl<'a> Interp<'a> {
                 .map_or_else(|| self.destruct_frame_objs(&f), Err)
                 .and_then(|_| self.destruct_cells(&dying))
                 .err();
+            // The frame's arg vec is dead now (dtor passes ran) —
+            // clear+pool it like the slots vec so the next call's arg
+            // materialization costs no malloc.
+            let mut fa = std::mem::take(&mut f.args);
+            fa.clear();
+            if self.vm_cell_pool.len() < 64 {
+                self.vm_cell_pool.push(fa);
+            }
+            slots.clear();
+            if self.vm_slot_pool.len() < 64 {
+                self.vm_slot_pool.push(std::mem::take(&mut slots));
+            }
+            if self.vm_frame_pool.len() < 64 {
+                self.vm_frame_pool.push(f);
+            }
             match (r, dtor_err) {
                 (Ok(_), Some(e)) => Err(e),
                 (r, _) => r,
@@ -682,9 +727,30 @@ impl<'a> Interp<'a> {
         &mut self,
         comp: &Compiled,
         slots: &mut [Slot],
-        mut tmark: usize,
+        tmark: usize,
     ) -> Result<Value, PhpError> {
-        let mut vs: Vec<Value> = Vec::with_capacity(16);
+        // Value-stack/argv vecs come from a per-Interp pool — a call
+        // costs no malloc here (cap bounds retention under deep
+        // recursion; each live frame holds its own vec anyway).
+        let mut vs = self
+            .vm_val_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(16));
+        let r = self.vm_exec_ops(comp, slots, tmark, &mut vs);
+        vs.clear();
+        if self.vm_val_pool.len() < 64 {
+            self.vm_val_pool.push(vs);
+        }
+        r
+    }
+
+    fn vm_exec_ops(
+        &mut self,
+        comp: &Compiled,
+        slots: &mut [Slot],
+        mut tmark: usize,
+        vs: &mut Vec<Value>,
+    ) -> Result<Value, PhpError> {
         let mut pc = 0usize;
         loop {
             match &comp.ops[pc] {
@@ -721,54 +787,101 @@ impl<'a> Interp<'a> {
                 Op::Binary(op) => {
                     let rv = vs.pop().unwrap();
                     let lv = vs.pop().unwrap();
-                    let v = match *op {
-                        "&&" => Value::Bool(rv.is_truthy()),
-                        "||" => Value::Bool(rv.is_truthy()),
-                        "." => {
-                            let grow = matches!(&lv, Value::Str(s) if Rc::strong_count(&s.rc) == 1);
-                            let mut ls = self.conv_bytes(&lv)?;
-                            let rs = self.conv_bytes(&rv)?;
-                            ls.extend_from_slice(&rs);
-                            let nv = Value::bytes(ls);
-                            if let Value::Str(s) = &nv {
-                                match &lv {
-                                    Value::Str(os) if grow => {
-                                        self.mem_grow_str(&os.rc, &s.rc, s.len() as u64 + 25)
+                    // Int×Int scalars bypass the arith/compare
+                    // machinery — no type dispatch, no cmp-depth or
+                    // notices protocol (scalar-scalar can't trigger
+                    // either). Overflow-to-float, div/mod-by-zero and
+                    // the INT_MIN/-1 edges drop to the general path
+                    // (`self.arith`) so their zend errors stay exact.
+                    let fast = if let (Value::Int(a), Value::Int(b)) = (&lv, &rv) {
+                        let (a, b) = (*a, *b);
+                        match *op {
+                            "+" => Some(match a.checked_add(b) {
+                                Some(i) => Value::Int(i),
+                                None => Value::Float(a as f64 + b as f64),
+                            }),
+                            "-" => Some(match a.checked_sub(b) {
+                                Some(i) => Value::Int(i),
+                                None => Value::Float(a as f64 - b as f64),
+                            }),
+                            "*" => Some(match a.checked_mul(b) {
+                                Some(i) => Value::Int(i),
+                                None => Value::Float(a as f64 * b as f64),
+                            }),
+                            "/" if b != 0 && !(a == i64::MIN && b == -1) => Some(if a % b == 0 {
+                                Value::Int(a / b)
+                            } else {
+                                Value::Float(a as f64 / b as f64)
+                            }),
+                            "%" if b != 0 && b != -1 => Some(Value::Int(a % b)),
+                            "==" | "===" => Some(Value::Bool(a == b)),
+                            "!=" | "!==" => Some(Value::Bool(a != b)),
+                            "<=>" => Some(Value::Int(match a.cmp(&b) {
+                                Ordering::Less => -1,
+                                Ordering::Equal => 0,
+                                Ordering::Greater => 1,
+                            })),
+                            "<" => Some(Value::Bool(a < b)),
+                            "<=" => Some(Value::Bool(a <= b)),
+                            ">" => Some(Value::Bool(a > b)),
+                            ">=" => Some(Value::Bool(a >= b)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let v = match fast {
+                        Some(v) => v,
+                        None => match *op {
+                            "&&" => Value::Bool(rv.is_truthy()),
+                            "||" => Value::Bool(rv.is_truthy()),
+                            "." => {
+                                let grow =
+                                    matches!(&lv, Value::Str(s) if Rc::strong_count(&s.rc) == 1);
+                                let mut ls = self.conv_bytes(&lv)?;
+                                let rs = self.conv_bytes(&rv)?;
+                                ls.extend_from_slice(&rs);
+                                let nv = Value::bytes(ls);
+                                if let Value::Str(s) = &nv {
+                                    match &lv {
+                                        Value::Str(os) if grow => {
+                                            self.mem_grow_str(&os.rc, &s.rc, s.len() as u64 + 25)
+                                        }
+                                        _ => self.mem_track(&s.rc, s.len() as u64 + 25),
                                     }
-                                    _ => self.mem_track(&s.rc, s.len() as u64 + 25),
                                 }
+                                nv
                             }
-                            nv
-                        }
-                        "===" | "!==" | "==" | "!=" | "<=>" | "<" | "<=" | ">" | ">=" => {
-                            crate::value::clear_cmp_depth_err();
-                            let (a, b) = (&lv, &rv);
-                            let v = match *op {
-                                "===" => Value::Bool(identical(a, b)),
-                                "!==" => Value::Bool(!identical(a, b)),
-                                "==" => Value::Bool(compare(a, b) == Ordering::Equal),
-                                "!=" => Value::Bool(compare(a, b) != Ordering::Equal),
-                                "<=>" => Value::Int(match compare(a, b) {
-                                    Ordering::Less => -1,
-                                    Ordering::Equal => 0,
-                                    Ordering::Greater => 1,
-                                }),
-                                "<" => Value::Bool(compare(a, b) == Ordering::Less),
-                                "<=" => Value::Bool(compare(a, b) != Ordering::Greater),
-                                ">" => Value::Bool(compare(b, a) == Ordering::Less),
-                                _ => Value::Bool(compare(b, a) != Ordering::Greater),
-                            };
-                            self.emit_cmp_notices()?;
-                            if crate::value::cmp_depth_err() {
-                                return self.fail(PhpError::uncaught(
-                                    "Error",
-                                    "Nesting level too deep - recursive dependency?",
-                                    self.cur_line,
-                                ));
+                            "===" | "!==" | "==" | "!=" | "<=>" | "<" | "<=" | ">" | ">=" => {
+                                crate::value::clear_cmp_depth_err();
+                                let (a, b) = (&lv, &rv);
+                                let v = match *op {
+                                    "===" => Value::Bool(identical(a, b)),
+                                    "!==" => Value::Bool(!identical(a, b)),
+                                    "==" => Value::Bool(compare(a, b) == Ordering::Equal),
+                                    "!=" => Value::Bool(compare(a, b) != Ordering::Equal),
+                                    "<=>" => Value::Int(match compare(a, b) {
+                                        Ordering::Less => -1,
+                                        Ordering::Equal => 0,
+                                        Ordering::Greater => 1,
+                                    }),
+                                    "<" => Value::Bool(compare(a, b) == Ordering::Less),
+                                    "<=" => Value::Bool(compare(a, b) != Ordering::Greater),
+                                    ">" => Value::Bool(compare(b, a) == Ordering::Less),
+                                    _ => Value::Bool(compare(b, a) != Ordering::Greater),
+                                };
+                                self.emit_cmp_notices()?;
+                                if crate::value::cmp_depth_err() {
+                                    return self.fail(PhpError::uncaught(
+                                        "Error",
+                                        "Nesting level too deep - recursive dependency?",
+                                        self.cur_line,
+                                    ));
+                                }
+                                v
                             }
-                            v
-                        }
-                        _ => self.arith(op, lv, rv)?,
+                            _ => self.arith(op, lv, rv)?,
+                        },
                     };
                     vs.push(v);
                 }
@@ -835,10 +948,23 @@ impl<'a> Interp<'a> {
                     argc,
                     site,
                     callee,
+                    cache,
                 } => {
                     let n = *argc as usize;
-                    let argv: Vec<Value> = vs.split_off(vs.len() - n);
-                    let v = self.vm_call(lname, raw, argv, *site, *callee)?;
+                    let mut argv = self.vm_val_pool.pop().unwrap_or_default();
+                    argv.extend(vs.drain(vs.len() - n..));
+                    // Direct hits bypass invoke_fn — arg values become
+                    // the frame's cells inside vm_run_direct.
+                    let hit = cache.borrow().clone();
+                    let v = if let Some(CachedFn::Direct(d, c)) = &hit {
+                        self.vm_run_direct(d, c, &mut argv)?
+                    } else {
+                        self.vm_call(lname, raw, &mut argv, *site, *callee, cache)?
+                    };
+                    argv.clear();
+                    if self.vm_val_pool.len() < 64 {
+                        self.vm_val_pool.push(argv);
+                    }
                     vs.push(v);
                 }
             }
@@ -879,6 +1005,79 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
+    /// Compiled-callee call: skips `invoke_fn`'s preamble (the yield
+    /// body-walk, SPL stubs, decl-class pendings) — a compiled decl
+    /// can contain no `yield`, `Stmt`/`Expr` coverage is fixed, and a
+    /// literal `f()` call carries no class context. The frame still
+    /// materializes exactly like invoke_fn_run's fills (args cells for
+    /// func_get_args + the dtor pass, vm_sites arena charge, trace).
+    /// Arity failures delegate to invoke_fn for the zend error path.
+    fn vm_run_direct(
+        &mut self,
+        decl: &Rc<FunctionDecl>,
+        comp: &Compiled,
+        argv: &mut Vec<Value>,
+    ) -> Result<Value, PhpError> {
+        let required = decl
+            .params
+            .iter()
+            .rposition(|p| p.default.is_none())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if argv.len() < required {
+            let mut args = super::CallArgs::empty();
+            args.cells = argv.drain(..).map(cell).collect();
+            return self.invoke_fn(decl, args, None, None);
+        }
+        let decl_site = self.pending_decl_site.take();
+        let _ = self.pending_decl_class.take();
+        let _ = self.pending_called_class.take();
+        // Pooled frame: every field vm_run/exec touches is reset here
+        // — vars/args/vm_sites come back cleared, class/closure state
+        // is unreachable from a literal f() call so None is correct.
+        let mut frame = self
+            .vm_frame_pool
+            .pop()
+            .unwrap_or_else(|| super::Frame::new(String::new()));
+        frame.fn_name = decl.name.clone();
+        frame.decl_site = decl_site.unwrap_or(Rc::as_ptr(decl) as usize);
+        frame.fn_line = decl.line;
+        frame.file = if decl.file.is_empty() {
+            self.cur_file.clone()
+        } else {
+            decl.file.clone()
+        };
+        frame.ns = decl.ns.clone();
+        frame.trait_origin = decl.decl_in.clone();
+        frame.hook_prop = self.pending_hook_prop.take();
+        frame.gen_body = self.pending_gen_body;
+        self.pending_gen_body = false;
+        frame.this_obj = None;
+        frame.scope_class = None;
+        frame.called_class = None;
+        frame.decl_class = None;
+        frame.ret_by_ref = false;
+        frame.closure_rc = None;
+        frame.call_alias = None;
+        frame.statics_unit = None;
+        frame.vars.clear();
+        frame.args.clear();
+        frame.vm_sites.clear();
+        let pending_caps = std::mem::take(&mut self.pending_gen_captures);
+        for (n, c, by_ref) in pending_caps {
+            let c2 = if by_ref { c } else { cell(c.borrow().clone()) };
+            frame.vars.insert(n, c2);
+        }
+        self.stack.push(frame);
+        let mut args = super::CallArgs::empty();
+        let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
+        cells.extend(argv.drain(..).map(cell));
+        args.cells = cells;
+        let n = args.cells.len() as u64;
+        self.vm_call_reserve(&mut args, n);
+        self.vm_run(decl, comp, args)
+    }
+
     /// VM-path callee dispatch: userland decls re-enter `invoke_fn`
     /// (which lands back on `vm_run` when the callee compiles),
     /// builtins take `call_builtin`, anything else is the same
@@ -888,9 +1087,10 @@ impl<'a> Interp<'a> {
         &mut self,
         lname: &str,
         raw: &str,
-        argv: Vec<Value>,
+        argv: &mut Vec<Value>,
         site: usize,
         callee: usize,
+        cache: &std::cell::RefCell<Option<CachedFn>>,
     ) -> Result<Value, PhpError> {
         self.send_line = Some(site);
         if lname == "__halt_compiler" {
@@ -903,36 +1103,65 @@ impl<'a> Interp<'a> {
                 line: 0,
             });
         }
-        let mut decl = self.functions.get(lname).cloned();
+        let hit = cache.borrow().clone();
+        let mut decl: Option<Rc<FunctionDecl>> = match &hit {
+            Some(CachedFn::Decl(d)) => Some(d.clone()),
+            Some(CachedFn::Builtin) => None,
+            _ => None,
+        };
+        let resolved = hit.is_some();
         let mut miss_name: Option<String> = None;
-        if decl.is_none() {
-            let ns = self.caller_ns();
-            if !ns.is_empty() {
-                let cand = format!("{}\\{}", ns.to_lowercase(), lname);
-                decl = self.functions.get(&cand).cloned();
-                if decl.is_none() {
-                    miss_name = Some(format!("{}\\{}", ns, raw));
+        if !resolved {
+            let direct = self.functions.get(lname).cloned();
+            decl = direct.clone();
+            if decl.is_none() {
+                let ns = self.caller_ns();
+                if !ns.is_empty() {
+                    let cand = format!("{}\\{}", ns.to_lowercase(), lname);
+                    decl = self.functions.get(&cand).cloned();
+                    if decl.is_none() {
+                        miss_name = Some(format!("{}\\{}", ns, raw));
+                    }
                 }
             }
+            // Resolution happens at INIT — an unresolvable name aborts
+            // before the (already-evaluated) args would matter.
+            if decl.is_none()
+                && !builtins::is_builtin(lname)
+                && builtins::builtin_params(lname).is_none()
+                && builtin_byref(lname).is_none()
+            {
+                self.send_line = Some(callee);
+                return self.fail(PhpError::uncaught(
+                    "Error",
+                    format!(
+                        "Call to undefined function {}()",
+                        miss_name.as_deref().unwrap_or(raw)
+                    ),
+                    0,
+                ));
+            }
+            // Pin only resolutions that can't change: a direct-hit
+            // userland decl (no redeclares — and when it also compiles,
+            // Direct skips invoke_fn next time), or a builtin reached
+            // with an empty caller ns (no ns\name can appear later).
+            // ns-fallback decls and namespaced builtin hits re-resolve.
+            let stable = if let Some(d) = direct {
+                match self.vm_compiled(&d) {
+                    Some(c) => Some(CachedFn::Direct(d, c)),
+                    None => Some(CachedFn::Decl(d)),
+                }
+            } else if decl.is_none() && self.caller_ns().is_empty() {
+                Some(CachedFn::Builtin)
+            } else {
+                None
+            };
+            if stable.is_some() {
+                *cache.borrow_mut() = stable;
+            }
         }
-        // Resolution happens at INIT — an unresolvable name aborts
-        // before the (already-evaluated) args would matter.
-        if decl.is_none()
-            && !builtins::is_builtin(lname)
-            && builtins::builtin_params(lname).is_none()
-            && builtin_byref(lname).is_none()
-        {
-            self.send_line = Some(callee);
-            return self.fail(PhpError::uncaught(
-                "Error",
-                format!(
-                    "Call to undefined function {}()",
-                    miss_name.as_deref().unwrap_or(raw)
-                ),
-                0,
-            ));
-        }
-        let cells: Vec<Cell> = argv.into_iter().map(cell).collect();
+        let mut cells = self.vm_cell_pool.pop().unwrap_or_default();
+        cells.extend(argv.drain(..).map(cell));
         let mut args = super::CallArgs::empty();
         args.cells = cells;
         let n = args.cells.len() as u64;
