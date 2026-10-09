@@ -773,6 +773,7 @@ pub(crate) const BUILTIN_NAMES: &[&str] = &[
     "stream_filter_remove",
     "stream_get_contents",
     "stream_get_filters",
+    "stream_get_line",
     "stream_get_meta_data",
     "stream_get_wrappers",
     "stream_isatty",
@@ -1281,6 +1282,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         "clearstatcache" => bp!(("clear_realpath_cache", Bool(false)), ("filename", Str(""))),
         "move_uploaded_file" => bp!(("from", Req), ("to", Req)),
         "stream_get_contents" => bp!(("stream", Req), ("length", Null), ("offset", Int(-1))),
+        "stream_get_line" => bp!(("stream", Req), ("max_length", Req), ("ending", Null)),
         "stream_get_meta_data" => bp!(("stream", Req)),
         "stream_copy_to_stream" => bp!(
             ("from", Req),

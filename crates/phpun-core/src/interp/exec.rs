@@ -260,6 +260,12 @@ impl<'a> Interp<'a> {
                 // A lone `$x;` compiles to a dead FREE op in Zend — no
                 // undefined-variable warning (first_class_callable_dynamic).
                 Expr::Var(n) if self.var_lookup(n).is_none() => Flow::Normal,
+                // `${expr};` — the discarded name fetch is elided the
+                // same way; only the inner expr's side effects run.
+                Expr::VarVar(inner, _) => match self.eval(inner) {
+                    Ok(_) => Flow::Normal,
+                    Err(e) => self.err_flow(e),
+                },
                 _ => {
                     let base = self.expr_temps.len();
                     // A previous statement's `return $lval` can leave a

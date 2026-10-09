@@ -711,6 +711,12 @@ pub(crate) fn dispatch(
                     rcap: 0,
                     fraw: 0,
                 })))
+            } else if path.to_lowercase().starts_with("data:") && rfc2397_err(&path).is_some() {
+                let why = rfc2397_err(&path).unwrap_or("illegal media type");
+                it.warn_pub(&format!(
+                    "fopen({path}): Failed to open stream: rfc2397: {why}"
+                ))?;
+                Value::Bool(false)
             } else if let Some(body) = parse_data_uri(&path) {
                 // `data:[mediatype][;base64],payload` — zend's RFC2397
                 // wrapper: a temp-backed read-only stream (scalar_*
@@ -797,6 +803,56 @@ pub(crate) fn dispatch(
                     which,
                     pos: 0,
                 })))
+            } else if path.to_lowercase().starts_with("php://fd/") {
+                // zend's fd scheme — strtol the suffix, dup() the fd.
+                let fd_s = &path["php://fd/".len()..];
+                match fd_s.trim_start().parse::<i64>() {
+                    Err(_) => {
+                        it.warn_pub(&format!(
+                            "fopen({path}): Failed to open stream: php://fd/ stream must be specified in the form php://fd/<orig fd>"
+                        ))?;
+                        Value::Bool(false)
+                    }
+                    Ok(n) if n < 0 || n >= unsafe { libc::sysconf(libc::_SC_OPEN_MAX) as i64 } => {
+                        it.warn_pub(&format!(
+                            "fopen({}): Failed to open stream: The file descriptors must be non-negative numbers smaller than {}",
+                            path,
+                            unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }
+                        ))?;
+                        Value::Bool(false)
+                    }
+                    Ok(n) => {
+                        let fd = unsafe { libc::dup(n as i32) };
+                        if fd < 0 {
+                            let (en, em) = io_errno_str(&std::io::Error::last_os_error());
+                            it.warn_pub(&format!(
+                                "fopen({path}): Failed to open stream: Error duping file descriptor {n}; possibly it doesn't exist: [{en}]: {em}"
+                            ))?;
+                            Value::Bool(false)
+                        } else {
+                            use std::os::unix::io::FromRawFd;
+                            let id = it.next_res_id();
+                            let spec = fopen_mode(&mode);
+                            let (rd, wr) = spec
+                                .as_ref()
+                                .map(|s| (s.read, s.write || s.append))
+                                .unwrap_or((true, false));
+                            Value::Resource(Rc::new(RefCell::new(PhpResource::File {
+                                id,
+                                file: unsafe { std::fs::File::from_raw_fd(fd) },
+                                read: rd,
+                                write: wr,
+                                pos: 0,
+                                eof: false,
+                                rbuf: Default::default(),
+                                rcap: 0,
+                                unlink_on_close: false,
+                                path: path.clone(),
+                                mode: mode.clone(),
+                            })))
+                        }
+                    }
+                }
             } else if path.to_lowercase().starts_with("php://") {
                 invalid_php_uri(it, "fopen", &path)?;
                 Value::Bool(false)
@@ -2176,6 +2232,48 @@ pub(crate) fn dispatch(
             it.stream_chunk_sizes.insert(id, new);
             Value::Int(prev)
         }
+        "stream_get_line" => {
+            stream_open_check(args, 0, name, 1, "stream")?;
+            let mut maxlen = zpp_long(it, args, 1, name, 2, "$max_length", "int")?;
+            if maxlen < 0 {
+                return err(
+                    "ValueError",
+                    format!(
+                        "{}(): Argument #2 ($max_length) must be greater than or equal to 0",
+                        name
+                    ),
+                );
+            }
+            if maxlen == 0 {
+                maxlen = 8192;
+            }
+            let delim = if args.len() > 2 {
+                arg_bs(it, args, 2)
+            } else {
+                Vec::new()
+            };
+            // php_stream_get_record: read up to maxlen bytes, stopping
+            // after a trailing delimiter (consumed, not returned);
+            // nothing read before EOF → false.
+            let mut out = Vec::new();
+            while (out.len() as i64) < maxlen {
+                match read_resource(it, args.first(), 1)? {
+                    StreamRead::Data(b) if !b.is_empty() => {
+                        out.extend_from_slice(&b);
+                        if !delim.is_empty() && out.ends_with(&delim) {
+                            out.truncate(out.len() - delim.len());
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            if out.is_empty() {
+                Value::Bool(false)
+            } else {
+                Value::bytes(out)
+            }
+        }
         "stream_get_meta_data" => {
             stream_open_check(args, 0, name, 1, "stream")?;
             let mk = |pairs: Vec<(&'static str, Value)>| {
@@ -2740,20 +2838,20 @@ fn uri_read(it: &mut Interp, f: &str, path: &str) -> Result<Option<UriRead>, Php
     let low = path.to_lowercase();
     let v = if low == "php://input" {
         UriRead::Body(it.php_input.as_ref().clone())
-    } else if let Some(rest) = path.strip_prefix("data:") {
-        // rfc2397 — a comma is required; zend's wrapper names it in
+    } else if path.strip_prefix("data:").is_some() {
+        // rfc2397 — zend's wrapper names its open-time rejections in
         // the open-stream warning.
-        let rest = rest.strip_prefix("//").unwrap_or(rest);
-        if rest.contains(',') {
-            match parse_data_uri(path) {
+        match rfc2397_err(path) {
+            Some(why) => {
+                it.warn_pub(&format!(
+                    "{f}({path}): Failed to open stream: rfc2397: {why}"
+                ))?;
+                UriRead::Fail
+            }
+            None => match parse_data_uri(path) {
                 Some(b) => UriRead::Body(b),
                 None => UriRead::Fail,
-            }
-        } else {
-            it.warn_pub(&format!(
-                "{f}({path}): Failed to open stream: rfc2397: no comma in URL"
-            ))?;
-            UriRead::Fail
+            },
         }
     } else if low.starts_with("php://") {
         if let Some((segs, inner)) = php_filter_uri(path) {
@@ -2820,6 +2918,50 @@ fn uri_read(it: &mut Interp, f: &str, path: &str) -> Result<Option<UriRead>, Php
         return Ok(None);
     };
     Ok(Some(v))
+}
+
+/// zend's RFC2397 open-time validation — the `data:` URI's mediatype
+/// (text before the first `;`) must be empty or media-token chars,
+/// every `;` param must be `attr=value` or an exact lowercase `base64`,
+/// and a `,` is required. Returns the reason phrase zend appends to
+/// `rfc2397: ` in the open-stream warning.
+fn rfc2397_err(path: &str) -> Option<&'static str> {
+    let rest = path
+        .strip_prefix("data:")
+        .or_else(|| path.strip_prefix("data://"))?;
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let comma = match rest.find(',') {
+        Some(c) => c,
+        None => return Some("no comma in URL"),
+    };
+    let meta = &rest[..comma];
+    let mut segs = meta.split(';');
+    let mediatype = segs.next().unwrap_or("");
+    if !mediatype.is_empty()
+        && !mediatype.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '-' | '.' | '_' | '~' | '!' | '$' | '&' | '\'' | '*' | '+' | '/'
+                )
+        })
+    {
+        return Some("illegal media type");
+    }
+    for seg in segs {
+        if seg == "base64" {
+            continue;
+        }
+        // Params need a mediatype to attach to; `;foo=bar` alone is an
+        // illegal media type in zend, `;foo` an illegal parameter.
+        if mediatype.is_empty() {
+            return Some("illegal media type");
+        }
+        if !seg.contains('=') {
+            return Some("illegal parameter");
+        }
+    }
+    None
 }
 
 fn parse_data_uri(path: &str) -> Option<Vec<u8>> {
