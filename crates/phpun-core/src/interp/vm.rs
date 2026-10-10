@@ -157,6 +157,7 @@ enum Op {
         key: Option<crate::ast::ForeachKey>,
         val: crate::ast::ForeachTarget,
         body: Rc<Compiled>,
+        depth: u32,
     },
     CanonicalStmt {
         stmt: Box<Stmt>,
@@ -562,6 +563,7 @@ impl Compiler {
                     key: key.clone(),
                     val: val.clone(),
                     body,
+                    depth: self.loops.len() as u32,
                 });
                 return Some(());
             }
@@ -1654,6 +1656,7 @@ impl<'a> Interp<'a> {
         targets: &mut Vec<CachedFn>,
     ) -> Result<Flow, PhpError> {
         let mut pc = 0usize;
+        let base_depth = if comp.loop_body { self.loop_depth } else { 0 };
         while pc < comp.ops.len() {
             match &comp.ops[pc] {
                 Op::Const(v) => vs.push(v.clone()),
@@ -1662,17 +1665,22 @@ impl<'a> Interp<'a> {
                     key,
                     val,
                     body,
+                    depth,
                 } => {
                     self.vm_materialize(comp, slots);
+                    let previous_depth =
+                        std::mem::replace(&mut self.loop_depth, base_depth + depth);
                     let flow = self.exec_foreach_with(arr, key, val, &mut |s| {
                         s.loop_depth += 1;
                         let result = s.vm_scope_exec(body, true);
-                        s.loop_depth -= 1;
-                        match result {
+                        let flow = match result {
                             Ok(flow) => flow,
                             Err(error) => s.err_flow(error),
-                        }
+                        };
+                        s.loop_depth -= 1;
+                        flow
                     });
+                    self.loop_depth = previous_depth;
                     self.vm_refresh(comp, slots);
                     if !matches!(flow, Flow::Normal) {
                         return Ok(flow);
