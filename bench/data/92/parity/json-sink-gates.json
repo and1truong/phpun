@@ -1,0 +1,37 @@
+{
+  "before_runtime": "b2c21b3",
+  "after_runtime": "03dcdb3",
+  "before": {
+    "total": 300,
+    "passed": 218,
+    "failed": 73,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 0,
+    "unsupported": 3,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 0,
+    "applicable": 297,
+    "compatibility_pct": 73.4
+  },
+  "after": {
+    "total": 300,
+    "passed": 218,
+    "failed": 73,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 0,
+    "unsupported": 3,
+    "borked": 0,
+    "crashed": 6,
+    "timed_out": 0,
+    "applicable": 297,
+    "compatibility_pct": 73.4
+  },
+  "status_deltas": [],
+  "ceilings": [
+    "6 existing JSON recursion crashes, not new crashes"
+  ],
+  "command": "BIN phpt PATHS --sut BIN --timeout 30 -j 4 --json SAVE"
+}
