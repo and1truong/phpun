@@ -109,3 +109,24 @@ and anonymous-class regression; 26 VM/standalone oracle probes. 1,965 selected
 class/hooks/type/lifetime PHPT:1,710pass/214existingfail/16skip/23unsupported/2existing
 GC timeouts at30s, zero crashes; every status unchanged across before/after.
 The two timeouts are retained in validation data, not counted as passes.
+
+## Guarded plain this-property resolution cache (#187)
+
+Runtime6bbe9e0 →728f405: per compiled `$this->name` site, cache only a
+shared positive plain-read proof's resolved key. Guard exact class and scope;
+read current backing cell every time, reprove on missing key/class/scope change.
+Private-scope candidate presence guards a cached public fallback key. Hook-body
+contexts bypass caching. Metadata pins no receiver or cell, verified by WeakReference.
+
+This is a key-resolution cache, not an offset/shape cache or storage rewrite.
+Hooks/magic/uninitialized/visibility failures retain canonical property machinery.
+
+Seven PHP-gated alternating release pairs: objects412.351→377.808ms (0.916×),
+norm176.631→149.209 (0.845×), ctor119.736→120.448 (1.006×). Fib/strings/app
+changes have overlapping ranges; no benefit claimed there. Their sample noise
+is retained in raw data. Cache benefit is specific to repeated method property reads.
+
+Validation: workspace tests/fmt/clippy/release, class/scope rebinding/missing-key/
+unset/magic/typed/hooks/weak-lifetime check; 26 oracle probes. Same1,965 class/hooks/
+type/lifetime PHPT, all statuses unchanged (including two existing GC30s timeouts),
+zero crashes. Offset/array-dim caches and storage-generation changes remain follow-ups.
