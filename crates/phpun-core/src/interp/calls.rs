@@ -1252,7 +1252,7 @@ impl<'a> Interp<'a> {
                         // (`{closure:enclosing():L}`) — __FUNCTION__/
                         // __METHOD__ read it, and a nested closure's
                         // `enclosing` resolves through it (closure_065).
-                        let mut frame = Frame::new(decl.name.clone());
+                        let mut frame = self.frame_new(decl.name.clone());
                         frame.closure_rc = Some(c.clone());
                         frame.call_alias = self.pending_call_alias.take();
                         frame.fn_line = decl.line;
@@ -1288,7 +1288,7 @@ impl<'a> Interp<'a> {
                             decl.file.clone()
                         };
                         let decl = decl.clone();
-                        self.stack.push(Box::new(frame));
+                        self.stack.push(frame);
                         // Reuse the existing scalar VM binder after establishing
                         // closure context. Captures and missing/default/named/ref
                         // arguments retain the canonical binder. The scalar slot
@@ -2624,7 +2624,7 @@ impl<'a> Interp<'a> {
                 .gen_run_state
                 .as_ref()
                 .is_some_and(|st| st.borrow().owns_frame(decl));
-            if suspended {
+            let out = if suspended {
                 let st = self.gen_run_state.clone().unwrap();
                 // CV order ~ the variable's first source position —
                 // the frame teardown decrefs in that order, so a
@@ -2703,7 +2703,9 @@ impl<'a> Interp<'a> {
                     (Ok(_), Some(e)) => Err(e),
                     (r, _) => r,
                 }
-            }
+            };
+            self.frame_recycle(f);
+            out
         } else {
             r
         };
@@ -4352,7 +4354,7 @@ impl<'a> Interp<'a> {
         // binding ("Argument #N ($x) not passed"); the count check below
         // is the positional-only form.
         if args.named.is_empty() && args.len() < required {
-            self.stack_pop();
+            self.stack_discard();
             let mut e = PhpError::uncaught(
                 "ArgumentCountError",
                 format!(
@@ -4391,7 +4393,7 @@ impl<'a> Interp<'a> {
         for (n, c, refable, trav) in &args.named {
             match decl.params.iter().position(|p| !p.variadic && p.name == *n) {
                 Some(j) if j < n_pos || by_name[j].is_some() => {
-                    self.stack_pop();
+                    self.stack_discard();
                     // Caller-side arg-verify error: the callee frame
                     // never existed (gh19653_2).
                     if self
@@ -4411,7 +4413,7 @@ impl<'a> Interp<'a> {
                 Some(j) => by_name[j] = Some((c.clone(), *refable, *trav)),
                 None if has_variadic => variadic_named.push((n.clone(), c.clone())),
                 None => {
-                    self.stack_pop();
+                    self.stack_discard();
                     if self
                         .call_trace
                         .last()
@@ -4501,7 +4503,7 @@ impl<'a> Interp<'a> {
                 // propagate (zend raises it, not the TypeError).
                 if ty.iter().any(|m| m.eq_ignore_ascii_case("callable")) {
                     if let Some(e) = self.take_callable_probe_err() {
-                        self.stack_pop();
+                        self.stack_discard();
                         return self.fail(e);
                     }
                 }
@@ -4620,7 +4622,7 @@ impl<'a> Interp<'a> {
                         &self.snapshot_trace_frame(fr),
                     ));
                 }
-                self.stack_pop();
+                self.stack_discard();
                 let mut e = PhpError::uncaught("TypeError", msg, call_line);
                 e.trace = Some(frs);
                 e.thrown_line = Some(decl.line);
@@ -4772,7 +4774,7 @@ impl<'a> Interp<'a> {
                     let mut dv = match r {
                         Ok(v) => v,
                         Err(e) => {
-                            self.stack_pop();
+                            self.stack_discard();
                             return self.fail(e);
                         }
                     };
@@ -4803,7 +4805,7 @@ impl<'a> Interp<'a> {
                         let ok = (implicit_null && matches!(dv, Value::Null))
                             || ty.iter().any(|m| self.param_type_match(m, &dv));
                         if !ok {
-                            self.stack_pop();
+                            self.stack_discard();
                             let tyv: Vec<String> = if implicit_null {
                                 let mut t = ty.to_vec();
                                 t.push("null".into());
@@ -4836,7 +4838,7 @@ impl<'a> Interp<'a> {
                             let mut e = PhpError::uncaught("TypeError", msg, self.cur_line);
                             e.display_msg = Some(display);
                             e.thrown_line = Some(decl.line);
-                            self.stack_pop();
+                            self.stack_discard();
                             return self.fail(e);
                         }
                         if !self.caller_file_strict() && !self.ty_weak_exact(ty, &dv) {
@@ -4850,7 +4852,7 @@ impl<'a> Interp<'a> {
                     // Unbound required param — only reachable via named
                     // args (the positional count check runs earlier).
                     let fname = self.decl_fname(decl);
-                    self.stack_pop();
+                    self.stack_discard();
                     let mut e = PhpError::uncaught(
                         "ArgumentCountError",
                         format!("{}(): Argument #{} (${}) not passed", fname, i + 1, p.name),
@@ -5178,7 +5180,7 @@ impl<'a> Interp<'a> {
             // attributes the throw to the declaration line
             // (probe11/probe11c). A minimal exec frame gives
             // call_site_frame the callee identity (C->m vs plain f()).
-            let mut frame = Frame::new(decl.name.clone());
+            let mut frame = self.frame_new(decl.name.clone());
             frame.this_obj = this_obj.clone();
             frame.scope_class = scope_class.clone();
             frame.decl_class = self
@@ -5186,11 +5188,11 @@ impl<'a> Interp<'a> {
                 .clone()
                 .or_else(|| scope_class.clone());
             crate::interp::util::alloc_hit(4);
-            self.stack.push(Box::new(frame));
+            self.stack.push(frame);
             let fr = self.call_site_frame(decl, &args, false);
             self.call_trace.push(fr);
             let fname = self.decl_fname(decl);
-            self.stack_pop();
+            self.stack_discard();
             let mut e = PhpError::uncaught(
                 "ArgumentCountError",
                 format!(
@@ -5248,7 +5250,7 @@ impl<'a> Interp<'a> {
         closure_rc: Option<Rc<PhpCallable>>,
         decl_site: Option<usize>,
     ) -> Result<Value, PhpError> {
-        let mut frame = Frame::new(decl.name.clone());
+        let mut frame = self.frame_new(decl.name.clone());
         frame.decl_site = decl_site.unwrap_or(Rc::as_ptr(decl) as usize);
         frame.closure_rc = closure_rc;
         frame.fn_line = decl.line;
@@ -5274,7 +5276,7 @@ impl<'a> Interp<'a> {
         let pending_caps = std::mem::take(&mut self.pending_gen_captures);
         frame.gen_body = self.pending_gen_body;
         self.pending_gen_body = false;
-        self.stack.push(Box::new(frame));
+        self.stack.push(frame);
         if let Some(top) = self.stack.last_mut() {
             for (n, c, by_ref) in pending_caps {
                 let c2 = if by_ref { c } else { cell(c.borrow().clone()) };
