@@ -30,6 +30,7 @@ use super::{Flow, Interp};
 /// func_get_arg()/func_get_args() report — Zend's CV *is* the arg
 /// slot, not a copy.
 pub(in crate::interp) enum Slot {
+    Uninit,
     V(Value),
     C(Cell),
 }
@@ -1025,7 +1026,7 @@ impl<'a> Interp<'a> {
                 slots.push(Slot::C(c));
             }
         }
-        slots.resize_with(comp.nslots, || Slot::V(Value::Null));
+        slots.resize_with(comp.nslots, || Slot::Uninit);
         if let Some(f) = self.stack.last_mut() {
             f.vm_sites.append(&mut args.vm_sites);
             f.args = fa;
@@ -1241,6 +1242,27 @@ impl<'a> Interp<'a> {
         })
     }
 
+    fn vm_slot_value(
+        &mut self,
+        comp: &Compiled,
+        slots: &[Slot],
+        index: u16,
+    ) -> Result<Value, PhpError> {
+        Ok(match &slots[index as usize] {
+            Slot::V(v) => v.clone(),
+            Slot::C(c) => c.borrow().clone(),
+            Slot::Uninit => {
+                let name = comp
+                    .names
+                    .iter()
+                    .find_map(|(name, i)| (*i == index).then_some(name))
+                    .unwrap();
+                self.warn(&format!("Undefined variable ${name}"))?;
+                Value::Null
+            }
+        })
+    }
+
     fn vm_exec_ops(
         &mut self,
         comp: &Compiled,
@@ -1253,11 +1275,9 @@ impl<'a> Interp<'a> {
         while pc < comp.ops.len() {
             match &comp.ops[pc] {
                 Op::Const(v) => vs.push(v.clone()),
-                Op::Load(s) => vs.push(match &slots[*s as usize] {
-                    Slot::V(v) => v.clone(),
-                    Slot::C(c) => c.borrow().clone(),
-                }),
+                Op::Load(s) => vs.push(self.vm_slot_value(comp, slots, *s)?),
                 Op::Store(s) => match &mut slots[*s as usize] {
+                    Slot::Uninit => slots[*s as usize] = Slot::V(vs.last().unwrap().clone()),
                     Slot::V(v) => {
                         let old = std::mem::replace(v, vs.last().unwrap().clone());
                         self.destruct_dying_value(&old)?;
@@ -1295,10 +1315,7 @@ impl<'a> Interp<'a> {
                     let rv = vs.pop().unwrap();
                     // The left CV binds here — zend fetches it at the
                     // binary op, after the rhs ran.
-                    let lv = match &slots[*sl as usize] {
-                        Slot::V(v) => v.clone(),
-                        Slot::C(c) => c.borrow().clone(),
-                    };
+                    let lv = self.vm_slot_value(comp, slots, *sl)?;
                     let v = self.vm_binary(op, lv, rv)?;
                     vs.push(v);
                 }
@@ -1334,12 +1351,10 @@ impl<'a> Interp<'a> {
                     tmark = self.expr_temps.len();
                 }
                 Op::IncDec { slot, delta, post } => {
-                    let old = match &slots[*slot as usize] {
-                        Slot::V(v) => v.clone(),
-                        Slot::C(c) => c.borrow().clone(),
-                    };
+                    let old = self.vm_slot_value(comp, slots, *slot)?;
                     let new = self.incdec_value(&old, *delta)?;
                     match &mut slots[*slot as usize] {
+                        Slot::Uninit => slots[*slot as usize] = Slot::V(new),
                         Slot::V(v) => *v = new,
                         Slot::C(c) => {
                             let c = c.clone();
@@ -1350,10 +1365,7 @@ impl<'a> Interp<'a> {
                     vs.push(if *post {
                         old
                     } else {
-                        match &slots[*slot as usize] {
-                            Slot::V(v) => v.clone(),
-                            Slot::C(c) => c.borrow().clone(),
-                        }
+                        self.vm_slot_value(comp, slots, *slot)?
                     });
                 }
                 Op::Echo => {
@@ -1396,6 +1408,7 @@ impl<'a> Interp<'a> {
                         for (name, index) in &comp.names {
                             let slot = &mut slots[*index as usize];
                             let c = match slot {
+                                Slot::Uninit => continue,
                                 Slot::C(c) => c.clone(),
                                 Slot::V(v) => cell(std::mem::replace(v, Value::Null)),
                             };
@@ -1403,6 +1416,11 @@ impl<'a> Interp<'a> {
                             frame.vars.insert(name.clone(), c);
                         }
                         let value = self.vm_ref_call(&target, lname, raw, args, *site)?;
+                        for (name, index) in &comp.names {
+                            if let Some(c) = self.cur().vars.get(name) {
+                                slots[*index as usize] = Slot::C(c.clone());
+                            }
+                        }
                         vs.push(value);
                         pc = *at + 1; // skip compiled argument ops and Call
                         continue;
@@ -1454,7 +1472,7 @@ impl<'a> Interp<'a> {
             .vm_slot_pool
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(comp.nslots));
-        slots.resize_with(comp.nslots, || Slot::V(Value::Null));
+        slots.resize_with(comp.nslots, || Slot::Uninit);
         if let Some(f) = self.stack.last() {
             for (name, idx) in &comp.names {
                 if let Some(c) = f.vars.get(name) {
