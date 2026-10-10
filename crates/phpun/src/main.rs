@@ -135,6 +135,32 @@ Usage: php [options] [-f] <file> [--] [args...]
 
 ";
 
+/// `php -m`: phpun's advertised extension set (same names as
+/// get_loaded_extensions) in zend's two-section format. phpun has no
+/// Zend extensions, so the second section is the bare header.
+fn print_modules() {
+    println!("[PHP Modules]");
+    for e in [
+        "Core",
+        "standard",
+        "SPL",
+        "pcre",
+        "hash",
+        "json",
+        "ctype",
+        "random",
+        "date",
+        "Reflection",
+        "mbstring",
+        "openssl",
+    ] {
+        println!("{e}");
+    }
+    println!();
+    println!("[Zend Modules]");
+    println!();
+}
+
 fn print_version() {
     // Compat-target banner, pinned to the oracle build string like the
     // pear include_path default — a different PHP build prints its own.
@@ -252,8 +278,12 @@ fn run_script(args: &[String]) -> ExitCode {
                     }
                 },
                 // Real php options phpun doesn't implement yet.
-                "modules" | "info" | "phpinfo" | "ini" | "rf" | "rc" | "re" | "rz" | "ri"
-                | "repeat" | "process-title" => return opt_unimpl(&a),
+                "modules" => {
+                    print_modules();
+                    return ExitCode::SUCCESS;
+                }
+                "info" | "phpinfo" | "ini" | "rf" | "rc" | "re" | "rz" | "ri" | "repeat"
+                | "process-title" => return opt_unimpl(&a),
                 _ => return opt_err(i + 1, 1, "no argument for option -".to_string()),
             }
             continue;
@@ -276,7 +306,11 @@ fn run_script(args: &[String]) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             // Real php options phpun doesn't implement yet.
-            "-m" | "-i" | "-l" | "-s" | "-w" | "-a" | "-B" | "-R" | "-F" | "-E" | "-S" | "-t" => {
+            "-m" => {
+                print_modules();
+                return ExitCode::SUCCESS;
+            }
+            "-i" | "-l" | "-s" | "-w" | "-a" | "-B" | "-R" | "-F" | "-E" | "-S" | "-t" => {
                 return opt_unimpl(&a)
             }
             _ if a.starts_with("-r") => {
