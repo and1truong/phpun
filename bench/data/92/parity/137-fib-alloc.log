@@ -1,0 +1,6 @@
+allocs: 1688844 bytes: 57519487
+  cell: 41
+  vm_site: 1664079
+  mem_track: 34
+  trace_frame: 1664079
+  call_args: 1
