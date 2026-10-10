@@ -1,0 +1,38 @@
+{
+  "before_runtime": "05804b7",
+  "after_runtime": "ca76c30",
+  "before_hash": "52e3725e3967e8e262a975dac5d1dea4e0333027bec636ac2c7bc9c817f12a8d",
+  "after_hash": "babded704b22e68d49e8cc97743e5537a9c3f1d17b08ab39136447611a616fbd",
+  "workspace_tests_fmt_clippy": "pass;6core/21runtime/19format checks",
+  "phpt_before_summary": {
+    "total": 3390,
+    "passed": 2671,
+    "failed": 639,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 29,
+    "unsupported": 34,
+    "borked": 0,
+    "crashed": 13,
+    "timed_out": 4,
+    "applicable": 3327,
+    "compatibility_pct": 80.28
+  },
+  "phpt_after_summary": {
+    "total": 3390,
+    "passed": 2671,
+    "failed": 639,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 29,
+    "unsupported": 34,
+    "borked": 0,
+    "crashed": 13,
+    "timed_out": 4,
+    "applicable": 3327,
+    "compatibility_pct": 80.28
+  },
+  "phpt_per_file_changes": [],
+  "abi_ceiling": "exact Null/Bool/Int/Float, provided fixed argument count, no canonical binder/variable ownership bridge. Writable scalar params and ThisProp metadata hybrids now eligible; scalar writes live in value_args; ownership-bearing writes/AST observation promote first; reference/named/coercing/default-widening/unresolved calls canonical",
+  "timer_note": "writable fib is a separate phase (source committed), not default10-fib. Sieve/app median changes are recorded but not causally attributed to arg elision"
+}

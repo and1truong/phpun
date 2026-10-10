@@ -23,7 +23,7 @@ pub(in crate::interp) enum Slot {
     Uninit,
     V(Value),
     C(Cell),
-    /// Read-only parameter in the live frame value vector.
+    /// Scalar parameter in the live frame value vector; writes remain inline.
     Arg(u16),
 }
 
@@ -407,15 +407,12 @@ impl Compiled {
             )
         });
         let hybrid = canonical_binding || c.ops.iter().any(|op| matches!(op, Op::ThisProp { .. }));
-        // ponytail: scalar, read-only params only. Writable/by-ref/hybrid
-        // bodies keep cells until lazy promotion supports their full lifetime.
-        let value_abi = !hybrid
+        // ponytail: exact scalar arguments only. Canonical binding/coercion
+        // keeps cells; scalar writes stay inline, ownership-bearing writes and
+        // AST observation promote arguments before exposing their lifetime.
+        let value_abi = !canonical_binding
             && !needs_bind
-            && !decl.params.iter().any(|p| p.variadic || p.promoted)
-            && !c.ops.iter().any(|op| match op {
-                Op::Store(i) | Op::IncDec { slot: i, .. } => (*i as usize) < decl.params.len(),
-                _ => false,
-            });
+            && !decl.params.iter().any(|p| p.variadic || p.promoted);
         Ok(Rc::new(Compiled {
             hybrid,
             top_level,
@@ -1985,8 +1982,19 @@ impl<'a> Interp<'a> {
                 }
                 Op::Load(s) => vs.push(self.vm_slot_value(comp, slots, *s)?),
                 Op::Store(s) => {
+                    if matches!(slots[*s as usize], Slot::Arg(_))
+                        && !matches!(
+                            vs.last().unwrap(),
+                            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+                        )
+                    {
+                        self.vm_materialize(comp, slots);
+                        self.vm_refresh(comp, slots);
+                    }
                     match &mut slots[*s as usize] {
-                        Slot::Arg(_) => unreachable!("value ABI parameters are read-only"),
+                        Slot::Arg(i) => {
+                            self.cur().value_args[*i as usize] = vs.last().unwrap().clone()
+                        }
                         Slot::Uninit => slots[*s as usize] = Slot::V(vs.last().unwrap().clone()),
                         Slot::V(v) => {
                             let old = std::mem::replace(v, vs.last().unwrap().clone());
@@ -2089,8 +2097,17 @@ impl<'a> Interp<'a> {
                 Op::IncDec { slot, delta, post } => {
                     let old = self.vm_slot_value(comp, slots, *slot)?;
                     let new = self.incdec_value(&old, *delta)?;
+                    if matches!(slots[*slot as usize], Slot::Arg(_))
+                        && !matches!(
+                            new,
+                            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+                        )
+                    {
+                        self.vm_materialize(comp, slots);
+                        self.vm_refresh(comp, slots);
+                    }
                     match &mut slots[*slot as usize] {
-                        Slot::Arg(_) => unreachable!("value ABI parameters are read-only"),
+                        Slot::Arg(i) => self.cur().value_args[*i as usize] = new,
                         Slot::Uninit => slots[*slot as usize] = Slot::V(new),
                         Slot::V(v) => *v = new,
                         Slot::C(c) => {
@@ -2734,6 +2751,74 @@ impl<'a> Interp<'a> {
 #[cfg(test)]
 mod tests {
     use super::Interp;
+
+    #[test]
+    fn writable_scalar_arguments_promote_before_owned_values_and_observe_writes() {
+        let mut it = Interp::new("writable-args.php");
+        let result = it.run_source(r#"<?php
+function write_args($n, $m) { $n += 2; $m++; echo json_encode(func_get_args()), "\n"; return $n + $m; }
+echo write_args(3, 4), "\n";
+function flip($n) { $n = null; echo json_encode(func_get_args()), "\n"; $n = 2.5; return $n; }
+var_dump(flip(1));
+function string_arg($n, $m) { $n = str_repeat('x', 3); $m += 2; echo json_encode(func_get_args()), "\n"; return $n; }
+echo string_arg(1, 2), "\n";
+function array_arg($n) { $n = range(1, 3); return func_get_args(); }
+echo json_encode(array_arg(1)), "\n";
+class ArgLife { function __destruct() { echo "destroy\n"; } }
+function make_arg() { return new ArgLife; }
+function weak_arg($n) { return WeakReference::create($n); }
+function weak_get($w) { var_dump($w->get()); }
+function object_arg($n) { $n = make_arg(); $weak = weak_arg($n); $n = 4; weak_get($weak); }
+object_arg(1);
+function trace_write($n) { $n--; echo json_encode(array_column(debug_backtrace(0, 1), 'args')), "\n"; }
+trace_write(6);
+function throw_write($n) { $n += 3; return intdiv($n, 0); }
+try { throw_write(2); } catch (DivisionByZeroError $e) { echo json_encode($e->getTrace()[1]['args']), "\n"; }
+function increment(&$n) { $n++; }
+function ref_observe($n) { increment($n); return func_get_args(); }
+echo json_encode(ref_observe(3)), "\n";
+class PropertyArgs { public int $x = 2; function calc($n) { $n += 3; return $n + $this->x; } }
+echo (new PropertyArgs)->calc(4), "\n";
+function coerced(int $n, int $m = 2) { $n++; return func_get_args(); }
+echo json_encode(coerced('4')), "\n";
+echo write_args(m: 4, n: 3), "\n";
+"#);
+        assert_eq!(
+            String::from_utf8_lossy(&it.out),
+            r#"[5,5]
+10
+[null]
+float(2.5)
+["xxx",4]
+xxx
+[[1,2,3]]
+destroy
+NULL
+[[5]]
+[5]
+[4]
+9
+[5]
+[5,5]
+10
+"#
+        );
+        assert_eq!(it.err_buf, "");
+        assert_eq!(result.exit_code, 0);
+        for name in [
+            "write_args",
+            "flip",
+            "string_arg",
+            "array_arg",
+            "object_arg",
+            "trace_write",
+            "throw_write",
+        ] {
+            let decl = it.functions[name].clone();
+            let compiled = it.vm_compiled(&decl).unwrap();
+            assert!(compiled.value_abi, "{name}");
+        }
+    }
 
     #[test]
     fn scalar_dimension_slots_preserve_mutation_refs_views_and_fallbacks() {
