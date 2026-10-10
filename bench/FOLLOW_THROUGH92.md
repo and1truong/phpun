@@ -42,3 +42,43 @@ are fixed, with no new failures. The two groups overlap and are not additive.
 
 Raw samples, binary SHA-256 hashes, build metadata, diagnostics and PHPT
 summaries: [data/92/follow-through/arrow](data/92/follow-through/arrow).
+
+## Capture-free closure dispatch — runtime 744d302 vs ecc3184
+
+`call_value` established a closure frame then always entered the full binder,
+even when the existing scalar VM binder was applicable. Reuse that binder for
+capture-free closures with all parameters supplied positionally. Captures,
+named/default/missing arguments, reference parameters and hybrid bodies retain
+the canonical binder. The gate is deliberately conservative.
+
+Seven alternating profiler-off release runs, PHP exit/stdout/stderr gates:
+
+| Workload | Before median ms | After median ms | Change |
+|---|---:|---:|---:|
+| Combined arrays | 579.791 | 463.100 | -20.1% |
+| Objects | 472.676 | 473.552 | +0.2% |
+| Captured arrows (control) | 163.018 | 167.585 | +2.8% |
+| Composer | 6.343 | 6.405 | +1.0% |
+| Capture-free arrows | 140.870 | 125.639 | -10.8% |
+
+Arrays and capture-free arrows improve; the other ranges overlap and establish
+no speed change. Arrays allocation requests fall 8,215,493 -> 2,769,890,
+cumulative bytes 265,702,134 -> 92,714,236 and cell events 700,826 -> 40,124.
+The existing CALLPROF now observes 350,351 gated callback calls. Its pre/cells
+fields are zero on this entry path and phases exclude closure-frame construction;
+these are VM phase diagnostics, not a complete CPU profile or wall-time budget.
+
+Workspace tests/clippy pass, all VM fixtures match PHP including the new dispatch
+probe, and 18 decomposition smoke cases match. The probe covers weak type
+coercion, named/default/missing args, variadic/by-ref args, captured-local isolation,
+exception args and bound receivers surviving until the last closure is released.
+899 PHPT cases run **sequentially before then after**, one worker, 60-second limit:
+752 pass, 130 existing fail, 3 skip, 14 unsupported, no crash/timeout and no status
+changes. Suites: arrows, closures, named params, function arguments, type
+declarations, GC, exceptions and backtrace. The previously failing gc_045 remains
+a fail at this cutoff; this is not a claim that GC parity is complete.
+
+Raw samples/ranges/hashes and diagnostics:
+[data/92/follow-through/closure-dispatch](data/92/follow-through/closure-dispatch).
+The capture-free benchmark mode was added after the runtime change; its source
+revision is recorded separately in the PHPT/provenance summary.
