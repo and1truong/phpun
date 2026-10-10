@@ -785,3 +785,42 @@ try { new HookRef($v); } catch (Error $e) { echo $e->getMessage(), "\n"; }
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn streaming_json_preserves_flags_nested_keys_hooks_and_utf8() {
+    let (out, err, code) = eval(
+        "json-sink.php",
+        r#"<?php
+class StreamJson implements JsonSerializable { function jsonSerialize(): mixed { echo "serialize\n"; return ['ok' => 3]; } }
+class HookJson {
+    public string $name { get { echo "get\n"; return 'hook'; } }
+    private int $hidden = 9;
+    public int $x = 2;
+}
+$payload = ['text' => "<>&'\"/\n\r\t\0\\é😀", 'nested' => [[null, true, false, 12, 2.5], [2 => 'two', 'x' => 'key']], 'empty' => []];
+foreach ([0, 15, 64, 256, 320] as $flags) echo json_encode($payload, $flags), "\n";
+echo json_encode([new StreamJson, new HookJson]), "\n";
+$s = '{"ascii":"user-123@example.com","utf8":"é😀","escaped":"a\\u0000b\\n","a":[1,true,null]}';
+$a = json_decode($s, true);
+echo $a['ascii'], ' ', bin2hex($a['utf8']), ' ', bin2hex($a['escaped']), ' ', json_encode($a['a']), "\n";
+echo json_encode(json_decode('{"x":1,"nested":{"k":"v"}}')), "\n";
+"#,
+        &[],
+    );
+    assert_eq!(
+        out,
+        r#"{"text":"<>&'\"\/\n\r\t\u0000\\\u00e9\ud83d\ude00","nested":[[null,true,false,12,2.5],{"2":"two","x":"key"}],"empty":[]}
+{"text":"\u003C\u003E\u0026\u0027\u0022\/\n\r\t\u0000\\\u00e9\ud83d\ude00","nested":[[null,true,false,12,2.5],{"2":"two","x":"key"}],"empty":[]}
+{"text":"<>&'\"/\n\r\t\u0000\\\u00e9\ud83d\ude00","nested":[[null,true,false,12,2.5],{"2":"two","x":"key"}],"empty":[]}
+{"text":"<>&'\"\/\n\r\t\u0000\\é😀","nested":[[null,true,false,12,2.5],{"2":"two","x":"key"}],"empty":[]}
+{"text":"<>&'\"/\n\r\t\u0000\\é😀","nested":[[null,true,false,12,2.5],{"2":"two","x":"key"}],"empty":[]}
+serialize
+get
+[{"ok":3},{"name":"hook","x":2}]
+user-123@example.com c3a9f09f9880 6100620a [1,true,null]
+{"x":1,"nested":{"k":"v"}}
+"#
+    );
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}
