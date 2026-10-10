@@ -1082,6 +1082,15 @@ impl<'a> Interp<'a> {
         comp: &Compiled,
         mut args: super::CallArgs,
     ) -> Result<Value, PhpError> {
+        // Scalar slots may share this call's arg cells, never the caller's
+        // by-value cells (array_walk, unpack and call_user_func_array share them).
+        // Do this before tracing/coercion so both see the isolated argument.
+        for (c, p) in args.cells.iter_mut().zip(&decl.params) {
+            if !p.by_ref && (Rc::strong_count(c) > 1 || Rc::weak_count(c) > 0) {
+                let value = c.borrow().clone();
+                *c = cell(value);
+            }
+        }
         let __p = pnow!();
         if __p.is_some() {
             PROF[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
