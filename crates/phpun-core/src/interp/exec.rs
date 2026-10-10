@@ -1970,6 +1970,25 @@ impl<'a> Interp<'a> {
         self.foreach_list_q(items, c, line, false)
     }
 
+    /// `Cannot use T as array` rows still bind every destructure
+    /// target — to null, recursively into nested lists.
+    fn foreach_bind_nulls(
+        &mut self,
+        items: &[Option<(Option<Expr>, ForeachTarget)>],
+    ) -> Result<(), PhpError> {
+        for elem in items.iter().flatten() {
+            match &elem.1 {
+                ForeachTarget::Var(n) => self.var_set(n, Value::Null)?,
+                ForeachTarget::Lvalue(e) => {
+                    self.store(e, Value::Null)?;
+                }
+                ForeachTarget::ByRef(e) => self.bind_cell(e, cell(Value::Null))?,
+                ForeachTarget::List(sub) => self.foreach_bind_nulls(sub)?,
+            }
+        }
+        Ok(())
+    }
+
     /// `quiet` suppresses 'Undefined array key' — set for a nested
     /// list's freshly auto-vivified intermediate (`[&$x]` on a
     /// missing slot creates `[]` and inner plain reads stay silent,
@@ -2022,7 +2041,12 @@ impl<'a> Interp<'a> {
         };
         match row {
             Row::Skip => {}
-            Row::Warn(t) => self.warn(&format!("Cannot use {} as array", t))?,
+            Row::Warn(t) => {
+                self.warn(&format!("Cannot use {} as array", t))?;
+                // The warn doesn't abort the destructure — zend binds
+                // each target to null (a dropped fetch reads as null).
+                self.foreach_bind_nulls(items)?;
+            }
             Row::ScalarErr => {
                 return self.fail(PhpError::uncaught(
                     "Error",

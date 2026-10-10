@@ -1137,6 +1137,11 @@ impl<'a> Interp<'a> {
                         visibility: Visibility::Public,
                         trait_alias_of: None,
                     }),
+                    stub_method("format", &["format"]),
+                    stub_method("modify", &["modifier"]),
+                    stub_method("add", &["interval"]),
+                    stub_method("sub", &["interval"]),
+                    stub_method("diff", &["targetObject"]),
                 ],
                 props: vec![],
                 consts: [
@@ -1389,6 +1394,7 @@ impl<'a> Interp<'a> {
                         visibility: Visibility::Public,
                         trait_alias_of: None,
                     }),
+                    stub_method("format", &["format"]),
                 ],
                 props: vec![],
                 consts: vec![],
@@ -2671,6 +2677,10 @@ impl<'a> Interp<'a> {
             ("ReflectionException", "Exception"),
             ("DateException", "Exception"),
             ("DateInvalidTimeZoneException", "DateException"),
+            ("DateError", "Error"),
+            ("DateMalformedStringException", "DateError"),
+            ("DateInvalidOperationException", "DateError"),
+            ("DateMalformedIntervalStringException", "DateException"),
         ] {
             let mut d = throwable_class(name, Some(parent), &["message", "code", "file", "line"]);
             // Only ErrorException has its own ctor in zend — every other
@@ -2680,6 +2690,39 @@ impl<'a> Interp<'a> {
                 !m.decl.name.eq_ignore_ascii_case("__construct") || name == "ErrorException"
             });
             reg(d, false);
+        }
+        // DateTimeImmutable mirrors DateTime's stub surface; the
+        // method_invoke arm reads `datetimeimmutable` for the clone-
+        // on-write return. Registered last so it can clone the
+        // datetime decl's methods/consts.
+        {
+            let (methods, consts) = self
+                .classes
+                .get("datetime")
+                .map(|dt| (dt.decl.methods.clone(), dt.decl.consts.clone()))
+                .unwrap_or_default();
+            let c = Rc::new(PhpClass {
+                decl: Rc::new(ClassDecl {
+                    name: "DateTimeImmutable".into(),
+                    kind: ClassKind::Class,
+                    is_abstract: false,
+                    is_final: false,
+                    readonly: false,
+                    parent: None,
+                    implements: vec![],
+                    attrs: vec![],
+                    traits: vec![],
+                    adaptations: vec![],
+                    methods,
+                    props: vec![],
+                    consts,
+                    file: String::new(),
+                    line: 0,
+                }),
+                statics: RefCell::new(HashMap::new()),
+                statics_init: RefCell::new(true),
+            });
+            self.classes.insert(c.name().to_lowercase(), c);
         }
     }
 }
