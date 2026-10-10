@@ -2223,7 +2223,7 @@ impl<'a> Interp<'a> {
         self.last_prop_ov = saved.prop_ov;
         self.dim_by_ref = saved.dim_by_ref;
         if let Some(e) = probe {
-            self.stack_pop();
+            self.stack_discard();
             return self.fail(e);
         }
         args.cells = std::mem::take(fa);
@@ -2652,6 +2652,33 @@ impl<'a> Interp<'a> {
 #[cfg(test)]
 mod tests {
     use super::Interp;
+
+    #[test]
+    fn canonical_frames_reuse_boxes_and_release_php_owners() {
+        let mut it = Interp::new("pool.php");
+        let result = it.run_source(
+            r#"<?php
+            class Receiver { function run($n = 1) { return $n; } }
+            function named($n, $m = 2) { return $n + $m; }
+            for ($i = 0; $i < 200; $i++) { named(m: 3, n: $i); }
+            $o = new Receiver; $w = WeakReference::create($o);
+            $o->run(n: 4); unset($o); var_dump($w->get());
+        "#,
+        );
+        assert_eq!(result.exit_code, 0, "{}", it.err_buf);
+        assert_eq!(it.out, b"NULL\n");
+        assert!(!it.vm_frame_pool.is_empty());
+        assert!(it.vm_frame_pool.iter().all(|f| f.vars.is_empty()
+            && f.args.is_empty()
+            && f.value_args.is_empty()
+            && f.this_obj.is_none()
+            && f.closure_rc.is_none()));
+        let frame = it.frame_new("first");
+        let ptr = &*frame as *const super::super::Frame;
+        it.frame_recycle(frame);
+        let frame = it.frame_new("second");
+        assert_eq!(&*frame as *const super::super::Frame, ptr);
+    }
 
     #[test]
     fn arena_spans_are_repaid_after_return_exception_and_page_extension() {
