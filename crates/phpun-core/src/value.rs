@@ -2308,7 +2308,7 @@ impl Drop for PhpArray {
 }
 
 /// One recorded call for exception backtraces (getTrace()).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TraceFrame {
     /// Callee name (`fopen`, `Error2Exception`, `Cls::m`/`{closure}`-ish).
     pub function: Rc<str>,

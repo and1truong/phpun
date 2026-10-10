@@ -592,6 +592,169 @@ impl<'a> Interp<'a> {
                 0,
             ));
         }
+        // DateTime::createFromFormat — static factory; failure is a
+        // silent `false` (warnings only surface via getLastErrors,
+        // which phpun doesn't model).
+        if matches!(
+            cls.name().to_lowercase().as_str(),
+            "datetime" | "datetimeimmutable"
+        ) && name.eq_ignore_ascii_case("createfromformat")
+        {
+            let fmt = args
+                .cells
+                .first()
+                .map(|c| c.borrow().clone())
+                .and_then(|v| match v {
+                    Value::Str(s) => Some(crate::value::lossy(&s).to_string()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let val = args
+                .cells
+                .get(1)
+                .map(|c| c.borrow().clone())
+                .and_then(|v| match v {
+                    Value::Str(s) => Some(crate::value::lossy(&s).to_string()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            return match crate::builtins::datetime::date_create_from_format(&fmt, &val, now) {
+                Some(n) => {
+                    let oc = called_class.unwrap_or_else(|| cls.clone());
+                    let mut props = HashMap::new();
+                    let mut order = Vec::new();
+                    for (k, v) in [
+                        ("\0dt\0ts", Value::Int(n.ts)),
+                        ("\0dt\0off", Value::Int(n.off)),
+                        ("\0dt\0tzty", Value::Int(n.tzty)),
+                        ("\0dt\0tz", Value::str(&n.tz)),
+                    ] {
+                        props.insert(k.to_string(), cell(v));
+                        order.push(k.to_string());
+                    }
+                    Ok(Value::Object(self.alloc_obj(PhpObject {
+                        class: oc,
+                        props,
+                        prop_order: order,
+                        id: 0,
+                        internal: None,
+                        unset_props: std::collections::HashSet::new(),
+                    })))
+                }
+                None => Ok(Value::Bool(false)),
+            };
+        }
+        // createFromMutable / createFromInterface / createFromImmutable:
+        // copy the instant + render-offset bundle into a fresh object
+        // of the called class.
+        if matches!(
+            cls.name().to_lowercase().as_str(),
+            "datetime" | "datetimeimmutable"
+        ) && matches!(
+            name.to_lowercase().as_str(),
+            "createfrommutable" | "createfrominterface" | "createfromimmutable"
+        ) {
+            let src = args
+                .cells
+                .first()
+                .map(|c| c.borrow().clone())
+                .and_then(|v| match v {
+                    Value::Object(o) => Some(o),
+                    _ => None,
+                });
+            return match src {
+                Some(so) => {
+                    let oc = called_class.unwrap_or_else(|| cls.clone());
+                    let mut props = HashMap::new();
+                    let mut order = Vec::new();
+                    {
+                        let sb = so.borrow();
+                        for k in ["\0dt\0ts", "\0dt\0off", "\0dt\0tzty", "\0dt\0tz"] {
+                            let v = sb
+                                .props
+                                .get(k)
+                                .map(|c| c.borrow().clone())
+                                .unwrap_or(Value::Int(0));
+                            props.insert(k.to_string(), cell(v));
+                            order.push(k.to_string());
+                        }
+                    }
+                    Ok(Value::Object(self.alloc_obj(PhpObject {
+                        class: oc,
+                        props,
+                        prop_order: order,
+                        id: 0,
+                        internal: None,
+                        unset_props: std::collections::HashSet::new(),
+                    })))
+                }
+                None => Ok(Value::Bool(false)),
+            };
+        }
+        // DateInterval::createFromDateString — relative-spec words
+        // ("1 day", "2 hours ago") into interval fields.
+        if cls.name().eq_ignore_ascii_case("dateinterval")
+            && name.eq_ignore_ascii_case("createfromdatestring")
+        {
+            let spec = args
+                .cells
+                .first()
+                .map(|c| c.borrow().clone())
+                .and_then(|v| match v {
+                    Value::Str(s) => Some(crate::value::lossy(&s).to_string()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            return match parse_interval_spec(&spec) {
+                Some(fields) => {
+                    let v = self.make_date_interval(fields);
+                    // spec-built intervals have days === false (only
+                    // diff() computes a real total)
+                    if let Value::Object(o) = &v {
+                        o.borrow_mut()
+                            .props
+                            .insert("days".into(), cell(Value::Bool(false)));
+                        o.borrow_mut().prop_order.push("days".into());
+                    }
+                    Ok(v)
+                }
+                None => {
+                    // static-call frame like dt_malformed's ->
+                    self.call_trace.push(TraceFrame {
+                        file: self.diag_file_shared(),
+                        line: self.send_line.unwrap_or(self.cur_line) as u32,
+                        function: name.to_string().into(),
+                        class: Some(cls.name().to_string()),
+                        ty: "::".into(),
+                        args: args.cells.clone(),
+                        named_args: args
+                            .named
+                            .iter()
+                            .map(|(n, c, ..)| (n.clone(), c.clone()))
+                            .collect(),
+                        internal: false,
+                        visible: true,
+                        named_dispatch: false,
+                        gen_resume: false,
+                        gen_body: false,
+                    });
+                    let first = spec.chars().next().unwrap_or(' ');
+                    let r = self.fail(PhpError::uncaught(
+                        "DateMalformedIntervalStringException",
+                        format!(
+                            "Unknown or bad format ({spec}) at position 0 ({first}): The timezone could not be found in the database"
+                        ),
+                        0,
+                    ));
+                    self.call_trace.pop();
+                    r
+                }
+            };
+        }
         // Throwable methods are instance-only; look up incl. parents.
         match self.find_method_in(&cls, name) {
             Some((m, dc)) => {
@@ -1192,4 +1355,58 @@ impl<'a> Interp<'a> {
         }
         false
     }
+}
+
+/// Relative-interval words → field list for make_date_interval.
+/// Accepts `N unit` chains ("2 days 3 hours", plurals ok) + a
+/// trailing "ago" → invert. ponytail: only unit pairs — "next
+/// monday"-style specs fall through to `false`.
+fn parse_interval_spec(s: &str) -> Option<Vec<(&'static str, i64)>> {
+    let mut y = 0i64;
+    let mut mo = 0i64;
+    let mut d = 0i64;
+    let mut h = 0i64;
+    let mut i = 0i64;
+    let mut sec = 0i64;
+    let mut it = s.split_whitespace().peekable();
+    let mut any = false;
+    while let Some(w) = it.next() {
+        if w.eq_ignore_ascii_case("ago") {
+            // zend negates the field values, not `invert`
+            y = -y;
+            mo = -mo;
+            d = -d;
+            h = -h;
+            i = -i;
+            sec = -sec;
+            continue;
+        }
+        let n: i64 = w.parse().ok()?;
+        let unit = it.next()?.trim_end_matches('s').to_lowercase();
+        any = true;
+        match unit.as_str() {
+            "year" => y += n,
+            "month" => mo += n,
+            "week" => d += n * 7,
+            "fortnight" => d += n * 14,
+            "day" => d += n,
+            "hour" => h += n,
+            "min" | "minute" => i += n,
+            "sec" | "second" => sec += n,
+            _ => return None,
+        }
+    }
+    if !any {
+        return None;
+    }
+    Some(vec![
+        ("y", y),
+        ("m", mo),
+        ("d", d),
+        ("h", h),
+        ("i", i),
+        ("s", sec),
+        ("f", 0),
+        ("invert", 0),
+    ])
 }

@@ -246,11 +246,21 @@ pub(crate) fn dispatch(
             let find = arg(args, 0);
             let repl = arg(args, 1);
             let subj = arg(args, 2);
-            let (r, n) = str_replace(&find, &repl, &subj, name == "str_ireplace");
+            // zend: array $replace is only legal when $search is an
+            // array too — checked before $count is written.
+            if !matches!(find, Value::Array(_)) && matches!(repl, Value::Array(_)) {
+                return err(
+                    "TypeError",
+                    format!(
+                        "{name}(): Argument #2 ($replace) must be of type string when argument #1 ($search) is a string"
+                    ),
+                );
+            }
+            let (r, n) = str_replace(it, &find, &repl, &subj, name == "str_ireplace")?;
             if let Some(c) = args.get(3) {
                 *c.borrow_mut() = Value::Int(n);
             }
-            Value::bytes(r)
+            r
         }
         "substr" => {
             let s = arg_bs(it, args, 0);
@@ -1292,35 +1302,25 @@ fn trim_set(s: &[u8], chars: &[u8], left: bool, right: bool) -> Vec<u8> {
     }
 }
 
-fn str_replace(find: &Value, repl: &Value, subj: &Value, ci: bool) -> (Vec<u8>, i64) {
-    let finds: Vec<Vec<u8>> = match find {
-        Value::Array(a) => a
-            .borrow()
-            .entries
-            .iter()
-            .map(|(_, c)| c.borrow().to_php_bytes())
-            .collect(),
-        v => vec![v.to_php_bytes()],
-    };
-    let repls: Vec<Vec<u8>> = match repl {
-        Value::Array(a) => a
-            .borrow()
-            .entries
-            .iter()
-            .map(|(_, c)| c.borrow().to_php_bytes())
-            .collect(),
-        v => vec![v.to_php_bytes()],
-    };
-    let mut out = subj.to_php_bytes();
-    let mut count = 0i64;
+fn str_replace_one(
+    finds: &[Vec<u8>],
+    repls: &[Vec<u8>],
+    repl_scalar: bool,
+    subj: &[u8],
+    ci: bool,
+    count: &mut i64,
+) -> Vec<u8> {
+    let mut out = subj.to_vec();
     for (i, f) in finds.iter().enumerate() {
         if f.is_empty() {
             continue;
         }
-        let r = repls
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| repls.last().cloned().unwrap_or_default());
+        // Scalar repl applies to every find; a short repl array pads ''.
+        let r = if repl_scalar {
+            &repls[0]
+        } else {
+            repls.get(i).map(|r| r.as_slice()).unwrap_or(&[])
+        };
         // Each replace is replace-all: occurrences present now are all hit.
         let mut i0 = 0usize;
         while let Some(p) = if ci {
@@ -1328,18 +1328,91 @@ fn str_replace(find: &Value, repl: &Value, subj: &Value, ci: bool) -> (Vec<u8>, 
         } else {
             bfind(&out, f, i0)
         } {
-            count += 1;
+            *count += 1;
             i0 = p + f.len();
         }
         out = if ci {
-            breplace_ci(&out, f, &r)
+            breplace_ci(&out, f, r)
         } else {
-            breplace(&out, f, &r)
+            breplace(&out, f, r)
         };
     }
-    (out, count)
+    out
 }
 
+fn str_replace(
+    it: &mut Interp,
+    find: &Value,
+    repl: &Value,
+    subj: &Value,
+    ci: bool,
+) -> Result<(Value, i64), PhpError> {
+    // Operand stringification goes through conv_str — zend invokes
+    // __toString, warns "Array to string conversion", and throws
+    // "could not be converted to string" on non-stringable objects.
+    let mut to_bytes = |v: &Value| -> Result<Vec<u8>, PhpError> {
+        match v {
+            Value::Str(s) => Ok(s.to_vec()),
+            _ => Ok(it.conv_str(v)?.into_bytes()),
+        }
+    };
+    let finds: Vec<Vec<u8>> = match find {
+        Value::Array(a) => {
+            let a = a.borrow();
+            let mut v = Vec::with_capacity(a.entries.len());
+            for (_, c) in &a.entries {
+                v.push(to_bytes(&c.borrow().clone())?);
+            }
+            v
+        }
+        v => vec![to_bytes(v)?],
+    };
+    let repls: Vec<Vec<u8>> = match repl {
+        Value::Array(a) => {
+            let a = a.borrow();
+            let mut v = Vec::with_capacity(a.entries.len());
+            for (_, c) in &a.entries {
+                v.push(to_bytes(&c.borrow().clone())?);
+            }
+            v
+        }
+        v => vec![to_bytes(v)?],
+    };
+    let repl_scalar = !matches!(repl, Value::Array(_));
+    let mut count = 0i64;
+    if let Value::Array(a) = subj {
+        // zend maps each element and sums replacements across the array.
+        let a = a.borrow();
+        let mut out = PhpArray::default();
+        for (k, c) in &a.entries {
+            let bytes = to_bytes(&c.borrow().clone())?;
+            out.set(
+                k.clone(),
+                Value::bytes(str_replace_one(
+                    &finds,
+                    &repls,
+                    repl_scalar,
+                    &bytes,
+                    ci,
+                    &mut count,
+                )),
+            );
+        }
+        Ok((Value::Array(Rc::new(RefCell::new(out))), count))
+    } else {
+        Ok((
+            Value::bytes(str_replace_one(
+                &finds,
+                &repls,
+                repl_scalar,
+                &to_bytes(subj)?,
+                ci,
+                &mut count,
+            )),
+            count,
+        ))
+    }
+}
 pub(in crate::builtins) fn php_substr(s: &[u8], start: i64, len: Option<i64>) -> Option<Vec<u8>> {
     let n = s.len() as i64;
     let start = if start < 0 {
