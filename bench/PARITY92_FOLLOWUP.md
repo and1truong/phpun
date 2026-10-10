@@ -298,3 +298,34 @@ were merged after these frozen timings; final-stack measurements are separate.
 
 This removes temporary string allocations, not inline packed array storage or
 shape-generation caches. Raw hashes/samples/status maps/profile in bench/data/92/parity/json-*.
+
+## Direct slot / literal operations (#188)
+
+Runtime03dcdb3 →cc12b19: BinaryCvConst reads the CV and an immutable literal
+directly, avoiding RHS push/pop and one opcode. Shared vm_binary retains all
+coercion/overflow/error gates; side-effectful RHS retains its original path.
+CPU attribution:1,289samples/zero lost, vm_exec46.63%exclusive, vm_run12.02%.
+Annotated opcode PC/decode regions total ~6.5%of vm_exec (~3%overall); other
+indirect jumps dispatch Value kinds. Sampling/skid and unresolved libc limits
+apply. This is not evidence that pure dispatch dominates or that JIT is needed.
+
+Seven alternating, profiler-off, PHP8.5.11-byte-gated release pairs:
+sieve242.843→224.062ms (0.923), default fib152.553→151.499 (0.993),
+typed fib29 626.315→618.164 (0.987), objects314.968→309.081 (0.981),
+strings211.948→216.170 (1.020), app41.318→42.097 (1.019). Small changes
+overlap; only the bounded sieve benefit is selected, not a broad speedup.
+
+Separate seven-run function clocks: first fib10 call (includes compilation,
+not pure compile cost)0.097→0.094ms; warm fib29 631.925→615.329ms (0.974).
+PHP warm31.379ms; gap remains ~19.6× here. Cold CLI is recorded separately.
+The timer is wall microtime, samples are variable, fixed result/exit/stderr gate.
+Decision: continue bounded slot/shared-runtime improvements; defer register
+rewrite/native tier without larger attributed dispatch cost. No parity claim.
+
+Workspace tests/fmt/clippy and scalar/numeric-string/null/overflow/error/trace/
+RHS-mutation oracle pass. Frozen d8cef25 includes parent review fixes;2521PHPT
+gain two promoted-reference tests. One GC stress case crosses the30s threshold
+under the parallel suite; standalone60s reruns pass on before/after. Nine
+existing crashes and five pre-existing timeouts remain. Raw per-file maps,
+original timeout and followup thresholds are retained; timing IDs are not
+relabelled after parent review fixes. Parent JSON trailing-escape fix is included.
