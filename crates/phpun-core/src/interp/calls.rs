@@ -2486,7 +2486,7 @@ impl<'a> Interp<'a> {
         // Overwrite (don't restore): the flag must describe THIS callee even
         // though nested calls overwrote it during the body.
         self.last_call_by_ref = decl.by_ref;
-        self.call_trace.pop();
+        self.trace_pop();
         self.cur_line = saved_line;
         self.send_line = Some(saved_line);
         // Zend decrefs the frame's CVs at unwind — a local object
@@ -2636,11 +2636,16 @@ impl<'a> Interp<'a> {
         // declaration order — `test3(NULL, 'B')` in named_params/defaults).
         // Named args collected by a variadic stay keyed
         // (`test(1, 2, x: 3, y: 4)` in named_params/backtrace).
-        let mut targs_named: Vec<(String, Cell)> = Vec::new();
+        let mut fr = self.trace_pool.pop().unwrap_or_default();
+        let mut targs_named = std::mem::take(&mut fr.named_args);
+        targs_named.clear();
+        let mut reusable = std::mem::take(&mut fr.args);
+        reusable.clear();
         let targs: Vec<Cell> = if defer_args {
-            Vec::new()
+            reusable
         } else if args.named.is_empty() {
-            args.cells.clone()
+            reusable.extend(args.cells.iter().cloned());
+            reusable
         } else {
             let mut last: i64 = -1;
             for (i, p) in decl.params.iter().enumerate() {
@@ -2705,76 +2710,61 @@ impl<'a> Interp<'a> {
             }
             t
         };
-        let mut fr = self
-            .stack
-            .last()
-            .map(|f| TraceFrame {
-                args_frame: None,
-                // fn_name is already the Zend scope name —
-                // `{closure:Foo::m():L}`/`{closure:FILE:L}` included.
-                function: f.fn_name.clone(),
-                // A closure bound to $this without a real scope runs
-                // on the "dummy scope" — traces show `Closure->`
-                // (closure_038).
-                class: f
-                    .scope_class
-                    .as_ref()
-                    .map(|c| c.name().to_string())
-                    .or_else(|| {
-                        if f.fn_name.starts_with("{closure:") && f.this_obj.is_some() {
-                            Some("Closure".to_string())
-                        } else {
-                            None
-                        }
-                    }),
-                ty: if f.this_obj.is_some() {
-                    "->"
-                } else if f.scope_class.is_some() {
-                    "::"
-                } else {
-                    ""
-                }
-                .to_string(),
-                // A generator body resumed by a `Generator->{m}()`
-                // call isn't a userland call — Zend stamps its trace
-                // frame at the internal site (`[internal function]:
-                // fn(args)`). Under an engine resume (foreach /
-                // iterator_*) the body frame instead shows the
-                // consumer's resume site (`FILE(line): fn(args)`).
-                file: if f.gen_body && self.iter_calls == 0 && self.gen_internal_resume == 0 {
-                    Rc::from("[internal function]")
-                } else {
-                    site_file.clone()
-                },
-                line: site_line,
-                args: Vec::new(),
-                named_args: Vec::new(),
-                internal: false,
-                visible: true,
-                named_dispatch: false,
-                gen_resume: false,
-                gen_body: f.gen_body,
-            })
-            .unwrap_or_else(|| TraceFrame {
-                args_frame: None,
-                function: decl.name.clone(),
-                class: None,
-                ty: String::new(),
-                file: site_file,
-                line: site_line,
-                args: Vec::new(),
-                named_args: Vec::new(),
-                internal: false,
-                visible: true,
-                named_dispatch: false,
-                gen_resume: false,
-                gen_body: false,
+        // Context is eager; positional trace vectors reuse pooled capacity.
+        // Named normalization retains its canonical ordering/default handling.
+        if let Some(f) = self.stack.last() {
+            // fn_name is already the Zend scope name —
+            // `{closure:Foo::m():L}`/`{closure:FILE:L}` included.
+            fr.function.clone_from(&f.fn_name);
+            // A closure bound to $this without a real scope runs
+            // on the "dummy scope" — traces show `Closure->`
+            // (closure_038).
+            fr.class = f
+                .scope_class
+                .as_ref()
+                .map(|c| c.name().to_string())
+                .or_else(|| {
+                    if f.fn_name.starts_with("{closure:") && f.this_obj.is_some() {
+                        Some("Closure".to_string())
+                    } else {
+                        None
+                    }
+                });
+            fr.ty.clear();
+            fr.ty.push_str(if f.this_obj.is_some() {
+                "->"
+            } else if f.scope_class.is_some() {
+                "::"
+            } else {
+                ""
             });
-        if defer_args {
-            fr.args_frame = Some(self.stack.len() - 1);
+            // A generator body resumed by a `Generator->{m}()`
+            // call isn't a userland call — Zend stamps its trace
+            // frame at the internal site (`[internal function]:
+            // fn(args)`). Under an engine resume (foreach /
+            // iterator_*) the body frame instead shows the
+            // consumer's resume site (`FILE(line): fn(args)`).
+            if f.gen_body && self.iter_calls == 0 && self.gen_internal_resume == 0 {
+                fr.file = Rc::from("[internal function]");
+            } else {
+                fr.file.clone_from(&site_file);
+            }
+            fr.gen_body = f.gen_body;
+        } else {
+            fr.function.clone_from(&decl.name);
+            fr.class = None;
+            fr.ty.clear();
+            fr.file = site_file;
+            fr.gen_body = false;
         }
+        fr.line = site_line;
+        fr.args_frame = defer_args.then(|| self.stack.len() - 1);
         fr.args = targs;
         fr.named_args = targs_named;
+        fr.internal = false;
+        fr.visible = true;
+        fr.named_dispatch = false;
+        fr.gen_resume = false;
         // Zend runs FilterIterator's accept loop in internal C — its
         // `fetch` frame never reaches a PHP trace.
         if fr.function.eq_ignore_ascii_case("fetch")
@@ -4284,7 +4274,7 @@ impl<'a> Interp<'a> {
                         .map(|f| f.function == decl.name)
                         .unwrap_or(false)
                     {
-                        self.call_trace.pop();
+                        self.trace_pop();
                     }
                     return self.fail(PhpError::uncaught(
                         "Error",
@@ -4302,7 +4292,7 @@ impl<'a> Interp<'a> {
                         .map(|f| f.function == decl.name)
                         .unwrap_or(false)
                     {
-                        self.call_trace.pop();
+                        self.trace_pop();
                     }
                     return self.fail(PhpError::uncaught(
                         "Error",
@@ -5089,7 +5079,7 @@ impl<'a> Interp<'a> {
             );
             e.thrown_line = Some(decl.line);
             let r = self.fail(e);
-            self.call_trace.pop();
+            self.trace_pop();
             return r;
         }
         // A `yield`-bearing body makes the call a Generator factory:

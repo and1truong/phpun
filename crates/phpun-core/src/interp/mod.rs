@@ -382,6 +382,9 @@ pub struct Interp<'a> {
     vm_scalar_cell_pool: Vec<Cell>,
     /// Popped VM frames — Frame::new/vars-map alloc per call avoided.
     vm_frame_pool: Vec<Frame>,
+    /// Popped trace frames — keeps String/Vec capacity alive so the
+    /// steady-state call path stops allocating (`site`/`post` phases).
+    trace_pool: Vec<crate::value::TraceFrame>,
     classes: crate::value::FxMap<String, Rc<PhpClass>>,
     /// Traits by name — their methods are copied into using classes.
     pub traits: HashMap<String, Rc<ClassDecl>>,
@@ -1389,6 +1392,16 @@ struct GcScan {
 }
 
 impl<'a> Interp<'a> {
+    /// zend pops the trace frame on return; the shell goes back to the
+    /// pool so the next call_site_frame reuses its allocations.
+    pub(in crate::interp) fn trace_pop(&mut self) {
+        if let Some(mut fr) = self.call_trace.pop() {
+            fr.args.clear();
+            fr.named_args.clear();
+            self.trace_pool.push(fr);
+        }
+    }
+
     pub fn new(file: &'a str) -> Self {
         let mut constants = crate::value::FxMap::default();
         constants.insert("PHP_EOL".into(), Value::str("\n"));
@@ -1748,6 +1761,7 @@ impl<'a> Interp<'a> {
             vm_cell_pool: Vec::new(),
             vm_scalar_cell_pool: Vec::new(),
             vm_frame_pool: Vec::new(),
+            trace_pool: Vec::new(),
             classes: crate::value::FxMap::default(),
             traits: HashMap::new(),
             trait_statics: HashMap::new(),
@@ -7470,7 +7484,7 @@ impl<'a> Interp<'a> {
             let cb_named = args.named.iter().position(|(n, ..)| n == "callback");
             let cb = if let Some(c) = args.cells.first() {
                 if cb_named.is_some() {
-                    self.call_trace.pop();
+                    self.trace_pop();
                     return self.fail(PhpError::uncaught(
                         "Error",
                         "Named parameter $callback overwrites previous argument",
@@ -7492,7 +7506,7 @@ impl<'a> Interp<'a> {
                     ),
                     0,
                 ));
-                self.call_trace.pop();
+                self.trace_pop();
                 return r;
             };
             if fwd && args.named.iter().any(|(n, ..)| n != "callback") {
@@ -7504,7 +7518,7 @@ impl<'a> Interp<'a> {
                     format!("{}() does not accept unknown named parameters", name),
                     0,
                 ));
-                self.call_trace.pop();
+                self.trace_pop();
                 return r;
             }
             let ca = CallArgs {
@@ -7540,7 +7554,7 @@ impl<'a> Interp<'a> {
                 if fwd {
                     if let Some(pe) = self.take_callable_probe_err() {
                         let r = self.fail(pe);
-                        self.call_trace.pop();
+                        self.trace_pop();
                         return r;
                     }
                 }
@@ -7553,7 +7567,7 @@ impl<'a> Interp<'a> {
                 let e = self.exception("TypeError", &msg);
                 let te = self.throw(e);
                 let r = self.fail(te);
-                self.call_trace.pop();
+                self.trace_pop();
                 return r;
             }
             if fwd && self.caller_scope_name().is_none() {
@@ -7562,7 +7576,7 @@ impl<'a> Interp<'a> {
                     "Cannot call forward_static_call() when no class scope is active",
                     0,
                 ));
-                self.call_trace.pop();
+                self.trace_pop();
                 return r;
             }
             // Forwarded names bind against the CALLEE's params at this
@@ -7581,7 +7595,7 @@ impl<'a> Interp<'a> {
                         format!("Unknown named parameter ${bad}"),
                         0,
                     ));
-                    self.call_trace.pop();
+                    self.trace_pop();
                     return r;
                 }
             }
@@ -7590,7 +7604,7 @@ impl<'a> Interp<'a> {
             self.internal_cb += 1;
             let r = self.call_value(&cb, ca);
             self.internal_cb -= 1;
-            self.call_trace.pop();
+            self.trace_pop();
             return match r {
                 Ok(v) => Ok(Some(v)),
                 Err(e) => self.fail(e),
@@ -7655,7 +7669,7 @@ impl<'a> Interp<'a> {
                             // the probe (usort/array_map/... — zend
                             // re-raises it rather than TypeError-ing).
                             if let Some(pe) = self.take_callable_probe_err() {
-                                self.call_trace.pop();
+                                self.trace_pop();
                                 return self.fail(pe);
                             }
                             let null = if pty.starts_with('?') { " or null" } else { "" };
@@ -7671,7 +7685,7 @@ impl<'a> Interp<'a> {
                             let e = self.exception("TypeError", &msg);
                             let te = self.throw(e);
                             let r = self.fail(te);
-                            self.call_trace.pop();
+                            self.trace_pop();
                             return r;
                         }
                     } else if matches!(v, Value::Null)
@@ -7699,7 +7713,7 @@ impl<'a> Interp<'a> {
                                     i + 1
                                 ));
                                 if let Err(e) = d {
-                                    self.call_trace.pop();
+                                    self.trace_pop();
                                     return self.fail(e);
                                 }
                             }
@@ -7723,7 +7737,7 @@ impl<'a> Interp<'a> {
                             );
                             let te = self.throw(e);
                             let r = self.fail(te);
-                            self.call_trace.pop();
+                            self.trace_pop();
                             return r;
                         }
                     } else if !strict
@@ -7756,7 +7770,7 @@ impl<'a> Interp<'a> {
                         let e = self.exception("TypeError", &msg);
                         let te = self.throw(e);
                         let r = self.fail(te);
-                        self.call_trace.pop();
+                        self.trace_pop();
                         return r;
                     } else if strict && !self.zpp_strict_ok(pty, &v) {
                         let msg = format!(
@@ -7771,7 +7785,7 @@ impl<'a> Interp<'a> {
                         let e = self.exception("TypeError", &msg);
                         let te = self.throw(e);
                         let r = self.fail(te);
-                        self.call_trace.pop();
+                        self.trace_pop();
                         return r;
                     }
                 }
@@ -7815,14 +7829,14 @@ impl<'a> Interp<'a> {
                     Ok(v) => Ok(v),
                     Err(e) => {
                         if Self::named_init_err(&e) {
-                            self.call_trace.pop();
+                            self.trace_pop();
                             frame_popped = true;
                         }
                         self.fail(e)
                     }
                 };
                 if !frame_popped {
-                    self.call_trace.pop();
+                    self.trace_pop();
                 }
                 let n = self.emit_cmp_notices();
                 if !visible {
@@ -7837,7 +7851,7 @@ impl<'a> Interp<'a> {
             // userland invoke path sees them.
             None if builtins::is_builtin(name) && !args.named.is_empty() => {
                 // Same param-build-phase error: no frame in the trace.
-                self.call_trace.pop();
+                self.trace_pop();
                 let r = self.fail(PhpError::uncaught(
                     "Error",
                     format!("Unknown named parameter ${}", args.named[0].0),
@@ -7861,7 +7875,7 @@ impl<'a> Interp<'a> {
                     Ok(r) => Ok(r),
                     Err(e) => self.fail(e),
                 };
-                self.call_trace.pop();
+                self.trace_pop();
                 let n = self.emit_cmp_notices();
                 if !visible {
                     self.cur_line = save_l;
@@ -8304,7 +8318,7 @@ impl<'a> Interp<'a> {
                 }
             }
             if const_frame {
-                self.call_trace.pop();
+                self.trace_pop();
             }
             if let Value::Object(o) = &v {
                 if let Some(ObjectInternal::Exception {

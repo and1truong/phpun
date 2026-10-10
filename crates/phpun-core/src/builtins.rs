@@ -1529,6 +1529,12 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         "unserialize" => bp!(("data", Req), ("options", Arr)),
         "unregister_tick_function" => bp!(("callback", Req)),
         "var_dump" => bp!(("value", Req), ("values", Var)),
+        "parse_str" => bp!(("string", Req), ("result", Req)),
+        "getopt" => bp!(
+            ("short_options", Req),
+            ("long_options", Arr),
+            ("rest_index", Null)
+        ),
         _ => return None,
     })
 }
