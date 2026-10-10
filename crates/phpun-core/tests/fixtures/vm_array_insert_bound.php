@@ -1,0 +1,31 @@
+<?php
+$a = [];
+for ($i = 0; $i < 100; ++$i) { $a[$i * 17] = $i; }
+$alias =& $a[51];
+$a[51] = 9;
+$other = 13;
+$a[51] =& $other;
+$other = 19;
+echo $alias, ':', $a[51], ':', count($a), "\n";
+unset($a[51]);
+$a[51] = 23;
+$a[] = 29;
+echo $a[51], ':', array_key_last($a), ':', $other, "\n";
+$copy = $a;
+$copy[5000] = 31;
+echo count($a), ':', count($copy), ':', isset($a[5000]) ? 1 : 0, "\n";
+$b = array_map(fn($x) => $x + 1, $a);
+$c = array_filter($b, fn($x) => $x % 3 === 0);
+echo array_sum($c), ':', count($c), "\n";
+$a = [-9 => 1, -2 => 3, 's' => 5, 20 => 7];
+echo $a[-9], ':', $a[-2], ':', $a[20], "\n";
+unset($a[20]);
+$a[20] = 11;
+array_unshift($a, 13);
+echo implode(',', array_values($a)), "\n";
+$a = ['a' => 7, 'b' => 3];
+sort($a);
+$a[] = 11;
+echo implode(',', $a), ':', array_key_last($a), "\n";
+$a = [PHP_INT_MAX - 1 => 17];
+echo $a[PHP_INT_MAX - 1], ':', isset($a[0]) ? 1 : 0, "\n";

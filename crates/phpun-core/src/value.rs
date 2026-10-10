@@ -273,6 +273,13 @@ impl PhpArray {
     /// `IDX_MIN`, linear scan below it or when the hint is stale.
     fn pos_of(&self, k: &ArrKey) -> Option<usize> {
         if let ArrKey::Int(i) = k {
+            // The append cursor is above every existing nonnegative int key.
+            // Prove absence before searching: map/filter and sparse inserts
+            // otherwise scan the growing table for each new key (quadratic).
+            // A wrapped/negative cursor cannot supply this proof.
+            if self.next >= 0 && *i >= self.next {
+                return None;
+            }
             if *i >= 0 && (*i as usize) < self.entries.len() {
                 let p = *i as usize;
                 if self.entries[p].0 == *k {
@@ -366,14 +373,14 @@ impl PhpArray {
     /// after the new binding is visible (its __destruct writes land
     /// on the shared cell, gh10168).
     pub fn bind_cell(&mut self, k: ArrKey, c: Cell) -> Option<Cell> {
-        if let ArrKey::Int(i) = k {
-            if i >= self.next {
-                self.next = i + 1;
-            }
-        }
         if let Some(p) = self.pos_of(&k) {
             Some(std::mem::replace(&mut self.entries[p].1, c))
         } else {
+            if let ArrKey::Int(i) = k {
+                if i >= self.next {
+                    self.next = i + 1;
+                }
+            }
             self.mem_note_key(&k);
             self.entries.push((k, c));
             self.mem_note_append();
