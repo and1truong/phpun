@@ -1192,7 +1192,7 @@ impl<'a> Interp<'a> {
             self.gen_resume_site = saved_site;
         }
         if userland {
-            self.call_trace.pop();
+            self.trace_pop();
         }
         r
     }
