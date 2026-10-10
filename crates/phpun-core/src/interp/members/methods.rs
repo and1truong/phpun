@@ -1816,7 +1816,8 @@ impl<'a> Interp<'a> {
                 // Zend binds the method at INIT_METHOD_CALL — before
                 // argument evaluation — so a missing method with no
                 // __call fallback fatals before any argument runs.
-                if self.find_method_in(&cls, &mn).is_none()
+                let fm = self.find_method_in(&cls, &mn);
+                if fm.is_none()
                     && self.scope_private_method(&mn).is_none()
                     && self.find_method_in(&cls, "__call").is_none()
                 {
@@ -1826,12 +1827,14 @@ impl<'a> Interp<'a> {
                         0,
                     ));
                 }
-                let fm = self.find_method_in(&cls, &mn);
                 let names_ok = fm.is_some();
-                let params = fm.map(|m| m.0.decl.params.clone()).unwrap_or_default();
+                let params = fm
+                    .as_ref()
+                    .map(|m| m.0.decl.params.clone())
+                    .unwrap_or_default();
                 let argvals = self.arg_cells(args, &params, &mn, false, site, false, names_ok)?;
                 // method_invoke handles builtin (Throwable), __call, undefined.
-                self.method_invoke_vis(o.clone(), &mn, argvals)
+                self.method_invoke_vis(o.clone(), &mn, argvals, fm)
             }
             Value::Null => {
                 if nullsafe {
@@ -2149,6 +2152,7 @@ impl<'a> Interp<'a> {
         obj: Rc<RefCell<PhpObject>>,
         name: &str,
         args: CallArgs,
+        pre: Option<(Rc<MethodDecl>, Rc<PhpClass>)>,
     ) -> Result<Value, PhpError> {
         let cls = obj.borrow().class.clone();
         // Scope-private binding takes precedence over the object's own
@@ -2170,18 +2174,23 @@ impl<'a> Interp<'a> {
                 return self.invoke_method(obj, &m, args, sc);
             }
         }
-        if let Some((m, dc)) = self.find_method_in(&cls, name) {
-            if !self.method_access_ok(&m, &dc) {
+        // The caller may already have resolved `name` on `cls` (zend
+        // binds at INIT_METHOD_CALL); reuse it instead of a second
+        // chain walk, then forward it so method_invoke's own dispatch
+        // skips the walk too.
+        let resolved = pre.or_else(|| self.find_method_in(&cls, name));
+        if let Some((m, dc)) = &resolved {
+            if !self.method_access_ok(m, dc) {
                 // Inaccessible method routes through __call when
                 // defined (zend_std_get_method fallback).
                 if let Some((cm, cdc)) = self.find_method_in(&cls, "__call") {
                     return self.call_via_magic(obj, &cm, cdc, name, args);
                 }
-                let e = self.method_vis_error(&m, &dc);
+                let e = self.method_vis_error(m, dc);
                 return self.fail(e);
             }
         }
-        self.method_invoke(obj, name, args)
+        self.method_invoke_pre(obj, name, args, resolved)
     }
 
     /// Method-call visibility against the current calling scope.
@@ -2285,14 +2294,28 @@ impl<'a> Interp<'a> {
         &mut self,
         obj: Rc<RefCell<PhpObject>>,
         name: &str,
-        mut args: CallArgs,
+        args: CallArgs,
     ) -> Result<Value, PhpError> {
+        self.method_invoke_pre(obj, name, args, None)
+    }
+
+    /// `method_invoke` with the method's (decl, declaring-class)
+    /// resolution already done at the call site — the stub checks and
+    /// final dispatch share it instead of re-walking the chain.
+    fn method_invoke_pre(
+        &mut self,
+        obj: Rc<RefCell<PhpObject>>,
+        name: &str,
+        mut args: CallArgs,
+        pre: Option<(Rc<MethodDecl>, Rc<PhpClass>)>,
+    ) -> Result<Value, PhpError> {
+        let mut resolved = pre;
         // Builtin exception methods implemented natively.
         if let Value::Object(_) = Value::Object(obj.clone()) {}
         let is_throwable = {
             let ob = obj.borrow();
             matches!(ob.internal, Some(ObjectInternal::Exception { .. }))
-                || self.is_throwable_name(&ob.class.decl.name)
+                || self.is_throwable_cls(&ob.class)
         };
         let cls = obj.borrow().class.clone();
         // Internal-class ctor ZPP: Reflection*/Throwable/DateTime
@@ -2310,8 +2333,8 @@ impl<'a> Interp<'a> {
         // params — same slot-fill/unknown-name/overwrite rules zend's
         // ZPP applies to ctor args, so reuse the ctor binder.
         if !args.named.is_empty() && !name.eq_ignore_ascii_case("__construct") {
-            let stub = self
-                .find_method_in(&cls, name)
+            let stub = resolved
+                .as_ref()
                 .filter(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
                 .map(|(m, dc)| (m.clone(), dc.clone()));
             if let Some((m, dc)) = stub {
@@ -2342,6 +2365,11 @@ impl<'a> Interp<'a> {
                 });
             }
         }
+        // One chain walk feeds every stub arm and the final
+        // dispatch below (callers that already resolved pass `pre`).
+        if resolved.is_none() {
+            resolved = self.find_method_in(&cls, name);
+        }
         if is_throwable {
             // Native method only when the resolved method is a builtin
             // registration (line 0 — userland always runs, even an empty
@@ -2349,8 +2377,8 @@ impl<'a> Interp<'a> {
             // find_method_in walks the parent chain so inherited stubs
             // (Exception::getTrace on a userland subclass) resolve
             // (tests/lang/038, error_2_exception_001).
-            let stub = self
-                .find_method_in(&cls, name)
+            let stub = resolved
+                .as_ref()
                 .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
                 .unwrap_or(false);
             if stub {
@@ -2364,8 +2392,8 @@ impl<'a> Interp<'a> {
         // on* hooks true. Only fires when the resolved method is the
         // registered stub — a userland override runs its own body.
         if self.obj_is_a_str(cls.name(), "php_user_filter") {
-            let stub = self
-                .find_method_in(&cls, name)
+            let stub = resolved
+                .as_ref()
                 .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
                 .unwrap_or(false);
             if stub {
@@ -2379,8 +2407,8 @@ impl<'a> Interp<'a> {
         }
         // name, methods act on it (gh15438_2).
         if cls.name().starts_with("Reflection") || cls.name().starts_with("reflection") {
-            let stub = self
-                .find_method_in(&cls, name)
+            let stub = resolved
+                .as_ref()
                 .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
                 .unwrap_or(false);
             if stub {
@@ -3141,8 +3169,8 @@ impl<'a> Interp<'a> {
         // override on a subclass (ArrayIteratorEx::rewind, myArray::
         // offsetGet — array_020/021/024, bug32134) still wins.
         if self.is_a_str(cls.name(), "arrayiterator") || self.is_a_str(cls.name(), "arrayobject") {
-            let stub = self
-                .find_method_in(&cls, name)
+            let stub = resolved
+                .as_ref()
                 .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
                 .unwrap_or(true);
             if stub {
@@ -3163,8 +3191,8 @@ impl<'a> Interp<'a> {
         // native stubs dispatch here — a userland override (e.g.
         // symfony/finder's current()) still wins.
         if self.is_a_str(cls.name(), "splfileinfo") {
-            let stub = self
-                .find_method_in(&cls, name)
+            let stub = resolved
+                .as_ref()
                 .map(|(m, _)| m.decl.body.is_empty() && m.decl.line == 0)
                 .unwrap_or(false);
             if stub {
@@ -3184,7 +3212,7 @@ impl<'a> Interp<'a> {
                 return Ok(v);
             }
         }
-        match self.find_method_in(&cls, name) {
+        match resolved {
             Some((m, dc)) => {
                 if m.is_abstract {
                     return self.fail(PhpError::uncaught(

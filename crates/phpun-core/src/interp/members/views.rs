@@ -2149,7 +2149,7 @@ impl<'a> Interp<'a> {
                             let resolved = self
                                 .resolve_class(name.trim_start_matches('\\'))
                                 .unwrap_or_else(|| name.clone());
-                            match self.classes.get(&resolved.to_lowercase()).cloned() {
+                            match lkey_get(&self.classes, resolved).cloned() {
                                 Some(c) => c,
                                 None => {
                                     return self

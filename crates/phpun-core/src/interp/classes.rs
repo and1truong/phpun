@@ -3745,8 +3745,8 @@ impl<'a> Interp<'a> {
             ));
         }
         self.link_const_inits(&cls)?;
-        let has_ctor = self.find_method_in(&cls, "__construct").is_some();
-        if !has_ctor {
+        let ctor = self.find_method_in(&cls, "__construct");
+        if ctor.is_none() {
             if let Some((n, ..)) = args.named.first() {
                 return self.fail(PhpError::uncaught(
                     "Error",
@@ -3758,9 +3758,9 @@ impl<'a> Interp<'a> {
         let obj = self.instantiate(&lname, &[])?;
         // __construct (native for builtins via method_invoke's
         // interception); the ctor may be inherited (property_hooks/foreach).
-        if has_ctor {
+        if let Some(ctor) = ctor {
             if let Value::Object(o) = &obj {
-                if let Err(e) = self.method_invoke_vis(o.clone(), "__construct", args) {
+                if let Err(e) = self.method_invoke_vis(o.clone(), "__construct", args, Some(ctor)) {
                     // A ctor that throws leaves a half-built object;
                     // zend never runs its __destruct (bug29368_1/_3).
                     self.mark_destructed(o);

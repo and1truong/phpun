@@ -1432,7 +1432,7 @@ impl<'a> Interp<'a> {
                                     }
                                     Err(SiteErr::Thrown(e)) => Err(e),
                                     Err(SiteErr::Msg(_)) => {
-                                        self.method_invoke_vis(o.clone(), &mname, args)
+                                        self.method_invoke_vis(o.clone(), &mname, args, None)
                                     }
                                 }
                             }
@@ -3966,7 +3966,7 @@ impl<'a> Interp<'a> {
             None => match bound {
                 // Via-handler resolution — the receiver's __call or
                 // the class's __callStatic trampoline.
-                Some(o) => self.method_invoke_vis(o, mn, args),
+                Some(o) => self.method_invoke_vis(o, mn, args, None),
                 None => self.static_invoke_vis(ce, mn, args, None, true),
             },
         }
