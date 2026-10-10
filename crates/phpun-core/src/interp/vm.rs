@@ -11,7 +11,9 @@ use super::util::cell;
 use crate::ast::{Expr, FunctionDecl, Param, Stmt};
 use crate::builtins;
 use crate::error::PhpError;
-use crate::value::{compare, identical, ArrKey, Cell, FxMap, PhpArray, PhpClass, Value};
+use crate::value::{
+    compare, identical, ArrKey, CallableKind, Cell, FxMap, PhpArray, PhpCallable, PhpClass, Value,
+};
 
 use super::{Flow, Interp};
 
@@ -2219,7 +2221,7 @@ impl<'a> Interp<'a> {
                     }
                     let result = if let CachedFn::Direct(d, c) = &target {
                         self.send_line = Some(*site);
-                        self.vm_run_direct(d, c, &mut argv)
+                        self.vm_run_direct(d, c, &mut argv, None)
                     } else {
                         self.vm_call(lname, raw, &mut argv, *site, &target)
                     };
@@ -2526,7 +2528,8 @@ impl<'a> Interp<'a> {
     /// Compiled-callee call: skips `invoke_fn`'s preamble (the yield
     /// body-walk, SPL stubs, decl-class pendings) — a compiled decl
     /// can contain no `yield`, `Stmt`/`Expr` coverage is fixed, and a
-    /// literal `f()` call carries no class context. The frame still
+    /// literal `f()` or proven context-free closure carries no class context.
+    /// The frame still
     /// materializes exactly like invoke_fn_run's fills (args cells for
     /// func_get_args + the dtor pass, vm_sites arena charge, trace).
     /// Arity failures delegate to invoke_fn for the zend error path.
@@ -2535,6 +2538,7 @@ impl<'a> Interp<'a> {
         decl: &Rc<FunctionDecl>,
         comp: &Compiled,
         argv: &mut Vec<Value>,
+        closure: Option<Rc<PhpCallable>>,
     ) -> Result<Value, PhpError> {
         let __p = pnow!();
         let required = decl
@@ -2553,7 +2557,8 @@ impl<'a> Interp<'a> {
         let _ = self.pending_called_class.take();
         // Pooled frame: every field vm_run/exec touches is reset here
         // — vars/args/vm_sites come back cleared, class/closure state
-        // is unreachable from a literal f() call so None is correct.
+        // is absent for the proven direct-call/closure subset. A closure keeps
+        // its own callable metadata until the normal frame teardown.
         let mut frame = self
             .vm_frame_pool
             .pop()
@@ -2576,7 +2581,7 @@ impl<'a> Interp<'a> {
         frame.called_class = None;
         frame.decl_class = None;
         frame.ret_by_ref = false;
-        frame.closure_rc = None;
+        frame.closure_rc = closure;
         frame.call_alias = None;
         frame.statics_unit = None;
         frame.vars.clear();
@@ -2643,6 +2648,85 @@ impl<'a> Interp<'a> {
         self.vm_call_reserve(&mut args, n);
         padd!(1, __p);
         self.vm_run(decl, comp, args)
+    }
+
+    /// Fresh positional callback values only: original/reference argument cells
+    /// must use call_value. Pool the value vector before invoking the shared ABI.
+    pub(crate) fn call_value_positional<const N: usize>(
+        &mut self,
+        callable: &Value,
+        values: [Value; N],
+        nonref: bool,
+    ) -> Result<Value, PhpError> {
+        let mut argv = self.vm_val_pool.pop().unwrap_or_default();
+        argv.extend(values);
+        let result = match self.vm_value_callback(callable, &mut argv) {
+            Some(result) => result,
+            None => {
+                let mut args = super::CallArgs::positional(argv.drain(..).map(cell).collect());
+                if nonref {
+                    args.nonref_cells.extend(0..N);
+                }
+                self.call_value(callable, args)
+            }
+        };
+        argv.clear();
+        if self.vm_val_pool.len() < 64 {
+            self.vm_val_pool.push(argv);
+        }
+        result
+    }
+
+    fn vm_value_callback(
+        &mut self,
+        callable: &Value,
+        argv: &mut Vec<Value>,
+    ) -> Option<Result<Value, PhpError>> {
+        let Value::Callable(c) = callable else {
+            return None;
+        };
+        let CallableKind::Closure(decl) = &c.kind else {
+            return None;
+        };
+        // ponytail: context-free fixed exact primitive closure calls only.
+        // Captures/receivers/class scope, coercion/defaults and refs retain the
+        // canonical callback binder; no callable resolution is cached here.
+        if !c.captures.is_empty()
+            || c.this_obj.is_some()
+            || c.scope_class.is_some()
+            || c.called_class.is_some()
+            || decl.by_ref
+            || argv.is_empty()
+            || argv.len() != decl.params.len()
+            || decl
+                .params
+                .iter()
+                .any(|p| p.by_ref || p.variadic || p.promoted)
+            || !argv.iter().all(|v| {
+                matches!(
+                    v,
+                    Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_)
+                )
+            })
+            || self.pending_call_alias.is_some()
+            || self.pending_decl_class.is_some()
+            || self.pending_called_class.is_some()
+            || self.pending_decl_site.is_some()
+            || self.pending_hook_prop.is_some()
+            || self.pending_gen_body
+            || !self.pending_gen_captures.is_empty()
+        {
+            return None;
+        }
+        let comp = self.vm_compiled(decl)?;
+        if !comp.value_abi
+            || !decl.params.iter().enumerate().all(|(i, p)| {
+                p.ty.is_none() || comp.param_fast[i].is_some_and(|gate| gate(&argv[i]))
+            })
+        {
+            return None;
+        }
+        Some(self.vm_run_direct(decl, &comp, argv, Some(c.clone())))
     }
 
     /// The typed check a fast `param_fast` gate could not settle for a
@@ -2924,6 +3008,90 @@ NULL
                 .iter()
                 .any(|op| matches!(op, super::Op::DimCv { .. })));
         }
+    }
+
+    #[test]
+    fn callback_values_preserve_live_args_fallbacks_sort_errors_and_owners() {
+        let mut it = Interp::new("callbacks.php");
+        let result = it.run_source(r#"<?php
+function liveCallbackArg() { return debug_backtrace(0, 2)[1]['args'][0]; }
+var_dump(array_map(function(int $x): int { $x++; echo json_encode(func_get_args()), "\n"; return liveCallbackArg(); }, ['a'=>1,'b'=>2]));
+echo json_encode(array_map(function($x) { $x = 1.5; return func_get_args(); }, [null, true])), "\n";
+echo json_encode(array_filter([1,2,3], fn(int $x): bool => $x % 2 === 0)), "\n";
+$a=[3,1,2]; usort($a, fn(int $x,int $y):int => $x <=> $y); echo json_encode($a), "\n";
+$a=[1=>3,2=>1,3=>2]; uasort($a, fn(int $x,int $y):int => $x <=> $y); echo json_encode($a), "\n";
+uksort($a, fn(int $x,int $y):int => $y <=> $x); echo json_encode($a), "\n";
+$seen=0; echo json_encode(array_map(function($x) use (&$seen) { $seen += $x; return $seen; }, [1,2])), "\n";
+echo json_encode(array_map(function($x,$y=10) { return $x+$y; }, [1,2])), "\n";
+echo json_encode(array_map(fn()=>func_num_args(), [1,2])), "\n";
+echo json_encode(array_map(fn(int $x)=>$x+1, ['2','3'])), "\n";
+class CallbackScope { private int $k=4; function run() { return array_map(fn($x)=>$this->k+$x, [1,2]); } }
+echo json_encode((new CallbackScope)->run()), "\n";
+$warnings=0; set_error_handler(function($code,$message) use (&$warnings) { $warnings++; return true; });
+$a=[2,1]; usort($a, function(&$x,$y) { return $x <=> $y; }); echo json_encode($a),' ', $warnings>0?'warning':'missing', "\n";
+$a=[2,1,2]; usort($a, fn(int $x,int $y):bool=>$x>$y); echo json_encode($a), "\n";
+restore_error_handler();
+try { $a=[1,1]; usort($a, fn(int $x,int $y):int=>intdiv(1,$x-$y)); } catch (Throwable $e) { echo get_class($e), ':', $e->getMessage(), "\n"; }
+echo json_encode(array_map(fn(int $x):int=>$x*2,[3,4])), "\n";
+"#);
+        assert_eq!(result.exit_code, 0, "{}", it.err_buf);
+        assert_eq!(it.err_buf, "");
+        assert_eq!(
+            it.out,
+            br#"[2]
+[3]
+array(2) {
+  ["a"]=>
+  int(2)
+  ["b"]=>
+  int(3)
+}
+[[1.5],[1.5]]
+{"1":2}
+[1,2,3]
+{"2":1,"3":2,"1":3}
+{"3":2,"2":1,"1":3}
+[1,3]
+[11,12]
+[1,1]
+[3,4]
+[5,6]
+[1,2] warning
+[1,2,2]
+DivisionByZeroError:Division by zero
+[6,8]
+"#
+        );
+
+        // Weak Rust ownership also covers the callable metadata retained by the
+        // shared direct frame. The compile cache may own the decl, never this Rc.
+        let mut it = Interp::new("callback-owner.php");
+        it.run_source("<?php function callbackOwned(int $x): int { return $x + 1; }");
+        let callable = it
+            .eval(&crate::ast::Expr::Closure(crate::ast::ClosureExpr {
+                decl: (*it.functions["callbackowned"]).clone(),
+                uses: Vec::new(),
+                arrow: false,
+                is_static: false,
+            }))
+            .unwrap();
+        let crate::value::Value::Callable(c) = &callable else {
+            panic!("closure")
+        };
+        let weak = std::rc::Rc::downgrade(c);
+        let result = it
+            .call_value_positional(&callable, [crate::value::Value::Int(2)], false)
+            .unwrap();
+        assert!(matches!(result, crate::value::Value::Int(3)));
+        assert!(
+            it.vm_frame_pool.iter().any(|f| f.value_args.capacity() > 0),
+            "primitive callback did not reach the value ABI"
+        );
+        drop(callable);
+        assert!(
+            weak.upgrade().is_none(),
+            "pooled callback frame retained callable owner"
+        );
     }
 
     #[test]

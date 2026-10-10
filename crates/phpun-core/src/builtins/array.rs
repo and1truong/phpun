@@ -852,10 +852,7 @@ pub(crate) fn dispatch(
                     let v = c.borrow().clone();
                     let keep = match &cb {
                         Some(cb) => {
-                            let r = it.call_value(
-                                cb,
-                                crate::interp::CallArgs::positional(vec![cell(v.clone())]),
-                            )?;
+                            let r = it.call_value_positional(cb, [v.clone()], false)?;
                             r.is_truthy()
                         }
                         None => v.is_truthy(),
@@ -882,10 +879,7 @@ pub(crate) fn dispatch(
                         let v = if null_cb {
                             c.borrow().clone()
                         } else {
-                            it.call_value(
-                                &cb,
-                                crate::interp::CallArgs::positional(vec![cell(c.borrow().clone())]),
-                            )?
+                            it.call_value_positional(&cb, [c.borrow().clone()], false)?
                         };
                         out.set(k.clone(), v);
                     }
@@ -1738,20 +1732,15 @@ pub(crate) fn zend_sort_user(
         // zend passes the bucket zvals BY VALUE — a `&$k` param warns
         // "must be passed by reference, value given" and binds a copy,
         // so callback writes can never reach the sorted storage.
-        let args = if by_key {
-            crate::interp::CallArgs::positional(vec![
-                cell(crate::interp::util::key_value(&x.1)),
-                cell(crate::interp::util::key_value(&y.1)),
-            ])
+        let values = if by_key {
+            [
+                crate::interp::util::key_value(&x.1),
+                crate::interp::util::key_value(&y.1),
+            ]
         } else {
-            crate::interp::CallArgs::positional(vec![
-                cell(x.2.borrow().clone()),
-                cell(y.2.borrow().clone()),
-            ])
+            [x.2.borrow().clone(), y.2.borrow().clone()]
         };
-        let mut args = args;
-        args.nonref_cells = vec![0, 1];
-        it.call_value(cb, args)
+        it.call_value_positional(cb, values, true)
     };
     crate::value::zend_sort(&mut v, &mut |x, y| {
         // zend keeps the comparator running after an exception but the
