@@ -71,3 +71,20 @@ existing byte matcher. Full concat/capacity storage remains a separate decision.
 
 Review arity fix49a3fff is inherited by this branch after frozen step timings;
 reported runtime54da20e is not relabelled as the later branch head.
+
+## Shared byte-search filter (#185)
+
+Replacement runtime54da20e → search runtime9961ea5 (includes review arity fix49a3fff),
+seven alternating PHP-gated release pairs: strings451.602→263.136ms (0.583×);
+replace phase130.805→37.681 (0.288×). Objects435.964→446.988, JSON972.486→969.060,
+app42.379→43.353 have overlapping ranges; no gain claimed. These are a separate
+paired run, not cumulative percentages or a new PHP ratio measurement.
+
+The shared byte search now filters candidate positions by the first byte before
+checking the full needle. Empty needle, binary bytes and offset behavior are
+unchanged. Worst-case O(n*m) remains; a two-way search requires evidence on
+adversarial/repeated-prefix workloads. No new dependency or builtin-only shortcut.
+
+Validation: exhaustive small binary haystack/needle/all-offset check, workspace
+tests/fmt/clippy/release, 24 VM/standalone oracle probes, 19 workload checks;
+59 relevant PHPT unchanged (26pass/33existingfail), zero crashes/timeouts.
