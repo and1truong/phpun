@@ -146,6 +146,8 @@ fn coverage_hit(reason: &str) {
 }
 
 /// Cache metadata only; never pin a receiver or a mutable property cell.
+/// ponytail: monomorphic resolved-key cache retains HashMap lookup; slot offsets
+/// need a measured layout change with storage-generation guards.
 struct CachedProp {
     class: Rc<PhpClass>,
     scope: Option<Rc<PhpClass>>,

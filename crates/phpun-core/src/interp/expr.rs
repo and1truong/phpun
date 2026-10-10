@@ -1753,6 +1753,8 @@ impl<'a> Interp<'a> {
 
     /// Borrow existing bytes and allocate only the combined output. Keep
     /// non-string conversions left-to-right through the canonical helper.
+    /// ponytail: Rc<[u8]> still copies growing prefixes; capacity append needs
+    /// a measured unique-owner/storage change, not just accounting "grow".
     pub(in crate::interp) fn concat_bytes(
         &mut self,
         left: &Value,
