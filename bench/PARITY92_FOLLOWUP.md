@@ -262,3 +262,19 @@ checks recursive live args, instance/static class context, retained exception af
 frame reuse, nested handler trace, and receiver WeakReference lifetime. Existing
 backtrace option semantics are unchanged; this does not claim to fix all trace
 compatibility gaps. Raw timings/status maps and hashes in bench/data/92/parity/frame-*.
+
+## Promoted reference aliases (#197, #186)
+
+Runtimeb2c21b3 preserves the canonical binder's by-reference parameter cell when
+promoting the property, using shared =& property binding. Shared binding now resolves
+uninitialized private keys and rejects readonly references; hook backing reads raise
+the existing typed-uninitialized error before reference installation. Named args,
+type-owner constraints, owner removal on destruction, alias mutation both ways, two
+promotions sharing one cell, private storage, readonly and hooked promotion match
+PHP8.5.11 byte-for-byte in the retained runtime test. This is correctness work, not
+a speedup claim; by-reference constructors still use canonical binding.
+
+2,160 selected PHPT gain property_hooks/gh16615_002 (1824→1825pass), every other
+status unchanged including3existing crashes/4timeouts. All18ctor_promotion PHPT gain
+ctor_promotion_by_ref (6→7pass), no regressions. Workspace tests/fmt/clippy pass.
+Raw per-test maps and summary in bench/data/92/parity/promoted-reference-gates.json.
