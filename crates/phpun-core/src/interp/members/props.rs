@@ -23,18 +23,18 @@ impl<'a> Interp<'a> {
         &self,
         o: &Rc<RefCell<PhpObject>>,
         pn: &str,
-    ) -> Option<(PropDecl, Rc<PhpClass>)> {
-        let scope = self.caller_scope_name()?;
+    ) -> Option<(usize, Rc<PhpClass>)> {
+        let frame = self.stack.last()?;
+        let scope = frame.decl_class.as_ref().or(frame.scope_class.as_ref())?;
         let mut cur = Some(o.borrow().class.clone());
         while let Some(c) = cur {
-            if c.name() == scope {
-                if let Some(p) = c
-                    .decl
-                    .props
-                    .iter()
-                    .find(|p| p.name == pn && p.visibility == crate::ast::Visibility::Private)
+            if c.name() == scope.name() {
+                if let Some(p) =
+                    c.decl.props.iter().position(|p| {
+                        p.name == pn && p.visibility == crate::ast::Visibility::Private
+                    })
                 {
-                    return Some((p.clone(), c.clone()));
+                    return Some((p, c));
                 }
                 break;
             }
@@ -55,7 +55,8 @@ impl<'a> Interp<'a> {
         o: &Rc<RefCell<PhpObject>>,
         pn: &str,
     ) -> Option<(PropDecl, MergedHooks)> {
-        if let Some((p, c)) = self.scope_private_prop(o, pn) {
+        if let Some((index, c)) = self.scope_private_prop(o, pn) {
+            let p = &c.decl.props[index];
             return p.hooks.as_ref().map(|hs| {
                 (
                     p.clone(),
@@ -63,11 +64,13 @@ impl<'a> Interp<'a> {
                 )
             });
         }
-        let mut nearest: Option<PropDecl> = None;
+        // Immutable declaration indices retain metadata only, never receivers
+        // or mutable property offsets. Clone only after proving a hook exists.
+        let mut nearest: Option<(usize, Rc<PhpClass>)> = None;
         let mut hooks: MergedHooks = Vec::new();
         let mut cur = Some(o.borrow().class.clone());
         while let Some(c) = cur {
-            for p in &c.decl.props {
+            for (index, p) in c.decl.props.iter().enumerate() {
                 if p.name != pn {
                     continue;
                 }
@@ -75,7 +78,7 @@ impl<'a> Interp<'a> {
                     continue;
                 }
                 if nearest.is_none() {
-                    nearest = Some(p.clone());
+                    nearest = Some((index, c.clone()));
                 }
                 if let Some(hs) = &p.hooks {
                     for h in hs {
@@ -88,11 +91,11 @@ impl<'a> Interp<'a> {
             let parent = c.decl.parent.clone();
             cur = parent.and_then(|p| self.classes.get(&p.to_lowercase()).cloned());
         }
-        let pd = nearest?;
+        let (index, owner) = nearest?;
         if hooks.is_empty() {
             return None;
         }
-        Some((pd, hooks))
+        Some((owner.decl.props[index].clone(), hooks))
     }
 
     /// The PropDecl owning a prop_order slot key — mangled `\0Cls\0p`
@@ -158,8 +161,8 @@ impl<'a> Interp<'a> {
         o: &Rc<RefCell<PhpObject>>,
         pn: &str,
     ) -> Option<(PropDecl, Rc<PhpClass>)> {
-        if let Some(x) = self.scope_private_prop(o, pn) {
-            return Some(x);
+        if let Some((index, c)) = self.scope_private_prop(o, pn) {
+            return Some((c.decl.props[index].clone(), c));
         }
         let mut cur = Some(o.borrow().class.clone());
         while let Some(c) = cur {

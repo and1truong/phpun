@@ -557,3 +557,64 @@ Objects still41.59×PHP on this host. Initial seven startup samples +16.4%;
 Composer7.625→8.021 (+5.2%), app44.622→42.154 (−5.5%).
 Ranges overlap but the cold startup/Composer cost remains visible; no universal
 application win or claimed explanation. Both sample sets retained verbatim.
+
+## Avoid property metadata cloning for absent hooks (#187 bounded R2 followup)
+
+Frozen main e847541→runtime6afc6bd (built sourcec5e7eca).
+`scope_private_prop` returns immutable declaration index + owner class metadata;
+its two callers borrow the declaration and clone only when returning an actual
+hook or owned declaration. `hooked_prop` similarly retains the nearest declaration
+owner/index until a hook exists. Caller scope name is borrowed rather than copied.
+No new cache, layout, mutable property offset or receiver/Cell pin. Class metadata
+is immutable during this read-only lookup; handles are local and dropped on return.
+Private priority, inherited get/set composition and canonical type/visibility/
+reference stores remain unchanged. This does not complete packed storage #187.
+
+Validation: one retained runnable runtime check covers plain/private parent-child
+shadowing, inherited hooks through plain redeclaration, get override inheriting
+set, typed-reference rejection, outside-private errors and WeakReference cleanup.
+Workspace5core/22runtime/19format checks pass; fmt/clippy pass. Twenty-one VM
+fixture scripts + metadata source probe and19 workload checks exact byte/exit/
+stderr gate against PHP8.5.11 -n. All619 relevant PHPT individual statuses
+unchanged vs frozen e847541:551pass/63existing fail/5unsupported, no crash/timeout.
+Original per-file maps, probes and binary provenance retained, no full PHP claim.
+
+Separate same-argv objects1×5000 instrumented runs:
+
+| Measure | Before | After | Ratio |
+|---|---:|---:|---:|
+| Rust allocation requests | 1,079,560 | 1,009,544 | 0.935 |
+| Requested allocation bytes | 32,794,742 | 32,294,632 | 0.985 |
+| Observed copy calls | 832,308 | 742,284 | 0.892 |
+| Observed out-of-line copy bytes | 82,444,379 | 72,340,424 | 0.877 |
+
+No speed claims from instrumented times. Observed copy lower bounds omit LLVM
+inline/hidden/realloc movement; LLVM also moves callsites between symbols, so
+scope_private_prop disappearing from the symbol table is not complete logical
+copy elimination. Root structural change removes unnecessary declaration copies;
+physical counters show less allocation/copy traffic on the same whole workload.
+
+Seven alternating profiler-off PHP-byte-gated release pairs:
+
+| Whole workload | Before / after median ms | After/before |
+|---|---:|---:|
+| bench/40-objects.php | 331.029 / 319.096 | 0.964 |
+| bench/40-objects.php 20 5000 | 1422.245 / 1381.901 | 0.972 |
+| bench/30-arrays.php | 192.393 / 189.202 | 0.983 |
+| bench/60-json.php | 574.502 / 565.021 | 0.983 |
+| bench/10-fib.php | 141.143 / 138.366 | 0.980 |
+| bench/00-startup.php | 4.977 / 5.253 | 1.055 |
+| bench/app/cli.php 100 20 | 42.067 / 40.689 | 0.967 |
+| examples/composer/run.php | 7.313 / 7.191 | 0.983 |
+
+Default objects−3.6%,long objects−2.8%; ranges overlap, modest median changes,
+not a parity/broad-app claim. Other medians/ranges retained; cold startup+5.5%
+visible, seven small samples not enough to attribute. No further repeat justified
+for this bounded change. First timing runner stopped at a nonexistent app path
+AFTER five byte-gated cases; no error/mismatch case used for timings, apps collected
+separately with correct existing path. Both raw datasets retained.
+
+Hashes: main76fd8bb184d7853ddfe972b311feb691a9390d8a1c949b05441d49ddb6db9400;
+after5f3de127ff71092ae4a1e776f72dd282ae5302b5bc997b6696c8a1461edae89b.
+Both release cores force-cleaned/rebuilt (Rust1.99.0 LTO/codegen-units1);
+raw `data/92/parity/metadata-*`, same native host/PHP as preceding supplement.
