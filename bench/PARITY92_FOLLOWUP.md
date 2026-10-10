@@ -88,3 +88,45 @@ adversarial/repeated-prefix workloads. No new dependency or builtin-only shortcu
 Validation: exhaustive small binary haystack/needle/all-offset check, workspace
 tests/fmt/clippy/release, 24 VM/standalone oracle probes, 19 workload checks;
 59 relevant PHPT unchanged (26pass/33existingfail), zero crashes/timeouts.
+
+## Class names and float positive proofs (#186)
+
+Objects profile after shared replacement: cpu-clock:u199Hz, DWARF8192, 1,024
+samples, zero lost. Exclusive StrSearcher::new6.84%, below PhpClass::name;
+to_lowercase2.44%. Inclusive stack presence (overlapping): property plain-read98,
+property-key51, hooks61, binder242, instantiate71, method_invoke320, new_instance218.
+This does not isolate pure method lookup; find_method_in appears in only31stacks.
+
+Runtime9961ea5 →6bbe9e0: avoid anonymous marker search for ordinary class names;
+reuse existing compiled positive type gates for already-float values (int widening
+stays canonical); construct return-diagnostic names only when needed in binder.
+Seven PHP-gated alternating release pairs: objects497.716→428.740ms (0.861×),
+ctor phase131.357→115.492 (0.879×), norm192.739→168.065 (0.872×). Fib/strings/app
+ranges overlap; no benefit claimed. Full promoted binding remains canonical.
+
+Validation: workspace tests/fmt/clippy/release, float widening/null/invalid-return
+and anonymous-class regression; 26 VM/standalone oracle probes. 1,965 selected
+class/hooks/type/lifetime PHPT:1,710pass/214existingfail/16skip/23unsupported/2existing
+GC timeouts at30s, zero crashes; every status unchanged across before/after.
+The two timeouts are retained in validation data, not counted as passes.
+
+## Guarded plain this-property resolution cache (#187)
+
+Runtime6bbe9e0 →728f405: per compiled `$this->name` site, cache only a
+shared positive plain-read proof's resolved key. Guard exact class and scope;
+read current backing cell every time, reprove on missing key/class/scope change.
+Private-scope candidate presence guards a cached public fallback key. Hook-body
+contexts bypass caching. Metadata pins no receiver or cell, verified by WeakReference.
+
+This is a key-resolution cache, not an offset/shape cache or storage rewrite.
+Hooks/magic/uninitialized/visibility failures retain canonical property machinery.
+
+Seven PHP-gated alternating release pairs: objects412.351→377.808ms (0.916×),
+norm176.631→149.209 (0.845×), ctor119.736→120.448 (1.006×). Fib/strings/app
+changes have overlapping ranges; no benefit claimed there. Their sample noise
+is retained in raw data. Cache benefit is specific to repeated method property reads.
+
+Validation: workspace tests/fmt/clippy/release, class/scope rebinding/missing-key/
+unset/magic/typed/hooks/weak-lifetime check; 26 oracle probes. Same1,965 class/hooks/
+type/lifetime PHPT, all statuses unchanged (including two existing GC30s timeouts),
+zero crashes. Offset/array-dim caches and storage-generation changes remain follow-ups.

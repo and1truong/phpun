@@ -1,0 +1,30 @@
+{
+  "runtime": "6bbe9e0",
+  "checks": [
+    "workspace tests",
+    "fmt",
+    "clippy",
+    "release",
+    "class names/float widening/invalid return regression",
+    "26 VM/standalone PHP oracle probes"
+  ],
+  "phpt": {
+    "total": 1965,
+    "passed": 1710,
+    "failed": 214,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 16,
+    "unsupported": 23,
+    "borked": 0,
+    "crashed": 0,
+    "timed_out": 2,
+    "applicable": 1926,
+    "compatibility_pct": 88.79
+  },
+  "status_changes": [],
+  "existing_timeouts": [
+    "/workspace/phpun/vendor/php-tests/Zend/tests/gc/bug77345_gc_2.phpt",
+    "/workspace/phpun/vendor/php-tests/Zend/tests/gc/gc_045.phpt"
+  ]
+}
