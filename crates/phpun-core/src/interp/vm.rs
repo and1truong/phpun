@@ -1374,7 +1374,9 @@ impl<'a> Interp<'a> {
                 Slot::C(c) => c.clone(),
                 Slot::V(v) => cell(std::mem::replace(v, Value::Null)),
             };
-            *slot = Slot::C(c.clone());
+            // Slot handles are bookkeeping, not PHP aliases. Drop them
+            // while AST code runs so unset/reference/GC sees canonical counts.
+            *slot = Slot::Uninit;
             frame.vars.insert(name.clone(), c);
         }
     }
@@ -1556,6 +1558,11 @@ impl<'a> Interp<'a> {
                     self.emit_bytes(&s);
                 }
                 Op::Line(l) => {
+                    if comp.hybrid {
+                        if let Some(flow) = self.statement_boundary() {
+                            return Ok(flow);
+                        }
+                    }
                     self.cur_line = *l;
                     // Statement boundary like exec's Stmt::Line — the
                     // caller's pending send_line dies with the stmt.

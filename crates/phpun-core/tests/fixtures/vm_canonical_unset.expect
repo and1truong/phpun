@@ -1,0 +1,5 @@
+destroy
+after unset
+alias alive
+destroy
+after alias
