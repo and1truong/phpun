@@ -588,3 +588,93 @@ string(2) "ok"
     assert_eq!(err, "");
     assert_eq!(code, 0);
 }
+
+#[test]
+fn promoted_slot_binding_preserves_args_hooks_readonly_and_fallbacks() {
+    let (out, err, code) = eval(
+        "promoted.php",
+        r#"<?php
+class Promoted {
+    function __construct(public int $x = 1, private float $y = 2.0) {
+        var_dump(func_get_args(), $this->x, $this->y);
+        $x = 99; echo "local $x property $this->x\n";
+    }
+}
+new Promoted(3, 4);
+new Promoted;
+new Promoted(y: 5);
+class ChildPromoted extends Promoted {}
+new ChildPromoted(...[7, 8]);
+try { new Promoted([]); } catch (TypeError $e) { echo "bad type\n"; }
+class Locked {
+    function __construct(public readonly int $x) { echo "locked $x\n"; }
+}
+$r = new Locked(6);
+try { $r->__construct(8); } catch (Error $e) { echo $e->getMessage(), "\n"; }
+class HookedCtor {
+    function __construct(public int $x {
+        set {
+            $bt = debug_backtrace();
+            echo "hook $value ", $bt[1]['function'], ' ', $bt[1]['args'][0], "\n";
+            if ($value < 0) throw new Exception('negative');
+            $this->x = $value * 2;
+        }
+    }) { echo "body $x $this->x\n"; }
+}
+new HookedCtor(4);
+try { new HookedCtor(-1); } catch (Exception $e) { echo $e->getMessage(), "\n"; }
+class DefaultCtor {
+    const N = 12;
+    function __construct(public int $x = self::N) { echo "default $x\n"; }
+}
+new DefaultCtor;
+"#,
+        &[],
+    );
+    assert_eq!(
+        out,
+        r#"array(2) {
+  [0]=>
+  int(3)
+  [1]=>
+  float(4)
+}
+int(3)
+float(4)
+local 99 property 3
+array(0) {
+}
+int(1)
+float(2)
+local 99 property 1
+array(2) {
+  [0]=>
+  int(1)
+  [1]=>
+  float(5)
+}
+int(1)
+float(5)
+local 99 property 1
+array(2) {
+  [0]=>
+  int(7)
+  [1]=>
+  float(8)
+}
+int(7)
+float(8)
+local 99 property 7
+bad type
+locked 6
+Cannot modify readonly property Locked::$x
+hook 4 __construct 4
+body 4 8
+hook -1 __construct -1
+negative
+default 12
+"#
+    );
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}

@@ -58,9 +58,8 @@ pub(crate) struct Compiled {
     pub(in crate::interp) bind_free: bool,
     /// What the slot path genuinely can't bind: by-ref params (must
     /// alias the caller's cell — argv carries owned Values) and
-    /// ctor-promoted params (`$this` writes). Those decls still
-    /// compile — they flow through bind_and_run, which runs the body
-    /// via vm_bound_exec.
+    /// unsupported promotion binds. Those decls still compile and run
+    /// their bodies via vm_bound_exec after the canonical binder.
     pub(in crate::interp) needs_bind: bool,
     /// Cheap pass-proof for single-scalar return types: `Some(f)`
     /// means `f(returned)` proving the type check satisfied lets the
@@ -322,8 +321,22 @@ impl Compiled {
         if Interp::decl_contains_yield(body) {
             return Err("generator");
         }
-        let needs_bind = decl.params.iter().any(|p| p.by_ref || p.promoted);
+        // ponytail: fixed by-value constructors reuse the slot binder and
+        // canonical promoted stores. Named/variadic/reference/default-expr
+        // calls keep bind_and_run; no alternative property-write semantics.
+        let promoted_slots = decl.name.eq_ignore_ascii_case("__construct")
+            && decl.params.iter().all(|p| {
+                !p.by_ref
+                    && !p.variadic
+                    && p.default.as_ref().is_none_or(|d| const_val(d).is_some())
+            });
+        let has_promoted = decl.params.iter().any(|p| p.promoted);
+        let needs_bind = decl
+            .params
+            .iter()
+            .any(|p| p.by_ref || (p.promoted && !promoted_slots));
         let mut bind_free = !needs_bind
+            && !has_promoted
             && decl.ret.is_none()
             && decl.params.iter().all(|p| p.ty.is_none() && !p.variadic);
         let mut defaults: Vec<Option<Value>> = Vec::new();
@@ -387,7 +400,7 @@ impl Compiled {
         // bodies keep cells until lazy promotion supports their full lifetime.
         let value_abi = !hybrid
             && !needs_bind
-            && !decl.params.iter().any(|p| p.variadic)
+            && !decl.params.iter().any(|p| p.variadic || p.promoted)
             && !c.ops.iter().any(|op| match op {
                 Op::Store(i) | Op::IncDec { slot: i, .. } => (*i as usize) < decl.params.len(),
                 _ => false,
@@ -1260,7 +1273,8 @@ impl<'a> Interp<'a> {
         // pass. Rebinding/coercion errors retain eager send-time arguments.
         let value_abi = !self.cur().value_args.is_empty();
         let defer_args = value_abi
-            || args.named.is_empty()
+            || !decl.params.iter().any(|p| p.promoted)
+                && args.named.is_empty()
                 && args.cells.len() >= decl.params.len()
                 && decl.params.iter().enumerate().all(|(i, p)| {
                     p.ty.is_none()
@@ -1395,7 +1409,21 @@ impl<'a> Interp<'a> {
         let saved_depth = std::mem::replace(&mut self.loop_depth, 0);
         padd!(3, __p);
         let __p = pnow!();
-        let r = self.vm_exec(comp, &mut slots, temps_base);
+        let r = (|| {
+            if decl.params.iter().any(|p| p.promoted) {
+                // Publish arguments before stores: a set hook can inspect this
+                // constructor's live args/locals or raise an exception.
+                self.vm_materialize(comp, &mut slots);
+                if let Some(obj) = self.cur().this_obj.clone() {
+                    for p in decl.params.iter().filter(|p| p.promoted) {
+                        let value = self.cur().vars[&p.name].borrow().clone();
+                        self.store_prop(Value::Object(obj.clone()), &p.name, value)?;
+                    }
+                }
+                self.vm_refresh(comp, &mut slots);
+            }
+            self.vm_exec(comp, &mut slots, temps_base)
+        })();
         self.loop_depth = saved_depth;
         padd!(4, __p);
         let __p = pnow!();
