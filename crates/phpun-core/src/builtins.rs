@@ -1532,7 +1532,7 @@ pub fn builtin_params(name: &str) -> Option<BParams> {
         "parse_str" => bp!(("string", Req), ("result", Req)),
         "getopt" => bp!(
             ("short_options", Req),
-            ("long_options", Null),
+            ("long_options", Arr),
             ("rest_index", Null)
         ),
         _ => return None,
