@@ -1552,6 +1552,12 @@ pub fn strict_sig(name: &str) -> Option<Vec<(String, String)>> {
     let ps: &[(&str, &str)] = match name {
         "strlen" | "strrev" | "strtoupper" | "strtolower" | "ucfirst" | "lcfirst" | "md5"
         | "sha1" | "str_rot13" | "nl2br" | "quotemeta" | "soundex" => &[str_p],
+        "parse_str" => &[("string", "string"), ("result", "mixed")],
+        "getopt" => &[
+            ("short_options", "string"),
+            ("long_options", "array"),
+            ("rest_index", "mixed"),
+        ],
         "ord" => &[("character", "string")],
         "defined" => &[("constant_name", "string")],
         "fwrite" | "fputs" => &[

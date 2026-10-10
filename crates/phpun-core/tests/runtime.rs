@@ -258,3 +258,65 @@ call_user_func('t');
     assert!(!out.contains("call_user_func"), "{}", out);
     assert!(out.contains("t()"), "{}", out);
 }
+
+#[test]
+fn dynamic_builtin_reference_sends_and_zpp_types() {
+    let (out, err, code) = eval(
+        "dynamic-builtin.php",
+        r#"<?php
+set_error_handler(function($n,$m){ echo "WARN $m\n"; });
+$r = 'keep';
+call_user_func('parse_str', 'a=1', $r); var_dump($r);
+call_user_func_array('parse_str', ['a=1', $r]); var_dump($r);
+call_user_func_array('parse_str', ['a=1', &$r]); var_dump($r);
+$r = 'keep';
+call_user_func_array('parse_str', ['result'=>&$r, 'string'=>'b=2']); var_dump($r);
+$r = 'keep';
+call_user_func_array('parse_str', ['result'=>$r, 'string'=>'b=2']); var_dump($r);
+foreach (['x', null] as $bad) {
+    try { getopt('a:', $bad); } catch (Throwable $e) { echo $e->getMessage(),"\n"; }
+    try { getopt(long_options:$bad, short_options:'a:'); } catch (Throwable $e) { echo $e->getMessage(),"\n"; }
+}
+$r = 'keep';
+try { parse_str([], $r); } catch (Throwable $e) { echo $e->getMessage(),"\n"; } var_dump($r);
+try { parse_str(result:$r, string:[]); } catch (Throwable $e) { echo $e->getMessage(),"\n"; } var_dump($r);
+try { call_user_func('parse_str', [], $r); } catch (Throwable $e) { echo $e->getMessage(),"\n"; } var_dump($r);
+set_error_handler(function($n,$m){ throw new Exception('warning intercepted'); });
+try { call_user_func('parse_str', 'a=1', $r); } catch (Throwable $e) { echo $e->getMessage(),"\n"; } var_dump($r);
+"#,
+        &[],
+    );
+    assert_eq!(
+        out,
+        r#"WARN parse_str(): Argument #2 ($result) must be passed by reference, value given
+string(4) "keep"
+WARN parse_str(): Argument #2 ($result) must be passed by reference, value given
+string(4) "keep"
+array(1) {
+  ["a"]=>
+  string(1) "1"
+}
+array(1) {
+  ["b"]=>
+  string(1) "2"
+}
+WARN parse_str(): Argument #2 ($result) must be passed by reference, value given
+string(4) "keep"
+getopt(): Argument #2 ($long_options) must be of type array, string given
+getopt(): Argument #2 ($long_options) must be of type array, string given
+getopt(): Argument #2 ($long_options) must be of type array, null given
+getopt(): Argument #2 ($long_options) must be of type array, null given
+parse_str(): Argument #1 ($string) must be of type string, array given
+string(4) "keep"
+parse_str(): Argument #1 ($string) must be of type string, array given
+string(4) "keep"
+WARN parse_str(): Argument #2 ($result) must be passed by reference, value given
+parse_str(): Argument #1 ($string) must be of type string, array given
+string(4) "keep"
+warning intercepted
+string(4) "keep"
+"#
+    );
+    assert_eq!(err, "");
+    assert_eq!(code, 0);
+}
