@@ -1,0 +1,118 @@
+[
+  {
+    "build": "arrow",
+    "argv": [
+      "bench/30-arrays.php"
+    ],
+    "flag": "PHPUN_ALLOC",
+    "stdout": "RESULT 30013165508\n",
+    "stderr": "allocs: 8215493 bytes: 265702134\n  cell: 700826\n  vm_site: 6\n  mem_track: 13\n  trace_frame: 350351\n  vars_insert: 1\n  call_args: 2\n"
+  },
+  {
+    "build": "arrow",
+    "argv": [
+      "bench/30-arrays.php"
+    ],
+    "flag": "PHPUN_CALLPROF",
+    "stdout": "RESULT 30013165508\n",
+    "stderr": ""
+  },
+  {
+    "build": "arrow",
+    "argv": [
+      "bench/40-objects.php"
+    ],
+    "flag": "PHPUN_ALLOC",
+    "stdout": "RESULT 1878947\n",
+    "stderr": "allocs: 6975032 bytes: 168505171\n  cell: 400018\n  vm_site: 75000\n  mem_track: 150011\n  trace_frame: 50000\n  vars_insert: 1\n  call_args: 50000\n"
+  },
+  {
+    "build": "arrow",
+    "argv": [
+      "bench/40-objects.php"
+    ],
+    "flag": "PHPUN_CALLPROF",
+    "stdout": "RESULT 1878947\n",
+    "stderr": ""
+  },
+  {
+    "build": "arrow",
+    "argv": [
+      "bench/profile/closures.php",
+      "20000",
+      "scalar"
+    ],
+    "flag": "PHPUN_ALLOC",
+    "stdout": "RESULT 200130000\n",
+    "stderr": "allocs: 1305400 bytes: 109116299\n  cell: 60023\n  vm_site: 20002\n  mem_track: 20007\n  trace_frame: 20001\n  call_args: 20002\n"
+  },
+  {
+    "build": "arrow",
+    "argv": [
+      "bench/profile/closures.php",
+      "20000",
+      "scalar"
+    ],
+    "flag": "PHPUN_CALLPROF",
+    "stdout": "RESULT 200130000\n",
+    "stderr": ""
+  },
+  {
+    "build": "dispatch",
+    "argv": [
+      "bench/30-arrays.php"
+    ],
+    "flag": "PHPUN_ALLOC",
+    "stdout": "RESULT 30013165508\n",
+    "stderr": "allocs: 2769890 bytes: 92714236\n  cell: 40124\n  vm_site: 6\n  mem_track: 13\n  trace_frame: 350351\n  vars_insert: 1\n  call_args: 2\n"
+  },
+  {
+    "build": "dispatch",
+    "argv": [
+      "bench/30-arrays.php"
+    ],
+    "flag": "PHPUN_CALLPROF",
+    "stdout": "RESULT 30013165508\n",
+    "stderr": "callprof: pre=0ns cells=0ns site=31442145ns bind=17863445ns exec=35508475ns post=51585744ns calls=350351; unit=total_ns exec=inclusive\n"
+  },
+  {
+    "build": "dispatch",
+    "argv": [
+      "bench/40-objects.php"
+    ],
+    "flag": "PHPUN_ALLOC",
+    "stdout": "RESULT 1878947\n",
+    "stderr": "allocs: 6975032 bytes: 168505189\n  cell: 400018\n  vm_site: 75000\n  mem_track: 150011\n  trace_frame: 50000\n  vars_insert: 1\n  call_args: 50000\n"
+  },
+  {
+    "build": "dispatch",
+    "argv": [
+      "bench/40-objects.php"
+    ],
+    "flag": "PHPUN_CALLPROF",
+    "stdout": "RESULT 1878947\n",
+    "stderr": ""
+  },
+  {
+    "build": "dispatch",
+    "argv": [
+      "bench/profile/closures.php",
+      "20000",
+      "scalar"
+    ],
+    "flag": "PHPUN_ALLOC",
+    "stdout": "RESULT 200130000\n",
+    "stderr": "allocs: 1025411 bytes: 98757797\n  cell: 40023\n  vm_site: 20002\n  mem_track: 8\n  trace_frame: 20001\n  call_args: 20002\n"
+  },
+  {
+    "build": "dispatch",
+    "argv": [
+      "bench/profile/closures.php",
+      "20000",
+      "scalar"
+    ],
+    "flag": "PHPUN_CALLPROF",
+    "stdout": "RESULT 200130000\n",
+    "stderr": "callprof: pre=0ns cells=0ns site=1981737ns bind=1411609ns exec=2054110ns post=4327034ns calls=20000; unit=total_ns exec=inclusive\n"
+  }
+]

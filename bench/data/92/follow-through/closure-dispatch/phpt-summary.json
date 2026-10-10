@@ -1,0 +1,37 @@
+{
+  "baseline_runtime": "ecc31840a03b453e553e83dd0b014c12716742cd",
+  "candidate_runtime": "744d302",
+  "benchmark_scalar_source": "d4c8cf8251614184e3e6ad9f8a18210a965fee7b",
+  "before": {
+    "total": 899,
+    "passed": 752,
+    "failed": 130,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 3,
+    "unsupported": 14,
+    "borked": 0,
+    "crashed": 0,
+    "timed_out": 0,
+    "applicable": 882,
+    "compatibility_pct": 85.26
+  },
+  "after": {
+    "total": 899,
+    "passed": 752,
+    "failed": 130,
+    "xfailed": 0,
+    "xpassed": 0,
+    "skipped": 3,
+    "unsupported": 14,
+    "borked": 0,
+    "crashed": 0,
+    "timed_out": 0,
+    "applicable": 882,
+    "compatibility_pct": 85.26
+  },
+  "status_changes": [],
+  "jobs": 1,
+  "timeout_seconds": 60,
+  "note": "Before then after; PHPT generated files shared by a suite must not overlap between runners."
+}
