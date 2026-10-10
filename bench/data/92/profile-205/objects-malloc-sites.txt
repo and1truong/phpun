@@ -1,0 +1,35 @@
+# events: 234786  bytes: 10689736
+#   myprobes:pmalloc: 234781
+#   myprobes:prealloc: 3
+#   myprobes:pcalloc: 2
+   pct      count   pctB          bytes     avg  site
+ 32.02      75185   5.25         561702       7  _NtCscdodAO9FK5_5alloc3stre12to_lowercase
+  8.59      20157   2.74         292859      14  FK5_5alloc3vecINtB5_3VecNtNtB7_6string6StringENtNtCs4NRVxsYgnAr_4core5clone5Clone5cloneCsdREBRar76Nx_10phpun_core
+  4.69      11001  17.41        1860635     169  _NtCscdodAO9FK5_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsdREBRar76Nx_10phpun_core
+  4.67      10969  21.36        2283572     208  edjipl_9hashbrown3rawNtB6_13RawTableInner22fallible_with_capacityNtNtCscdodAO9FK5_5alloc5alloc6GlobalECsdREBRar76Nx_10phpun_core
+  4.65      10920   1.16         124467      11  _NtCscdodAO9FK5_5alloc7raw_vecNtB5_11RawVecInner11finish_growB7_
+  3.40       7975   0.08           8362       1  Nx_10phpun_core3astNtB5_8PropDeclNtNtCs4NRVxsYgnAr_4core5clone5Clone5clone
+  3.36       7895   0.37          39475       5  Nx_10phpun_core6interp7members5propsNtB6_6Interp18scope_private_prop
+  2.55       5986   0.26          28008       4  FK5_5alloc3fmt6format12format_inner
+  2.53       5941   7.49         800272     134  Nx_10phpun_core6interp5callsNtB4_6Interp13invoke_fn_run
+  2.53       5939   0.65          69289      11  Nx_10phpun_core6interp7members5viewsNtB6_6Interp8is_a_str
+  2.33       5472   9.21         984262     179  Nx_10phpun_core3astNtB5_4ExprNtNtCs4NRVxsYgnAr_4core5clone5Clone5clone
+  1.69       3960   1.48         158400      40  _NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp19destruct_frame_objs
+  1.68       3945   0.54          57193      14  Nx_10phpun_core6interp7members5propsNtB6_6Interp11resolved_ty
+  1.68       3945   0.90          96629      24  _NtNtCsdREBRar76Nx_10phpun_core6interp4exprNtB7_6Interp10store_prop
+  1.37       3209   6.24         666695     207  FK5_5alloc5sliceSp9to_vec_inNtNtCsdREBRar76Nx_10phpun_core3ast5ParamNtB3_10ConvertVec6to_vecNtNtB8_5alloc6GlobalEBN_
+  1.27       2982   0.33          35784      12  _NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp18call_builtin_inner
+  0.84       1980   0.30          31680      16  _NtCsdREBRar76Nx_10phpun_core6interpNtB6_5Frame3newINtNtCscdodAO9FK5_5alloc2rc2RceEEB8_
+  0.84       1977   0.09           9885       5  Nx_10phpun_core6interp7members5propsNtB6_6Interp12prop_visible
+  0.84       1976   0.09           9880       5  Nx_10phpun_core6interp7members5propsNtB6_6Interp12obj_prop_key
+  0.84       1975   0.02           1975       1  _NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp14vm_materialize
+  0.84       1973   0.40          42438      21  _NtNtCsdREBRar76Nx_10phpun_core6interp4exprNtB7_6Interp12assign_inner
+  0.84       1972   0.15          15776       8  _NtNtCsdREBRar76Nx_10phpun_core6interp4exprNtB7_6Interp17assign_index_path
+  0.84       1968   0.09           9840       5  _NtNtCsdREBRar76Nx_10phpun_core6interp4exprNtB9_6Interp4evalsm_0Bb_
+  0.84       1968   0.02           1968       1  _NtNtCsdREBRar76Nx_10phpun_core6interp4exprNtB7_6Interp15binary_operands
+  0.84       1968   0.88          94464      48  Nx_10phpun_core6interp5callsNtB4_6Interp9arg_cells
+  0.77       1800   0.09           9565       5  Nx_10phpun_core5lexer5ident
+  0.72       1702   0.07           6960       4  _NtCscdodAO9FK5_5alloc6stringNtB5_6StringNtNtCs4NRVxsYgnAr_4core5clone5Clone5clone
+  0.63       1475   0.06           6849       4  Nx_10phpun_core5lexerNtB4_5TokenNtNtCs4NRVxsYgnAr_4core5clone5Clone5clone
+  0.53       1244   1.17         124800     100  _NtCscdodAO9FK5_5alloc7raw_vecNtB5_11RawVecInner11finish_growCs2AWtUsOyxgP_3std
+  0.43       1000   0.45          48000      48  _NtNtNtCs4NRVxsYgnAr_4core4iter8adapters3mapINtB5_3MapINtNtB7_6filter6FilterINtNtNtBb_5slice4iter4IterTNtNtCsdREBRar76Nx_10phpun_core5value6ArrKeyINtNtCscdodAO9FK5_5alloc2rc2RcINtNtBb_4cell7RefCellNtB1L_5ValueEEEENCNvMs0_B1L_NtB1L_8PhpArray4iter0ENCNvMNtNtB1N_6interp4execNtB4a_6Interp17exec_foreach_withs1_0ENtNtNtB9_6traits8iterator8Iterator4nextB1N_

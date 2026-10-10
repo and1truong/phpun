@@ -1,0 +1,120 @@
+## fib-flat.report tot=100.1
+   63.60%  VM dispatch/vm
+   10.79%  call/frame machinery
+    0.03%  name/dispatch lookup
+    0.00%  property/store
+    0.00%  assign/dim/index
+    0.00%  JSON
+    0.03%  string materialize
+    0.30%  memory accounting
+    0.03%  array ops
+    1.99%  libc
+   23.34%  (other)
+     38.52% _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp7vm_exec
+     11.68% _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp6vm_run
+      7.92% _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp13vm_slot_value
+      7.43% _RNvMNtNtCsdREBRar76Nx_10phpun_core6interp5callsNtB4_6Interp15call_site_frame
+      4.37% 0x00000000001a6853
+      2.62% 0x00000000001a695d
+      2.32% _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp9trace_pop
+      2.18% _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp9vm_binary
+      1.88% _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueNtNtCsdREBRar76Nx_10phpun_core5value5ValueEBF_
+      1.69% _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp7vm_site
+      1.31% _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp13vm_frame_free
+      1.15% _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueINtNtCscdodAO9FK5_5alloc3vec3VecINtNtBG_2rc2RcINtNtB4_4cell7RefCellNtNtCsdREBRar76Nx_10phpun_core5value5ValueEEEEB1K_
+## sieve-flat.report tot=99.8
+   28.81%  VM dispatch/vm
+    0.00%  call/frame machinery
+    0.35%  name/dispatch lookup
+    0.00%  property/store
+   31.21%  assign/dim/index
+    0.00%  JSON
+    0.00%  string materialize
+    1.30%  memory accounting
+    3.60%  array ops
+    3.86%  libc
+   30.71%  (other)
+     13.66% _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp15global_var_cell
+     10.28% _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp7vm_exec
+      7.11% _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp14vm_materialize
+      6.86% _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp10vm_refresh
+      5.91% _RNvMs2_NtNtCsdREBRar76Nx_10phpun_core6interp4exprNtB7_6Interp12assign_inner
+      5.66% 0x00000000001ae89e
+      4.08% _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp13vm_slot_value
+      2.62% _RNvMs2_NtNtCsdREBRar76Nx_10phpun_core6interp4exprNtB7_6Interp17assign_index_path
+      2.56% 0x00000000001ae880
+      2.50% malloc
+      2.40% _RNvMs2_NtNtCsdREBRar76Nx_10phpun_core6interp4exprNtB7_6Interp14index_into_key
+      1.42% 0x00000000001ae8a5
+## objects-flat.report tot=99.7
+    8.54%  VM dispatch/vm
+    4.65%  call/frame machinery
+   15.98%  name/dispatch lookup
+    1.56%  property/store
+    2.90%  assign/dim/index
+    0.04%  JSON
+    1.93%  string materialize
+    4.40%  memory accounting
+    5.03%  array ops
+    9.40%  libc
+   45.23%  (other)
+      6.01% malloc
+      4.47% _RNvMs3_NtCscdodAO9FK5_5alloc3stre12to_lowercase
+      3.66% _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp7vm_exec
+      3.39% _RNvMs5_NtCsdREBRar76Nx_10phpun_core5valueNtB5_8PhpClass4name
+      3.37% cfree
+      3.33% _RNvXs_NtNtCs4NRVxsYgnAr_4core3str7patternNtB4_12CharSearcherNtB4_8Searcher10next_match
+      2.81% 0x00000000001ae89e
+      2.48% _RNvMNtNtCsdREBRar76Nx_10phpun_core6interp7classesNtB4_6Interp11push_handle
+      2.39% _RNvMNtNtNtCsdREBRar76Nx_10phpun_core6interp7members5viewsNtB6_6Interp8is_a_str
+      2.29% _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp14destruct_cells
+      2.08% _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp6vm_run
+      2.02% _RINvYNtNtNtCs2AWtUsOyxgP_3std4hash6random11RandomStateNtNtCs4NRVxsYgnAr_4core4hash11BuildHasher8hash_oneRjECsdREBRar76Nx_10phpun_core
+## arrays-flat.report tot=100.3
+   30.52%  VM dispatch/vm
+   12.55%  call/frame machinery
+    0.06%  name/dispatch lookup
+    0.00%  property/store
+    5.34%  assign/dim/index
+    0.00%  JSON
+    0.60%  string materialize
+    1.54%  memory accounting
+    9.84%  array ops
+    6.46%  libc
+   33.42%  (other)
+     12.67% _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp6vm_run
+     11.81% _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp7vm_exec
+      5.93% _RNCNvNtNtCsdREBRar76Nx_10phpun_core8builtins5array14zend_sort_user0B7_
+      4.51% malloc
+      3.82% _RNvMs1_NtNtCsdREBRar76Nx_10phpun_core6interp2vmNtB7_6Interp13vm_slot_value
+      3.50% _RNvMNtNtCsdREBRar76Nx_10phpun_core6interp5callsNtB4_6Interp15call_site_frame
+      3.03% _RNvMNtNtCsdREBRar76Nx_10phpun_core6interp5callsNtB4_6Interp10call_value
+      2.64% 0x00000000001a6853
+      2.24% 0x00000000001a695d
+      1.95% cfree
+      1.92% _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp15global_var_cell
+      1.69% _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp9trace_pop
+## json-flat.report tot=100.2
+    0.14%  VM dispatch/vm
+    0.02%  call/frame machinery
+    0.04%  name/dispatch lookup
+    0.00%  property/store
+    0.24%  assign/dim/index
+   11.82%  JSON
+    9.80%  string materialize
+   42.42%  memory accounting
+    4.04%  array ops
+    6.85%  libc
+   24.82%  (other)
+     21.57% _RNCINvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB8_6Interp11mem_reallocINtNtCs4NRVxsYgnAr_4core4cell7RefCellNtNtBa_5value8PhpArrayEEs2_0Ba_
+     12.04% _RNCINvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB8_6Interp9mem_trackShEs0_0Ba_
+      5.22% _RNvNtNtCsdREBRar76Nx_10phpun_core8builtins4json10json_value
+      4.48% malloc
+      4.32% _RNvMs3_NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp9mem_sweep
+      3.96% _RNvNtNtCsdREBRar76Nx_10phpun_core8builtins4json8json_enc
+      2.71% _RINvNtCs4NRVxsYgnAr_4core3ptr9drop_glueNtNtCsdREBRar76Nx_10phpun_core5value8PhpArrayEBF_
+      2.64% _RNvNtNtCsdREBRar76Nx_10phpun_core8builtins4json8json_str
+      2.52% _RNvMs6_NtCsdREBRar76Nx_10phpun_core5valueNtB5_6PhpStr3new
+      2.39% _RNvXs2_NtNtCs4NRVxsYgnAr_4core3str5lossyNtB5_10Utf8ChunksNtNtNtNtB9_4iter6traits8iterator8Iterator4next
+      2.37% cfree
+      2.30% _RNvMs0_NtCsdREBRar76Nx_10phpun_core5valueNtB5_8PhpArray15mem_note_append

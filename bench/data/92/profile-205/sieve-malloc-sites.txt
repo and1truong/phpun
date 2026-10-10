@@ -1,0 +1,35 @@
+# events: 320034  bytes: 8435520
+#   myprobes:pmalloc: 320029
+#   myprobes:prealloc: 3
+#   myprobes:pcalloc: 2
+   pct      count   pctB          bytes     avg  site
+ 29.23      93543  17.01        1434474      15  _NtNtCsdREBRar76Nx_10phpun_core6interp4exprNtB7_6Interp12assign_inner
+ 19.49      62389   5.92         499112       8  _NtNtCsdREBRar76Nx_10phpun_core6interp4exprNtB7_6Interp17assign_index_path
+ 10.05      32174  34.65        2922612      90  _NtCscdodAO9FK5_5alloc7raw_vecNtB5_11RawVecInner11finish_growCsdREBRar76Nx_10phpun_core
+  9.90      31694   1.88         158968       5  _NtCscdodAO9FK5_5alloc6stringNtB5_6StringNtNtCs4NRVxsYgnAr_4core5clone5Clone5clone
+  9.74      31181   1.85         155905       5  _NtNtCsdREBRar76Nx_10phpun_core6interp4exprNtB7_6Interp13dim_self_root
+  9.74      31177   0.37          31177       1  _NtNtCsdREBRar76Nx_10phpun_core6interp4exprNtB7_6Interp11dim_var_key
+  5.94      19017  10.82         912816      48  Nx_10phpun_core8builtins4cell
+  1.06       3400   7.17         605058     177  Nx_10phpun_core3astNtB5_4ExprNtNtCs4NRVxsYgnAr_4core5clone5Clone5clone
+  0.52       1664   0.17          14282       8  _NtCscdodAO9FK5_5alloc3stre12to_lowercase
+  0.46       1471   0.08           6861       4  Nx_10phpun_core5lexerNtB4_5TokenNtNtCs4NRVxsYgnAr_4core5clone5Clone5clone
+  0.45       1445   0.09           7714       5  Nx_10phpun_core5lexer5ident
+  0.32       1031   0.30          25311      24  _NtCscdodAO9FK5_5alloc7raw_vecNtB5_11RawVecInner11finish_growB7_
+  0.28        894   1.03          87152      97  Nx_10phpun_core6interp8registryNtB6_6Interp24register_builtin_classes6method
+  0.22        711   0.16          13755      19  _NtCsdREBRar76Nx_10phpun_core6interpNtB5_6Interp3new
+  0.22        694   1.91         161008     232  Nx_10phpun_core6parser4exprNtB4_6Parser8markline
+  0.18        579   0.84          70746     122  Nx_10phpun_core6interp8registryNtB6_6Interp24register_builtin_classess1_0B8_
+  0.17        555   0.65          54632      98  Nx_10phpun_core6interp8registryNtB6_6Interp24register_builtin_classessa_0B8_
+  0.15        483   1.33         111829     231  Nx_10phpun_core6parser4exprNtB4_6Parser7postfix
+  0.15        481   0.82          68915     143  Nx_10phpun_core6interp8registryNtB4_6Interp24register_builtin_classes
+  0.15        476   1.32         110936     233  FK5_5alloc5boxed14box_new_uninit
+  0.12        393   2.02         170520     433  Nx_10phpun_core6parser4exprNtB4_6Parser4args
+  0.12        380   1.06          89531     235  Nx_10phpun_core6interp8registryNtB6_6Interp24register_builtin_classes15throwable_class
+  0.11        354   0.06           4856      13  Nx_10phpun_core6interp8registryNtB6_6Interp24register_builtin_classes5param
+  0.10        312   0.06           5236      16  Nx_10phpun_core6parser4declNtB4_6Parser11method_decl
+  0.08        246   0.34          28992     117  _NtCscdodAO9FK5_5alloc7raw_vecNtB5_11RawVecInner11finish_growCs2AWtUsOyxgP_3std
+  0.07        226   0.04           3675      16  FK5_5alloc3vecINtB5_3VecNtNtB7_6string6StringENtNtCs4NRVxsYgnAr_4core5clone5Clone5cloneCsdREBRar76Nx_10phpun_core
+  0.06        184   0.40          33856     184  Nx_10phpun_core6interp8registryNtB6_6Interp24register_builtin_classes0B8_
+  0.06        179   0.42          35566     198  FK5_5alloc5sliceSp9to_vec_inNtNtCsdREBRar76Nx_10phpun_core3ast5ParamNtB3_10ConvertVec6to_vecNtNtB8_5alloc6GlobalEBN_
+  0.05        169   0.01           1222       7  FK5_5alloc3str17join_generic_copyehNtNtB4_6string6StringECsdREBRar76Nx_10phpun_core
+  0.04        136   0.09           8000      58  Nx_10phpun_core6interp8registryNtB6_6Interp24register_builtin_classess_0B8_
