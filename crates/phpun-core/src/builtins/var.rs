@@ -1041,12 +1041,27 @@ fn ser_value(it: &mut Interp, v: &Value, ctx: &mut SerCtx) -> Result<String, Php
                 .filter_map(|name| ob.props.get(name).map(|c| (name.clone(), c.clone())))
                 .collect();
             drop(ob);
+            let cls = o.borrow().class.clone();
             for (name, c) in pairs {
                 // Int-keyed buckets (SPL `[]=` appends) serialize
                 // their key as `i:N;` like an array's int member.
                 match crate::value::int_prop_index(&name) {
                     Some(i) => body.push_str(&format!("i:{};", i)),
-                    None => body.push_str(&format!("s:{}:\"{}\";", name.len(), name)),
+                    None => {
+                        // zend stores protected slots mangled \0*\0name;
+                        // phpun keeps them plain, so remangle at emit.
+                        let k = if name.starts_with('\0') {
+                            name.clone()
+                        } else {
+                            match it.prop_visibility(&cls, &name).0 {
+                                crate::ast::Visibility::Protected => {
+                                    format!("\0*\0{}", name)
+                                }
+                                _ => name.clone(),
+                            }
+                        };
+                        body.push_str(&format!("s:{}:\"{}\";", k.len(), k))
+                    }
                 }
                 body.push_str(&ser_cell(it, &c, ctx)?);
                 n += 1;
@@ -1110,7 +1125,13 @@ fn php_unserialize_key(s: &str, pos: &mut usize) -> Result<Value, ()> {
                 return Err(());
             }
             let st = String::from_utf8_lossy(&b[*pos..*pos + len]).into_owned();
-            *pos += len + 2; // closing quote + ;
+            // zend checks the `";` terminator at the byte right after
+            // the declared length and reports THAT offset on failure.
+            *pos += len;
+            if b.get(*pos) != Some(&b'"') || b.get(*pos + 1) != Some(&b';') {
+                return Err(());
+            }
+            *pos += 2; // closing quote + ;
             Ok(Value::str(st))
         }
         _ => Err(()),
@@ -1393,6 +1414,24 @@ pub(crate) fn php_unserialize(
                     }
                     return Err(());
                 };
+                // A `\0`-mangled key must be `\0Scope\0name` or
+                // `\0*\0name` with non-empty parts — anything else
+                // (`\0a`, `\0\0a`, `\0Cls\0`) notices and aborts
+                // the whole payload at the member-name's end offset.
+                if ks.starts_with(&[0u8][..]) {
+                    let r = &ks[1..];
+                    let ok = r
+                        .iter()
+                        .position(|b| *b == 0)
+                        .is_some_and(|z| z > 0 && z + 1 < r.len());
+                    if !ok {
+                        // The outer Err path prints the `Error at
+                        // offset` warning — `pos` already sits at the
+                        // member-name's end.
+                        let _ = it.notice("Illegal member variable name");
+                        return Err(());
+                    }
+                }
                 let plain = ks
                     .strip_prefix(&[0u8][..])
                     .and_then(|r| r.split(|b| *b == 0).nth(1))
@@ -1418,6 +1457,23 @@ pub(crate) fn php_unserialize(
                 // declared-prop name (mangled or plain) before writing —
                 // mismatched scopes stay verbatim dynamic props.
                 let canon = it.unserial_resolve_key(&obj, ks.as_ref());
+                // An unresolvable key stays a verbatim dynamic prop —
+                // zend still emits the creation deprecation (mangled
+                // scope failures deprecate under the PLAIN name).
+                if canon.is_none()
+                    && it.dyn_prop_deprecated(
+                        &obj,
+                        &crate::value::lossy(&plain),
+                        &crate::value::lossy(&ks),
+                    )
+                {
+                    let cn = obj.borrow().class.name().to_string();
+                    let _ = it.deprecated(&format!(
+                        "Creation of dynamic property {}::${} is deprecated",
+                        cn,
+                        crate::value::lossy(&plain)
+                    ));
+                }
                 // A `previous` payload is classified BEFORE borrow_mut:
                 // an r:/R: backref to this very object makes
                 // obj_implements' o.borrow() panic under the mut borrow.

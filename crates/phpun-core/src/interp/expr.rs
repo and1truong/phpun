@@ -10555,13 +10555,25 @@ impl<'a> Interp<'a> {
                         return Ok(Value::Array(Rc::new(RefCell::new(a))));
                     }
                     let ob = o.borrow();
+                    let cls = ob.class.clone();
                     for n in &ob.prop_order {
                         if let Some(c) = ob.props.get(n) {
                             // Int-keyed buckets decode to int keys like
                             // zend's property-HT int slots.
                             let k = match crate::value::int_prop_index(n) {
                                 Some(i) => ArrKey::Int(i),
-                                None => ArrKey::Str(n.clone().into()),
+                                None => {
+                                    // zend's prop table keys protected
+                                    // slots \0*\0name — mirror at emit.
+                                    if !n.starts_with('\0')
+                                        && self.prop_visibility(&cls, n).0
+                                            == crate::ast::Visibility::Protected
+                                    {
+                                        ArrKey::Str(format!("\0*\0{}", n).into())
+                                    } else {
+                                        ArrKey::Str(n.clone().into())
+                                    }
+                                }
                             };
                             a.set(k, c.borrow().clone());
                         }
