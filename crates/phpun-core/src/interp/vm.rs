@@ -25,7 +25,7 @@ pub(in crate::interp) enum Slot {
     Uninit,
     V(Value),
     C(Cell),
-    /// Read-only parameter in the live frame value vector.
+    /// Live parameter in the frame's value vector, with writes visible to args.
     Arg(u16),
 }
 
@@ -2652,10 +2652,10 @@ impl<'a> Interp<'a> {
 
     /// Fresh positional callback values only: original/reference argument cells
     /// must use call_value. Pool the value vector before invoking the shared ABI.
-    pub(crate) fn call_value_positional<const N: usize>(
+    pub(crate) fn call_value_pair(
         &mut self,
         callable: &Value,
-        values: [Value; N],
+        values: [Value; 2],
         nonref: bool,
     ) -> Result<Value, PhpError> {
         let mut argv = self.vm_val_pool.pop().unwrap_or_default();
@@ -2665,7 +2665,7 @@ impl<'a> Interp<'a> {
             None => {
                 let mut args = super::CallArgs::positional(argv.drain(..).map(cell).collect());
                 if nonref {
-                    args.nonref_cells.extend(0..N);
+                    args.nonref_cells.extend(0..2);
                 }
                 self.call_value(callable, args)
             }
@@ -3033,6 +3033,9 @@ $a=[2,1,2]; usort($a, fn(int $x,int $y):bool=>$x>$y); echo json_encode($a), "\n"
 restore_error_handler();
 try { $a=[1,1]; usort($a, fn(int $x,int $y):int=>intdiv(1,$x-$y)); } catch (Throwable $e) { echo get_class($e), ':', $e->getMessage(), "\n"; }
 echo json_encode(array_map(fn(int $x):int=>$x*2,[3,4])), "\n";
+function liveCallbackArgs() { return debug_backtrace(0, 2)[1]['args']; }
+$a=[2,1]; usort($a, function(int $x,int $y):int { $x++; echo json_encode(func_get_args()), ' ', json_encode(liveCallbackArgs()), "\n"; return ($x-1)<=>$y; });
+echo json_encode($a), "\n";
 "#);
         assert_eq!(result.exit_code, 0, "{}", it.err_buf);
         assert_eq!(it.err_buf, "");
@@ -3060,13 +3063,15 @@ array(2) {
 [1,2,2]
 DivisionByZeroError:Division by zero
 [6,8]
+[3,1] [3,1]
+[1,2]
 "#
         );
 
         // Weak Rust ownership also covers the callable metadata retained by the
         // shared direct frame. The compile cache may own the decl, never this Rc.
         let mut it = Interp::new("callback-owner.php");
-        it.run_source("<?php function callbackOwned(int $x): int { return $x + 1; }");
+        it.run_source("<?php function callbackOwned(int $x, int $y): int { return $x + $y; }");
         let callable = it
             .eval(&crate::ast::Expr::Closure(crate::ast::ClosureExpr {
                 decl: (*it.functions["callbackowned"]).clone(),
@@ -3080,7 +3085,11 @@ DivisionByZeroError:Division by zero
         };
         let weak = std::rc::Rc::downgrade(c);
         let result = it
-            .call_value_positional(&callable, [crate::value::Value::Int(2)], false)
+            .call_value_pair(
+                &callable,
+                [crate::value::Value::Int(2), crate::value::Value::Int(1)],
+                false,
+            )
             .unwrap();
         assert!(matches!(result, crate::value::Value::Int(3)));
         assert!(

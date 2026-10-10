@@ -852,7 +852,10 @@ pub(crate) fn dispatch(
                     let v = c.borrow().clone();
                     let keep = match &cb {
                         Some(cb) => {
-                            let r = it.call_value_positional(cb, [v.clone()], false)?;
+                            let r = it.call_value(
+                                cb,
+                                crate::interp::CallArgs::positional(vec![cell(v.clone())]),
+                            )?;
                             r.is_truthy()
                         }
                         None => v.is_truthy(),
@@ -879,7 +882,10 @@ pub(crate) fn dispatch(
                         let v = if null_cb {
                             c.borrow().clone()
                         } else {
-                            it.call_value_positional(&cb, [c.borrow().clone()], false)?
+                            it.call_value(
+                                &cb,
+                                crate::interp::CallArgs::positional(vec![cell(c.borrow().clone())]),
+                            )?
                         };
                         out.set(k.clone(), v);
                     }
@@ -1740,7 +1746,7 @@ pub(crate) fn zend_sort_user(
         } else {
             [x.2.borrow().clone(), y.2.borrow().clone()]
         };
-        it.call_value_positional(cb, values, true)
+        it.call_value_pair(cb, values, true)
     };
     crate::value::zend_sort(&mut v, &mut |x, y| {
         // zend keeps the comparator running after an exception but the
