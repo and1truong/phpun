@@ -2486,7 +2486,7 @@ impl<'a> Interp<'a> {
                 .enumerate()
                 .all(|(i, p)| p.variadic || i < argv.len() || comp.defaults[i].is_some());
         if abi {
-            for (i, p) in decl.params.iter().enumerate() {
+            'abi: for (i, p) in decl.params.iter().enumerate() {
                 if p.variadic {
                     abi = p.ty.is_none();
                     break;
@@ -2497,41 +2497,16 @@ impl<'a> Interp<'a> {
                 if comp.param_fast[i].is_some_and(|g| g(v)) {
                     continue;
                 }
-                self.callable_probe_err = None;
-                match self.vm_param_gate(decl, p, ty, v) {
-                    // A swallowed probe's exception propagates verbatim.
-                    Some(Some(e)) => {
+                let v = v.clone();
+                match self.vm_abi_gate_slow(decl, p, ty, &v, argv, i) {
+                    Ok(()) => {}
+                    Err(Some(e)) => {
                         self.stack_pop();
                         return self.fail(e);
                     }
-                    // Any other miss needs the canonical TypeError.
-                    Some(None) => {
+                    Err(None) => {
                         abi = false;
-                        break;
-                    }
-                    None => {}
-                }
-                // Proven ok — apply the same widening/coercion the typed
-                // prelude stores into the arg cell, on the argv value.
-                let v = v.clone();
-                let strict = self.caller_file_strict();
-                if !strict && !self.ty_weak_exact(ty, &v) {
-                    if let Some(cv) = self.coerce_scalar(ty, &v) {
-                        // Arg-coercion deprecations attribute to the
-                        // callee's decl line (scalar_basic).
-                        let pl = self.cur_line;
-                        self.cur_line = decl.line;
-                        self.deprecate_lossy_int(ty, &v, &cv);
-                        self.cur_line = pl;
-                        argv[i] = cv;
-                    }
-                }
-                if strict
-                    && ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
-                    && !self.ty_weak_exact(ty, &v)
-                {
-                    if let Value::Int(n) = v {
-                        argv[i] = Value::Float(n as f64);
+                        break 'abi;
                     }
                 }
             }
@@ -2548,6 +2523,53 @@ impl<'a> Interp<'a> {
         self.vm_call_reserve(&mut args, n);
         padd!(1, __p);
         self.vm_run(decl, comp, args)
+    }
+
+    /// The typed check a fast `param_fast` gate could not settle for a
+    /// value-ABI candidate: probe-ok params get the prelude's widening/
+    /// coercion written into argv (so func_get_args reports the bound
+    /// value); anything else falls back to the canonical binder for its
+    /// TypeError machinery. Err(None) = rebind, Err(Some) = propagate.
+    #[cold]
+    fn vm_abi_gate_slow(
+        &mut self,
+        decl: &FunctionDecl,
+        p: &Param,
+        ty: &[String],
+        v: &Value,
+        argv: &mut [Value],
+        i: usize,
+    ) -> Result<(), Option<PhpError>> {
+        self.callable_probe_err = None;
+        match self.vm_param_gate(decl, p, ty, v) {
+            // A swallowed probe's exception propagates verbatim.
+            Some(Some(e)) => return Err(Some(e)),
+            // Any other miss needs the canonical TypeError.
+            Some(None) => return Err(None),
+            None => {}
+        }
+        let v = v.clone();
+        let strict = self.caller_file_strict();
+        if !strict && !self.ty_weak_exact(ty, &v) {
+            if let Some(cv) = self.coerce_scalar(ty, &v) {
+                // Arg-coercion deprecations attribute to the callee's
+                // decl line (scalar_basic).
+                let pl = self.cur_line;
+                self.cur_line = decl.line;
+                self.deprecate_lossy_int(ty, &v, &cv);
+                self.cur_line = pl;
+                argv[i] = cv;
+            }
+        }
+        if strict
+            && ty.iter().any(|m| m.eq_ignore_ascii_case("float"))
+            && !self.ty_weak_exact(ty, &v)
+        {
+            if let Value::Int(n) = v {
+                argv[i] = Value::Float(n as f64);
+            }
+        }
+        Ok(())
     }
 
     /// Cells for args taking the canonical bind path — scalar cells come
