@@ -1297,6 +1297,13 @@ impl<'a> Interp<'a> {
             if self.vm_slot_pool.len() < 64 {
                 self.vm_slot_pool.push(std::mem::take(&mut slots));
             }
+            // stack_pop already repaid these spans. Reuse only unaliased
+            // site tokens after destructor callbacks and argument cleanup.
+            for site in f.vm_sites.drain(..) {
+                if self.vm_site_pool.len() < 256 && Rc::strong_count(&site) == 1 {
+                    self.vm_site_pool.push(site);
+                }
+            }
             if self.vm_frame_pool.len() < 64 {
                 self.vm_frame_pool.push(f);
             }
@@ -2251,5 +2258,37 @@ impl<'a> Interp<'a> {
             ));
         }
         self.invoke_fn(&decl.unwrap(), args, None, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Interp;
+
+    #[test]
+    fn arena_spans_are_repaid_after_return_exception_and_page_extension() {
+        let mut it = Interp::new("arena.php");
+        let initial: Vec<_> = it.vm_stack.iter().map(|s| (s.size, s.used)).collect();
+        let result = it.run_source(
+            r#"<?php
+            function scalar($n) { return $n + 1; }
+            function explode_call($n) { return intdiv($n, 0); }
+            for ($i = 0; $i < 300; $i++) { scalar($i); }
+            try { explode_call(5); } catch (Throwable $e) {}
+            scalar(...array_fill(0, 20000, 1));
+            for ($i = 0; $i < 300; $i++) { scalar($i); }
+            echo 'ok';
+        "#,
+        );
+        assert_eq!(result.exit_code, 0, "{}", it.err_buf);
+        assert_eq!(it.out, b"ok");
+        assert_eq!(
+            it.vm_stack
+                .iter()
+                .map(|s| (s.size, s.used))
+                .collect::<Vec<_>>(),
+            initial
+        );
+        assert!(it.mem_tracked.values().all(|charge| charge.vm.is_none()));
     }
 }

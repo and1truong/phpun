@@ -380,6 +380,7 @@ pub struct Interp<'a> {
     vm_slot_pool: Vec<Vec<crate::interp::vm::Slot>>,
     vm_cell_pool: Vec<Vec<Cell>>,
     vm_scalar_cell_pool: Vec<Cell>,
+    vm_site_pool: Vec<Rc<VmSite>>,
     /// Popped VM frames — Frame::new/vars-map alloc per call avoided.
     vm_frame_pool: Vec<Frame>,
     classes: crate::value::FxMap<String, Rc<PhpClass>>,
@@ -1747,6 +1748,7 @@ impl<'a> Interp<'a> {
             vm_slot_pool: Vec::new(),
             vm_cell_pool: Vec::new(),
             vm_scalar_cell_pool: Vec::new(),
+            vm_site_pool: Vec::new(),
             vm_frame_pool: Vec::new(),
             classes: crate::value::FxMap::default(),
             traits: HashMap::new(),
@@ -4508,8 +4510,14 @@ impl<'a> Interp<'a> {
     /// at sweep once a never-dispatched call's token dies.
     fn vm_site(&mut self, out: &mut CallArgs, seg: usize, slots: u64, own: usize) {
         crate::interp::util::alloc_hit(1);
-        let site: Rc<VmSite> = Rc::new(VmSite);
-        self.mem_track(&site, 0);
+        let site = match self.vm_site_pool.pop() {
+            Some(site) => site, // Its zero-sized charge stays live in the pool.
+            None => {
+                let site = Rc::new(VmSite);
+                self.mem_track(&site, 0);
+                site
+            }
+        };
         let key = Rc::as_ptr(&site) as *const u8 as usize;
         if let Some(c) = self.mem_tracked.get_mut(&key) {
             c.vm = Some((seg, slots, own));
