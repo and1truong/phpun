@@ -1495,26 +1495,33 @@ impl<'a> Interp<'a> {
         let frame = self.cur();
         for (name, index) in &comp.names {
             let slot = &mut slots[*index as usize];
-            let c = match slot {
+            // Move the handle out: it must not look like a PHP alias while
+            // AST code runs. Existing canonical cells need no reinsertion.
+            let c = match std::mem::replace(slot, Slot::Uninit) {
                 Slot::Uninit => continue,
-                Slot::C(c) => c.clone(),
-                Slot::V(v) => cell(std::mem::replace(v, Value::Null)),
+                Slot::C(c) => c,
+                Slot::V(v) => cell(v),
             };
-            // Slot handles are bookkeeping, not PHP aliases. Drop them
-            // while AST code runs so unset/reference/GC sees canonical counts.
-            *slot = Slot::Uninit;
+            if frame
+                .vars
+                .get(name)
+                .is_some_and(|current| Rc::ptr_eq(current, &c))
+            {
+                continue;
+            }
             frame.vars.insert(name.clone(), c);
         }
     }
 
     fn vm_refresh(&mut self, comp: &Compiled, slots: &mut [Slot]) {
         for (name, index) in &comp.names {
-            slots[*index as usize] = self
-                .cur()
-                .vars
-                .get(name)
-                .map(|c| Slot::C(c.clone()))
-                .unwrap_or(Slot::Uninit);
+            let c = if comp.top_level {
+                // $GLOBALS writes/unsets synchronize lazily on canonical reads.
+                self.global_var_cell(name)
+            } else {
+                self.cur().vars.get(name).cloned()
+            };
+            slots[*index as usize] = c.map(Slot::C).unwrap_or(Slot::Uninit);
         }
     }
 
@@ -1751,12 +1758,21 @@ impl<'a> Interp<'a> {
                     // finding: skipped it attributed callee traces to
                     // the previous call's site).
                     let target = targets.pop().expect("InitCall resolved this call");
-                    let v = if let CachedFn::Direct(d, c) = &target {
+                    if comp.top_level {
+                        // Callees may unset/rebind globals or run GC. Slot
+                        // handles must not pin old bindings during the call.
+                        self.vm_materialize(comp, slots);
+                    }
+                    let result = if let CachedFn::Direct(d, c) = &target {
                         self.send_line = Some(*site);
-                        self.vm_run_direct(d, c, &mut argv)?
+                        self.vm_run_direct(d, c, &mut argv)
                     } else {
-                        self.vm_call(lname, raw, &mut argv, *site, &target)?
+                        self.vm_call(lname, raw, &mut argv, *site, &target)
                     };
+                    if comp.top_level {
+                        self.vm_refresh(comp, slots);
+                    }
+                    let v = result?;
                     argv.clear();
                     if self.vm_val_pool.len() < 64 {
                         self.vm_val_pool.push(argv);
