@@ -2,6 +2,34 @@
 
 use super::*;
 
+// zend JSON error codes (what json_last_error reports).
+const J_DEPTH: i64 = 1;
+const J_CTRL: i64 = 3;
+const J_SYNTAX: i64 = 4;
+const J_UTF8: i64 = 5;
+const J_RECURSION: i64 = 6;
+const J_INF_NAN: i64 = 7;
+const J_UNSUPPORTED: i64 = 8;
+const J_UTF16: i64 = 10;
+
+// Encode flag bits. Decode shares zend's overlapping space —
+// JSON_OBJECT_AS_ARRAY = 1 and JSON_BIGINT_AS_STRING = 2 are read inline.
+const F_HEX_TAG: i64 = 1;
+const F_HEX_AMP: i64 = 2;
+const F_HEX_APOS: i64 = 4;
+const F_HEX_QUOT: i64 = 8;
+const F_FORCE_OBJECT: i64 = 16;
+const F_NUMERIC: i64 = 32;
+const F_UNESC_SLASH: i64 = 64;
+const F_PRETTY: i64 = 128;
+const F_UNESC_UNI: i64 = 256;
+const F_PARTIAL: i64 = 512;
+const F_PRESERVE: i64 = 1024;
+const F_UNESC_LT: i64 = 2048;
+const F_UTF8_IGNORE: i64 = 0x100000;
+const F_UTF8_SUB: i64 = 0x200000;
+const F_THROW: i64 = 0x400000;
+
 pub(crate) fn dispatch(
     it: &mut Interp,
     name: &str,
@@ -11,56 +39,79 @@ pub(crate) fn dispatch(
         "json_encode" => {
             let v = arg(args, 0);
             let flags = arg(args, 1).to_int();
-            match json_encode(it, &v, flags) {
-                Ok(s) => {
-                    it.last_json_error = 0;
-                    Value::str(s)
-                }
-                Err(_) => {
-                    it.last_json_error = 8;
-                    Value::Bool(false)
-                }
+            let depth = if args.len() > 2 {
+                arg(args, 2).to_int()
+            } else {
+                512
+            };
+            let (s, code) = json_encode(it, &v, flags, depth);
+            // THROW wins over output; json_last_error stays untouched.
+            if code != 0 && flags & F_THROW != 0 {
+                let e = it.exception("JsonException", json_err_msg(code));
+                return Err(it.throw_value(e));
+            }
+            it.last_json_error = code;
+            if code != 0 && flags & F_PARTIAL == 0 {
+                Value::Bool(false)
+            } else {
+                Value::str(s)
             }
         }
         "json_decode" => {
-            let s = arg_str(it, args, 0);
-            let mut assoc = arg(args, 1).is_truthy();
-            let flags = arg(args, 3).to_int();
-            if flags & 1 != 0 {
-                assoc = true; // JSON_OBJECT_AS_ARRAY
+            let s = arg_bs(it, args, 0);
+            // An explicit assoc wins; OBJECT_AS_ARRAY only fills the
+            // default when arg 2 is null/missing (zend parity).
+            let assoc = if matches!(arg(args, 1), Value::Null) {
+                arg(args, 3).to_int() & 1 != 0
+            } else {
+                arg(args, 1).is_truthy()
+            };
+            let depth = if args.len() > 2 {
+                arg(args, 2).to_int()
+            } else {
+                512
+            };
+            if depth < 1 {
+                let e = it.exception(
+                    "ValueError",
+                    "json_decode(): Argument #3 ($depth) must be greater than 0",
+                );
+                return Err(it.throw_value(e));
             }
-            match json_decode(it, &s, assoc) {
+            let flags = arg(args, 3).to_int();
+            match json_decode(it, &s, assoc, depth, flags) {
                 Ok(v) => {
                     it.last_json_error = 0;
                     v
                 }
-                Err(_) => {
-                    it.last_json_error = 4;
-                    if flags & 4194304 != 0 {
-                        return Err(PhpError::uncaught("JsonException", "Syntax error", 0));
+                Err(code) => {
+                    if flags & F_THROW != 0 {
+                        let e = it.exception("JsonException", json_err_msg(code));
+                        return Err(it.throw_value(e));
                     }
+                    it.last_json_error = code;
                     Value::Null
                 }
             }
         }
         "json_last_error" => Value::Int(it.last_json_error),
-        "json_last_error_msg" => Value::str(
-            match it.last_json_error {
-                0 => "No error",
-                1 => "Maximum stack depth exceeded",
-                2 => "State mismatch (invalid or malformed JSON)",
-                3 => "Control character error, possibly incorrectly encoded",
-                4 => "Syntax error",
-                5 => "Malformed UTF-8 characters, possibly incorrectly encoded",
-                7 => "Inf and NaN cannot be JSON encoded",
-                8 => "Unsupported type",
-                _ => "Unknown error",
-            }
-            .to_string(),
-        ),
+        "json_last_error_msg" => Value::str(json_err_msg(it.last_json_error).to_string()),
         "json_validate" => {
-            let s = arg_str(it, args, 0);
-            Value::Bool(json_decode(it, &s, true).is_ok())
+            let s = arg_bs(it, args, 0);
+            let depth = if args.len() > 1 {
+                arg(args, 1).to_int()
+            } else {
+                512
+            };
+            if depth < 1 {
+                let e = it.exception(
+                    "ValueError",
+                    "json_validate(): Argument #2 ($depth) must be greater than 0",
+                );
+                return Err(it.throw_value(e));
+            }
+            let flags = arg(args, 2).to_int();
+            Value::Bool(json_decode(it, &s, true, depth, flags).is_ok())
         }
         _ => return Ok(None),
     }))
@@ -68,382 +119,897 @@ pub(crate) fn dispatch(
 
 // ----- helpers -----
 
-fn json_encode(it: &mut Interp, v: &Value, flags: i64) -> Result<String, ()> {
-    let mut out = String::new();
-    json_enc(it, v, flags, &mut Vec::new(), &mut out)?;
-    Ok(out)
+fn json_err_msg(code: i64) -> &'static str {
+    match code {
+        0 => "No error",
+        1 => "Maximum stack depth exceeded",
+        2 => "State mismatch (invalid or malformed JSON)",
+        3 => "Control character error, possibly incorrectly encoded",
+        4 => "Syntax error",
+        5 => "Malformed UTF-8 characters, possibly incorrectly encoded",
+        6 => "Recursion detected",
+        7 => "Inf and NaN cannot be JSON encoded",
+        8 => "Type is not supported",
+        10 => "Single unpaired UTF-16 surrogate in unicode escape",
+        _ => "Unknown error",
+    }
 }
 
-// Preserve the existing child-error null fallback without per-child strings.
-fn json_child(it: &mut Interp, v: &Value, flags: i64, seen: &mut Vec<usize>, out: &mut String) {
-    let start = out.len();
-    if json_enc(it, v, flags, seen, out).is_err() {
-        out.truncate(start);
-        out.push_str("null");
+// Per-call escape table — one flags→action pass instead of re-matching
+// flags per char (60-json writes ~200KB of string content per rep).
+const A_HI: u8 = 1; // >=0x80: utf8-validate, then maybe \uXXXX
+const A_UNI_LO: u8 = 2; // \u00xx lowercase (control chars, non-ascii)
+const A_UNI_HI: u8 = 3; // \u00XX uppercase (JSON_HEX_* flags only)
+const A_ESC: u8 = 4; // one-char escape: \" \\ \/ \n \r \t \b \f
+
+struct Esc {
+    flags: i64,
+    tab: [u8; 256],
+}
+
+impl Esc {
+    fn new(flags: i64) -> Esc {
+        let mut tab = [0u8; 256];
+        for (c, t) in tab.iter_mut().enumerate() {
+            *t = match c as u8 {
+                0x00..=0x1f => A_UNI_LO,
+                0x80..=0xff => A_HI,
+                _ => 0,
+            };
+        }
+        for c in [b'\n', b'\r', b'\t', 0x08, 0x0c] {
+            tab[c as usize] = A_ESC;
+        }
+        tab[b'\\' as usize] = A_ESC;
+        tab[b'"' as usize] = if flags & F_HEX_QUOT != 0 {
+            A_UNI_HI
+        } else {
+            A_ESC
+        };
+        if flags & F_UNESC_SLASH == 0 {
+            tab[b'/' as usize] = A_ESC;
+        }
+        if flags & F_HEX_TAG != 0 {
+            tab[b'<' as usize] = A_UNI_HI;
+            tab[b'>' as usize] = A_UNI_HI;
+        }
+        if flags & F_HEX_AMP != 0 {
+            tab[b'&' as usize] = A_UNI_HI;
+        }
+        if flags & F_HEX_APOS != 0 {
+            tab[b'\'' as usize] = A_UNI_HI;
+        }
+        Esc { flags, tab }
+    }
+
+    fn pretty(&self) -> bool {
+        self.flags & F_PRETTY != 0
+    }
+}
+
+/// Returns (output, zend error code) — under PARTIAL_OUTPUT_ON_ERROR the
+/// string still ships and `code` reports the LAST substituted error.
+fn json_encode(it: &mut Interp, v: &Value, flags: i64, max_depth: i64) -> (String, i64) {
+    let esc = Esc::new(flags);
+    // ponytail: fixed 4KB head start — not sized to the payload.
+    let mut out = String::with_capacity(4096);
+    let mut seen = Vec::new();
+    let mut err = 0;
+    if let Err(code) = json_enc(it, v, &esc, &mut seen, &mut out, 0, max_depth, &mut err) {
+        err = code;
+        if flags & F_PARTIAL != 0 {
+            out.truncate(0);
+            out.push_str(json_subst(code));
+        }
+    }
+    (out, err)
+}
+
+/// zend's PARTIAL placeholder: `0` for the one error that is a value.
+fn json_subst(code: i64) -> &'static str {
+    if code == J_INF_NAN {
+        "0"
+    } else {
+        "null"
     }
 }
 
 fn json_enc(
     it: &mut Interp,
     v: &Value,
-    flags: i64,
+    esc: &Esc,
     seen: &mut Vec<usize>,
     out: &mut String,
-) -> Result<(), ()> {
+    lvl: i64,
+    max: i64,
+    err: &mut i64,
+) -> Result<(), i64> {
     use std::fmt::Write;
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Int(i) => write!(out, "{i}").unwrap(),
         Value::Float(f) => {
-            if f.fract() == 0.0 && f.abs() < 1e15 {
-                write!(out, "{}", *f as i64).unwrap();
-            } else {
-                out.push_str(&crate::value::format_float(*f));
+            if f.is_nan() || f.is_infinite() {
+                return Err(J_INF_NAN);
             }
+            json_f64(*f, esc.flags, out);
         }
-        Value::Str(s) => json_str(&crate::value::lossy(s), flags, out),
-        Value::Array(a) => {
-            let a = a.borrow();
-            let is_list = a
-                .entries
-                .iter()
-                .enumerate()
-                .all(|(i, (k, _))| matches!(k, ArrKey::Int(x) if *x == i as i64));
-            out.push(if is_list { '[' } else { '{' });
-            for (i, (k, c)) in a.entries.iter().enumerate() {
-                if i != 0 {
-                    out.push(',');
+        Value::Str(s) => {
+            if esc.flags & F_NUMERIC != 0 {
+                match numeric(s) {
+                    Numeric::Int(i) => {
+                        write!(out, "{i}").unwrap();
+                        return Ok(());
+                    }
+                    Numeric::Float(f) if f.is_finite() => {
+                        json_f64(f, esc.flags, out);
+                        return Ok(());
+                    }
+                    _ => {}
                 }
-                if !is_list {
-                    json_key(k, flags, out);
-                    out.push(':');
-                }
-                json_child(it, &c.borrow(), flags, seen, out);
             }
-            out.push(if is_list { ']' } else { '}' });
+            json_str(s, esc, out)?
+        }
+        Value::Array(a) => {
+            let lvl = lvl + 1;
+            if lvl > max {
+                return Err(J_DEPTH);
+            }
+            let key = Rc::as_ptr(a) as usize;
+            if seen.contains(&key) {
+                return Err(J_RECURSION);
+            }
+            seen.push(key);
+            let r = json_arr(it, a, esc, seen, out, lvl, max, err);
+            seen.pop();
+            return r;
         }
         Value::Object(o) => {
+            let lvl = lvl + 1;
+            if lvl > max {
+                return Err(J_DEPTH);
+            }
             let key = Rc::as_ptr(o) as usize;
-            if !seen.contains(&key)
-                && it
-                    .find_method_in(&o.borrow().class, "jsonserialize")
-                    .is_some()
+            if seen.contains(&key) {
+                return Err(J_RECURSION);
+            }
+            seen.push(key);
+            let r = if it
+                .find_method_in(&o.borrow().class, "jsonserialize")
+                .is_some()
             {
-                seen.push(key);
                 let v = it
                     .method_invoke(o.clone(), "jsonSerialize", crate::interp::CallArgs::empty())
                     .unwrap_or(Value::Null);
-                return json_enc(it, &v, flags, seen, out);
-            }
-            let ao_arr = if matches!(
-                o.borrow().internal,
-                Some(crate::value::ObjectInternal::ArrayIter { .. })
-            ) {
-                Some(it.ao_arr(o))
+                if matches!(&v, Value::Object(r) if Rc::ptr_eq(r, o)) {
+                    // gh10519: serialize() returning $this encodes the
+                    // property view, once. Anything else containing $this
+                    // hits the stack check above.
+                    json_obj(it, o, esc, seen, out, lvl, max, err)
+                } else {
+                    json_enc(it, &v, esc, seen, out, lvl, max, err)
+                }
             } else {
-                None
+                json_obj(it, o, esc, seen, out, lvl, max, err)
             };
-            let dtp = if ao_arr.is_none() {
-                crate::builtins::datetime::dt_public_props(&o.borrow())
-            } else {
-                None
-            };
-            out.push('{');
-            if let Some(arr) = ao_arr {
-                for (i, (k, c)) in arr.borrow().iter().enumerate() {
-                    if i != 0 {
-                        out.push(',');
-                    }
-                    json_key(k, flags, out);
-                    out.push(':');
-                    json_child(it, &c.borrow(), flags, seen, out);
-                }
-            } else if let Some(dtp) = dtp {
-                for (i, (k, v)) in dtp.iter().enumerate() {
-                    if i != 0 {
-                        out.push(',');
-                    }
-                    json_str(k, flags, out);
-                    out.push(':');
-                    json_child(it, v, flags, seen, out);
-                }
-            } else {
-                let entries = it.object_serial_entries(o);
-                let mut first = true;
-                for (name, slot, decl) in entries {
-                    if !decl
-                        .as_ref()
-                        .map(|(p, _)| p.visibility == crate::ast::Visibility::Public)
-                        .unwrap_or(true)
-                    {
-                        continue;
-                    }
-                    let name = match crate::value::int_prop_index(&name) {
-                        Some(i) => i.to_string(),
-                        None => name,
-                    };
-                    let v = match &decl {
-                        Some((p, dcls)) => it.serial_entry_value(o, p, dcls, &slot),
-                        None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
-                    };
-                    if let Some(v) = v {
-                        if !first {
-                            out.push(',');
-                        }
-                        first = false;
-                        json_str(&name, flags, out);
-                        out.push(':');
-                        // Raw object fields historically use a fresh serializer scope.
-                        json_child(it, &v, flags, &mut Vec::new(), out);
-                    }
-                }
-            }
-            out.push('}');
+            seen.pop();
+            return r;
         }
-        _ => out.push_str("null"),
+        Value::Callable(_) => out.push_str("{}"),
+        _ => return Err(J_UNSUPPORTED),
     }
     Ok(())
 }
 
-fn json_key(key: &ArrKey, flags: i64, out: &mut String) {
-    match key {
-        ArrKey::Str(s) => json_str(s, flags, out),
-        _ => json_str(&key_str(key), flags, out),
+/// Element/property encoder: PARTIAL swaps a failing child for 0/null and
+/// records its code — zend reports the last error it hit.
+fn json_child(
+    it: &mut Interp,
+    v: &Value,
+    esc: &Esc,
+    seen: &mut Vec<usize>,
+    out: &mut String,
+    lvl: i64,
+    max: i64,
+    err: &mut i64,
+) -> Result<(), i64> {
+    let start = out.len();
+    match json_enc(it, v, esc, seen, out, lvl, max, err) {
+        Err(code) if esc.flags & F_PARTIAL != 0 => {
+            *err = code;
+            out.truncate(start);
+            out.push_str(json_subst(code));
+            Ok(())
+        }
+        r => r,
     }
 }
 
-fn json_str(s: &str, flags: i64, out: &mut String) {
+fn indent(out: &mut String, lvl: i64) {
+    out.extend(std::iter::repeat(' ').take(4 * lvl.max(0) as usize));
+}
+
+fn json_arr(
+    it: &mut Interp,
+    a: &Rc<RefCell<PhpArray>>,
+    esc: &Esc,
+    seen: &mut Vec<usize>,
+    out: &mut String,
+    lvl: i64,
+    max: i64,
+    err: &mut i64,
+) -> Result<(), i64> {
+    let a = a.borrow();
+    let is_list = esc.flags & F_FORCE_OBJECT == 0
+        && a
+            .entries
+            .iter()
+            .enumerate()
+            .all(|(i, (k, _))| matches!(k, ArrKey::Int(x) if *x == i as i64));
+    out.push(if is_list { '[' } else { '{' });
+    let mut first = true;
+    for (k, c) in &a.entries {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        if esc.pretty() {
+            out.push('\n');
+            indent(out, lvl);
+        }
+        if !is_list {
+            json_key(k, esc, out)?;
+            out.push(':');
+            if esc.pretty() {
+                out.push(' ');
+            }
+        }
+        json_child(it, &c.borrow(), esc, seen, out, lvl, max, err)?;
+    }
+    if esc.pretty() && !a.entries.is_empty() {
+        out.push('\n');
+        indent(out, lvl - 1);
+    }
+    out.push(if is_list { ']' } else { '}' });
+    Ok(())
+}
+
+/// Property view of a plain object (and the JsonSerializable $this
+/// fallback): same shape zend emits.
+fn json_obj(
+    it: &mut Interp,
+    o: &Rc<RefCell<PhpObject>>,
+    esc: &Esc,
+    seen: &mut Vec<usize>,
+    out: &mut String,
+    lvl: i64,
+    max: i64,
+    err: &mut i64,
+) -> Result<(), i64> {
+    let ao_arr = if matches!(
+        o.borrow().internal,
+        Some(crate::value::ObjectInternal::ArrayIter { .. })
+    ) {
+        Some(it.ao_arr(o))
+    } else {
+        None
+    };
+    let dtp = if ao_arr.is_none() {
+        crate::builtins::datetime::dt_public_props(&o.borrow())
+    } else {
+        None
+    };
+    out.push('{');
+    let mut first = true;
+    if let Some(arr) = ao_arr {
+        for (k, c) in arr.borrow().iter() {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            if esc.pretty() {
+                out.push('\n');
+                indent(out, lvl);
+            }
+            json_key(k, esc, out)?;
+            out.push(':');
+            if esc.pretty() {
+                out.push(' ');
+            }
+            json_child(it, &c.borrow(), esc, seen, out, lvl, max, err)?;
+        }
+    } else if let Some(dtp) = dtp {
+        for (k, v) in dtp.iter() {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            if esc.pretty() {
+                out.push('\n');
+                indent(out, lvl);
+            }
+            json_str(k.as_bytes(), esc, out)?;
+            out.push(':');
+            if esc.pretty() {
+                out.push(' ');
+            }
+            json_child(it, v, esc, seen, out, lvl, max, err)?;
+        }
+    } else {
+        let entries = it.object_serial_entries(o);
+        for (name, slot, decl) in entries {
+            if !decl
+                .as_ref()
+                .map(|(p, _)| p.visibility == crate::ast::Visibility::Public)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let name = match crate::value::int_prop_index(&name) {
+                Some(i) => i.to_string(),
+                None => name,
+            };
+            let v = match &decl {
+                Some((p, dcls)) => it.serial_entry_value(o, p, dcls, &slot),
+                None => o.borrow().props.get(&slot).map(|c| c.borrow().clone()),
+            };
+            if let Some(v) = v {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                if esc.pretty() {
+                    out.push('\n');
+                    indent(out, lvl);
+                }
+                json_str(name.as_bytes(), esc, out)?;
+                out.push(':');
+                if esc.pretty() {
+                    out.push(' ');
+                }
+                json_child(it, &v, esc, seen, out, lvl, max, err)?;
+            }
+        }
+    }
+    if esc.pretty() && !first {
+        out.push('\n');
+        indent(out, lvl - 1);
+    }
+    out.push('}');
+    Ok(())
+}
+
+fn json_key(key: &ArrKey, esc: &Esc, out: &mut String) -> Result<(), i64> {
+    match key {
+        ArrKey::Str(s) => json_str(s.as_bytes(), esc, out),
+        ArrKey::Int(i) => {
+            use std::fmt::Write;
+            write!(out, "\"{i}\"").unwrap();
+            Ok(())
+        }
+        ArrKey::Tomb => Ok(()),
+    }
+}
+
+/// Emit `"…"`. Err(5) on broken utf8 unless an INVALID_UTF8_* flag says
+/// what to substitute instead.
+fn json_str(s: &[u8], esc: &Esc, out: &mut String) -> Result<(), i64> {
     use std::fmt::Write;
-    const HEX_TAG: i64 = 1;
-    const HEX_AMP: i64 = 2;
-    const HEX_APOS: i64 = 4;
-    const HEX_QUOT: i64 = 8;
-    const UNESCAPED_SLASHES: i64 = 64;
-    const UNESCAPED_UNICODE: i64 = 256;
-    // HEX-flag escapes use %04X; default unicode escapes %04x (PHP quirk).
     out.push('"');
-    for c in s.chars() {
-        let u = c as u32;
-        match c {
-            '"' if flags & HEX_QUOT != 0 => write!(out, "\\u{:04X}", u).unwrap(),
-            '"' => out.push_str("\\\""),
-            '\'' if flags & HEX_APOS != 0 => write!(out, "\\u{:04X}", u).unwrap(),
-            '<' | '>' if flags & HEX_TAG != 0 => write!(out, "\\u{:04X}", u).unwrap(),
-            '&' if flags & HEX_AMP != 0 => write!(out, "\\u{:04X}", u).unwrap(),
-            '\\' => out.push_str("\\\\"),
-            '/' if flags & UNESCAPED_SLASHES == 0 => out.push_str("\\/"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            _ if u < 0x20 => write!(out, "\\u{:04x}", u).unwrap(),
-            _ if u > 0x7f && flags & UNESCAPED_UNICODE == 0 => {
-                if u > 0xffff {
-                    let x = u - 0x10000;
-                    write!(
-                        out,
-                        "\\u{:04x}\\u{:04x}",
-                        0xd800 + (x >> 10),
-                        0xdc00 + (x & 0x3ff)
-                    )
-                    .unwrap();
+    let mut i = 0;
+    let mut run = 0;
+    while i < s.len() {
+        let c = s[i];
+        let act = esc.tab[c as usize];
+        if act == 0 {
+            i += 1;
+            continue;
+        }
+        if run < i {
+            // clean runs are all-ASCII — hi bytes break them above
+            out.push_str(std::str::from_utf8(&s[run..i]).unwrap());
+        }
+        match act {
+            A_ESC => {
+                out.push('\\');
+                out.push(match c {
+                    b'\n' => 'n',
+                    b'\r' => 'r',
+                    b'\t' => 't',
+                    0x08 => 'b',
+                    0x0c => 'f',
+                    _ => c as char, // \" \\ \/
+                });
+                i += 1;
+            }
+            A_UNI_LO => {
+                write!(out, "\\u{:04x}", c).unwrap();
+                i += 1;
+            }
+            A_UNI_HI => {
+                write!(out, "\\u{:04X}", c).unwrap();
+                i += 1;
+            }
+            _ => {
+                let n = utf8_len(c);
+                if i + n <= s.len() && std::str::from_utf8(&s[i..i + n]).is_ok() {
+                    let u = std::str::from_utf8(&s[i..i + n])
+                        .unwrap()
+                        .chars()
+                        .next()
+                        .unwrap() as u32;
+                    if esc.flags & F_UNESC_UNI != 0 {
+                        // U+2028/29 stay escaped — JS line separators.
+                        if (u == 0x2028 || u == 0x2029) && esc.flags & F_UNESC_LT == 0 {
+                            write!(out, "\\u{:04x}", u).unwrap();
+                        } else {
+                            out.push_str(std::str::from_utf8(&s[i..i + n]).unwrap());
+                        }
+                    } else if u > 0xffff {
+                        let x = u - 0x10000;
+                        write!(
+                            out,
+                            "\\u{:04x}\\u{:04x}",
+                            0xd800 + (x >> 10),
+                            0xdc00 + (x & 0x3ff)
+                        )
+                        .unwrap();
+                    } else {
+                        write!(out, "\\u{:04x}", u).unwrap();
+                    }
+                    i += n;
+                } else if esc.flags & F_UTF8_IGNORE != 0 {
+                    // zend substitutes per bad byte, not per sequence.
+                    i += 1;
+                } else if esc.flags & F_UTF8_SUB != 0 {
+                    // The substitute is a real U+FFFD — it goes out raw
+                    // under UNESCAPED_UNICODE like any other char.
+                    if esc.flags & F_UNESC_UNI != 0 {
+                        out.push_str("\u{fffd}");
+                    } else {
+                        out.push_str("\\ufffd");
+                    }
+                    i += 1;
                 } else {
-                    write!(out, "\\u{:04x}", u).unwrap();
+                    return Err(J_UTF8);
                 }
             }
-            c => out.push(c),
         }
+        run = i;
+    }
+    if run < s.len() {
+        out.push_str(std::str::from_utf8(&s[run..]).unwrap());
     }
     out.push('"');
+    Ok(())
 }
 
-fn json_decode(it: &mut Interp, s: &str, assoc: bool) -> Result<Value, ()> {
-    let b = s.as_bytes();
+fn json_f64(f: f64, flags: i64, out: &mut String) {
+    let mut s = format_float_repr(f);
+    if s.contains('E') {
+        // gcvt prints %G's uppercase; zend's JSON writer uses 'e'.
+        s = s.replace('E', "e");
+    }
+    if flags & F_PRESERVE != 0 && !s.contains('.') && !s.contains('e') {
+        s.push_str(".0");
+    }
+    out.push_str(&s);
+}
+
+// ----- decode -----
+
+fn json_decode(
+    it: &mut Interp,
+    s: &[u8],
+    assoc: bool,
+    depth: i64,
+    flags: i64,
+) -> Result<Value, i64> {
     let mut pos = 0;
-    let v = json_value(it, b, &mut pos, assoc)?;
-    Ok(v)
-}
-
-fn json_ws(b: &[u8], pos: &mut usize) {
-    while *pos < b.len() && (b[*pos] as char).is_ascii_whitespace() {
-        *pos += 1;
+    let v = json_value(it, s, &mut pos, assoc, flags, depth)?;
+    json_ws(s, &mut pos)?;
+    match s.get(pos) {
+        // ws already rejected <0x20 and broken utf8 in the tail.
+        None => Ok(v),
+        Some(_) => Err(J_SYNTAX),
     }
 }
 
-fn json_value(it: &mut Interp, b: &[u8], pos: &mut usize, assoc: bool) -> Result<Value, ()> {
-    json_ws(b, pos);
+fn json_ws(b: &[u8], pos: &mut usize) -> Result<(), i64> {
+    while let Some(&c) = b.get(*pos) {
+        match c {
+            b' ' | b'\t' | b'\r' | b'\n' => *pos += 1,
+            _ if c < 0x20 => return Err(J_CTRL),
+            _ if c >= 0x80 => {
+                // zend's scanner validates utf8 wherever it lands — a
+                // broken sequence anywhere mid-document is err5, a valid
+                // char simply isn't whitespace.
+                if utf8_seq_len(b, *pos).is_none() {
+                    return Err(J_UTF8);
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
+fn json_value(
+    it: &mut Interp,
+    b: &[u8],
+    pos: &mut usize,
+    assoc: bool,
+    flags: i64,
+    rem: i64,
+) -> Result<Value, i64> {
+    json_ws(b, pos)?;
     match b.get(*pos) {
-        Some(b'n') => {
-            *pos += 4;
-            Ok(Value::Null)
-        }
-        Some(b't') => {
-            *pos += 4;
-            Ok(Value::Bool(true))
-        }
-        Some(b'f') => {
-            *pos += 5;
-            Ok(Value::Bool(false))
-        }
+        Some(b'n') => json_lit(b, pos, b"null", Value::Null),
+        Some(b't') => json_lit(b, pos, b"true", Value::Bool(true)),
+        Some(b'f') => json_lit(b, pos, b"false", Value::Bool(false)),
         Some(b'"') => {
             *pos += 1;
-            let mut s = String::new();
-            while *pos < b.len() && b[*pos] != b'"' {
-                if b[*pos] == b'\\' {
-                    if *pos + 1 == b.len() {
-                        return Err(());
-                    }
-                    *pos += 1;
-                    match b[*pos] {
-                        b'n' => s.push('\n'),
-                        b't' => s.push('\t'),
-                        b'r' => s.push('\r'),
-                        b'b' => s.push('\u{8}'),
-                        b'f' => s.push('\u{c}'),
-                        b'u' if *pos + 4 < b.len() => {
-                            let h = std::str::from_utf8(&b[*pos + 1..*pos + 5]).map_err(|_| ())?;
-                            let cp = u32::from_str_radix(h, 16).map_err(|_| ())?;
-                            s.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
-                            *pos += 4;
-                        }
-                        c => s.push(c as char),
-                    }
-                    *pos += 1;
-                } else if b[*pos].is_ascii() {
-                    // Scan ASCII runs once instead of validating/copying each byte.
-                    let start = *pos;
-                    while *pos < b.len() && b[*pos].is_ascii() && !matches!(b[*pos], b'"' | b'\\') {
-                        *pos += 1;
-                    }
-                    s.push_str(std::str::from_utf8(&b[start..*pos]).unwrap());
-                } else {
-                    // UTF-8 pass-through
-                    let ch_len = utf8_len(b[*pos]);
-                    s.push_str(&String::from_utf8_lossy(&b[*pos..*pos + ch_len]));
-                    *pos += ch_len;
-                }
-            }
-            *pos += 1;
-            Ok(Value::str(s))
+            Ok(Value::bytes(jstr(b, pos, flags)?))
         }
         Some(b'[') => {
             *pos += 1;
+            // zend counts one extra level past the deepest container.
+            let rem = rem - 1;
+            if rem == 0 {
+                return Err(J_DEPTH);
+            }
             let mut a = PhpArray::new();
-            json_ws(b, pos);
+            json_ws(b, pos)?;
             if b.get(*pos) == Some(&b']') {
                 *pos += 1;
                 return Ok(Value::Array(Rc::new(RefCell::new(a))));
             }
             loop {
-                let v = json_value(it, b, pos, assoc)?;
+                let v = json_value(it, b, pos, assoc, flags, rem)?;
                 a.push(v);
-                json_ws(b, pos);
+                json_ws(b, pos)?;
                 match b.get(*pos) {
-                    Some(b',') => {
-                        *pos += 1;
-                    }
+                    Some(b',') => *pos += 1,
                     Some(b']') => {
                         *pos += 1;
                         break;
                     }
-                    _ => return Err(()),
+                    _ => return Err(J_SYNTAX),
                 }
             }
             Ok(Value::Array(Rc::new(RefCell::new(a))))
         }
         Some(b'{') => {
             *pos += 1;
-            let mut a = PhpArray::new();
-            json_ws(b, pos);
+            let rem = rem - 1;
+            if rem == 0 {
+                return Err(J_DEPTH);
+            }
+            json_ws(b, pos)?;
             if b.get(*pos) == Some(&b'}') {
                 *pos += 1;
                 return Ok(if assoc {
-                    Value::Array(Rc::new(RefCell::new(a)))
+                    Value::Array(Rc::new(RefCell::new(PhpArray::new())))
                 } else {
-                    let Some(cls) = it.lookup_class("stdclass") else {
-                        return Ok(Value::Null);
-                    };
-                    Value::Object(it.alloc_obj(PhpObject {
-                        class: cls,
-                        props: HashMap::new(),
-                        prop_order: Vec::new(),
-                        id: 0,
-                        internal: None,
-                        unset_props: std::collections::HashSet::new(),
-                    }))
+                    stdclass(it, HashMap::new(), Vec::new())
                 });
             }
-            loop {
-                json_ws(b, pos);
-                let k = match json_value(it, b, pos, true)? {
-                    Value::Str(s) => crate::value::lossy(&s).into_owned(),
-                    _ => return Err(()),
-                };
-                json_ws(b, pos);
-                if b.get(*pos) != Some(&b':') {
-                    return Err(());
-                }
-                *pos += 1;
-                let v = json_value(it, b, pos, assoc)?;
-                a.set(ArrKey::Str(k.into()), v);
-                json_ws(b, pos);
-                match b.get(*pos) {
-                    Some(b',') => {
-                        *pos += 1;
+            if assoc {
+                let mut a = PhpArray::new();
+                loop {
+                    json_ws(b, pos)?;
+                    if b.get(*pos) != Some(&b'"') {
+                        return Err(J_SYNTAX);
                     }
-                    Some(b'}') => {
-                        *pos += 1;
-                        break;
+                    *pos += 1;
+                    let k = key_cast(&jstr(b, pos, flags)?)?;
+                    json_ws(b, pos)?;
+                    if b.get(*pos) != Some(&b':') {
+                        return Err(J_SYNTAX);
                     }
-                    _ => return Err(()),
+                    *pos += 1;
+                    let v = json_value(it, b, pos, assoc, flags, rem)?;
+                    a.set(k, v);
+                    json_ws(b, pos)?;
+                    match b.get(*pos) {
+                        Some(b',') => *pos += 1,
+                        Some(b'}') => {
+                            *pos += 1;
+                            break;
+                        }
+                        _ => return Err(J_SYNTAX),
+                    }
                 }
-            }
-            Ok(if assoc {
-                Value::Array(Rc::new(RefCell::new(a)))
+                Ok(Value::Array(Rc::new(RefCell::new(a))))
             } else {
-                // non-assoc decodes to stdClass
+                // stdClass: build props directly, no temp array pass.
                 let mut props = HashMap::new();
                 let mut order = Vec::new();
-                for (k, c) in a.iter() {
-                    let ks = match k {
-                        ArrKey::Str(st) => st.to_string(),
-                        ArrKey::Int(i) => i.to_string(),
-                        ArrKey::Tomb => continue,
-                    };
-                    order.push(ks.clone());
-                    props.insert(ks, c.clone());
+                loop {
+                    json_ws(b, pos)?;
+                    if b.get(*pos) != Some(&b'"') {
+                        return Err(J_SYNTAX);
+                    }
+                    *pos += 1;
+                    let k = String::from_utf8(jstr(b, pos, flags)?).map_err(|_| J_UTF8)?;
+                    json_ws(b, pos)?;
+                    if b.get(*pos) != Some(&b':') {
+                        return Err(J_SYNTAX);
+                    }
+                    *pos += 1;
+                    let v = json_value(it, b, pos, assoc, flags, rem)?;
+                    if !props.contains_key(&k) {
+                        order.push(k.clone());
+                    }
+                    props.insert(k, Rc::new(RefCell::new(v)));
+                    json_ws(b, pos)?;
+                    match b.get(*pos) {
+                        Some(b',') => *pos += 1,
+                        Some(b'}') => {
+                            *pos += 1;
+                            break;
+                        }
+                        _ => return Err(J_SYNTAX),
+                    }
                 }
-                let Some(cls) = it.lookup_class("stdclass") else {
-                    return Ok(Value::Null);
-                };
-                Value::Object(it.alloc_obj(PhpObject {
-                    class: cls,
-                    props,
-                    prop_order: order,
-                    id: 0,
-                    internal: None,
-                    unset_props: std::collections::HashSet::new(),
-                }))
-            })
-        }
-        Some(&c) if c == b'-' || c.is_ascii_digit() => {
-            let start = *pos;
-            while *pos < b.len()
-                && matches!(b[*pos], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
-            {
-                *pos += 1;
-            }
-            let text = std::str::from_utf8(&b[start..*pos]).map_err(|_| ())?;
-            if let Ok(i) = text.parse::<i64>() {
-                Ok(Value::Int(i))
-            } else {
-                Ok(Value::Float(text.parse().map_err(|_| ())?))
+                Ok(stdclass(it, props, order))
             }
         }
-        _ => Err(()),
+        Some(&c) if c == b'-' || c.is_ascii_digit() => jnum(b, pos, flags),
+        _ => Err(J_SYNTAX),
     }
+}
+
+fn stdclass(it: &mut Interp, props: HashMap<String, Cell>, order: Vec<String>) -> Value {
+    let Some(cls) = it.lookup_class("stdclass") else {
+        return Value::Null;
+    };
+    Value::Object(it.alloc_obj(PhpObject {
+        class: cls,
+        props,
+        prop_order: order,
+        id: 0,
+        internal: None,
+        unset_props: std::collections::HashSet::new(),
+    }))
+}
+
+fn json_lit(b: &[u8], pos: &mut usize, lit: &[u8], v: Value) -> Result<Value, i64> {
+    if b[*pos..].starts_with(lit) {
+        *pos += lit.len();
+        Ok(v)
+    } else {
+        Err(J_SYNTAX)
+    }
+}
+
+/// zend's object-key int cast for assoc decode: canonical decimal forms
+/// only — "+3", "007", "-0", "1e5" and int64 overflows stay strings.
+fn key_cast(k: &[u8]) -> Result<ArrKey, i64> {
+    let s = std::str::from_utf8(k).map_err(|_| J_UTF8)?;
+    let d = s.strip_prefix('-').unwrap_or(s);
+    if !d.is_empty()
+        && d.bytes().all(|c| c.is_ascii_digit())
+        && !(d.len() > 1 && d.starts_with('0'))
+        && !(s.starts_with('-') && d == "0")
+    {
+        if let Ok(i) = s.parse::<i64>() {
+            return Ok(ArrKey::Int(i));
+        }
+    }
+    Ok(ArrKey::Str(s.into()))
+}
+
+/// -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)? — zend rejects "01",
+/// ".5", "1.", "1e" as syntax (err4); int64 overflow becomes float, or
+/// string under JSON_BIGINT_AS_STRING.
+fn jnum(b: &[u8], pos: &mut usize, flags: i64) -> Result<Value, i64> {
+    let start = *pos;
+    let mut p = start;
+    if b.get(p) == Some(&b'-') {
+        p += 1;
+    }
+    match b.get(p) {
+        Some(b'0') => p += 1,
+        Some(&c) if c.is_ascii_digit() => {
+            p += 1;
+            while matches!(b.get(p), Some(&c) if c.is_ascii_digit()) {
+                p += 1;
+            }
+        }
+        _ => return Err(J_SYNTAX),
+    }
+    let mut float = false;
+    if b.get(p) == Some(&b'.') {
+        float = true;
+        p += 1;
+        if !matches!(b.get(p), Some(&c) if c.is_ascii_digit()) {
+            return Err(J_SYNTAX);
+        }
+        while matches!(b.get(p), Some(&c) if c.is_ascii_digit()) {
+            p += 1;
+        }
+    }
+    if matches!(b.get(p), Some(b'e') | Some(b'E')) {
+        float = true;
+        p += 1;
+        if matches!(b.get(p), Some(b'+') | Some(b'-')) {
+            p += 1;
+        }
+        if !matches!(b.get(p), Some(&c) if c.is_ascii_digit()) {
+            return Err(J_SYNTAX);
+        }
+        while matches!(b.get(p), Some(&c) if c.is_ascii_digit()) {
+            p += 1;
+        }
+    }
+    let text = std::str::from_utf8(&b[start..p]).unwrap();
+    *pos = p;
+    if !float {
+        if let Ok(i) = text.parse::<i64>() {
+            return Ok(Value::Int(i));
+        }
+        if flags & 2 != 0 {
+            // JSON_BIGINT_AS_STRING
+            return Ok(Value::bytes(b[start..p].to_vec()));
+        }
+    }
+    Ok(Value::Float(text.parse().unwrap_or(f64::INFINITY)))
+}
+
+/// String-content scanner — caller consumed the opening `"`; on return
+/// `*pos` sits past the closing quote. Fast path borrows the span when no
+/// escapes; unterminated input lands in zend's CTRL bucket (err3).
+fn jstr(b: &[u8], pos: &mut usize, flags: i64) -> Result<Vec<u8>, i64> {
+    let mut p = *pos;
+    let mut hi = false;
+    loop {
+        match b.get(p) {
+            None => return Err(J_CTRL),
+            Some(b'"') => break,
+            Some(b'\\') => return jstr_esc(b, pos, p, flags),
+            Some(&c) if c < 0x20 => return Err(J_CTRL),
+            Some(&c) => {
+                hi |= c >= 0x80;
+                p += 1;
+            }
+        }
+    }
+    let span = &b[*pos..p];
+    *pos = p + 1;
+    if !hi {
+        return Ok(span.to_vec());
+    }
+    match std::str::from_utf8(span) {
+        Ok(_) => Ok(span.to_vec()),
+        Err(_) if flags & (F_UTF8_IGNORE | F_UTF8_SUB) == 0 => Err(J_UTF8),
+        Err(_) => {
+            let mut out = Vec::with_capacity(span.len());
+            utf8_filter(&mut out, span, flags);
+            Ok(out)
+        }
+    }
+}
+
+/// Slow path once the first `\` is seen; `p` points at it.
+fn jstr_esc(b: &[u8], pos: &mut usize, mut p: usize, flags: i64) -> Result<Vec<u8>, i64> {
+    let mut out = Vec::with_capacity(32);
+    let mut run = *pos;
+    loop {
+        match b.get(p) {
+            None => return Err(J_CTRL),
+            Some(b'"') => {
+                push_span(&mut out, &b[run..p], flags)?;
+                *pos = p + 1;
+                return Ok(out);
+            }
+            Some(b'\\') => {
+                push_span(&mut out, &b[run..p], flags)?;
+                p += 1;
+                match b.get(p) {
+                    None => return Err(J_SYNTAX),
+                    Some(b'"') => out.push(b'"'),
+                    Some(b'\\') => out.push(b'\\'),
+                    Some(b'/') => out.push(b'/'),
+                    Some(b'n') => out.push(b'\n'),
+                    Some(b't') => out.push(b'\t'),
+                    Some(b'r') => out.push(b'\r'),
+                    Some(b'b') => out.push(0x08),
+                    Some(b'f') => out.push(0x0c),
+                    Some(b'u') => {
+                        let cp = hex4(b, p + 1).ok_or(J_SYNTAX)?;
+                        p += 5;
+                        let u = if (0xd800..0xdc00).contains(&cp) {
+                            // lone high surrogate → UTF16 error; a valid
+                            // pair wants \uDC00..\uDFFF right behind.
+                            if b.get(p) == Some(&b'\\') && b.get(p + 1) == Some(&b'u') {
+                                let lo = hex4(b, p + 2).ok_or(J_SYNTAX)?;
+                                if (0xdc00..0xe000).contains(&lo) {
+                                    p += 6;
+                                    0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00)
+                                } else {
+                                    return Err(J_UTF16);
+                                }
+                            } else {
+                                return Err(J_UTF16);
+                            }
+                        } else if (0xdc00..0xe000).contains(&cp) {
+                            return Err(J_UTF16);
+                        } else {
+                            cp
+                        };
+                        let mut tmp = [0u8; 4];
+                        out.extend_from_slice(
+                            char::from_u32(u)
+                                .unwrap_or('\u{fffd}')
+                                .encode_utf8(&mut tmp)
+                                .as_bytes(),
+                        );
+                        run = p;
+                        continue;
+                    }
+                    Some(_) => return Err(J_SYNTAX),
+                }
+                p += 1;
+                run = p;
+            }
+            Some(&c) if c < 0x20 => return Err(J_CTRL),
+            Some(_) => p += 1,
+        }
+    }
+}
+
+/// Flush a content run (between escapes) under the utf8 policy.
+fn push_span(out: &mut Vec<u8>, span: &[u8], flags: i64) -> Result<(), i64> {
+    match std::str::from_utf8(span) {
+        Ok(_) => {
+            out.extend_from_slice(span);
+            Ok(())
+        }
+        Err(_) if flags & (F_UTF8_IGNORE | F_UTF8_SUB) == 0 => Err(J_UTF8),
+        Err(_) => {
+            utf8_filter(out, span, flags);
+            Ok(())
+        }
+    }
+}
+
+/// Append `s` under INVALID_UTF8_IGNORE/SUBSTITUTE — one U+FFFD per bad
+/// BYTE (zend walks one byte forward on every invalid unit).
+fn utf8_filter(out: &mut Vec<u8>, s: &[u8], flags: i64) {
+    let sub = flags & F_UTF8_SUB != 0 && flags & F_UTF8_IGNORE == 0;
+    let mut i = 0;
+    while i < s.len() {
+        match utf8_seq_len(s, i) {
+            Some(n) => {
+                out.extend_from_slice(&s[i..i + n]);
+                i += n;
+            }
+            None => {
+                if sub {
+                    out.extend_from_slice("\u{fffd}".as_bytes());
+                }
+                i += 1;
+            }
+        }
+    }
+}
+
+fn hex4(b: &[u8], i: usize) -> Option<u32> {
+    let h = b.get(i..i + 4)?;
+    if h.iter().all(|c| c.is_ascii_hexdigit()) {
+        u32::from_str_radix(std::str::from_utf8(h).unwrap(), 16).ok()
+    } else {
+        None
+    }
+}
+
+/// Length of the valid utf8 char starting at b[i], else None.
+fn utf8_seq_len(b: &[u8], i: usize) -> Option<usize> {
+    let n = utf8_len(b[i]);
+    (i + n <= b.len() && std::str::from_utf8(&b[i..i + n]).is_ok()).then_some(n)
 }
 
 fn utf8_len(b: u8) -> usize {

@@ -2709,6 +2709,7 @@ impl<'a> Interp<'a> {
             ("ParseError", "CompileError"),
             ("AssertionError", "Error"),
             ("UnhandledMatchError", "Error"),
+            ("JsonException", "Exception"),
             ("ReflectionException", "Exception"),
             ("DateException", "Exception"),
             ("DateInvalidTimeZoneException", "DateException"),

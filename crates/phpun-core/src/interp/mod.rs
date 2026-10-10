@@ -1717,6 +1717,7 @@ impl<'a> Interp<'a> {
         constants.insert("JSON_ERROR_RECURSION".into(), Value::Int(6));
         constants.insert("JSON_ERROR_INF_OR_NAN".into(), Value::Int(7));
         constants.insert("JSON_ERROR_UNSUPPORTED_TYPE".into(), Value::Int(8));
+        constants.insert("JSON_ERROR_UTF16".into(), Value::Int(10));
         constants.insert("JSON_HEX_TAG".into(), Value::Int(1));
         constants.insert("JSON_HEX_AMP".into(), Value::Int(2));
         constants.insert("JSON_HEX_APOS".into(), Value::Int(4));
