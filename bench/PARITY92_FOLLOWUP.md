@@ -329,3 +329,57 @@ under the parallel suite; standalone60s reruns pass on before/after. Nine
 existing crashes and five pre-existing timeouts remain. Raw per-file maps,
 original timeout and followup thresholds are retained; timing IDs are not
 relabelled after parent review fixes. Parent JSON trailing-escape fix is included.
+
+## Capacity-backed PHP byte strings (#185)
+
+Runtime15f5d86 uses Rc<Vec<u8>>; constructing PhpStr moves the Vec instead of
+copying its payload into Rc<[u8]>. A proven unique-owner string CV can append
+using Vec capacity in AST and VM. Payload-sharing aliases and typed-reference
+owners retain canonical concatenation/write gates. Weak handles detach before
+mutation; tracked grow charges transfer by the old identity after a live sweep.
+One Rc shell is still allocated per append for cache invalidation; there is no
+stable-generation cache or inline packed-array storage claim. Existing memory
+accounting heuristics remain, measured compatibility is reported below.
+
+Correct frozen release verified by distinct hash and append symbols; shared Cargo
+target initially reused the parent artifact. That copy was quarantined before
+speed measurements, core cleaned/rebuilt, and never used for published timings.
+Final6dbf71c includes parent trailing-JSON-escape rejection; valid-workload timings
+retain15f5d86. Measured x86_64 layout: Value16B, Cell8B, TraceFrame160B.
+
+Seven alternating slot-final d8cef25 →15f5d86 pairs, all exit/stdout/stderr
+PHP-byte-identical, profiler off: concat4000 14.753→13.318ms (0.903),
+16000 63.661→33.017 (0.519),64000 643.407→106.854 (0.166).
+Strings251.316→191.829 (0.763), fib165.675→152.419 (0.920),
+arrays226.493→213.427 (0.942), objects387.853→371.660 (0.958),
+JSON738.307→637.630 (0.864). This removes increasing-prefix copying on the
+proven path; small-case noise remains and individual steps are not multiplied.
+
+Fresh native PHP/main3a-runtime-equivalent a5dc13f/15f5d86 comparison,7rotating
+reps, profilers off, every exit/stdout/stderr PHP byte-identical, cold CLI:
+
+| Bench | PHP / merged-main baseline / stack median ms | Main/PHP | Stack/PHP | Stack/main |
+|---|---:|---:|---:|---:|
+| bench/00-startup.php | 4.269 / 5.274 / 5.121 | 1.24× | 1.20× | 0.971× |
+| bench/10-fib.php | 13.577 / 204.566 / 147.123 | 15.07× | 10.84× | 0.719× |
+| bench/11-sieve.php | 8.427 / 244.067 / 246.210 | 28.96× | 29.22× | 1.009× |
+| bench/20-strings.php | 14.546 / 247.204 / 182.590 | 16.99× | 12.55× | 0.739× |
+| bench/30-arrays.php | 18.685 / 237.447 / 206.414 | 12.71× | 11.05× | 0.869× |
+| bench/40-objects.php | 8.599 / 385.936 / 364.962 | 44.88× | 42.44× | 0.946× |
+| bench/50-regex.php | 8.604 / 42.705 / 44.795 | 4.96× | 5.21× | 1.049× |
+| bench/60-json.php | 187.067 / 1016.983 / 649.746 | 5.44× | 3.47× | 0.639× |
+| bench/70-db.php | 31.481 / 127.692 / 124.250 | 4.06× | 3.95× | 0.973× |
+| bench/app/cli.php | 6.110 / 44.789 / 43.648 | 7.33× | 7.14× | 0.975× |
+| examples/composer/run.php | 5.324 / 9.096 / 8.114 | 1.71× | 1.52× | 0.892× |
+
+Nine-bench geomean9.398→8.155×, stack/main0.868 (~13.2%less time).
+Strings−26.1%, JSON−36.1%, fib−28.1%; objects−5.4%but still42.44×PHP here,
+sieve1.009×main and regex1.049×main with substantial overlapping dispersion.
+Cold app0.975×main, Composer0.892×main; seven small samples are insufficient
+for a broad app gain claim. This is a fresh same-host native setup and is separate
+from the existing user-reported main3a geomean3.05×; no cross-host ratio mixing.
+Main moved after these samples: baseline explicitly3a/a5dc, not ef63392.
+
+Workspace tests/fmt/clippy pass.26 VM/probe and19 workload byte gates pass,
+including binary/NUL bytes, aliases, refs, typed-owner fallback, RHS mutation,
+weak UTF8-cache invalidation after append and large tracked-string growth.
