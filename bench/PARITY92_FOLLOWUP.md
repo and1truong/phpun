@@ -130,3 +130,21 @@ Validation: workspace tests/fmt/clippy/release, class/scope rebinding/missing-ke
 unset/magic/typed/hooks/weak-lifetime check; 26 oracle probes. Same1,965 class/hooks/
 type/lifetime PHPT, all statuses unchanged (including two existing GC30s timeouts),
 zero crashes. Offset/array-dim caches and storage-generation changes remain follow-ups.
+
+## Scalar coercion member order without heap strings (#186)
+
+Runtime728f405 →2077344: shared coerce_scalar uses borrowed static member names
+and an iterator chain instead of constructing a Vec<String>/lowercase copies
+on every coercion. Preserves numeric-string float preference then int/float/string/
+bool family order. No separate constructor or builtin coercion policy.
+
+Seven paired PHP-gated release reps: objects347.728→330.505ms (0.950×),
+ctor109.308→107.362 (0.982×), scaled240.077→235.577 (0.981×), strings249.068→243.781
+(0.979×), fib184.187→192.131 (1.043×), app43.143→41.992 (0.973×). Ranges overlap;
+this run establishes no reliable broad speedup. Allocation removal is structural,
+not a claim of measured malloc count. Raw samples retained.
+
+Validation: workspace tests/fmt/clippy/release, union order/mixed-case/by-ref/
+promoted args/introspection/object conversion check, 27 oracle probes; 709 binding
+PHPT636pass/62existingfail/2skip/9unsupported, all statuses unchanged, zero
+crashes/timeouts.
